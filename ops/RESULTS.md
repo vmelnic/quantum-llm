@@ -126,6 +126,38 @@ Overlap-ul real SSD/IOCP→pinned RAM→H2D rămâne de exercitat de P6 cu un mo
 care nu încape în RAM/VRAM; OLMoE este complet VRAM-resident și ar fabrica un
 test de cold I/O dacă l-am evacua artificial.
 
+### P5 — serviciu persistent OpenAI-compatible
+
+Stare: **PASS VERTICAL SLICE OPERAȚIONAL PE 3090BOX**.
+
+Procesul CUDA are protocol persistent `BEGIN/NEXT/END/SHUTDOWN`; smoke-ul a
+încărcat containerul o singură dată, a returnat tokenii canonici `7785, 15` și
+s-a oprit curat. Frontend-ul Python folosește tokenizerul local și oferă:
+
+- `/v1/completions` și `/v1/chat/completions`;
+- SSE incremental, inclusiv chunk final cu `finish_reason` și `[DONE]`;
+- `/health`, `/ready`, `/model-info`, `/v1/models`, `/metrics`;
+- queue/admission limitate, timeout-uri, anulare la disconnect și drain;
+- API key pentru bind non-loopback, logs JSONL și identificatori build/model;
+- script foreground și Task Scheduler install/uninstall pentru operare fără
+  shell interactiv.
+
+Probe reale:
+
+- completion pentru `The capital of France is` a returnat ` Paris.\n\n`;
+- același request streaming a livrat deltele ` Paris`, `.`, newline;
+- chat completions a traversat template-ul tokenizerului și a răspuns HTTP 200;
+- la capacitate `active + queue = 3`, patru request-uri concurente de câte 100
+  tokeni au produs trei răspunsuri HTTP 200 și un HTTP 503 explicit
+  `overload_error`;
+- după request, metricile au raportat `active=0`, `admitted=1`, `completed=1`,
+  `generated_tokens=2`, zero failed/cancelled, readiness `1`;
+- `SIGINT` a făcut drain și workerul a ieșit cu cod 0;
+- logul `logs/expert-server.jsonl` a fost creat și actualizat.
+
+Runnerul verifică la fiecare startup dimensiunea și SHA-256 pentru toate cele
+6.948.352.000 bytes de pack. Un container corupt nu ajunge în readiness.
+
 ## Etapa B — analizor SafeTensors
 
 Stare: **PASS**.

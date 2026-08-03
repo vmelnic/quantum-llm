@@ -313,9 +313,107 @@ class Model {
 
 }  // namespace
 
+namespace {
+
+std::vector<std::string_view> split_tabs(std::string_view line) {
+  std::vector<std::string_view> fields;
+  while (true) {
+    const auto position = line.find('\t');
+    fields.push_back(line.substr(0, position));
+    if (position == std::string_view::npos) break;
+    line.remove_prefix(position + 1);
+  }
+  return fields;
+}
+
+std::vector<std::uint32_t> parse_token_ids(std::string_view text) {
+  std::vector<std::uint32_t> result;
+  while (!text.empty()) {
+    const auto separator = text.find(',');
+    const auto field = text.substr(0, separator);
+    if (field.empty()) throw std::runtime_error("empty token id");
+    const auto value = std::stoull(std::string(field));
+    if (value > 0xffffffffULL) throw std::runtime_error("token id exceeds u32");
+    result.push_back(static_cast<std::uint32_t>(value));
+    if (separator == std::string_view::npos) break;
+    text.remove_prefix(separator + 1);
+  }
+  if (result.empty()) throw std::runtime_error("prompt is empty");
+  return result;
+}
+
+int worker_loop(Model& model) {
+  std::uint64_t active_id = 0;
+  std::uint32_t predicted = 0, next_position = 0;
+  std::cout << "{\"type\":\"ready\",\"protocol\":1}\n" << std::flush;
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    try {
+      const auto fields = split_tabs(line);
+      if (fields.empty()) continue;
+      if (fields[0] == "PING") {
+        std::cout << "{\"type\":\"pong\"}\n" << std::flush;
+        continue;
+      }
+      if (fields[0] == "BEGIN") {
+        if (fields.size() != 3) throw std::runtime_error("BEGIN field count");
+        if (active_id != 0) throw std::runtime_error("worker already has an active request");
+        const auto id = std::stoull(std::string(fields[1]));
+        if (id == 0) throw std::runtime_error("request id zero");
+        const auto tokens = parse_token_ids(fields[2]);
+        for (std::uint32_t position = 0; position < tokens.size(); ++position)
+          predicted = model.forward(tokens[position], position);
+        next_position = static_cast<std::uint32_t>(tokens.size());
+        active_id = id;
+        std::cout << "{\"type\":\"begun\",\"id\":" << active_id << "}\n" << std::flush;
+        continue;
+      }
+      if (fields[0] == "NEXT") {
+        if (fields.size() != 3) throw std::runtime_error("NEXT field count");
+        const auto id = std::stoull(std::string(fields[1]));
+        if (id == 0 || id != active_id) throw std::runtime_error("NEXT request mismatch");
+        const bool final = fields[2] == "1";
+        const auto token = predicted;
+        if (!final) predicted = model.forward(token, next_position++);
+        std::cout << "{\"type\":\"token\",\"id\":" << id
+                  << ",\"token\":" << token << "}\n" << std::flush;
+        if (final) active_id = 0;
+        continue;
+      }
+      if (fields[0] == "END") {
+        if (fields.size() != 2) throw std::runtime_error("END field count");
+        const auto id = std::stoull(std::string(fields[1]));
+        if (id != active_id) throw std::runtime_error("END request mismatch");
+        active_id = 0;
+        std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n" << std::flush;
+        continue;
+      }
+      if (fields[0] == "SHUTDOWN") {
+        if (active_id != 0) throw std::runtime_error("cannot shutdown active worker");
+        std::cout << "{\"type\":\"shutdown\"}\n" << std::flush;
+        return 0;
+      }
+      throw std::runtime_error("unknown worker command");
+    } catch (const std::exception& error) {
+      std::cerr << "worker command failed: " << error.what() << '\n';
+      std::cout << "{\"type\":\"error\",\"active_id\":" << active_id
+                << "}\n" << std::flush;
+    }
+  }
+  return 0;
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   try {
     if (argc < 2) { std::cerr << "usage: expert-olmoe-runner <container> [new-tokens] [--trace-logits] [--concurrency N] [--verify-interleaving]\n"; return 64; }
+    if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
+      if (argc > 4) throw std::runtime_error("worker usage: <container> --worker [max-context]");
+      const auto max_context = argc == 4 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
+      Model model(argv[1], max_context, 1);
+      return worker_loop(model);
+    }
     std::uint32_t new_tokens = 12U, concurrency = 1U;
     bool trace_logits = false, verify_interleaving = false;
     int argument = 2;

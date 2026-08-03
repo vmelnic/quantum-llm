@@ -30,6 +30,57 @@ Invoke-ExpertPack.ps1 -Action Validate -Path C:\path\model.expert-pack
 Specificațiile normative sunt în `docs/`, codul produsului în `core/`,
 `compiler/` și `runtime/`; `ops/` conține numai automatizarea operațională.
 
+## Runtime CUDA și serviciul P3–P5
+
+Build-ul Release compilează runnerul end-to-end, workerul persistent și
+kernelurile batched. Smoke-ul protocolului încarcă modelul o singură dată și
+verifică primii tokeni canonici:
+
+```powershell
+Invoke-BuildExpertRuntime.ps1 -Configuration Release
+Invoke-ExpertWorkerSmoke.ps1
+```
+
+Serviciul OpenAI-compatible pornește implicit numai pe loopback:
+
+```powershell
+Start-ExpertServer.ps1 -HostAddress 127.0.0.1 -Port 8080 `
+  -BuildId (git rev-parse --short HEAD)
+```
+
+Endpoint-uri:
+
+- `POST /v1/completions` și `POST /v1/chat/completions`;
+- streaming SSE prin `"stream": true`;
+- `GET /health`, `/ready`, `/model-info`, `/v1/models` și `/metrics`;
+- coadă limitată, timeout de queue/generation, cancellation la disconnect și
+  graceful drain la `SIGINT`/`SIGTERM`.
+
+Pentru bind non-loopback se setează obligatoriu `EXPERT_API_KEY` în mediul
+procesului și clienții trimit `Authorization: Bearer ...`. Containerul și
+tokenizerul sunt strict locale; startup-ul nu descarcă nimic.
+
+Lansarea fără shell interactiv se instalează în Task Scheduler și poate fi
+pornită imediat:
+
+```powershell
+Install-ExpertServerTask.ps1 -Start -BuildId (git rev-parse --short HEAD)
+Get-ScheduledTask QuantumLLM-ExpertServer
+```
+
+Logurile JSONL sunt în `logs/expert-server.jsonl`. Pentru drain/rollback:
+
+```powershell
+Stop-ScheduledTask QuantumLLM-ExpertServer
+Uninstall-ExpertServerTask.ps1
+```
+
+Rollback-ul codului se face pe hostul de control la un commit validat, apoi
+`sync-to-3090box.sh`, rebuild, worker smoke și reinstalarea task-ului. Modelul
+Expert Pack nu este modificat de deploy/rollback. La recovery se verifică în
+ordine logul, `/health`, `Invoke-ExpertPack.ps1 -Action Validate`, build-ul și
+worker smoke-ul; un hash mismatch nu este ignorat și nu pornește modelul.
+
 ## Fluxul de lucru
 
 De pe hostul de control (acest repository):
