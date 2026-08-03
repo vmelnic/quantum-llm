@@ -1,4 +1,4 @@
-# Plan QMOE — handoff pentru sesiunea următoare
+# Plan Expert Pack — handoff pentru sesiunea următoare
 
 ## Obiectiv
 
@@ -109,12 +109,18 @@ selectat într-un strat. Request-urile independente pot avansa în ordine diferi
 ordinea operațiilor din interiorul fiecărui request și agregarea top-k rămân
 semantic identice.
 
-## 1. Formatul QMOE v1
+## 1. Formatul Expert Pack v1 (working name)
+
+`Expert Pack` este un nume intern temporar. Conceptul formatului este propus de
+acest proiect și nu are încă o implementare. Nu folosim numele `QMOE`: acesta
+aparține deja proiectului [QMoE](https://github.com/IST-DASLab/qmoe), care face
+compresie sub-1-bit și are propriul format și propriile kerneluri. Alegem numele
+public definitiv numai după un collision check.
 
 Compilerul produce un container independent de checkpoint-ul sursă:
 
 ```text
-qmoe-model/
+expert-pack-model/
 ├── manifest.json
 ├── dense.qpack
 ├── experts-000.qpack
@@ -174,7 +180,7 @@ Recordurile nu traversează inutil granițele shard-urilor. Pack-urile au o
 mărime configurabilă pentru copiere, verificare și distribuție, nu un expert per
 fișier.
 
-### Compiler QMOE
+### Compiler Expert Pack
 
 Compilerul trebuie să:
 
@@ -393,8 +399,8 @@ mod best-effort, iar API-ul și metricile trebuie să reflecte acest lucru.
 
 Livrabile:
 
-- `docs/qmoe-format-v1.md` cu schema binară și manifestul;
-- `docs/qmoe-runtime.md` cu state machines și ABI CUDA;
+- `docs/expert-pack-v1.md` cu schema binară și manifestul;
+- `docs/expert-runtime.md` cu state machines și ABI CUDA;
 - directoarele `compiler/` și `runtime/` cu build reproducibil;
 - inventar hardware extins cu CUDA, VRAM, RAM, disk și PCIe;
 - calculatorul de fezabilitate folosit atât de compiler, cât și de runtime.
@@ -405,7 +411,7 @@ Poarta P0:
 - un model imposibil este refuzat cu formula și resursa limitativă;
 - nu există dependență de codul Colibri în noul skeleton.
 
-### P1 — compiler și container QMOE
+### P1 — compiler și container Expert Pack
 
 Livrabile:
 
@@ -449,7 +455,7 @@ Livrabile:
 - router/top-k exact;
 - fused grouped gate+up/down;
 - weighted accumulation și KV persistent;
-- un request poate traversa integral modelul din QMOE.
+- un request poate traversa integral modelul din Expert Pack.
 
 Poarta P3:
 
@@ -502,7 +508,7 @@ Poarta P5:
 Modelul este ales după manifest și criterii, nu după numele sau popularitatea
 checkpoint-ului:
 
-- container QMOE mai mare decât RAM-ul fizic al mașinii;
+- container Expert Pack mai mare decât RAM-ul fizic al mașinii;
 - dense + KV + workspace încap în VRAM;
 - masa activă și top-k sunt compatibile cu SLO-ul;
 - licența și tokenizer/config sunt complete;
@@ -517,7 +523,319 @@ Poarta finală:
 - output-ul păstrează semantica modelului cuantizat;
 - procesul respectă bugetele și rămâne disponibil sub churn.
 
-## 5. Ce nu facem în această ramură
+## 5. Direcții viitoare — macOS/Metal și execuție distribuită
+
+Această secțiune păstrează deciziile pentru fazele de după P6. **Nu implementăm
+acum Metal, protocolul de rețea sau multi-node scheduling.** Focusul curent
+rămâne Expert Pack + runtime Windows/CUDA pe RTX 3090 până la demonstrarea
+SLO-ului pe un model mai mare decât RAM-ul.
+
+Totuși, core-ul, manifestul, schedulerul și cache-ul nu trebuie cuplate
+ireversibil la CUDA/Windows. Separarea logică urmărită este:
+
+```text
+core/
+  model manifest
+  cache
+  scheduler
+  request state
+
+backends/
+  cuda/                 # implementat primul
+  metal/                # viitor
+
+storage/
+  windows_iocp/         # implementat primul
+  macos_async/          # viitor
+
+distributed/
+  coordinator/          # viitor
+  expert_worker/        # viitor
+  protocol/             # viitor
+```
+
+Expertul trebuie să poată deveni ulterior o resursă locală sau remote prin
+aceeași interfață conceptuală. Placement planner-ul viitor va putea alege:
+
+- expert pe GPU local;
+- expert în RAM local;
+- expert pe SSD local;
+- expert pe un worker Mac/PC;
+- replică hot pe mai multe noduri.
+
+### P7 — backend macOS/Metal pe MacBook Air M4
+
+MacBook Air-ul curent a fost inventariat:
+
+- Apple M4, 10 nuclee;
+- 24 GB unified memory;
+- două porturi Thunderbolt/USB4 de până la 40 Gb/s;
+- interfața Thunderbolt Bridge este deja prezentă.
+
+Arhitectura curentă Windows/IOCP/CUDA nu rulează direct pe această mașină. După
+P6 adaptăm backend-urile, fără să schimbăm semantica Expert Pack, schedulerul sau
+modelul de request:
+
+- `Metal` înlocuiește backend-ul CUDA;
+- unified memory înlocuiește separarea strictă RAM/VRAM și multe copii H2D;
+- storage-ul macOS folosește citiri asincrone și mecanisme precum `F_NOCACHE`,
+  nu `O_DIRECT`/IOCP;
+- planner-ul rezervă explicit memorie pentru macOS, Metal, KV, runtime și
+  staging înainte de expert cache;
+- cache residency rămâne explicită chiar dacă CPU și GPU împart memoria fizică.
+
+Avantaje M4 Air:
+
+- CPU și GPU folosesc unified memory;
+- experții rezidenți pot fi consumați de Metal fără traseul PCIe al unui GPU
+  discret;
+- SSD intern și Thunderbolt Bridge pot deveni tier-uri utile;
+- consum energetic redus;
+- poate deveni coordinator pentru un cluster mic de expert workers.
+
+Dezavantaje și limite:
+
+- cei 24 GB sunt împărțiți cu macOS și GPU; nu presupunem automat 20 GB liberi;
+- MacBook Air este fanless și poate reduce frecvența sub sarcină susținută;
+- este necesar un backend Metal/grouped MoE separat;
+- macOS nu oferă `O_DIRECT`;
+- unified memory locală nu include memoria altui Mac;
+- backend-ul Metal nu intră în critical path-ul P0–P6.
+
+Poarta P7 se stabilește după P6: același manifest logic și aceeași semantică a
+modelului cuantizat trebuie să ruleze pe Metal, cu memory pressure și metrici de
+residency controlate.
+
+### P8 — două Mac-uri sau alt PC ca expert workers
+
+Nu obținem „RAM comun” transparent. macOS nu poate face memoria celuilalt Mac să
+apară ca RAM local. Construim execuție distribuită la nivel de aplicație și
+mutăm calculul către calculatorul care deține expertul.
+
+MacBook Pro-ul 2019 nu a răspuns la ultimul inventar SSH. Înainte de P8 trebuie
+confirmate modelul exact, RAM-ul, GPU-ul, SSD-ul, porturile și performanța lui.
+Estimarea de 40–48 GB utili combinați este doar condițională dacă Pro are 32 GB;
+din memoria fizică a ambelor sisteme se scad macOS, KV cache, runtime, Metal/GPU,
+staging și network buffers.
+
+Apple suportă oficial IP over Thunderbolt între două Mac-uri prin
+[Thunderbolt Bridge](https://support.apple.com/en-in/guide/mac-help/mchld53dd2f5/mac).
+Cablul trebuie să fie Thunderbolt 3/4 real, nu doar un cablu USB-C de încărcare.
+Throughput-ul IP util nu este dedus din link-ul fizic de 40 Gb/s; îl calificăm cu
+`iperf3` înainte de folosire.
+
+Cele trei variante sunt:
+
+| Variantă | Verdict |
+|---|---|
+| Air citește weights din RAM-ul Pro prin rețea | Slabă |
+| Air trimite activarea, Pro calculează expertul și întoarce rezultatul | Promițătoare |
+| Fiecare Mac ține shard-uri în RAM/SSD și calculează local | Calea corectă |
+
+Gigabit Ethernet are maximum teoretic 125 MB/s și nu depășește SSD-ul SATA de
+aproximativ 560 MB/s dacă transferăm weights. Rețeaua este folosită pentru
+activări și rezultate mici, nu ca un cablu de memorie pentru payload-urile
+experților.
+
+Arhitectura viitoare:
+
+```text
+MacBook Air M4 — coordinator
+  dense + attention + router
+              |
+              | activation + expert IDs + routing weights
+              v
+Thunderbolt Bridge / TCP persistent
+              |
+MacBook Pro sau alt PC — expert worker
+  weights locale în RAM/SSD/device cache
+  gate + up + down local
+              |
+              | partial expert outputs
+              v
+MacBook Air — weighted aggregation exactă
+```
+
+Nu trimitem sutele de MB de weights la fiecare token. Trimitem:
+
+- hidden activations;
+- layer și expert IDs;
+- routing weights;
+- rezultatele parțiale ale experților.
+
+Pentru OLMoE, hidden size 2048 înseamnă aproximativ 4 KB pentru o activare FP16.
+Request + rezultat sunt aproximativ 8–12 KB/strat, față de aproximativ 50 MB de
+weights pentru cei opt experți activi ai unui strat. La 16 straturi și 30 tok/s,
+un request + partial output de 8 KB/strat înseamnă aproximativ 3,84 MB/s. Chiar
+Gigabit poate susține bandwidth-ul activărilor; latența RPC și compute-ul
+worker-ului devin limitele principale.
+
+Câștigurile urmărite:
+
+- RAM utilizabilă combinată la nivel de runtime, nu adresare comună;
+- două SSD-uri și două dispozitive compute folosite în paralel;
+- weights rămân lângă compute-ul care le consumă;
+- hot experts pot fi replicați, iar long tail-ul împărțit între noduri;
+- request-uri diferite pot folosi simultan noduri diferite.
+
+Single-stream poate pierde din cauza unui round-trip per strat și a unui worker
+lent. Beneficiul principal este capacity și throughput aggregate: cât timp un
+request așteaptă un expert remote, schedulerul poate executa request-uri gata pe
+M4, pe worker sau din SSD. MacBook Pro devine worker numai dacă remote compute
+măsurat bate cold SSD load + compute local; altfel nu intră în placement activ.
+
+### Expert RPC v0 (working name)
+
+Protocolul nostru distribuit poate deveni un diferențiator, dar nu inventăm
+transport, reliability sau crypto. Versiunea inițială folosește TCP persistent
+peste Thunderbolt Bridge. TLS/mTLS devine obligatoriu când traficul părăsește
+cablul direct; QUIC este considerat numai dacă multiple streams și recovery îl
+justifică.
+
+Protocolul are două planuri logice:
+
+- **control plane**, folosit pentru handshake, model registration,
+  manifest/hash validation, inventar, placement, cache status, health,
+  cancellation și shutdown;
+- **data plane**, folosit pentru activation batches, layer/expert IDs, routing
+  weights, rezultate și timing. Control plane-ul nu trebuie să blocheze data
+  plane-ul.
+
+Handshake-ul negociază explicit:
+
+- protocol version și endianness;
+- model manifest hash și quant/kernel ABI;
+- dtypes și hidden/intermediate dimensions;
+- maximum batch rows;
+- RAM, GPU/unified-memory și storage disponibile;
+- kernel layouts și aggregation modes suportate;
+- compression capabilities.
+
+Manifest sau ABI mismatch închid conexiunea înainte de execuție. Nu interpretăm
+aproximativ un record necunoscut.
+
+Mesajele v0 prevăzute sunt:
+
+```text
+HELLO
+WELCOME
+REGISTER_MODEL
+MODEL_READY
+PLACEMENT_UPDATE
+EXEC_BATCH
+EXEC_RESULT
+CACHE_STATUS
+CANCEL
+CREDIT_UPDATE
+HEARTBEAT
+ERROR
+DRAIN
+SHUTDOWN
+```
+
+`EXEC_BATCH` conține mai multe request-uri/experți, nu câte un RPC per expert:
+
+```text
+model_handle
+operation_id
+layer_id
+row_count
+hidden_size
+activation_dtype
+output_dtype
+aggregation_mode
+
+activations[row_count, hidden_size]
+
+selection entries:
+  row_id
+  expert_id
+  routing_weight
+```
+
+Coordinatorul grupează toate activările care cer același expert. Worker-ul
+returnează `EXEC_RESULT` într-unul dintre două moduri negociate explicit:
+
+1. `PER_EXPERT_STRICT`: fiecare ieșire expert este returnată separat, iar
+   coordinatorul o agregă într-o ordine stabilă; acesta este modul de verificare;
+2. `WEIGHTED_PARTIAL`: worker-ul aplică routing weights și returnează un vector
+   parțial per row; devine mod production numai după validare.
+
+Modul de agregare nu se schimbă automat.
+
+Framing-ul binar folosește un header fix, versionat, de ordinul a 64 bytes:
+
+```text
+magic
+protocol_version
+message_type
+flags
+header_bytes
+payload_bytes
+connection_epoch
+operation_id
+request_id
+sequence_number
+payload_checksum
+```
+
+Toate dimensiunile și limitele sunt validate înainte de alocare. JSON nu intră
+în hot path; poate fi folosit numai pentru diagnostic și dump-uri.
+
+Flow control este bazat pe credits publicate de worker:
+
+```text
+available_queue_slots
+available_staging_bytes
+available_compute_rows
+available_cache_bytes
+```
+
+`EXEC_BATCH` consumă credits, iar `EXEC_RESULT` sau anularea le restituie. Astfel
+prevenim OOM, cozi nelimitate, suprascrierea bufferelor și congestion collapse.
+
+Failure semantics sunt fail-closed:
+
+- fiecare operație are `operation_id` unic și `connection_epoch`;
+- worker-ul detectează duplicatele și retry-ul nu dublează rezultatul;
+- la disconnect, experții neconfirmați sunt marcați incomplete;
+- coordinatorul poate reexecuta local sau pe o replică;
+- fără replică validă request-ul eșuează explicit;
+- nu omitem expertul și nu continuăm cu top-k incomplet;
+- cancellation eliberează work items, credits și references.
+
+Placement-ul distribuit păstrează harta:
+
+```text
+(layer, expert) ->
+  local_vram
+  local_ram
+  local_ssd
+  worker_1_ram
+  worker_1_ssd
+  worker_2_ram
+  replica_set
+```
+
+Decizia folosește capacity, compute throughput, network latency, cache heat,
+load curent și replici disponibile.
+
+Primul vertical slice P8 este unul real, nu un mock:
+
+1. MacBook Air rulează routerul unui strat;
+2. trimite activarea și expert IDs;
+3. worker-ul încarcă experții locali și calculează gate/up/down;
+4. întoarce ieșirile per expert;
+5. Air agregă rezultatele;
+6. stratul distribuit este verificat față de aceeași execuție locală;
+7. apoi extindem la toate straturile și batching.
+
+Cheia fazei distribuite este:
+
+> Nu unim RAM-ul calculatoarelor. Mutăm calculul către calculatorul care deține
+> expertul.
+
+## 6. Ce nu facem în această ramură
 
 - nu facem un fork-feature race cu Colibri sau llama.cpp;
 - nu facem benchmark în trei runtime-uri ca obiectiv de proiect;
@@ -527,27 +845,31 @@ Poarta finală:
 - nu introducem route prediction înainte de traces care arată un beneficiu net;
 - nu optimizăm CPU-only pentru ținta de 10–30 tok/s; RTX 3090 este backend-ul
   compute inițial;
+- nu implementăm încă Metal, Expert RPC sau multi-node; acestea sunt P7/P8 după
+  demonstrația Windows/CUDA P6;
 - nu descărcăm încă un model mare înainte ca P0 să poată demonstra fezabilitatea;
 - nu declarăm production pe baza unui prompt scurt sau doar a mediei tok/s.
 
-## 6. Ordinea exactă pentru următoarea sesiune
+## 7. Ordinea exactă pentru următoarea sesiune
 
 1. recitim acest plan și `RESULTS.md`; nu redeschidem experimentele închise;
-2. creăm specificația `qmoe-format-v1` și schema manifestului;
+2. creăm specificația `expert-pack-v1` și schema manifestului;
 3. fixăm ABI-ul recordului expert: header, alignment, fused gate+up, down, scales,
    checksum și quant profile;
 4. creăm skeleton-ul `compiler/` și `runtime/` cu CMake/build Windows;
 5. implementăm calculatorul de fezabilitate și extindem inventarul hardware;
 6. inventariem checkpoint-urile locale numai prin config/headere și selectăm
    primul adaptor după criteriile P1;
-7. implementăm writer/index/checksum/resume pentru QMOE;
+7. implementăm writer/index/checksum/resume pentru Expert Pack;
 8. abia după un container valid începem `storage/` IOCP și cache state machine;
 9. CUDA grouped MoE și schedulerul vin după ce ABI-ul și lifecycle-ul experților
    sunt stabile;
 10. serverul vine după execuția exactă și bugetată, nu înainte.
 
 Deciziile deja fixate pentru sesiunea următoare sunt: runtime propriu,
-Windows+CUDA/RTX3090 prima platformă, QMOE compute-ready, semantică exactă,
+Windows+CUDA/RTX3090 prima platformă, Expert Pack compute-ready, semantică exactă,
 cache global în bytes, I/O asincron, grouped MoE cross-request și production
-admission/backpressure. Alegerea primului model mare și profilul final INT4/INT8
-rămân deschise până când calculatorul P0 le poate valida numeric.
+admission/backpressure. macOS/Metal și Expert RPC rămân faze viitoare P7/P8;
+core-ul nu trebuie cuplat ireversibil la Windows/CUDA. Alegerea primului model
+mare și profilul final INT4/INT8 rămân deschise până când calculatorul P0 le
+poate valida numeric.
