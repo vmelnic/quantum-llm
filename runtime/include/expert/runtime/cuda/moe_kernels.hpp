@@ -24,10 +24,29 @@ struct MoeLaunch final {
   void* stream{};         // cudaStream_t without leaking CUDA headers.
 };
 
+struct MoeBatchLaunch final {
+  const float* input{};                 // [rows, hidden]
+  const std::int8_t* const* gate_up_weights{};
+  const float* const* gate_up_scales{};
+  const std::int8_t* const* down_weights{};
+  const float* const* down_scales{};
+  const float* routing_weights{};       // [rows, top_k]
+  const std::uint32_t* expert_indices{};  // [rows, top_k]
+  float* intermediate{};                // [rows, top_k, intermediate]
+  float* output{};                      // [rows, hidden]
+  std::uint32_t rows{};
+  std::uint32_t hidden_size{};
+  std::uint32_t intermediate_size{};
+  std::uint32_t top_k{};
+  std::uint32_t expert_table_size{};
+  void* stream{};
+};
+
 // Exact Expert Pack INT8-per-row decode path. The first launch computes fused
 // gate/up/SiLU for every selected expert. The second computes down projections
 // and accumulates experts in routing order, avoiding atomics and preserving a
 // deterministic numeric order.
 [[nodiscard]] Status launch_moe_single_token(const MoeLaunch& launch) noexcept;
+[[nodiscard]] Status launch_moe_batch(const MoeBatchLaunch& launch) noexcept;
 
 }  // namespace expert::runtime::cuda

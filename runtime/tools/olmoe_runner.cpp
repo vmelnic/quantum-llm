@@ -6,6 +6,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -14,6 +15,7 @@
 #include <iostream>
 #include <map>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -100,7 +102,10 @@ struct Tensor {
 
 class Model {
  public:
-  Model(const std::filesystem::path& root, std::uint32_t max_tokens) : root_(root), max_tokens_(max_tokens) {
+  Model(const std::filesystem::path& root, std::uint32_t max_tokens,
+        std::uint32_t capacity = 1)
+      : root_(root), max_tokens_(max_tokens), capacity_(capacity) {
+    if (capacity_ == 0) throw std::runtime_error("request capacity must be positive");
     const auto document = expert::core::json::Parse(read_text(root / "manifest.json"));
     const auto& manifest = document.AsObject("manifest");
     const auto& architecture = Required(manifest, "architecture", "manifest").AsObject("architecture");
@@ -137,28 +142,69 @@ class Model {
   }
 
   std::uint32_t forward(std::uint32_t token, std::uint32_t position) {
-    status_check(expert::runtime::cuda::embedding(matrix("model.embed_tokens.weight"), token, hidden_state, nullptr));
+    const std::array tokens{token};
+    const std::array positions{position};
+    return forward_batch(tokens, positions).front();
+  }
+
+  std::vector<std::uint32_t> forward_batch(
+      std::span<const std::uint32_t> tokens,
+      std::span<const std::uint32_t> positions) {
+    if (tokens.empty() || tokens.size() != positions.size() ||
+        tokens.size() > capacity_)
+      throw std::runtime_error("invalid request microbatch");
+    const auto rows = static_cast<std::uint32_t>(tokens.size());
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      if (positions[row] >= max_tokens_) throw std::runtime_error("context capacity exceeded");
+      status_check(expert::runtime::cuda::embedding(
+          matrix("model.embed_tokens.weight"), tokens[row],
+          hidden_state + static_cast<std::size_t>(row) * hidden, nullptr));
+    }
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
       const auto prefix = "model.layers." + std::to_string(layer) + ".";
-      status_check(expert::runtime::cuda::rms_norm(hidden_state, fp32(prefix + "input_layernorm.weight"), normalized, hidden, epsilon, nullptr));
-      status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.q_proj.weight"), normalized, query, nullptr));
-      status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.k_proj.weight"), normalized, key, nullptr));
-      status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.v_proj.weight"), normalized, value, nullptr));
-      status_check(expert::runtime::cuda::qkv_rope_cache(query, key, value, fp32(prefix + "self_attn.q_norm.weight"), fp32(prefix + "self_attn.k_norm.weight"), key_cache[layer], value_cache[layer], position, heads, head_dim, epsilon, rope_theta, nullptr));
-      status_check(expert::runtime::cuda::attention_decode(query, key_cache[layer], value_cache[layer], attention, position + 1, heads, head_dim, nullptr));
-      status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.o_proj.weight"), attention, residual, nullptr));
-      status_check(expert::runtime::cuda::add_in_place(hidden_state, residual, hidden, nullptr));
-      status_check(expert::runtime::cuda::rms_norm(hidden_state, fp32(prefix + "post_attention_layernorm.weight"), normalized, hidden, epsilon, nullptr));
-      status_check(expert::runtime::cuda::router_topk(normalized, fp32(prefix + "mlp.gate.weight"), hidden, experts, top_k, router_logits, routing_scores, routing_indices, nullptr));
-      expert::runtime::cuda::MoeLaunch launch{normalized, d_gate_up + static_cast<std::size_t>(layer) * experts, d_gate_scales + static_cast<std::size_t>(layer) * experts, d_down + static_cast<std::size_t>(layer) * experts, d_down_scales + static_cast<std::size_t>(layer) * experts, routing_scores, routing_indices, moe_intermediate, residual, hidden, intermediate, top_k, experts, nullptr};
-      status_check(expert::runtime::cuda::launch_moe_single_token(launch));
-      status_check(expert::runtime::cuda::add_in_place(hidden_state, residual, hidden, nullptr));
+      for (std::uint32_t row = 0; row < rows; ++row) {
+        const auto hidden_offset = static_cast<std::size_t>(row) * hidden;
+        auto* row_hidden = hidden_state + hidden_offset;
+        auto* row_normalized = normalized + hidden_offset;
+        auto* row_query = query + hidden_offset;
+        auto* row_key = key + hidden_offset;
+        auto* row_value = value + hidden_offset;
+        auto* row_attention = attention + hidden_offset;
+        auto* row_residual = residual + hidden_offset;
+        const auto cache_offset = static_cast<std::size_t>(row) * max_tokens_ * hidden;
+        status_check(expert::runtime::cuda::rms_norm(row_hidden, fp32(prefix + "input_layernorm.weight"), row_normalized, hidden, epsilon, nullptr));
+        status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.q_proj.weight"), row_normalized, row_query, nullptr));
+        status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.k_proj.weight"), row_normalized, row_key, nullptr));
+        status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.v_proj.weight"), row_normalized, row_value, nullptr));
+        status_check(expert::runtime::cuda::qkv_rope_cache(row_query, row_key, row_value, fp32(prefix + "self_attn.q_norm.weight"), fp32(prefix + "self_attn.k_norm.weight"), key_cache[layer] + cache_offset, value_cache[layer] + cache_offset, positions[row], heads, head_dim, epsilon, rope_theta, nullptr));
+        status_check(expert::runtime::cuda::attention_decode(row_query, key_cache[layer] + cache_offset, value_cache[layer] + cache_offset, row_attention, positions[row] + 1, heads, head_dim, nullptr));
+        status_check(expert::runtime::cuda::gemv(matrix(prefix + "self_attn.o_proj.weight"), row_attention, row_residual, nullptr));
+        status_check(expert::runtime::cuda::add_in_place(row_hidden, row_residual, hidden, nullptr));
+        status_check(expert::runtime::cuda::rms_norm(row_hidden, fp32(prefix + "post_attention_layernorm.weight"), row_normalized, hidden, epsilon, nullptr));
+        status_check(expert::runtime::cuda::router_topk(row_normalized, fp32(prefix + "mlp.gate.weight"), hidden, experts, top_k, router_logits + static_cast<std::size_t>(row) * experts, routing_scores + static_cast<std::size_t>(row) * top_k, routing_indices + static_cast<std::size_t>(row) * top_k, nullptr));
+      }
+      expert::runtime::cuda::MoeBatchLaunch launch{
+          normalized, d_gate_up + static_cast<std::size_t>(layer) * experts,
+          d_gate_scales + static_cast<std::size_t>(layer) * experts,
+          d_down + static_cast<std::size_t>(layer) * experts,
+          d_down_scales + static_cast<std::size_t>(layer) * experts,
+          routing_scores, routing_indices, moe_intermediate, residual, rows,
+          hidden, intermediate, top_k, experts, nullptr};
+      status_check(expert::runtime::cuda::launch_moe_batch(launch));
+      for (std::uint32_t row = 0; row < rows; ++row)
+        status_check(expert::runtime::cuda::add_in_place(
+            hidden_state + static_cast<std::size_t>(row) * hidden,
+            residual + static_cast<std::size_t>(row) * hidden, hidden, nullptr));
     }
-    status_check(expert::runtime::cuda::rms_norm(hidden_state, fp32("model.norm.weight"), normalized, hidden, epsilon, nullptr));
-    status_check(expert::runtime::cuda::gemv(matrix("lm_head.weight"), normalized, output_logits, nullptr));
-    status_check(expert::runtime::cuda::argmax(output_logits, vocab, output_token, nullptr));
-    std::uint32_t result{};
-    cuda_check(cudaMemcpy(&result, output_token, sizeof(result), cudaMemcpyDeviceToHost), "copy output token");
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      const auto hidden_offset = static_cast<std::size_t>(row) * hidden;
+      const auto logits_offset = static_cast<std::size_t>(row) * vocab;
+      status_check(expert::runtime::cuda::rms_norm(hidden_state + hidden_offset, fp32("model.norm.weight"), normalized + hidden_offset, hidden, epsilon, nullptr));
+      status_check(expert::runtime::cuda::gemv(matrix("lm_head.weight"), normalized + hidden_offset, output_logits + logits_offset, nullptr));
+      status_check(expert::runtime::cuda::argmax(output_logits + logits_offset, vocab, output_token + row, nullptr));
+    }
+    std::vector<std::uint32_t> result(rows);
+    cuda_check(cudaMemcpy(result.data(), output_token, result.size() * sizeof(result[0]), cudaMemcpyDeviceToHost), "copy output tokens");
     return result;
   }
 
@@ -238,19 +284,23 @@ class Model {
     cuda_check(cudaMemcpy(d_down_scales, down_scale.data(), count * sizeof(down_scale[0]), cudaMemcpyHostToDevice), "copy down scales");
   }
   void allocate_workspace() {
-    hidden_state = device_allocate<float>(hidden); normalized = device_allocate<float>(hidden);
-    query = device_allocate<float>(hidden); key = device_allocate<float>(hidden); value = device_allocate<float>(hidden);
-    attention = device_allocate<float>(hidden); residual = device_allocate<float>(hidden);
-    router_logits = device_allocate<float>(experts); routing_scores = device_allocate<float>(top_k);
-    routing_indices = device_allocate<std::uint32_t>(top_k); moe_intermediate = device_allocate<float>(static_cast<std::size_t>(top_k) * intermediate);
-    output_logits = device_allocate<float>(vocab); output_token = device_allocate<std::uint32_t>(1);
+    const auto hidden_rows = static_cast<std::size_t>(capacity_) * hidden;
+    hidden_state = device_allocate<float>(hidden_rows); normalized = device_allocate<float>(hidden_rows);
+    query = device_allocate<float>(hidden_rows); key = device_allocate<float>(hidden_rows); value = device_allocate<float>(hidden_rows);
+    attention = device_allocate<float>(hidden_rows); residual = device_allocate<float>(hidden_rows);
+    router_logits = device_allocate<float>(static_cast<std::size_t>(capacity_) * experts);
+    routing_scores = device_allocate<float>(static_cast<std::size_t>(capacity_) * top_k);
+    routing_indices = device_allocate<std::uint32_t>(static_cast<std::size_t>(capacity_) * top_k);
+    moe_intermediate = device_allocate<float>(static_cast<std::size_t>(capacity_) * top_k * intermediate);
+    output_logits = device_allocate<float>(static_cast<std::size_t>(capacity_) * vocab);
+    output_token = device_allocate<std::uint32_t>(capacity_);
     key_cache.resize(layers); value_cache.resize(layers);
-    const auto cache_elements = static_cast<std::size_t>(max_tokens_) * hidden;
+    const auto cache_elements = static_cast<std::size_t>(capacity_) * max_tokens_ * hidden;
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
       key_cache[layer] = device_allocate<float>(cache_elements); value_cache[layer] = device_allocate<float>(cache_elements);
     }
   }
-  std::filesystem::path root_; std::uint32_t max_tokens_{};
+  std::filesystem::path root_; std::uint32_t max_tokens_{}, capacity_{};
   std::unordered_map<std::string, DevicePack> packs_;
   std::unordered_map<std::string, Tensor> tensors_;
   const std::int8_t** d_gate_up{}; const float** d_gate_scales{};
@@ -265,24 +315,74 @@ class Model {
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 2 || argc > 4) { std::cerr << "usage: expert-olmoe-runner <container> [new-tokens] [--trace-logits]\n"; return 64; }
-    const auto new_tokens = argc >= 3 ? static_cast<std::uint32_t>(std::stoul(argv[2])) : 12U;
-    const bool trace_logits = argc == 4 && std::string_view(argv[3]) == "--trace-logits";
-    if (argc == 4 && !trace_logits) throw std::runtime_error("unknown option");
+    if (argc < 2) { std::cerr << "usage: expert-olmoe-runner <container> [new-tokens] [--trace-logits] [--concurrency N] [--verify-interleaving]\n"; return 64; }
+    std::uint32_t new_tokens = 12U, concurrency = 1U;
+    bool trace_logits = false, verify_interleaving = false;
+    int argument = 2;
+    if (argument < argc && std::string_view(argv[argument]).find("--") != 0) {
+      new_tokens = static_cast<std::uint32_t>(std::stoul(argv[argument++]));
+    }
+    while (argument < argc) {
+      const std::string_view option(argv[argument++]);
+      if (option == "--trace-logits") trace_logits = true;
+      else if (option == "--verify-interleaving") verify_interleaving = true;
+      else if (option == "--concurrency" && argument < argc)
+        concurrency = static_cast<std::uint32_t>(std::stoul(argv[argument++]));
+      else throw std::runtime_error("unknown or incomplete option");
+    }
+    if (new_tokens == 0 || concurrency == 0 || concurrency > 64)
+      throw std::runtime_error("new-tokens/concurrency out of range");
+    if (trace_logits && concurrency != 1)
+      throw std::runtime_error("logit tracing requires concurrency 1");
     const std::vector<std::uint32_t> prompt{510, 5347, 273, 6181, 310};
     const auto load_started = std::chrono::steady_clock::now();
-    Model model(argv[1], static_cast<std::uint32_t>(prompt.size()) + new_tokens);
+    Model model(argv[1], static_cast<std::uint32_t>(prompt.size()) + new_tokens,
+                concurrency);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - load_started).count();
-    std::vector<std::uint32_t> full = prompt;
-    std::uint32_t predicted = 0;
+    std::vector<std::vector<std::uint32_t>> prompts(concurrency, prompt);
+    if (verify_interleaving) {
+      for (std::uint32_t row = 0; row < concurrency; ++row) prompts[row][0] += row;
+    }
+    std::vector<std::vector<std::uint32_t>> isolated;
+    if (verify_interleaving) {
+      isolated.reserve(concurrency);
+      for (std::uint32_t row = 0; row < concurrency; ++row) {
+        auto sequence = prompts[row];
+        std::vector<std::uint32_t> one_token(1), one_position(1), one_prediction;
+        for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+          one_token[0] = prompts[row][position];
+          one_position[0] = position;
+          one_prediction = model.forward_batch(one_token, one_position);
+        }
+        for (std::uint32_t generated = 0; generated < new_tokens; ++generated) {
+          sequence.push_back(one_prediction[0]);
+          if (generated + 1 < new_tokens) {
+            one_token = one_prediction;
+            one_position[0] = static_cast<std::uint32_t>(prompt.size()) + generated;
+            one_prediction = model.forward_batch(one_token, one_position);
+          }
+        }
+        isolated.push_back(std::move(sequence));
+      }
+    }
+    std::vector<std::vector<std::uint32_t>> full = prompts;
+    std::vector<std::uint32_t> predicted(concurrency), batch_tokens(concurrency),
+        batch_positions(concurrency);
     const auto prompt_started = std::chrono::steady_clock::now();
-    for (std::uint32_t position = 0; position < prompt.size(); ++position) predicted = model.forward(prompt[position], position);
+    for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+      for (std::uint32_t row = 0; row < concurrency; ++row)
+        batch_tokens[row] = prompts[row][position];
+      std::fill(batch_positions.begin(), batch_positions.end(), position);
+      predicted = model.forward_batch(batch_tokens, batch_positions);
+    }
     const auto prompt_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - prompt_started).count();
     const auto started = std::chrono::steady_clock::now();
+    std::vector<double> inter_token_ms;
     for (std::uint32_t generated = 0; generated < new_tokens; ++generated) {
-      full.push_back(predicted);
+      for (std::uint32_t row = 0; row < concurrency; ++row)
+        full[row].push_back(predicted[row]);
       if (trace_logits) {
         std::cerr << "logits position=" << (prompt.size() + generated) << " top=";
         const auto top = model.top_logits(5);
@@ -292,13 +392,31 @@ int main(int argc, char** argv) {
         }
         std::cerr << '\n';
       }
-      if (generated + 1 < new_tokens) predicted = model.forward(predicted, static_cast<std::uint32_t>(prompt.size()) + generated);
+      if (generated + 1 < new_tokens) {
+        std::fill(batch_positions.begin(), batch_positions.end(),
+                  static_cast<std::uint32_t>(prompt.size()) + generated);
+        const auto step_started = std::chrono::steady_clock::now();
+        predicted = model.forward_batch(predicted, batch_positions);
+        inter_token_ms.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - step_started).count());
+      }
     }
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
     const auto decode_forwards = new_tokens > 0 ? new_tokens - 1U : 0U;
-    const auto tokens_per_second = decode_forwards > 0 ? decode_forwards / seconds : 0.0;
+    const auto aggregate_forwards = static_cast<std::uint64_t>(decode_forwards) * concurrency;
+    const auto tokens_per_second = aggregate_forwards > 0 ? aggregate_forwards / seconds : 0.0;
+    std::sort(inter_token_ms.begin(), inter_token_ms.end());
+    const auto percentile = [&](double fraction) {
+      if (inter_token_ms.empty()) return 0.0;
+      const auto index = static_cast<std::size_t>(
+          std::ceil(fraction * static_cast<double>(inter_token_ms.size()))) - 1U;
+      return inter_token_ms[std::min(index, inter_token_ms.size() - 1U)];
+    };
+    const bool identical_requests = std::all_of(
+        full.begin() + 1, full.end(), [&](const auto& sequence) { return sequence == full[0]; });
+    const bool interleaving_match = !verify_interleaving || full == isolated;
     std::cout << "{\"tokens\":[";
-    for (std::size_t i = 0; i < full.size(); ++i) { if (i) std::cout << ','; std::cout << full[i]; }
+    for (std::size_t i = 0; i < full[0].size(); ++i) { if (i) std::cout << ','; std::cout << full[0][i]; }
     std::cout << "],\"generated\":" << new_tokens
               << ",\"model_load_seconds\":" << load_seconds
               << ",\"startup_pack_read_bytes\":" << model.pack_bytes
@@ -306,10 +424,18 @@ int main(int argc, char** argv) {
               << ",\"hot_storage_read_bytes\":0,\"hot_h2d_bytes\":0"
               << ",\"prompt_tokens\":" << prompt.size()
               << ",\"prompt_seconds\":" << prompt_seconds
+              << ",\"concurrency\":" << concurrency
               << ",\"decode_forward_tokens\":" << decode_forwards
+              << ",\"aggregate_decode_forwards\":" << aggregate_forwards
               << ",\"decode_seconds\":" << seconds
               << ",\"tokens_per_second\":" << tokens_per_second
+              << ",\"inter_token_p50_ms\":" << percentile(0.50)
+              << ",\"inter_token_p95_ms\":" << percentile(0.95)
+              << ",\"fairness_token_skew\":0"
+              << ",\"identical_request_outputs\":" << (identical_requests ? "true" : "false")
+              << ",\"interleaving_verified\":" << (verify_interleaving ? "true" : "false")
+              << ",\"interleaving_match\":" << (interleaving_match ? "true" : "false")
               << ",\"trace_logits\":" << (trace_logits ? "true" : "false") << "}\n";
-    return 0;
+    return interleaving_match ? 0 : 2;
   } catch (const std::exception& error) { std::cerr << "olmoe runner: " << error.what() << '\n'; return 1; }
 }

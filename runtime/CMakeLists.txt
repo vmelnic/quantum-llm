@@ -12,6 +12,7 @@ add_library(expert_runtime STATIC
   src/cache_state.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
+  src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp
 )

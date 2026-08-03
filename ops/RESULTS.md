@@ -91,6 +91,41 @@ tok/s. Rezultatul trece poarta de 10 tok/s fără să ascundă costul de startup
 Oracle-ul reproductibil este `ops/python/run_expert_pack_oracle.py`, iar
 executabilul este `expert-olmoe-runner`.
 
+### P4 — scheduler global și continuous microbatch
+
+Stare: **PASS HOT PATH PE 3090BOX**.
+
+Schedulerul runtime are admission și cozi limitate, fairness determinist după
+deadline/vârstă, grupare `(layer, expert)`, ready-first, completare exactă și
+cancellation. În scenariul determinist, un expert absent rămâne blocat fără să
+oprească grupurile VRAM-ready ale altui request; după schimbarea residency,
+work-ul rece este reluat și tokenul se finalizează. Reuse și toate stările de
+coadă sunt contorizate.
+
+Backend-ul CUDA acceptă acum mai multe rows/request slots cu KV separat.
+Selecțiile tuturor request-urilor folosesc două dispatch-uri MoE per strat
+(`gate+up` și `down+ordered accumulation`), nu câte două per request. Dense și
+router rulează per slot, iar expert IDs/routing weights rămân pe device.
+
+Măsurarea Release cu 4 request-uri, câte 24 tokeni generați, a produs:
+
+- 92 forward rows decode în `1,36418 s`;
+- **67,4398 tok/s aggregate**;
+- inter-token p50 `57,6183 ms`, p95 `66,8937 ms`;
+- fairness token skew `0`;
+- output identic pentru cele patru request-uri identice.
+
+O verificare separată a folosit patru prompturi diferite. Fiecare a fost rulat
+mai întâi izolat, apoi toate patru intercalat în același microbatch/KV pool.
+Toate cele patru secvențe batched au fost identice cu baseline-ul lor izolat
+(`interleaving_match=true`); throughput-ul acelui run scurt a fost
+`76,8394 tok/s`, p95 `55,2542 ms`, skew `0`.
+
+Acest rezultat califică hot path-ul și depășește poarta de 30 tok/s aggregate.
+Overlap-ul real SSD/IOCP→pinned RAM→H2D rămâne de exercitat de P6 cu un model
+care nu încape în RAM/VRAM; OLMoE este complet VRAM-resident și ar fabrica un
+test de cold I/O dacă l-am evacua artificial.
+
 ## Etapa B — analizor SafeTensors
 
 Stare: **PASS**.

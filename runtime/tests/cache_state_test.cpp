@@ -1,4 +1,5 @@
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
 
 #include <algorithm>
@@ -311,6 +312,53 @@ void test_state_machine_and_sha256() {
           "streaming SHA-256 finalize is not idempotent");
 }
 
+void test_ready_first_grouped_scheduler() {
+  er::ContinuousBatchScheduler scheduler({2, 4, 8});
+  require(scheduler.admit(1).ok() && scheduler.admit(2).ok(),
+          "scheduler admission failed");
+  require(!scheduler.admit(3).ok(), "scheduler ignored request capacity");
+  const std::array first_routes = {
+      er::RoutedExpert{7, 0.7F}, er::RoutedExpert{8, 0.2F}};
+  const std::array second_routes = {
+      er::RoutedExpert{7, 0.6F}, er::RoutedExpert{9, 0.3F}};
+  require(scheduler.enqueue({1, 4, 0, 3, 20, first_routes}).ok(),
+          "first token enqueue failed");
+  require(scheduler.enqueue({2, 9, 1, 3, 10, second_routes}).ok(),
+          "second token enqueue failed");
+  auto batch = scheduler.schedule([](std::uint32_t, std::uint32_t expert) {
+    return expert == 8 ? er::ExpertResidency::absent
+                       : er::ExpertResidency::vram_ready;
+  });
+  require(batch.ready_items == 3 && batch.blocked_items == 1 &&
+              batch.groups.size() == 2 && batch.unique_experts == 2,
+          "ready-first grouping counts are wrong");
+  require(batch.groups[0].expert == 7 && batch.groups[0].items.size() == 2 &&
+              batch.groups[0].items[0].request == 2,
+          "deadline fairness or expert reuse grouping is wrong");
+  std::vector<er::WorkId> completed;
+  for (const auto& group : batch.groups)
+    for (const auto& item : group.items) completed.push_back(item.work);
+  require(scheduler.complete(completed).ok(), "batch completion failed");
+  require(!scheduler.token_complete(1, 4) && scheduler.token_complete(2, 9),
+          "cold token blocked a ready token or completed too early");
+  scheduler.retire_token(2, 9);
+  batch = scheduler.schedule([](std::uint32_t, std::uint32_t) {
+    return er::ExpertResidency::vram_ready;
+  });
+  require(batch.ready_items == 1 && batch.groups[0].expert == 8,
+          "cold item did not resume after residency changed");
+  completed = {batch.groups[0].items[0].work};
+  require(scheduler.complete(completed).ok() && scheduler.token_complete(1, 4),
+          "resumed token did not complete");
+  scheduler.retire_token(1, 4);
+  scheduler.finish(1);
+  scheduler.cancel(2);
+  const auto snapshot = scheduler.snapshot();
+  require(snapshot.active_requests == 0 && snapshot.completed_tokens == 2 &&
+              snapshot.reused_items == 1 && snapshot.cancelled_requests == 1,
+          "scheduler accounting mismatch");
+}
+
 void test_concurrent_load_dedup_and_visibility() {
   Harness harness(8192, 2);
   const auto fixture = make_record(7);
@@ -456,6 +504,7 @@ void test_short_read_checksum_and_upload_fail_closed() {
 int main() {
   try {
     test_state_machine_and_sha256();
+    test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();
     test_short_read_checksum_and_upload_fail_closed();
