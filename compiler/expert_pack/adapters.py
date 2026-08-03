@@ -83,8 +83,11 @@ class OlmoeAdapter:
                     prefix + "self_attn.k_proj.weight": (kv_heads * head_dim, hidden),
                     prefix + "self_attn.v_proj.weight": (kv_heads * head_dim, hidden),
                     prefix + "self_attn.o_proj.weight": (hidden, hidden),
-                    prefix + "self_attn.q_norm.weight": (head_dim,),
-                    prefix + "self_attn.k_norm.weight": (head_dim,),
+                    # OLMoE applies q/k norms to the full projected hidden
+                    # vector; the checkpoint tensors are [hidden_size], not
+                    # one shared [head_dim] vector.
+                    prefix + "self_attn.q_norm.weight": (hidden,),
+                    prefix + "self_attn.k_norm.weight": (hidden,),
                     prefix + "mlp.gate.weight": (experts, hidden),
                 }
             )
@@ -188,4 +191,3 @@ def adapt_checkpoint(checkpoint: SafeTensorCheckpoint, adapter: str) -> AdaptedM
     except KeyError as error:
         raise AdapterError(f"unknown adapter {adapter!r}; supported: {sorted(ADAPTERS)}") from error
     return implementation.adapt(checkpoint)
-

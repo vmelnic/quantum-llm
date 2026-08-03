@@ -94,8 +94,8 @@ def _make_fixture(root: Path, unknown: bool = False) -> dict[str, list[float]]:
         "model.layers.0.self_attn.k_proj.weight": (2, 4),
         "model.layers.0.self_attn.v_proj.weight": (2, 4),
         "model.layers.0.self_attn.o_proj.weight": (4, 4),
-        "model.layers.0.self_attn.q_norm.weight": (2,),
-        "model.layers.0.self_attn.k_norm.weight": (2,),
+        "model.layers.0.self_attn.q_norm.weight": (4,),
+        "model.layers.0.self_attn.k_norm.weight": (4,),
         "model.layers.0.mlp.gate.weight": (2, 4),
     }
     for expert in range(2):
