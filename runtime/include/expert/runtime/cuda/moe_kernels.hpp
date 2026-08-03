@@ -14,11 +14,13 @@ struct MoeLaunch final {
   const std::int8_t* const* down_weights{};
   const float* const* down_scales{};
   const float* routing_weights{};
+  const std::uint32_t* expert_indices{};  // null means slots already selected.
   float* intermediate{};  // [top_k, intermediate_size]
   float* output{};        // [hidden_size]
   std::uint32_t hidden_size{};
   std::uint32_t intermediate_size{};
   std::uint32_t top_k{};
+  std::uint32_t expert_table_size{};  // top_k when expert_indices is null.
   void* stream{};         // cudaStream_t without leaking CUDA headers.
 };
 

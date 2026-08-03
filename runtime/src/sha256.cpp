@@ -1,5 +1,6 @@
 #include "expert/runtime/sha256.hpp"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstdint>
@@ -83,41 +84,67 @@ void transform(std::array<std::uint32_t, 8>& state,
 
 }  // namespace
 
-Sha256Digest sha256(std::span<const std::byte> input) noexcept {
-  std::array<std::uint32_t, 8> state = {
+Sha256::Sha256() noexcept
+    : state_({
       0x6a09e667U, 0xbb67ae85U, 0x3c6ef372U, 0xa54ff53aU,
-      0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U};
+      0x510e527fU, 0x9b05688cU, 0x1f83d9abU, 0x5be0cd19U}) {}
+
+void Sha256::update(std::span<const std::byte> input) noexcept {
+  if (finalized_ || input.empty()) return;
+  total_bytes_ += input.size();
   std::size_t cursor = 0;
-  while (input.size() - cursor >= 64) {
-    transform(state, input.data() + cursor);
-    cursor += 64;
-  }
-
-  std::array<std::byte, 128> tail{};
-  const auto remaining = input.size() - cursor;
-  if (remaining != 0) {
-    std::memcpy(tail.data(), input.data() + cursor, remaining);
-  }
-  tail[remaining] = std::byte{0x80};
-  const auto tail_bytes = remaining < 56 ? 64U : 128U;
-  const auto bit_length = static_cast<std::uint64_t>(input.size()) * 8U;
-  for (std::size_t index = 0; index < 8; ++index) {
-    tail[tail_bytes - 1U - index] =
-        static_cast<std::byte>((bit_length >> (index * 8U)) & 0xffU);
-  }
-  transform(state, tail.data());
-  if (tail_bytes == 128) {
-    transform(state, tail.data() + 64);
-  }
-
-  Sha256Digest digest{};
-  for (std::size_t word = 0; word < state.size(); ++word) {
-    for (std::size_t byte = 0; byte < 4; ++byte) {
-      digest[word * 4 + byte] = static_cast<std::byte>(
-          (state[word] >> (24U - static_cast<unsigned>(byte * 8U))) & 0xffU);
+  if (tail_bytes_ != 0) {
+    const auto count = std::min<std::size_t>(64U - tail_bytes_, input.size());
+    std::memcpy(tail_.data() + tail_bytes_, input.data(), count);
+    tail_bytes_ += count;
+    cursor += count;
+    if (tail_bytes_ == 64U) {
+      transform(state_, tail_.data());
+      tail_bytes_ = 0;
     }
   }
-  return digest;
+  while (input.size() - cursor >= 64U) {
+    transform(state_, input.data() + cursor);
+    cursor += 64U;
+  }
+  if (cursor < input.size()) {
+    tail_bytes_ = input.size() - cursor;
+    std::memcpy(tail_.data(), input.data() + cursor, tail_bytes_);
+  }
+}
+
+Sha256Digest Sha256::finalize() noexcept {
+  if (finalized_) return digest_;
+  std::array<std::byte, 128> tail{};
+  if (tail_bytes_ != 0) {
+    std::memcpy(tail.data(), tail_.data(), tail_bytes_);
+  }
+  tail[tail_bytes_] = std::byte{0x80};
+  const auto padded_bytes = tail_bytes_ < 56U ? 64U : 128U;
+  const auto bit_length = total_bytes_ * 8U;
+  for (std::size_t index = 0; index < 8; ++index) {
+    tail[padded_bytes - 1U - index] =
+        static_cast<std::byte>((bit_length >> (index * 8U)) & 0xffU);
+  }
+  transform(state_, tail.data());
+  if (padded_bytes == 128U) {
+    transform(state_, tail.data() + 64);
+  }
+
+  for (std::size_t word = 0; word < state_.size(); ++word) {
+    for (std::size_t byte = 0; byte < 4; ++byte) {
+      digest_[word * 4 + byte] = static_cast<std::byte>(
+          (state_[word] >> (24U - static_cast<unsigned>(byte * 8U))) & 0xffU);
+    }
+  }
+  finalized_ = true;
+  return digest_;
+}
+
+Sha256Digest sha256(std::span<const std::byte> input) noexcept {
+  Sha256 hasher;
+  hasher.update(input);
+  return hasher.finalize();
 }
 
 bool constant_time_equal(const Sha256Digest& left,
@@ -130,4 +157,3 @@ bool constant_time_equal(const Sha256Digest& left,
 }
 
 }  // namespace expert::runtime
-

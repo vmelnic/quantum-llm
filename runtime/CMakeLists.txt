@@ -44,7 +44,9 @@ endif()
 if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   enable_language(CUDA)
   find_package(CUDAToolkit 12.1 REQUIRED)
-  target_sources(expert_runtime PRIVATE src/cuda/moe_kernels.cu)
+  target_sources(expert_runtime PRIVATE
+    src/cuda/moe_kernels.cu
+    src/cuda/transformer_kernels.cu)
   target_compile_definitions(expert_runtime PUBLIC EXPERT_RUNTIME_HAS_CUDA_COMPUTE=1)
   target_compile_definitions(expert_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
@@ -58,6 +60,9 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   add_executable(expert-cuda-moe-smoke tools/cuda_moe_smoke.cpp)
   target_compile_features(expert-cuda-moe-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-cuda-moe-smoke PRIVATE expert_runtime CUDA::cudart)
+  add_executable(expert-olmoe-runner tools/olmoe_runner.cpp)
+  target_compile_features(expert-olmoe-runner PRIVATE cxx_std_20)
+  target_link_libraries(expert-olmoe-runner PRIVATE expert_runtime expert_core CUDA::cudart)
 endif()
 
 if(EXPERT_RUNTIME_BUILD_TESTS)

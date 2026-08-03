@@ -205,7 +205,7 @@ int main(int argc, char** argv) {
     cuda_check(cudaMemcpy(d_gate_scale_ptrs, gate_scale_ptrs.data(), top_k * sizeof(*d_gate_scale_ptrs), cudaMemcpyHostToDevice), "copy gate scale pointers");
     cuda_check(cudaMemcpy(d_down_scale_ptrs, down_scale_ptrs.data(), top_k * sizeof(*d_down_scale_ptrs), cudaMemcpyHostToDevice), "copy down scale pointers");
 
-    expert::runtime::cuda::MoeLaunch launch{d_input, d_gate_ptrs, d_gate_scale_ptrs, d_down_ptrs, d_down_scale_ptrs, d_routing, d_intermediate, d_output, hidden, width, top_k, nullptr};
+    expert::runtime::cuda::MoeLaunch launch{d_input, d_gate_ptrs, d_gate_scale_ptrs, d_down_ptrs, d_down_scale_ptrs, d_routing, nullptr, d_intermediate, d_output, hidden, width, top_k, top_k, nullptr};
     const auto status = expert::runtime::cuda::launch_moe_single_token(launch);
     if (!status.ok()) throw std::runtime_error(std::string(status.message()));
     cuda_check(cudaDeviceSynchronize(), "MoE synchronize");

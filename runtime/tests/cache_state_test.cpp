@@ -301,6 +301,14 @@ void test_state_machine_and_sha256() {
     require(std::to_integer<std::uint8_t>(digest[index]) == expected[index],
             "SHA-256 implementation mismatch");
   }
+  er::Sha256 streaming;
+  streaming.update(std::span<const std::byte>(input).first(1));
+  streaming.update(std::span<const std::byte>(input).subspan(1, 1));
+  streaming.update(std::span<const std::byte>(input).subspan(2));
+  require(er::constant_time_equal(digest, streaming.finalize()),
+          "streaming SHA-256 differs from one-shot digest");
+  require(er::constant_time_equal(digest, streaming.finalize()),
+          "streaming SHA-256 finalize is not idempotent");
 }
 
 void test_concurrent_load_dedup_and_visibility() {

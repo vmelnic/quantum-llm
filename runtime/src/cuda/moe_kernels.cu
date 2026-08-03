@@ -27,8 +27,9 @@ __device__ float block_sum(float value) {
 __global__ void gate_up_silu(
     const float* input, const std::int8_t* const* weights,
     const float* const* scales, float* intermediate, std::uint32_t hidden,
-    std::uint32_t width) {
-  const auto expert = static_cast<std::uint32_t>(blockIdx.y);
+    std::uint32_t width, const std::uint32_t* indices) {
+  const auto slot = static_cast<std::uint32_t>(blockIdx.y);
+  const auto expert = indices == nullptr ? slot : indices[slot];
   const auto row = static_cast<std::uint32_t>(blockIdx.x);
   if (row >= width) return;
 
@@ -51,7 +52,7 @@ __global__ void gate_up_silu(
     gate_sum *= expert_scales[row];
     up_sum *= expert_scales[width + row];
     const float silu = gate_sum / (1.0F + expf(-gate_sum));
-    intermediate[static_cast<std::size_t>(expert) * width + row] =
+    intermediate[static_cast<std::size_t>(slot) * width + row] =
         silu * up_sum;
   }
 }
@@ -59,14 +60,16 @@ __global__ void gate_up_silu(
 __global__ void down_weighted_ordered(
     const std::int8_t* const* weights, const float* const* scales,
     const float* routing, const float* intermediate, float* output,
-    std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k) {
+    std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k,
+    const std::uint32_t* indices) {
   const auto row = static_cast<std::uint32_t>(blockIdx.x);
   if (row >= hidden) return;
 
   float ordered_total = 0.0F;
   for (std::uint32_t expert = 0; expert < top_k; ++expert) {
+    const auto expert_id = indices == nullptr ? expert : indices[expert];
     const auto* matrix_row =
-        weights[expert] + static_cast<std::size_t>(row) * width;
+        weights[expert_id] + static_cast<std::size_t>(row) * width;
     const auto* activation =
         intermediate + static_cast<std::size_t>(expert) * width;
     float partial = 0.0F;
@@ -76,7 +79,7 @@ __global__ void down_weighted_ordered(
     }
     partial = block_sum(partial);
     if (threadIdx.x == 0) {
-      ordered_total += routing[expert] * partial * scales[expert][row];
+      ordered_total += routing[expert] * partial * scales[expert_id][row];
     }
     __syncthreads();
   }
@@ -97,21 +100,23 @@ Status launch_moe_single_token(const MoeLaunch& launch) noexcept {
       launch.down_scales == nullptr || launch.routing_weights == nullptr ||
       launch.intermediate == nullptr || launch.output == nullptr ||
       launch.hidden_size == 0 || launch.intermediate_size == 0 ||
-      launch.top_k == 0 || launch.top_k > 64) {
+      launch.top_k == 0 || launch.top_k > 64 ||
+      launch.expert_table_size < launch.top_k) {
     return Status(ErrorCode::invalid_argument, "invalid MoE CUDA launch");
   }
   auto stream = static_cast<cudaStream_t>(launch.stream);
   const dim3 gate_grid(launch.intermediate_size, launch.top_k);
   gate_up_silu<<<gate_grid, kThreads, 0, stream>>>(
       launch.input, launch.gate_up_weights, launch.gate_up_scales,
-      launch.intermediate, launch.hidden_size, launch.intermediate_size);
+      launch.intermediate, launch.hidden_size, launch.intermediate_size,
+      launch.expert_indices);
   auto status = cuda_status(cudaPeekAtLastError(), "gate_up_silu launch");
   if (!status.ok()) return status;
 
   down_weighted_ordered<<<launch.hidden_size, kThreads, 0, stream>>>(
       launch.down_weights, launch.down_scales, launch.routing_weights,
       launch.intermediate, launch.output, launch.hidden_size,
-      launch.intermediate_size, launch.top_k);
+      launch.intermediate_size, launch.top_k, launch.expert_indices);
   return cuda_status(cudaPeekAtLastError(), "down_weighted_ordered launch");
 }
 

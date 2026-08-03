@@ -51,6 +51,46 @@ Ultima valoare nu este raportată ca viteză de model: exclude dense, attention,
 router, KV, lm_head și orice miss/upload. Ea demonstrează că kernelul MoE hot
 nu consumă bugetul de 100 ms/token al porții single-stream de 10 tok/s.
 
+### P3 — inferență exactă end-to-end din Expert Pack
+
+Stare: **PASS PE 3090BOX, PROFIL INT8 EXPERT PACK**.
+
+Runtime-ul CUDA traversează integral modelul: embedding, RMSNorm, Q/K/V,
+normalizarea Q/K OLMoE pe vectorul proiectat complet, RoPE, KV persistent,
+attention, router softmax/top-8, experții fused, residual, norma finală,
+`lm_head` și argmax. Routerul și selecția experților rămân device-local.
+
+Corectitudinea a fost verificată cu un oracle NumPy independent care citește
+aceiași bytes Expert Pack, îi de-cuantizează conform ABI-ului și implementează
+separat forward-ul. Pentru promptul canonic, CUDA și oracle-ul au produs exact
+aceiași 12 tokeni:
+
+```text
+510,5347,273,6181,310,7785,15,187,187,510,3565,14731,273,6181,310,253,14029
+```
+
+Top-5 logits au coincis la precizia afișată, cu diferențe numai în ultimele
+zecimale. Secvența BF16/Colibri anterioară nu este oracle pentru acest profil:
+Colibri cuantizează numai experții, iar Expert Pack v1 cuantizează și matricile
+dense. Cele două trasee coincid în primele șase tokenuri generate; apoi Expert
+Pack alege `14731` cu logit `16,0087`, iar tokenul BF16 `3448` este al doilea cu
+`15,9676` (marjă `0,0411`).
+
+Măsurarea canonică Release, fără tracing, verifică SHA-256 al fiecărui pack la
+startup și raportează separat startup/prompt/decode:
+
+- 6.948.352.000 bytes citiți, verificați și copiați H2D la startup;
+- `26,8875 s` model load, inclusiv SHA-256 și H2D;
+- `0` bytes storage și `0` bytes H2D în decode hot;
+- 5 tokeni prompt în `0,243322 s`;
+- 11 forward-uri decode în `0,194159 s`;
+- **56,6547 tok/s single-stream hot**.
+
+Numărul de forward-uri, nu numărul de tokeni afișați, este folosit la calculul
+tok/s. Rezultatul trece poarta de 10 tok/s fără să ascundă costul de startup.
+Oracle-ul reproductibil este `ops/python/run_expert_pack_oracle.py`, iar
+executabilul este `expert-olmoe-runner`.
+
 ## Etapa B — analizor SafeTensors
 
 Stare: **PASS**.
