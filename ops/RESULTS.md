@@ -31,6 +31,26 @@ Manifestul canonic rezultat declară și `clip_qkv: null`; prima conversie,
 anterioară acestui câmp semantic, a fost păstrată recuperabil sub numele
 `olmoe-expert-pack-int8-pre-clip-contract` și nu este folosită de P3.
 
+### P3.0 — fused CUDA MoE pe records reale
+
+Stare: **PASS COMPONENTĂ, NU ÎNCĂ INFERENȚĂ END-TO-END**.
+
+Backend-ul SM86 execută un strat single-token/top-8 în două dispatch-uri:
+`gate+up+SiLU` grouped și `down+weighted accumulation` în ordine stabilă.
+Smoke-ul a citit și validat primii opt experți reali din `experts-000.qpack`,
+apoi a comparat RTX 3090 cu referința CPU a aceluiași quant ABI:
+
+- hidden 2.048, intermediate 1.024, top-k 8;
+- eroare absolută maximă `1,16415e-9`;
+- eroare relativă maximă `7,29039e-5`;
+- cosine `1,0`;
+- `0,199588 ms` MoE hot per strat, media a 100 iterații după warmup;
+- plafon izolat MoE pentru 16 straturi: `313,145 tok/s`.
+
+Ultima valoare nu este raportată ca viteză de model: exclude dense, attention,
+router, KV, lm_head și orice miss/upload. Ea demonstrează că kernelul MoE hot
+nu consumă bugetul de 100 ms/token al porții single-stream de 10 tok/s.
+
 ## Etapa B — analizor SafeTensors
 
 Stare: **PASS**.

@@ -1,7 +1,8 @@
 param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
-    [bool]$EnableCudaPinned = $true
+    [bool]$EnableCudaPinned = $true,
+    [bool]$EnableCudaCompute = $true
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -17,6 +18,7 @@ $preset = if ($Configuration -eq "Release") {
     "windows-msvc-debug"
 }
 $cudaPinned = if ($EnableCudaPinned) { "ON" } else { "OFF" }
+$cudaCompute = if ($EnableCudaCompute) { "ON" } else { "OFF" }
 
 function Invoke-CheckedNative {
     param(
@@ -32,10 +34,18 @@ function Invoke-CheckedNative {
 
 Push-Location $script:RepoRoot
 try {
-    Invoke-CheckedNative -Command $cmake -Arguments @(
-        "--preset", $preset,
-        "-DEXPERT_RUNTIME_ENABLE_CUDA_PINNED=$cudaPinned"
+    $configureArguments = @(
+        "--fresh", "--preset", $preset,
+        "-DEXPERT_RUNTIME_ENABLE_CUDA_PINNED=$cudaPinned",
+        "-DEXPERT_RUNTIME_ENABLE_CUDA_COMPUTE=$cudaCompute"
     )
+    if ($EnableCudaCompute) {
+        $nvcc = Get-Command "nvcc.exe" -ErrorAction Stop
+        $cudaRoot = Split-Path (Split-Path $nvcc.Source -Parent) -Parent
+        $env:NVCC_PREPEND_FLAGS = "--allow-unsupported-compiler -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH"
+        $configureArguments += @("-T", "cuda=$cudaRoot")
+    }
+    Invoke-CheckedNative -Command $cmake -Arguments $configureArguments
     Invoke-CheckedNative -Command $cmake -Arguments @(
         "--build", "--preset", $preset
     )
@@ -56,6 +66,7 @@ $result = [PSCustomObject]@{
     preset = $preset
     configuration = $Configuration
     cuda_pinned = $EnableCudaPinned
+    cuda_compute = $EnableCudaCompute
     build_root = Join-Path $script:RepoRoot "out\build\$preset"
     status = "pass"
 }
