@@ -1,5 +1,33 @@
 # Rezultate experimentale
 
+## Expert Pack P0–P2 — fundația runtime-ului propriu
+
+Stare: **PASS PE 3090BOX, WINDOWS/CUDA TOOLCHAIN**.
+
+Commitul `7473cf2` introduce contractul Expert Pack v1, calculatorul de
+fezabilitate, compilerul/validatorul, cache-ul bugetat și backend-ul IOCP.
+Build-ul Release cu Visual Studio 2022 și CUDA 12.1 a trecut 3/3 teste CTest,
+iar compilerul a trecut 5/5 teste Python. Build-ul include pool-ul CUDA pinned
+și compilează backend-ul IOCP nativ Windows.
+
+Checkpoint-ul real `allenai/OLMoE-1B-7B-0125-Instruct` a fost apoi convertit,
+nu doar fixture-ul sintetic:
+
+- 3.219 tensori sursă și 13.838.721.960 bytes;
+- 147 records dense și 1.024 records expert;
+- 6.948.352.000 bytes Expert Pack INT8 în trei pack-uri;
+- 484.929.536 bytes dense și 6.463.422.464 bytes experți;
+- 807.927.808 bytes experți activi/token;
+- conversie în 136,75 s cu NumPy pe 3090box;
+- validator independent: 3/3 pack-uri, toate records și hash-urile valide;
+- manifest content SHA-256:
+  `27a0751231c2124fdcabaf608f10600d228a721abe4a5d304cd7f20afe792898`.
+
+Containerul este în
+`work/models/olmoe-expert-pack-int8` pe 3090box și devine intrarea P3 CUDA.
+Conversia reală a corectat o presupunere din fixture: tensorii OLMoE `q_norm`
+și `k_norm` au shape `[hidden_size]`, nu `[head_dim]`.
+
 ## Etapa B — analizor SafeTensors
 
 Stare: **PASS**.
