@@ -21,12 +21,15 @@ nu doar fixture-ul sintetic:
 - conversie în 136,75 s cu NumPy pe 3090box;
 - validator independent: 3/3 pack-uri, toate records și hash-urile valide;
 - manifest content SHA-256:
-  `27a0751231c2124fdcabaf608f10600d228a721abe4a5d304cd7f20afe792898`.
+  `82d0a6fa20fd440a1113cd0f89399c710c36c8a5c4d223d74971ec52276e3427`.
 
 Containerul este în
 `work/models/olmoe-expert-pack-int8` pe 3090box și devine intrarea P3 CUDA.
 Conversia reală a corectat o presupunere din fixture: tensorii OLMoE `q_norm`
 și `k_norm` au shape `[hidden_size]`, nu `[head_dim]`.
+Manifestul canonic rezultat declară și `clip_qkv: null`; prima conversie,
+anterioară acestui câmp semantic, a fost păstrată recuperabil sub numele
+`olmoe-expert-pack-int8-pre-clip-contract` și nu este folosită de P3.
 
 ## Etapa B — analizor SafeTensors
 
