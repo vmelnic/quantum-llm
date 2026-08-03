@@ -58,6 +58,7 @@ def _make_fixture(root: Path, unknown: bool = False) -> dict[str, list[float]]:
         "architectures": ["OlmoeForCausalLM"],
         "model_type": "olmoe",
         "hidden_act": "silu",
+        "clip_qkv": None,
         "hidden_size": 4,
         "intermediate_size": 3,
         "max_position_embeddings": 16,

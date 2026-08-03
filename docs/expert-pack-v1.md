@@ -51,7 +51,7 @@ Rolurile blocurilor sunt:
 - `source`: identitatea/revizia checkpoint-ului, inventarul fiecărui fișier și
   SHA-256-ul inventarului canonic;
 - `architecture`: contractul complet OLMoE v1, fără acces la Hugging Face la
-  runtime;
+  runtime, inclusiv politica `clip_qkv` (`null` pentru checkpoint-ul curent);
 - `quantization`: `int8-symmetric-per-row-v1`, ABI 1;
 - `kernel_abi`: `expert-pack-sm86-int8-row-v1`, gate+up în această ordine,
   down output-major, SiLU și țintă CUDA SM86;

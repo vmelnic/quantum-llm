@@ -66,6 +66,13 @@ class OlmoeAdapter:
         if top_k > experts:
             raise AdapterError("num_experts_per_tok exceeds num_experts")
         head_dim = hidden // heads
+        clip_qkv = config.get("clip_qkv")
+        if clip_qkv is not None and (
+            isinstance(clip_qkv, bool)
+            or not isinstance(clip_qkv, (int, float))
+            or float(clip_qkv) <= 0.0
+        ):
+            raise AdapterError("clip_qkv must be null or a positive number")
 
         expected_dense: dict[str, tuple[int, ...]] = {
             "model.embed_tokens.weight": (vocab, hidden),
@@ -165,6 +172,7 @@ class OlmoeAdapter:
             "hidden_activation": config.get("hidden_act", "silu"),
             "attention_bias": bool(config.get("attention_bias", False)),
             "attention_dropout": config.get("attention_dropout", 0.0),
+            "clip_qkv": clip_qkv,
             "rms_norm_epsilon": config.get("rms_norm_eps"),
             "rope": {
                 "theta": config.get("rope_theta", 10000.0),
