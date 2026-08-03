@@ -4,6 +4,7 @@
 /work/
 /models/
 /downloads/
+/out/
 
 # Local council/session state (the exported debate remains versioned)
 /.council/
@@ -26,6 +27,8 @@ __pycache__/
 *.pth
 *.onnx
 *.xet
+*.qpack
+*.partial/
 
 # Generated logs and temporary files
 *.log

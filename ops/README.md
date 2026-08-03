@@ -1,9 +1,34 @@
 # Operațiuni pentru 3090box
 
-Acest director este sursa canonică pentru scripturile experimentului. Repository-ul
-este sincronizat în `C:\Users\vladi\quantum-llm`, iar scripturile PowerShell sunt
-rulate pe 3090box. GPU-ul este inventariat, dar este dezactivat explicit pentru
-procesele experimentului.
+Acest director este sursa canonică pentru scripturile rulate pe 3090box.
+Repository-ul este sincronizat în `C:\Users\vladi\quantum-llm`. Experimentele
+istorice Colibri rămân CPU-only; runtime-ul Expert Pack nou țintește explicit
+Windows/CUDA și RTX 3090.
+
+## Expert Pack P0–P2
+
+Build-ul, testele C++, cross-testul compiler→planner și testele compilerului se
+rulează prin:
+
+```bash
+./ops/sync-to-3090box.sh
+./ops/run-on-3090box.sh Invoke-Inventory.ps1 \
+  -SustainedStorageReadBytesPerSecond 560000000 \
+  -SustainedH2DBytesPerSecond 12000000000
+./ops/run-on-3090box.sh Invoke-BuildExpertRuntime.ps1 -Configuration Release
+```
+
+Compilerul și validatorul Expert Pack rulează pe Windows printr-un singur
+wrapper; checkpoint-ul sursă nu este modificat:
+
+```powershell
+Invoke-ExpertPack.ps1 -Action Compile -Path C:\path\snapshot `
+  -Output C:\path\model.expert-pack -SourceId org/model -SourceRevision REV
+Invoke-ExpertPack.ps1 -Action Validate -Path C:\path\model.expert-pack
+```
+
+Specificațiile normative sunt în `docs/`, codul produsului în `core/`,
+`compiler/` și `runtime/`; `ops/` conține numai automatizarea operațională.
 
 ## Fluxul de lucru
 

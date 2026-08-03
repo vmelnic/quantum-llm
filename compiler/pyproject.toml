@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "expert-pack-compiler"
+version = "0.1.0"
+description = "Streaming SafeTensors to Expert Pack v1 compiler"
+requires-python = ">=3.10"
+
+[project.optional-dependencies]
+fast = ["numpy>=1.26"]
+
+[project.scripts]
+expert-pack = "expert_pack.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["expert_pack*"]

@@ -1,0 +1,460 @@
+#include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/sha256.hpp"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <future>
+#include <iostream>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <string_view>
+#include <thread>
+#include <utility>
+#include <vector>
+
+using namespace std::chrono_literals;
+
+namespace er = expert::runtime;
+
+namespace {
+
+void require(bool condition, std::string_view message) {
+  if (!condition) {
+    throw std::runtime_error(std::string(message));
+  }
+}
+
+template <typename T>
+void write_le(std::byte* output, T value) {
+  using Unsigned = std::make_unsigned_t<T>;
+  const auto converted = static_cast<Unsigned>(value);
+  for (std::size_t index = 0; index < sizeof(T); ++index) {
+    output[index] = static_cast<std::byte>(
+        (converted >> static_cast<unsigned>(index * 8U)) & 0xffU);
+  }
+}
+
+struct FixtureRecord final {
+  er::ExpertKey key;
+  er::PayloadRecord record;
+  std::vector<std::byte> bytes;
+};
+
+FixtureRecord make_record(std::uint32_t expert_id, std::uint64_t file_offset = 0) {
+  FixtureRecord result;
+  result.key = {0x0123456789abcdefULL, 3, expert_id,
+                er::kExpertQuantAbiInt8PerRow};
+  result.bytes.resize(er::kExpertPackAlignment);
+  for (std::size_t index = er::kExpertHeaderBytes; index < result.bytes.size();
+       ++index) {
+    result.bytes[index] = static_cast<std::byte>((index * 37U + expert_id) & 0xffU);
+  }
+
+  auto* header = result.bytes.data();
+  std::memcpy(header, "EPEXPR01", 8);
+  write_le<std::uint16_t>(header + 8, er::kExpertPackVersion);
+  write_le<std::uint16_t>(header + 10, er::kExpertHeaderBytes);
+  write_le<std::uint32_t>(header + 12, 0x0fU);
+  write_le<std::uint32_t>(header + 16, er::kExpertQuantAbiInt8PerRow);
+  write_le<std::int32_t>(header + 20, 3);
+  write_le<std::int32_t>(header + 24, static_cast<std::int32_t>(expert_id));
+  write_le<std::uint32_t>(header + 28, 16);
+  write_le<std::uint32_t>(header + 32, 8);
+  write_le<std::uint32_t>(header + 36, 16);
+  write_le<std::uint32_t>(header + 40, 0);
+  write_le<std::uint64_t>(header + 44, result.bytes.size());
+  write_le<std::uint64_t>(header + 52, 256);
+  write_le<std::uint64_t>(header + 60, 256);
+  write_le<std::uint64_t>(header + 68, 512);
+  write_le<std::uint64_t>(header + 76, 64);
+  write_le<std::uint64_t>(header + 84, 768);
+  write_le<std::uint64_t>(header + 92, 128);
+  write_le<std::uint64_t>(header + 100, 1024);
+  write_le<std::uint64_t>(header + 108, 64);
+  const auto digest = er::sha256(std::span<const std::byte>(result.bytes).subspan(
+      er::kExpertHeaderBytes));
+  std::copy(digest.begin(), digest.end(), header + 116);
+
+  result.record.path = "fixture.qpack";
+  result.record.record_offset = file_offset;
+  result.record.stored_bytes = result.bytes.size();
+  result.record.decoded_bytes = 3ULL * 16 * 8 * sizeof(float);
+  result.record.header_bytes = er::kExpertHeaderBytes;
+  result.record.alignment = er::kExpertPackAlignment;
+  result.record.payload_sha256 = digest;
+  return result;
+}
+
+class ControlledStorage final : public er::IAsyncStorage {
+ public:
+  struct Pending final {
+    er::OperationId id{};
+    er::ReadRequest request;
+    er::ReadCompletion completion;
+  };
+
+  er::OperationId read(er::ReadRequest request,
+                       er::ReadCompletion completion) override {
+    std::lock_guard lock(mutex_);
+    const auto id = next_id_++;
+    pending_.push_back({id, std::move(request), std::move(completion)});
+    ++read_count_;
+    return id;
+  }
+
+  void cancel(er::OperationId operation) noexcept override {
+    er::ReadCompletion completion;
+    std::uint64_t requested = 0;
+    {
+      std::lock_guard lock(mutex_);
+      const auto iterator = std::find_if(
+          pending_.begin(), pending_.end(),
+          [operation](const Pending& item) { return item.id == operation; });
+      if (iterator == pending_.end()) {
+        return;
+      }
+      requested = iterator->request.record.stored_bytes;
+      completion = std::move(iterator->completion);
+      pending_.erase(iterator);
+    }
+    completion({er::Status(er::ErrorCode::cancelled, "test read cancelled"),
+                requested, 0});
+  }
+
+  void complete_success(const std::vector<std::byte>& source) {
+    Pending pending = take_one();
+    require(source.size() == pending.request.record.stored_bytes,
+            "fixture/read size mismatch");
+    require(pending.request.destination.capacity >= source.size(),
+            "destination too small");
+    require(reinterpret_cast<std::uintptr_t>(pending.request.destination.data) %
+                    er::kExpertPackAlignment ==
+                0,
+            "direct-read destination is not 4096 aligned");
+    std::copy(source.begin(), source.end(), pending.request.destination.data);
+    pending.completion({er::Status::success(), source.size(), source.size()});
+  }
+
+  void complete_short(const std::vector<std::byte>& source) {
+    Pending pending = take_one();
+    const auto bytes = source.size() / 2;
+    std::copy_n(source.begin(), bytes, pending.request.destination.data);
+    pending.completion({er::Status::success(), source.size(), bytes});
+  }
+
+  [[nodiscard]] std::size_t read_count() const {
+    std::lock_guard lock(mutex_);
+    return read_count_;
+  }
+
+  [[nodiscard]] std::size_t pending_count() const {
+    std::lock_guard lock(mutex_);
+    return pending_.size();
+  }
+
+ private:
+  Pending take_one() {
+    std::lock_guard lock(mutex_);
+    require(!pending_.empty(), "no pending storage operation");
+    auto pending = std::move(pending_.front());
+    pending_.pop_front();
+    return pending;
+  }
+
+  mutable std::mutex mutex_;
+  std::deque<Pending> pending_;
+  er::OperationId next_id_{1};
+  std::size_t read_count_{};
+};
+
+class TestDeviceAllocation final : public er::IDeviceAllocation {
+ public:
+  explicit TestDeviceAllocation(std::size_t size) : size_(size) {}
+  [[nodiscard]] std::size_t bytes() const noexcept override { return size_; }
+
+ private:
+  std::size_t size_{};
+};
+
+class ControlledUploader final : public er::IDeviceUploader {
+ public:
+  struct Pending final {
+    er::OperationId id{};
+    er::UploadRequest request;
+    er::UploadCompletion completion;
+  };
+
+  er::OperationId upload(er::UploadRequest request,
+                         er::UploadCompletion completion) override {
+    std::lock_guard lock(mutex_);
+    const auto id = next_id_++;
+    pending_.push_back({id, request, std::move(completion)});
+    ++upload_count_;
+    return id;
+  }
+
+  void cancel(er::OperationId operation) noexcept override {
+    er::UploadCompletion completion;
+    {
+      std::lock_guard lock(mutex_);
+      const auto iterator = std::find_if(
+          pending_.begin(), pending_.end(),
+          [operation](const Pending& item) { return item.id == operation; });
+      if (iterator == pending_.end()) {
+        return;
+      }
+      completion = std::move(iterator->completion);
+      pending_.erase(iterator);
+    }
+    completion({er::Status(er::ErrorCode::cancelled, "test upload cancelled"),
+                {}, 0});
+  }
+
+  void complete_success(std::size_t device_bytes = 2048) {
+    auto pending = take_one();
+    pending.completion({er::Status::success(),
+                        std::make_shared<TestDeviceAllocation>(device_bytes),
+                        device_bytes});
+  }
+
+  void complete_failure() {
+    auto pending = take_one();
+    pending.completion(
+        {er::Status(er::ErrorCode::upload_failed, "injected CUDA failure"), {}, 0});
+  }
+
+  [[nodiscard]] std::size_t upload_count() const {
+    std::lock_guard lock(mutex_);
+    return upload_count_;
+  }
+
+  [[nodiscard]] std::size_t pending_count() const {
+    std::lock_guard lock(mutex_);
+    return pending_.size();
+  }
+
+ private:
+  Pending take_one() {
+    std::lock_guard lock(mutex_);
+    require(!pending_.empty(), "no pending upload operation");
+    auto pending = std::move(pending_.front());
+    pending_.pop_front();
+    return pending;
+  }
+
+  mutable std::mutex mutex_;
+  std::deque<Pending> pending_;
+  er::OperationId next_id_{1};
+  std::size_t upload_count_{};
+};
+
+struct Harness final {
+  std::shared_ptr<ControlledStorage> storage =
+      std::make_shared<ControlledStorage>();
+  std::shared_ptr<ControlledUploader> uploader =
+      std::make_shared<ControlledUploader>();
+  std::shared_ptr<er::FixedBufferPool> buffers;
+  er::ExpertCache cache;
+
+  explicit Harness(std::uint64_t budget = 8192, std::size_t slots = 2)
+      : buffers(std::make_shared<er::FixedBufferPool>(
+            slots, er::kExpertPackAlignment, er::kExpertPackAlignment)),
+        cache({{budget, budget, std::min<std::uint64_t>(4096, budget)},
+               {budget, budget, std::min<std::uint64_t>(4096, budget)}, true},
+              storage, uploader, buffers) {}
+
+  er::AcquireResult finish(er::AcquireHandle& handle,
+                           const FixtureRecord& fixture) {
+    storage->complete_success(fixture.bytes);
+    require(handle.wait_for(0ms) == std::future_status::timeout,
+            "expert became visible before upload completion");
+    uploader->complete_success();
+    auto result = handle.get();
+    require(result.status.ok() && result.lease, "valid expert did not publish");
+    return result;
+  }
+};
+
+void test_state_machine_and_sha256() {
+  require(er::cache_state_name(er::CacheState::vram_ready) == "VRAM_READY",
+          "cache state name");
+  require(er::valid_cache_transition(er::CacheState::absent,
+                                     er::CacheState::ssd_loading),
+          "valid transition rejected");
+  require(!er::valid_cache_transition(er::CacheState::absent,
+                                      er::CacheState::vram_ready),
+          "invalid publish transition accepted");
+  const std::array input = {std::byte{'a'}, std::byte{'b'}, std::byte{'c'}};
+  const auto digest = er::sha256(input);
+  constexpr std::array<std::uint8_t, 32> expected = {
+      0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
+      0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+      0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
+      0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad};
+  for (std::size_t index = 0; index < expected.size(); ++index) {
+    require(std::to_integer<std::uint8_t>(digest[index]) == expected[index],
+            "SHA-256 implementation mismatch");
+  }
+}
+
+void test_concurrent_load_dedup_and_visibility() {
+  Harness harness(8192, 2);
+  const auto fixture = make_record(7);
+  constexpr std::size_t kCallers = 16;
+  std::vector<er::AcquireHandle> handles(kCallers);
+  std::vector<std::thread> callers;
+  callers.reserve(kCallers);
+  for (std::size_t index = 0; index < kCallers; ++index) {
+    callers.emplace_back([&, index] {
+      handles[index] = harness.cache.acquire(fixture.key, fixture.record);
+    });
+  }
+  for (auto& thread : callers) {
+    thread.join();
+  }
+  require(harness.storage->read_count() == 1,
+          "concurrent acquire issued a double-load");
+  for (auto& handle : handles) {
+    require(handle.wait_for(0ms) == std::future_status::timeout,
+            "SSD_LOADING entry was visible");
+  }
+
+  harness.storage->complete_success(fixture.bytes);
+  require(harness.uploader->upload_count() == 1,
+          "deduplicated load issued multiple uploads");
+  const auto uploading = harness.cache.inspect(fixture.key);
+  require(uploading && uploading->state == er::CacheState::gpu_uploading &&
+              !uploading->has_device_copy,
+          "entry was published before upload completion");
+  for (auto& handle : handles) {
+    require(handle.wait_for(0ms) == std::future_status::timeout,
+            "GPU_UPLOADING entry was visible");
+  }
+
+  harness.uploader->complete_success();
+  std::vector<er::AcquireResult> results;
+  for (auto& handle : handles) {
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "deduplicated waiter did not receive a lease");
+    results.push_back(std::move(result));
+  }
+  const auto ready = harness.cache.inspect(fixture.key);
+  require(ready && ready->state == er::CacheState::vram_ready &&
+              ready->reference_count == kCallers,
+          "ready leases are not reference-counted");
+  const auto metrics = harness.cache.telemetry();
+  require(metrics.load_started == 1 &&
+              metrics.load_deduplicated == kCallers - 1,
+          "load dedup telemetry mismatch");
+}
+
+void test_budget_eviction_refcount_and_cancellation() {
+  Harness harness(8192, 2);
+  const auto first = make_record(1, 0);
+  const auto second = make_record(2, 4096);
+  const auto third = make_record(3, 8192);
+  const auto fourth = make_record(4, 12288);
+
+  auto first_handle = harness.cache.acquire(first.key, first.record);
+  auto first_result = harness.finish(first_handle, first);
+  auto second_handle = harness.cache.acquire(second.key, second.record);
+  auto second_result = harness.finish(second_handle, second);
+  auto third_handle = harness.cache.acquire(third.key, third.record);
+  require(harness.storage->pending_count() == 0,
+          "referenced expert was evicted to admit a third record");
+
+  first_result.lease = {};
+  require(harness.storage->pending_count() == 1,
+          "releasing a lease did not unblock budget admission");
+  auto third_result = harness.finish(third_handle, third);
+  const auto first_after = harness.cache.inspect(first.key);
+  require(first_after && first_after->state == er::CacheState::absent &&
+              !first_after->has_device_copy,
+          "LRU expert was not safely evicted");
+  require(second_result.lease && third_result.lease,
+          "live leases were invalidated by eviction");
+
+  auto fourth_handle = harness.cache.acquire(fourth.key, fourth.record);
+  require(harness.storage->pending_count() == 0,
+          "budget overcommitted while all entries were referenced");
+  fourth_handle.cancel();
+  auto cancelled = fourth_handle.get();
+  require(cancelled.status.code() == er::ErrorCode::cancelled,
+          "pending acquisition did not cancel cleanly");
+  const auto metrics = harness.cache.telemetry();
+  require(metrics.ram_high_water <= 8192 && metrics.vram_high_water <= 8192 &&
+              metrics.ram_bytes <= 8192 && metrics.vram_bytes <= 8192,
+          "cache exceeded byte budget under churn");
+  require(metrics.stalled_by_budget != 0 && metrics.cancellation_count == 1 &&
+              metrics.eviction_count != 0,
+          "budget/cancel/eviction telemetry missing");
+}
+
+void test_short_read_checksum_and_upload_fail_closed() {
+  {
+    Harness harness(4096, 1);
+    const auto fixture = make_record(10);
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_short(fixture.bytes);
+    auto result = handle.get();
+    require(result.status.code() == er::ErrorCode::short_read && !result.lease,
+            "short read was not fail-closed");
+    require(harness.uploader->upload_count() == 0,
+            "short record reached device uploader");
+    require(harness.cache.inspect(fixture.key)->state == er::CacheState::failed,
+            "short record was not quarantined");
+  }
+  {
+    Harness harness(4096, 1);
+    auto fixture = make_record(11);
+    auto corrupted = fixture.bytes;
+    corrupted[300] ^= std::byte{0x01};
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(corrupted);
+    auto result = handle.get();
+    require(result.status.code() == er::ErrorCode::checksum_mismatch &&
+                !result.lease,
+            "checksum mismatch was not fail-closed");
+    require(harness.uploader->upload_count() == 0,
+            "corrupt weights reached device uploader");
+    require(harness.cache.telemetry().checksum_errors == 1,
+            "checksum error telemetry missing");
+  }
+  {
+    Harness harness(4096, 1);
+    const auto fixture = make_record(12);
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_failure();
+    auto result = handle.get();
+    require(result.status.code() == er::ErrorCode::upload_failed && !result.lease,
+            "device failure was not fail-closed");
+    require(harness.cache.inspect(fixture.key)->state == er::CacheState::failed,
+            "failed device copy became visible");
+    require(harness.cache.telemetry().upload_errors == 1,
+            "upload error telemetry missing");
+  }
+}
+
+}  // namespace
+
+int main() {
+  try {
+    test_state_machine_and_sha256();
+    test_concurrent_load_dedup_and_visibility();
+    test_budget_eviction_refcount_and_cancellation();
+    test_short_read_checksum_and_upload_fail_closed();
+    std::cout << "expert_runtime_tests: PASS\n";
+    return 0;
+  } catch (const std::exception& error) {
+    std::cerr << "expert_runtime_tests: FAIL: " << error.what() << '\n';
+    return 1;
+  }
+}

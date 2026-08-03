@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://expert-pack.local/schemas/feasibility-request-v1.schema.json",
+  "title": "Expert runtime feasibility request v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "target_tokens_per_second_milli",
+    "concurrency",
+    "vram_expert_budget_bytes",
+    "ram_expert_budget_bytes",
+    "expected_vram_hit_ppm",
+    "expected_ram_hit_ppm",
+    "minimum_workspace_bytes",
+    "minimum_staging_bytes",
+    "kv_bytes_per_request"
+  ],
+  "properties": {
+    "target_tokens_per_second_milli": { "type": "integer", "minimum": 1 },
+    "concurrency": { "type": "integer", "minimum": 1 },
+    "vram_expert_budget_bytes": { "type": "integer", "minimum": 0 },
+    "ram_expert_budget_bytes": { "type": "integer", "minimum": 0 },
+    "expected_vram_hit_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "expected_ram_hit_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+    "minimum_workspace_bytes": { "type": "integer", "minimum": 0 },
+    "minimum_staging_bytes": { "type": "integer", "minimum": 1 },
+    "kv_bytes_per_request": { "type": "integer", "minimum": 1 }
+  }
+}

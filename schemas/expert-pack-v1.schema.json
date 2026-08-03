@@ -1,0 +1,303 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://expert-pack.local/schemas/expert-pack-v1.schema.json",
+  "title": "Expert Pack manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema", "format", "compatibility", "source", "architecture",
+    "quantization", "kernel_abi", "alignment", "tensors", "experts",
+    "packs", "indexes", "masses", "requirements", "tokenizer", "integrity"
+  ],
+  "properties": {
+    "schema": { "const": "expert-pack-manifest-v1" },
+    "format": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "version", "minimum_runtime_version"],
+      "properties": {
+        "name": { "const": "expert-pack" },
+        "version": { "const": 1 },
+        "minimum_runtime_version": { "const": "0.1.0" }
+      }
+    },
+    "compatibility": {
+      "type": "object", "additionalProperties": false,
+      "required": ["unknown_fields", "unknown_quant_abi", "unknown_record_version"],
+      "properties": {
+        "unknown_fields": { "const": "reject" },
+        "unknown_quant_abi": { "const": "reject" },
+        "unknown_record_version": { "const": "reject" }
+      }
+    },
+    "source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "revision", "checkpoint_sha256", "tensor_count", "files"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "revision": { "type": ["string", "null"] },
+        "checkpoint_sha256": { "$ref": "#/$defs/sha256" },
+        "tensor_count": { "$ref": "#/$defs/positiveInteger" },
+        "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/file" } }
+      }
+    },
+    "architecture": { "$ref": "#/$defs/olmoeArchitecture" },
+    "quantization": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "profile", "abi_id", "expert_weights", "dense_matrix_weights",
+        "router_and_norms", "scale_dtype", "group_size", "rounding", "zero_points"
+      ],
+      "properties": {
+        "profile": { "const": "int8-symmetric-per-row-v1" },
+        "abi_id": { "const": 1 },
+        "expert_weights": { "const": "symmetric-int8" },
+        "dense_matrix_weights": { "const": "symmetric-int8-except-router" },
+        "router_and_norms": { "const": "float32" },
+        "scale_dtype": { "const": "float32" },
+        "group_size": { "const": 0 },
+        "rounding": { "const": "nearest-ties-to-even" },
+        "zero_points": { "const": false }
+      }
+    },
+    "kernel_abi": {
+      "type": "object", "additionalProperties": false,
+      "required": ["id", "quant_abi", "gate_up_fused", "gate_up_order", "down_layout", "activation", "target"],
+      "properties": {
+        "id": { "const": "expert-pack-sm86-int8-row-v1" },
+        "quant_abi": { "const": 1 },
+        "gate_up_fused": { "const": true },
+        "gate_up_order": { "const": ["gate", "up"] },
+        "down_layout": { "const": "output-major-row-contiguous" },
+        "activation": { "const": "silu" },
+        "target": { "const": "cuda-sm86" }
+      }
+    },
+    "alignment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["pack_bytes", "section_bytes", "direct_io_bytes", "pinned_host_bytes", "cuda_bytes"],
+      "properties": {
+        "pack_bytes": { "type": "integer", "minimum": 4096, "multipleOf": 4096 },
+        "section_bytes": { "const": 256 },
+        "direct_io_bytes": { "type": "integer", "minimum": 4096, "multipleOf": 4096 },
+        "pinned_host_bytes": { "const": 256 },
+        "cuda_bytes": { "const": 256 }
+      }
+    },
+    "tensors": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/denseRecord" } },
+    "experts": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/expertRecord" } },
+    "packs": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/pack" } },
+    "indexes": {
+      "type": "object", "additionalProperties": false,
+      "required": ["dense_sha256", "experts_sha256"],
+      "properties": {
+        "dense_sha256": { "$ref": "#/$defs/sha256" },
+        "experts_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "masses": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_tensor_bytes", "pack_bytes", "dense_bytes", "expert_bytes", "active_expert_bytes_per_token"],
+      "properties": {
+        "source_tensor_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "pack_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "dense_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "expert_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "active_expert_bytes_per_token": { "$ref": "#/$defs/positiveInteger" }
+      }
+    },
+    "requirements": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "resident_dense_bytes", "minimum_vram_bytes", "minimum_ram_bytes",
+        "cold_disk_bytes_per_second_at_10_tps", "cold_disk_bytes_per_second_at_30_tps",
+        "pcie_bytes_per_second_at_10_tps_without_reuse", "estimation_policy"
+      ],
+      "properties": {
+        "resident_dense_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "minimum_vram_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "minimum_ram_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "cold_disk_bytes_per_second_at_10_tps": { "$ref": "#/$defs/positiveInteger" },
+        "cold_disk_bytes_per_second_at_30_tps": { "$ref": "#/$defs/positiveInteger" },
+        "pcie_bytes_per_second_at_10_tps_without_reuse": { "$ref": "#/$defs/positiveInteger" },
+        "estimation_policy": { "const": "lower-bound; KV/workspace/cache are added by P0 feasibility planner" }
+      }
+    },
+    "tokenizer": {
+      "type": "object", "additionalProperties": false,
+      "required": ["files", "chat_template", "special_tokens"],
+      "properties": {
+        "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/file" } },
+        "chat_template": { "type": ["string", "null"] },
+        "special_tokens": {
+          "type": "object", "additionalProperties": false,
+          "required": ["bos_token_id", "eos_token_id", "pad_token_id"],
+          "properties": {
+            "bos_token_id": { "$ref": "#/$defs/tokenIdOrNull" },
+            "eos_token_id": {
+              "oneOf": [
+                { "$ref": "#/$defs/tokenIdOrNull" },
+                { "type": "array", "minItems": 1, "uniqueItems": true, "items": { "type": "integer", "minimum": 0 } }
+              ]
+            },
+            "pad_token_id": { "$ref": "#/$defs/tokenIdOrNull" }
+          }
+        }
+      }
+    },
+    "integrity": {
+      "type": "object", "additionalProperties": false,
+      "required": ["algorithm", "content_sha256"],
+      "properties": {
+        "algorithm": { "const": "sha256" },
+        "content_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  },
+  "$defs": {
+    "uint64": { "type": "integer", "minimum": 0, "maximum": 18446744073709551615 },
+    "positiveInteger": { "type": "integer", "minimum": 1, "maximum": 18446744073709551615 },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "relativePath": { "type": "string", "minLength": 1, "pattern": "^(?![A-Za-z]:)(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$" },
+    "packPath": { "type": "string", "pattern": "^(dense|experts-[0-9]{3,})\\.qpack$" },
+    "tokenIdOrNull": { "type": ["integer", "null"], "minimum": 0 },
+    "shape": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "$ref": "#/$defs/positiveInteger" } },
+    "file": {
+      "type": "object", "additionalProperties": false,
+      "required": ["path", "bytes", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/relativePath" },
+        "bytes": { "$ref": "#/$defs/uint64" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "section": {
+      "type": "object", "additionalProperties": false,
+      "required": ["offset", "bytes"],
+      "properties": { "offset": { "$ref": "#/$defs/uint64" }, "bytes": { "$ref": "#/$defs/uint64" } }
+    },
+    "olmoeArchitecture": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "family", "model_type", "architectures", "hidden_size", "intermediate_size",
+        "vocab_size", "max_position_embeddings", "num_hidden_layers", "num_attention_heads",
+        "num_key_value_heads", "head_dim", "num_experts", "num_experts_per_token",
+        "shared_experts", "hidden_activation", "attention_bias", "attention_dropout",
+        "rms_norm_epsilon", "rope", "normalize_topk_probability", "tie_word_embeddings"
+      ],
+      "properties": {
+        "family": { "const": "olmoe" },
+        "model_type": { "const": "olmoe" },
+        "architectures": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "hidden_size": { "$ref": "#/$defs/positiveInteger" },
+        "intermediate_size": { "$ref": "#/$defs/positiveInteger" },
+        "vocab_size": { "$ref": "#/$defs/positiveInteger" },
+        "max_position_embeddings": { "$ref": "#/$defs/positiveInteger" },
+        "num_hidden_layers": { "$ref": "#/$defs/positiveInteger" },
+        "num_attention_heads": { "$ref": "#/$defs/positiveInteger" },
+        "num_key_value_heads": { "$ref": "#/$defs/positiveInteger" },
+        "head_dim": { "$ref": "#/$defs/positiveInteger" },
+        "num_experts": { "$ref": "#/$defs/positiveInteger" },
+        "num_experts_per_token": { "$ref": "#/$defs/positiveInteger" },
+        "shared_experts": { "$ref": "#/$defs/uint64" },
+        "hidden_activation": { "const": "silu" },
+        "attention_bias": { "type": "boolean" },
+        "attention_dropout": { "type": "number", "minimum": 0 },
+        "rms_norm_epsilon": { "type": "number", "exclusiveMinimum": 0 },
+        "rope": {
+          "type": "object", "additionalProperties": false,
+          "required": ["theta", "scaling"],
+          "properties": {
+            "theta": { "type": "number", "exclusiveMinimum": 0 },
+            "scaling": { "type": "null" }
+          }
+        },
+        "normalize_topk_probability": { "type": "boolean" },
+        "tie_word_embeddings": { "type": "boolean" }
+      }
+    },
+    "denseRecord": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "name", "pack", "offset", "stored_bytes", "source_bytes", "decoded_bytes",
+        "source_dtype", "source_shape", "stored_dtype", "layout", "quant_abi",
+        "payload_sha256", "sections"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "pack": { "const": "dense.qpack" },
+        "offset": { "$ref": "#/$defs/uint64" },
+        "stored_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "source_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "decoded_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "source_dtype": { "enum": ["BF16", "F16", "F32"] },
+        "source_shape": { "$ref": "#/$defs/shape" },
+        "stored_dtype": { "enum": ["I8", "F32"] },
+        "layout": { "enum": ["output-major-row-contiguous-int8", "row-major-f32"] },
+        "quant_abi": { "enum": [0, 1] },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "sections": {
+          "type": "object", "additionalProperties": false,
+          "required": ["data", "scales"],
+          "properties": { "data": { "$ref": "#/$defs/section" }, "scales": { "$ref": "#/$defs/section" } }
+        }
+      }
+    },
+    "expertRecord": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "layer", "expert", "pack", "offset", "stored_bytes", "source_bytes",
+        "decoded_bytes", "source_dtype", "source_shape", "stored_dtype", "layout",
+        "quant_abi", "payload_sha256", "source_tensors", "sections"
+      ],
+      "properties": {
+        "layer": { "$ref": "#/$defs/uint64" },
+        "expert": { "$ref": "#/$defs/uint64" },
+        "pack": { "type": "string", "pattern": "^experts-[0-9]{3,}\\.qpack$" },
+        "offset": { "$ref": "#/$defs/uint64" },
+        "stored_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "source_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "decoded_bytes": { "$ref": "#/$defs/positiveInteger" },
+        "source_dtype": {
+          "type": "object", "additionalProperties": false,
+          "required": ["gate", "up", "down"],
+          "properties": { "gate": {"enum":["BF16","F16","F32"]}, "up": {"enum":["BF16","F16","F32"]}, "down": {"enum":["BF16","F16","F32"]} }
+        },
+        "source_shape": {
+          "type": "object", "additionalProperties": false,
+          "required": ["gate", "up", "down"],
+          "properties": { "gate": {"$ref":"#/$defs/shape"}, "up": {"$ref":"#/$defs/shape"}, "down": {"$ref":"#/$defs/shape"} }
+        },
+        "stored_dtype": { "const": "I8" },
+        "layout": { "const": "gate-rows-then-up-rows;down-output-major;row-contiguous-int8" },
+        "quant_abi": { "const": 1 },
+        "payload_sha256": { "$ref": "#/$defs/sha256" },
+        "source_tensors": {
+          "type": "object", "additionalProperties": false,
+          "required": ["gate", "up", "down"],
+          "properties": { "gate": {"type":"string","minLength":1}, "up": {"type":"string","minLength":1}, "down": {"type":"string","minLength":1} }
+        },
+        "sections": {
+          "type": "object", "additionalProperties": false,
+          "required": ["gate_up_q", "gate_up_scales", "down_q", "down_scales"],
+          "properties": {
+            "gate_up_q": { "$ref": "#/$defs/section" },
+            "gate_up_scales": { "$ref": "#/$defs/section" },
+            "down_q": { "$ref": "#/$defs/section" },
+            "down_scales": { "$ref": "#/$defs/section" }
+          }
+        }
+      }
+    },
+    "pack": {
+      "type": "object", "additionalProperties": false,
+      "required": ["name", "kind", "bytes", "record_count", "sha256"],
+      "properties": {
+        "name": { "$ref": "#/$defs/packPath" },
+        "kind": { "enum": ["dense", "experts"] },
+        "bytes": { "$ref": "#/$defs/positiveInteger" },
+        "record_count": { "$ref": "#/$defs/positiveInteger" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}
