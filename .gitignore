@@ -1,0 +1,41 @@
+# Generated experiment state and large local data
+/artifacts/
+/logs/
+/work/
+/models/
+/downloads/
+
+# Local council/session state (the exported debate remains versioned)
+/.council/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model and tensor blobs
+*.safetensors
+*.gguf
+*.ggml
+*.bin
+*.pt
+*.pth
+*.onnx
+*.xet
+
+# Generated logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# Editor and operating-system metadata
+.DS_Store
+._*
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini
