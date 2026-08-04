@@ -50,8 +50,9 @@ Rolurile blocurilor sunt:
 
 - `source`: identitatea/revizia checkpoint-ului, inventarul fiecărui fișier și
   SHA-256-ul inventarului canonic;
-- `architecture`: contractul complet OLMoE v1, fără acces la Hugging Face la
-  runtime, inclusiv politica `clip_qkv` (`null` pentru checkpoint-ul curent);
+- `architecture`: contractul complet al familiei (`olmoe` sau
+  `qwen3_next`), fără acces la Hugging Face la runtime; adaptorul este strict
+  și refuză orice tensor sau geometrie neidentificată;
 - `quantization`: `int8-symmetric-per-row-v1`, ABI 1;
 - `kernel_abi`: `expert-pack-sm86-int8-row-v1`, gate+up în această ordine,
   down output-major, SiLU și țintă CUDA SM86;
@@ -194,6 +195,14 @@ q[i]    = clamp(round_ties_to_even(row[i] / scale), -127, 127)
 Valorile nefinite sunt refuzate. Scalele sunt FP32 little-endian, strict finite
 și pozitive. Zero-point nu există. Dense rank-2 este cuantizat cu excepția
 routerului; normele rank-1 și routerul sunt normalizate la FP32.
+
+Adaptorul Qwen3-Next păstrează explicit și head-ul auxiliar MTP din
+checkpoint-ul Instruct în `dense.qpack`; runtime-ul autoregresiv îl poate omite
+din residency, dar compilerul nu pierde implicit cei 1.553 de tensori. Pentru
+full attention, `q_proj` conține concatenat query și gate-ul de output. Normele
+Qwen3-Next au semantica `(1 + weight)`, iar top-k este renormalizat după
+selecție; aceste diferențe sunt parte din contractul familiei, nu euristici ale
+runtime-ului.
 
 ## Semantica checksum-ului de record
 

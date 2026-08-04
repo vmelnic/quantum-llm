@@ -40,7 +40,12 @@
         "files": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/file" } }
       }
     },
-    "architecture": { "$ref": "#/$defs/olmoeArchitecture" },
+    "architecture": {
+      "oneOf": [
+        { "$ref": "#/$defs/olmoeArchitecture" },
+        { "$ref": "#/$defs/qwen3NextArchitecture" }
+      ]
+    },
     "quantization": {
       "type": "object", "additionalProperties": false,
       "required": [
@@ -214,6 +219,61 @@
         },
         "normalize_topk_probability": { "type": "boolean" },
         "tie_word_embeddings": { "type": "boolean" }
+      }
+    },
+    "qwen3NextArchitecture": {
+      "type": "object", "additionalProperties": false,
+      "required": [
+        "family", "model_type", "architectures", "hidden_size", "intermediate_size",
+        "vocab_size", "max_position_embeddings", "num_hidden_layers", "num_attention_heads",
+        "num_key_value_heads", "head_dim", "num_experts", "num_experts_per_token",
+        "shared_experts", "hidden_activation", "attention_bias", "attention_dropout", "clip_qkv",
+        "rms_norm_epsilon", "rope", "normalize_topk_probability", "tie_word_embeddings",
+        "full_attention_interval", "partial_rotary_factor", "linear_conv_kernel_dim",
+        "linear_key_head_dim", "linear_value_head_dim", "linear_num_key_heads",
+        "linear_num_value_heads", "shared_expert_intermediate_size",
+        "multi_token_prediction_layers", "attention_output_gate"
+      ],
+      "properties": {
+        "family": { "const": "qwen3_next" },
+        "model_type": { "const": "qwen3_next" },
+        "architectures": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+        "hidden_size": { "$ref": "#/$defs/positiveInteger" },
+        "intermediate_size": { "$ref": "#/$defs/positiveInteger" },
+        "vocab_size": { "$ref": "#/$defs/positiveInteger" },
+        "max_position_embeddings": { "$ref": "#/$defs/positiveInteger" },
+        "num_hidden_layers": { "$ref": "#/$defs/positiveInteger" },
+        "num_attention_heads": { "$ref": "#/$defs/positiveInteger" },
+        "num_key_value_heads": { "$ref": "#/$defs/positiveInteger" },
+        "head_dim": { "$ref": "#/$defs/positiveInteger" },
+        "num_experts": { "$ref": "#/$defs/positiveInteger" },
+        "num_experts_per_token": { "$ref": "#/$defs/positiveInteger" },
+        "shared_experts": { "const": 1 },
+        "hidden_activation": { "const": "silu" },
+        "attention_bias": { "type": "boolean" },
+        "attention_dropout": { "type": "number", "minimum": 0 },
+        "clip_qkv": { "type": "null" },
+        "rms_norm_epsilon": { "type": "number", "exclusiveMinimum": 0 },
+        "rope": {
+          "type": "object", "additionalProperties": false,
+          "required": ["theta", "scaling"],
+          "properties": {
+            "theta": { "type": "number", "exclusiveMinimum": 0 },
+            "scaling": { "type": "null" }
+          }
+        },
+        "normalize_topk_probability": { "const": true },
+        "tie_word_embeddings": { "type": "boolean" },
+        "full_attention_interval": { "$ref": "#/$defs/positiveInteger" },
+        "partial_rotary_factor": { "type": "number", "exclusiveMinimum": 0, "maximum": 1 },
+        "linear_conv_kernel_dim": { "$ref": "#/$defs/positiveInteger" },
+        "linear_key_head_dim": { "$ref": "#/$defs/positiveInteger" },
+        "linear_value_head_dim": { "$ref": "#/$defs/positiveInteger" },
+        "linear_num_key_heads": { "$ref": "#/$defs/positiveInteger" },
+        "linear_num_value_heads": { "$ref": "#/$defs/positiveInteger" },
+        "shared_expert_intermediate_size": { "$ref": "#/$defs/positiveInteger" },
+        "multi_token_prediction_layers": { "type": "integer", "minimum": 0, "maximum": 1 },
+        "attention_output_gate": { "const": true }
       }
     },
     "denseRecord": {

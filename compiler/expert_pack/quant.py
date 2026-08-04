@@ -123,6 +123,23 @@ def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> 
 def write_float32(view: TensorView, destination: BinaryIO, digest: object) -> int:
     """Write an unquantized tensor normalized to little-endian FP32."""
 
+    if len(view.info.shape) > 2:
+        if len(view.info.shape) > 4 or view.info.dtype not in SUPPORTED_FLOAT_DTYPES:
+            raise SourceFormatError(
+                f"float32 storage accepts rank <=4 BF16/F16/F32, got {view.info.shape} {view.info.dtype}"
+            )
+        values = _decode_float_row(view.raw, view.info.dtype)
+        if _np is not None:
+            payload = _np.asarray(values, dtype="<f4").tobytes()
+        else:
+            output = array("f", values)
+            if sys.byteorder != "little":
+                output.byteswap()
+            payload = output.tobytes()
+        write_all(destination, payload)
+        digest.update(payload)
+        return len(payload)
+
     rows, _columns, row_bytes = _row_geometry(view)
     written = 0
     for row in range(rows):

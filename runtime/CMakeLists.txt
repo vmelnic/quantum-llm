@@ -46,6 +46,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   enable_language(CUDA)
   find_package(CUDAToolkit 12.1 REQUIRED)
   target_sources(expert_runtime PRIVATE
+    src/cuda/expert_uploader.cu
     src/cuda/moe_kernels.cu
     src/cuda/transformer_kernels.cu)
   target_compile_definitions(expert_runtime PUBLIC EXPERT_RUNTIME_HAS_CUDA_COMPUTE=1)

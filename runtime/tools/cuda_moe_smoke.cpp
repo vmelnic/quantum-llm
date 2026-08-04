@@ -1,5 +1,8 @@
 #include "expert/runtime/cuda/moe_kernels.hpp"
+#include "expert/runtime/cuda/expert_uploader.hpp"
+#include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/expert_record.hpp"
+#include "expert/runtime/windows_iocp_storage.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -41,16 +44,10 @@ void device_allocate(T*& pointer, std::size_t bytes, const char* operation) {
   pointer = reinterpret_cast<T*>(raw);
 }
 
-struct DeviceRecord {
-  std::int8_t* gate_up{};
-  float* gate_up_scales{};
-  std::int8_t* down{};
-  float* down_scales{};
-};
-
 struct HostRecord {
   std::vector<std::byte> bytes;
   expert::runtime::ValidatedExpertRecord validated;
+  expert::runtime::PayloadRecord payload;
 };
 
 HostRecord load_record(std::ifstream& stream, const std::filesystem::path& path,
@@ -85,6 +82,7 @@ HostRecord load_record(std::ifstream& stream, const std::filesystem::path& path,
     throw std::runtime_error(std::string(validation.status.message()));
   }
   result.validated = validation.record;
+  result.payload = expected;
   return result;
 }
 
@@ -173,24 +171,43 @@ int main(int argc, char** argv) {
     cuda_check(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input");
     cuda_check(cudaMemcpy(d_routing, routing.data(), routing.size() * sizeof(float), cudaMemcpyHostToDevice), "copy routing");
 
-    std::vector<DeviceRecord> device(top_k);
     std::vector<const std::int8_t*> gate_ptrs(top_k), down_ptrs(top_k);
     std::vector<const float*> gate_scale_ptrs(top_k), down_scale_ptrs(top_k);
+    const auto slot_bytes = static_cast<std::size_t>(
+        std::max_element(records.begin(), records.end(), [](const auto& left, const auto& right) {
+          return left.payload.stored_bytes < right.payload.stored_bytes;
+        })->payload.stored_bytes);
+    const auto tier_bytes = static_cast<std::uint64_t>(slot_bytes) * top_k;
+    auto storage = std::make_shared<expert::runtime::WindowsIocpStorage>(2);
+    auto uploader = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
+    auto buffers = std::make_shared<expert::runtime::FixedBufferPool>(
+        top_k, slot_bytes, expert::runtime::kExpertPackAlignment,
+        std::make_shared<expert::runtime::CudaPinnedAllocator>());
+    expert::runtime::ExpertCache cache(
+        {{tier_bytes, tier_bytes, tier_bytes},
+         {tier_bytes, tier_bytes, tier_bytes}, false},
+        storage, uploader, buffers);
+    std::vector<expert::runtime::AcquireHandle> handles;
+    handles.reserve(top_k);
     for (std::uint32_t i = 0; i < top_k; ++i) {
-      const auto& record = records[i];
-      const auto& s = record.validated.sections;
-      device_allocate(device[i].gate_up, s.gate_up_q_bytes, "cudaMalloc gate_up");
-      device_allocate(device[i].gate_up_scales, s.gate_up_scale_bytes, "cudaMalloc gate scales");
-      device_allocate(device[i].down, s.down_q_bytes, "cudaMalloc down");
-      device_allocate(device[i].down_scales, s.down_scale_bytes, "cudaMalloc down scales");
-      cuda_check(cudaMemcpy(device[i].gate_up, section<std::byte>(record, s.gate_up_q_offset), s.gate_up_q_bytes, cudaMemcpyHostToDevice), "copy gate_up");
-      cuda_check(cudaMemcpy(device[i].gate_up_scales, section<std::byte>(record, s.gate_up_scale_offset), s.gate_up_scale_bytes, cudaMemcpyHostToDevice), "copy gate scales");
-      cuda_check(cudaMemcpy(device[i].down, section<std::byte>(record, s.down_q_offset), s.down_q_bytes, cudaMemcpyHostToDevice), "copy down");
-      cuda_check(cudaMemcpy(device[i].down_scales, section<std::byte>(record, s.down_scale_offset), s.down_scale_bytes, cudaMemcpyHostToDevice), "copy down scales");
-      gate_ptrs[i] = device[i].gate_up;
-      gate_scale_ptrs[i] = device[i].gate_up_scales;
-      down_ptrs[i] = device[i].down;
-      down_scale_ptrs[i] = device[i].down_scales;
+      handles.push_back(cache.acquire({0, 0, i, 1}, records[i].payload));
+    }
+    std::vector<expert::runtime::ExpertLease> leases;
+    leases.reserve(top_k);
+    for (std::uint32_t i = 0; i < top_k; ++i) {
+      auto acquired = handles[i].get();
+      if (!acquired.status.ok()) {
+        throw std::runtime_error(std::string("cache acquire: ") +
+                                 std::string(acquired.status.message()));
+      }
+      leases.push_back(std::move(acquired.lease));
+      const auto* allocation = dynamic_cast<const expert::runtime::cuda::CudaExpertAllocation*>(
+          leases.back().get());
+      if (allocation == nullptr) throw std::runtime_error("unexpected cache allocation type");
+      gate_ptrs[i] = allocation->gate_up();
+      gate_scale_ptrs[i] = allocation->gate_up_scales();
+      down_ptrs[i] = allocation->down();
+      down_scale_ptrs[i] = allocation->down_scales();
     }
     const std::int8_t** d_gate_ptrs{};
     const std::int8_t** d_down_ptrs{};
@@ -245,11 +262,15 @@ int main(int argc, char** argv) {
       norm_b += static_cast<double>(reference[i]) * reference[i];
     }
     const double cosine = dot / std::sqrt(norm_a * norm_b);
+    const auto cache_metrics = cache.telemetry();
     std::cout << "{\"valid\":" << (max_rel < 0.01 && cosine > 0.999999 ? "true" : "false")
               << ",\"top_k\":" << top_k << ",\"hidden\":" << hidden
               << ",\"intermediate\":" << width << ",\"max_abs\":" << max_abs
               << ",\"max_rel\":" << max_rel << ",\"cosine\":" << cosine
               << ",\"kernel_ms_per_layer\":" << kernel_ms
+              << ",\"cache_read_bytes\":" << cache_metrics.read_bytes
+              << ",\"cache_uploaded_bytes\":" << cache_metrics.uploaded_bytes
+              << ",\"cache_loads\":" << cache_metrics.load_completed
               << ",\"moe_only_16_layer_ceiling_tps\":" << (1000.0F / (16.0F * kernel_ms))
               << "}\n";
     return max_rel < 0.01 && cosine > 0.999999 ? 0 : 2;

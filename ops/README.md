@@ -81,6 +81,22 @@ Expert Pack nu este modificat de deploy/rollback. La recovery se verifică în
 ordine logul, `/health`, `Invoke-ExpertPack.ps1 -Action Validate`, build-ul și
 worker smoke-ul; un hash mismatch nu este ignorat și nu pornește modelul.
 
+## P6 — Qwen3-Next > RAM
+
+Checkpoint-ul țintă este `Qwen/Qwen3-Next-80B-A3B-Instruct`. Download-ul
+rezumabil și statusul lui se lansează astfel:
+
+```powershell
+Start-P6ModelDownload.ps1 -MaxWorkers 4
+Get-P6ModelDownload.ps1
+```
+
+Compilerul folosește `-Adapter qwen3_next`. Modelul include un decoder auxiliar
+MTP; adaptorul îl clasifică și îl păstrează explicit. Nu se șterge și nu se mută
+niciun checkpoint existent. Înaintea conversiei trebuie asigurat spațiu pentru
+checkpoint plus container; pe instalația curentă există numai C:, deci fluxul
+de conversie nu pornește dacă preflight-ul nu confirmă capacitatea.
+
 ## Fluxul de lucru
 
 De pe hostul de control (acest repository):

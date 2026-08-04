@@ -328,3 +328,32 @@ Concluzia actuală nu este „mai multe teste”, ci o separare de arhitectură:
 2. când nu încape, folosim LRU/SSD exact ca fallback măsurabil;
 3. redeschidem aproximarea numai cu o reprezentare distilată mai puternică și
    o poartă validation fixată, nu prin scalarea variantelor respinse aici.
+
+## P6 — fundația modelului mai mare decât RAM
+
+Stare: **ÎN IMPLEMENTARE; compilerul și traseul cache→CUDA sunt validate**.
+
+Ținta aleasă este `Qwen/Qwen3-Next-80B-A3B-Instruct`: 48 straturi, 512
+experți/strat, top-10, hidden 2048 și expert width 512. Adaptorul strict
+`qwen3_next` acoperă linear attention, full attention cu query/output gate,
+shared expert și cei 1.553 de tensori MTP. Fixture-urile compilerului validează
+inclusiv Conv1D rank-3 și conservarea explicită MTP.
+
+Pe 3090box, primul vertical slice real a traversat:
+
+```text
+experts-000.qpack -> Windows IOCP -> pinned pool -> SHA-256/header validation
+                  -> cache RAM/VRAM -> uploader CUDA -> fused MoE kernel
+```
+
+Pentru 8 experți OLMoE reali a raportat 50.495.488 bytes citiți,
+50.462.720 bytes urcați, 8 load-uri și rezultat identic numeric cu referința
+CPU (`cosine=1`, `max_abs=1.16415e-09`). Kernelul MoE a măsurat 0,199639
+ms/strat în acest caz.
+
+Download-ul Qwen3-Next rulează prin Hugging Face Xet. C: este singurul volum și
+avea aproximativ 202 GB liberi la începutul verificării; checkpoint-ul sursă de
+aproximativ 163 GB plus containerul estimat la peste 80 GB nu încap simultan.
+Conversia reală rămâne blocată de preflight-ul de spațiu până când fluxul poate
+elibera controlat shard-uri deja consumate sau este disponibilă capacitate
+suplimentară. Nu se șterg automat modelele existente.

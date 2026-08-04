@@ -129,7 +129,129 @@ def _make_fixture(root: Path, unknown: bool = False) -> dict[str, list[float]]:
     return values
 
 
+def _make_qwen3_next_fixture(root: Path, include_mtp: bool = False) -> None:
+    config = {
+        "_name_or_path": "synthetic/qwen3-next",
+        "architectures": ["Qwen3NextForCausalLM"],
+        "model_type": "qwen3_next",
+        "hidden_act": "silu",
+        "hidden_size": 4,
+        "moe_intermediate_size": 2,
+        "shared_expert_intermediate_size": 2,
+        "max_position_embeddings": 32,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "head_dim": 2,
+        "num_experts": 2,
+        "num_experts_per_tok": 1,
+        "num_hidden_layers": 1,
+        "full_attention_interval": 2,
+        "linear_conv_kernel_dim": 2,
+        "linear_key_head_dim": 2,
+        "linear_value_head_dim": 2,
+        "linear_num_key_heads": 1,
+        "linear_num_value_heads": 2,
+        "partial_rotary_factor": 0.5,
+        "norm_topk_prob": True,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 10000000.0,
+        "tie_word_embeddings": False,
+        "vocab_size": 8,
+        "bos_token_id": 0,
+        "eos_token_id": 1,
+        "pad_token_id": 7,
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+    shapes = {
+        "model.embed_tokens.weight": (8, 4),
+        "model.norm.weight": (4,),
+        "lm_head.weight": (8, 4),
+        "model.layers.0.input_layernorm.weight": (4,),
+        "model.layers.0.post_attention_layernorm.weight": (4,),
+        "model.layers.0.linear_attn.dt_bias": (2,),
+        "model.layers.0.linear_attn.A_log": (2,),
+        "model.layers.0.linear_attn.conv1d.weight": (8, 1, 2),
+        "model.layers.0.linear_attn.in_proj_qkvz.weight": (12, 4),
+        "model.layers.0.linear_attn.in_proj_ba.weight": (4, 4),
+        "model.layers.0.linear_attn.norm.weight": (2,),
+        "model.layers.0.linear_attn.out_proj.weight": (4, 4),
+        "model.layers.0.mlp.gate.weight": (2, 4),
+        "model.layers.0.mlp.shared_expert.gate_proj.weight": (2, 4),
+        "model.layers.0.mlp.shared_expert.up_proj.weight": (2, 4),
+        "model.layers.0.mlp.shared_expert.down_proj.weight": (4, 2),
+        "model.layers.0.mlp.shared_expert_gate.weight": (1, 4),
+    }
+    for expert in range(2):
+        prefix = f"model.layers.0.mlp.experts.{expert}."
+        shapes[prefix + "gate_proj.weight"] = (2, 4)
+        shapes[prefix + "up_proj.weight"] = (2, 4)
+        shapes[prefix + "down_proj.weight"] = (4, 2)
+    if include_mtp:
+        shapes.update({
+            "mtp.fc.weight": (4, 8),
+            "mtp.pre_fc_norm_embedding.weight": (4,),
+            "mtp.pre_fc_norm_hidden.weight": (4,),
+            "mtp.norm.weight": (4,),
+            "mtp.layers.0.input_layernorm.weight": (4,),
+            "mtp.layers.0.post_attention_layernorm.weight": (4,),
+            "mtp.layers.0.self_attn.q_proj.weight": (8, 4),
+            "mtp.layers.0.self_attn.k_proj.weight": (2, 4),
+            "mtp.layers.0.self_attn.v_proj.weight": (2, 4),
+            "mtp.layers.0.self_attn.o_proj.weight": (4, 4),
+            "mtp.layers.0.self_attn.q_norm.weight": (2,),
+            "mtp.layers.0.self_attn.k_norm.weight": (2,),
+            "mtp.layers.0.mlp.gate.weight": (2, 4),
+            "mtp.layers.0.mlp.shared_expert.gate_proj.weight": (2, 4),
+            "mtp.layers.0.mlp.shared_expert.up_proj.weight": (2, 4),
+            "mtp.layers.0.mlp.shared_expert.down_proj.weight": (4, 2),
+            "mtp.layers.0.mlp.shared_expert_gate.weight": (1, 4),
+        })
+        for expert in range(2):
+            prefix = f"mtp.layers.0.mlp.experts.{expert}."
+            shapes[prefix + "gate_proj.weight"] = (2, 4)
+            shapes[prefix + "up_proj.weight"] = (2, 4)
+            shapes[prefix + "down_proj.weight"] = (4, 2)
+    tensors = {name: _tensor(name, shape) for name, shape in shapes.items()}
+    _write_safetensors(root / "model.safetensors", tensors)
+
+
 class ExpertPackTests(unittest.TestCase):
+    def test_qwen3_next_adapter_and_rank3_dense_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_qwen3_next_fixture(source)
+            adapted = adapt_checkpoint(SafeTensorCheckpoint(source), "qwen3_next")
+            self.assertEqual(adapted.architecture["family"], "qwen3_next")
+            self.assertEqual(len(adapted.experts), 2)
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source, output=output, adapter="qwen3_next",
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            conv = next(item for item in manifest["tensors"] if item["name"].endswith("conv1d.weight"))
+            self.assertEqual(conv["source_shape"], [8, 1, 2])
+            self.assertEqual(conv["stored_dtype"], "F32")
+
+    def test_qwen3_next_optional_mtp_is_explicitly_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_qwen3_next_fixture(source, include_mtp=True)
+            adapted = adapt_checkpoint(SafeTensorCheckpoint(source), "qwen3_next")
+            self.assertEqual(adapted.architecture["multi_token_prediction_layers"], 1)
+            self.assertIn("mtp.fc.weight", {tensor.name for tensor in adapted.dense})
+            self.assertEqual(adapted.source_tensor_count,
+                             len(adapted.dense) + 3 * len(adapted.experts))
+
     def test_checkpoint_reader_and_strict_olmoe_adapter(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
