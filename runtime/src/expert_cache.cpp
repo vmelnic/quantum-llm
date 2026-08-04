@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -18,6 +19,7 @@ namespace expert::runtime {
 namespace {
 
 constexpr std::size_t kStateCount = 6;
+constexpr std::uint64_t kRoutingScoreScale = 1ULL << 20U;
 
 bool valid_budget(const TierBudget& budget) noexcept {
   return budget.capacity_bytes != 0 && budget.high_watermark_bytes != 0 &&
@@ -57,6 +59,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::uint64_t references{};
     std::uint64_t last_access{};
     std::uint32_t frequency{};
+    std::uint64_t routing_score_mass_q20{};
+    std::uint32_t routing_score_peak_q20{};
     bool vram_resident{true};
     OperationId io_operation{};
     OperationId upload_operation{};
@@ -148,8 +152,50 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       for (auto& [key, candidate] : entries) {
         (void)key;
         candidate->frequency = (candidate->frequency + 1U) / 2U;
+        candidate->routing_score_mass_q20 =
+            (candidate->routing_score_mass_q20 + 1U) / 2U;
+        candidate->routing_score_peak_q20 =
+            (candidate->routing_score_peak_q20 + 1U) / 2U;
       }
     }
+  }
+
+  void add_routing_score_locked(Entry& entry, double sum,
+                                double maximum) noexcept {
+    if (!std::isfinite(sum) || !std::isfinite(maximum) || sum <= 0.0 ||
+        maximum < 0.0) {
+      return;
+    }
+    const auto scaled_sum = static_cast<std::uint64_t>(std::min(
+        std::ceil(sum * static_cast<double>(kRoutingScoreScale)),
+        static_cast<double>(std::numeric_limits<std::uint64_t>::max())));
+    entry.routing_score_mass_q20 =
+        scaled_sum > std::numeric_limits<std::uint64_t>::max() -
+                         entry.routing_score_mass_q20
+            ? std::numeric_limits<std::uint64_t>::max()
+            : entry.routing_score_mass_q20 + scaled_sum;
+    const auto scaled_max = static_cast<std::uint32_t>(std::min(
+        std::ceil(std::min(maximum, 1.0) *
+                  static_cast<double>(kRoutingScoreScale)),
+        static_cast<double>(std::numeric_limits<std::uint32_t>::max())));
+    entry.routing_score_peak_q20 =
+        std::max(entry.routing_score_peak_q20, scaled_max);
+  }
+
+  [[nodiscard]] std::uint64_t temperature_locked(
+      const Entry& entry) const noexcept {
+    const auto frequency_heat =
+        static_cast<std::uint64_t>(entry.frequency) * kRoutingScoreScale;
+    const auto peak_heat = entry.routing_score_peak_q20 / 4U;
+    const auto score_heat =
+        peak_heat > std::numeric_limits<std::uint64_t>::max() -
+                        entry.routing_score_mass_q20
+            ? std::numeric_limits<std::uint64_t>::max()
+            : entry.routing_score_mass_q20 + peak_heat;
+    return score_heat > std::numeric_limits<std::uint64_t>::max() -
+                            frequency_heat
+               ? std::numeric_limits<std::uint64_t>::max()
+               : frequency_heat + score_heat;
   }
 
   void update_usage_locked() noexcept {
@@ -237,11 +283,11 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
                         std::optional<std::size_t> required_partition = {},
                         bool over_quota_only = false,
                         std::optional<bool> required_vram_class = {},
-                        std::optional<std::uint32_t>
-                            maximum_frequency_exclusive = {}) {
+                        std::optional<std::uint64_t>
+                            maximum_temperature_exclusive = {}) {
     std::shared_ptr<Entry> candidate;
     std::uint64_t candidate_excess{};
-    std::uint32_t candidate_frequency{};
+    std::uint64_t candidate_temperature{};
     const auto ram_quota = partition_quota(
         config.ram, config.placement.ram_shared_burst_bytes);
     const auto vram_quota = partition_quota(
@@ -264,8 +310,9 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
            entry->vram_resident != *required_vram_class)) {
         continue;
       }
-      if (maximum_frequency_exclusive &&
-          entry->frequency >= *maximum_frequency_exclusive) {
+      const auto entry_temperature = temperature_locked(*entry);
+      if (maximum_temperature_exclusive &&
+          entry_temperature >= *maximum_temperature_exclusive) {
         continue;
       }
       const auto partition = partition_for(key);
@@ -284,8 +331,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (over_quota_only && excess == 0) {
         continue;
       }
-      if (!candidate || entry->frequency < candidate_frequency ||
-          (entry->frequency == candidate_frequency &&
+      if (!candidate || entry_temperature < candidate_temperature ||
+          (entry_temperature == candidate_temperature &&
            (excess > candidate_excess ||
             (excess == candidate_excess &&
              (entry->last_access < candidate->last_access ||
@@ -293,7 +340,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
                key < candidate->key)))))) {
         candidate = entry;
         candidate_excess = excess;
-        candidate_frequency = entry->frequency;
+        candidate_temperature = entry_temperature;
       }
     }
     if (!candidate) {
@@ -354,13 +401,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   bool make_vram_class_capacity_locked(std::uint64_t vram_need,
                                        const ExpertKey& key,
                                        bool resident,
-                                       std::uint32_t admission_frequency) {
+                                       std::uint64_t admission_temperature) {
     if (vram_need == 0) return true;
     const auto transient_limit =
         config.placement.vram_transient_bytes;
     const auto admission_limit =
         resident && transient_limit != 0
-            ? std::optional<std::uint32_t>(admission_frequency)
+            ? std::optional<std::uint64_t>(admission_temperature)
             : std::nullopt;
     const auto limit = resident
                            ? config.vram.high_watermark_bytes - transient_limit
@@ -393,7 +440,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         config.placement.vram_transient_bytes == 0 ||
         entry.frequency < 2 ||
         !make_vram_class_capacity_locked(entry.vram_reserved, entry.key,
-                                         true, entry.frequency)) {
+                                         true, temperature_locked(entry))) {
       return;
     }
     vram_transient_bytes -= entry.vram_reserved;
@@ -405,14 +452,14 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
 
   bool make_capacity_locked(std::uint64_t ram_need, std::uint64_t vram_need,
                             const ExpertKey& key, bool resident,
-                            std::uint32_t admission_frequency) {
+                            std::uint64_t admission_temperature) {
     if (ram_need > config.ram.high_watermark_bytes ||
         vram_need > config.vram.high_watermark_bytes) {
       return false;
     }
     if (!make_partition_capacity_locked(ram_need, key) ||
         !make_vram_class_capacity_locked(vram_need, key, resident,
-                                         admission_frequency)) {
+                                         admission_temperature)) {
       return false;
     }
     const bool ram_pressured =
@@ -449,11 +496,11 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
               entry->frequency >= 2;
           if (!make_capacity_locked(0, entry->record.stored_bytes,
                                     entry->key, resident,
-                                    entry->frequency)) {
+                                    temperature_locked(*entry))) {
             if (!resident ||
                 !make_capacity_locked(0, entry->record.stored_bytes,
                                       entry->key, false,
-                                      entry->frequency)) {
+                                      temperature_locked(*entry))) {
               continue;
             }
             resident = false;
@@ -480,11 +527,11 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           entry->frequency >= 2;
       if (!make_capacity_locked(entry->record.stored_bytes,
                                 entry->record.stored_bytes, entry->key,
-                                resident, entry->frequency)) {
+                                resident, temperature_locked(*entry))) {
         if (!resident ||
             !make_capacity_locked(entry->record.stored_bytes,
                                   entry->record.stored_bytes, entry->key,
-                                  false, entry->frequency)) {
+                                  false, temperature_locked(*entry))) {
           continue;
         }
         resident = false;
@@ -846,6 +893,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       for (std::uint32_t item = 0; item < access.count; ++item) {
         touch_locked(*iterator->second);
       }
+      add_routing_score_locked(*iterator->second, access.routing_score_sum,
+                               access.routing_score_max);
       recorded += access.count;
     }
     return recorded;
@@ -867,11 +916,12 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     if (vram_bytes + need <= config.vram.high_watermark_bytes) return true;
     const auto deficit =
         vram_bytes + need - config.vram.high_watermark_bytes;
+    const auto entry_temperature = temperature_locked(entry);
     std::uint64_t colder_bytes = 0;
     for (const auto& [candidate_key, candidate] : entries) {
       if (candidate_key == key || !candidate->device ||
           candidate->references != 0 || !candidate->waiters.empty() ||
-          candidate->frequency >= entry.frequency ||
+          temperature_locked(*candidate) >= entry_temperature ||
           candidate->state == CacheState::gpu_uploading ||
           candidate->state == CacheState::failed) {
         continue;
@@ -1125,7 +1175,10 @@ std::optional<CacheEntrySnapshot> ExpertCache::inspect(
   const auto& entry = *iterator->second;
   return CacheEntrySnapshot{entry.state, entry.references, entry.waiters.size(),
                             entry.host != nullptr || entry.host_copy != nullptr,
-                            entry.device != nullptr};
+                            entry.device != nullptr, entry.frequency,
+                            entry.routing_score_mass_q20,
+                            entry.routing_score_peak_q20,
+                            core_->temperature_locked(entry)};
 }
 
 TelemetrySnapshot ExpertCache::telemetry() const noexcept {

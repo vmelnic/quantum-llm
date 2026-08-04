@@ -90,6 +90,12 @@ or in-use residents. CPU/GPU compute may overlap; the current synchronous
 uploader is modeled before GPU expert execution. Decision reasons, alternative
 costs, and EWMAs are retained in bounded telemetry.
 
+During unfrozen placement, exact selected routing weights feed cache
+temperature. Frequency, accumulated score mass, and peak score are stored as
+bounded fixed-point values and aged together. Eviction compares this composite
+temperature before deterministic pressure/recency tie breaks. Frozen epochs do
+not copy scores or mutate this evidence.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

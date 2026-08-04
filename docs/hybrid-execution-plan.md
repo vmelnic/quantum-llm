@@ -173,10 +173,33 @@ it must not be represented as equivalent to this frozen runner result.
 
 ## Stage 3 — score-aware cache and bounded prefetch
 
-Add routing-score evidence to the existing frequency/reuse cache. Retain a
-bounded score history and combine reuse, selection load, measured CPU debt,
-upload cost, and victim temperature. Prefetch is admitted only if it has
-credits, cannot evict an in-use/hotter expert, and cannot starve current work.
+### Stage 3a — score-aware cache temperature — completed
+
+Unfrozen placement copies the exact selected routing weights alongside expert
+IDs. Each cache entry retains bounded fixed-point evidence:
+
+```text
+temperature = frequency × 2^20
+            + accumulated selected-score mass
+            + peak selected score / 4
+```
+
+Frequency, score mass, and peak score age together at the existing bounded
+cache epoch. Eviction and strictly-colder admission compare this composite
+temperature, then use partition pressure, recency, and key as deterministic
+tie breaks. Invalid/non-finite score feedback contributes no heat. Frozen
+placement performs no score copy or policy mutation.
+
+The qualified mixed batch passed at 42.893 tok/s with exact outputs, zero
+rejected dispatch plans, zero SSD/H2D in the measured window, and zero pagefile
+use. A deterministic cache test proves that, at equal frequency, the expert
+with greater router-score mass survives VRAM pressure.
+
+### Stage 3b — bounded prefetch — next
+
+Use the bounded score temperature together with reuse, selection load,
+measured CPU debt, and upload cost. Prefetch is admitted only if it has credits,
+cannot evict an in-use/hotter expert, and cannot starve current work.
 
 Potential predictors are sequence-local reuse, near-top-k scores, and
 workload/prefix warm sets. Prediction failure and cache pollution are first-

@@ -99,6 +99,13 @@ must outperform the conservative H2D cost and displace only a strictly colder
 entry. Current execution continues on an available path while asynchronous
 promotion can benefit future tokens.
 
+Cache temperature also includes exact selected-router score mass and peak
+score, encoded at Q20 precision. Score evidence ages with frequency and affects
+victim/admission ordering only; it never changes router top-k, routing weights,
+or aggregation. Non-finite feedback is ignored and all arithmetic saturates.
+The entry snapshot exposes frequency, score evidence, and final temperature for
+diagnostics.
+
 At warmup/request barriers, admitted promotions drain and placement freezes.
 The measured frozen epoch performs no promotion, expert H2D, or policy mutation.
 

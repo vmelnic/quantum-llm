@@ -93,6 +93,20 @@ decision for the measured short microbatch: a synchronous expert upload does
 not amortize before CPU compute completes. Larger row groups or a future
 overlapped uploader can cross that measured boundary without changing policy.
 
+### Score-aware cache temperature
+
+Adding exact selected-routing-score evidence to cache admission produced
+42.893 tok/s on the same frozen mixed batch. Exact interleaved/chunked output,
+zero pagefile use, zero measured SSD/H2D, and zero rejected dispatch plans were
+preserved. Score collection occurs only during unfrozen placement; the
+qualified hot window performs no extra score transfer or policy mutation.
+
+The run's placement distribution changed within normal warm-cache variation
+(51,284 VRAM hits and 8,136 RAM hits). This single run does not claim a cache
+hit-rate improvement. Its acceptance evidence is semantic and structural: the
+full model remains correct, while a deterministic pressure test proves that an
+equal-frequency, higher-score expert is retained over its lower-score peer.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

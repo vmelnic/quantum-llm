@@ -18,6 +18,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
@@ -663,6 +664,55 @@ void test_frequency_admission_protects_reused_expert() {
           "frequency-admitted expert did not publish");
 }
 
+void test_routing_score_temperature_breaks_frequency_ties() {
+  Harness harness(16384, 4, 8192);
+  const auto high_score = make_record(43, 0, 0);
+  const auto low_score = make_record(44, 4096, 0);
+  const auto incoming = make_record(45, 8192, 0);
+  const auto load = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_success(er::kExpertPackAlignment);
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "score-temperature fixture load failed");
+    result.lease = {};
+  };
+  load(high_score);
+  load(low_score);
+  const std::array accesses{
+      er::ExpertAccess{high_score.key, 1, 0.9, 0.9},
+      er::ExpertAccess{low_score.key, 1, 0.1, 0.1},
+  };
+  require(harness.cache.record_accesses(accesses) == 2,
+          "scored route feedback was not recorded");
+  const auto high_snapshot = harness.cache.inspect(high_score.key);
+  const auto low_snapshot = harness.cache.inspect(low_score.key);
+  require(high_snapshot && low_snapshot &&
+              high_snapshot->frequency == low_snapshot->frequency &&
+              high_snapshot->routing_score_mass_q20 >
+                  low_snapshot->routing_score_mass_q20 &&
+              high_snapshot->placement_temperature >
+                  low_snapshot->placement_temperature,
+          "routing score did not affect bounded cache temperature");
+
+  auto incoming_handle = harness.cache.acquire(incoming.key, incoming.record);
+  const auto high_after = harness.cache.inspect(high_score.key);
+  const auto low_after = harness.cache.inspect(low_score.key);
+  if (!high_after || !low_after ||
+      high_after->state != er::CacheState::vram_ready ||
+      low_after->state != er::CacheState::ram_ready) {
+    throw std::runtime_error(
+        "score-aware eviction state mismatch: high=" +
+        std::to_string(high_after ? static_cast<int>(high_after->state) : -1) +
+        ", low=" +
+        std::to_string(low_after ? static_cast<int>(low_after->state) : -1));
+  }
+  auto incoming_result = harness.finish(incoming_handle, incoming);
+  require(incoming_result.status.ok() && incoming_result.lease,
+          "score-aware replacement did not publish");
+}
+
 void test_vram_replacement_requires_a_strictly_colder_victim() {
   Harness harness(16384, 4, 8192);
   const auto candidate = make_record(50, 0, 0);
@@ -808,6 +858,7 @@ int main() {
     test_cpu_executor_writes_compact_selection_outputs();
     test_layer_partitioned_eviction_protects_other_layers();
     test_frequency_admission_protects_reused_expert();
+    test_routing_score_temperature_breaks_frequency_ties();
     test_vram_replacement_requires_a_strictly_colder_victim();
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();

@@ -365,6 +365,8 @@ class Qwen3NextModel final {
     build_expert_index(
         Required(manifest, "experts", "manifest").AsArray("experts"));
     route_access_counts_.resize(experts_);
+    route_score_sums_.resize(experts_);
+    route_score_maxima_.resize(experts_);
     route_accesses_.reserve(experts_);
 
     const auto slot_bytes = static_cast<std::size_t>(max_expert_record_bytes_);
@@ -785,6 +787,12 @@ class Qwen3NextModel final {
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU route indices");
     cuda_check(cudaHostAlloc(
+                   reinterpret_cast<void**>(&host_routing_scores_),
+                   static_cast<std::size_t>(capacity_) * top_k_ *
+                       sizeof(float),
+                   cudaHostAllocDefault),
+               "cudaHostAlloc CPU route scores");
+    cuda_check(cudaHostAlloc(
                    reinterpret_cast<void**>(&host_cpu_selection_output_),
                    static_cast<std::size_t>(capacity_) * top_k_ * hidden_ *
                        sizeof(float),
@@ -991,14 +999,31 @@ class Qwen3NextModel final {
                             cudaMemcpyDeviceToHost),
                  "copy expert route to host");
     }
+    if (placement_feedback) {
+      cuda_check(cudaMemcpy(host_routing_scores_, routing_scores_,
+                            static_cast<std::size_t>(selection_count) *
+                                sizeof(float),
+                            cudaMemcpyDeviceToHost),
+                 "copy expert routing scores to host");
+    }
     if (!plan.missing_experts.empty() || placement_feedback) {
       std::fill(route_access_counts_.begin(), route_access_counts_.end(), 0U);
+      if (placement_feedback) {
+        std::fill(route_score_sums_.begin(), route_score_sums_.end(), 0.0);
+        std::fill(route_score_maxima_.begin(), route_score_maxima_.end(), 0.0);
+      }
       for (std::uint32_t selection = 0; selection < selection_count;
            ++selection) {
         const auto expert = host_routing_indices_[selection];
         if (expert >= experts_)
           throw std::runtime_error("router expert out of range");
         ++route_access_counts_[expert];
+        if (placement_feedback) {
+          const auto score = static_cast<double>(host_routing_scores_[selection]);
+          route_score_sums_[expert] += score;
+          route_score_maxima_[expert] =
+              std::max(route_score_maxima_[expert], score);
+        }
       }
     }
     if (placement_feedback) {
@@ -1006,7 +1031,8 @@ class Qwen3NextModel final {
       for (std::uint32_t expert = 0; expert < experts_; ++expert) {
         if (route_access_counts_[expert] != 0) {
           route_accesses_.push_back(
-              {{model_id_, layer, expert, 1}, route_access_counts_[expert]});
+              {{model_id_, layer, expert, 1}, route_access_counts_[expert],
+               route_score_sums_[expert], route_score_maxima_[expert]});
         }
       }
       static_cast<void>(cache_->record_accesses(route_accesses_));
@@ -1295,6 +1321,7 @@ class Qwen3NextModel final {
   std::unordered_map<std::string, Tensor> tensors_;
   std::vector<expert::runtime::PayloadRecord> expert_records_;
   std::vector<std::uint32_t> route_access_counts_;
+  std::vector<double> route_score_sums_, route_score_maxima_;
   std::vector<expert::runtime::ExpertAccess> route_accesses_;
   std::shared_ptr<expert::runtime::WindowsIocpStorage> storage_;
   std::shared_ptr<expert::runtime::cuda::CudaExpertUploader> uploader_;
@@ -1310,7 +1337,7 @@ class Qwen3NextModel final {
       *shared_intermediate_{}, *shared_output_{}, *shared_scalar_{},
       *router_logits_{}, *routing_scores_{}, *moe_intermediate_{},
       *moe_selection_output_{}, *cpu_selection_output_device_{},
-      *moe_output_{}, *logits_{}, *host_normalized_{},
+      *moe_output_{}, *logits_{}, *host_normalized_{}, *host_routing_scores_{},
       *host_cpu_selection_output_{};
   std::uint32_t *routing_indices_{}, *output_token_{}, *host_routing_indices_{},
       *cpu_slot_by_selection_{};

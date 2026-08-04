@@ -172,6 +172,10 @@ struct CacheEntrySnapshot final {
   std::uint64_t waiter_count{};
   bool has_host_copy{};
   bool has_device_copy{};
+  std::uint32_t frequency{};
+  std::uint64_t routing_score_mass_q20{};
+  std::uint32_t routing_score_peak_q20{};
+  std::uint64_t placement_temperature{};
 };
 
 struct ExpertCacheCore;
@@ -179,6 +183,8 @@ struct ExpertCacheCore;
 struct ExpertAccess final {
   ExpertKey key;
   std::uint32_t count{};
+  double routing_score_sum{};
+  double routing_score_max{};
 };
 
 class ExpertCache final {
