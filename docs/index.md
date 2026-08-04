@@ -11,6 +11,7 @@
 | [Benchmarks](benchmarks.md) | Reproducible evidence and interpretation |
 | [Production readiness](production-readiness.md) | Readiness matrix, known gaps, and release gates |
 | [Roadmap](roadmap.md) | Long-context, performance, and distributed execution phases |
+| [Hybrid execution plan](hybrid-execution-plan.md) | Staged CPU/GPU scheduler implementation and acceptance gates |
 
 The JSON schemas under `schemas/` and the compiler validator are normative for
 Expert Pack. Documentation never overrides executable validation.
