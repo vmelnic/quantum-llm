@@ -66,11 +66,13 @@ if (-not $info.manifest_content_sha256 -or -not $info.experts_index_sha256) {
     throw "Service does not publish the deployed container identity"
 }
 if ([int]$info.worker_protocol -lt 3 -or
+    $info.worker_prefill.mode -ne "causal_chunked" -or
+    [int]$info.worker_prefill.chunk_tokens -lt 2 -or
     $info.worker_kv.dtype -ne "fp16" -or
     [int]$info.worker_kv.page_tokens -lt 1 -or
     [int64]$info.worker_kv.page_bytes -lt 1 -or
     [int]$info.worker_kv.page_capacity -lt $Concurrency) {
-    throw "Service does not publish a usable protocol-v3 paged KV contract"
+    throw "Service does not publish usable chunked-prefill/paged-KV contracts"
 }
 if ([int]$info.worker_capacity -lt $Concurrency) {
     throw "Worker capacity $($info.worker_capacity) is below requested concurrency $Concurrency"

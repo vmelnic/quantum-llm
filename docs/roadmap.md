@@ -8,10 +8,13 @@ This roadmap records direction, not a compatibility promise.
    worker protocol v3.
 2. ~~Mixed context lengths without reserving maximum context for every slot.~~
    Implemented through page-credit admission.
-3. Chunked prefill and FlashAttention-class full-attention kernels.
-4. Certified 8K → 16K → 32K → 64K gates.
-5. Workload-trained warm expert sets and non-blocking prefetch.
-6. End-to-end SLOs for TTFT, inter-token latency, throughput, and memory.
+3. ~~Bounded causal chunked prefill vertical slice.~~ Implemented with a
+   four-token current profile and scalar/full-model equality gate.
+4. Decouple prefill chunk size from request concurrency; add adaptive chunks
+   and FlashAttention-class full-attention kernels.
+5. Certified 8K → 16K → 32K → 64K gates.
+6. Workload-trained warm expert sets and non-blocking prefetch.
+7. End-to-end SLOs for TTFT, inter-token latency, throughput, and memory.
 
 ## Phase 2 — service hardening
 

@@ -160,14 +160,16 @@ slots and eight queued requests. Prompt plus requested output must fit the
 context. The request body limit is 1 MiB.
 
 4096 is the only certified context limit. The Qwen checkpoint advertises 262K
-positions. The runtime now uses paged FP16 KV and context credits, but has not
-qualified efficient long-context prefill/decode. Model metadata is therefore
-not exposed as an operational API promise. If concurrent requests exhaust KV
-page credits, admission returns HTTP `503` with code
+positions. The runtime uses paged FP16 KV, context credits, and bounded causal
+prefill chunks, but has not qualified efficient long-context prefill/decode.
+Model metadata is therefore not exposed as an operational API promise. If
+concurrent requests exhaust KV page credits, admission returns HTTP `503` with code
 `context_capacity_exhausted` before streaming starts.
 
 `/model-info.worker_kv` reports FP16 dtype, page geometry, total page capacity,
 currently reserved pages, and physically allocated high-water pages.
+`/model-info.worker_prefill` reports the causal chunk mode and current maximum
+tokens per chunk.
 
 Admission is bounded. Overload/drain returns HTTP `503` with code `overloaded`;
 it does not create an unbounded queue. Generation timeout returns `504` before

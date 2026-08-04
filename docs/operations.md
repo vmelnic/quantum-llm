@@ -63,10 +63,21 @@ logs/expert-server.jsonl
 artifacts/expert-runtime-build-latest.json
 artifacts/p6-service-smoke-latest.json
 artifacts/p6-gate-latest.json
+artifacts/p6-text-probe-latest.json
 ```
 
 Ship logs and metrics to external storage for a real pilot. Local JSONL has no
 rotation or retention manager. Never log API keys or prompt content.
+
+Measure a real tokenizer/chat-template path separately from the synthetic
+token-ID correctness gate:
+
+```powershell
+.\ops\windows\Invoke-P6TextProbe.ps1 -Rounds 2 -MaxTokens 32
+```
+
+The first round records the current placement state; the second identical round
+shows reuse. Report both—never publish only the warm result.
 
 ## Capacity and overload
 

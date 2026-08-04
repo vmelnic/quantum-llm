@@ -162,10 +162,12 @@ class CudaWorker:
             )
         self.protocol = int(response.get("protocol", 1))
         self.capacity = int(response.get("capacity", 1))
+        self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
         self.kv_page_tokens = int(response.get("kv_page_tokens", 0))
         self.kv_page_bytes = int(response.get("kv_page_bytes", 0))
         self.kv_page_capacity = int(response.get("kv_page_capacity", 0))
         if (self.protocol < 3 or self.capacity != requested_capacity or
+                self.prefill_chunk_tokens != requested_capacity or
                 self.kv_page_tokens != kv_page_tokens or
                 self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0):
             self.process.kill()
@@ -722,6 +724,10 @@ class Application:
             "maximum_queue": self.args.maximum_queue,
             "worker_capacity": self.args.worker_capacity,
             "worker_protocol": self.worker.protocol,
+            "worker_prefill": {
+                "mode": "causal_chunked",
+                "chunk_tokens": self.worker.prefill_chunk_tokens,
+            },
             "worker_kv": {
                 "dtype": "fp16",
                 "page_tokens": self.worker.kv_page_tokens,

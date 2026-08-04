@@ -122,10 +122,13 @@ most 64 pages, or 384 MiB—not 768 MiB reserved at startup.
 
 Attention uses online softmax and constant shared memory instead of storing one
 score per context token. This removes the previous kernel launch ceiling for
-large contexts. It does not make 262K fast: prefill still invokes one causal
-forward per token and full attention remains quadratic. Chunked prefill,
-FlashAttention-class kernels, RoPE validation, and staged SLO/correctness gates
-are required before raising the certified 4096 limit.
+large contexts. Prefill now groups up to four consecutive tokens from one
+request into a causal microbatch. Full-attention cache writes and DeltaNet state
+updates remain position ordered, while projections and MoE work reuse the
+microbatch path. This is bounded chunked prefill, not FlashAttention: full
+attention remains quadratic and the chunk is tied to worker capacity. Larger
+chunks, prefill-specific workspaces/kernels, RoPE validation, and staged
+SLO/correctness gates are required before raising the certified 4096 limit.
 
 ## Failure model
 

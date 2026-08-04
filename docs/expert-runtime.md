@@ -139,8 +139,10 @@ long-context gates pass.
 
 The local line-framed protocol supports:
 
-- startup `ready` with protocol/capacity and KV page geometry;
-- protocol-v3 `BEGIN` with an exact context reservation, then prefill;
+- startup `ready` with protocol/capacity, causal prefill chunk size, and KV page
+  geometry;
+- protocol-v3 `BEGIN` with an exact context reservation, then position-ordered
+  causal prefill in chunks no larger than the advertised worker capacity;
 - `STEP` to decode several active request IDs together;
 - `STATS` for current KV page allocation/reservation;
 - `END` to release/cancel request state;
@@ -168,3 +170,8 @@ The runtime distinguishes SSD misses, RAM hits, VRAM hits, useful/read/uploaded
 bytes, cache high-water marks, executor time, batch rows, TTFT and inter-token
 latency. Metrics windows are bounded. A benchmark must identify cold/warm/frozen
 placement and cannot infer hot-path throughput from configuration alone.
+
+Chunked prefill shares the normal transformer microbatch implementation. The
+full-model gate requires its generated sequence to equal scalar prefill plus
+decode exactly. The implementation does not claim FlashAttention or an
+efficient 262K path.

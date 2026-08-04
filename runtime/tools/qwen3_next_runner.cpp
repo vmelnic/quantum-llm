@@ -343,12 +343,15 @@ class Qwen3NextModel final {
   std::vector<std::uint32_t> forward_batch(
       std::span<const std::uint32_t> tokens,
       std::span<const std::uint32_t> positions,
-      std::span<const std::uint32_t> state_slots = {}) {
+      std::span<const std::uint32_t> state_slots = {},
+      bool causal_same_slot = false) {
     const auto forward_started = std::chrono::steady_clock::now();
     if (tokens.empty() || tokens.size() != positions.size() ||
         tokens.size() > capacity_ ||
         (!state_slots.empty() && state_slots.size() != tokens.size()))
       throw std::runtime_error("invalid Qwen3-Next microbatch");
+    if (causal_same_slot && state_slots.empty())
+      throw std::runtime_error("causal chunk requires an explicit state slot");
     const auto rows = static_cast<std::uint32_t>(tokens.size());
     std::vector<std::uint32_t> default_slots;
     if (state_slots.empty()) {
@@ -360,8 +363,16 @@ class Qwen3NextModel final {
     for (std::uint32_t row = 0; row < rows; ++row) {
       if (positions[row] >= max_context_ || tokens[row] >= vocab_)
         throw std::runtime_error("token/position outside capacity");
-      if (state_slots[row] >= capacity_ || seen_slots[state_slots[row]])
-        throw std::runtime_error("invalid or duplicate request state slot");
+      if (state_slots[row] >= capacity_)
+        throw std::runtime_error("invalid request state slot");
+      if (causal_same_slot) {
+        if (row && (state_slots[row] != state_slots[0] ||
+                    positions[row] != positions[row - 1U] + 1U))
+          throw std::runtime_error(
+              "causal chunk must use one slot and consecutive positions");
+      } else if (seen_slots[state_slots[row]]) {
+        throw std::runtime_error("duplicate request state slot");
+      }
       if (!slot_context_limits_[state_slots[row]] ||
           positions[row] >= slot_context_limits_[state_slots[row]])
         throw std::runtime_error("token/position outside reserved context");
@@ -424,6 +435,27 @@ class Qwen3NextModel final {
     return result;
   }
 
+  std::uint32_t prefill(std::uint32_t slot,
+                        std::span<const std::uint32_t> prompt) {
+    if (prompt.empty()) throw std::runtime_error("empty prefill prompt");
+    std::uint32_t predicted = 0;
+    std::vector<std::uint32_t> positions;
+    std::vector<std::uint32_t> slots;
+    positions.reserve(capacity_);
+    slots.reserve(capacity_);
+    for (std::size_t offset = 0; offset < prompt.size(); offset += capacity_) {
+      const auto rows = static_cast<std::uint32_t>(
+          std::min<std::size_t>(capacity_, prompt.size() - offset));
+      positions.resize(rows);
+      slots.assign(rows, slot);
+      for (std::uint32_t row = 0; row < rows; ++row)
+        positions[row] = static_cast<std::uint32_t>(offset + row);
+      predicted = forward_batch(prompt.subspan(offset, rows), positions, slots,
+                                true).back();
+    }
+    return predicted;
+  }
+
   expert::runtime::TelemetrySnapshot telemetry() const {
     auto snapshot = cache_->telemetry();
     snapshot.acquire_vram_hits += directory_vram_hits_;
@@ -440,6 +472,7 @@ class Qwen3NextModel final {
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
+  std::uint32_t prefill_chunk_tokens() const noexcept { return capacity_; }
   std::uint64_t kv_page_bytes() const noexcept { return kv_page_bytes_; }
   std::uint64_t kv_page_capacity() const noexcept { return kv_page_capacity_; }
   std::uint64_t kv_allocated_pages() const noexcept {
@@ -1138,7 +1171,8 @@ int worker_loop(Qwen3NextModel& model) {
   std::unordered_map<std::uint64_t, WorkerRequest> active;
   std::vector<bool> used_slots(model.capacity());
   std::cout << "{\"type\":\"ready\",\"protocol\":3,\"capacity\":"
-            << model.capacity() << ",\"kv_page_tokens\":"
+            << model.capacity() << ",\"prefill_chunk_tokens\":"
+            << model.prefill_chunk_tokens() << ",\"kv_page_tokens\":"
             << model.kv_page_tokens() << ",\"kv_page_bytes\":"
             << model.kv_page_bytes() << ",\"kv_page_capacity\":"
             << model.kv_page_capacity() << "}\n" << std::flush;
@@ -1175,11 +1209,7 @@ int worker_loop(Qwen3NextModel& model) {
         used_slots[slot] = true;
         try {
           model.reserve_slot(slot, context_limit);
-          std::uint32_t predicted = 0;
-          for (std::uint32_t position = 0; position < prompt.size(); ++position) {
-            const std::array token{prompt[position]}, positions{position}, slots{slot};
-            predicted = model.forward_batch(token, positions, slots).front();
-          }
+          const auto predicted = model.prefill(slot, prompt);
           active.emplace(
               request_id, WorkerRequest{
                               slot, predicted,
@@ -1434,19 +1464,41 @@ int main(int argc, char** argv) {
 
       std::vector<std::vector<std::uint32_t>> isolated(concurrency);
       for (std::uint32_t row = 0; row < concurrency; ++row) {
-        model.reset_slot(0);
+        model.reset_slot(row);
         std::uint32_t isolated_prediction = 0;
-        for (std::uint32_t position = 0; position < prompts[row].size(); ++position)
-          isolated_prediction = model.forward(prompts[row][position], position);
+        const std::array slot{row};
+        for (std::uint32_t position = 0; position < prompts[row].size(); ++position) {
+          const std::array token{prompts[row][position]}, one_position{position};
+          isolated_prediction =
+              model.forward_batch(token, one_position, slot).front();
+        }
         for (std::uint32_t step = 0; step < new_tokens; ++step) {
           isolated[row].push_back(isolated_prediction);
-          if (step + 1U < new_tokens)
-            isolated_prediction = model.forward(
-                isolated_prediction,
-                static_cast<std::uint32_t>(prompts[row].size()) + step);
+          if (step + 1U < new_tokens) {
+            const std::array token{isolated_prediction}, one_position{
+                static_cast<std::uint32_t>(prompts[row].size()) + step};
+            isolated_prediction =
+                model.forward_batch(token, one_position, slot).front();
+          }
         }
       }
       const bool interleaving_match = isolated == generated;
+      std::vector<std::vector<std::uint32_t>> chunked(concurrency);
+      for (std::uint32_t row = 0; row < concurrency; ++row) {
+        model.reset_slot(row);
+        auto chunked_prediction = model.prefill(row, prompts[row]);
+        const std::array slot{row};
+        for (std::uint32_t step = 0; step < new_tokens; ++step) {
+          chunked[row].push_back(chunked_prediction);
+          if (step + 1U < new_tokens) {
+            const std::array token{chunked_prediction}, one_position{
+                static_cast<std::uint32_t>(prompts[row].size()) + step};
+            chunked_prediction =
+                model.forward_batch(token, one_position, slot).front();
+          }
+        }
+      }
+      const bool chunked_prefill_match = chunked == isolated;
       std::cout << "{\"tokens\":[";
       for (std::size_t i = 0; i < generated.front().size(); ++i) {
         if (i) std::cout << ',';
@@ -1470,6 +1522,10 @@ int main(int argc, char** argv) {
                 << (identical_outputs ? "true" : "false")
                 << ",\"interleaving_match\":"
                 << (interleaving_match ? "true" : "false")
+                << ",\"chunked_prefill_match\":"
+                << (chunked_prefill_match ? "true" : "false")
+                << ",\"prefill_chunk_tokens\":"
+                << model.prefill_chunk_tokens()
                 << ",\"model_load_seconds\":" << load_seconds
                 << ",\"prompt_seconds\":" << prompt_seconds
                 << ",\"warm_ttft_seconds\":" << prompt_seconds
@@ -1525,7 +1581,7 @@ int main(int argc, char** argv) {
                 << metrics.over_quota_evictions;
       print_phase_json(std::cout, phases);
       std::cout << "}\n";
-      return interleaving_match ? 0 : 2;
+      return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
       if (argc > 9)

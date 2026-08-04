@@ -3,7 +3,7 @@ param(
     [string]$Mode = "Both",
     [string]$Container = "",
     [string]$PromptTokenIds = "151644,872,374",
-    [string]$BatchPromptTokenIds = "151644,872,374;151644,9707,374;151644,17,488,17;151644,3696,13362",
+    [string]$BatchPromptTokenIds = "151644,872,374;151644,9707,374;151644,17,488,17;151644,3696,13362,374,279,330,82",
     [int]$NewTokens = 32,
     [int]$Concurrency = 4,
     [int]$RamCacheGiB = 48,
@@ -88,6 +88,11 @@ function Invoke-GateRun {
             [Environment]::NewLine
         throw "P6 $Name runner failed with $exitCode`:$([Environment]::NewLine)$tail"
     }
+    if ($null -eq $model.PSObject.Properties["tokens_per_second"]) {
+        $tail = @(Get-Content $stderr -Tail 30 -ErrorAction SilentlyContinue) -join `
+            [Environment]::NewLine
+        throw "P6 $Name runner returned an error payload (exit=$exitCode):$([Environment]::NewLine)$tail"
+    }
     $pagefileAfter = Get-PagefileUsageMiB
     $pagefilePeak = [Math]::Max($pagefilePeak, $pagefileAfter)
     $pagefileGrowth = [Math]::Max([int64]0, $pagefilePeak - $pagefileBefore)
@@ -103,7 +108,8 @@ function Invoke-GateRun {
         measured_tokens_per_second = [double]$model.tokens_per_second
         speed_gate_pass = [double]$model.tokens_per_second -ge $RequiredTokensPerSecond
         correctness_gate_pass = if ($Name -eq "batch") {
-            [bool]$model.mixed_prompts -and [bool]$model.interleaving_match
+            [bool]$model.mixed_prompts -and [bool]$model.interleaving_match -and
+            [bool]$model.chunked_prefill_match
         } else { $true }
         container_bytes = [int64]$model.container_bytes
         physical_ram_bytes = $physicalRam

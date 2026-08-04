@@ -17,13 +17,18 @@ The final full-model gate produced:
 
 | Gate | Result | Required |
 |---|---:|---:|
-| single-stream hot runtime | 46.7651 tok/s | 10 tok/s |
-| four-request aggregate hot runtime | 39.4794 tok/s | 30 tok/s |
+| single-stream hot runtime | 47.6703 tok/s | 10 tok/s |
+| four-request aggregate hot runtime | 41.6653 tok/s | 30 tok/s |
 
 The gate used a warmup in the same process, retained expert residency, then
 reset request state and measurement counters. It observed no expert-weight H2D
-in the measured hot window, no pagefile growth, and identical batched versus
-isolated token sequences.
+in the measured hot window, no pagefile growth, identical batched versus
+isolated token sequences, and exact chunked-prefill versus scalar-prefill
+sequences on the full model.
+
+The mixed batch contains prompt lengths 3, 3, 4, and 7. With a four-token
+prefill chunk, the seven-token case crosses a `4 + 3` boundary and proves that
+KV and recurrent DeltaNet state survive more than one chunk.
 
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
@@ -42,12 +47,29 @@ cold operational window reported:
 
 - 21 decode batches / 32 rows;
 - effective decode batch: 1.5238;
-- TTFT p95: 22.922 seconds;
-- inter-token p95: 2.343 seconds.
+- TTFT p95: 16.203 seconds;
+- inter-token p95: 2.375 seconds.
 
 Smoke latencies include cold expert placement and short, heterogeneous requests.
 They demonstrate lifecycle behavior, not the hot throughput SLO. The large gap
 between hot gate and cold API latency is an open production problem.
+
+## Real text probe
+
+A streaming Chat Completions probe used a 25-token templated English prompt and
+requested 32 tokens. Two identical sequential requests on the already-running
+service produced:
+
+| Placement state | TTFT | Total | Approx. post-first-token rate |
+|---|---:|---:|---:|
+| first request after heterogeneous smoke | 25.664 s | 56.216 s | 1.01 tok/s |
+| immediately repeated request | 0.807 s | 2.429 s | 19.12 tok/s |
+
+The output text and token usage were identical. The warm prefill processed the
+25-token prompt at roughly 31 prompt tok/s, but this is not yet a formal prefill
+throughput gate. The result exposes two separate remaining costs: cold expert
+placement dominates the first request, while a longer prompt/output working set
+still trails the short synthetic runner's fully hot 47.67 tok/s decode rate.
 
 ## Memory observation
 
