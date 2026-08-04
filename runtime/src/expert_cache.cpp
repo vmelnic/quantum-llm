@@ -204,12 +204,17 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         vram_need > config.vram.high_watermark_bytes) {
       return false;
     }
-    bool pressured = ram_bytes + ram_need > config.ram.high_watermark_bytes ||
-                     vram_bytes + vram_need > config.vram.high_watermark_bytes;
+    const bool ram_pressured =
+        ram_bytes + ram_need > config.ram.high_watermark_bytes;
+    const bool vram_pressured =
+        vram_bytes + vram_need > config.vram.high_watermark_bytes;
+    const bool pressured = ram_pressured || vram_pressured;
     while (ram_bytes + ram_need > config.ram.high_watermark_bytes ||
            vram_bytes + vram_need > config.vram.high_watermark_bytes) {
-      const bool need_ram = ram_bytes + ram_need > config.ram.low_watermark_bytes;
-      const bool need_vram = vram_bytes + vram_need > config.vram.low_watermark_bytes;
+      const bool need_ram =
+          ram_bytes + ram_need > config.ram.high_watermark_bytes;
+      const bool need_vram =
+          vram_bytes + vram_need > config.vram.high_watermark_bytes;
       if (!evict_one_locked(need_ram, need_vram, &key)) {
         Telemetry::add(metrics.stalled_by_budget_);
         return false;
@@ -218,10 +223,12 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     if (pressured) {
       // Continue evicting toward low watermarks when safe, creating headroom
       // for a burst instead of oscillating at the high mark.
-      while ((ram_bytes > config.ram.low_watermark_bytes ||
-              vram_bytes > config.vram.low_watermark_bytes) &&
-             evict_one_locked(ram_bytes > config.ram.low_watermark_bytes,
-                              vram_bytes > config.vram.low_watermark_bytes,
+      while (((ram_pressured && ram_bytes > config.ram.low_watermark_bytes) ||
+              (vram_pressured && vram_bytes > config.vram.low_watermark_bytes)) &&
+             evict_one_locked(ram_pressured &&
+                                  ram_bytes > config.ram.low_watermark_bytes,
+                              vram_pressured &&
+                                  vram_bytes > config.vram.low_watermark_bytes,
                               &key)) {
       }
     }
@@ -237,6 +244,15 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       }
       if (entry->state == CacheState::ram_ready &&
           (entry->host || entry->host_copy)) {
+        if (entry->vram_reserved == 0) {
+          if (!make_capacity_locked(0, entry->record.stored_bytes,
+                                    entry->key)) {
+            continue;
+          }
+          entry->vram_reserved = entry->record.stored_bytes;
+          vram_bytes += entry->vram_reserved;
+          update_usage_locked();
+        }
         transition_locked(*entry, CacheState::gpu_uploading);
         Telemetry::add(metrics.upload_started_);
         return {TaskKind::upload, entry};

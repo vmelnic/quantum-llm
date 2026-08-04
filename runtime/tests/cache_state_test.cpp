@@ -263,11 +263,15 @@ struct Harness final {
   std::shared_ptr<er::FixedBufferPool> buffers;
   er::ExpertCache cache;
 
-  explicit Harness(std::uint64_t budget = 8192, std::size_t slots = 2)
+  explicit Harness(std::uint64_t budget = 8192, std::size_t slots = 2,
+                   std::uint64_t vram_budget = 0)
       : buffers(std::make_shared<er::FixedBufferPool>(
             slots, er::kExpertPackAlignment, er::kExpertPackAlignment)),
         cache({{budget, budget, std::min<std::uint64_t>(4096, budget)},
-               {budget, budget, std::min<std::uint64_t>(4096, budget)}, true},
+               {vram_budget ? vram_budget : budget,
+                vram_budget ? vram_budget : budget,
+                std::min<std::uint64_t>(4096,
+                    vram_budget ? vram_budget : budget)}, true},
               storage, uploader, buffers) {}
 
   er::AcquireResult finish(er::AcquireHandle& handle,
@@ -431,9 +435,9 @@ void test_budget_eviction_refcount_and_cancellation() {
           "releasing a lease did not unblock budget admission");
   auto third_result = harness.finish(third_handle, third);
   const auto first_after = harness.cache.inspect(first.key);
-  require(first_after && first_after->state == er::CacheState::absent &&
-              !first_after->has_device_copy,
-          "LRU expert was not safely evicted");
+  require(first_after && first_after->state == er::CacheState::vram_ready &&
+              !first_after->has_host_copy && first_after->has_device_copy,
+          "RAM pressure incorrectly coupled RAM and VRAM eviction");
   require(second_result.lease && third_result.lease,
           "live leases were invalidated by eviction");
 
@@ -499,6 +503,35 @@ void test_short_read_checksum_and_upload_fail_closed() {
   }
 }
 
+void test_ram_hit_reuploads_after_vram_eviction() {
+  Harness harness(8192, 1, 4096);
+  const auto first = make_record(20, 0);
+  const auto second = make_record(21, 4096);
+  auto first_handle = harness.cache.acquire(first.key, first.record);
+  auto first_result = harness.finish(first_handle, first);
+  first_result.lease = {};
+
+  auto second_handle = harness.cache.acquire(second.key, second.record);
+  auto second_result = harness.finish(second_handle, second);
+  second_result.lease = {};
+  const auto first_in_ram = harness.cache.inspect(first.key);
+  require(first_in_ram && first_in_ram->state == er::CacheState::ram_ready &&
+              first_in_ram->has_host_copy && !first_in_ram->has_device_copy,
+          "VRAM pressure discarded the independent RAM tier");
+
+  const auto reads_before = harness.storage->read_count();
+  auto ram_hit = harness.cache.acquire(first.key, first.record);
+  require(harness.storage->read_count() == reads_before &&
+              harness.uploader->pending_count() == 1,
+          "RAM hit reread SSD or failed to schedule H2D");
+  harness.uploader->complete_success();
+  auto result = ram_hit.get();
+  require(result.status.ok() && result.lease,
+          "RAM hit did not republish after VRAM reservation");
+  require(harness.cache.telemetry().upload_completed == 3,
+          "RAM reupload telemetry mismatch");
+}
+
 }  // namespace
 
 int main() {
@@ -508,6 +541,7 @@ int main() {
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();
     test_short_read_checksum_and_upload_fail_closed();
+    test_ram_hit_reuploads_after_vram_eviction();
     std::cout << "expert_runtime_tests: PASS\n";
     return 0;
   } catch (const std::exception& error) {
