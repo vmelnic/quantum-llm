@@ -568,3 +568,28 @@ Artefactul `p6-gate-batch-18g-pass.json` raportează:
 Containerul de `81.903.198.208` bytes este mai mare decât cei
 `68.641.103.872` bytes RAM fizici, iar ambele SLO-uri P6 sunt astfel închise
 fără al doilea GPU și fără a șterge checkpoint-ul sursă.
+
+### Deploy persistent P6
+
+Task Scheduler rulează profilul `QuantumLLM-P6ExpertServer` pe loopback cu
+build ID `2383494`, worker protocol 2, capacitate 4, cache RAM 48 GiB și cache
+VRAM 18 GiB. `/model-info` publică manifest hash
+`55cc761ae66f294f2ad423421cb4d87462aaafea9ccae0c4b89efdaab04656e3` și
+experts index hash
+`45c98005ae0897bbadfd8f9315c003f33c03a16a80b0a3cf6d66aa0551ca7bab`.
+
+Primul smoke a găsit că disconnect-ul putea încăpea complet în send buffer și
+nu producea `BrokenPipeError`; serverul a fost corectat să detecteze FIN/RST
+prin peek non-blocant înaintea următorului decode și să închidă generatorul,
+trimițând `END` workerului. Smoke-ul final a trecut cu:
+
+- `completed_delta=5` pentru patru completări concurente plus streaming;
+- `decode_batches_delta=10`, `decode_rows_delta=21`, batch efectiv `2,1`;
+- SSE terminat cu `[DONE]` și `cancellation_observed=true`;
+- model/build/container identity corecte;
+- TTFT p95 `15,109 s` și inter-token p95 `2,563 s` pe smoke-ul operațional
+  rece; acestea nu înlocuiesc gate-urile hot de throughput.
+
+Installerul oprește acum arborele de procese al aceluiași repo/port înainte de
+reînregistrare; aceasta previne ca un worker vechi să păstreze portul și VRAM la
+redeploy sau rollback.

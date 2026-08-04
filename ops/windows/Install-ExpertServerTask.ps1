@@ -36,6 +36,43 @@ $startScript = Join-Path $PSScriptRoot $(if ($isP6) {
 if (-not (Test-Path -LiteralPath $startScript -PathType Leaf)) {
     throw "Start script is missing: $startScript"
 }
+
+# Re-registration does not reliably terminate grandchildren of the scheduled
+# PowerShell action. Stop only the server tree owned by this repository and
+# endpoint before replacing the task, otherwise an old worker can retain the
+# port/VRAM while the new task appears to have started.
+$existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+if ($existingTask) {
+    Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
+$serverScriptPattern = [regex]::Escape(
+    (Join-Path $script:RepoRoot "ops\python\expert_server.py"))
+$portPattern = "(?:^|\s)--port\s+$Port(?:\s|$)"
+$processes = @(Get-CimInstance Win32_Process)
+$targetIds = [Collections.Generic.HashSet[int]]::new()
+foreach ($process in $processes) {
+    if ($process.CommandLine -and
+        $process.CommandLine -match $serverScriptPattern -and
+        $process.CommandLine -match $portPattern) {
+        [void]$targetIds.Add([int]$process.ProcessId)
+    }
+}
+$changed = $true
+while ($changed) {
+    $changed = $false
+    foreach ($process in $processes) {
+        if ($targetIds.Contains([int]$process.ParentProcessId) -and
+            $targetIds.Add([int]$process.ProcessId)) {
+            $changed = $true
+        }
+    }
+}
+if ($targetIds.Count -gt 0) {
+    Stop-Process -Id @($targetIds) -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Milliseconds 500
+}
+
 $arguments = @(
     "-NoProfile", "-ExecutionPolicy", "Bypass",
     "-File", "`"$startScript`"",

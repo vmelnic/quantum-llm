@@ -544,7 +544,7 @@ Starea curentă:
 | P2 storage/cache | completă pentru P6: IOCP, cache RAM/VRAM, host lease, director GPU, LFU cu feedback batched și placement adaptiv asincron pe epoci |
 | P3 single-request exact | completă: gate Qwen PASS la 31,7312 tok/s cu cache expert 18 GiB |
 | P4 batching | completă: 31,1004 tok/s aggregate la concurență 4, interleaving exact și zero H2D weights după warmup |
-| P5 serviciu | completă și operabilă; profilul Task Scheduler și smoke-ul Qwen sunt pregătite |
+| P5 serviciu | completă și deployată: task `QuantumLLM-P6ExpertServer`, build `2383494`, smoke health/concurrency/SSE/cancellation PASS |
 | P6 model > RAM | completă: 81,90 GB > 68,64 GB RAM, single și aggregate PASS, zero creștere pagefile și >24 GiB RAM fizic liber |
 
 Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P6 a
