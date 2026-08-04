@@ -397,6 +397,15 @@ containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
 Preflight-ul confirmă că download-ul și conversia cu reclamare sunt fezabile,
 dar conversia fără reclamare nu este.
 
+Ordinea de reclamare a fost simulată din `weight_map` și mărimile oficiale ale
+celor 41 de shard-uri, nu doar din masa totală. Un record are `3.162.112` bytes,
+un pack de 4 GiB ține 1.358 experți, iar conversia produce 19 pack-uri. Shard-ul
+41 (dense/MTP) se poate reclama imediat după `dense.qpack`; apoi se eliberează
+2–3 shard-uri per pack. La proiecția curentă de spațiu după download, minimum-ul
+este aproximativ `49,93 GiB` liberi, mult peste safety margin-ul de 8 GiB.
+Preflight-ul va recalcula aceeași curbă din dimensiunile locale înainte de a
+permite conversia reală.
+
 Compilerul are acum un mod distructiv explicit, oprit implicit: după fsync-ul
 fiecărui pack și al stării, jurnalizează hash-ul shard-ului consumat și elimină
 numai shard-uri fără tensori viitori. Modul trece testul end-to-end, dar nu va

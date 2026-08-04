@@ -107,6 +107,12 @@ Get-P6ModelDownload.ps1
 Invoke-P6Preflight.ps1
 ```
 
+La 41/41, preflight-ul reconstruiește exact ordinea compilerului din
+`weight_map`: dense pack, apoi experți `(layer, expert)` și reclamare numai după
+ultimul tensor necesar din fiecare shard. Artefactul include fiecare eveniment
+de reclamare și minimum-ul proiectat de spațiu liber; estimarea simplă
+`dense + un pack` nu este folosită drept dovadă finală.
+
 Compilerul folosește `-Adapter qwen3_next`. Modelul include un decoder auxiliar
 MTP; adaptorul îl clasifică și îl păstrează explicit. Nu se șterge și nu se mută
 niciun checkpoint existent. Înaintea conversiei trebuie asigurat spațiu pentru
