@@ -26,6 +26,9 @@ remote files.
 | `Invoke-BuildExpertRuntime.ps1` | configure, build, C++/CUDA/Python tests |
 | `Start-P6ModelDownload.ps1` | resumable Hugging Face download task |
 | `Get-P6ModelDownload.ps1` | independently verify download progress/completion |
+| `Start-HuggingFaceModelDownload.ps1` | generic pinned, disk-checked Xet download task |
+| `Get-HuggingFaceModelDownload.ps1` | progress and index/shard completion verification |
+| `Start-DeepSeekV4FlashDownload.ps1` | pinned DeepSeek-V4-Flash Xet download profile |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
 | `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |
 | `Invoke-P6Conversion.ps1` | pinned Qwen3-Next conversion profile |
