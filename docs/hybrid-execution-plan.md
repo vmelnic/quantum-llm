@@ -195,23 +195,45 @@ rejected dispatch plans, zero SSD/H2D in the measured window, and zero pagefile
 use. A deterministic cache test proves that, at equal frequency, the expert
 with greater router-score mass survives VRAM pressure.
 
-### Stage 3b — bounded prefetch — next
+### Stage 3b — bounded sequence-local prefetch — completed
 
 Use the bounded score temperature together with reuse, selection load,
 measured CPU debt, and upload cost. Prefetch is admitted only if it has credits,
 cannot evict an in-use/hotter expert, and cannot starve current work.
 
-Potential predictors are sequence-local reuse, near-top-k scores, and
-workload/prefix warm sets. Prediction failure and cache pollution are first-
-class metrics.
+The existing future-promotion path is now a bounded predictor rather than an
+unbounded debt map:
 
-Acceptance:
+- at most 4,096 candidate histories and one in-flight promotion;
+- at least two recent observations within 192 routed-layer epochs;
+- CPU debt is weighted conservatively by selected-score EWMA;
+- a priority queue orders benefit/upload-cost without scanning all candidates;
+- cache admission still requires a strictly colder, unreferenced victim;
+- current-route work is planned first; promotion uses only remaining credit;
+- pending stale work is cancelled and candidate history/predictions expire;
+- completed predictions are classified useful only if later observed
+  GPU-resident, otherwise missing/expired predictions are wasted.
+
+The initial one-observation version exposed 9 useful versus 107 wasted
+predictions. Requiring two recent observations reduced the measured window to
+7 useful / 77 wasted and 243,482,624 wasted bytes. A direct default-off run
+removed the pollution but reduced VRAM hit ratio from 86.08% to 83.94% and
+throughput from 42.1741 to 38.3828 tok/s. The bounded predictor therefore
+remains enabled by default for the qualified balanced runtime; its low strict
+precision remains visible and is not treated as solved.
+
+This stage implements sequence-local reuse. Near-top-k logits and
+workload/prefix warm sets remain possible predictors, but are not enabled
+without separate evidence. Prediction failure and cache pollution are
+first-class metrics.
+
+Acceptance evidence:
 
 - no unbounded score or trace history;
 - prefetch cancellation and stale-epoch behavior are deterministic;
 - useful/wasted prefetch bytes and hit-rate delta are observable;
-- cold/warm service evidence improves or the feature remains disabled by
-  default.
+- the qualified hot batch improves against a direct prefetch-off run; cold/warm
+  service qualification remains required before changing service profiles.
 
 ## Stage 4 — CPU executor efficiency and autotuning
 

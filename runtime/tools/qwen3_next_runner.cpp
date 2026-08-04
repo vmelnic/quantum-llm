@@ -150,6 +150,13 @@ struct PhaseTelemetry final {
   std::uint64_t cpu_expert_selections{};
   std::uint64_t gpu_expert_selections{};
   std::uint64_t adaptive_promotions{};
+  std::uint64_t useful_prefetches{};
+  std::uint64_t useful_prefetch_bytes{};
+  std::uint64_t wasted_prefetches{};
+  std::uint64_t wasted_prefetch_bytes{};
+  std::uint64_t stale_prefetch_cancellations{};
+  std::uint64_t prefetch_candidate_evictions{};
+  std::uint64_t prefetch_credit_rejections{};
   std::uint64_t cpu_result_h2d_bytes{};
   std::uint64_t cpu_result_map_h2d_bytes{};
   std::uint64_t final_head_ns{};
@@ -180,6 +187,16 @@ PhaseTelemetry phase_delta(const PhaseTelemetry& value,
       value.cpu_expert_selections - baseline.cpu_expert_selections,
       value.gpu_expert_selections - baseline.gpu_expert_selections,
       value.adaptive_promotions - baseline.adaptive_promotions,
+      value.useful_prefetches - baseline.useful_prefetches,
+      value.useful_prefetch_bytes - baseline.useful_prefetch_bytes,
+      value.wasted_prefetches - baseline.wasted_prefetches,
+      value.wasted_prefetch_bytes - baseline.wasted_prefetch_bytes,
+      value.stale_prefetch_cancellations -
+          baseline.stale_prefetch_cancellations,
+      value.prefetch_candidate_evictions -
+          baseline.prefetch_candidate_evictions,
+      value.prefetch_credit_rejections -
+          baseline.prefetch_credit_rejections,
       value.cpu_result_h2d_bytes - baseline.cpu_result_h2d_bytes,
       value.cpu_result_map_h2d_bytes - baseline.cpu_result_map_h2d_bytes,
       value.final_head_ns - baseline.final_head_ns,
@@ -241,6 +258,16 @@ void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
          << gpu_ns_per_selection
          << ",\"cpu_gpu_overlap_ratio\":" << overlap_ratio
          << ",\"adaptive_promotions\":" << phase.adaptive_promotions
+         << ",\"useful_prefetches\":" << phase.useful_prefetches
+         << ",\"useful_prefetch_bytes\":" << phase.useful_prefetch_bytes
+         << ",\"wasted_prefetches\":" << phase.wasted_prefetches
+         << ",\"wasted_prefetch_bytes\":" << phase.wasted_prefetch_bytes
+         << ",\"stale_prefetch_cancellations\":"
+         << phase.stale_prefetch_cancellations
+         << ",\"prefetch_candidate_evictions\":"
+         << phase.prefetch_candidate_evictions
+         << ",\"prefetch_credit_rejections\":"
+         << phase.prefetch_credit_rejections
          << ",\"cpu_result_h2d_bytes\":" << phase.cpu_result_h2d_bytes
          << ",\"cpu_result_map_h2d_bytes\":"
          << phase.cpu_result_map_h2d_bytes
@@ -368,6 +395,8 @@ class Qwen3NextModel final {
     route_score_sums_.resize(experts_);
     route_score_maxima_.resize(experts_);
     route_accesses_.reserve(experts_);
+    routed_expert_keys_.reserve(capacity_ * top_k_);
+    missing_expert_keys_.reserve(capacity_ * top_k_);
 
     const auto slot_bytes = static_cast<std::size_t>(max_expert_record_bytes_);
     const auto slot_count = std::max<std::size_t>(top_k_ * 2U, 32U);
@@ -574,7 +603,15 @@ class Qwen3NextModel final {
   }
   PhaseTelemetry phase_telemetry() const noexcept {
     auto result = phase_;
-    result.adaptive_promotions = placement_->telemetry().completed;
+    const auto placement = placement_->telemetry();
+    result.adaptive_promotions = placement.completed;
+    result.useful_prefetches = placement.useful_prefetches;
+    result.useful_prefetch_bytes = placement.useful_prefetch_bytes;
+    result.wasted_prefetches = placement.wasted_prefetches;
+    result.wasted_prefetch_bytes = placement.wasted_prefetch_bytes;
+    result.stale_prefetch_cancellations = placement.stale_cancellations;
+    result.prefetch_candidate_evictions = placement.candidate_evictions;
+    result.prefetch_credit_rejections = placement.credit_rejections;
     return result;
   }
   expert::runtime::HybridDispatchTelemetry dispatch_telemetry() const noexcept {
@@ -990,6 +1027,13 @@ class Qwen3NextModel final {
     auto plan = directory_->pin_or_collect_misses(
         layer, routing_indices_, rows * top_k_, nullptr, true);
     status_check(plan.status);
+    routed_expert_keys_.clear();
+    missing_expert_keys_.clear();
+    for (const auto expert : plan.ready_experts)
+      routed_expert_keys_.push_back({model_id_, layer, expert, 1});
+    for (const auto expert : plan.missing_experts)
+      missing_expert_keys_.push_back({model_id_, layer, expert, 1});
+    placement_->observe_routes(routed_expert_keys_, missing_expert_keys_);
     const auto selection_count = rows * top_k_;
     const bool placement_feedback = !placement_->frozen();
     if (!plan.missing_experts.empty() || placement_feedback) {
@@ -1295,7 +1339,8 @@ class Qwen3NextModel final {
               static_cast<std::size_t>(layer) * experts_ + expert);
           placement_->consider(
               {model_id_, layer, expert, 1}, record,
-              static_cast<std::uint32_t>(cpu_groups[index].selections.size()));
+              static_cast<std::uint32_t>(cpu_groups[index].selections.size()),
+              route_score_sums_[expert]);
         }
       }
     phase_.expert_compute_ns += elapsed_ns(expert_started);
@@ -1323,6 +1368,8 @@ class Qwen3NextModel final {
   std::vector<std::uint32_t> route_access_counts_;
   std::vector<double> route_score_sums_, route_score_maxima_;
   std::vector<expert::runtime::ExpertAccess> route_accesses_;
+  std::vector<expert::runtime::ExpertKey> routed_expert_keys_;
+  std::vector<expert::runtime::ExpertKey> missing_expert_keys_;
   std::shared_ptr<expert::runtime::WindowsIocpStorage> storage_;
   std::shared_ptr<expert::runtime::cuda::CudaExpertUploader> uploader_;
   std::shared_ptr<expert::runtime::cuda::CudaExpertDirectory> directory_;

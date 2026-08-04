@@ -107,6 +107,21 @@ hit-rate improvement. Its acceptance evidence is semantic and structural: the
 full model remains correct, while a deterministic pressure test proves that an
 equal-frequency, higher-score expert is retained over its lower-score peer.
 
+### Bounded prefetch policy
+
+The first attributed predictor admitted after one observation and reported 9
+useful versus 107 wasted predictions. Requiring two recent observations cut
+wasted traffic from 338,345,984 B to 243,482,624 B. Its qualified run passed at
+42.1741 tok/s, with a 86.08% VRAM hit ratio, exact outputs, zero measured-window
+expert H2D, and zero pagefile use.
+
+A direct run with prefetch disabled produced 38.3828 tok/s and an 83.94% VRAM
+hit ratio. It had zero predicted/wasted bytes, but moved 10,658 selections to
+CPU versus 9,353 with bounded prefetch. This A/B is why the one-credit predictor
+remains enabled in the balanced baseline despite low strict next-use precision.
+Its pollution telemetry remains a production tuning signal, not a success
+metric to optimize in isolation.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

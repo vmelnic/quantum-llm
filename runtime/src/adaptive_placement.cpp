@@ -2,9 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
-#include <deque>
 #include <limits>
 #include <map>
+#include <queue>
 #include <stdexcept>
 #include <utility>
 #include <vector>
@@ -15,13 +15,34 @@ struct AdaptivePlacementPlanner::Impl final {
   struct Candidate final {
     PayloadRecord record;
     std::uint64_t debt_ns{};
+    std::uint64_t last_seen_epoch{};
+    std::uint64_t predicted_epoch{};
+    std::uint64_t queue_generation{};
+    std::uint32_t observations{};
+    double routing_score_ewma{};
     bool queued{};
     bool pending{};
+    bool demanded{};
+    bool ready_prediction{};
   };
 
   struct Pending final {
     ExpertKey key;
     AcquireHandle handle;
+    std::uint64_t scheduled_epoch{};
+    std::uint64_t bytes{};
+    bool cancelled{};
+  };
+
+  struct Eligible final {
+    double priority{};
+    ExpertKey key;
+    std::uint64_t generation{};
+
+    bool operator<(const Eligible& other) const noexcept {
+      if (priority != other.priority) return priority < other.priority;
+      return other.key < key;
+    }
   };
 
   Impl(ExpertCache& value, AdaptivePlacementConfig settings)
@@ -36,7 +57,12 @@ struct AdaptivePlacementPlanner::Impl final {
         !std::isfinite(config.cpu_cost_ewma_alpha) ||
         config.cpu_cost_ewma_alpha <= 0.0 ||
         config.cpu_cost_ewma_alpha > 1.0 ||
-        config.maximum_inflight_promotions == 0) {
+        !std::isfinite(config.routing_score_reuse_weight) ||
+        config.routing_score_reuse_weight < 0.0 ||
+        config.maximum_inflight_promotions == 0 ||
+        config.maximum_candidates == 0 ||
+        config.minimum_recent_observations == 0 ||
+        config.candidate_ttl_epochs == 0) {
       throw std::invalid_argument("invalid adaptive placement configuration");
     }
   }
@@ -49,6 +75,41 @@ struct AdaptivePlacementPlanner::Impl final {
         observed * config.cpu_cost_ewma_alpha;
   }
 
+  [[nodiscard]] std::uint64_t upload_cost(const Candidate& candidate) const {
+    return std::max<std::uint64_t>(
+        1, static_cast<std::uint64_t>(std::ceil(
+               static_cast<double>(candidate.record.stored_bytes) * 1.0e9 /
+               config.conservative_h2d_bytes_per_second *
+               config.admission_margin)));
+  }
+
+  [[nodiscard]] double effective_debt(const Candidate& candidate) const {
+    return static_cast<double>(candidate.debt_ns) *
+           (1.0 + config.routing_score_reuse_weight *
+                      candidate.routing_score_ewma);
+  }
+
+  void attribute_resident_use(Candidate& candidate) noexcept {
+    if (candidate.ready_prediction) {
+      ++metrics.useful_prefetches;
+      metrics.useful_prefetch_bytes += candidate.record.stored_bytes;
+      candidate.ready_prediction = false;
+      candidate.debt_ns = 0;
+    }
+  }
+
+  void attribute_missing_use(Candidate& candidate) noexcept {
+    if (candidate.pending) {
+      candidate.demanded = true;
+    } else if (candidate.ready_prediction) {
+      candidate.ready_prediction = false;
+      candidate.debt_ns = 0;
+      candidate.observations = 0;
+      ++metrics.wasted_prefetches;
+      metrics.wasted_prefetch_bytes += candidate.record.stored_bytes;
+    }
+  }
+
   void complete_ready() {
     for (std::size_t index = 0; index < pending.size();) {
       if (pending[index].handle.wait_for(std::chrono::milliseconds(0)) !=
@@ -57,34 +118,140 @@ struct AdaptivePlacementPlanner::Impl final {
         continue;
       }
       auto result = pending[index].handle.get();
-      if (result.status.ok() && result.lease) {
-        ++metrics.completed;
-      } else {
-        ++metrics.failed;
+      auto candidate = candidates.find(pending[index].key);
+      if (candidate != candidates.end()) {
+        candidate->second.pending = false;
+        if (result.status.ok() && result.lease) {
+          ++metrics.completed;
+          if (candidate->second.demanded) {
+            ++metrics.useful_prefetches;
+            metrics.useful_prefetch_bytes += pending[index].bytes;
+            candidate->second.demanded = false;
+            candidate->second.debt_ns = 0;
+          } else {
+            candidate->second.ready_prediction = true;
+            candidate->second.predicted_epoch = epoch;
+          }
+        } else if (!pending[index].cancelled) {
+          ++metrics.failed;
+        }
       }
-      candidates[pending[index].key].pending = false;
       pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(index));
     }
+  }
+
+  void expire_stale() {
+    for (auto& item : pending) {
+      auto candidate = candidates.find(item.key);
+      if (!item.cancelled && candidate != candidates.end() &&
+          !candidate->second.demanded &&
+          epoch - item.scheduled_epoch > config.candidate_ttl_epochs) {
+        item.handle.cancel();
+        item.cancelled = true;
+        ++metrics.stale_cancellations;
+        ++metrics.wasted_prefetches;
+        metrics.wasted_prefetch_bytes += item.bytes;
+      }
+    }
+    for (auto& [key, candidate] : candidates) {
+      (void)key;
+      if (candidate.ready_prediction &&
+          epoch - candidate.predicted_epoch > config.candidate_ttl_epochs) {
+        candidate.ready_prediction = false;
+        candidate.debt_ns = 0;
+        candidate.observations = 0;
+        ++metrics.wasted_prefetches;
+        metrics.wasted_prefetch_bytes += candidate.record.stored_bytes;
+      }
+      if (candidate.queued &&
+          epoch - candidate.last_seen_epoch > config.candidate_ttl_epochs) {
+        candidate.queued = false;
+        ++candidate.queue_generation;
+        ++metrics.stale_cancellations;
+      }
+    }
+    complete_ready();
+  }
+
+  void observe_routes(std::span<const ExpertKey> gpu_resident,
+                      std::span<const ExpertKey> missing) {
+    complete_ready();
+    ++epoch;
+    for (const auto& key : gpu_resident) {
+      const auto candidate = candidates.find(key);
+      if (candidate != candidates.end())
+        attribute_resident_use(candidate->second);
+    }
+    for (const auto& key : missing) {
+      const auto candidate = candidates.find(key);
+      if (candidate != candidates.end())
+        attribute_missing_use(candidate->second);
+    }
+    if (!pending.empty() || (epoch & 0x3fU) == 0U) expire_stale();
+  }
+
+  bool ensure_candidate_capacity(const ExpertKey& key) {
+    if (candidates.contains(key)) return true;
+    if (candidates.size() < config.maximum_candidates) return true;
+    auto victim = candidates.end();
+    for (auto iterator = candidates.begin(); iterator != candidates.end();
+         ++iterator) {
+      const auto& candidate = iterator->second;
+      if (candidate.queued || candidate.pending || candidate.ready_prediction)
+        continue;
+      if (victim == candidates.end() ||
+          candidate.last_seen_epoch < victim->second.last_seen_epoch) {
+        victim = iterator;
+      }
+    }
+    if (victim == candidates.end()) {
+      ++metrics.credit_rejections;
+      return false;
+    }
+    candidates.erase(victim);
+    ++metrics.candidate_evictions;
+    return true;
+  }
+
+  void queue_if_profitable(const ExpertKey& key, Candidate& candidate) {
+    const auto cost = upload_cost(candidate);
+    if (!config.enable_prefetch || frozen || candidate.queued ||
+        candidate.pending || cost == 0 ||
+        candidate.observations < config.minimum_recent_observations ||
+        effective_debt(candidate) < static_cast<double>(cost)) {
+      return;
+    }
+    candidate.queued = true;
+    ++candidate.queue_generation;
+    eligible.push({effective_debt(candidate) / static_cast<double>(cost), key,
+                   candidate.queue_generation});
+    if (pending.size() >= config.maximum_inflight_promotions)
+      ++metrics.credit_rejections;
   }
 
   void fill_slots() {
     if (frozen) return;
     while (pending.size() < config.maximum_inflight_promotions &&
            !eligible.empty()) {
-      const auto key = eligible.front();
-      eligible.pop_front();
-      auto iterator = candidates.find(key);
-      if (iterator == candidates.end()) continue;
+      const auto next = eligible.top();
+      eligible.pop();
+      auto iterator = candidates.find(next.key);
+      if (iterator == candidates.end() || !iterator->second.queued ||
+          iterator->second.queue_generation != next.generation) {
+        continue;
+      }
       auto& candidate = iterator->second;
       candidate.queued = false;
       if (candidate.pending) continue;
-      if (!cache.vram_admission_would_improve(key, candidate.record)) {
+      if (!cache.vram_admission_would_improve(next.key, candidate.record)) {
         ++metrics.admission_rejected;
         continue;
       }
-      pending.push_back({key, cache.acquire(key, candidate.record)});
+      pending.push_back({next.key, cache.acquire(next.key, candidate.record),
+                         epoch, candidate.record.stored_bytes, false});
       candidate.debt_ns = 0;
       candidate.pending = true;
+      candidate.demanded = false;
       ++metrics.scheduled;
       metrics.scheduled_bytes += candidate.record.stored_bytes;
       complete_ready();
@@ -92,41 +259,40 @@ struct AdaptivePlacementPlanner::Impl final {
   }
 
   void consider(const ExpertKey& key, const PayloadRecord& record,
-                std::uint32_t selections) {
+                std::uint32_t selections, double routing_score_sum) {
     complete_ready();
-    if (selections == 0) return;
+    if (selections == 0 || !ensure_candidate_capacity(key)) return;
     ++metrics.considered;
     auto& candidate = candidates[key];
     candidate.record = record;
+    if (candidate.last_seen_epoch != 0 &&
+        epoch - candidate.last_seen_epoch > config.candidate_ttl_epochs) {
+      candidate.debt_ns = 0;
+      candidate.observations = 0;
+      candidate.routing_score_ewma = 0.0;
+    }
+    candidate.last_seen_epoch = epoch;
+    if (candidate.observations != std::numeric_limits<std::uint32_t>::max())
+      ++candidate.observations;
+    const auto average_score =
+        std::isfinite(routing_score_sum)
+            ? std::clamp(routing_score_sum / selections, 0.0, 1.0)
+            : 0.0;
+    candidate.routing_score_ewma =
+        candidate.routing_score_ewma * 0.75 + average_score * 0.25;
     const auto addition = static_cast<std::uint64_t>(
         cpu_ns_per_selection * static_cast<double>(selections));
     candidate.debt_ns += std::min(
         std::numeric_limits<std::uint64_t>::max() - candidate.debt_ns,
         addition);
-    const auto upload_cost = static_cast<std::uint64_t>(
-        static_cast<double>(record.stored_bytes) * 1.0e9 /
-        config.conservative_h2d_bytes_per_second * config.admission_margin);
-    if (!frozen && candidate.debt_ns >= upload_cost && !candidate.queued &&
-        !candidate.pending) {
-      candidate.queued = true;
-      eligible.push_back(key);
-    }
+    queue_if_profitable(key, candidate);
     fill_slots();
   }
 
   void enqueue_profitable_candidates() {
-    if (frozen) return;
-    for (auto& [key, candidate] : candidates) {
-      const auto upload_cost = static_cast<std::uint64_t>(
-          static_cast<double>(candidate.record.stored_bytes) * 1.0e9 /
-          config.conservative_h2d_bytes_per_second *
-          config.admission_margin);
-      if (candidate.debt_ns >= upload_cost && !candidate.queued &&
-          !candidate.pending) {
-        candidate.queued = true;
-        eligible.push_back(key);
-      }
-    }
+    if (!config.enable_prefetch || frozen) return;
+    for (auto& [key, candidate] : candidates)
+      queue_if_profitable(key, candidate);
   }
 
   Status drain(std::chrono::milliseconds timeout) {
@@ -138,21 +304,20 @@ struct AdaptivePlacementPlanner::Impl final {
       if (pending.empty() && eligible.empty()) return Status::success();
       if (pending.empty()) continue;
       const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline) {
+      if (now >= deadline)
         return {ErrorCode::cancelled, "adaptive placement drain timed out"};
-      }
-      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-          deadline - now);
+      const auto remaining =
+          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
       static_cast<void>(pending.front().handle.wait_for(remaining));
     }
-    return Status::success();
   }
 
   ExpertCache& cache;
   AdaptivePlacementConfig config;
   double cpu_ns_per_selection;
+  std::uint64_t epoch{};
   std::map<ExpertKey, Candidate> candidates;
-  std::deque<ExpertKey> eligible;
+  std::priority_queue<Eligible> eligible;
   std::vector<Pending> pending;
   AdaptivePlacementTelemetry metrics;
   bool frozen{};
@@ -169,10 +334,17 @@ void AdaptivePlacementPlanner::observe_cpu_batch(
   impl_->observe(elapsed_ns, selections);
 }
 
+void AdaptivePlacementPlanner::observe_routes(
+    std::span<const ExpertKey> gpu_resident,
+    std::span<const ExpertKey> missing) {
+  impl_->observe_routes(gpu_resident, missing);
+}
+
 void AdaptivePlacementPlanner::consider(const ExpertKey& key,
                                         const PayloadRecord& record,
-                                        std::uint32_t selections) {
-  impl_->consider(key, record, selections);
+                                        std::uint32_t selections,
+                                        double routing_score_sum) {
+  impl_->consider(key, record, selections, routing_score_sum);
 }
 
 void AdaptivePlacementPlanner::poll() {

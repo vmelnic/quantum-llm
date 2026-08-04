@@ -17,6 +17,7 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -750,21 +751,76 @@ void test_vram_replacement_requires_a_strictly_colder_victim() {
   require(harness.cache.vram_admission_would_improve(candidate.key,
                                                       candidate.record),
           "hot RAM candidate did not outrank a colder VRAM resident");
-  er::AdaptivePlacementPlanner planner(harness.cache);
+  er::AdaptivePlacementConfig placement_config;
+  placement_config.enable_prefetch = true;
+  placement_config.minimum_recent_observations = 1;
+  er::AdaptivePlacementPlanner planner(harness.cache, placement_config);
   planner.consider(candidate.key, candidate.record, 1);
   require(planner.telemetry().scheduled == 1 &&
               harness.uploader->pending_count() == 1,
           "admitted promotion did not enter the asynchronous uploader");
+  const std::array routed_candidate{candidate.key};
+  planner.observe_routes(std::span<const er::ExpertKey>{}, routed_candidate);
   harness.uploader->complete_success(er::kExpertPackAlignment);
   planner.poll();
   require(planner.telemetry().completed == 1 &&
+              planner.telemetry().useful_prefetches == 1 &&
+              planner.telemetry().useful_prefetch_bytes ==
+                  er::kExpertPackAlignment &&
               harness.cache.inspect(candidate.key)->state ==
                   er::CacheState::vram_ready,
-          "asynchronous promotion did not publish its VRAM entry");
+          "useful asynchronous prefetch was not attributed or published");
   require(planner.quiesce(10ms).ok() && planner.frozen(),
           "placement epoch did not quiesce and freeze");
   planner.resume();
   require(!planner.frozen(), "placement epoch did not resume");
+}
+
+void test_prefetch_credits_and_stale_epoch_cancel_pending_work() {
+  Harness harness(16384, 4, 8192);
+  const auto candidate = make_record(53, 0, 0);
+  const auto resident_a = make_record(54, 4096, 0);
+  const auto resident_b = make_record(55, 8192, 0);
+  const auto rejected = make_record(56, 12288, 0);
+  const auto load = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_success(er::kExpertPackAlignment);
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "prefetch cancellation fixture failed to load");
+    result.lease = {};
+  };
+  load(candidate);
+  load(resident_a);
+  load(resident_b);
+  const std::array hot_accesses{er::ExpertAccess{candidate.key, 8, 4.0, 0.8}};
+  require(harness.cache.record_accesses(hot_accesses) == 8,
+          "prefetch candidate did not become hotter than residents");
+
+  er::AdaptivePlacementConfig config;
+  config.enable_prefetch = true;
+  config.maximum_candidates = 1;
+  config.minimum_recent_observations = 1;
+  config.candidate_ttl_epochs = 1;
+  er::AdaptivePlacementPlanner planner(harness.cache, config);
+  planner.consider(candidate.key, candidate.record, 1, 0.8);
+  require(harness.uploader->pending_count() == 1,
+          "bounded prefetch did not consume its one in-flight credit");
+  planner.consider(rejected.key, rejected.record, 1, 0.9);
+  require(planner.telemetry().credit_rejections == 1,
+          "busy candidate bound did not reject additional prefetch history");
+
+  planner.observe_routes(std::span<const er::ExpertKey>{},
+                         std::span<const er::ExpertKey>{});
+  planner.observe_routes(std::span<const er::ExpertKey>{},
+                         std::span<const er::ExpertKey>{});
+  const auto telemetry = planner.telemetry();
+  require(telemetry.stale_cancellations == 1 &&
+              telemetry.wasted_prefetches == 1 &&
+              telemetry.wasted_prefetch_bytes == er::kExpertPackAlignment &&
+              telemetry.failed == 0 && harness.uploader->pending_count() == 0,
+          "stale pending prefetch was not cancelled and attributed exactly");
 }
 
 void test_hybrid_dispatch_minimizes_measured_critical_path() {
@@ -860,6 +916,7 @@ int main() {
     test_frequency_admission_protects_reused_expert();
     test_routing_score_temperature_breaks_frequency_ties();
     test_vram_replacement_requires_a_strictly_colder_victim();
+    test_prefetch_credits_and_stale_epoch_cancel_pending_work();
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();
     std::cout << "expert_runtime_tests: PASS\n";

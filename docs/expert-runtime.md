@@ -109,6 +109,14 @@ diagnostics.
 At warmup/request barriers, admitted promotions drain and placement freezes.
 The measured frozen epoch performs no promotion, expert H2D, or policy mutation.
 
+The promotion predictor retains at most 4,096 histories, requires two recent
+observations, expires them after 192 routed-layer epochs, and permits one
+in-flight promotion. Score-weighted saved CPU debt determines priority only
+after current work is planned. Stale pending work is cancelled. A completed
+promotion is useful only when a later route finds it GPU-resident; selection
+after eviction or TTL expiry is charged as wasted bytes. Prefetch never weakens
+strictly-colder admission or current-route references.
+
 ## Windows storage
 
 - pack files are opened read-only with overlapped I/O;

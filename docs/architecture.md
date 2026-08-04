@@ -96,6 +96,14 @@ bounded fixed-point values and aged together. Eviction compares this composite
 temperature before deterministic pressure/recency tie breaks. Frozen epochs do
 not copy scores or mutate this evidence.
 
+Sequence-local prefetch promotes a repeatedly CPU-executed RAM expert only
+after measured saved CPU debt amortizes upload. Candidate history, in-flight
+credits, score EWMA, and TTL are bounded. Current route references are
+protected before admission, and only a strictly colder victim is eligible.
+Router observations distinguish a GPU-resident useful prediction from a
+prefetch that was evicted before use; useful, wasted, stale, and credit metrics
+remain explicit.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full
