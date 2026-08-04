@@ -149,6 +149,18 @@ expert-qwen3-next-runner.exe C:\Users\vladi\quantum-llm\work\models\qwen3-next-8
 Rezultatul publică `concurrency`, `aggregate_forward_tokens`, tok/s aggregate și
 telemetria comună SSD/RAM/VRAM. Numerele devin gate numai după conversia
 checkpoint-ului complet; smoke-ul de kernel nu este tratat ca benchmark de model.
+Implicit, runnerul face un warmup complet în același proces, resetează numai
+starea request-ului și începe apoi contoarele gate-ului; cache-ul de experți
+rămâne intact. Wrapperul canonic rulează ambele porți și monitorizează memoria și
+pagefile-ul pe toată durata:
+
+```powershell
+Invoke-P6Gate.ps1 -Mode Both -NewTokens 32 -Concurrency 4
+```
+
+Gate-ul `no_swap` este strict: pagefile usage trebuie să fie zero înainte și
+după fiecare rulare. Un delta zero peste un pagefile deja folosit nu este raportat
+ca succes. Artefactul rezultat este `artifacts/p6-gate-latest.json`.
 
 ## Fluxul de lucru
 

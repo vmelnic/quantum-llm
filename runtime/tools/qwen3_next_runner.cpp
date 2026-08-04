@@ -838,10 +838,10 @@ int worker_loop(Qwen3NextModel& model) {
 int main(int argc, char** argv) {
   try {
     if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
-      if (argc < 4 || argc > 8)
+      if (argc < 4 || argc > 9)
         throw std::runtime_error(
             "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
-            "[concurrency] [ram-gib] [vram-gib]");
+            "[concurrency] [ram-gib] [vram-gib] [warmup-rounds]");
       const auto prompt = parse_tokens(argv[3]);
       const auto new_tokens = argc >= 5
           ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
@@ -849,6 +849,8 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::stoul(argv[5])) : 4U;
       const auto ram_gib = argc >= 7 ? std::stoull(argv[6]) : 48ULL;
       const auto vram_gib = argc >= 8 ? std::stoull(argv[7]) : 14ULL;
+      const auto warmup_rounds = argc >= 9
+          ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 1U;
       if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
         throw std::runtime_error("zero batched runtime setting");
       const auto max_context =
@@ -860,6 +862,21 @@ int main(int argc, char** argv) {
           std::chrono::steady_clock::now() - started_load).count();
       std::vector<std::uint32_t> batch_tokens(concurrency),
           positions(concurrency), predicted;
+      for (std::uint32_t round = 0; round < warmup_rounds; ++round) {
+        model.reset_request();
+        for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+          std::fill(batch_tokens.begin(), batch_tokens.end(), prompt[position]);
+          std::fill(positions.begin(), positions.end(), position);
+          predicted = model.forward_batch(batch_tokens, positions);
+        }
+        for (std::uint32_t step = 0; step + 1U < new_tokens; ++step) {
+          std::fill(positions.begin(), positions.end(),
+                    static_cast<std::uint32_t>(prompt.size()) + step);
+          predicted = model.forward_batch(predicted, positions);
+        }
+      }
+      const auto baseline_metrics = model.telemetry();
+      model.reset_request();
       const auto started_prompt = std::chrono::steady_clock::now();
       for (std::uint32_t position = 0; position < prompt.size(); ++position) {
         std::fill(batch_tokens.begin(), batch_tokens.end(), prompt[position]);
@@ -891,18 +908,28 @@ int main(int argc, char** argv) {
           generated.begin() + 1, generated.end(),
           [&](const auto& sequence) { return sequence == generated.front(); });
       const auto metrics = model.telemetry();
+      const auto measured_read_bytes =
+          metrics.read_bytes - baseline_metrics.read_bytes;
+      const auto measured_uploaded_bytes =
+          metrics.uploaded_bytes - baseline_metrics.uploaded_bytes;
+      const auto measured_vram_hits =
+          metrics.acquire_vram_hits - baseline_metrics.acquire_vram_hits;
+      const auto measured_ram_hits =
+          metrics.acquire_ram_hits - baseline_metrics.acquire_ram_hits;
+      const auto measured_ssd_misses =
+          metrics.acquire_ssd_misses - baseline_metrics.acquire_ssd_misses;
       const auto model_forwards =
           (static_cast<std::uint64_t>(prompt.size()) + new_tokens - 1U) *
           concurrency;
-      const auto acquires = metrics.acquire_vram_hits +
-                            metrics.acquire_ram_hits +
-                            metrics.acquire_ssd_misses;
+      const auto acquires =
+          measured_vram_hits + measured_ram_hits + measured_ssd_misses;
       std::cout << "{\"tokens\":[";
       for (std::size_t i = 0; i < generated.front().size(); ++i) {
         if (i) std::cout << ',';
         std::cout << generated.front()[i];
       }
       std::cout << "],\"concurrency\":" << concurrency
+                << ",\"warmup_rounds\":" << warmup_rounds
                 << ",\"identical_outputs\":"
                 << (identical ? "true" : "false")
                 << ",\"model_load_seconds\":" << load_seconds
@@ -919,20 +946,23 @@ int main(int argc, char** argv) {
                 << ",\"inter_token_p95_ms\":"
                 << percentile_ms(inter_token_ms, 0.95)
                 << ",\"container_bytes\":" << model.total_pack_bytes()
-                << ",\"expert_read_bytes\":" << metrics.read_bytes
-                << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
-                << ",\"expert_vram_hits\":" << metrics.acquire_vram_hits
-                << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
-                << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
+                << ",\"expert_read_bytes\":" << measured_read_bytes
+                << ",\"expert_h2d_bytes\":" << measured_uploaded_bytes
+                << ",\"expert_vram_hits\":" << measured_vram_hits
+                << ",\"expert_ram_hits\":" << measured_ram_hits
+                << ",\"expert_ssd_misses\":" << measured_ssd_misses
                 << ",\"expert_acquires\":"
                 << acquires
                 << ",\"cold_bytes_per_forward\":"
-                << (model_forwards ? metrics.read_bytes / model_forwards : 0)
+                << (model_forwards ? measured_read_bytes / model_forwards : 0)
                 << ",\"vram_hit_ratio\":"
-                << (acquires ? static_cast<double>(metrics.acquire_vram_hits) /
+                << (acquires ? static_cast<double>(measured_vram_hits) /
                                    static_cast<double>(acquires) : 0.0)
-                << ",\"expert_loads\":" << metrics.load_completed
-                << ",\"expert_deduplicated\":" << metrics.load_deduplicated
+                << ",\"expert_loads\":"
+                << (metrics.load_completed - baseline_metrics.load_completed)
+                << ",\"expert_deduplicated\":"
+                << (metrics.load_deduplicated -
+                    baseline_metrics.load_deduplicated)
                 << ",\"ram_high_water\":" << metrics.ram_high_water
                 << ",\"vram_high_water\":" << metrics.vram_high_water
                 << ",\"evictions\":" << metrics.eviction_count << "}\n";
@@ -953,15 +983,18 @@ int main(int argc, char** argv) {
                            vram_gib << 30U, capacity);
       return worker_loop(model);
     }
-    if (argc < 3 || argc > 6) {
+    if (argc < 3 || argc > 7) {
       std::cerr << "usage: expert-qwen3-next-runner <container> <token-ids-csv> "
-                   "[new-tokens] [ram-cache-gib] [vram-cache-gib]\n";
+                   "[new-tokens] [ram-cache-gib] [vram-cache-gib] "
+                   "[warmup-rounds]\n";
       return 64;
     }
     auto tokens = parse_tokens(argv[2]);
     const auto new_tokens = argc >= 4 ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 8U;
     const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
     const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
+    const auto warmup_rounds = argc >= 7
+        ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 1U;
     if (!new_tokens || !ram_gib || !vram_gib) throw std::runtime_error("zero runtime budget");
     const auto max_context = static_cast<std::uint32_t>(tokens.size()) + new_tokens;
     const auto started_load = std::chrono::steady_clock::now();
@@ -969,6 +1002,16 @@ int main(int argc, char** argv) {
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_load).count();
     std::uint32_t predicted = 0;
+    for (std::uint32_t round = 0; round < warmup_rounds; ++round) {
+      model.reset_request();
+      for (std::uint32_t position = 0; position < tokens.size(); ++position)
+        predicted = model.forward(tokens[position], position);
+      for (std::uint32_t step = 0; step + 1U < new_tokens; ++step)
+        predicted = model.forward(
+            predicted, static_cast<std::uint32_t>(tokens.size()) + step);
+    }
+    const auto baseline_metrics = model.telemetry();
+    model.reset_request();
     const auto started_prompt = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens.size(); ++position)
       predicted = model.forward(tokens[position], position);
@@ -990,17 +1033,28 @@ int main(int argc, char** argv) {
     const auto decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_decode).count();
     const auto metrics = model.telemetry();
+    const auto measured_read_bytes =
+        metrics.read_bytes - baseline_metrics.read_bytes;
+    const auto measured_uploaded_bytes =
+        metrics.uploaded_bytes - baseline_metrics.uploaded_bytes;
+    const auto measured_vram_hits =
+        metrics.acquire_vram_hits - baseline_metrics.acquire_vram_hits;
+    const auto measured_ram_hits =
+        metrics.acquire_ram_hits - baseline_metrics.acquire_ram_hits;
+    const auto measured_ssd_misses =
+        metrics.acquire_ssd_misses - baseline_metrics.acquire_ssd_misses;
     const auto forwards = new_tokens > 0 ? new_tokens - 1U : 0U;
     const auto model_forwards =
         static_cast<std::uint64_t>(tokens.size() - new_tokens) + forwards;
-    const auto acquires = metrics.acquire_vram_hits + metrics.acquire_ram_hits +
-                          metrics.acquire_ssd_misses;
+    const auto acquires =
+        measured_vram_hits + measured_ram_hits + measured_ssd_misses;
     std::cout << "{\"tokens\":[";
     for (std::size_t i = 0; i < tokens.size(); ++i) {
       if (i) std::cout << ',';
       std::cout << tokens[i];
     }
     std::cout << "],\"model_load_seconds\":" << load_seconds
+              << ",\"warmup_rounds\":" << warmup_rounds
               << ",\"prompt_seconds\":" << prompt_seconds
               << ",\"warm_ttft_seconds\":" << prompt_seconds
               << ",\"cold_ttft_seconds\":"
@@ -1014,20 +1068,23 @@ int main(int argc, char** argv) {
               << percentile_ms(inter_token_ms, 0.95)
               << ",\"container_bytes\":" << model.total_pack_bytes()
               << ",\"startup_dense_read_bytes\":" << model.dense_read_bytes()
-              << ",\"expert_read_bytes\":" << metrics.read_bytes
-              << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
-              << ",\"expert_vram_hits\":" << metrics.acquire_vram_hits
-              << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
-              << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
+              << ",\"expert_read_bytes\":" << measured_read_bytes
+              << ",\"expert_h2d_bytes\":" << measured_uploaded_bytes
+              << ",\"expert_vram_hits\":" << measured_vram_hits
+              << ",\"expert_ram_hits\":" << measured_ram_hits
+              << ",\"expert_ssd_misses\":" << measured_ssd_misses
               << ",\"expert_acquires\":"
               << acquires
               << ",\"cold_bytes_per_forward\":"
-              << (model_forwards ? metrics.read_bytes / model_forwards : 0)
+              << (model_forwards ? measured_read_bytes / model_forwards : 0)
               << ",\"vram_hit_ratio\":"
-              << (acquires ? static_cast<double>(metrics.acquire_vram_hits) /
+              << (acquires ? static_cast<double>(measured_vram_hits) /
                                  static_cast<double>(acquires) : 0.0)
-              << ",\"expert_loads\":" << metrics.load_completed
-              << ",\"expert_deduplicated\":" << metrics.load_deduplicated
+              << ",\"expert_loads\":"
+              << (metrics.load_completed - baseline_metrics.load_completed)
+              << ",\"expert_deduplicated\":"
+              << (metrics.load_deduplicated -
+                  baseline_metrics.load_deduplicated)
               << ",\"ram_high_water\":" << metrics.ram_high_water
               << ",\"vram_high_water\":" << metrics.vram_high_water
               << ",\"evictions\":" << metrics.eviction_count << "}\n";
