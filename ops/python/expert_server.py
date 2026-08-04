@@ -129,11 +129,12 @@ class CudaWorker:
     def __init__(self, executable: Path, container: Path, max_context: int,
                  startup_timeout: float, requested_capacity: int,
                  ram_cache_gib: int, vram_cache_gib: int,
-                 kv_cache_mib: int, kv_page_tokens: int) -> None:
+                 kv_cache_mib: int, kv_page_tokens: int,
+                 placement_profile: str) -> None:
         command = [
             str(executable), str(container), "--worker", str(max_context),
             str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
-            str(kv_cache_mib), str(kv_page_tokens),
+            str(kv_cache_mib), str(kv_page_tokens), placement_profile,
         ]
         self.process = subprocess.Popen(
             command,
@@ -166,12 +167,30 @@ class CudaWorker:
         self.kv_page_tokens = int(response.get("kv_page_tokens", 0))
         self.kv_page_bytes = int(response.get("kv_page_bytes", 0))
         self.kv_page_capacity = int(response.get("kv_page_capacity", 0))
-        if (self.protocol < 3 or self.capacity != requested_capacity or
+        self.placement_profile = str(response.get("placement_profile", ""))
+        self.ram_cache_bytes = int(response.get("ram_cache_bytes", 0))
+        self.vram_cache_bytes = int(response.get("vram_cache_bytes", 0))
+        self.placement_prefetch_enabled = bool(
+            response.get("placement_prefetch_enabled", False)
+        )
+        self.placement_minimum_observations = int(
+            response.get("placement_minimum_observations", 0)
+        )
+        expected_prefetch = placement_profile != "capacity"
+        expected_observations = 1 if placement_profile == "latency" else 2
+        if (self.protocol < 4 or self.capacity != requested_capacity or
                 self.prefill_chunk_tokens != requested_capacity or
                 self.kv_page_tokens != kv_page_tokens or
-                self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0):
+                self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0 or
+                self.placement_profile != placement_profile or
+                self.ram_cache_bytes != ram_cache_gib << 30 or
+                self.vram_cache_bytes != vram_cache_gib << 30 or
+                self.placement_prefetch_enabled != expected_prefetch or
+                self.placement_minimum_observations != expected_observations):
             self.process.kill()
-            raise WorkerError("CUDA worker does not support requested KV/batching contract")
+            raise WorkerError(
+                "CUDA worker does not support requested runtime contract"
+            )
         self.active_ids: set[int] = set()
         self.command_lock = threading.Lock()
 
@@ -362,7 +381,8 @@ class Application:
                                  args.worker_ram_cache_gib,
                                  args.worker_vram_cache_gib,
                                  args.worker_kv_cache_mib,
-                                 args.worker_kv_page_tokens)
+                                 args.worker_kv_page_tokens,
+                                 args.placement_profile)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
@@ -724,6 +744,15 @@ class Application:
             "maximum_queue": self.args.maximum_queue,
             "worker_capacity": self.args.worker_capacity,
             "worker_protocol": self.worker.protocol,
+            "worker_placement": {
+                "profile": self.worker.placement_profile,
+                "ram_cache_bytes": self.worker.ram_cache_bytes,
+                "vram_cache_bytes": self.worker.vram_cache_bytes,
+                "prefetch_enabled": self.worker.placement_prefetch_enabled,
+                "minimum_recent_observations": (
+                    self.worker.placement_minimum_observations
+                ),
+            },
             "worker_prefill": {
                 "mode": "causal_chunked",
                 "chunk_tokens": self.worker.prefill_chunk_tokens,
@@ -744,6 +773,7 @@ class Application:
                 "worker_capacity": self.args.worker_capacity,
                 "worker_ram_cache_gib": self.args.worker_ram_cache_gib,
                 "worker_vram_cache_gib": self.args.worker_vram_cache_gib,
+                "placement_profile": self.args.placement_profile,
                 "worker_kv_cache_mib": self.args.worker_kv_cache_mib,
                 "worker_kv_page_tokens": self.args.worker_kv_page_tokens,
                 "microbatch_window_ms": self.args.microbatch_window_ms,
@@ -1171,6 +1201,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-capacity", type=int, default=1)
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
     parser.add_argument("--worker-vram-cache-gib", type=int, default=14)
+    parser.add_argument(
+        "--placement-profile", choices=("latency", "balanced", "capacity"),
+        default="balanced",
+    )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)

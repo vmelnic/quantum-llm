@@ -171,6 +171,13 @@ currently reserved pages, and physically allocated high-water pages.
 `/model-info.worker_prefill` reports the causal chunk mode and current maximum
 tokens per chunk.
 
+`/model-info.worker_placement` is the authoritative effective placement
+contract. It returns the selected `profile`, exact RAM/VRAM cache bytes,
+whether speculative prefetch is enabled, and the required recent-observation
+count. `/model-info.runtime_config.placement_profile` reports the requested
+launcher value; startup fails if the worker reports a different profile or
+budget.
+
 Admission is bounded. Overload/drain returns HTTP `503` with code `overloaded`;
 it does not create an unbounded queue. Generation timeout returns `504` before
 streaming starts, or an `error` event after a Responses stream has started.

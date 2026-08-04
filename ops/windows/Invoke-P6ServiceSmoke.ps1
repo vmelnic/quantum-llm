@@ -2,6 +2,8 @@ param(
     [string]$BaseUri = "http://127.0.0.1:8080",
     [string]$ExpectedModel = "qwen3-next-80b-a3b-expert-pack-int8",
     [string]$ExpectedBuildId = "",
+    [ValidateSet("latency", "balanced", "capacity")]
+    [string]$ExpectedPlacementProfile = "balanced",
     [int]$Concurrency = 4,
     [int]$NewTokens = 4,
     [int]$TimeoutSeconds = 600
@@ -65,7 +67,7 @@ if ($ExpectedBuildId -and $info.build_id -ne $ExpectedBuildId) {
 if (-not $info.manifest_content_sha256 -or -not $info.experts_index_sha256) {
     throw "Service does not publish the deployed container identity"
 }
-if ([int]$info.worker_protocol -lt 3 -or
+if ([int]$info.worker_protocol -lt 4 -or
     $info.worker_prefill.mode -ne "causal_chunked" -or
     [int]$info.worker_prefill.chunk_tokens -lt 2 -or
     $info.worker_kv.dtype -ne "fp16" -or
@@ -73,6 +75,12 @@ if ([int]$info.worker_protocol -lt 3 -or
     [int64]$info.worker_kv.page_bytes -lt 1 -or
     [int]$info.worker_kv.page_capacity -lt $Concurrency) {
     throw "Service does not publish usable chunked-prefill/paged-KV contracts"
+}
+if ($info.worker_placement.profile -ne $ExpectedPlacementProfile -or
+    $info.runtime_config.placement_profile -ne $ExpectedPlacementProfile -or
+    [int64]$info.worker_placement.ram_cache_bytes -lt 1 -or
+    [int64]$info.worker_placement.vram_cache_bytes -lt 1) {
+    throw "Service does not publish the requested placement contract"
 }
 if ([int]$info.worker_capacity -lt $Concurrency) {
     throw "Worker capacity $($info.worker_capacity) is below requested concurrency $Concurrency"

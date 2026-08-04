@@ -280,7 +280,7 @@ Acceptance evidence:
 - measured effective weight bandwidth and selections/s are published;
 - the scheduler consumes calibrated costs instead of a hard-coded CPU rate.
 
-## Stage 5 — operator placement profiles
+## Stage 5 — operator placement profiles — implemented
 
 Expose policy goals, not fixed expert percentages:
 
@@ -297,6 +297,14 @@ Acceptance:
 - profile and effective budgets appear in `/model-info` and artifacts;
 - overload and insufficient-memory failures remain explicit;
 - each profile has a documented intended workload and evidence boundary.
+
+The runner, foreground service, scheduled-task installer, P6 gate and HTTP
+metadata now carry the same validated profile. Worker startup compares the
+requested profile and byte-exact cache budgets with its ready contract and
+fails closed on disagreement. Standalone and batch artifacts publish the same
+fields. `balanced` remains the only qualified SLO profile; the earlier
+one-observation and prefetch-off experiments bound `latency` and `capacity`
+without treating three identical full runs as useful evidence.
 
 ## Stage 6 — larger-model decision
 

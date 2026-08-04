@@ -48,7 +48,7 @@ scripts resolve the server command line and kill its full descendant tree.
 - `/health`: worker process is alive;
 - `/ready`: worker is healthy and server is accepting requests;
 - `/model-info`: model ID, build ID, manifest/index hashes, active requests,
-  cache budgets, context, capacity, and timeouts;
+  effective placement profile/cache budgets, context, capacity, and timeouts;
 - `/metrics`: Prometheus counters and bounded latency-window percentiles.
 
 Always check build ID and model content hashes after deployment. A listening
@@ -81,7 +81,11 @@ shows reuse. Report both—never publish only the warm result.
 
 ## Capacity and overload
 
-The default profile has four active worker slots and eight queued requests.
+The default deployment has four active worker slots, eight queued requests,
+and the `balanced` placement profile. Placement profiles change cache policy,
+not admission limits. Pass `-PlacementProfile latency|balanced|capacity` to the
+foreground or task installer and verify the effective policy through
+`/model-info.worker_placement`.
 Admission and worker-slot acquisition are bounded. Overload returns HTTP 503;
 clients should use bounded exponential backoff with jitter and a request
 deadline.

@@ -353,11 +353,25 @@ class Qwen3NextModel final {
                  std::uint64_t vram_cache_bytes,
                  std::uint32_t capacity = 1,
                  std::uint64_t kv_cache_bytes = 2ULL << 30U,
-                 std::uint32_t kv_page_tokens = 256)
+                 std::uint32_t kv_page_tokens = 256,
+                 std::string_view placement_profile = "balanced")
       : root_(root), max_context_(max_context), capacity_(capacity),
-        kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens) {
+        ram_cache_bytes_(ram_cache_bytes),
+        vram_cache_bytes_(vram_cache_bytes), kv_cache_bytes_(kv_cache_bytes),
+        kv_page_tokens_(kv_page_tokens),
+        placement_profile_(placement_profile) {
     if (!capacity_ || !max_context_ || !kv_cache_bytes_ || !kv_page_tokens_)
       throw std::runtime_error("zero request/KV capacity");
+    expert::runtime::AdaptivePlacementConfig placement_config;
+    if (placement_profile_ == "latency") {
+      placement_config.minimum_recent_observations = 1;
+      placement_config.admission_margin = 1.0;
+    } else if (placement_profile_ == "capacity") {
+      placement_config.enable_prefetch = false;
+    } else if (placement_profile_ != "balanced") {
+      throw std::runtime_error(
+          "placement profile must be latency, balanced, or capacity");
+    }
     const auto document = expert::core::json::Parse(read_text(root / "manifest.json"));
     const auto& manifest = document.AsObject("manifest");
     const auto& architecture =
@@ -462,8 +476,8 @@ class Qwen3NextModel final {
     cpu_executor_ =
         std::make_unique<expert::runtime::cpu::ExpertExecutor>(
             logical_threads);
-    placement_ =
-        std::make_unique<expert::runtime::AdaptivePlacementPlanner>(*cache_);
+    placement_ = std::make_unique<expert::runtime::AdaptivePlacementPlanner>(
+        *cache_, placement_config);
     dispatch_ = std::make_unique<expert::runtime::HybridDispatchPlanner>();
     allocate_workspace();
     cuda_check(cudaEventCreate(&layer_start_event_), "create layer-start event");
@@ -659,6 +673,17 @@ class Qwen3NextModel final {
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
   std::uint32_t prefill_chunk_tokens() const noexcept { return capacity_; }
+  const std::string& placement_profile() const noexcept {
+    return placement_profile_;
+  }
+  std::uint64_t ram_cache_bytes() const noexcept { return ram_cache_bytes_; }
+  std::uint64_t vram_cache_bytes() const noexcept { return vram_cache_bytes_; }
+  bool placement_prefetch_enabled() const noexcept {
+    return placement_profile_ != "capacity";
+  }
+  std::uint32_t placement_minimum_observations() const noexcept {
+    return placement_profile_ == "latency" ? 1U : 2U;
+  }
   std::uint64_t kv_page_bytes() const noexcept { return kv_page_bytes_; }
   std::uint64_t kv_page_capacity() const noexcept { return kv_page_capacity_; }
   std::uint64_t kv_allocated_pages() const noexcept {
@@ -1166,7 +1191,8 @@ class Qwen3NextModel final {
       }
       const auto has_cold_fallback =
           host_slot_by_expert.size() != plan.missing_experts.size();
-      const auto may_upload_from_ram = !placement_->frozen();
+      const auto may_upload_from_ram =
+          !placement_->frozen() && placement_profile_ != "capacity";
       if (has_cold_fallback || may_upload_from_ram) {
         // Admission checks and uploads require cache references mirroring the
         // directory pins so no current-route entry can become a victim.
@@ -1392,9 +1418,11 @@ class Qwen3NextModel final {
   std::uint64_t model_id_{0x51334e4558540001ULL};
   std::uint64_t total_pack_bytes_{}, dense_read_bytes_{},
       max_expert_record_bytes_{};
-  std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{},
-      kv_allocated_pages_{}, kv_reserved_pages_{};
+  std::uint64_t ram_cache_bytes_{}, vram_cache_bytes_{}, kv_cache_bytes_{},
+      kv_page_bytes_{}, kv_page_capacity_{}, kv_allocated_pages_{},
+      kv_reserved_pages_{};
   std::uint32_t kv_page_tokens_{}, max_kv_pages_per_slot_{};
+  std::string placement_profile_;
   std::uint64_t directory_vram_hits_{};
   PhaseTelemetry phase_;
   DevicePack dense_pack_;
@@ -1490,12 +1518,19 @@ struct WorkerRequest final {
 int worker_loop(Qwen3NextModel& model) {
   std::unordered_map<std::uint64_t, WorkerRequest> active;
   std::vector<bool> used_slots(model.capacity());
-  std::cout << "{\"type\":\"ready\",\"protocol\":3,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":4,\"capacity\":"
             << model.capacity() << ",\"prefill_chunk_tokens\":"
             << model.prefill_chunk_tokens() << ",\"kv_page_tokens\":"
             << model.kv_page_tokens() << ",\"kv_page_bytes\":"
             << model.kv_page_bytes() << ",\"kv_page_capacity\":"
-            << model.kv_page_capacity() << "}\n" << std::flush;
+            << model.kv_page_capacity() << ",\"placement_profile\":\""
+            << model.placement_profile() << "\",\"ram_cache_bytes\":"
+            << model.ram_cache_bytes() << ",\"vram_cache_bytes\":"
+            << model.vram_cache_bytes()
+            << ",\"placement_prefetch_enabled\":"
+            << (model.placement_prefetch_enabled() ? "true" : "false")
+            << ",\"placement_minimum_observations\":"
+            << model.placement_minimum_observations() << "}\n" << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
     try {
@@ -1656,11 +1691,11 @@ int worker_loop(Qwen3NextModel& model) {
 int main(int argc, char** argv) {
   try {
     if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
-      if (argc < 4 || argc > 11)
+      if (argc < 4 || argc > 12)
         throw std::runtime_error(
             "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
             "[concurrency] [ram-gib] [vram-gib] [warmup-rounds] "
-            "[kv-cache-mib] [kv-page-tokens]");
+            "[kv-cache-mib] [kv-page-tokens] [placement-profile]");
       auto prompts = parse_prompt_batch(argv[3]);
       const auto new_tokens = argc >= 5
           ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
@@ -1673,6 +1708,8 @@ int main(int argc, char** argv) {
       const auto kv_cache_mib = argc >= 10 ? std::stoull(argv[9]) : 2048ULL;
       const auto kv_page_tokens = argc >= 11
           ? static_cast<std::uint32_t>(std::stoul(argv[10])) : 256U;
+      const std::string_view placement_profile =
+          argc >= 12 ? argv[11] : "balanced";
       if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
         throw std::runtime_error("zero batched runtime setting");
       if (prompts.size() == 1U) prompts.resize(concurrency, prompts.front());
@@ -1692,7 +1729,7 @@ int main(int argc, char** argv) {
       const auto started_load = std::chrono::steady_clock::now();
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                            vram_gib << 30U, concurrency, kv_cache_mib << 20U,
-                           kv_page_tokens);
+                           kv_page_tokens, placement_profile);
       for (std::uint32_t row = 0; row < concurrency; ++row)
         model.reserve_slot(
             row, static_cast<std::uint32_t>(prompts[row].size()) + new_tokens);
@@ -1839,6 +1876,14 @@ int main(int argc, char** argv) {
         std::cout << ']';
       }
       std::cout << "],\"concurrency\":" << concurrency
+                << ",\"placement_profile\":\""
+                << model.placement_profile()
+                << "\",\"ram_cache_bytes\":" << model.ram_cache_bytes()
+                << ",\"vram_cache_bytes\":" << model.vram_cache_bytes()
+                << ",\"placement_prefetch_enabled\":"
+                << (model.placement_prefetch_enabled() ? "true" : "false")
+                << ",\"placement_minimum_observations\":"
+                << model.placement_minimum_observations()
                 << ",\"warmup_rounds\":" << warmup_rounds
                 << ",\"mixed_prompts\":"
                 << (!identical_prompts ? "true" : "false")
@@ -1910,10 +1955,11 @@ int main(int argc, char** argv) {
       return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
-      if (argc > 9)
+      if (argc > 10)
         throw std::runtime_error(
             "worker usage: <container> --worker [max-context] [ram-gib] "
-            "[vram-gib] [capacity] [kv-cache-mib] [kv-page-tokens]");
+            "[vram-gib] [capacity] [kv-cache-mib] [kv-page-tokens] "
+            "[placement-profile]");
       const auto max_context = argc >= 4
           ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
       const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
@@ -1923,15 +1969,18 @@ int main(int argc, char** argv) {
       const auto kv_cache_mib = argc >= 8 ? std::stoull(argv[7]) : 2048ULL;
       const auto kv_page_tokens = argc >= 9
           ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
+      const std::string_view placement_profile =
+          argc >= 10 ? argv[9] : "balanced";
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                            vram_gib << 30U, capacity, kv_cache_mib << 20U,
-                           kv_page_tokens);
+                           kv_page_tokens, placement_profile);
       return worker_loop(model);
     }
-    if (argc < 3 || argc > 9) {
+    if (argc < 3 || argc > 10) {
       std::cerr << "usage: expert-qwen3-next-runner <container> <token-ids-csv> "
                    "[new-tokens] [ram-cache-gib] [vram-cache-gib] "
-                   "[warmup-rounds] [kv-cache-mib] [kv-page-tokens]\n";
+                   "[warmup-rounds] [kv-cache-mib] [kv-page-tokens] "
+                   "[placement-profile]\n";
       return 64;
     }
     auto tokens = parse_tokens(argv[2]);
@@ -1943,12 +1992,14 @@ int main(int argc, char** argv) {
     const auto kv_cache_mib = argc >= 8 ? std::stoull(argv[7]) : 2048ULL;
     const auto kv_page_tokens = argc >= 9
         ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
+    const std::string_view placement_profile =
+        argc >= 10 ? argv[9] : "balanced";
     if (!new_tokens || !ram_gib || !vram_gib) throw std::runtime_error("zero runtime budget");
     const auto max_context = static_cast<std::uint32_t>(tokens.size()) + new_tokens;
     const auto started_load = std::chrono::steady_clock::now();
     Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                          vram_gib << 30U, 1, kv_cache_mib << 20U,
-                         kv_page_tokens);
+                         kv_page_tokens, placement_profile);
     model.reserve_slot(0, max_context);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_load).count();
@@ -2011,7 +2062,15 @@ int main(int argc, char** argv) {
       if (i) std::cout << ',';
       std::cout << tokens[i];
     }
-    std::cout << "],\"model_load_seconds\":" << load_seconds
+    std::cout << "],\"placement_profile\":\""
+              << model.placement_profile()
+              << "\",\"ram_cache_bytes\":" << model.ram_cache_bytes()
+              << ",\"vram_cache_bytes\":" << model.vram_cache_bytes()
+              << ",\"placement_prefetch_enabled\":"
+              << (model.placement_prefetch_enabled() ? "true" : "false")
+              << ",\"placement_minimum_observations\":"
+              << model.placement_minimum_observations()
+              << ",\"model_load_seconds\":" << load_seconds
               << ",\"kv_page_tokens\":" << model.kv_page_tokens()
               << ",\"kv_page_bytes\":" << model.kv_page_bytes()
               << ",\"kv_page_capacity\":" << model.kv_page_capacity()

@@ -145,6 +145,18 @@ measured expert SSD/H2D, and zero pagefile use. Effective traversal counts each
 expert record once per grouped execution and may include cache reuse; it must
 not be presented as measured socket DRAM bandwidth.
 
+### Operator placement contract
+
+The first profile-aware `balanced` batch gate passed at 42.2958 aggregate
+tok/s. Its artifact reports the effective 48 GiB RAM and 18 GiB VRAM budgets,
+prefetch enabled, and two-observation threshold. Isolated/interleaved/chunked
+outputs matched; the measured window had zero expert SSD reads, zero expert
+H2D, zero pagefile use, and at least 25.85 GiB free physical memory.
+
+This is the qualified `balanced` result. The earlier one-observation predictor
+and prefetch-off A/B establish policy direction for `latency` and `capacity`,
+respectively, but are not independent SLO qualifications for those profiles.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

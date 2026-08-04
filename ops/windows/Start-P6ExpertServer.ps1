@@ -11,6 +11,8 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [ValidateSet("latency", "balanced", "capacity")]
+    [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
     [double]$MicrobatchWindowMs = 2.0,
@@ -31,6 +33,7 @@ $arguments = @{
     WorkerCapacity = $WorkerCapacity
     WorkerRamCacheGiB = $WorkerRamCacheGiB
     WorkerVramCacheGiB = $WorkerVramCacheGiB
+    PlacementProfile = $PlacementProfile
     WorkerKvCacheMiB = $WorkerKvCacheMiB
     WorkerKvPageTokens = $WorkerKvPageTokens
     MicrobatchWindowMs = $MicrobatchWindowMs

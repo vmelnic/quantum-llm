@@ -12,6 +12,8 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [ValidateSet("latency", "balanced", "capacity")]
+    [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
     [double]$MicrobatchWindowMs = 2.0,
@@ -83,6 +85,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-capacity $WorkerCapacity `
     --worker-ram-cache-gib $WorkerRamCacheGiB `
     --worker-vram-cache-gib $WorkerVramCacheGiB `
+    --placement-profile $PlacementProfile `
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
     --microbatch-window-ms $MicrobatchWindowMs `

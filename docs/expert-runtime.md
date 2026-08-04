@@ -125,6 +125,20 @@ promotion is useful only when a later route finds it GPU-resident; selection
 after eviction or TTL expiry is charged as wasted bytes. Prefetch never weakens
 strictly-colder admission or current-route references.
 
+Operators select a policy goal with `-PlacementProfile` (PowerShell) or
+`--placement-profile` (HTTP server):
+
+| Profile | Policy | Evidence boundary |
+|---|---|---|
+| `latency` | Admit prefetch after one recent observation and remove the extra admission margin. | More aggressive warming; not yet an independent throughput SLO. |
+| `balanced` | Require two recent observations and use measured CPU/H2D/GPU critical-path cost. | Qualified default for the 3090box 80B deployment. |
+| `capacity` | Disable speculative prefetch and opportunistic RAM→VRAM execution; retain mandatory cold fallback. | Minimizes churn for larger working sets; not a promise that CPU execution is faster. |
+
+These are policy goals, not expert percentages. Resident experts stay on the
+GPU, unavailable host experts still take the required load path, and all three
+profiles preserve exact routing and stable aggregation. RAM and VRAM budgets
+remain independent operator inputs.
+
 ## Windows storage
 
 - pack files are opened read-only with overlapped I/O;

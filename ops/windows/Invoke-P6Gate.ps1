@@ -8,6 +8,8 @@ param(
     [int]$Concurrency = 4,
     [int]$RamCacheGiB = 48,
     [int]$VramCacheGiB = 18,
+    [ValidateSet("latency", "balanced", "capacity")]
+    [string]$PlacementProfile = "balanced",
     [int]$KvCacheMiB = 2048,
     [int]$KvPageTokens = 256,
     [int]$MinimumFreePhysicalGiB = 2,
@@ -133,12 +135,12 @@ function Invoke-GateRun {
 
 $runs = @()
 if ($Mode -in @("Single", "Both")) {
-    $arguments = "$Container $PromptTokenIds $NewTokens $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens"
+    $arguments = "$Container $PromptTokenIds $NewTokens $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens $PlacementProfile"
     $runs += Invoke-GateRun -Name "single" -Arguments $arguments `
         -RequiredTokensPerSecond $SingleTokensPerSecond
 }
 if ($Mode -in @("Batch", "Both")) {
-    $arguments = "$Container --batch $BatchPromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens"
+    $arguments = "$Container --batch $BatchPromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens $PlacementProfile"
     $runs += Invoke-GateRun -Name "batch" -Arguments $arguments `
         -RequiredTokensPerSecond $AggregateTokensPerSecond
 }
@@ -153,6 +155,7 @@ $result = [PSCustomObject]@{
     schema_version = 2
     timestamp_utc = [DateTime]::UtcNow.ToString("o")
     model_id = "Qwen/Qwen3-Next-80B-A3B-Instruct"
+    placement_profile = $PlacementProfile
     mode = $Mode
     overall_pass = $overall
     runs = $runs

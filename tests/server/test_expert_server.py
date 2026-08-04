@@ -194,6 +194,45 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.release_context_credits(first)
         self.assertEqual(app.acquire_context_credits(512), 2)
 
+    def test_model_info_reports_effective_placement_contract(self) -> None:
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(
+            model="test-model", build_id="build", maximum_queue=8,
+            worker_capacity=4, host="127.0.0.1", port=8080,
+            max_context=4096, maximum_new_tokens=512,
+            worker_ram_cache_gib=48, worker_vram_cache_gib=18,
+            placement_profile="capacity", worker_kv_cache_mib=2048,
+            worker_kv_page_tokens=256, microbatch_window_ms=2.0,
+            latency_window=4096, queue_timeout=1.0,
+            generation_timeout=120.0,
+        )
+        app.manifest = {
+            "source": {}, "format": {}, "quantization": {},
+            "integrity": {"content_sha256": "manifest"},
+            "indexes": {"dense_sha256": "dense", "experts_sha256": "experts"},
+            "architecture": {}, "masses": {},
+        }
+        app.worker = types.SimpleNamespace(
+            protocol=4, prefill_chunk_tokens=4, kv_page_tokens=256,
+            kv_page_bytes=1024, kv_page_capacity=8192,
+            placement_profile="capacity", ram_cache_bytes=48 << 30,
+            vram_cache_bytes=18 << 30, placement_prefetch_enabled=False,
+            placement_minimum_observations=2,
+            stats=lambda: {"allocated_pages": 0, "reserved_pages": 0},
+        )
+        app.active = 0
+        app.active_lock = threading.Lock()
+        app.draining = threading.Event()
+
+        info = app.info()
+        self.assertEqual(info["worker_placement"], {
+            "profile": "capacity", "ram_cache_bytes": 48 << 30,
+            "vram_cache_bytes": 18 << 30, "prefetch_enabled": False,
+            "minimum_recent_observations": 2,
+        })
+        self.assertEqual(info["runtime_config"]["placement_profile"],
+                         "capacity")
+
     def test_concurrent_rows_share_one_worker_step(self) -> None:
         worker = FakeWorker()
         observed: list[int] = []

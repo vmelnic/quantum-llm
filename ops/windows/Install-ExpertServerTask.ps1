@@ -13,6 +13,8 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [ValidateSet("latency", "balanced", "capacity")]
+    [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
     [double]$MicrobatchWindowMs = 2.0,
@@ -54,6 +56,7 @@ $taskArguments.AddRange([string[]]@(
     "-WorkerCapacity", [string]$WorkerCapacity,
     "-WorkerRamCacheGiB", [string]$WorkerRamCacheGiB,
     "-WorkerVramCacheGiB", [string]$WorkerVramCacheGiB,
+    "-PlacementProfile", (Quote-TaskArgument $PlacementProfile),
     "-WorkerKvCacheMiB", [string]$WorkerKvCacheMiB,
     "-WorkerKvPageTokens", [string]$WorkerKvPageTokens,
     "-MicrobatchWindowMs", $MicrobatchWindowMs.ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -96,5 +99,6 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     endpoint = "http://${HostAddress}:$Port"
     maximum_context = $MaximumContext
     maximum_new_tokens = $MaximumNewTokens
+    placement_profile = $PlacementProfile
     started = [bool]$Start
 } | ConvertTo-Json
