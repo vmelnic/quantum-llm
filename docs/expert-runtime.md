@@ -92,6 +92,14 @@ CPU/GPU/H2D cost EWMAs are bounded state. The newest 256 per-expert reason/cost
 snapshots form a circular diagnostic trace; aggregate counters are emitted for
 benchmark windows. The trace affects neither routing nor aggregation order.
 
+The CPU executor owns a maximum worker pool but activates only its calibrated
+subset. Lazy calibration tests physical-core and logical-thread estimates with
+two bounded gate/down tiles on the first real batch. Persistent scratch,
+precomputed row pointers, multi-row weight reuse, and AVX2 software prefetch do
+not change FP32 activation arithmetic or compact output-slot semantics.
+Telemetry reports calibration cost, chosen threads/tiles, selections, logical
+weight bytes, and effective bytes/s; the latter is not raw DRAM bandwidth.
+
 ## Placement policy
 
 The cache uses bounded frequency/reuse evidence with aging. RAM→VRAM promotion

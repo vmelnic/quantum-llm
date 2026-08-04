@@ -104,6 +104,13 @@ Router observations distinguish a GPU-resident useful prediction from a
 prefetch that was evicted before use; useful, wasted, stale, and credit metrics
 remain explicit.
 
+The CPU executor keeps FP32 activations and the INT8-per-row weight ABI. Its
+worker pool is persistent; per-batch intermediate/offset/validation scratch is
+reused. AVX2 kernels reuse each weight vector across routed rows and issue
+bounded software prefetches. A first-real-batch calibration chooses active
+workers and gate/down tiles under a time limit, then publishes the selected
+configuration and effective weight traversal rate.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

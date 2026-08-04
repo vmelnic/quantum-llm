@@ -315,6 +315,37 @@ void print_dispatch_json(
          << telemetry.h2d_bytes_per_second;
 }
 
+void print_cpu_executor_json(
+    std::ostream& output,
+    const expert::runtime::cpu::ExpertExecutorTelemetry& telemetry,
+    const expert::runtime::cpu::ExpertExecutorTelemetry& baseline) {
+  const auto compute_ns = telemetry.compute_ns - baseline.compute_ns;
+  const auto weight_bytes = telemetry.effective_weight_bytes -
+                            baseline.effective_weight_bytes;
+  const auto bytes_per_second =
+      compute_ns ? static_cast<double>(weight_bytes) * 1.0e9 /
+                       static_cast<double>(compute_ns)
+                 : 0.0;
+  output << ",\"cpu_executor_maximum_threads\":"
+         << telemetry.maximum_threads
+         << ",\"cpu_executor_selected_threads\":"
+         << telemetry.selected_threads
+         << ",\"cpu_executor_gate_chunk\":" << telemetry.gate_chunk
+         << ",\"cpu_executor_down_chunk\":" << telemetry.down_chunk
+         << ",\"cpu_executor_calibration_runs\":"
+         << telemetry.calibration_runs
+         << ",\"cpu_executor_calibration_seconds\":"
+         << telemetry.calibration_ns / 1.0e9
+         << ",\"cpu_executor_calls\":"
+         << telemetry.execute_calls - baseline.execute_calls
+         << ",\"cpu_executor_selections\":"
+         << telemetry.selections - baseline.selections
+         << ",\"cpu_executor_effective_weight_bytes\":" << weight_bytes
+         << ",\"cpu_executor_compute_seconds\":" << compute_ns / 1.0e9
+         << ",\"cpu_executor_effective_weight_bytes_per_second\":"
+         << bytes_per_second;
+}
+
 class Qwen3NextModel final {
  public:
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
@@ -616,6 +647,10 @@ class Qwen3NextModel final {
   }
   expert::runtime::HybridDispatchTelemetry dispatch_telemetry() const noexcept {
     return dispatch_->telemetry();
+  }
+  expert::runtime::cpu::ExpertExecutorTelemetry
+  cpu_executor_telemetry() const noexcept {
+    return cpu_executor_->telemetry();
   }
   void settle_placement() {
     status_check(placement_->quiesce(std::chrono::seconds(30)));
@@ -1699,6 +1734,7 @@ int main(int argc, char** argv) {
       const auto baseline_metrics = model.telemetry();
       const auto baseline_phase = model.phase_telemetry();
       const auto baseline_dispatch = model.dispatch_telemetry();
+      const auto baseline_cpu_executor = model.cpu_executor_telemetry();
       model.reset_request();
       const auto started_prompt = std::chrono::steady_clock::now();
       prefill();
@@ -1730,6 +1766,7 @@ int main(int argc, char** argv) {
       const auto metrics = model.telemetry();
       const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
       const auto dispatch = model.dispatch_telemetry();
+      const auto cpu_executor = model.cpu_executor_telemetry();
       const auto measured_read_bytes =
           metrics.read_bytes - baseline_metrics.read_bytes;
       const auto measured_uploaded_bytes =
@@ -1868,6 +1905,7 @@ int main(int argc, char** argv) {
                 << metrics.over_quota_evictions;
       print_phase_json(std::cout, phases);
       print_dispatch_json(std::cout, dispatch, baseline_dispatch);
+      print_cpu_executor_json(std::cout, cpu_executor, baseline_cpu_executor);
       std::cout << "}\n";
       return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
@@ -1927,6 +1965,7 @@ int main(int argc, char** argv) {
     const auto baseline_metrics = model.telemetry();
     const auto baseline_phase = model.phase_telemetry();
     const auto baseline_dispatch = model.dispatch_telemetry();
+    const auto baseline_cpu_executor = model.cpu_executor_telemetry();
     model.reset_request();
     const auto started_prompt = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens.size(); ++position)
@@ -1951,6 +1990,7 @@ int main(int argc, char** argv) {
     const auto metrics = model.telemetry();
     const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
     const auto dispatch = model.dispatch_telemetry();
+    const auto cpu_executor = model.cpu_executor_telemetry();
     const auto measured_read_bytes =
         metrics.read_bytes - baseline_metrics.read_bytes;
     const auto measured_uploaded_bytes =
@@ -2028,6 +2068,7 @@ int main(int argc, char** argv) {
               << metrics.over_quota_evictions;
     print_phase_json(std::cout, phases);
     print_dispatch_json(std::cout, dispatch, baseline_dispatch);
+    print_cpu_executor_json(std::cout, cpu_executor, baseline_cpu_executor);
     std::cout << "}\n";
     return 0;
   } catch (const std::exception& error) {

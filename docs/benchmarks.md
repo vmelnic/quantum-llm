@@ -122,6 +122,29 @@ remains enabled in the balanced baseline despite low strict next-use precision.
 Its pollution telemetry remains a production tuning signal, not a success
 metric to optimize in isolation.
 
+### CPU executor autotuning
+
+The bounded first-batch tuner evaluated four configurations in 1.5543 ms and
+selected all 12 logical workers with 64-output gate/up and 128-output down
+jobs. Persistent scratch, row-pointer reuse, and AVX2 software prefetch then
+produced:
+
+| Measurement | Result |
+|---|---:|
+| aggregate throughput | 42.3659 tok/s |
+| CPU expert selections | 9,361 |
+| CPU executor calls | 1,675 |
+| CPU time per selection | 109,714 ns |
+| effective weight bytes | 26,148,372,480 B |
+| CPU compute time | 1.0259 s |
+| effective weight traversal | 25.4882 GB/s |
+
+The immediately preceding bounded-prefetch gate measured 113,501 ns per CPU
+selection. The new result is 3.34% lower while retaining exact output, zero
+measured expert SSD/H2D, and zero pagefile use. Effective traversal counts each
+expert record once per grouped execution and may include cache reuse; it must
+not be presented as measured socket DRAM bandwidth.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

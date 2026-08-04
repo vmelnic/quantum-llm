@@ -597,6 +597,16 @@ void test_cpu_executor_writes_compact_selection_outputs() {
   const auto status = executor.execute(std::span(&group, 1), inputs, 2, 2,
                                        outputs);
   require(status.ok(), "CPU expert executor rejected valid fixture");
+  const auto executor_metrics = executor.telemetry();
+  require(executor_metrics.maximum_threads == 2 &&
+              executor_metrics.selected_threads >= 1 &&
+              executor_metrics.selected_threads <= 2 &&
+              executor_metrics.calibration_runs >= 1 &&
+              executor_metrics.execute_calls == 1 &&
+              executor_metrics.selections == 2 &&
+              executor_metrics.effective_weight_bytes == 768 &&
+              executor_metrics.compute_ns > 0,
+          "CPU executor calibration or bandwidth telemetry mismatch");
   for (std::size_t column = 0; column < 16; ++column) {
     require(std::isfinite(outputs[column]) &&
                 outputs[column] == outputs[16 + column],

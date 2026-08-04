@@ -235,17 +235,45 @@ Acceptance evidence:
 - the qualified hot batch improves against a direct prefetch-off run; cold/warm
   service qualification remains required before changing service profiles.
 
-## Stage 4 — CPU executor efficiency and autotuning
+## Stage 4 — CPU executor efficiency and autotuning — completed
 
 Keep FP32 activations and the current numerical ABI first. Improve the AVX2
 executor through cache blocking, packed traversal, multi-row reuse, software
 prefetch, and allocation reuse. At startup, a bounded calibration selects the
 physical-core/SMT thread count and kernel tile from real hardware measurements.
 
+The implementation now:
+
+- retains intermediate, offset, and compact-output validation scratch across
+  calls instead of rebuilding group/intermediate storage per layer;
+- precomputes input/intermediate/output row pointers for multi-row weight
+  reuse;
+- prefetches the next weight/activation cache lines in AVX2 gate/up/down loops;
+- fixes the portable scalar fallback to honor compact output slots;
+- creates the maximum worker pool once and activates only the calibrated
+  subset;
+- calibrates `{logical/2, logical}` × `{64/128, 128/256}` gate/down tiles on
+  the first real CPU batch, bounded to 250 ms;
+- publishes selected workers/tiles, calibration cost, selections, effective
+  weight bytes, compute time, and effective bytes/s.
+
+On the Ryzen 5 5600, calibration ran all four candidates in 1.5543 ms and
+selected 12 workers with 64/128 tiles. The qualified mixed batch measured:
+
+- 42.3659 tok/s aggregate;
+- 109,714 ns per CPU selection;
+- 9,361 CPU selections over 1,675 executor calls;
+- 25.4882 GB/s effective weight traversal;
+- exact output, zero measured expert SSD/H2D, and zero pagefile use.
+
+Compared with the immediately preceding bounded-prefetch run, CPU time per
+selection fell from 113,501 ns to 109,714 ns. Effective traversal bandwidth is
+an executor accounting metric, not a claim of raw DRAM bandwidth.
+
 Activation INT8 or another arithmetic ABI is a separate future stage because
 it requires numerical and model-quality qualification.
 
-Acceptance:
+Acceptance evidence:
 
 - the CPU reference tolerance does not change;
 - calibration has a strict time/memory bound and a deterministic fallback;
