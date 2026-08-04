@@ -17,10 +17,12 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Mapping
+from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import unquote, urlsplit
 
 from transformers import AutoTokenizer
 
@@ -37,6 +39,89 @@ def log(event: str, **fields: Any) -> None:
 
 class WorkerError(RuntimeError):
     pass
+
+
+class RequestError(ValueError):
+    def __init__(self, message: str, param: str | None = None,
+                 code: str = "invalid_value") -> None:
+        super().__init__(message)
+        self.param = param
+        self.code = code
+
+
+@dataclass(frozen=True)
+class GenerationRequest:
+    endpoint: str
+    prompt_ids: list[int]
+    maximum: int
+    stream: bool
+    stop: tuple[str, ...]
+    include_usage: bool
+    instructions: str | None = None
+    metadata: dict[str, Any] | None = None
+    user: str | None = None
+
+
+class StopFilter:
+    """Hold possible stop-prefix suffixes so stop strings never leak to clients."""
+
+    def __init__(self, stops: tuple[str, ...]) -> None:
+        self.stops = stops
+        self.pending = ""
+        self.stopped = False
+
+    def feed(self, text: str) -> str:
+        if self.stopped:
+            return ""
+        combined = self.pending + text
+        match = min(
+            (index for stop in self.stops
+             if (index := combined.find(stop)) >= 0),
+            default=-1,
+        )
+        if match >= 0:
+            self.pending = ""
+            self.stopped = True
+            return combined[:match]
+        held = 0
+        for stop in self.stops:
+            maximum = min(len(stop) - 1, len(combined))
+            for size in range(maximum, 0, -1):
+                if combined.endswith(stop[:size]):
+                    held = max(held, size)
+                    break
+        if held:
+            result, self.pending = combined[:-held], combined[-held:]
+            return result
+        self.pending = ""
+        return combined
+
+    def finish(self) -> str:
+        if self.stopped:
+            return ""
+        result, self.pending = self.pending, ""
+        return result
+
+
+def _text_content(content: Any, param: str) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        raise RequestError("message content must be text or an array of text parts", param)
+    pieces: list[str] = []
+    for index, part in enumerate(content):
+        if not isinstance(part, dict):
+            raise RequestError("message content parts must be objects", f"{param}.{index}")
+        kind = part.get("type")
+        if kind not in {"text", "input_text", "output_text"}:
+            raise RequestError(
+                f"content type {kind!r} is not supported by this text-only model",
+                f"{param}.{index}.type", "unsupported_value",
+            )
+        if not isinstance(part.get("text"), str):
+            raise RequestError("text content part requires a string", f"{param}.{index}.text")
+        pieces.append(part["text"])
+    return "".join(pieces)
 
 
 class CudaWorker:
@@ -357,32 +442,190 @@ class Application:
                       f"expert_service_ready {int(self.worker.healthy() and not self.draining.is_set())}"))
         return "\n".join(lines) + "\n"
 
-    def prompt_ids(self, payload: dict[str, Any], chat: bool) -> list[int]:
-        if chat:
-            messages = payload.get("messages")
-            if not isinstance(messages, list) or not messages:
-                raise ValueError("messages must be a non-empty array")
-            ids = self.tokenizer.apply_chat_template(
-                messages, tokenize=True, add_generation_prompt=True
-            )
-            if hasattr(ids, "input_ids"):
-                ids = ids.input_ids
-            elif isinstance(ids, Mapping):
-                ids = ids["input_ids"]
-            if ids and isinstance(ids[0], list):
-                ids = ids[0]
+    def _chat_prompt_ids(self, messages: list[dict[str, Any]]) -> list[int]:
+        ids = self.tokenizer.apply_chat_template(
+            messages, tokenize=True, add_generation_prompt=True
+        )
+        if hasattr(ids, "input_ids"):
+            ids = ids.input_ids
+        elif isinstance(ids, Mapping):
+            ids = ids["input_ids"]
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        return [int(token) for token in ids]
+
+    def _messages(self, raw: Any, param: str = "messages") -> list[dict[str, Any]]:
+        if not isinstance(raw, list) or not raw:
+            raise RequestError(f"{param} must be a non-empty array", param)
+        result: list[dict[str, Any]] = []
+        for index, message in enumerate(raw):
+            item_param = f"{param}.{index}"
+            if isinstance(message, str):
+                result.append({"role": "user", "content": message})
+                continue
+            if not isinstance(message, dict):
+                raise RequestError("message must be an object", item_param)
+            if message.get("type", "message") != "message":
+                raise RequestError("only message input items are supported",
+                                   f"{item_param}.type", "unsupported_value")
+            role = message.get("role")
+            if role == "developer":
+                role = "system"
+            if role not in {"system", "user", "assistant"}:
+                raise RequestError(f"message role {role!r} is not supported",
+                                   f"{item_param}.role", "unsupported_value")
+            content = _text_content(message.get("content"), f"{item_param}.content")
+            result.append({"role": role, "content": content})
+        return result
+
+    @staticmethod
+    def _stop_sequences(value: Any) -> tuple[str, ...]:
+        if value is None:
+            return ()
+        stops = [value] if isinstance(value, str) else value
+        if (not isinstance(stops, list) or not 1 <= len(stops) <= 4 or
+                not all(isinstance(stop, str) and stop for stop in stops)):
+            raise RequestError("stop must be a non-empty string or up to four strings", "stop")
+        return tuple(stops)
+
+    @staticmethod
+    def _stream_usage(payload: dict[str, Any]) -> bool:
+        options = payload.get("stream_options")
+        if options is None:
+            return False
+        if not isinstance(options, dict):
+            raise RequestError("stream_options must be an object", "stream_options")
+        include = options.get("include_usage", False)
+        if not isinstance(include, bool):
+            raise RequestError("include_usage must be boolean", "stream_options.include_usage")
+        return include
+
+    @staticmethod
+    def _validate_compatibility(payload: dict[str, Any], endpoint: str) -> None:
+        def only(field: str, allowed: tuple[Any, ...], message: str) -> None:
+            if field in payload and payload[field] not in allowed:
+                raise RequestError(message, field, "unsupported_value")
+
+        only("n", (None, 1), "this runtime supports n=1")
+        only("best_of", (None, 1), "this runtime supports best_of=1")
+        only("temperature", (None, 0, 0.0),
+             "sampling is not implemented; omit temperature or use 0")
+        only("top_p", (None, 1, 1.0),
+             "nucleus sampling is not implemented; omit top_p or use 1")
+        only("presence_penalty", (None, 0, 0.0),
+             "presence_penalty is not implemented")
+        only("frequency_penalty", (None, 0, 0.0),
+             "frequency_penalty is not implemented")
+        only("logprobs", (None, False, 0), "logprobs are not implemented")
+        only("top_logprobs", (None, 0), "top_logprobs are not implemented")
+        only("echo", (None, False), "echo is not implemented")
+        only("background", (None, False), "background responses are not implemented")
+        only("previous_response_id", (None,), "stored response chaining is not implemented")
+        only("conversation", (None,), "server-side conversations are not implemented")
+        only("truncation", (None, "disabled"), "automatic truncation is not implemented")
+
+        if payload.get("logit_bias") not in (None, {}):
+            raise RequestError("logit_bias is not implemented", "logit_bias", "unsupported_value")
+        if payload.get("tools") not in (None, []):
+            raise RequestError("tool calling is not implemented", "tools", "unsupported_value")
+        if payload.get("functions") not in (None, []):
+            raise RequestError("function calling is not implemented", "functions", "unsupported_value")
+        if payload.get("modalities") not in (None, ["text"]):
+            raise RequestError("only text output is supported", "modalities", "unsupported_value")
+        if payload.get("audio") is not None:
+            raise RequestError("audio output is not supported", "audio", "unsupported_value")
+        if payload.get("prediction") is not None:
+            raise RequestError("predicted output is not implemented", "prediction", "unsupported_value")
+        if payload.get("reasoning") not in (None, {}):
+            raise RequestError("reasoning controls are not implemented", "reasoning", "unsupported_value")
+        if payload.get("suffix") is not None:
+            raise RequestError("suffix completion is not implemented", "suffix", "unsupported_value")
+
+        tools = payload.get("tools") or payload.get("functions")
+        tool_choice = payload.get("tool_choice", payload.get("function_call"))
+        if tools or tool_choice not in (None, "none", "auto"):
+            raise RequestError("tool choice is not supported", "tool_choice", "unsupported_value")
+
+        response_format = payload.get("response_format")
+        if response_format not in (None, {"type": "text"}):
+            raise RequestError("only response_format type=text is supported",
+                               "response_format", "unsupported_value")
+        text = payload.get("text")
+        if text is not None:
+            if not isinstance(text, dict):
+                raise RequestError("text must be an object", "text")
+            text_format = text.get("format", {"type": "text"})
+            if text_format != {"type": "text"}:
+                raise RequestError("only text.format type=text is supported",
+                                   "text.format", "unsupported_value")
+        if endpoint == "responses" and payload.get("include") not in (None, []):
+            raise RequestError("additional response fields are not available",
+                               "include", "unsupported_value")
+
+    def parse_request(self, payload: dict[str, Any], endpoint: str) -> GenerationRequest:
+        if payload.get("model", self.args.model) != self.args.model:
+            raise RequestError("unknown model", "model", "model_not_found")
+        stream = payload.get("stream", False)
+        if not isinstance(stream, bool):
+            raise RequestError("stream must be boolean", "stream")
+        self._validate_compatibility(payload, endpoint)
+
+        max_field = "max_output_tokens" if endpoint == "responses" else "max_tokens"
+        maximum_value = payload.get("max_output_tokens") if endpoint == "responses" else payload.get(
+            "max_completion_tokens", payload.get("max_tokens", 16)
+        )
+        if maximum_value is None:
+            maximum_value = 16
+        if isinstance(maximum_value, bool) or not isinstance(maximum_value, int):
+            raise RequestError(f"{max_field} must be an integer", max_field)
+        maximum = maximum_value
+        if not 1 <= maximum <= self.args.maximum_new_tokens:
+            raise RequestError(f"{max_field} is outside service limits", max_field)
+
+        instructions = payload.get("instructions")
+        if instructions is not None and not isinstance(instructions, str):
+            raise RequestError("instructions must be a string", "instructions")
+        metadata = payload.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            raise RequestError("metadata must be an object", "metadata")
+        user = payload.get("user")
+        if user is not None and not isinstance(user, str):
+            raise RequestError("user must be a string", "user")
+
+        if endpoint == "chat":
+            prompt_ids = self._chat_prompt_ids(self._messages(payload.get("messages")))
+        elif endpoint == "responses":
+            raw_input = payload.get("input")
+            if isinstance(raw_input, str):
+                messages = [{"role": "user", "content": raw_input}]
+            else:
+                messages = self._messages(raw_input, "input")
+            if instructions:
+                messages.insert(0, {"role": "system", "content": instructions})
+            prompt_ids = self._chat_prompt_ids(messages)
         else:
             prompt = payload.get("prompt")
             if isinstance(prompt, str):
-                ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-            elif isinstance(prompt, list) and all(isinstance(item, int) for item in prompt):
-                ids = prompt
+                prompt_ids = [int(token) for token in self.tokenizer.encode(
+                    prompt, add_special_tokens=False
+                )]
+            elif (isinstance(prompt, list) and prompt and
+                  all(isinstance(item, int) and not isinstance(item, bool) for item in prompt)):
+                prompt_ids = [int(token) for token in prompt]
             else:
-                raise ValueError("prompt must be a string or token-id array")
-        ids = [int(token) for token in ids]
-        if not ids or len(ids) >= self.args.max_context:
-            raise ValueError("prompt is empty or exceeds context capacity")
-        return ids
+                raise RequestError("prompt must be a string or token-id array", "prompt")
+
+        if not prompt_ids or len(prompt_ids) >= self.args.max_context:
+            raise RequestError("prompt is empty or exceeds context capacity",
+                               "input" if endpoint == "responses" else "prompt")
+        if len(prompt_ids) + maximum > self.args.max_context:
+            raise RequestError("prompt plus output tokens exceeds context capacity", max_field)
+        return GenerationRequest(
+            endpoint=endpoint, prompt_ids=prompt_ids, maximum=maximum,
+            stream=stream, stop=self._stop_sequences(payload.get("stop")),
+            include_usage=self._stream_usage(payload), instructions=instructions,
+            metadata=metadata, user=user,
+        )
 
     def generate(self, prompt_ids: list[int], maximum: int) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
@@ -409,7 +652,7 @@ class Application:
                 self.increment("generated_tokens")
                 generated.append(token)
                 current = self.tokenizer.decode(
-                    generated, skip_special_tokens=False,
+                    generated, skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
                 delta = current[len(decoded):] if current.startswith(decoded) else current
@@ -469,7 +712,7 @@ class Application:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "ExpertRuntime/1"
+    server_version = "ExpertRuntime/2"
 
     @property
     def app(self) -> Application:
@@ -497,155 +740,345 @@ class Handler(BaseHTTPRequestHandler):
         except (ConnectionResetError, OSError, ValueError):
             return True
 
+    def _request_id(self) -> str:
+        value = getattr(self, "http_request_id", None)
+        if value is None:
+            value = "req_" + uuid.uuid4().hex
+            self.http_request_id = value
+        return value
+
     def _json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("x-request-id", self._request_id())
         self.end_headers()
         self.wfile.write(encoded)
 
-    def _error(self, status: int, message: str, kind: str = "invalid_request_error") -> None:
-        self._json(status, {"error": {"message": message, "type": kind}})
+    def _error(self, status: int, message: str, kind: str = "invalid_request_error",
+               param: str | None = None, code: str | None = None) -> None:
+        self._json(status, {"error": {
+            "message": message, "type": kind, "param": param, "code": code,
+        }})
+
+    def _sse_headers(self) -> None:
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.send_header("x-request-id", self._request_id())
+        self.end_headers()
+
+    def _sse(self, payload: dict[str, Any] | str) -> None:
+        encoded = payload if isinstance(payload, str) else json.dumps(
+            payload, separators=(",", ":")
+        )
+        self.wfile.write(b"data: " + encoded.encode() + b"\n\n")
+        self.wfile.flush()
+
+    def _model(self) -> dict[str, Any]:
+        return {
+            "id": self.app.args.model,
+            "object": "model",
+            "created": 0,
+            "owned_by": "local",
+        }
+
+    @staticmethod
+    def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+        return {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
+            "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
+            "completion_tokens_details": {
+                "reasoning_tokens": 0, "audio_tokens": 0,
+                "accepted_prediction_tokens": 0,
+                "rejected_prediction_tokens": 0,
+            },
+        }
+
+    @staticmethod
+    def _responses_usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+        return {
+            "input_tokens": prompt_tokens,
+            "input_tokens_details": {"cached_tokens": 0},
+            "output_tokens": completion_tokens,
+            "output_tokens_details": {"reasoning_tokens": 0},
+            "total_tokens": prompt_tokens + completion_tokens,
+        }
+
+    def _run_generation(self, request: GenerationRequest, emit: Any) -> tuple[str, int, str]:
+        pieces: list[str] = []
+        count = 0
+        finish_reason = "length"
+        stop_filter = StopFilter(request.stop)
+        generation = self.app.generate(request.prompt_ids, request.maximum)
+        try:
+            for token, delta in generation:
+                if request.stream and self._client_disconnected():
+                    raise BrokenPipeError("streaming client disconnected")
+                count += 1
+                safe = stop_filter.feed(delta)
+                if safe:
+                    pieces.append(safe)
+                    emit(safe)
+                if stop_filter.stopped or token in self.app.eos_token_ids:
+                    finish_reason = "stop"
+                    break
+            tail = stop_filter.finish()
+            if tail:
+                pieces.append(tail)
+                emit(tail)
+        finally:
+            generation.close()
+        return "".join(pieces), count, finish_reason
+
+    def _response_object(self, request: GenerationRequest, response_id: str,
+                         message_id: str, created: int, text: str,
+                         completion_tokens: int, status: str = "completed") -> dict[str, Any]:
+        completed = status == "completed"
+        output = [] if not completed else [{
+            "id": message_id, "type": "message", "status": "completed",
+            "role": "assistant", "content": [{
+                "type": "output_text", "text": text, "annotations": [],
+                "logprobs": [],
+            }],
+        }]
+        return {
+            "id": response_id, "object": "response", "created_at": created,
+            "status": status, "completed_at": int(time.time()) if completed else None,
+            "error": None, "incomplete_details": None,
+            "instructions": request.instructions,
+            "max_output_tokens": request.maximum, "model": self.app.args.model,
+            "output": output, "parallel_tool_calls": True,
+            "previous_response_id": None, "reasoning": {"effort": None, "summary": None},
+            "store": False, "temperature": 0.0,
+            "text": {"format": {"type": "text"}},
+            "tool_choice": "none", "tools": [], "top_p": 1.0,
+            "truncation": "disabled",
+            "usage": self._responses_usage(len(request.prompt_ids), completion_tokens)
+                     if completed else None,
+            "user": request.user, "metadata": request.metadata or {},
+        }
 
     def do_GET(self) -> None:
+        self.http_request_id = "req_" + uuid.uuid4().hex
         if not self._authorized():
-            self._error(HTTPStatus.UNAUTHORIZED, "invalid API key", "authentication_error")
+            self._error(HTTPStatus.UNAUTHORIZED, "invalid API key", "authentication_error",
+                        code="invalid_api_key")
             return
-        if self.path == "/health":
+        path = urlsplit(self.path).path
+        if path == "/health":
             status = HTTPStatus.OK if self.app.worker.healthy() else HTTPStatus.SERVICE_UNAVAILABLE
             self._json(status, {"status": "ok" if status == 200 else "failed"})
-        elif self.path == "/ready":
+        elif path == "/ready":
             ready = self.app.worker.healthy() and not self.app.draining.is_set()
             self._json(HTTPStatus.OK if ready else HTTPStatus.SERVICE_UNAVAILABLE,
                        {"ready": ready})
-        elif self.path == "/model-info":
+        elif path == "/model-info":
             self._json(HTTPStatus.OK, self.app.info())
-        elif self.path == "/v1/models":
-            self._json(HTTPStatus.OK, {"object": "list", "data": [{
-                "id": self.app.args.model, "object": "model", "owned_by": "local"
-            }]})
-        elif self.path == "/metrics":
+        elif path == "/v1/models":
+            self._json(HTTPStatus.OK, {"object": "list", "data": [self._model()]})
+        elif path.startswith("/v1/models/"):
+            model = unquote(path[len("/v1/models/"):])
+            if model != self.app.args.model:
+                self._error(HTTPStatus.NOT_FOUND, f"model {model!r} was not found",
+                            "invalid_request_error", "model", "model_not_found")
+            else:
+                self._json(HTTPStatus.OK, self._model())
+        elif path == "/metrics":
             encoded = self.app.metrics_text().encode()
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/plain; version=0.0.4")
             self.send_header("Content-Length", str(len(encoded)))
+            self.send_header("x-request-id", self._request_id())
             self.end_headers()
             self.wfile.write(encoded)
         else:
-            self._error(HTTPStatus.NOT_FOUND, "route not found")
+            self._error(HTTPStatus.NOT_FOUND, "route not found", code="not_found")
 
     def do_POST(self) -> None:
+        self.http_request_id = "req_" + uuid.uuid4().hex
         if not self._authorized():
-            self._error(HTTPStatus.UNAUTHORIZED, "invalid API key", "authentication_error")
+            self._error(HTTPStatus.UNAUTHORIZED, "invalid API key", "authentication_error",
+                        code="invalid_api_key")
             return
-        chat = self.path == "/v1/chat/completions"
-        if not chat and self.path != "/v1/completions":
-            self._error(HTTPStatus.NOT_FOUND, "route not found")
+        path = urlsplit(self.path).path
+        endpoint = {
+            "/v1/completions": "completion",
+            "/v1/chat/completions": "chat",
+            "/v1/responses": "responses",
+        }.get(path)
+        if endpoint is None:
+            self._error(HTTPStatus.NOT_FOUND, "route not found", code="not_found")
             return
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length <= 0 or length > self.app.args.maximum_body_bytes:
-                raise ValueError("request body size is invalid")
+                raise RequestError("request body size is invalid", code="invalid_request_body")
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
-                raise ValueError("request body must be an object")
-            if payload.get("model", self.app.args.model) != self.app.args.model:
-                raise ValueError("unknown model")
-            maximum = int(payload.get("max_completion_tokens", payload.get("max_tokens", 16)))
-            if maximum < 1 or maximum > self.app.args.maximum_new_tokens:
-                raise ValueError("max_tokens is outside service limits")
-            prompt_ids = self.app.prompt_ids(payload, chat)
-            if len(prompt_ids) + maximum > self.app.args.max_context:
-                raise ValueError("prompt plus max_tokens exceeds context")
-            stream = bool(payload.get("stream", False))
+                raise RequestError("request body must be an object", code="invalid_request_body")
+            request = self.app.parse_request(payload, endpoint)
+        except RequestError as error:
+            self._error(HTTPStatus.BAD_REQUEST, str(error), param=error.param, code=error.code)
+            return
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error))
+            self._error(HTTPStatus.BAD_REQUEST, str(error), code="invalid_json")
             return
         if not self.app.acquire():
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "service overloaded or draining", "overload_error")
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "service overloaded or draining",
+                        "server_error", code="overloaded")
             return
         if not self.app.acquire_worker_slot():
             self.app.release()
             self._error(HTTPStatus.SERVICE_UNAVAILABLE,
-                        "all model slots are busy", "overload_error")
+                        "all model slots are busy", "server_error", code="overloaded")
             return
-        request_uuid = "cmpl-" + uuid.uuid4().hex
+        prefix = {"chat": "chatcmpl-", "completion": "cmpl-", "responses": "resp_"}[endpoint]
+        request_uuid = prefix + uuid.uuid4().hex
+        message_uuid = "msg_" + uuid.uuid4().hex
         created = int(time.time())
-        completion_count = 0
-        finish_reason = "length"
+        stream_started = False
         try:
-            if stream:
-                self.send_response(HTTPStatus.OK)
-                self.send_header("Content-Type", "text/event-stream")
-                self.send_header("Cache-Control", "no-cache")
-                self.send_header("Connection", "close")
-                self.end_headers()
-                generation = self.app.generate(prompt_ids, maximum)
-                try:
-                    while True:
+            if request.stream:
+                self._sse_headers()
+                stream_started = True
+                if endpoint == "responses":
+                    sequence = 0
+                    initial = self._response_object(
+                        request, request_uuid, message_uuid, created, "", 0, "in_progress"
+                    )
+                    self._sse({"type": "response.created", "response": initial,
+                               "sequence_number": sequence})
+                    sequence += 1
+                    item = {"id": message_uuid, "type": "message", "status": "in_progress",
+                            "role": "assistant", "content": []}
+                    self._sse({"type": "response.output_item.added", "output_index": 0,
+                               "item": item, "sequence_number": sequence})
+                    sequence += 1
+                    part = {"type": "output_text", "text": "", "annotations": [],
+                            "logprobs": []}
+                    self._sse({"type": "response.content_part.added", "item_id": message_uuid,
+                               "output_index": 0, "content_index": 0, "part": part,
+                               "sequence_number": sequence})
+                    sequence += 1
+
+                    def emit_response(delta: str) -> None:
+                        nonlocal sequence
                         if self._client_disconnected():
                             raise BrokenPipeError("streaming client disconnected")
-                        try:
-                            token, delta = next(generation)
-                        except StopIteration:
-                            break
-                        completion_count += 1
-                        if token in self.app.eos_token_ids:
-                            finish_reason = "stop"
-                        choice = {"index": 0, "finish_reason": None}
-                        choice["delta" if chat else "text"] = ({"content": delta} if chat else delta)
-                        chunk = {"id": request_uuid, "object": "chat.completion.chunk" if chat else "text_completion",
-                                 "created": created, "model": self.app.args.model, "choices": [choice]}
-                        self.wfile.write(b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n")
-                        self.wfile.flush()
-                finally:
-                    generation.close()
-                final_choice: dict[str, Any] = {
-                    "index": 0, "finish_reason": finish_reason
-                }
-                final_choice["delta" if chat else "text"] = ({} if chat else "")
-                final_chunk = {"id": request_uuid,
-                    "object": "chat.completion.chunk" if chat else "text_completion",
-                    "created": created, "model": self.app.args.model,
-                    "choices": [final_choice]}
-                self.wfile.write(b"data: " + json.dumps(final_chunk, separators=(",", ":")).encode() + b"\n\n")
-                self.wfile.write(b"data: [DONE]\n\n")
-                self.wfile.flush()
+                        self._sse({"type": "response.output_text.delta",
+                                   "item_id": message_uuid, "output_index": 0,
+                                   "content_index": 0, "delta": delta,
+                                   "logprobs": [], "sequence_number": sequence})
+                        sequence += 1
+
+                    text, completion_count, _finish_reason = self._run_generation(
+                        request, emit_response
+                    )
+                    self._sse({"type": "response.output_text.done", "item_id": message_uuid,
+                               "output_index": 0, "content_index": 0, "text": text,
+                               "logprobs": [], "sequence_number": sequence})
+                    sequence += 1
+                    done_part = {"type": "output_text", "text": text,
+                                 "annotations": [], "logprobs": []}
+                    self._sse({"type": "response.content_part.done", "item_id": message_uuid,
+                               "output_index": 0, "content_index": 0, "part": done_part,
+                               "sequence_number": sequence})
+                    sequence += 1
+                    done_item = {"id": message_uuid, "type": "message",
+                                 "status": "completed", "role": "assistant",
+                                 "content": [done_part]}
+                    self._sse({"type": "response.output_item.done", "output_index": 0,
+                               "item": done_item, "sequence_number": sequence})
+                    sequence += 1
+                    completed = self._response_object(
+                        request, request_uuid, message_uuid, created, text, completion_count
+                    )
+                    self._sse({"type": "response.completed", "response": completed,
+                               "sequence_number": sequence})
+                else:
+                    chat = endpoint == "chat"
+                    base = {"id": request_uuid,
+                            "object": "chat.completion.chunk" if chat else "text_completion",
+                            "created": created, "model": self.app.args.model,
+                            "system_fingerprint": "fp_" + self.app.args.build_id}
+                    if chat:
+                        self._sse({**base, "choices": [{"index": 0,
+                            "delta": {"role": "assistant", "content": ""},
+                            "logprobs": None, "finish_reason": None}]})
+
+                    def emit_completion(delta: str) -> None:
+                        if self._client_disconnected():
+                            raise BrokenPipeError("streaming client disconnected")
+                        choice: dict[str, Any] = {"index": 0, "finish_reason": None,
+                                                  "logprobs": None}
+                        choice["delta" if chat else "text"] = ({"content": delta}
+                                                                 if chat else delta)
+                        self._sse({**base, "choices": [choice]})
+
+                    _text, completion_count, finish_reason = self._run_generation(
+                        request, emit_completion
+                    )
+                    final_choice: dict[str, Any] = {
+                        "index": 0, "finish_reason": finish_reason, "logprobs": None,
+                    }
+                    final_choice["delta" if chat else "text"] = {} if chat else ""
+                    self._sse({**base, "choices": [final_choice]})
+                    if request.include_usage:
+                        self._sse({**base, "choices": [],
+                                   "usage": self._usage(len(request.prompt_ids),
+                                                        completion_count)})
+                    self._sse("[DONE]")
             else:
                 pieces: list[str] = []
-                for token, delta in self.app.generate(prompt_ids, maximum):
-                    completion_count += 1
-                    pieces.append(delta)
-                    if token in self.app.eos_token_ids:
-                        finish_reason = "stop"
-                text = "".join(pieces)
-                choice: dict[str, Any] = {
-                    "index": 0, "finish_reason": finish_reason
-                }
-                if chat:
-                    choice["message"] = {"role": "assistant", "content": text}
+                text, completion_count, finish_reason = self._run_generation(
+                    request, pieces.append
+                )
+                if endpoint == "responses":
+                    self._json(HTTPStatus.OK, self._response_object(
+                        request, request_uuid, message_uuid, created, text, completion_count
+                    ))
                 else:
-                    choice["text"] = text
-                self._json(HTTPStatus.OK, {"id": request_uuid,
-                    "object": "chat.completion" if chat else "text_completion",
-                    "created": created, "model": self.app.args.model, "choices": [choice],
-                    "usage": {"prompt_tokens": len(prompt_ids),
-                              "completion_tokens": completion_count,
-                              "total_tokens": len(prompt_ids) + completion_count}})
+                    chat = endpoint == "chat"
+                    choice: dict[str, Any] = {
+                        "index": 0, "finish_reason": finish_reason, "logprobs": None,
+                    }
+                    if chat:
+                        choice["message"] = {"role": "assistant", "content": text,
+                                             "refusal": None, "annotations": []}
+                    else:
+                        choice["text"] = text
+                    self._json(HTTPStatus.OK, {"id": request_uuid,
+                        "object": "chat.completion" if chat else "text_completion",
+                        "created": created, "model": self.app.args.model,
+                        "system_fingerprint": "fp_" + self.app.args.build_id,
+                        "choices": [choice],
+                        "usage": self._usage(len(request.prompt_ids), completion_count),
+                        "service_tier": "default"})
             self.app.increment("completed")
         except (BrokenPipeError, ConnectionResetError):
             self.app.increment("cancelled")
             log("request_cancelled", id=request_uuid, reason="client_disconnect")
         except TimeoutError as error:
             self.app.increment("failed")
-            if not stream:
+            if not stream_started:
                 self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error), "timeout_error")
+            elif endpoint == "responses":
+                self._sse({"type": "error", "code": "generation_timeout",
+                           "message": str(error), "param": None})
         except Exception as error:
             self.app.increment("failed")
             log("request_failed", id=request_uuid, error=repr(error))
-            if not stream:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed", "server_error")
+            if not stream_started:
+                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed",
+                            "server_error", code="generation_failed")
+            elif endpoint == "responses":
+                self._sse({"type": "error", "code": "generation_failed",
+                           "message": "generation failed", "param": None})
         finally:
             self.app.release_worker_slot()
             self.app.release()

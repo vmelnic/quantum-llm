@@ -50,11 +50,16 @@ Start-ExpertServer.ps1 -HostAddress 127.0.0.1 -Port 8080 `
 
 Endpoint-uri:
 
-- `POST /v1/completions` și `POST /v1/chat/completions`;
+- `POST /v1/responses`, `/v1/chat/completions` și `/v1/completions`;
 - streaming SSE prin `"stream": true`;
-- `GET /health`, `/ready`, `/model-info`, `/v1/models` și `/metrics`;
+- `GET /health`, `/ready`, `/model-info`, `/v1/models`,
+  `/v1/models/{model}` și `/metrics`;
 - coadă limitată, timeout de queue/generation, cancellation la disconnect și
   graceful drain la `SIGINT`/`SIGTERM`.
+
+Contractul API, exemplele OpenAI SDK, matricea parametrilor și limitele
+intenționate sunt documentate în [`docs/openai-api.md`](../docs/openai-api.md).
+Fișierul Python este implementarea, nu documentația publică a API-ului.
 
 `/model-info` include build ID, hash-ul de conținut al manifestului, hash-urile
 indicilor dense/expert și configurația efectivă de runtime (sloturi, cache-uri,

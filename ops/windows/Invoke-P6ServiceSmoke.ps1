@@ -38,21 +38,25 @@ function Get-MetricValue {
 
 function New-CompletionBody {
     param([int]$TokenCount, [bool]$Stream)
-    @{
+    $body = @{
         model = $ExpectedModel
         prompt = @(151644, 872, 374)
         max_tokens = $TokenCount
         stream = $Stream
         temperature = 0
-    } | ConvertTo-Json -Compress
+    }
+    if ($Stream) { $body.stream_options = @{ include_usage = $true } }
+    $body | ConvertTo-Json -Compress
 }
 
 $health = Invoke-JsonGet -Path "/health"
 $ready = Invoke-JsonGet -Path "/ready"
 $info = Invoke-JsonGet -Path "/model-info"
 $models = Invoke-JsonGet -Path "/v1/models"
+$model = Invoke-JsonGet -Path "/v1/models/$ExpectedModel"
 if ($health.status -ne "ok" -or -not $ready.ready) { throw "Service is not ready" }
-if ($info.model -ne $ExpectedModel -or $models.data[0].id -ne $ExpectedModel) {
+if ($info.model -ne $ExpectedModel -or $models.data[0].id -ne $ExpectedModel -or
+    $model.id -ne $ExpectedModel -or $model.object -ne "model") {
     throw "Unexpected deployed model identity"
 }
 if ($ExpectedBuildId -and $info.build_id -ne $ExpectedBuildId) {
@@ -111,11 +115,104 @@ try {
     $streamResponse = $client.PostAsync(
         "$BaseUri/v1/completions", $streamContent).GetAwaiter().GetResult()
     $streamText = $streamResponse.Content.ReadAsStringAsync().GetAwaiter().GetResult()
-    if (-not $streamResponse.IsSuccessStatusCode -or $streamText -notmatch "data: \[DONE\]") {
+    if (-not $streamResponse.IsSuccessStatusCode -or
+        $streamText -notmatch "data: \[DONE\]" -or
+        $streamText -notmatch '"choices":\[\],"usage":') {
         throw "Streaming completion did not terminate correctly"
     }
     $streamResponse.Dispose()
     $streamContent.Dispose()
+
+    $responsesBody = @{
+        model = $ExpectedModel
+        instructions = "Answer briefly."
+        input = @(@{
+            role = "user"
+            content = @(@{ type = "input_text"; text = "Say hello." })
+        })
+        max_output_tokens = $NewTokens
+        temperature = 0
+    } | ConvertTo-Json -Depth 6 -Compress
+    $responsesContent = [System.Net.Http.StringContent]::new(
+        $responsesBody, [Text.Encoding]::UTF8, "application/json")
+    $responsesHttp = $client.PostAsync(
+        "$BaseUri/v1/responses", $responsesContent).GetAwaiter().GetResult()
+    $responsesText = $responsesHttp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if (-not $responsesHttp.IsSuccessStatusCode) {
+        throw "Responses API failed with $([int]$responsesHttp.StatusCode): $responsesText"
+    }
+    $responsesPayload = $responsesText | ConvertFrom-Json
+    if ($responsesPayload.object -ne "response" -or
+        $responsesPayload.status -ne "completed" -or
+        $responsesPayload.output[0].content[0].type -ne "output_text" -or
+        [int]$responsesPayload.usage.output_tokens -lt 1) {
+        throw "Responses API returned an invalid payload"
+    }
+    $responsesHttp.Dispose()
+    $responsesContent.Dispose()
+
+    $responsesStreamContent = [System.Net.Http.StringContent]::new(
+        (@{
+            model = $ExpectedModel
+            input = "Say hello."
+            max_output_tokens = $NewTokens
+            temperature = 0
+            stream = $true
+        } | ConvertTo-Json -Compress),
+        [Text.Encoding]::UTF8, "application/json")
+    $responsesStreamHttp = $client.PostAsync(
+        "$BaseUri/v1/responses", $responsesStreamContent).GetAwaiter().GetResult()
+    $responsesStreamText = $responsesStreamHttp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if (-not $responsesStreamHttp.IsSuccessStatusCode -or
+        $responsesStreamText -notmatch '"type":"response.created"' -or
+        $responsesStreamText -notmatch '"type":"response.output_text.delta"' -or
+        $responsesStreamText -notmatch '"type":"response.completed"') {
+        throw "Responses API stream did not emit its typed lifecycle"
+    }
+    $responsesStreamHttp.Dispose()
+    $responsesStreamContent.Dispose()
+
+    $chatBody = @{
+        model = $ExpectedModel
+        messages = @(@{
+            role = "user"
+            content = @(@{ type = "text"; text = "Say hello." })
+        })
+        max_completion_tokens = $NewTokens
+        temperature = 0
+    } | ConvertTo-Json -Depth 6 -Compress
+    $chatContent = [System.Net.Http.StringContent]::new(
+        $chatBody, [Text.Encoding]::UTF8, "application/json")
+    $chatHttp = $client.PostAsync(
+        "$BaseUri/v1/chat/completions", $chatContent).GetAwaiter().GetResult()
+    $chatText = $chatHttp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    if (-not $chatHttp.IsSuccessStatusCode) {
+        throw "Chat Completions failed with $([int]$chatHttp.StatusCode): $chatText"
+    }
+    $chatPayload = $chatText | ConvertFrom-Json
+    if ($chatPayload.object -ne "chat.completion" -or
+        $chatPayload.choices[0].message.role -ne "assistant" -or
+        [int]$chatPayload.usage.completion_tokens -lt 1) {
+        throw "Chat Completions returned an invalid payload"
+    }
+    $chatHttp.Dispose()
+    $chatContent.Dispose()
+
+    $unsupportedContent = [System.Net.Http.StringContent]::new(
+        (@{ model = $ExpectedModel; input = "hello"; temperature = 0.5 } |
+            ConvertTo-Json -Compress),
+        [Text.Encoding]::UTF8, "application/json")
+    $unsupportedHttp = $client.PostAsync(
+        "$BaseUri/v1/responses", $unsupportedContent).GetAwaiter().GetResult()
+    $unsupportedText = $unsupportedHttp.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+    $unsupportedPayload = $unsupportedText | ConvertFrom-Json
+    if ([int]$unsupportedHttp.StatusCode -ne 400 -or
+        $unsupportedPayload.error.param -ne "temperature" -or
+        $unsupportedPayload.error.code -ne "unsupported_value") {
+        throw "Unsupported capability did not return a precise OpenAI error"
+    }
+    $unsupportedHttp.Dispose()
+    $unsupportedContent.Dispose()
 
     $cancelBefore = Get-MetricValue -Text (Get-MetricsText) `
         -Name "expert_service_cancelled_total"
@@ -154,7 +251,7 @@ $rows = (Get-MetricValue -Text $after -Name "expert_service_decode_rows_total") 
     (Get-MetricValue -Text $before -Name "expert_service_decode_rows_total")
 $completed = (Get-MetricValue -Text $after -Name "expert_service_completed_total") - `
     (Get-MetricValue -Text $before -Name "expert_service_completed_total")
-if ($completed -lt ($Concurrency + 1) -or $rows -lt $concurrentCompletionTokens -or $batches -le 0) {
+if ($completed -lt ($Concurrency + 4) -or $rows -lt $concurrentCompletionTokens -or $batches -le 0) {
     throw "Persistent service counters do not cover the completed smoke requests"
 }
 
@@ -174,6 +271,11 @@ $result = [PSCustomObject]@{
     decode_rows_delta = $rows
     effective_decode_batch = $rows / $batches
     cancellation_observed = $true
+    responses_api_observed = $true
+    responses_stream_observed = $true
+    chat_completions_observed = $true
+    streaming_usage_observed = $true
+    precise_unsupported_error_observed = $true
     ttft_p95_seconds = Get-MetricValue -Text $after `
         -Name "expert_service_ttft_seconds_p95"
     inter_token_p95_seconds = Get-MetricValue -Text $after `
