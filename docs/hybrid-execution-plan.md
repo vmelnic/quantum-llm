@@ -34,7 +34,7 @@ The following invariants do not change:
 - source checkpoint and the validated 80B Expert Pack are retained until an
   operator explicitly approves deletion.
 
-## Stage 1 — compact CPU result transport
+## Stage 1 — compact CPU result transport — completed
 
 Replace the dense `rows × top_k × hidden` CPU output transfer with:
 
@@ -56,6 +56,15 @@ Acceptance:
   mapping;
 - pagefile growth remains zero and throughput gates do not regress below their
   existing required thresholds.
+
+Measured result on the qualified mixed batch:
+
+- 9,521 CPU selections;
+- 77,996,032 result bytes, exactly `selections × 2048 × sizeof(float)`;
+- 85.05% fewer CPU-result H2D bytes than the previous 521,830,400-byte dense
+  masked transfer;
+- 42.5976 tok/s aggregate versus the previous 41.6653 tok/s;
+- exact isolated/interleaved/chunked output and zero pagefile growth.
 
 ## Stage 2 — critical-path telemetry and dynamic scheduling
 

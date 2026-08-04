@@ -57,8 +57,9 @@ Status validate_group(const ExpertWorkGroup& group, std::uint32_t rows,
       s.intermediate == 0 || (s.hidden % 8U) != 0 ||
       (s.intermediate % 8U) != 0 ||
       group.selections.size() > kMaximumRowsPerExpert ||
+      group.output_slots.size() != group.selections.size() ||
       input_values < static_cast<std::size_t>(rows) * s.hidden ||
-      output_values < static_cast<std::size_t>(rows) * top_k * s.hidden) {
+      output_values < s.hidden || (output_values % s.hidden) != 0) {
     return {ErrorCode::invalid_argument, "invalid CPU expert work group"};
   }
   const auto within = [&](std::uint64_t offset, std::uint64_t bytes) {
@@ -75,6 +76,12 @@ Status validate_group(const ExpertWorkGroup& group, std::uint32_t rows,
     if (selection >= rows * top_k) {
       return {ErrorCode::invalid_argument,
               "CPU expert selection exceeds microbatch"};
+    }
+  }
+  for (const auto output_slot : group.output_slots) {
+    if (output_slot >= output_values / s.hidden) {
+      return {ErrorCode::invalid_argument,
+              "CPU expert compact output slot exceeds output"};
     }
   }
   return Status::success();
@@ -174,8 +181,8 @@ void run_down_range(const ExpertWorkGroup& group, std::uint32_t top_k,
       }
     }
     for (std::uint32_t item = 0; item < count; ++item) {
-      const auto selection = group.selections[item];
-      selection_outputs[static_cast<std::size_t>(selection) * s.hidden +
+      const auto output_slot = group.output_slots[item];
+      selection_outputs[static_cast<std::size_t>(output_slot) * s.hidden +
                         output] =
           horizontal_sum(down_sum[item]) * down_scales[output];
     }
@@ -335,11 +342,28 @@ struct ExpertExecutor::Impl final {
     batch.output_values = outputs.size();
     batch.groups.assign(groups.begin(), groups.end());
     batch.intermediate_offsets.reserve(groups.size());
+    if (groups.front().sections.hidden == 0) {
+      return {ErrorCode::invalid_argument,
+              "CPU expert group has zero hidden size"};
+    }
+    std::vector<bool> claimed_outputs(outputs.size() /
+                                      groups.front().sections.hidden);
     std::size_t intermediate_values = 0;
     for (const auto& group : batch.groups) {
+      if (group.sections.hidden != batch.groups.front().sections.hidden) {
+        return {ErrorCode::invalid_argument,
+                "CPU expert groups disagree on hidden size"};
+      }
       const auto status = validate_group(
           group, rows, top_k, inputs.size(), outputs.size());
       if (!status.ok()) return status;
+      for (const auto output_slot : group.output_slots) {
+        if (claimed_outputs[output_slot]) {
+          return {ErrorCode::invalid_argument,
+                  "duplicate CPU expert compact output slot"};
+        }
+        claimed_outputs[output_slot] = true;
+      }
       batch.intermediate_offsets.push_back(intermediate_values);
       intermediate_values +=
           group.selections.size() * group.sections.intermediate;

@@ -574,7 +574,7 @@ void test_host_lease_protects_validated_ram_copy() {
           "released host lease remained unevictable");
 }
 
-void test_cpu_executor_writes_only_named_selections() {
+void test_cpu_executor_writes_compact_selection_outputs() {
   auto fixture = make_record(26);
   auto* bytes = fixture.bytes.data();
   std::fill_n(bytes + 256, 256, std::byte{1});
@@ -588,20 +588,22 @@ void test_cpu_executor_writes_only_named_selections() {
   const er::ExpertSections sections{16, 8, 256, 512, 512, 64,
                                     768, 128, 1024, 64};
   const expert::runtime::cpu::ExpertWorkGroup group{
-      fixture.bytes, sections, {0, 3}};
+      fixture.bytes, sections, {0, 3}, {1, 0}};
   std::vector<float> inputs(2 * 16, 1.0F);
-  std::vector<float> outputs(2 * 2 * 16, -123.0F);
+  std::vector<float> outputs(2 * 16, -123.0F);
   const auto status = executor.execute(std::span(&group, 1), inputs, 2, 2,
                                        outputs);
   require(status.ok(), "CPU expert executor rejected valid fixture");
   for (std::size_t column = 0; column < 16; ++column) {
     require(std::isfinite(outputs[column]) &&
-                outputs[column] == outputs[3 * 16 + column],
-            "CPU expert output is invalid or row reuse changed result");
-    require(outputs[16 + column] == -123.0F &&
-                outputs[2 * 16 + column] == -123.0F,
-            "CPU expert executor overwrote an unnamed selection");
+                outputs[column] == outputs[16 + column],
+            "CPU compact output is invalid or mapping changed the result");
   }
+  auto duplicate = group;
+  duplicate.output_slots = {0, 0};
+  require(!executor.execute(std::span(&duplicate, 1), inputs, 2, 2,
+                            outputs).ok(),
+          "CPU executor accepted duplicate compact output slots");
 }
 
 void test_layer_partitioned_eviction_protects_other_layers() {
@@ -725,7 +727,7 @@ int main() {
     test_short_read_checksum_and_upload_fail_closed();
     test_ram_hit_reuploads_after_vram_eviction();
     test_host_lease_protects_validated_ram_copy();
-    test_cpu_executor_writes_only_named_selections();
+    test_cpu_executor_writes_compact_selection_outputs();
     test_layer_partitioned_eviction_protects_other_layers();
     test_frequency_admission_protects_reused_expert();
     test_vram_replacement_requires_a_strictly_colder_victim();

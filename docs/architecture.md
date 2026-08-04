@@ -69,6 +69,10 @@ weight renormalization. Work is grouped by `(layer, expert, quant ABI)` across
 the active microbatch. Ready GPU work proceeds while cache misses are loaded or
 executed on CPU. Weighted aggregation uses a stable order.
 
+CPU expert results return in a compact selection buffer rather than a dense
+`rows × top_k` buffer. A device-side selection map restores the original stable
+top-k order during weighted aggregation.
+
 Adaptive placement observes reuse and measured execution cost. Placement is
 frozen at a safe request/warmup boundary for deterministic latency measurement;
 the frozen hot path performs no expert-weight H2D.

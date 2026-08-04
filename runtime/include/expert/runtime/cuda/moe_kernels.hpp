@@ -66,10 +66,12 @@ struct MoeSelectionBatchLaunch final {
 
 struct MoeAggregateLaunch final {
   const float* selection_outputs{};  // primary [rows, top_k, hidden]
-  const float* alternate_outputs{};  // optional secondary buffer
+  const float* alternate_outputs{};  // compact [alternate_output_count, hidden]
   const std::uint8_t* primary_mask{};  // 1 selects primary, 0 secondary
+  const std::uint32_t* alternate_slot_by_selection{}; // [rows, top_k]
   const float* routing_weights{};     // [rows, top_k]
   float* output{};                    // [rows, hidden]
+  std::uint32_t alternate_output_count{};
   std::uint32_t rows{};
   std::uint32_t hidden_size{};
   std::uint32_t top_k{};

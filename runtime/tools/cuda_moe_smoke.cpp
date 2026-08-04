@@ -232,8 +232,8 @@ int main(int argc, char** argv) {
     if (!split_status.ok())
       throw std::runtime_error(std::string(split_status.message()));
     split_status = expert::runtime::cuda::launch_moe_aggregate({
-        d_selection_output, nullptr, nullptr, d_routing, d_output, 1, hidden,
-        top_k, nullptr});
+        d_selection_output, nullptr, nullptr, nullptr, d_routing, d_output, 0,
+        1, hidden, top_k, nullptr});
     if (!split_status.ok())
       throw std::runtime_error(std::string(split_status.message()));
     cuda_check(cudaDeviceSynchronize(), "split MoE synchronize");

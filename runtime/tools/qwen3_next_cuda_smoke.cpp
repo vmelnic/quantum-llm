@@ -1,4 +1,5 @@
 #include "expert/runtime/cuda/transformer_kernels.hpp"
+#include "expert/runtime/cuda/moe_kernels.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -165,6 +166,44 @@ double check_batched_router() {
     }
   }
   return error;
+}
+
+double check_compact_moe_aggregation() {
+  constexpr std::uint32_t rows = 2, hidden = 5, top_k = 3;
+  constexpr std::uint32_t selections = rows * top_k;
+  std::vector<float> primary(selections * hidden), routing{
+      0.5F, 0.3F, 0.2F, 0.1F, 0.6F, 0.3F};
+  for (std::size_t index = 0; index < primary.size(); ++index)
+    primary[index] = pattern(index + 101, 0.7F);
+  const std::vector<std::uint8_t> mask{1, 0, 1, 1, 0, 1};
+  const std::vector<std::uint32_t> compact_slot{0, 0, 0, 0, 1, 0};
+  std::vector<float> compact(2U * hidden);
+  for (std::uint32_t column = 0; column < hidden; ++column) {
+    compact[column] = primary[hidden + column];
+    compact[hidden + column] = primary[4U * hidden + column];
+  }
+  std::vector<float> expected(rows * hidden);
+  for (std::uint32_t row = 0; row < rows; ++row)
+    for (std::uint32_t column = 0; column < hidden; ++column)
+      for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+        const auto selection = row * top_k + slot;
+        expected[row * hidden + column] +=
+            routing[selection] * primary[selection * hidden + column];
+      }
+  DeviceBuffer<float> d_primary(primary.size()), d_compact(compact.size()),
+      d_routing(routing.size()), d_output(expected.size());
+  DeviceBuffer<std::uint8_t> d_mask(mask.size());
+  DeviceBuffer<std::uint32_t> d_compact_slot(compact_slot.size());
+  d_primary.upload(primary);
+  d_compact.upload(compact);
+  d_routing.upload(routing);
+  d_mask.upload(mask);
+  d_compact_slot.upload(compact_slot);
+  status_check(expert::runtime::cuda::launch_moe_aggregate({
+      d_primary.get(), d_compact.get(), d_mask.get(), d_compact_slot.get(),
+      d_routing.get(), d_output.get(), 2, rows, hidden, top_k, nullptr}));
+  cuda_check(cudaDeviceSynchronize(), "compact aggregation synchronize");
+  return maximum_error(d_output.download(), expected);
 }
 
 double check_full_attention() {
@@ -339,15 +378,18 @@ int main() {
     const auto rms = check_rms();
     const auto batched_gemv = check_batched_gemv();
     const auto batched_router = check_batched_router();
+    const auto compact_aggregate = check_compact_moe_aggregation();
     const auto attention = check_full_attention();
     const auto delta = check_delta();
     const bool valid = rms < 2.0e-6 && batched_gemv < 2.0e-6 &&
-                       batched_router < 2.0e-6 && attention < 2.0e-4 &&
+                       batched_router < 2.0e-6 &&
+                       compact_aggregate < 2.0e-6 && attention < 2.0e-4 &&
                        delta < 2.0e-5;
     std::cout << "{\"valid\":" << (valid ? "true" : "false")
               << ",\"qwen_rms_max_abs\":" << rms
               << ",\"batched_gemv_max_abs\":" << batched_gemv
               << ",\"batched_router_max_abs\":" << batched_router
+              << ",\"compact_aggregate_max_abs\":" << compact_aggregate
               << ",\"full_attention_max_abs\":" << attention
               << ",\"delta_max_abs\":" << delta << "}\n";
     return valid ? 0 : 2;

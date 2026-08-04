@@ -656,6 +656,8 @@ class Qwen3NextModel final {
         static_cast<std::size_t>(capacity_) * top_k_ * hidden_);
     gpu_selection_mask_ =
         device_allocate<std::uint8_t>(capacity_ * top_k_);
+    cpu_slot_by_selection_ =
+        device_allocate<std::uint32_t>(capacity_ * top_k_);
     moe_output_ = device_allocate<float>(capacity_ * hidden_);
     logits_ = device_allocate<float>(capacity_ * vocab_);
     output_token_ = device_allocate<std::uint32_t>(capacity_);
@@ -864,6 +866,7 @@ class Qwen3NextModel final {
       }
     } pin_guard{directory_.get(), &route_pinned};
     bool split_execution = false;
+    std::uint32_t compact_cpu_selection_count = 0;
     auto plan = directory_->pin_or_collect_misses(
         layer, routing_indices_, rows * top_k_, nullptr, true);
     status_check(plan.status);
@@ -964,9 +967,10 @@ class Qwen3NextModel final {
       for (std::size_t index = 0; index < cpu_experts.size(); ++index) {
         cpu_group_by_expert.emplace(cpu_experts[index], index);
         cpu_groups.push_back({host_leases[index].bytes(),
-                              host_leases[index].sections(), {}});
+                              host_leases[index].sections(), {}, {}});
       }
       std::vector<std::uint8_t> gpu_mask(selection_count, 1);
+      std::vector<std::uint32_t> cpu_slot_by_selection(selection_count, 0);
       for (std::uint32_t selection = 0; selection < selection_count;
            ++selection) {
         const auto expert = host_routing_indices_[selection];
@@ -974,12 +978,23 @@ class Qwen3NextModel final {
         if (cpu_group != cpu_group_by_expert.end()) {
           gpu_mask[selection] = 0;
           cpu_groups[cpu_group->second].selections.push_back(selection);
+          cpu_groups[cpu_group->second].output_slots.push_back(
+              compact_cpu_selection_count);
+          cpu_slot_by_selection[selection] = compact_cpu_selection_count++;
         }
       }
-      cuda_check(cudaMemcpy(gpu_selection_mask_, gpu_mask.data(),
-                            gpu_mask.size() * sizeof(gpu_mask[0]),
-                            cudaMemcpyHostToDevice),
-                 "copy GPU expert selection mask");
+      if (compact_cpu_selection_count) {
+        cuda_check(cudaMemcpy(gpu_selection_mask_, gpu_mask.data(),
+                              gpu_mask.size() * sizeof(gpu_mask[0]),
+                              cudaMemcpyHostToDevice),
+                   "copy GPU expert selection mask");
+        cuda_check(cudaMemcpy(cpu_slot_by_selection_,
+                              cpu_slot_by_selection.data(),
+                              cpu_slot_by_selection.size() *
+                                  sizeof(cpu_slot_by_selection[0]),
+                              cudaMemcpyHostToDevice),
+                   "copy compact CPU selection map");
+      }
     }
     const auto event_ns = [](cudaEvent_t begin, cudaEvent_t end) {
       float milliseconds = 0.0F;
@@ -1008,7 +1023,8 @@ class Qwen3NextModel final {
         if (route_pinned) {
           status_check(expert::runtime::cuda::launch_moe_selection_batch({
               normalized_, routing_scores_, routing_indices_,
-              gpu_selection_mask_, moe_intermediate_, moe_selection_output_,
+              compact_cpu_selection_count ? gpu_selection_mask_ : nullptr,
+              moe_intermediate_, moe_selection_output_,
               rows, hidden_, expert_width_, top_k_, experts_, nullptr,
               directory_->device_entries(), layer}));
         }
@@ -1021,7 +1037,8 @@ class Qwen3NextModel final {
               rows, top_k_,
               std::span<float>(
                   host_cpu_selection_output_,
-                  static_cast<std::size_t>(rows) * top_k_ * hidden_)));
+                  static_cast<std::size_t>(compact_cpu_selection_count) *
+                      hidden_)));
           const auto cpu_elapsed = elapsed_ns(cpu_started);
           phase_.cpu_expert_ns += cpu_elapsed;
           phase_.cpu_expert_groups += cpu_groups.size();
@@ -1031,8 +1048,9 @@ class Qwen3NextModel final {
           phase_.cpu_expert_selections += cpu_selections;
           if (!placement_->frozen())
             placement_->observe_cpu_batch(cpu_elapsed, cpu_selections);
-          const auto output_bytes = static_cast<std::size_t>(rows) * top_k_ *
-                                    hidden_ * sizeof(float);
+          const auto output_bytes =
+              static_cast<std::size_t>(compact_cpu_selection_count) *
+              hidden_ * sizeof(float);
           cuda_check(cudaMemcpyAsync(cpu_selection_output_device_,
                                      host_cpu_selection_output_, output_bytes,
                                      cudaMemcpyHostToDevice, nullptr),
@@ -1040,9 +1058,13 @@ class Qwen3NextModel final {
           phase_.cpu_result_h2d_bytes += output_bytes;
         }
         status_check(expert::runtime::cuda::launch_moe_aggregate({
-            moe_selection_output_, cpu_selection_output_device_,
-            gpu_selection_mask_, routing_scores_, moe_output_, rows, hidden_,
-            top_k_, nullptr}));
+            moe_selection_output_,
+            compact_cpu_selection_count ? cpu_selection_output_device_
+                                         : nullptr,
+            compact_cpu_selection_count ? gpu_selection_mask_ : nullptr,
+            compact_cpu_selection_count ? cpu_slot_by_selection_ : nullptr,
+            routing_scores_, moe_output_, compact_cpu_selection_count, rows,
+            hidden_, top_k_, nullptr}));
     }
       status_check(expert::runtime::cuda::add_in_place(
           moe_output_, shared_output_, rows * hidden_, nullptr));
@@ -1104,7 +1126,8 @@ class Qwen3NextModel final {
       *moe_selection_output_{}, *cpu_selection_output_device_{},
       *moe_output_{}, *logits_{}, *host_normalized_{},
       *host_cpu_selection_output_{};
-  std::uint32_t *routing_indices_{}, *output_token_{}, *host_routing_indices_{};
+  std::uint32_t *routing_indices_{}, *output_token_{}, *host_routing_indices_{},
+      *cpu_slot_by_selection_{};
   std::uint8_t* gpu_selection_mask_{};
   void** device_kv_page_table_{};
   std::vector<std::vector<void*>> slot_kv_pages_;

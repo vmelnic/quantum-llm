@@ -253,7 +253,9 @@ __global__ void down_selection_batch(
 
 __global__ void aggregate_selection_outputs(
     const float* selection_outputs, const float* alternate_outputs,
-    const std::uint8_t* primary_mask, const float* routing, float* output,
+    const std::uint8_t* primary_mask,
+    const std::uint32_t* alternate_slot_by_selection,
+    const float* routing, float* output,
     std::uint32_t hidden, std::uint32_t top_k,
     std::uint32_t value_count) {
   for (auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
@@ -264,11 +266,12 @@ __global__ void aggregate_selection_outputs(
     float total = 0.0F;
     for (std::uint32_t slot = 0; slot < top_k; ++slot) {
       const auto selection = static_cast<std::size_t>(row) * top_k + slot;
-      const auto* source = primary_mask == nullptr || primary_mask[selection]
-                               ? selection_outputs
-                               : alternate_outputs;
-      total += routing[selection] *
-               source[selection * hidden + column];
+      const bool primary = primary_mask == nullptr || primary_mask[selection];
+      const auto source_selection = primary
+          ? selection
+          : static_cast<std::size_t>(alternate_slot_by_selection[selection]);
+      const auto* source = primary ? selection_outputs : alternate_outputs;
+      total += routing[selection] * source[source_selection * hidden + column];
     }
     output[index] = total;
   }
@@ -393,7 +396,14 @@ Status launch_moe_aggregate(const MoeAggregateLaunch& launch) noexcept {
       launch.routing_weights == nullptr || launch.output == nullptr ||
       launch.rows == 0 || launch.hidden_size == 0 || launch.top_k == 0 ||
       launch.top_k > 64 ||
-      (launch.primary_mask != nullptr && launch.alternate_outputs == nullptr)) {
+      (launch.primary_mask != nullptr &&
+       (launch.alternate_outputs == nullptr ||
+        launch.alternate_slot_by_selection == nullptr ||
+        launch.alternate_output_count == 0)) ||
+      (launch.primary_mask == nullptr &&
+       (launch.alternate_outputs != nullptr ||
+        launch.alternate_slot_by_selection != nullptr ||
+        launch.alternate_output_count != 0))) {
     return Status(ErrorCode::invalid_argument,
                   "invalid MoE aggregate CUDA launch");
   }
@@ -402,7 +412,8 @@ Status launch_moe_aggregate(const MoeAggregateLaunch& launch) noexcept {
   aggregate_selection_outputs<<<blocks, kThreads, 0,
                                 static_cast<cudaStream_t>(launch.stream)>>>(
       launch.selection_outputs, launch.alternate_outputs,
-      launch.primary_mask, launch.routing_weights, launch.output,
+      launch.primary_mask, launch.alternate_slot_by_selection,
+      launch.routing_weights, launch.output,
       launch.hidden_size, launch.top_k, values);
   return cuda_status(cudaPeekAtLastError(), "aggregate_selection launch");
 }

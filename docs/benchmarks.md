@@ -18,7 +18,7 @@ The final full-model gate produced:
 | Gate | Result | Required |
 |---|---:|---:|
 | single-stream hot runtime | 47.6703 tok/s | 10 tok/s |
-| four-request aggregate hot runtime | 41.6653 tok/s | 30 tok/s |
+| four-request aggregate hot runtime | 42.5976 tok/s | 30 tok/s |
 
 The gate used a warmup in the same process, retained expert residency, then
 reset request state and measurement counters. It observed no expert-weight H2D
@@ -29,6 +29,22 @@ sequences on the full model.
 The mixed batch contains prompt lengths 3, 3, 4, and 7. With a four-token
 prefill chunk, the seven-token case crosses a `4 + 3` boundary and proves that
 KV and recurrent DeltaNet state survive more than one chunk.
+
+### Compact CPU-result path
+
+The mixed batch previously copied a dense masked CPU output buffer whenever any
+selection used the CPU. Compact selection mapping changed only transport and
+aggregation storage:
+
+| Measurement | Dense masked | Compact |
+|---|---:|---:|
+| CPU selections | 9,281 | 9,521 |
+| CPU-result H2D | 521,830,400 B | 77,996,032 B |
+| aggregate throughput | 41.6653 tok/s | 42.5976 tok/s |
+
+The compact byte count is exactly `9,521 × 2,048 × 4`; no unused top-k slots
+are transferred. Despite minor route/cache-count variation between runs, H2D
+fell 85.05%, output equality remained exact, and pagefile growth remained zero.
 
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact

@@ -71,6 +71,13 @@ Every executor writes a per-selection output. Device aggregation applies
 routing weights in stable `(request, row, top-k slot)` order. Completion order
 must not alter numerical order.
 
+CPU execution uses compact result slots. Each CPU work group retains the global
+selection ID for input-row lookup and maps it to a unique compact output slot.
+Only `cpu_selection_count × hidden × sizeof(float)` is copied to the device;
+the aggregation kernel resolves non-GPU selections through a bounded
+`cpu_slot_by_selection` table. The mapping changes storage only, never routing
+or aggregation order.
+
 Planner decisions use measured queue, transfer and compute costs. A missing
 expert is never treated as zero and a timeout never reduces top-k.
 
