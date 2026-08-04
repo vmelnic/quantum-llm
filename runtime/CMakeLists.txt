@@ -14,6 +14,7 @@ add_library(expert_runtime STATIC
   src/cpu/expert_executor.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
+  src/hybrid_dispatch.cpp
   src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp

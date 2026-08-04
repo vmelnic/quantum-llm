@@ -82,6 +82,14 @@ CPU expert work with the host steady clock. It publishes selection-normalized
 lane costs and a conservative overlap lower bound. These measurements form the
 cost basis for dynamic placement; they do not prescribe a fixed CPU share.
 
+The portable hybrid dispatcher makes a bounded plan only when a layer has a
+non-resident expert. GPU-resident work is fixed. A RAM-resident miss may execute
+locally or upload only if measured CPU versus serialized-H2D-plus-GPU cost
+reduces the projected layer critical path and cache admission protects hotter
+or in-use residents. CPU/GPU compute may overlap; the current synchronous
+uploader is modeled before GPU expert execution. Decision reasons, alternative
+costs, and EWMAs are retained in bounded telemetry.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

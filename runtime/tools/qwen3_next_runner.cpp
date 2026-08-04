@@ -6,6 +6,7 @@
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/sha256.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 
@@ -249,6 +250,44 @@ void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
          << unattributed / ns_per_second;
 }
 
+void print_dispatch_json(
+    std::ostream& output,
+    const expert::runtime::HybridDispatchTelemetry& telemetry,
+    const expert::runtime::HybridDispatchTelemetry& baseline) {
+  output << ",\"dispatch_plans\":" << telemetry.plans - baseline.plans
+         << ",\"dispatch_candidates\":"
+         << telemetry.candidates - baseline.candidates
+         << ",\"dispatch_resident_gpu\":"
+         << telemetry.resident_gpu - baseline.resident_gpu
+         << ",\"dispatch_cpu_only\":"
+         << telemetry.cpu_only - baseline.cpu_only
+         << ",\"dispatch_gpu_only\":"
+         << telemetry.gpu_only - baseline.gpu_only
+         << ",\"dispatch_cpu_cost_wins\":"
+         << telemetry.cpu_cost_wins - baseline.cpu_cost_wins
+         << ",\"dispatch_gpu_cost_wins\":"
+         << telemetry.gpu_cost_wins - baseline.gpu_cost_wins
+         << ",\"dispatch_stable_ties\":"
+         << telemetry.stable_ties - baseline.stable_ties
+         << ",\"dispatch_rejected_plans\":"
+         << telemetry.rejected_plans - baseline.rejected_plans
+         << ",\"dispatch_pre_measurement_plans\":" << baseline.plans
+         << ",\"dispatch_pre_measurement_cpu_cost_wins\":"
+         << baseline.cpu_cost_wins
+         << ",\"dispatch_pre_measurement_gpu_cost_wins\":"
+         << baseline.gpu_cost_wins
+         << ",\"dispatch_pre_measurement_cpu_only\":"
+         << baseline.cpu_only
+         << ",\"dispatch_pre_measurement_gpu_only\":"
+         << baseline.gpu_only
+         << ",\"dispatch_cpu_ns_per_selection\":"
+         << telemetry.cpu_ns_per_selection
+         << ",\"dispatch_gpu_ns_per_selection\":"
+         << telemetry.gpu_ns_per_selection
+         << ",\"dispatch_h2d_bytes_per_second\":"
+         << telemetry.h2d_bytes_per_second;
+}
+
 class Qwen3NextModel final {
  public:
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
@@ -363,6 +402,7 @@ class Qwen3NextModel final {
             logical_threads);
     placement_ =
         std::make_unique<expert::runtime::AdaptivePlacementPlanner>(*cache_);
+    dispatch_ = std::make_unique<expert::runtime::HybridDispatchPlanner>();
     allocate_workspace();
     cuda_check(cudaEventCreate(&layer_start_event_), "create layer-start event");
     cuda_check(cudaEventCreate(&attention_done_event_),
@@ -371,6 +411,7 @@ class Qwen3NextModel final {
     cuda_check(cudaEventCreate(&router_done_event_), "create router-done event");
     expert_start_events_.resize(layers_);
     expert_done_events_.resize(layers_);
+    gpu_selections_by_layer_.resize(layers_);
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
       cuda_check(cudaEventCreate(&expert_start_events_[layer]),
                  "create expert-start event");
@@ -485,6 +526,9 @@ class Qwen3NextModel final {
                  "measure GPU expert lane");
       phase_.gpu_expert_ns +=
           static_cast<std::uint64_t>(milliseconds * 1'000'000.0F);
+      dispatch_->observe_gpu(
+          static_cast<std::uint64_t>(milliseconds * 1'000'000.0F),
+          gpu_selections_by_layer_[layer]);
     }
     const auto cpu_expert_delta = phase_.cpu_expert_ns - cpu_expert_before;
     const auto gpu_expert_delta = phase_.gpu_expert_ns - gpu_expert_before;
@@ -530,6 +574,9 @@ class Qwen3NextModel final {
     auto result = phase_;
     result.adaptive_promotions = placement_->telemetry().completed;
     return result;
+  }
+  expert::runtime::HybridDispatchTelemetry dispatch_telemetry() const noexcept {
+    return dispatch_->telemetry();
   }
   void settle_placement() {
     status_check(placement_->quiesce(std::chrono::seconds(30)));
@@ -944,9 +991,8 @@ class Qwen3NextModel final {
                             cudaMemcpyDeviceToHost),
                  "copy expert route to host");
     }
-    if (placement_feedback) {
+    if (!plan.missing_experts.empty() || placement_feedback) {
       std::fill(route_access_counts_.begin(), route_access_counts_.end(), 0U);
-      route_accesses_.clear();
       for (std::uint32_t selection = 0; selection < selection_count;
            ++selection) {
         const auto expert = host_routing_indices_[selection];
@@ -954,6 +1000,9 @@ class Qwen3NextModel final {
           throw std::runtime_error("router expert out of range");
         ++route_access_counts_[expert];
       }
+    }
+    if (placement_feedback) {
+      route_accesses_.clear();
       for (std::uint32_t expert = 0; expert < experts_; ++expert) {
         if (route_access_counts_[expert] != 0) {
           route_accesses_.push_back(
@@ -968,11 +1017,6 @@ class Qwen3NextModel final {
     } else {
       split_execution = true;
       route_pinned = true;
-      cuda_check(cudaMemcpy(host_normalized_, normalized_,
-                            static_cast<std::size_t>(rows) * hidden_ *
-                                sizeof(float),
-                            cudaMemcpyDeviceToHost),
-                 "copy CPU expert activations");
       const auto acquire_device = [&](std::span<const std::uint32_t> experts) {
         std::vector<expert::runtime::AcquireHandle> handles;
         handles.reserve(experts.size());
@@ -1001,9 +1045,8 @@ class Qwen3NextModel final {
         }
       };
 
-      std::vector<std::uint32_t> fallback_experts;
-      cpu_experts.reserve(plan.missing_experts.size());
-      fallback_experts.reserve(plan.missing_experts.size());
+      std::unordered_map<std::uint32_t, std::size_t> host_slot_by_expert;
+      host_leases.reserve(plan.missing_experts.size());
       for (const auto expert : plan.missing_experts) {
         if (expert >= experts_)
           throw std::runtime_error("router expert out of range");
@@ -1012,27 +1055,88 @@ class Qwen3NextModel final {
         auto host = cache_->try_acquire_host(
             {model_id_, layer, expert, 1}, record, false);
         if (host) {
-          cpu_experts.push_back(expert);
+          host_slot_by_expert.emplace(expert, host_leases.size());
           host_leases.push_back(std::move(*host));
-        } else {
-          fallback_experts.push_back(expert);
+        }
+      }
+      const auto has_cold_fallback =
+          host_slot_by_expert.size() != plan.missing_experts.size();
+      const auto may_upload_from_ram = !placement_->frozen();
+      if (has_cold_fallback || may_upload_from_ram) {
+        // Admission checks and uploads require cache references mirroring the
+        // directory pins so no current-route entry can become a victim.
+        acquire_device(plan.ready_experts);
+      }
+
+      std::vector<expert::runtime::HybridDispatchCandidate> candidates;
+      candidates.reserve(plan.ready_experts.size() +
+                         plan.missing_experts.size());
+      for (const auto expert : plan.ready_experts) {
+        const auto& record = expert_records_.at(
+            static_cast<std::size_t>(layer) * experts_ + expert);
+        candidates.push_back({expert, route_access_counts_[expert],
+                              record.stored_bytes, true, false, true});
+      }
+      for (const auto expert : plan.missing_experts) {
+        const auto& record = expert_records_.at(
+            static_cast<std::size_t>(layer) * experts_ + expert);
+        const auto host_available = host_slot_by_expert.contains(expert);
+        const auto gpu_available =
+            !host_available ||
+            (may_upload_from_ram && cache_->vram_admission_would_improve(
+                                        {model_id_, layer, expert, 1}, record));
+        candidates.push_back(
+            {expert, route_access_counts_[expert], record.stored_bytes, false,
+             host_available, gpu_available});
+      }
+      const auto dispatch_plan = dispatch_->plan(candidates);
+      status_check(dispatch_plan.status);
+
+      std::vector<std::uint32_t> gpu_upload_experts;
+      std::uint64_t observed_upload_bytes = 0;
+      bool uploads_are_ram_resident = true;
+      cpu_experts.reserve(plan.missing_experts.size());
+      gpu_upload_experts.reserve(plan.missing_experts.size());
+      for (const auto& decision : dispatch_plan.decisions) {
+        if (decision.executor == expert::runtime::HybridExecutor::cpu_local) {
+          cpu_experts.push_back(decision.expert);
+        } else if (decision.executor ==
+                   expert::runtime::HybridExecutor::gpu_upload) {
+          gpu_upload_experts.push_back(decision.expert);
+          const auto host_available =
+              host_slot_by_expert.contains(decision.expert);
+          uploads_are_ram_resident =
+              uploads_are_ram_resident && host_available;
+          if (host_available) {
+            observed_upload_bytes += expert_records_.at(
+                static_cast<std::size_t>(layer) * experts_ +
+                decision.expert).stored_bytes;
+          }
         }
       }
       directory_vram_hits_ += plan.ready_experts.size();
-      if (!fallback_experts.empty()) {
-        // A cold upload can invoke eviction. Mirror the retained device pins
-        // with cache references so capacity selection cannot choose a pinned
-        // ready entry and wait for itself.
-        acquire_device(plan.ready_experts);
-        acquire_device(fallback_experts);
+      if (!gpu_upload_experts.empty()) {
+        const auto upload_started = std::chrono::steady_clock::now();
+        acquire_device(gpu_upload_experts);
+        const auto upload_elapsed = elapsed_ns(upload_started);
+        if (uploads_are_ram_resident && observed_upload_bytes != 0)
+          dispatch_->observe_h2d(upload_elapsed, observed_upload_bytes);
       }
 
       std::unordered_map<std::uint32_t, std::size_t> cpu_group_by_expert;
       cpu_groups.reserve(cpu_experts.size());
       for (std::size_t index = 0; index < cpu_experts.size(); ++index) {
+        const auto host_slot = host_slot_by_expert.at(cpu_experts[index]);
         cpu_group_by_expert.emplace(cpu_experts[index], index);
-        cpu_groups.push_back({host_leases[index].bytes(),
-                              host_leases[index].sections(), {}, {}});
+        cpu_groups.push_back({host_leases[host_slot].bytes(),
+                              host_leases[host_slot].sections(), {}, {}});
+      }
+      if (!cpu_groups.empty()) {
+        cuda_check(cudaMemcpy(host_normalized_, normalized_,
+                              static_cast<std::size_t>(rows) * hidden_ *
+                                  sizeof(float),
+                              cudaMemcpyDeviceToHost),
+                   "copy CPU expert activations");
       }
       std::vector<std::uint8_t> gpu_mask(selection_count, 1);
       std::vector<std::uint32_t> cpu_slot_by_selection(selection_count, 0);
@@ -1087,6 +1191,7 @@ class Qwen3NextModel final {
             expert_width_, top_k_, experts_, nullptr,
             directory_->device_entries(), layer}));
         phase_.gpu_expert_selections += selection_count;
+        gpu_selections_by_layer_[layer] = selection_count;
         cuda_check(cudaEventRecord(expert_done_events_[layer]),
                    "record expert lane done");
       } else {
@@ -1099,6 +1204,8 @@ class Qwen3NextModel final {
               directory_->device_entries(), layer}));
         }
         phase_.gpu_expert_selections +=
+            selection_count - compact_cpu_selection_count;
+        gpu_selections_by_layer_[layer] =
             selection_count - compact_cpu_selection_count;
         cuda_check(cudaEventRecord(expert_done_events_[layer]),
                    "record expert lane done");
@@ -1122,6 +1229,7 @@ class Qwen3NextModel final {
           phase_.cpu_expert_selections += cpu_selections;
           if (!placement_->frozen())
             placement_->observe_cpu_batch(cpu_elapsed, cpu_selections);
+          dispatch_->observe_cpu(cpu_elapsed, cpu_selections);
           const auto output_bytes =
               static_cast<std::size_t>(compact_cpu_selection_count) *
               hidden_ * sizeof(float);
@@ -1195,6 +1303,7 @@ class Qwen3NextModel final {
   std::unique_ptr<expert::runtime::ExpertCache> cache_;
   std::unique_ptr<expert::runtime::cpu::ExpertExecutor> cpu_executor_;
   std::unique_ptr<expert::runtime::AdaptivePlacementPlanner> placement_;
+  std::unique_ptr<expert::runtime::HybridDispatchPlanner> dispatch_;
   float *hidden_state_{}, *normalized_{}, *residual_{}, *query_gate_{}, *key_{},
       *value_{}, *attention_{}, *projected_qkvz_{}, *projected_ba_{},
       *delta_output_{}, *conv_output_{}, *shared_gate_{}, *shared_up_{},
@@ -1211,6 +1320,7 @@ class Qwen3NextModel final {
   std::vector<void*> free_kv_pages_;
   std::vector<std::uint32_t> slot_context_limits_;
   std::vector<float*> conv_state_, recurrent_state_;
+  std::vector<std::uint32_t> gpu_selections_by_layer_;
   std::vector<cudaEvent_t> expert_start_events_, expert_done_events_;
   cudaEvent_t layer_start_event_{}, attention_done_event_{},
       shared_done_event_{}, router_done_event_{};
@@ -1514,6 +1624,7 @@ int main(int argc, char** argv) {
       model.settle_placement();
       const auto baseline_metrics = model.telemetry();
       const auto baseline_phase = model.phase_telemetry();
+      const auto baseline_dispatch = model.dispatch_telemetry();
       model.reset_request();
       const auto started_prompt = std::chrono::steady_clock::now();
       prefill();
@@ -1544,6 +1655,7 @@ int main(int argc, char** argv) {
           [&](const auto& sequence) { return sequence == generated.front(); });
       const auto metrics = model.telemetry();
       const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
+      const auto dispatch = model.dispatch_telemetry();
       const auto measured_read_bytes =
           metrics.read_bytes - baseline_metrics.read_bytes;
       const auto measured_uploaded_bytes =
@@ -1681,6 +1793,7 @@ int main(int argc, char** argv) {
                 << ",\"over_quota_evictions\":"
                 << metrics.over_quota_evictions;
       print_phase_json(std::cout, phases);
+      print_dispatch_json(std::cout, dispatch, baseline_dispatch);
       std::cout << "}\n";
       return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
@@ -1739,6 +1852,7 @@ int main(int argc, char** argv) {
     model.settle_placement();
     const auto baseline_metrics = model.telemetry();
     const auto baseline_phase = model.phase_telemetry();
+    const auto baseline_dispatch = model.dispatch_telemetry();
     model.reset_request();
     const auto started_prompt = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens.size(); ++position)
@@ -1762,6 +1876,7 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() - started_decode).count();
     const auto metrics = model.telemetry();
     const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
+    const auto dispatch = model.dispatch_telemetry();
     const auto measured_read_bytes =
         metrics.read_bytes - baseline_metrics.read_bytes;
     const auto measured_uploaded_bytes =
@@ -1838,6 +1953,7 @@ int main(int argc, char** argv) {
               << ",\"over_quota_evictions\":"
               << metrics.over_quota_evictions;
     print_phase_json(std::cout, phases);
+    print_dispatch_json(std::cout, dispatch, baseline_dispatch);
     std::cout << "}\n";
     return 0;
   } catch (const std::exception& error) {

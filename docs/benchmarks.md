@@ -71,6 +71,28 @@ lower bound, not a full CUDA timeline. Transfer and aggregation remain in the
 enclosing phase. These measurements are inputs to the dynamic scheduler, not a
 fixed CPU/GPU split policy.
 
+### Dynamic dispatch gate
+
+After connecting the bounded critical-path planner, the same frozen-placement
+batch gate produced 42.2259 tok/s with exact interleaved and chunked-prefill
+outputs. The measured window contained 1,693 split-layer plans and 56,198
+unique-expert candidates: 47,861 were already resident on GPU and 8,337 were
+CPU-only RAM misses. No plan was rejected; there was no expert SSD read, expert
+H2D, or pagefile use.
+
+The measured window correctly contains no CPU-vs-upload cost wins because
+placement is frozen after warmup. This is a policy boundary, not evidence that
+the cost branch is dead: deterministic runtime tests exercise CPU, GPU,
+transfer, saturation, and tie outcomes, while runner JSON separately reports
+pre-measurement decisions. Cold/warm service results will be qualified in a
+service stage and must not be compared directly with this frozen result.
+
+The unfrozen warmup recorded 3,896 CPU critical-path wins, zero GPU-upload
+wins, 10,963 forced cold GPU paths, and two CPU-only paths. This is the expected
+decision for the measured short microbatch: a synchronous expert upload does
+not amortize before CPU compute completes. Larger row groups or a future
+overlapped uploader can cross that measured boundary without changing policy.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

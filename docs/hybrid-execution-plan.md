@@ -98,9 +98,49 @@ a resident GPU selection on this workload. It does not imply that every
 RAM-resident expert should be uploaded: upload, eviction, queue debt, expert
 record size, and reuse horizon still decide whether a miss amortizes.
 
-### Stage 2b — dynamic lane scheduler — next
+### Stage 2b — dynamic lane scheduler — completed
 
-Measure per layer and execution epoch:
+`HybridDispatchPlanner` is a platform-neutral, bounded planner. For each
+routed expert it receives selection count, record bytes, CPU availability,
+GPU availability, and existing GPU residency. It applies these rules:
+
+1. an already-resident expert stays on GPU;
+2. an expert with only one feasible executor uses it or the layer fails;
+3. flexible RAM misses are ordered by descending CPU work;
+4. each is assigned to the choice minimizing the projected layer critical
+   path, with CPU as the deterministic no-upload tie break;
+5. a GPU upload is eligible only when the cache can admit it without evicting
+   an equally hot/in-use resident;
+6. current-route GPU entries receive cache references before admission or
+   upload can select a victim.
+
+The cost model reflects the current implementation: H2D uploads are serialized
+before routed GPU compute, while CPU expert compute can overlap the GPU lane.
+CPU, resident-GPU, and RAM→GPU observations update bounded EWMAs. Initial CPU
+and GPU values come from Stage 2a; H2D begins at a conservative 8 GiB/s until a
+clean RAM-resident upload observation exists.
+
+Every plan returns per-expert reason plus both alternative critical-path costs.
+A 256-decision circular trace retains the newest snapshots; aggregate reason
+counters and current EWMAs appear in runner JSON. The planner rejects duplicate,
+empty, unavailable, or over-bound candidate sets rather than dropping work.
+
+Measured frozen-placement gate:
+
+- 42.2259 tok/s aggregate;
+- exact interleaved and chunked-prefill token equality;
+- 1,693 split-layer plans and 56,198 candidates;
+- 47,861 resident-GPU and 8,337 CPU-only decisions;
+- zero rejected plans, zero SSD misses, zero expert H2D, and zero pagefile use.
+
+Cost wins are intentionally zero in this measured window: after warmup the
+gate freezes placement, so RAM misses are CPU-only by policy. Unfrozen service
+epochs may make cost-based upload decisions; benchmark output separates their
+pre-measurement counters from the frozen window. The warmup recorded 3,896
+CPU critical-path wins and zero GPU-upload wins: with this short microbatch and
+synchronous uploader, no eligible RAM miss amortized its transfer.
+
+The implemented cost basis covers:
 
 - CPU queue and compute time;
 - resident GPU queue and compute time;
@@ -108,7 +148,7 @@ Measure per layer and execution epoch:
 - selected rows per expert;
 - overlap and the final layer critical path.
 
-For a RAM-resident GPU miss, compare measured estimates:
+For a RAM-resident GPU miss, the planner compares measured estimates:
 
 ```text
 CPU queue + CPU(expert, rows)
@@ -119,14 +159,17 @@ Cached GPU experts retain GPU priority. Small-load misses prefer CPU; a
 high-load miss may use the bounded transient GPU path when transfer amortizes.
 The scheduler balances lanes rather than applying a fixed CPU percentage.
 
-Acceptance:
+Acceptance evidence:
 
-- deterministic scheduler tests cover CPU, GPU, transfer, saturation, and tie
-  decisions;
+- deterministic scheduler tests cover resident/forced CPU/forced GPU,
+  transfer-vs-compute choices, EWMA updates, bounds, duplicate rejection,
+  circular trace order, and stable ties;
 - every decision publishes a reason/cost snapshot in bounded telemetry;
 - exact full-model tokens and all memory/failure invariants remain unchanged;
-- real API cold/warm and runner single/aggregate evidence is recorded without
-  comparing different placement states as equivalent.
+- runner measurement separates pre-measurement and frozen-window decisions.
+
+Cold/warm API qualification remains part of the later service/profile stage;
+it must not be represented as equivalent to this frozen runner result.
 
 ## Stage 3 — score-aware cache and bounded prefetch
 

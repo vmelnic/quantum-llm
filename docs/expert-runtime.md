@@ -81,6 +81,17 @@ or aggregation order.
 Planner decisions use measured queue, transfer and compute costs. A missing
 expert is never treated as zero and a timeout never reduces top-k.
 
+`HybridDispatchPlanner` receives one unique candidate per routed expert. It
+keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
+balances flexible RAM misses by projected critical path. Current synchronous
+H2D is modeled as serialized before GPU expert compute; CPU compute may overlap
+that GPU path. Stable ties remain on CPU to avoid unnecessary placement
+mutation. Invalid, duplicate, unavailable, or over-bound plans fail closed.
+
+CPU/GPU/H2D cost EWMAs are bounded state. The newest 256 per-expert reason/cost
+snapshots form a circular diagnostic trace; aggregate counters are emitted for
+benchmark windows. The trace affects neither routing nor aggregation order.
+
 ## Placement policy
 
 The cache uses bounded frequency/reuse evidence with aging. RAM→VRAM promotion

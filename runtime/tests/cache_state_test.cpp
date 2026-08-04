@@ -1,5 +1,6 @@
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
@@ -716,6 +717,83 @@ void test_vram_replacement_requires_a_strictly_colder_victim() {
   require(!planner.frozen(), "placement epoch did not resume");
 }
 
+void test_hybrid_dispatch_minimizes_measured_critical_path() {
+  er::HybridDispatchPlanner planner({100.0, 10.0, 1.0e9, 0.5, 16, 16});
+  const std::array candidates{
+      er::HybridDispatchCandidate{3, 10, 0, true, true, true},
+      er::HybridDispatchCandidate{1, 5, 10, false, true, true},
+      er::HybridDispatchCandidate{2, 5, 10'000, false, true, true},
+      er::HybridDispatchCandidate{4, 2, 0, false, true, false},
+      er::HybridDispatchCandidate{5, 2, 100, false, false, true},
+  };
+  const auto plan = planner.plan(candidates);
+  require(plan.status.ok() && plan.decisions.size() == candidates.size(),
+          "hybrid dispatch rejected a feasible layer");
+  const auto decision = [&](std::uint32_t expert) -> const auto& {
+    const auto found = std::find_if(
+        plan.decisions.begin(), plan.decisions.end(),
+        [&](const auto& value) { return value.expert == expert; });
+    require(found != plan.decisions.end(), "hybrid decision is missing");
+    return *found;
+  };
+  require(decision(3).executor == er::HybridExecutor::gpu_resident &&
+              decision(3).reason == er::HybridDispatchReason::resident_gpu,
+          "resident expert did not retain GPU priority");
+  require(decision(1).executor == er::HybridExecutor::gpu_upload &&
+              decision(1).reason ==
+                  er::HybridDispatchReason::gpu_lower_critical_path,
+          "small upload did not shorten the projected critical path");
+  require(decision(2).executor == er::HybridExecutor::cpu_local &&
+              decision(2).reason ==
+                  er::HybridDispatchReason::cpu_lower_critical_path,
+          "large upload was not kept on CPU");
+  require(decision(4).reason == er::HybridDispatchReason::cpu_only &&
+              decision(5).reason == er::HybridDispatchReason::gpu_only,
+          "forced executor reason was not preserved");
+
+  planner.observe_cpu(1'000, 20);
+  planner.observe_gpu(400, 20);
+  planner.observe_h2d(1'000, 2'000);
+  const auto telemetry = planner.telemetry();
+  require(telemetry.cpu_ns_per_selection == 75.0 &&
+              telemetry.gpu_ns_per_selection == 15.0 &&
+              telemetry.h2d_bytes_per_second == 1.5e9 &&
+              telemetry.plans == 1 && telemetry.candidates == 5,
+          "hybrid EWMA or decision telemetry mismatch");
+}
+
+void test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic() {
+  er::HybridDispatchPlanner planner({100.0, 10.0, 1.0e9, 0.5, 2, 2});
+  const std::array tie{
+      er::HybridDispatchCandidate{7, 1, 90, false, true, true}};
+  const auto tied = planner.plan(tie);
+  require(tied.status.ok() &&
+              tied.decisions.front().executor ==
+                  er::HybridExecutor::cpu_local &&
+              tied.decisions.front().reason ==
+                  er::HybridDispatchReason::cpu_stable_tie,
+          "hybrid tie did not use the stable CPU fallback");
+  const std::array two{
+      er::HybridDispatchCandidate{8, 1, 0, true, false, false},
+      er::HybridDispatchCandidate{9, 1, 0, true, false, false}};
+  require(planner.plan(two).status.ok(), "bounded hybrid plan failed");
+  const auto trace = planner.trace();
+  require(trace.size() == 2 && trace[0].expert == 8 && trace[1].expert == 9,
+          "bounded trace did not retain the newest decisions in order");
+  const std::array duplicate{
+      er::HybridDispatchCandidate{1, 1, 0, true, false, false},
+      er::HybridDispatchCandidate{1, 1, 0, true, false, false}};
+  require(!planner.plan(duplicate).status.ok(),
+          "hybrid planner accepted duplicate experts");
+  const std::array too_many{
+      er::HybridDispatchCandidate{1, 1, 0, true, false, false},
+      er::HybridDispatchCandidate{2, 1, 0, true, false, false},
+      er::HybridDispatchCandidate{3, 1, 0, true, false, false}};
+  require(!planner.plan(too_many).status.ok() &&
+              planner.telemetry().rejected_plans == 2,
+          "hybrid planner did not enforce its candidate bound");
+}
+
 }  // namespace
 
 int main() {
@@ -731,6 +809,8 @@ int main() {
     test_layer_partitioned_eviction_protects_other_layers();
     test_frequency_admission_protects_reused_expert();
     test_vram_replacement_requires_a_strictly_colder_victim();
+    test_hybrid_dispatch_minimizes_measured_critical_path();
+    test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();
     std::cout << "expert_runtime_tests: PASS\n";
     return 0;
   } catch (const std::exception& error) {
