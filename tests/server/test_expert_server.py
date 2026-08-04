@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+import socket
 import threading
 import types
 import unittest
@@ -12,7 +13,7 @@ sys.modules.setdefault(
     "transformers", types.SimpleNamespace(AutoTokenizer=object)
 )
 
-from ops.python.expert_server import Application, ContinuousDecodeBatcher
+from ops.python.expert_server import Application, ContinuousDecodeBatcher, Handler
 
 
 class FakeWorker:
@@ -30,6 +31,18 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_stream_disconnect_is_visible_before_next_decode(self) -> None:
+        server_side, client_side = socket.socketpair()
+        try:
+            handler = Handler.__new__(Handler)
+            handler.connection = server_side
+            self.assertFalse(handler._client_disconnected())
+            client_side.close()
+            self.assertTrue(handler._client_disconnected())
+        finally:
+            server_side.close()
+            client_side.close()
+
     def test_concurrent_rows_share_one_worker_step(self) -> None:
         worker = FakeWorker()
         observed: list[int] = []

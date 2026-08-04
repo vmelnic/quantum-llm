@@ -7,7 +7,9 @@ import argparse
 import json
 import os
 import queue
+import select
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -480,6 +482,21 @@ class Handler(BaseHTTPRequestHandler):
         expected = self.app.args.api_key
         return not expected or self.headers.get("Authorization") == f"Bearer {expected}"
 
+    def _client_disconnected(self) -> bool:
+        # A streaming response can fit in the kernel send buffer, so relying
+        # only on a later BrokenPipeError may finish dozens of tokens after the
+        # peer has already sent FIN/RST. A non-blocking peek observes that
+        # closure before scheduling the next decode step.
+        try:
+            readable, _writable, _errors = select.select(
+                [self.connection], [], [], 0
+            )
+            if not readable:
+                return False
+            return self.connection.recv(1, socket.MSG_PEEK) == b""
+        except (ConnectionResetError, OSError, ValueError):
+            return True
+
     def _json(self, status: int, payload: dict[str, Any]) -> None:
         encoded = json.dumps(payload, separators=(",", ":")).encode()
         self.send_response(status)
@@ -564,16 +581,26 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                for token, delta in self.app.generate(prompt_ids, maximum):
-                    completion_count += 1
-                    if token in self.app.eos_token_ids:
-                        finish_reason = "stop"
-                    choice = {"index": 0, "finish_reason": None}
-                    choice["delta" if chat else "text"] = ({"content": delta} if chat else delta)
-                    chunk = {"id": request_uuid, "object": "chat.completion.chunk" if chat else "text_completion",
-                             "created": created, "model": self.app.args.model, "choices": [choice]}
-                    self.wfile.write(b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n")
-                    self.wfile.flush()
+                generation = self.app.generate(prompt_ids, maximum)
+                try:
+                    while True:
+                        if self._client_disconnected():
+                            raise BrokenPipeError("streaming client disconnected")
+                        try:
+                            token, delta = next(generation)
+                        except StopIteration:
+                            break
+                        completion_count += 1
+                        if token in self.app.eos_token_ids:
+                            finish_reason = "stop"
+                        choice = {"index": 0, "finish_reason": None}
+                        choice["delta" if chat else "text"] = ({"content": delta} if chat else delta)
+                        chunk = {"id": request_uuid, "object": "chat.completion.chunk" if chat else "text_completion",
+                                 "created": created, "model": self.app.args.model, "choices": [choice]}
+                        self.wfile.write(b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n")
+                        self.wfile.flush()
+                finally:
+                    generation.close()
                 final_choice: dict[str, Any] = {
                     "index": 0, "finish_reason": finish_reason
                 }
