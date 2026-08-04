@@ -1,6 +1,6 @@
 param(
-    [string]$Snapshot = "C:\Users\vladi\.cache\huggingface\hub\models--Qwen--Qwen3-Next-80B-A3B-Instruct\snapshots\9c7f2fbe84465e40164a94cc16cd30b6999b0cc7",
-    [string]$Output = "C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8",
+    [string]$Snapshot = "",
+    [string]$Output = "",
     [ValidateSet("NO", "DELETE_CONSUMED_SHARDS")]
     [string]$SourceReclamationConfirmation = "NO",
     [switch]$Resume
@@ -8,6 +8,14 @@ param(
 
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
+
+if (-not $Output) {
+    $Output = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
+}
+if (-not $Snapshot) {
+    $Snapshot = Resolve-HuggingFaceSnapshot `
+        -ModelId "Qwen/Qwen3-Next-80B-A3B-Instruct"
+}
 
 $snapshotPath = [System.IO.Path]::GetFullPath($Snapshot)
 $outputPath = [System.IO.Path]::GetFullPath($Output)
@@ -36,7 +44,7 @@ $arguments = @{
     Path = $snapshotPath
     Output = $outputPath
     SourceId = "Qwen/Qwen3-Next-80B-A3B-Instruct"
-    SourceRevision = "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7"
+    SourceRevision = Split-Path $snapshotPath -Leaf
     Adapter = "qwen3_next"
     MaxExpertPackBytes = 4GB
     Resume = $Resume

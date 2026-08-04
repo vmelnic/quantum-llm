@@ -1,58 +1,92 @@
 param(
-    [string]$Container = "C:\Users\vladi\quantum-llm\work\models\olmoe-expert-pack-int8",
+    [string]$Container = "",
     [string]$Tokenizer = "",
     [string]$Runner = "",
-    [string]$ModelId = "olmoe-expert-pack-int8",
+    [string]$Python = "",
+    [string]$ModelId = "qwen3-next-80b-a3b-expert-pack-int8",
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
     [int]$MaximumContext = 4096,
-    [int]$WorkerCapacity = 1,
+    [int]$MaximumNewTokens = 512,
+    [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
-    [int]$WorkerVramCacheGiB = 14,
+    [int]$WorkerVramCacheGiB = 18,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
-    [int]$StartupTimeoutSeconds = 120,
-    [string]$BuildId = "development"
+    [double]$QueueTimeoutSeconds = 1.0,
+    [double]$GenerationTimeoutSeconds = 120.0,
+    [int]$StartupTimeoutSeconds = 600,
+    [int]$DrainTimeoutSeconds = 30,
+    [string]$BuildId = "development",
+    [string]$LogFile = ""
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
 
-$python = Join-Path $script:RepoRoot "work\venv\colibri\Scripts\python.exe"
-$worker = if ($Runner) { [System.IO.Path]::GetFullPath($Runner) } else {
-    Join-Path $script:RepoRoot "out\build\windows-msvc-release\runtime\Release\expert-olmoe-runner.exe"
+if (-not $Container) {
+    $Container = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
 }
-$server = Join-Path $script:RepoRoot "ops\python\expert_server.py"
-$logFile = Join-Path (Join-Path $script:RepoRoot "logs") "expert-server.jsonl"
-if (-not (Test-Path $python -PathType Leaf)) { throw "Python environment missing: $python" }
-if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $worker" }
-if (-not (Test-Path $Container -PathType Container)) { throw "Container missing: $Container" }
-if (-not $Tokenizer) {
-    $containerTokenizer = Join-Path $Container "tokenizer"
-    if (Test-Path $containerTokenizer -PathType Container) {
-        $Tokenizer = $containerTokenizer
+if (-not $Runner) {
+    $Runner = Join-Path $script:RepoRoot `
+        "out\build\windows-msvc-release\runtime\Release\expert-qwen3-next-runner.exe"
+}
+if (-not $Tokenizer) { $Tokenizer = Join-Path $Container "tokenizer" }
+if (-not $LogFile) { $LogFile = Join-Path $script:RepoRoot "logs\expert-server.jsonl" }
+
+$pythonCommand = $null
+if ($Python) {
+    if (Test-Path -LiteralPath $Python -PathType Leaf) {
+        $pythonCommand = Get-Command ([System.IO.Path]::GetFullPath($Python)) -ErrorAction Stop
     } else {
-        $snapshotRoot = "C:\Users\vladi\.cache\huggingface\hub\models--allenai--OLMoE-1B-7B-0125-Instruct\snapshots"
-        $Tokenizer = (Get-ChildItem $snapshotRoot -Directory | Select-Object -First 1).FullName
+        $pythonCommand = Get-Command $Python -ErrorAction Stop
     }
+} else {
+    foreach ($candidate in @(
+        (Join-Path $script:RepoRoot ".venv\Scripts\python.exe"),
+        (Join-Path $script:RepoRoot "work\venv\server\Scripts\python.exe")
+    )) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            $pythonCommand = Get-Command $candidate -ErrorAction Stop
+            break
+        }
+    }
+    if ($null -eq $pythonCommand) { $pythonCommand = Get-PythonCommand }
 }
 
-& $python $server `
+$loopback = $HostAddress -in @("127.0.0.1", "::1", "localhost")
+if (-not $loopback -and [string]::IsNullOrWhiteSpace($env:EXPERT_API_KEY)) {
+    throw "EXPERT_API_KEY is required for a non-loopback bind"
+}
+
+$worker = [System.IO.Path]::GetFullPath($Runner)
+$containerPath = [System.IO.Path]::GetFullPath($Container)
+$tokenizerPath = [System.IO.Path]::GetFullPath($Tokenizer)
+$server = Join-Path $script:RepoRoot "ops\python\expert_server.py"
+if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $worker" }
+if (-not (Test-Path $containerPath -PathType Container)) { throw "Container missing: $containerPath" }
+if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer missing: $tokenizerPath" }
+
+& $pythonCommand.Source $server `
     --worker $worker `
-    --container $Container `
-    --tokenizer $Tokenizer `
+    --container $containerPath `
+    --tokenizer $tokenizerPath `
+    --model $ModelId `
     --host $HostAddress `
     --port $Port `
     --maximum-queue $MaximumQueue `
     --max-context $MaximumContext `
+    --maximum-new-tokens $MaximumNewTokens `
     --worker-capacity $WorkerCapacity `
     --worker-ram-cache-gib $WorkerRamCacheGiB `
     --worker-vram-cache-gib $WorkerVramCacheGiB `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
+    --queue-timeout $QueueTimeoutSeconds `
+    --generation-timeout $GenerationTimeoutSeconds `
     --startup-timeout $StartupTimeoutSeconds `
-    --model $ModelId `
+    --drain-timeout $DrainTimeoutSeconds `
     --build-id $BuildId `
-    --log-file $logFile
+    --log-file $LogFile
 if ($LASTEXITCODE -ne 0) { throw "Expert server exited with code $LASTEXITCODE" }

@@ -1,41 +1,58 @@
 # Expert Pack compiler
 
-This directory contains the P1 compiler and an independent container validator.
-It reads a local SafeTensors checkpoint one tensor at a time through read-only
-memory mappings; it does not instantiate a Transformers model or materialize the
-whole checkpoint.
+The compiler converts a local SafeTensors checkpoint into independently
+addressable, compute-ready Expert Pack v1 records. It reads through read-only
+memory mappings and never instantiates the Transformers model or materializes
+the complete checkpoint.
 
-The first explicit adapter is `olmoe`, verified against
-`allenai/OLMoE-1B-7B-0125-Instruct`. The v1 quantization profile is symmetric
-INT8 with one FP32 scale per output row. Expert `gate` and `up` rows are fused
-in that order, followed by the `down` projection. Router matrices and rank-one
-dense tensors remain FP32. Every record and section layout is declared in the
-manifest; readers must not infer it from byte counts.
+Supported strict adapters:
 
-Run from the repository root:
+- `olmoe` — `allenai/OLMoE-1B-7B-0125-Instruct` geometry;
+- `qwen3_next` — `Qwen/Qwen3-Next-80B-A3B-Instruct`, including explicit MTP
+  tensor preservation.
 
-```text
-python -m compiler compile \
-  --source C:\path\to\snapshot \
-  --output C:\path\to\olmoe-expert-pack \
-  --source-id allenai/OLMoE-1B-7B-0125-Instruct \
-  --source-revision b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e
+Unknown, missing, or geometrically inconsistent tensors fail conversion.
 
-python -m compiler validate C:\path\to\olmoe-expert-pack
+## Install
+
+From the repository root:
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e .\compiler
+
+# Optional NumPy row-conversion acceleration
+.\.venv\Scripts\python.exe -m pip install -e ".\compiler[fast]"
 ```
 
-If conversion is interrupted, the final output directory is absent and a
-neighboring `<output>.partial` directory remains. Resume only with identical
-source bytes and options:
+## Compile
 
-```text
-python -m compiler compile --source ... --output ... --resume
+```powershell
+.\.venv\Scripts\python.exe -m compiler compile `
+  --source C:\path\to\snapshot `
+  --output C:\path\to\model.expert-pack `
+  --source-id Qwen/Qwen3-Next-80B-A3B-Instruct `
+  --source-revision <immutable-revision> `
+  --adapter qwen3_next
 ```
 
-Resume commits at complete pack boundaries. Uncommitted `.tmp` packs are
-discarded. A directory without a valid `COMPLETED` marker is rejected.
+## Validate
 
-The implementation has a dependency-free, row-streaming conversion path and
-uses NumPy automatically when the optional `fast` dependency is installed.
-Both paths produce the same quant ABI; the dependency-free path is correct but
-substantially slower for large checkpoints.
+```powershell
+.\.venv\Scripts\python.exe -m compiler validate C:\path\to\model.expert-pack
+```
+
+Output is written to `<output>.partial` and becomes the final directory only
+after packs, manifest, hashes, and `COMPLETED` validate. Interrupted conversion
+can resume only with identical source bytes and options:
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler compile <same arguments> --resume
+```
+
+`--reclaim-source-shards` is destructive and deliberately not part of the
+normal example. Use the P6 preflight/wrapper only after reviewing its exact
+reclaim schedule and preserving a recoverable source checkpoint.
+
+The dependency-free and optional NumPy paths produce the same quantization ABI.
+See [Expert Pack v1](../docs/expert-pack-v1.md).

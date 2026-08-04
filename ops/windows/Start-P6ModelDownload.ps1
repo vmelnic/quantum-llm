@@ -6,7 +6,7 @@ param(
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
 
-$hf = "C:\Users\vladi\.hf-cli\venv\Scripts\hf.exe"
+$hf = Join-Path $env:USERPROFILE ".hf-cli\venv\Scripts\hf.exe"
 if (-not (Test-Path $hf -PathType Leaf)) { $hf = (Get-Command hf.exe -ErrorAction Stop).Source }
 $artifact = Join-Path (Join-Path $script:RepoRoot "artifacts") "p6-download-process.json"
 $stdout = Join-Path (Join-Path $script:RepoRoot "logs") "p6-download.stdout.log"

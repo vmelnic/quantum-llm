@@ -159,6 +159,11 @@ are a 4096-token context, at most 512 generated tokens, four active worker
 slots and eight queued requests. Prompt plus requested output must fit the
 context. The request body limit is 1 MiB.
 
+4096 is the only certified context limit. The Qwen checkpoint advertises 262K
+positions, but the current runtime preallocates FP32 KV for every worker slot
+and has not qualified long-context prefill/decode. Model metadata is therefore
+not exposed as an operational API promise.
+
 Admission is bounded. Overload/drain returns HTTP `503` with code `overloaded`;
 it does not create an unbounded queue. Generation timeout returns `504` before
 streaming starts, or an `error` event after a Responses stream has started.
@@ -173,4 +178,3 @@ matched stop text is not returned.
 - [OpenAI Responses API reference](https://developers.openai.com/api/reference/resources/responses)
 - [OpenAI streaming Responses guide](https://developers.openai.com/api/docs/guides/streaming-responses)
 - [OpenAI migration guide: streaming consumers](https://developers.openai.com/api/docs/guides/migrate-to-responses#7-update-streaming-consumers)
-

@@ -156,6 +156,15 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                                "temperature": 0.5}, "responses")
         self.assertEqual(raised.exception.param, "temperature")
 
+        app.args.max_context = 9
+        with self.assertRaises(RequestError) as raised:
+            app.parse_request({
+                "model": "test-model", "input": "hello",
+                "max_output_tokens": 8, "temperature": 0,
+            }, "responses")
+        self.assertEqual(raised.exception.param, "max_output_tokens")
+        self.assertIn("exceeds context capacity", str(raised.exception))
+
     def test_stream_disconnect_is_visible_before_next_decode(self) -> None:
         server_side, client_side = socket.socketpair()
         try:

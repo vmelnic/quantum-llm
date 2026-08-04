@@ -1,7 +1,7 @@
 param(
     [ValidateSet("Single", "Batch", "Both")]
     [string]$Mode = "Both",
-    [string]$Container = "C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8",
+    [string]$Container = "",
     [string]$PromptTokenIds = "151644,872,374",
     [string]$BatchPromptTokenIds = "151644,872,374;151644,9707,374;151644,17,488,17;151644,3696,13362",
     [int]$NewTokens = 32,
@@ -16,6 +16,10 @@ param(
 
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
+
+if (-not $Container) {
+    $Container = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
+}
 
 if ($NewTokens -lt 2 -or $Concurrency -lt 1 -or $RamCacheGiB -lt 1 -or
     $VramCacheGiB -lt 1 -or $MinimumFreePhysicalGiB -lt 1 -or

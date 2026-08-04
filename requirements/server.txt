@@ -1,0 +1,2 @@
+# Tokenizer dependency for the HTTP front-end. Pin for reproducible deployments.
+transformers==5.14.1

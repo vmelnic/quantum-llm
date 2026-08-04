@@ -5,13 +5,18 @@
 /models/
 /downloads/
 /out/
+/build/
+/dist/
 
-# Local council/session state (the exported debate remains versioned)
+# Local council/session state
 /.council/
 
 # Python environments and caches
 .venv/
 venv/
+.env
+.env.*
+!.env.example
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -32,8 +37,22 @@ __pycache__/
 
 # Generated logs and temporary files
 *.log
+*.jsonl
 *.tmp
 *.temp
+*.bak
+*.swp
+
+# Test and coverage output
+.coverage
+coverage.xml
+htmlcov/
+
+# CMake generated files outside the standard out/ directory
+CMakeCache.txt
+CMakeFiles/
+Testing/
+compile_commands.json
 
 # Editor and operating-system metadata
 .DS_Store

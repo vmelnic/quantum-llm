@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hmac
 import json
 import os
 import queue
@@ -723,7 +724,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         expected = self.app.args.api_key
-        return not expected or self.headers.get("Authorization") == f"Bearer {expected}"
+        if not expected:
+            return True
+        supplied = self.headers.get("Authorization", "")
+        return hmac.compare_digest(supplied, f"Bearer {expected}")
 
     def _client_disconnected(self) -> bool:
         # A streaming response can fit in the kernel send buffer, so relying
@@ -1089,7 +1093,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker", required=True, type=Path)
     parser.add_argument("--container", required=True, type=Path)
     parser.add_argument("--tokenizer", required=True, type=Path)
-    parser.add_argument("--model", default="olmoe-expert-pack-int8")
+    parser.add_argument(
+        "--model", default="qwen3-next-80b-a3b-expert-pack-int8"
+    )
     parser.add_argument("--build-id", default=os.environ.get("EXPERT_BUILD_ID", "development"))
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
@@ -1119,6 +1125,9 @@ def main() -> int:
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
+    if (args.host not in {"127.0.0.1", "::1", "localhost"} and
+            not args.api_key):
+        raise SystemExit("--api-key or EXPERT_API_KEY is required for non-loopback bind")
     if args.log_file:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
         LOG_FILE = args.log_file.open("a", encoding="utf-8")

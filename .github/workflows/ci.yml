@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  portable:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Configure
+        run: cmake --preset portable-release
+      - name: Build
+        run: cmake --build --preset portable-release --parallel 2
+      - name: C++ tests
+        run: ctest --preset portable-release
+      - name: Python tests
+        run: python -m unittest -v tests.compiler.test_expert_pack tests.server.test_expert_server
+      - name: Python syntax
+        run: python -m compileall -q compiler ops/python tests

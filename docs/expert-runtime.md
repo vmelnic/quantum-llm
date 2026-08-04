@@ -1,304 +1,163 @@
-# Expert Runtime v1 — contract Windows/CUDA
+# Expert Runtime v1 contract
 
-Acest document fixează lifecycle-ul și ABI-ul dintre core, storage/cache și
-backend-ul CUDA. Platforma P0–P6 este Windows + RTX 3090 (SM86). Metal și
-execuția distribuită sunt faze viitoare și nu fac parte din ABI-ul v1.
+This document defines invariants between the portable core, Windows storage,
+heterogeneous cache/scheduler, CUDA backend, model runner, and HTTP service.
+The current backend target is Windows + RTX 3090 (SM86).
 
-## Limita dintre module
-
-```text
-manifest/index -> feasibility/admission -> request state
-                                           |
-router exact -> device dispatch plan -> scheduler expert-centric
-                                           |
-                +--------------------------+--------------------------+
-                |                          |                          |
-          VRAM resident              RAM -> pinned slab          RAM host lease
-          grouped CUDA               -> H2D -> CUDA              -> CPU kernel
-                |                          |                          |
-                +---------- per-selection exact outputs -------------+
-                                           |
-                                stable weighted aggregation
-```
-
-Core-ul folosește IDs, byte budgets, stări și interfețe; handle-urile Win32 și
-tipurile CUDA rămân în backend-urile lor. Nicio dependență Colibri/llama.cpp și
-nicio cale Metal/network nu intră în build-ul curent. Contractul de placement
-acceptă însă tiers locale sau remote, astfel încât un model 1T să nu impună o
-rescriere a data plane-ului.
-
-## Data plane GPU-driven, control plane ierarhic
-
-GPU-driven descrie cine orchestrează traseul hot, nu locul unde se află modelul
-complet. Routerul scrie selecțiile direct într-un plan device. Un kernel le
-deduplică/grupează și consultă un director device cu intrări versionate. Ready
-work continuă pe GPU; numai cheile lipsă sunt copiate într-un miss ring bounded.
-
-CPU/storage nu reconstruiește lista completă de pointeri la fiecare strat. El
-rezolvă miss-ul din RAM, SSD sau ulterior dintr-un worker și alege un executor.
-Un miss poate fi admis într-un slot resident, calculat tranzitoriu într-un slab
-VRAM sau calculat lângă copia RAM. Slotul/slab-ul nu poate fi reutilizat până
-când toate event-urile generației vechi s-au terminat.
-
-## Contractul executorului heterogen
-
-Unitatea comună este un `ExpertWorkGroup`: un singur `(layer, expert,
-quant_abi)` și toate selecțiile din microbatch care îl cer. El conține host sau
-device lease, indicii rândurilor, sloturile top-k, deadline-ul și destinațiile
-per-selecție. Executorii disponibili sunt:
-
-- `cuda_resident`: consumă o generație publicată în director;
-- `cuda_slab`: copiază mai multe grupuri RAM-ready într-un slab pinned/device
-  prealocat și publică pointerii numai pentru durata generației tranzitorii;
-- `cpu_local`: consumă host lease și calculează în thread pool-ul bounded;
-- `remote_worker`: rezervat P8, cu aceeași ieșire semantică.
-
-Plannerul alege după completion time măsurat, queue depth și credits. Nicio cale
-nemăsurată nu este considerată gratuită. Alegerea executorului nu schimbă
-routerul, routing weights, precizia declarată sau ordinea finală de acumulare.
-
-Fiecare executor scrie `selection_output[row, top_k_slot, hidden]`. După event-
-urile tuturor selecțiilor, un kernel device aplică routing weights în ordinea
-stabilă din ABI. Astfel execuția concurentă CPU/GPU nu introduce o ordine
-numerică dependentă de completion.
-
-Costurile minime urmărite online sunt:
+## Module boundary
 
 ```text
-resident = gpu_queue + gpu_kernel(rows, abi)
-slab     = h2d_queue + host_pack + bytes/h2d_Bps + gpu_kernel(rows, abi)
-cpu      = cpu_queue + cpu_kernel(bytes, rows, abi) + result_copy
+manifest/index → feasibility/admission → request state
+                                         │
+exact router → device dispatch plan → expert-centric scheduler
+                                         │
+           ┌─────────────────────────────┼────────────────────────────┐
+           ▼                             ▼                            ▼
+     VRAM resident                 RAM → H2D slab               RAM CPU lease
+     grouped CUDA                  transient CUDA               CPU executor
+           └─────────────────────────────┬────────────────────────────┘
+                                         ▼
+                              stable weighted aggregation
 ```
 
-EWMA-urile sunt separate după ABI, geometrie și bucket de rows. Timeout-ul sau
-lipsa credits produce backpressure/failure explicit, nu drop de expert.
+Core contracts expose IDs, byte budgets, state and interfaces. Win32 handles
+and CUDA types remain behind backend boundaries.
 
-Indexul logic este global, dar memoria este partitionată pe layer/layer-group și
-pe două clase: resident și transient. Astfel, parcurgerea secvențială a unui
-model cu multe straturi nu produce evacuarea ciclică observată la Qwen3-Next.
-Pentru modele 1T, directorul conține metadata de ordinul zecilor de bytes per
-expert și poate fi windowed; weights rămân pagini în tiers, nu intrări în
-director.
-
-Admission-ul v1 este determinist și folosește LFU cu aging periodic bounded,
-astfel încât o distribuție veche să nu blocheze permanent un workload nou.
-Opțional, plannerul poate rezerva un pool transient separat: primul acces intră
-în acel ring, iar promovarea cere reuse și o frecvență strict mai mare decât
-victima resident. Mecanismul este o decizie de placement, nu un default: pe
-Qwen3-Next 80B măsurarea lui a fost mai lentă decât pool-ul LFU comun.
-
-Placement-ul adaptiv rulează în epoci. Într-o epocă de observație, toate
-rutele GPU și CPU actualizează LFU în batch pe strat, iar costul CPU per
-selecție este urmărit prin EWMA. Un expert RAM devine candidat numai după ce
-reuse debt-ul său depășește costul conservator H2D și există suficienți
-rezidenți VRAM strict mai reci. Promovarea folosește `AcquireHandle` asincron:
-invocarea curentă continuă pe CPU, iar upload-ul poate ajuta numai tokeni
-viitori.
-
-La bariera de warmup/request, plannerul drenează promovările admise și îngheață
-placement-ul. În epoch-ul frozen nu există promotion, H2D de weights, copiere
-de rută pentru control sau actualizare LFU/debt. Miss-urile RAM continuă prin
-executorul CPU exact. Această separare împiedică rebalansarea să introducă
-jitter în decode și permite reluarea explicită a observației la o frontieră
-sigură de workload.
-
-## Mașina de stări a containerului
+## Container lifecycle
 
 ```text
-UNOPENED -> MANIFEST_VALID -> PACKS_VALID -> PLANNED -> READY
-    |             |              |             |
-    +-------------+--------------+-------------+--> FAILED
-READY -> DRAINING -> CLOSED
+UNOPENED → MANIFEST_VALID → PACKS_VALID → PLANNED → READY
+    └────────────── any validation/planning error ─────────► FAILED
+READY → DRAINING → CLOSED
 ```
 
-`READY` cere manifest strict, `COMPLETED`, hashes, ABI SM86 compatibil și plan
-fezabil. `impossible` nu ajunge în READY cu promisiunea SLO; numai un flag
-operator explicit poate porni `best-effort`, stare vizibilă în API și metrici.
+`READY` requires exact schema/ABI support, valid hashes, compatible SM target,
+and feasible declared budgets. No best-effort integrity mode exists.
 
-## Mașina de stări a expertului
-
-Cheia este `(model_content_hash, layer, expert, quant_abi)`.
+## Expert lifecycle
 
 ```text
-ABSENT -> SSD_LOADING -> RAM_READY -> GPU_UPLOADING -> VRAM_READY
-   ^          |             |              |              |
-   |          +--FAILED-----+--------------+--------------+
-   +---------------- eviction după refcount/event --------+
+ABSENT → SSD_LOADING → RAM_READY → GPU_UPLOADING → VRAM_READY
+   ▲          └──────────── failure ───────────────────────► FAILED
+   └──────────────── safe eviction after leases/events ──────────────┘
 ```
 
-Reguli obligatorii:
+Rules:
 
-- un singur load și un singur upload in-flight per cheie;
-- waiterii se atașează aceleiași operații, nu pornesc duplicate;
-- slotul RAM devine vizibil numai după read complet + checksum;
-- slotul VRAM devine vizibil numai după `cudaMemcpyAsync` + event complet;
-- `refcount > 0`, rezervarea schedulerului sau un CUDA event incomplet interzic
-  eviction;
-- tranzițiile consumă credits înainte de alocare și le restituie exact o dată;
-- cancellation elimină waiterul, nu invalidează un load încă necesar altora;
-- short read, checksum sau CUDA error duc în `FAILED` și închid request-urile
-  dependente; top-k incomplet nu continuă;
-- high watermark oprește admission/load, low watermark îl reactivează;
-- bugetele VRAM, RAM cache, staging și KV sunt independente și în bytes.
-- `HostExpertLease` protejează copia RAM validată cât timp este folosită de CPU
-  sau copiată într-un slab; nu necesită promovare implicită în VRAM;
-- slab-urile pinned/device au state și generații separate de cache entry și sunt
-  restituite ca unitate după ultimul event dependent;
-- memoria pageable de durată nu este sursă directă pentru mii de copii CUDA
-  mici; grupurile alese pentru H2D sunt coalesced într-un staging pinned bounded.
+- one load and one upload in flight per expert key;
+- waiters share the same operation;
+- RAM publishes only after complete read and checksum;
+- VRAM publishes only after copy completion event;
+- leases, scheduler reservations and incomplete CUDA events prevent eviction;
+- credits are acquired before allocation and returned exactly once;
+- cancellation removes a waiter, not data still required by another request;
+- short read, checksum or CUDA error fails all dependent requests;
+- RAM cache, pinned staging, VRAM resident/transient, workspace and KV budgets
+  are independent.
 
-## Request și work item
+The key is `(model_content_hash, layer, expert, quant_abi)`.
 
-Un request trece prin:
+## Heterogeneous execution
+
+An `ExpertWorkGroup` represents one expert and every microbatch row selecting
+it. Executors are:
+
+- `cuda_resident`: published device directory entry;
+- `cuda_slab`: bounded RAM→pinned→device transient execution;
+- `cpu_local`: host lease and bounded CPU pool;
+- future `remote_worker`: same semantic output from another node.
+
+Every executor writes a per-selection output. Device aggregation applies
+routing weights in stable `(request, row, top-k slot)` order. Completion order
+must not alter numerical order.
+
+Planner decisions use measured queue, transfer and compute costs. A missing
+expert is never treated as zero and a timeout never reduces top-k.
+
+## Placement policy
+
+The cache uses bounded frequency/reuse evidence with aging. RAM→VRAM promotion
+must outperform the conservative H2D cost and displace only a strictly colder
+entry. Current execution continues on an available path while asynchronous
+promotion can benefit future tokens.
+
+At warmup/request barriers, admitted promotions drain and placement freezes.
+The measured frozen epoch performs no promotion, expert H2D, or policy mutation.
+
+## Windows storage
+
+- pack files are opened read-only with overlapped I/O;
+- unbuffered I/O is used only when file offset, length and buffer alignment
+  meet effective volume constraints;
+- one bounded IOCP/pool serves reads—never one blocking thread per expert;
+- staging buffers have explicit owner/generation and fixed capacity;
+- durable RAM cache is pageable so pinned staging cannot be exhausted by
+  retention;
+- useful, requested, physical-read and overfetch bytes are measured separately;
+- EOF, short completion, checksum mismatch and device removal fail closed.
+
+## CUDA ABI
+
+`expert-pack-sm86-int8-row-v1` consumes symmetric per-row INT8 expert weights
+and FP32 scales. Expert function:
 
 ```text
-QUEUED -> ADMITTED -> PREFILL -> DECODE_LAYER -> STREAMING -> COMPLETE
-             |            |           |              |
-             +------------+-----------+--------------+-> CANCELLING -> CANCELLED
-             +------------+-----------+--------------+-> FAILED
+down(silu(gate(x)) * up(x))
 ```
 
-Work item-ul immutable conține cel puțin request/sequence/row, layer, expert,
-routing weight, KV slot, deadline și generația cache entry. Schedulerul poate
-reordona work items între request-uri, dar nu poate schimba routerul, top-k sau
-ordinea numerică de agregare dintr-un request.
+Resident/transient descriptors contain only device pointers, declared geometry,
+dtype, ABI, workspace and completion event. Host pointers are never published
+in the device directory. Pointer generations prevent ABA reuse after eviction.
 
-Ready-first execută grupurile VRAM-ready, suprapune upload/read și aplică
-fairness prin vârstă/deadline. Un request rece nu ține blocată coada ready.
+The straightforward FP32-activation kernel is the numerical oracle, not the
+performance contract. Optimized kernels may change internal tiling/dtype only
+behind a versioned kernel ABI and correctness tolerance.
 
-## Contract storage Windows
+## Qwen3-Next runtime
 
-- pack deschis read-only cu `FILE_FLAG_OVERLAPPED`;
-- `FILE_FLAG_NO_BUFFERING` numai când offsetul, lungimea și bufferul satisfac
-  alinierea efectivă a volumului și `manifest.alignment.direct_io_bytes`;
-- IOCP unic/pool controlat, nu thread blocant per expert;
-- buffers page-locked dintr-un pool fix, cu owner și generation explicite;
-- după H2D, copia RAM de durată este mutată într-un buffer pageable bugetat,
-  iar slotul pinned revine imediat în pool; cache-ul RAM nu poate epuiza
-  staging-ul fix prin simpla retenție a experților;
-- un read direct acoperă `stored_bytes`, inclusiv padding determinist;
-- coalescing numai pentru recorduri vecine compatibile, iar requested/useful/
-  read/overfetch bytes se contorizează separat;
-- EOF, short completion, device removal și checksum mismatch sunt fail-closed.
+The runner implements full-attention GQA with partial RoPE/output gate and
+Gated DeltaNet with persistent Conv/recurrent state. Dense projection, routed
+expert grouping and aggregation operate on a microbatch. KV/Conv/DeltaNet state
+is isolated by worker slot; weights/cache are shared.
 
-## ABI CUDA `expert-pack-sm86-int8-row-v1`
-
-Container ABI:
-
-- weight `I8`, simetric per output row, zero-point 0;
-- scale `F32`, little-endian în pack, convertibil la device type numai explicit;
-- `gate_up_q [2I,H]`, gate rows apoi up rows, row-contiguous;
-- `gate_up_scales [2I]` în aceeași ordine;
-- `down_q [H,I]`, output-major row-contiguous;
-- `down_scales [H]`;
-- activarea este SiLU; outputul expert este `down(silu(gate(x))*up(x))`;
-- weighted accumulation este device-local și folosește o ordine stabilă
-  `(request,row,expert_id)` pentru modul exact.
-
-Descriptorul CUDA resident/slab nu conține pointeri host și nu expune layout
-implicit:
+The current KV implementation is FP32 and preallocated:
 
 ```text
-ExpertBatchV1
-  abi_id = 1
-  H, I, row_count
-  activation_dtype
-  output_dtype
-  x_device[row_count,H]
-  gate_up_q_device, gate_up_scale_device
-  down_q_device, down_scale_device
-  routing_weight_device[row_count]
-  output_device[row_count,H]
-  workspace_device + workspace_bytes
-  completion_event
+KV bytes = 48 KiB × maximum_context × worker_capacity
 ```
 
-Backend-ul validează `abi_id`, SM capability, dimensiunile și bounds înainte de
-launch. Pointerii weight trebuie să provină dintr-un slot `VRAM_READY` rezervat
-sau dintr-o generație activă a ring-ului slab. Calea CPU are un descriptor
-separat cu `HostExpertLease`; pointerii host nu sunt publicați în directorul
-device. Gate și up sunt un singur grouped dispatch logic. SiLU/produsul rămân
-device-local pentru CUDA, apoi down scrie ieșirea per selecție fără round-trip
-CPU.
+Only 4096 context with capacity four is certified. The model's 262K position
+metadata is not a runtime guarantee.
 
-Kernelul row-major FP32-activation existent este oracle-ul exact al ABI-ului,
-nu contractul de performanță. Kernelul production grupează expert-major și
-reutilizează weights pentru toate rândurile acelui expert. Poate schimba
-tiling-ul, tipul intern al activării sau primitivele SM86 numai dacă profilul
-numeric declarat trece față de oracle; o asemenea schimbare este versionată în
-`kernel_abi`, nu activată în tăcere.
+## Worker protocol
 
-Backend-ul Qwen3-Next adaugă două token mixers exacte: GQA full-attention cu
-partial RoPE și output gate, respectiv Gated DeltaNet cu stare Conv1D și stare
-recurentă persistentă. Normele dense folosesc `(1 + weight)`; norma gated din
-DeltaNet folosește `weight` direct, conform checkpoint-ului. Routerul face
-softmax global, top-k și renormalizare pe selecția top-k înainte de dispatch.
-În microbatch, proiecțiile dense consumă toate activările într-o singură lansare
-și ordonează blocurile astfel încât request-urile să reutilizeze aceeași linie de
-weights. Selecțiile sunt deduplicate pe strat, apoi toate rândurile folosesc un
-singur dispatch MoE batched și același cache global; stările KV/Conv/DeltaNet
-rămân izolate per slot.
+The local line-framed protocol supports:
 
-Workerul persistent Qwen folosește protocolul local v2: mai multe request-uri
-pot deține simultan sloturi KV/Conv/DeltaNet, iar `STEP` avansează până la
-capacitatea negociată într-un singur `forward_batch`. Front-end-ul adună pașii
-concurenți într-o fereastră configurabilă și păstrează protocolul v1 pentru
-runner-ele single-slot. Admission rezervă un slot înainte de a trimite headere
-HTTP/SSE; lipsa unui slot produce overload explicit, nu suprascriere de stare.
+- startup `ready` with protocol/capacity;
+- `BEGIN` to allocate request state and prefill;
+- protocol-v2 `STEP` to decode several active request IDs together;
+- `END` to release/cancel request state;
+- `SHUTDOWN` for orderly worker exit.
 
-Streams logice:
+Unexpected message type, duplicate ID, invalid capacity or mismatched response
+is fatal to the affected control flow. The front-end serializes worker commands
+and continuously batches compatible decode waiters within a bounded window.
 
-- compute: dense/router/grouped experts/aggregation;
-- H2D: upload din pinned RAM;
-- preload: opțional, numai dacă nu întârzie ready work.
-
-CUDA events exprimă dependențele și protejează eviction. Shapes/buffers pentru
-microbatch-urile acceptate sunt prealocate; alocarea necontrolată în decode este
-o eroare de runtime.
-
-## Fezabilitate și admission
-
-Calculatorul comun primește `manifest.json`, inventory și request-ul strict din
-`schemas/feasibility-request-v1.schema.json`. Din manifest folosește
-`masses.pack_bytes`, `masses.expert_bytes`,
-`masses.active_expert_bytes_per_token`, `requirements.resident_dense_bytes` și
-media `experts[].stored_bytes`. Workspace, staging și KV/request sunt tunables
-runtime, nu un al doilea dialect de manifest.
-
-Pentru ținta `T`:
+## Request lifecycle
 
 ```text
-cold_budget_B_per_token = sustained_storage_Bps / T
-h2d_budget_B_per_token  = sustained_H2D_Bps / T
-required_storage_avoidance = ceil((active - cold_budget) / active * 1e6)
-resident_vram = dense + workspace + kv_per_request * concurrency
-compute_ceiling = 1e9 / measured_non_io_nanoseconds_per_token
+QUEUED → ADMITTED → PREFILL → DECODE → STREAMING → COMPLETE
+             └──────── failure/cancel ───────────► FAILED/CANCELLED
 ```
 
-Se verifică în ordine stabilă: VRAM rezident, VRAM total cu cache, RAM cu
-staging/cache, disk capacity, storage bandwidth, PCIe/H2D bandwidth și plafonul
-compute măsurat. Prima constrângere eșuată este `limiting_resource`, împreună cu
-`required`, `available` și formula. Bandwidth sau compute modelat, nu măsurat,
-nu poate produce `feasible`; produce cel mult `degraded`.
+Admission reserves capacity before streaming headers. Queue and worker-slot
+waits have deadlines. Client disconnect is checked before scheduling another
+decode step; cancellation always closes the generator and sends `END` when the
+worker state is active.
 
-Exit code-ul CLI este 0 pentru feasible/degraded, 2 pentru impossible și 65
-pentru manifest/inventory/request invalid. Inputurile canonice și decizia au
-SHA-256, astfel încât aceeași intrare produce aceeași decizie reproductibilă.
+## Telemetry
 
-## Telemetrie minimă
-
-Fiecare request și proces expun TTFT/inter-token/tok/s, wait admission/batch,
-dense/router/expert/H2D/SSD time, rows și experți unici, hit VRAM/RAM/miss SSD,
-requested/useful/read/uploaded bytes, overfetch/dedup, high-water marks, eviction,
-budget stalls, cancellation și toate erorile checksum/I/O/CUDA. Identificatorii
-build/model-content/config sunt obligatorii în health, logs și incidente.
-
-## Invariante de corectitudine
-
-1. Niciun slot nu este vizibil înainte de validare/completion.
-2. Niciun expert rezervat sau în execuție nu este evicted.
-3. Niciun failure nu devine weight zero sau top-k redus în tăcere.
-4. Interleaving-ul schimbă scheduling-ul, nu rezultatul fiecărui request.
-5. Memoria nu depășește bugetele; overload produce backpressure explicit.
-6. Orice byte I/O/H2D și orice fallback sunt contorizate.
-7. Startup-ul nu descarcă și nu modifică modelul.
+The runtime distinguishes SSD misses, RAM hits, VRAM hits, useful/read/uploaded
+bytes, cache high-water marks, executor time, batch rows, TTFT and inter-token
+latency. Metrics windows are bounded. A benchmark must identify cold/warm/frozen
+placement and cannot infer hot-path throughput from configuration alone.

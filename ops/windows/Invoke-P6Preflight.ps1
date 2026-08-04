@@ -1,11 +1,16 @@
 param(
-    [string]$Snapshot = "C:\Users\vladi\.cache\huggingface\hub\models--Qwen--Qwen3-Next-80B-A3B-Instruct\snapshots\9c7f2fbe84465e40164a94cc16cd30b6999b0cc7",
+    [string]$Snapshot = "",
     [int64]$SafetyBytes = 8GB,
     [int64]$MaximumExpertPackBytes = 4GB
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
+
+if (-not $Snapshot) {
+    $Snapshot = Resolve-HuggingFaceSnapshot `
+        -ModelId "Qwen/Qwen3-Next-80B-A3B-Instruct"
+}
 
 $snapshotPath = [System.IO.Path]::GetFullPath($Snapshot)
 $indexPath = Join-Path $snapshotPath "model.safetensors.index.json"

@@ -1,17 +1,14 @@
 . (Join-Path $PSScriptRoot "Common.ps1")
 
-Set-CpuOnlyEnvironment
 Initialize-ExperimentDirectories
-$config = Get-ExperimentConfig
 
 $state = [PSCustomObject]@{
-    machine_name = $config.machine_name
-    computer_name = $env:COMPUTERNAME
-    repo_root = $script:RepoRoot
-    cpu_only = $true
-    cuda_visible_devices = $env:CUDA_VISIBLE_DEVICES
-    nvidia_visible_devices = $env:NVIDIA_VISIBLE_DEVICES
+    schema_version = 1
     timestamp_utc = [DateTime]::UtcNow.ToString("o")
+    computer_name = $env:COMPUTERNAME
+    user = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    repo_root = $script:RepoRoot
+    powershell_version = $PSVersionTable.PSVersion.ToString()
 }
 
 $path = Write-JsonArtifact -Value $state -Name "bootstrap-latest.json"

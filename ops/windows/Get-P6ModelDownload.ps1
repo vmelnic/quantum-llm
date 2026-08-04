@@ -29,7 +29,7 @@ $task = if ($null -ne $state.PSObject.Properties["task_name"]) {
 } else { $null }
 $taskRunning = $null -ne $task -and $task.State -eq "Running"
 $cacheName = "models--" + ($state.model_id -replace "/", "--")
-$root = Join-Path "C:\Users\vladi\.cache\huggingface\hub" $cacheName
+$root = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
 $bytes = if (Test-Path $root) {
     [int64]((Get-ChildItem $root -File -Recurse -ErrorAction SilentlyContinue |
         Measure-Object Length -Sum).Sum)

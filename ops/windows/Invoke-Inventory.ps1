@@ -1,5 +1,5 @@
 param(
-    [switch]$CpuOnly,
+    [string]$HuggingFaceHub = (Join-Path $env:USERPROFILE ".cache\huggingface\hub"),
     [int64]$SustainedStorageReadBytesPerSecond = 0,
     [int64]$SustainedH2DBytesPerSecond = 0,
     [switch]$StorageBandwidthMeasured,
@@ -7,16 +7,12 @@ param(
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
-
-if ($CpuOnly) { Set-CpuOnlyEnvironment }
 Initialize-ExperimentDirectories
-$config = Get-ExperimentConfig
 
 $os = Get-CimInstance Win32_OperatingSystem
-$cpu = Get-CimInstance Win32_Processor
+$cpu = @(Get-CimInstance Win32_Processor)
 $memoryModules = @(Get-CimInstance Win32_PhysicalMemory)
 $physicalDisks = @(Get-PhysicalDisk)
-$videoControllers = @(Get-CimInstance Win32_VideoController)
 $logicalDisks = @(Get-CimInstance Win32_LogicalDisk -Filter "DriveType=3")
 
 $cuda = [ordered]@{
@@ -27,16 +23,15 @@ $cuda = [ordered]@{
     devices = @()
     error = $null
 }
-
 try {
     $nvidiaSmi = Get-Command "nvidia-smi.exe" -ErrorAction Stop
-    $query = "index,name,driver_version,memory.total,memory.free,compute_cap,pci.bus_id,pcie.link.gen.current,pcie.link.gen.max,pcie.link.width.current,pcie.link.width.max"
+    $query = "index,name,driver_version,memory.total,memory.free,compute_cap,pci.bus_id"
     $rows = @(& $nvidiaSmi.Source "--query-gpu=$query" "--format=csv,noheader,nounits" 2>&1)
     if ($LASTEXITCODE -ne 0) { throw ($rows -join [Environment]::NewLine) }
     $devices = @()
     foreach ($row in $rows) {
         $fields = @($row -split "," | ForEach-Object { $_.Trim() })
-        if ($fields.Count -ne 11) { throw "Unexpected nvidia-smi row: $row" }
+        if ($fields.Count -ne 7) { throw "Unexpected nvidia-smi row: $row" }
         $devices += [PSCustomObject]@{
             index = [int]$fields[0]
             name = $fields[1]
@@ -44,21 +39,13 @@ try {
             vram_free_bytes = [int64]$fields[4] * 1MB
             compute_capability = $fields[5]
             pci_bus_id = $fields[6]
-            pcie = [PSCustomObject]@{
-                current_generation = [int]$fields[7]
-                maximum_generation = [int]$fields[8]
-                current_width = [int]$fields[9]
-                maximum_width = [int]$fields[10]
-            }
         }
     }
     $cuda.nvidia_smi_available = $true
     $cuda.devices = $devices
-    if ($devices.Count -gt 0) { $cuda.driver_version = (@($rows[0] -split ","))[2].Trim() }
+    if ($rows.Count -gt 0) { $cuda.driver_version = (@($rows[0] -split ","))[2].Trim() }
 }
-catch {
-    $cuda.error = $_.Exception.Message
-}
+catch { $cuda.error = $_.Exception.Message }
 
 try {
     $nvcc = Get-Command "nvcc.exe" -ErrorAction Stop
@@ -69,155 +56,65 @@ try {
         $cuda.toolkit_version = $Matches[1]
     }
 }
-catch {
-    if ($null -eq $cuda.error) { $cuda.error = $_.Exception.Message }
-}
+catch { if ($null -eq $cuda.error) { $cuda.error = $_.Exception.Message } }
 
 $cmake = [ordered]@{ available = $false; version = $null; path = $null }
 try {
-    $cmakeCommand = Get-Command "cmake.exe" -ErrorAction Stop
-    $cmakeOutput = (& $cmakeCommand.Source --version 2>&1 | Select-Object -First 1)
+    $command = Get-Command "cmake.exe" -ErrorAction Stop
+    $line = (& $command.Source --version 2>&1 | Select-Object -First 1)
     $cmake.available = $true
-    $cmake.path = $cmakeCommand.Source
-    if ($cmakeOutput -match "cmake version\s+([^\s]+)") { $cmake.version = $Matches[1] }
+    $cmake.path = $command.Source
+    if ($line -match "cmake version\s+([^\s]+)") { $cmake.version = $Matches[1] }
 }
 catch {}
 
 $primaryGpu = @($cuda.devices | Select-Object -First 1)
-$plannerVramTotal = if ($primaryGpu.Count) { [int64]$primaryGpu[0].vram_total_bytes } else { [int64]0 }
-$plannerVramAvailable = if ($primaryGpu.Count) { [int64]$primaryGpu[0].vram_free_bytes } else { [int64]0 }
-$systemDrive = @($logicalDisks | Where-Object DeviceID -EQ $env:SystemDrive | Select-Object -First 1)
-$plannerDiskFree = if ($systemDrive.Count) { [int64]$systemDrive[0].FreeSpace } else { [int64]0 }
-
+$systemDrive = @($logicalDisks | Where-Object DeviceID -EQ $env:SystemDrive |
+    Select-Object -First 1)
 $hfModels = @()
-if (Test-Path -LiteralPath $config.huggingface_hub) {
-    $hfModels = @(Get-ChildItem -LiteralPath $config.huggingface_hub -Directory |
-        Where-Object Name -Like "models--*" |
-        ForEach-Object {
-            $summaries = @()
-            $snapshotRoot = Join-Path $_.FullName "snapshots"
-            if (Test-Path -LiteralPath $snapshotRoot) {
-                $summaries = @(Get-ChildItem -LiteralPath $snapshotRoot -Filter "config.json" -File -Recurse -ErrorAction SilentlyContinue |
-                    ForEach-Object { Read-JsonSummary -Path $_.FullName })
-            }
+if (Test-Path -LiteralPath $HuggingFaceHub -PathType Container) {
+    $hfModels = @(Get-ChildItem -LiteralPath $HuggingFaceHub -Directory |
+        Where-Object Name -Like "models--*" | ForEach-Object {
             [PSCustomObject]@{
                 name = $_.Name
                 path = $_.FullName
                 size_bytes = Get-DirectorySizeBytes -Path $_.FullName
-                configs = $summaries
             }
         })
-}
-
-$dockerStatus = [PSCustomObject]@{
-    available = $false
-    server_version = $null
-    volume = $config.docker_volume
-    volume_size_bytes = $null
-    models = @()
-    error = $null
-}
-
-try {
-    $dockerStatus.server_version = (& docker version --format "{{.Server.Version}}" 2>&1 | Out-String).Trim()
-    if ($LASTEXITCODE -ne 0) { throw $dockerStatus.server_version }
-    $dockerStatus.available = $true
-
-    $probeCommand = "du -sb /models/*"
-    $probeArgs = @(
-        "run", "--rm", "--network", "none", "--entrypoint", "/bin/sh",
-        "-v", ($config.docker_volume + ":/models:ro"),
-        $config.docker_probe_image, "-c", $probeCommand
-    )
-    $probeOutput = @(& docker @probeArgs 2>&1)
-    if ($LASTEXITCODE -ne 0) { throw ($probeOutput -join [Environment]::NewLine) }
-
-    $dockerModels = @()
-    foreach ($line in $probeOutput) {
-        if ($line -match '^(\d+)\s+/models/(.+)$') {
-            $dockerModels += [PSCustomObject]@{
-                name = $Matches[2]
-                size_bytes = [int64]$Matches[1]
-            }
-        }
-    }
-    $dockerStatus.models = $dockerModels
-    $dockerStatus.volume_size_bytes = [int64](($dockerModels | Measure-Object -Property size_bytes -Sum).Sum)
-}
-catch {
-    $dockerStatus.error = $_.Exception.Message
-}
-
-$targetConfig = $null
-if ($dockerStatus.available) {
-    try {
-        $targetPath = "/models/$($config.models.runtime_moe)/config.json"
-        $targetArgs = @(
-            "run", "--rm", "--network", "none", "--entrypoint", "/bin/cat",
-            "-v", ($config.docker_volume + ":/models:ro"),
-            $config.docker_probe_image, $targetPath
-        )
-        $rawConfig = (& docker @targetArgs 2>&1 | Out-String)
-        if ($LASTEXITCODE -ne 0) { throw $rawConfig }
-        $targetConfig = Convert-ModelConfigToSummary -Config ($rawConfig | ConvertFrom-Json) -Source ("docker://" + $config.docker_volume + $targetPath)
-    }
-    catch {
-        $targetConfig = [PSCustomObject]@{ error = $_.Exception.Message }
-    }
 }
 
 $inventory = [PSCustomObject]@{
-    schema_version = 2
+    schema_version = 3
     timestamp_utc = [DateTime]::UtcNow.ToString("o")
     machine = [PSCustomObject]@{
-        logical_name = $config.machine_name
         computer_name = $env:COMPUTERNAME
         os = $os.Caption
         os_version = $os.Version
-        cpu = @($cpu | ForEach-Object {
-            [PSCustomObject]@{
-                name = $_.Name.Trim()
-                cores = $_.NumberOfCores
-                logical_processors = $_.NumberOfLogicalProcessors
-                max_clock_mhz = $_.MaxClockSpeed
-            }
-        })
+        cpu = @($cpu | ForEach-Object { [PSCustomObject]@{
+            name = $_.Name.Trim()
+            cores = $_.NumberOfCores
+            logical_processors = $_.NumberOfLogicalProcessors
+        } })
         total_memory_bytes = [int64]$os.TotalVisibleMemorySize * 1KB
         available_memory_bytes = [int64]$os.FreePhysicalMemory * 1KB
-        memory_modules = @($memoryModules | ForEach-Object {
-            [PSCustomObject]@{
-                manufacturer = $_.Manufacturer
-                capacity_bytes = [int64]$_.Capacity
-                configured_clock_mhz = $_.ConfiguredClockSpeed
-            }
-        })
-        physical_disks = @($physicalDisks | ForEach-Object {
-            [PSCustomObject]@{
-                name = $_.FriendlyName
-                media_type = [string]$_.MediaType
-                bus_type = [string]$_.BusType
-                size_bytes = [int64]$_.Size
-                health_status = [string]$_.HealthStatus
-                logical_sector_bytes = [int64]$_.LogicalSectorSize
-                physical_sector_bytes = [int64]$_.PhysicalSectorSize
-            }
-        })
-        volumes = @($logicalDisks | ForEach-Object {
-            [PSCustomObject]@{
-                drive = $_.DeviceID
-                filesystem = $_.FileSystem
-                size_bytes = [int64]$_.Size
-                free_bytes = [int64]$_.FreeSpace
-            }
-        })
-        display_adapters = @($videoControllers | ForEach-Object { $_.Name })
-    }
-    execution_policy = [PSCustomObject]@{
-        cpu_only = [bool]$CpuOnly
-        target = if ($CpuOnly) { "cpu-experiment" } else { "windows-cuda" }
-        cuda_visible_devices = $env:CUDA_VISIBLE_DEVICES
-        nvidia_visible_devices = $env:NVIDIA_VISIBLE_DEVICES
-        docker_gpu_flag_used = $false
+        memory_modules = @($memoryModules | ForEach-Object { [PSCustomObject]@{
+            manufacturer = $_.Manufacturer
+            capacity_bytes = [int64]$_.Capacity
+            configured_clock_mhz = $_.ConfiguredClockSpeed
+        } })
+        physical_disks = @($physicalDisks | ForEach-Object { [PSCustomObject]@{
+            name = $_.FriendlyName
+            media_type = [string]$_.MediaType
+            bus_type = [string]$_.BusType
+            size_bytes = [int64]$_.Size
+            health_status = [string]$_.HealthStatus
+        } })
+        volumes = @($logicalDisks | ForEach-Object { [PSCustomObject]@{
+            drive = $_.DeviceID
+            filesystem = $_.FileSystem
+            size_bytes = [int64]$_.Size
+            free_bytes = [int64]$_.FreeSpace
+        } })
     }
     cuda = [PSCustomObject]$cuda
     toolchain = [PSCustomObject]@{
@@ -227,29 +124,17 @@ $inventory = [PSCustomObject]@{
     planner = [PSCustomObject]@{
         total_ram_bytes = [int64]$os.TotalVisibleMemorySize * 1KB
         available_ram_bytes = [int64]$os.FreePhysicalMemory * 1KB
-        vram_total_bytes = $plannerVramTotal
-        vram_available_bytes = $plannerVramAvailable
-        disk_free_bytes = $plannerDiskFree
-        sustained_storage_read_bytes_per_second = [int64]$SustainedStorageReadBytesPerSecond
-        sustained_h2d_bytes_per_second = [int64]$SustainedH2DBytesPerSecond
+        vram_total_bytes = if ($primaryGpu.Count) { [int64]$primaryGpu[0].vram_total_bytes } else { [int64]0 }
+        vram_available_bytes = if ($primaryGpu.Count) { [int64]$primaryGpu[0].vram_free_bytes } else { [int64]0 }
+        disk_free_bytes = if ($systemDrive.Count) { [int64]$systemDrive[0].FreeSpace } else { [int64]0 }
+        sustained_storage_read_bytes_per_second = $SustainedStorageReadBytesPerSecond
+        sustained_h2d_bytes_per_second = $SustainedH2DBytesPerSecond
         storage_bandwidth_measured = [bool]$StorageBandwidthMeasured
         h2d_bandwidth_measured = [bool]$H2DBandwidthMeasured
     }
-    models = [PSCustomObject]@{
-        huggingface = $hfModels
-        docker = $dockerStatus
-        runtime_moe_config = $targetConfig
-    }
+    models = [PSCustomObject]@{ huggingface = $hfModels }
 }
 
-$stamp = [DateTime]::UtcNow.ToString("yyyyMMdd-HHmmss")
-$versionedPath = Write-JsonArtifact -Value $inventory -Name "inventory-$stamp.json"
-$latestPath = Write-JsonArtifact -Value $inventory -Name "inventory-latest.json"
-
-Write-Output "Inventory written: $versionedPath"
-Write-Output "Latest inventory: $latestPath"
-Write-Output "Execution target: $($inventory.execution_policy.target)"
-Write-Output "CUDA devices: $(@($cuda.devices).Count); nvcc=$($cuda.toolkit_version); driver=$($cuda.driver_version)"
-if ($SustainedStorageReadBytesPerSecond -eq 0 -or $SustainedH2DBytesPerSecond -eq 0) {
-    Write-Warning "Planner bandwidth is zero until qualified values are supplied; SLO admission will fail closed."
-}
+$path = Write-JsonArtifact -Value $inventory -Name "inventory-latest.json"
+$inventory | ConvertTo-Json -Depth 8
+Write-Output "Inventory written: $path"

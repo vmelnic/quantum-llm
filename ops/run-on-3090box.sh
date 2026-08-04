@@ -9,8 +9,12 @@ if [[ "${script_name}" == */* || "${script_name}" != *.ps1 ]]; then
   exit 2
 fi
 
-remote_host="${QUANTUM_LLM_REMOTE:-vladi@10.10.88.4}"
-remote_root="${QUANTUM_LLM_REMOTE_ROOT:-C:/Users/vladi/quantum-llm}"
+remote_host="${QUANTUM_LLM_REMOTE:-}"
+remote_root="${QUANTUM_LLM_REMOTE_ROOT:-C:/quantum-llm}"
+if [[ -z "${remote_host}" ]]; then
+  echo "Set QUANTUM_LLM_REMOTE=user@host" >&2
+  exit 2
+fi
 
 ssh -o BatchMode=yes "${remote_host}" \
   "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${remote_root}/ops/windows/${script_name}\" $*"
