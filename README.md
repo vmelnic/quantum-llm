@@ -42,6 +42,7 @@ dropped.
 - strict adapters for OLMoE and Qwen3-Next;
 - Windows IOCP storage, bounded RAM/VRAM caches, pinned staging, and CUDA SM86;
 - exact Qwen3-Next attention/DeltaNet/MoE inference;
+- paged FP16 KV with per-request credits and constant-memory online attention;
 - continuous decode batching with isolated request state;
 - Responses, Chat Completions, and legacy Completions HTTP APIs;
 - SSE streaming, usage, cancellation, overload handling, health and metrics;

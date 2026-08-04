@@ -20,6 +20,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <numeric>
 #include <span>
@@ -216,9 +217,13 @@ class Qwen3NextModel final {
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
                  std::uint64_t ram_cache_bytes,
                  std::uint64_t vram_cache_bytes,
-                 std::uint32_t capacity = 1)
-      : root_(root), max_context_(max_context), capacity_(capacity) {
-    if (!capacity_) throw std::runtime_error("request capacity is zero");
+                 std::uint32_t capacity = 1,
+                 std::uint64_t kv_cache_bytes = 2ULL << 30U,
+                 std::uint32_t kv_page_tokens = 256)
+      : root_(root), max_context_(max_context), capacity_(capacity),
+        kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens) {
+    if (!capacity_ || !max_context_ || !kv_cache_bytes_ || !kv_page_tokens_)
+      throw std::runtime_error("zero request/KV capacity");
     const auto document = expert::core::json::Parse(read_text(root / "manifest.json"));
     const auto& manifest = document.AsObject("manifest");
     const auto& architecture =
@@ -229,6 +234,10 @@ class Qwen3NextModel final {
     hidden_ = u32(architecture, "hidden_size", "architecture");
     expert_width_ = u32(architecture, "intermediate_size", "architecture");
     vocab_ = u32(architecture, "vocab_size", "architecture");
+    const auto architecture_max_context =
+        u32(architecture, "max_position_embeddings", "architecture");
+    if (max_context_ > architecture_max_context)
+      throw std::runtime_error("configured context exceeds model architecture");
     layers_ = u32(architecture, "num_hidden_layers", "architecture");
     query_heads_ = u32(architecture, "num_attention_heads", "architecture");
     kv_heads_ = u32(architecture, "num_key_value_heads", "architecture");
@@ -254,6 +263,9 @@ class Qwen3NextModel final {
         key_heads_ != 16 || value_heads_ != 32 || key_head_dim_ != 128 ||
         value_head_dim_ != 128 || conv_kernel_ != 4 || rotary_dim_ != 64)
       throw std::runtime_error("unsupported Qwen3-Next geometry");
+    if (!full_interval_ || layers_ % full_interval_)
+      throw std::runtime_error("invalid full-attention interval");
+    full_attention_layers_ = layers_ / full_interval_;
 
     const auto& packs = Required(manifest, "packs", "manifest").AsArray("packs");
     for (const auto& value : packs) {
@@ -350,7 +362,11 @@ class Qwen3NextModel final {
         throw std::runtime_error("token/position outside capacity");
       if (state_slots[row] >= capacity_ || seen_slots[state_slots[row]])
         throw std::runtime_error("invalid or duplicate request state slot");
+      if (!slot_context_limits_[state_slots[row]] ||
+          positions[row] >= slot_context_limits_[state_slots[row]])
+        throw std::runtime_error("token/position outside reserved context");
       seen_slots[state_slots[row]] = true;
+      ensure_kv_page(state_slots[row], positions[row]);
       status_check(expert::runtime::cuda::embedding(
           matrix("model.embed_tokens.weight"), tokens[row],
           hidden_state_ + static_cast<std::size_t>(row) * hidden_, nullptr));
@@ -424,6 +440,48 @@ class Qwen3NextModel final {
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
+  std::uint64_t kv_page_bytes() const noexcept { return kv_page_bytes_; }
+  std::uint64_t kv_page_capacity() const noexcept { return kv_page_capacity_; }
+  std::uint64_t kv_allocated_pages() const noexcept {
+    return kv_allocated_pages_;
+  }
+  std::uint64_t kv_reserved_pages() const noexcept {
+    return kv_reserved_pages_;
+  }
+  std::uint32_t kv_page_tokens() const noexcept { return kv_page_tokens_; }
+
+  void reserve_slot(std::uint32_t slot, std::uint32_t context_tokens) {
+    if (slot >= capacity_ || !context_tokens || context_tokens > max_context_)
+      throw std::runtime_error("invalid slot context reservation");
+    if (slot_context_limits_[slot])
+      throw std::runtime_error("slot already has a context reservation");
+    const auto pages = (static_cast<std::uint64_t>(context_tokens) +
+                        kv_page_tokens_ - 1U) / kv_page_tokens_;
+    if (pages > kv_page_capacity_ - kv_reserved_pages_)
+      throw std::runtime_error("KV page credits exhausted");
+    slot_kv_pages_[slot].assign(static_cast<std::size_t>(pages), nullptr);
+    slot_context_limits_[slot] = context_tokens;
+    kv_reserved_pages_ += pages;
+    reset_slot(slot);
+  }
+
+  void release_slot(std::uint32_t slot) {
+    if (slot >= capacity_) throw std::runtime_error("state slot out of range");
+    auto& pages = slot_kv_pages_[slot];
+    if (!slot_context_limits_[slot] && pages.empty()) return;
+    cuda_check(cudaDeviceSynchronize(), "synchronize KV slot release");
+    for (auto* page : pages)
+      if (page) free_kv_pages_.push_back(page);
+    kv_reserved_pages_ -= pages.size();
+    pages.clear();
+    slot_context_limits_[slot] = 0;
+    cuda_check(cudaMemset(
+                   device_kv_page_table_ +
+                       static_cast<std::size_t>(slot) * max_kv_pages_per_slot_,
+                   0, static_cast<std::size_t>(max_kv_pages_per_slot_) *
+                          sizeof(void*)),
+               "clear KV page table slot");
+  }
   void reset_slot(std::uint32_t slot) {
     if (slot >= capacity_) throw std::runtime_error("state slot out of range");
     const auto conv_elements =
@@ -585,19 +643,33 @@ class Qwen3NextModel final {
                        sizeof(float),
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU expert output");
-    key_cache_.resize(layers_);
-    value_cache_.resize(layers_);
     conv_state_.resize(layers_);
     recurrent_state_.resize(layers_);
-    const auto kv_elements = static_cast<std::size_t>(max_context_) * kv_heads_ * head_dim_;
+    max_kv_pages_per_slot_ =
+        (max_context_ + kv_page_tokens_ - 1U) / kv_page_tokens_;
+    const auto page_elements = static_cast<std::uint64_t>(kv_page_tokens_) *
+                               kv_heads_ * head_dim_;
+    kv_page_bytes_ = static_cast<std::uint64_t>(full_attention_layers_) * 2U *
+                     page_elements * sizeof(std::uint16_t);
+    kv_page_capacity_ = std::min<std::uint64_t>(
+        kv_cache_bytes_ / kv_page_bytes_,
+        static_cast<std::uint64_t>(capacity_) * max_kv_pages_per_slot_);
+    if (!kv_page_capacity_)
+      throw std::runtime_error("KV cache budget fits no page");
+    device_kv_page_table_ = device_allocate<void*>(
+        static_cast<std::size_t>(capacity_) * max_kv_pages_per_slot_);
+    cuda_check(cudaMemset(
+                   device_kv_page_table_, 0,
+                   static_cast<std::size_t>(capacity_) *
+                       max_kv_pages_per_slot_ * sizeof(void*)),
+               "zero KV page table");
+    slot_kv_pages_.resize(capacity_);
+    slot_context_limits_.resize(capacity_);
     const auto conv_elements = conv_size * conv_kernel_;
     const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
                                     key_head_dim_ * value_head_dim_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      if ((layer + 1U) % full_interval_ == 0) {
-        key_cache_[layer] = device_allocate<float>(capacity_ * kv_elements);
-        value_cache_[layer] = device_allocate<float>(capacity_ * kv_elements);
-      } else {
+      if ((layer + 1U) % full_interval_ != 0) {
         conv_state_[layer] =
             device_allocate<float>(capacity_ * conv_elements);
         recurrent_state_[layer] =
@@ -618,7 +690,7 @@ class Qwen3NextModel final {
     const auto query_size = 2U * query_heads_ * head_dim_;
     const auto kv_size = kv_heads_ * head_dim_;
     const auto attention_size = query_heads_ * head_dim_;
-    const auto cache_stride = static_cast<std::size_t>(max_context_) * kv_size;
+    const auto full_attention_layer = layer / full_interval_;
     status_check(expert::runtime::cuda::gemv_batch(
         matrix(prefix + "self_attn.q_proj.weight"), normalized_, query_gate_,
         rows, nullptr));
@@ -629,28 +701,53 @@ class Qwen3NextModel final {
         matrix(prefix + "self_attn.v_proj.weight"), normalized_, value_, rows,
         nullptr));
     for (std::uint32_t row = 0; row < rows; ++row) {
-      const auto state_offset =
-          static_cast<std::size_t>(state_slots[row]) * cache_stride;
-      status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
+      const auto page_index = positions[row] / kv_page_tokens_;
+      auto* page = slot_kv_pages_[state_slots[row]][page_index];
+      status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache_paged_fp16(
           query_gate_ + static_cast<std::size_t>(row) * query_size,
           key_ + static_cast<std::size_t>(row) * kv_size,
           value_ + static_cast<std::size_t>(row) * kv_size,
           fp32(prefix + "self_attn.q_norm.weight"),
           fp32(prefix + "self_attn.k_norm.weight"),
-          key_cache_[layer] + state_offset,
-          value_cache_[layer] + state_offset,
-          positions[row], query_heads_, kv_heads_, head_dim_, rotary_dim_,
-          epsilon_, rope_theta_, nullptr));
-      status_check(expert::runtime::cuda::qwen3_next_attention_decode(
+          page, full_attention_layer, kv_page_tokens_, positions[row],
+          query_heads_, kv_heads_, head_dim_, rotary_dim_, epsilon_,
+          rope_theta_, nullptr));
+      const auto* table = reinterpret_cast<const void* const*>(
+          device_kv_page_table_ + static_cast<std::size_t>(state_slots[row]) *
+                                      max_kv_pages_per_slot_);
+      status_check(
+          expert::runtime::cuda::qwen3_next_attention_decode_paged_fp16(
           query_gate_ + static_cast<std::size_t>(row) * query_size,
-          key_cache_[layer] + state_offset,
-          value_cache_[layer] + state_offset,
+          table,
           attention_ + static_cast<std::size_t>(row) * attention_size,
-          positions[row] + 1U, query_heads_, kv_heads_, head_dim_, nullptr));
+          positions[row] + 1U, full_attention_layer, kv_page_tokens_,
+          query_heads_, kv_heads_, head_dim_, nullptr));
     }
     status_check(expert::runtime::cuda::gemv_batch(
         matrix(prefix + "self_attn.o_proj.weight"), attention_, residual_, rows,
         nullptr));
+  }
+
+  void ensure_kv_page(std::uint32_t slot, std::uint32_t position) {
+    const auto page_index = position / kv_page_tokens_;
+    auto& page = slot_kv_pages_[slot].at(page_index);
+    if (page) return;
+    if (!free_kv_pages_.empty()) {
+      page = free_kv_pages_.back();
+      free_kv_pages_.pop_back();
+    } else {
+      if (kv_allocated_pages_ >= kv_page_capacity_)
+        throw std::runtime_error("KV physical page capacity exhausted");
+      cuda_check(cudaMalloc(&page, static_cast<std::size_t>(kv_page_bytes_)),
+                 "allocate KV page");
+      ++kv_allocated_pages_;
+    }
+    cuda_check(cudaMemcpy(
+                   device_kv_page_table_ +
+                       static_cast<std::size_t>(slot) * max_kv_pages_per_slot_ +
+                       page_index,
+                   &page, sizeof(page), cudaMemcpyHostToDevice),
+               "publish KV page");
   }
 
   void run_delta(const std::string& prefix, std::uint32_t layer,
@@ -939,7 +1036,7 @@ class Qwen3NextModel final {
   }
 
   std::filesystem::path root_;
-  std::uint32_t max_context_{}, capacity_{};
+  std::uint32_t max_context_{}, capacity_{}, full_attention_layers_{};
   std::uint32_t hidden_{}, expert_width_{}, vocab_{}, layers_{};
   std::uint32_t query_heads_{}, kv_heads_{}, head_dim_{}, experts_{}, top_k_{};
   std::uint32_t full_interval_{}, conv_kernel_{}, key_head_dim_{},
@@ -949,6 +1046,9 @@ class Qwen3NextModel final {
   std::uint64_t model_id_{0x51334e4558540001ULL};
   std::uint64_t total_pack_bytes_{}, dense_read_bytes_{},
       max_expert_record_bytes_{};
+  std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{},
+      kv_allocated_pages_{}, kv_reserved_pages_{};
+  std::uint32_t kv_page_tokens_{}, max_kv_pages_per_slot_{};
   std::uint64_t directory_vram_hits_{};
   PhaseTelemetry phase_;
   DevicePack dense_pack_;
@@ -973,7 +1073,11 @@ class Qwen3NextModel final {
       *host_cpu_selection_output_{};
   std::uint32_t *routing_indices_{}, *output_token_{}, *host_routing_indices_{};
   std::uint8_t* gpu_selection_mask_{};
-  std::vector<float*> key_cache_, value_cache_, conv_state_, recurrent_state_;
+  void** device_kv_page_table_{};
+  std::vector<std::vector<void*>> slot_kv_pages_;
+  std::vector<void*> free_kv_pages_;
+  std::vector<std::uint32_t> slot_context_limits_;
+  std::vector<float*> conv_state_, recurrent_state_;
   cudaEvent_t layer_start_event_{}, attention_done_event_{},
       shared_done_event_{}, router_done_event_{};
 };
@@ -1033,8 +1137,11 @@ struct WorkerRequest final {
 int worker_loop(Qwen3NextModel& model) {
   std::unordered_map<std::uint64_t, WorkerRequest> active;
   std::vector<bool> used_slots(model.capacity());
-  std::cout << "{\"type\":\"ready\",\"protocol\":2,\"capacity\":"
-            << model.capacity() << "}\n" << std::flush;
+  std::cout << "{\"type\":\"ready\",\"protocol\":3,\"capacity\":"
+            << model.capacity() << ",\"kv_page_tokens\":"
+            << model.kv_page_tokens() << ",\"kv_page_bytes\":"
+            << model.kv_page_bytes() << ",\"kv_page_capacity\":"
+            << model.kv_page_capacity() << "}\n" << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
     try {
@@ -1042,9 +1149,20 @@ int worker_loop(Qwen3NextModel& model) {
       if (fields[0] == "PING") {
         if (fields.size() != 1) throw std::runtime_error("invalid PING");
         std::cout << "{\"type\":\"pong\"}\n" << std::flush;
+      } else if (fields[0] == "STATS") {
+        if (fields.size() != 1) throw std::runtime_error("invalid STATS");
+        std::cout << "{\"type\":\"stats\",\"kv_allocated_pages\":"
+                  << model.kv_allocated_pages()
+                  << ",\"kv_reserved_pages\":"
+                  << model.kv_reserved_pages() << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
-        if (fields.size() != 3) throw std::runtime_error("invalid BEGIN");
+        if (fields.size() != 4) throw std::runtime_error("invalid BEGIN");
         const auto request_id = std::stoull(std::string(fields[1]));
+        const auto context_limit_u64 = std::stoull(std::string(fields[2]));
+        if (context_limit_u64 > std::numeric_limits<std::uint32_t>::max())
+          throw std::runtime_error("BEGIN context limit exceeds u32");
+        const auto context_limit =
+            static_cast<std::uint32_t>(context_limit_u64);
         if (!request_id || active.contains(request_id))
           throw std::runtime_error("invalid or duplicate request id");
         const auto available =
@@ -1053,17 +1171,24 @@ int worker_loop(Qwen3NextModel& model) {
           throw std::runtime_error("worker request capacity exhausted");
         const auto slot = static_cast<std::uint32_t>(
             std::distance(used_slots.begin(), available));
-        const auto prompt = parse_tokens(fields[2]);
-        model.reset_slot(slot);
-        std::uint32_t predicted = 0;
-        for (std::uint32_t position = 0; position < prompt.size(); ++position) {
-          const std::array token{prompt[position]}, positions{position}, slots{slot};
-          predicted = model.forward_batch(token, positions, slots).front();
-        }
+        const auto prompt = parse_tokens(fields[3]);
         used_slots[slot] = true;
-        active.emplace(request_id,
-                       WorkerRequest{slot, predicted,
-                                     static_cast<std::uint32_t>(prompt.size())});
+        try {
+          model.reserve_slot(slot, context_limit);
+          std::uint32_t predicted = 0;
+          for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+            const std::array token{prompt[position]}, positions{position}, slots{slot};
+            predicted = model.forward_batch(token, positions, slots).front();
+          }
+          active.emplace(
+              request_id, WorkerRequest{
+                              slot, predicted,
+                              static_cast<std::uint32_t>(prompt.size())});
+        } catch (...) {
+          model.release_slot(slot);
+          used_slots[slot] = false;
+          throw;
+        }
         std::cout << "{\"type\":\"begun\",\"id\":" << request_id
                   << ",\"slot\":" << slot << "}\n" << std::flush;
       } else if (fields[0] == "NEXT") {
@@ -1086,6 +1211,7 @@ int worker_loop(Qwen3NextModel& model) {
         std::cout << "{\"type\":\"token\",\"id\":" << id
                   << ",\"token\":" << token << "}\n" << std::flush;
         if (final) {
+          model.release_slot(iterator->second.slot);
           used_slots[iterator->second.slot] = false;
           active.erase(iterator);
         }
@@ -1140,7 +1266,9 @@ int worker_loop(Qwen3NextModel& model) {
         std::cout << "]}\n" << std::flush;
         for (const auto& step : steps) {
           if (step.final) {
-            used_slots[active.at(step.id).slot] = false;
+            const auto slot = active.at(step.id).slot;
+            model.release_slot(slot);
+            used_slots[slot] = false;
             active.erase(step.id);
           }
         }
@@ -1151,6 +1279,7 @@ int worker_loop(Qwen3NextModel& model) {
         const auto iterator = active.find(id);
         if (!id || iterator == active.end())
           throw std::runtime_error("END request mismatch");
+        model.release_slot(iterator->second.slot);
         used_slots[iterator->second.slot] = false;
         active.erase(iterator);
         std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
@@ -1177,10 +1306,11 @@ int worker_loop(Qwen3NextModel& model) {
 int main(int argc, char** argv) {
   try {
     if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
-      if (argc < 4 || argc > 9)
+      if (argc < 4 || argc > 11)
         throw std::runtime_error(
             "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
-            "[concurrency] [ram-gib] [vram-gib] [warmup-rounds]");
+            "[concurrency] [ram-gib] [vram-gib] [warmup-rounds] "
+            "[kv-cache-mib] [kv-page-tokens]");
       auto prompts = parse_prompt_batch(argv[3]);
       const auto new_tokens = argc >= 5
           ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
@@ -1190,6 +1320,9 @@ int main(int argc, char** argv) {
       const auto vram_gib = argc >= 8 ? std::stoull(argv[7]) : 14ULL;
       const auto warmup_rounds = argc >= 9
           ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 1U;
+      const auto kv_cache_mib = argc >= 10 ? std::stoull(argv[9]) : 2048ULL;
+      const auto kv_page_tokens = argc >= 11
+          ? static_cast<std::uint32_t>(std::stoul(argv[10])) : 256U;
       if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
         throw std::runtime_error("zero batched runtime setting");
       if (prompts.size() == 1U) prompts.resize(concurrency, prompts.front());
@@ -1208,7 +1341,11 @@ int main(int argc, char** argv) {
                                new_tokens;
       const auto started_load = std::chrono::steady_clock::now();
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
-                           vram_gib << 30U, concurrency);
+                           vram_gib << 30U, concurrency, kv_cache_mib << 20U,
+                           kv_page_tokens);
+      for (std::uint32_t row = 0; row < concurrency; ++row)
+        model.reserve_slot(
+            row, static_cast<std::uint32_t>(prompts[row].size()) + new_tokens);
       const auto load_seconds = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started_load).count();
       std::vector<std::uint32_t> batch_tokens, positions, state_slots,
@@ -1347,6 +1484,11 @@ int main(int argc, char** argv) {
                 << ",\"inter_token_p95_ms\":"
                 << percentile_ms(inter_token_ms, 0.95)
                 << ",\"container_bytes\":" << model.total_pack_bytes()
+                << ",\"kv_page_tokens\":" << model.kv_page_tokens()
+                << ",\"kv_page_bytes\":" << model.kv_page_bytes()
+                << ",\"kv_page_capacity\":" << model.kv_page_capacity()
+                << ",\"kv_allocated_pages\":" << model.kv_allocated_pages()
+                << ",\"kv_reserved_pages\":" << model.kv_reserved_pages()
                 << ",\"expert_read_bytes\":" << measured_read_bytes
                 << ",\"expert_h2d_bytes\":" << measured_uploaded_bytes
                 << ",\"expert_vram_hits\":" << measured_vram_hits
@@ -1386,24 +1528,28 @@ int main(int argc, char** argv) {
       return interleaving_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
-      if (argc > 7)
+      if (argc > 9)
         throw std::runtime_error(
             "worker usage: <container> --worker [max-context] [ram-gib] "
-            "[vram-gib] [capacity]");
+            "[vram-gib] [capacity] [kv-cache-mib] [kv-page-tokens]");
       const auto max_context = argc >= 4
           ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
       const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
       const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
       const auto capacity = argc >= 7
           ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 1U;
+      const auto kv_cache_mib = argc >= 8 ? std::stoull(argv[7]) : 2048ULL;
+      const auto kv_page_tokens = argc >= 9
+          ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
-                           vram_gib << 30U, capacity);
+                           vram_gib << 30U, capacity, kv_cache_mib << 20U,
+                           kv_page_tokens);
       return worker_loop(model);
     }
-    if (argc < 3 || argc > 7) {
+    if (argc < 3 || argc > 9) {
       std::cerr << "usage: expert-qwen3-next-runner <container> <token-ids-csv> "
                    "[new-tokens] [ram-cache-gib] [vram-cache-gib] "
-                   "[warmup-rounds]\n";
+                   "[warmup-rounds] [kv-cache-mib] [kv-page-tokens]\n";
       return 64;
     }
     auto tokens = parse_tokens(argv[2]);
@@ -1412,10 +1558,16 @@ int main(int argc, char** argv) {
     const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
     const auto warmup_rounds = argc >= 7
         ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 1U;
+    const auto kv_cache_mib = argc >= 8 ? std::stoull(argv[7]) : 2048ULL;
+    const auto kv_page_tokens = argc >= 9
+        ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
     if (!new_tokens || !ram_gib || !vram_gib) throw std::runtime_error("zero runtime budget");
     const auto max_context = static_cast<std::uint32_t>(tokens.size()) + new_tokens;
     const auto started_load = std::chrono::steady_clock::now();
-    Qwen3NextModel model(argv[1], max_context, ram_gib << 30U, vram_gib << 30U);
+    Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
+                         vram_gib << 30U, 1, kv_cache_mib << 20U,
+                         kv_page_tokens);
+    model.reserve_slot(0, max_context);
     const auto load_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_load).count();
     std::uint32_t predicted = 0;
@@ -1474,6 +1626,11 @@ int main(int argc, char** argv) {
       std::cout << tokens[i];
     }
     std::cout << "],\"model_load_seconds\":" << load_seconds
+              << ",\"kv_page_tokens\":" << model.kv_page_tokens()
+              << ",\"kv_page_bytes\":" << model.kv_page_bytes()
+              << ",\"kv_page_capacity\":" << model.kv_page_capacity()
+              << ",\"kv_allocated_pages\":" << model.kv_allocated_pages()
+              << ",\"kv_reserved_pages\":" << model.kv_reserved_pages()
               << ",\"warmup_rounds\":" << warmup_rounds
               << ",\"prompt_seconds\":" << prompt_seconds
               << ",\"warm_ttft_seconds\":" << prompt_seconds

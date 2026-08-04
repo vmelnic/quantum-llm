@@ -8,6 +8,8 @@ param(
     [int]$Concurrency = 4,
     [int]$RamCacheGiB = 48,
     [int]$VramCacheGiB = 18,
+    [int]$KvCacheMiB = 2048,
+    [int]$KvPageTokens = 256,
     [int]$MinimumFreePhysicalGiB = 2,
     [int]$WarmupRounds = 1,
     [double]$SingleTokensPerSecond = 10.0,
@@ -22,7 +24,8 @@ if (-not $Container) {
 }
 
 if ($NewTokens -lt 2 -or $Concurrency -lt 1 -or $RamCacheGiB -lt 1 -or
-    $VramCacheGiB -lt 1 -or $MinimumFreePhysicalGiB -lt 1 -or
+    $VramCacheGiB -lt 1 -or $KvCacheMiB -lt 1 -or $KvPageTokens -lt 1 -or
+    $MinimumFreePhysicalGiB -lt 1 -or
     $WarmupRounds -lt 0) {
     throw "Invalid P6 gate settings"
 }
@@ -124,12 +127,12 @@ function Invoke-GateRun {
 
 $runs = @()
 if ($Mode -in @("Single", "Both")) {
-    $arguments = "$Container $PromptTokenIds $NewTokens $RamCacheGiB $VramCacheGiB $WarmupRounds"
+    $arguments = "$Container $PromptTokenIds $NewTokens $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens"
     $runs += Invoke-GateRun -Name "single" -Arguments $arguments `
         -RequiredTokensPerSecond $SingleTokensPerSecond
 }
 if ($Mode -in @("Batch", "Both")) {
-    $arguments = "$Container --batch $BatchPromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds"
+    $arguments = "$Container --batch $BatchPromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds $KvCacheMiB $KvPageTokens"
     $runs += Invoke-GateRun -Name "batch" -Arguments $arguments `
         -RequiredTokensPerSecond $AggregateTokensPerSecond
 }

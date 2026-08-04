@@ -9,8 +9,9 @@ versioning once public releases begin.
 - implemented bounded SSD/RAM/VRAM expert placement and CUDA SM86 execution;
 - completed Qwen3-Next attention, DeltaNet, MoE, and multi-request state;
 - added continuous decode batching and OpenAI-compatible text endpoints;
+- replaced global FP32 KV with paged FP16 KV, request credits, online-softmax
+  attention, worker protocol v3, and page observability;
 - qualified the Qwen3-Next 80B hot path on one RTX 3090;
 - published the controlled 4096-context pre-production pilot profile;
 - documented long-context, cold-latency, service-hardening, Metal, and
   distributed-expert work still required.
-

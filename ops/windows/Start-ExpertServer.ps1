@@ -12,6 +12,8 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [int]$WorkerKvCacheMiB = 2048,
+    [int]$WorkerKvPageTokens = 256,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -81,6 +83,8 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-capacity $WorkerCapacity `
     --worker-ram-cache-gib $WorkerRamCacheGiB `
     --worker-vram-cache-gib $WorkerVramCacheGiB `
+    --worker-kv-cache-mib $WorkerKvCacheMiB `
+    --worker-kv-page-tokens $WorkerKvPageTokens `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `

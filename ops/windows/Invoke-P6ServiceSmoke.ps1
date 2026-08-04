@@ -65,6 +65,13 @@ if ($ExpectedBuildId -and $info.build_id -ne $ExpectedBuildId) {
 if (-not $info.manifest_content_sha256 -or -not $info.experts_index_sha256) {
     throw "Service does not publish the deployed container identity"
 }
+if ([int]$info.worker_protocol -lt 3 -or
+    $info.worker_kv.dtype -ne "fp16" -or
+    [int]$info.worker_kv.page_tokens -lt 1 -or
+    [int64]$info.worker_kv.page_bytes -lt 1 -or
+    [int]$info.worker_kv.page_capacity -lt $Concurrency) {
+    throw "Service does not publish a usable protocol-v3 paged KV contract"
+}
 if ([int]$info.worker_capacity -lt $Concurrency) {
     throw "Worker capacity $($info.worker_capacity) is below requested concurrency $Concurrency"
 }
@@ -245,6 +252,7 @@ finally {
 }
 
 $after = Get-MetricsText
+$afterInfo = Invoke-JsonGet -Path "/model-info"
 $batches = (Get-MetricValue -Text $after -Name "expert_service_decode_batches_total") - `
     (Get-MetricValue -Text $before -Name "expert_service_decode_batches_total")
 $rows = (Get-MetricValue -Text $after -Name "expert_service_decode_rows_total") - `
@@ -264,6 +272,12 @@ $result = [PSCustomObject]@{
     experts_index_sha256 = $info.experts_index_sha256
     worker_protocol = $info.worker_protocol
     worker_capacity = $info.worker_capacity
+    kv_dtype = $afterInfo.worker_kv.dtype
+    kv_page_tokens = $afterInfo.worker_kv.page_tokens
+    kv_page_bytes = $afterInfo.worker_kv.page_bytes
+    kv_page_capacity = $afterInfo.worker_kv.page_capacity
+    kv_allocated_pages = $afterInfo.worker_kv.allocated_pages
+    kv_reserved_pages = $afterInfo.worker_kv.reserved_pages
     concurrency = $Concurrency
     new_tokens = $NewTokens
     completed_delta = $completed

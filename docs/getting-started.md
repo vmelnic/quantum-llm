@@ -103,6 +103,8 @@ Validate an existing pack independently:
   -Python .\.venv\Scripts\python.exe `
   -MaximumContext 4096 `
   -WorkerCapacity 4 `
+  -WorkerKvCacheMiB 2048 `
+  -WorkerKvPageTokens 256 `
   -BuildId (git rev-parse --short HEAD)
 ```
 
@@ -144,6 +146,13 @@ Remove registration and stop the entire process tree:
 ## Context configuration
 
 `MaximumContext=4096` is the only certified value. The API rejects prompt plus
-output beyond this capacity. Raising it increases startup VRAM allocation for
-all slots; do not advertise the model's 262K architectural maximum as an
-operational limit. See [Production readiness](production-readiness.md).
+output beyond this capacity. Raising it no longer preallocates maximum KV for
+every slot, but it still requires a matching aggregate page budget and
+long-context qualification. Do not advertise the model's 262K architectural
+maximum as an operational limit. See
+[Production readiness](production-readiness.md).
+
+KV capacity is an aggregate request budget. With the tested geometry, one
+256-token page is 6 MiB. The 4096 × four-slot profile can reserve at most 64
+pages (384 MiB); the larger 2048 MiB setting leaves room to qualify higher
+contexts without changing the service interface.

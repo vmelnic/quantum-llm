@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_fp16.h>
 
 #include <cmath>
 #include <cstdint>
@@ -444,44 +445,171 @@ __global__ void qwen_attention_kernel(
     const float* value_cache, float* output, std::uint32_t tokens,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim) {
-  extern __shared__ float scores[];
+  __shared__ float online_maximum;
+  __shared__ float online_denominator;
+  __shared__ float previous_scale;
+  __shared__ float token_scale;
   const auto query_head = static_cast<std::uint32_t>(blockIdx.x);
   const auto kv_head = query_head / (query_heads / kv_heads);
   const auto query = q_and_gate +
       static_cast<std::size_t>(query_head) * 2U * head_dim;
-  for (std::uint32_t token = threadIdx.x; token < tokens;
-       token += blockDim.x) {
+  if (threadIdx.x == 0) {
+    online_maximum = kNegativeInfinity;
+    online_denominator = 0.0F;
+  }
+  __syncthreads();
+  float result = 0.0F;
+  for (std::uint32_t token = 0; token < tokens; ++token) {
     const auto cache =
         (static_cast<std::size_t>(token) * kv_heads + kv_head) * head_dim;
-    float dot = 0.0F;
-    for (std::uint32_t d = 0; d < head_dim; ++d)
-      dot += query[d] * key_cache[cache + d];
-    scores[token] = dot * rsqrtf(static_cast<float>(head_dim));
-  }
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float maximum = kNegativeInfinity;
-    for (std::uint32_t token = 0; token < tokens; ++token)
-      maximum = fmaxf(maximum, scores[token]);
-    float denominator = 0.0F;
-    for (std::uint32_t token = 0; token < tokens; ++token) {
-      scores[token] = expf(scores[token] - maximum);
-      denominator += scores[token];
+    float dot = threadIdx.x < head_dim
+                    ? query[threadIdx.x] * key_cache[cache + threadIdx.x]
+                    : 0.0F;
+    dot = reduce_sum(dot) * rsqrtf(static_cast<float>(head_dim));
+    if (threadIdx.x == 0) {
+      const float next_maximum = fmaxf(online_maximum, dot);
+      previous_scale = expf(online_maximum - next_maximum);
+      token_scale = expf(dot - next_maximum);
+      online_denominator = online_denominator * previous_scale + token_scale;
+      online_maximum = next_maximum;
     }
-    scores[tokens] = denominator;
+    __syncthreads();
+    if (threadIdx.x < head_dim)
+      result = result * previous_scale + token_scale *
+          value_cache[cache + threadIdx.x];
+    __syncthreads();
   }
-  __syncthreads();
   if (threadIdx.x < head_dim) {
-    float result = 0.0F;
-    for (std::uint32_t token = 0; token < tokens; ++token) {
-      const auto cache =
-          (static_cast<std::size_t>(token) * kv_heads + kv_head) * head_dim +
-          threadIdx.x;
-      result += scores[token] / scores[tokens] * value_cache[cache];
-    }
     const float gate = query[head_dim + threadIdx.x];
     output[static_cast<std::size_t>(query_head) * head_dim + threadIdx.x] =
-        result / (1.0F + expf(-gate));
+        (result / online_denominator) / (1.0F + expf(-gate));
+  }
+}
+
+__global__ void qwen_qkv_rope_paged_fp16_kernel(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_weight, const float* k_weight, __half* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t position, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float epsilon, float theta) {
+  __shared__ float normalized[256];
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (head < query_heads) {
+    auto* query = q_and_gate + static_cast<std::size_t>(head) * 2U * head_dim;
+    float square = dimension < head_dim ? query[dimension] * query[dimension] : 0.0F;
+    square = reduce_sum(square);
+    if (dimension < head_dim)
+      normalized[dimension] = query[dimension] *
+          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+          (1.0F + q_weight[dimension]);
+    __syncthreads();
+    if (dimension < head_dim) {
+      float final_query = normalized[dimension];
+      if (dimension < rotary_dim) {
+        const auto half = rotary_dim / 2U;
+        const auto pair = dimension % half;
+        const float angle = static_cast<float>(position) *
+            powf(theta, -2.0F * static_cast<float>(pair) /
+                             static_cast<float>(rotary_dim));
+        const float other = dimension < half ? -normalized[dimension + half]
+                                             : normalized[dimension - half];
+        final_query = normalized[dimension] * cosf(angle) + other * sinf(angle);
+      }
+      query[dimension] = final_query;
+    }
+  }
+  __syncthreads();
+  if (head < kv_heads) {
+    auto* key_head = key + static_cast<std::size_t>(head) * head_dim;
+    float square = dimension < head_dim
+                       ? key_head[dimension] * key_head[dimension]
+                       : 0.0F;
+    square = reduce_sum(square);
+    if (dimension < head_dim)
+      normalized[dimension] = key_head[dimension] *
+          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+          (1.0F + k_weight[dimension]);
+    __syncthreads();
+    if (dimension < head_dim) {
+      float final_key = normalized[dimension];
+      if (dimension < rotary_dim) {
+        const auto half = rotary_dim / 2U;
+        const auto pair = dimension % half;
+        const float angle = static_cast<float>(position) *
+            powf(theta, -2.0F * static_cast<float>(pair) /
+                             static_cast<float>(rotary_dim));
+        const float other = dimension < half ? -normalized[dimension + half]
+                                             : normalized[dimension - half];
+        final_key = normalized[dimension] * cosf(angle) + other * sinf(angle);
+      }
+      key_head[dimension] = final_key;
+      const auto page_elements = static_cast<std::size_t>(page_tokens) *
+                                 kv_heads * head_dim;
+      auto* key_page = page + static_cast<std::size_t>(full_attention_layer) *
+                                  2U * page_elements;
+      auto* value_page = key_page + page_elements;
+      const auto cache =
+          (static_cast<std::size_t>(position % page_tokens) * kv_heads + head) *
+              head_dim + dimension;
+      key_page[cache] = __float2half_rn(final_key);
+      value_page[cache] = __float2half_rn(
+          value[static_cast<std::size_t>(head) * head_dim + dimension]);
+    }
+  }
+}
+
+__global__ void qwen_attention_paged_fp16_kernel(
+    const float* q_and_gate, const void* const* page_table, float* output,
+    std::uint32_t tokens, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  __shared__ float online_maximum;
+  __shared__ float online_denominator;
+  __shared__ float previous_scale;
+  __shared__ float token_scale;
+  const auto query_head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto kv_head = query_head / (query_heads / kv_heads);
+  const auto* query = q_and_gate +
+      static_cast<std::size_t>(query_head) * 2U * head_dim;
+  const auto page_elements = static_cast<std::size_t>(page_tokens) *
+                             kv_heads * head_dim;
+  if (threadIdx.x == 0) {
+    online_maximum = kNegativeInfinity;
+    online_denominator = 0.0F;
+  }
+  __syncthreads();
+  float result = 0.0F;
+  for (std::uint32_t token = 0; token < tokens; ++token) {
+    const auto* page = static_cast<const __half*>(page_table[token / page_tokens]);
+    const auto* key_page = page +
+        static_cast<std::size_t>(full_attention_layer) * 2U * page_elements;
+    const auto* value_page = key_page + page_elements;
+    const auto cache =
+        (static_cast<std::size_t>(token % page_tokens) * kv_heads + kv_head) *
+            head_dim + threadIdx.x;
+    float dot = threadIdx.x < head_dim
+                    ? query[threadIdx.x] * __half2float(key_page[cache])
+                    : 0.0F;
+    dot = reduce_sum(dot) * rsqrtf(static_cast<float>(head_dim));
+    if (threadIdx.x == 0) {
+      const float next_maximum = fmaxf(online_maximum, dot);
+      previous_scale = expf(online_maximum - next_maximum);
+      token_scale = expf(dot - next_maximum);
+      online_denominator = online_denominator * previous_scale + token_scale;
+      online_maximum = next_maximum;
+    }
+    __syncthreads();
+    if (threadIdx.x < head_dim)
+      result = result * previous_scale + token_scale *
+          __half2float(value_page[cache]);
+    __syncthreads();
+  }
+  if (threadIdx.x < head_dim) {
+    const float gate = query[head_dim + threadIdx.x];
+    output[static_cast<std::size_t>(query_head) * head_dim + threadIdx.x] =
+        (result / online_denominator) / (1.0F + expf(-gate));
   }
 }
 
@@ -830,13 +958,50 @@ Status qwen3_next_attention_decode(
       !head_dim || head_dim > kThreads)
     return Status(ErrorCode::invalid_argument,
                   "invalid Qwen3-Next attention decode");
-  qwen_attention_kernel<<<
-      query_heads, kThreads,
-      (static_cast<std::size_t>(context_tokens) + 1U) * sizeof(float),
+  qwen_attention_kernel<<<query_heads, kThreads, 0,
       static_cast<cudaStream_t>(raw)>>>(
       q_and_gate, key_cache, value_cache, output, context_tokens, query_heads,
       kv_heads, head_dim);
   return checked(cudaPeekAtLastError(), "Qwen3-Next attention");
+}
+Status qwen3_next_qkv_rope_cache_paged_fp16(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t position, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float epsilon, float rope_theta,
+    void* raw) noexcept {
+  if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
+      !page || !page_tokens || !query_heads || !kv_heads ||
+      query_heads % kv_heads || !head_dim || head_dim > kThreads ||
+      !rotary_dim || rotary_dim > head_dim || rotary_dim % 2U ||
+      epsilon <= 0 || rope_theta <= 0)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid paged Qwen3-Next qkv rope");
+  qwen_qkv_rope_paged_fp16_kernel<<<query_heads, kThreads, 0,
+      static_cast<cudaStream_t>(raw)>>>(
+      q_and_gate, key, value, q_norm_weight, k_norm_weight,
+      static_cast<__half*>(page), full_attention_layer, page_tokens, position,
+      query_heads, kv_heads, head_dim, rotary_dim, epsilon, rope_theta);
+  return checked(cudaPeekAtLastError(), "paged Qwen3-Next qkv rope");
+}
+Status qwen3_next_attention_decode_paged_fp16(
+    const float* q_and_gate, const void* const* page_table,
+    float* output, std::uint32_t context_tokens,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* raw) noexcept {
+  if (!q_and_gate || !page_table || !output || !context_tokens ||
+      !page_tokens || !query_heads || !kv_heads || query_heads % kv_heads ||
+      !head_dim || head_dim > kThreads)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid paged Qwen3-Next attention decode");
+  qwen_attention_paged_fp16_kernel<<<query_heads, kThreads, 0,
+      static_cast<cudaStream_t>(raw)>>>(
+      q_and_gate, page_table, output, context_tokens, full_attention_layer,
+      page_tokens, query_heads, kv_heads, head_dim);
+  return checked(cudaPeekAtLastError(), "paged Qwen3-Next attention");
 }
 Status qwen3_next_delta_decode(const Qwen3NextDeltaLaunch& launch) noexcept {
   if (!launch.projected_qkvz || !launch.projected_ba ||

@@ -49,12 +49,16 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         )
         app.tokenizer = Tokenizer()
         app.eos_token_ids = set()
-        app.worker = types.SimpleNamespace(healthy=lambda: True)
+        app.worker = types.SimpleNamespace(
+            healthy=lambda: True, kv_page_tokens=16, kv_page_capacity=32,
+        )
         app.draining = threading.Event()
         app.acquire = lambda: True
         app.release = lambda: None
         app.acquire_worker_slot = lambda: True
         app.release_worker_slot = lambda: None
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
         app.increment = lambda *_args, **_kwargs: None
 
         def generate(_prompt: list[int], maximum: int):
@@ -177,6 +181,19 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             server_side.close()
             client_side.close()
 
+    def test_context_credits_are_bounded_and_reusable(self) -> None:
+        app = Application.__new__(Application)
+        app.worker = types.SimpleNamespace(
+            kv_page_tokens=256, kv_page_capacity=3,
+        )
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        first = app.acquire_context_credits(257)
+        self.assertEqual(first, 2)
+        self.assertEqual(app.acquire_context_credits(512), 0)
+        app.release_context_credits(first)
+        self.assertEqual(app.acquire_context_credits(512), 2)
+
     def test_concurrent_rows_share_one_worker_step(self) -> None:
         worker = FakeWorker()
         observed: list[int] = []
@@ -208,7 +225,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.active_ids: set[int] = set()
 
-            def begin(self, request_id: int, _prompt: list[int]) -> None:
+            def begin(self, request_id: int, _prompt: list[int],
+                      _context_limit: int) -> None:
                 self.active_ids.add(request_id)
 
             def cancel(self, request_id: int) -> None:

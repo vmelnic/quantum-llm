@@ -17,13 +17,18 @@ The final full-model gate produced:
 
 | Gate | Result | Required |
 |---|---:|---:|
-| single-stream hot runtime | 31.7312 tok/s | 10 tok/s |
-| four-request aggregate hot runtime | 31.1004 tok/s | 30 tok/s |
+| single-stream hot runtime | 46.7651 tok/s | 10 tok/s |
+| four-request aggregate hot runtime | 39.4794 tok/s | 30 tok/s |
 
 The gate used a warmup in the same process, retained expert residency, then
 reset request state and measurement counters. It observed no expert-weight H2D
 in the measured hot window, no pagefile growth, and identical batched versus
 isolated token sequences.
+
+This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
+physically sufficient for each short gate request. The batch run retained exact
+batched-versus-isolated token equality, used no pagefile growth, and kept at
+least 24.3 GiB physical RAM free.
 
 These numbers are runner throughput under a qualified hot placement. They are
 not a promise of 31 user-visible tokens/s for a cold chat.
@@ -37,8 +42,8 @@ cold operational window reported:
 
 - 21 decode batches / 32 rows;
 - effective decode batch: 1.5238;
-- TTFT p95: 23.812 seconds;
-- inter-token p95: 2.469 seconds.
+- TTFT p95: 22.922 seconds;
+- inter-token p95: 2.343 seconds.
 
 Smoke latencies include cold expert placement and short, heterogeneous requests.
 They demonstrate lifecycle behavior, not the hot throughput SLO. The large gap

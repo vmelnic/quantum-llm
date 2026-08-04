@@ -79,6 +79,11 @@ An 18 GiB VRAM expert-cache budget does not allocate 18 GiB at startup. Cache
 use grows with expert reuse and remains hot until eviction or process stop.
 Stopping the service releases model VRAM.
 
+KV has an independent MiB budget. `/model-info.worker_kv` exposes page size,
+capacity, reservations, and physical high-water allocation; Prometheus exposes
+`expert_service_kv_reserved_pages`. Overcommitted context is rejected before
+streaming with `context_capacity_exhausted`.
+
 ## Rollback
 
 1. Stop the task with the repository script.

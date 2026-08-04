@@ -85,8 +85,8 @@ compiled for SM86.
 The Python front-end owns tokenization, bounded admission, continuous decode
 batching, cancellation, SSE, metrics, and the OpenAI-compatible wire contract.
 The C++ worker owns model state and token selection. Their local protocol is
-line-framed and versioned; protocol v2 supports multiple active request slots
-and batched `STEP`.
+line-framed and versioned; protocol v3 supports multiple active request slots,
+exact context reservations, KV telemetry, and batched `STEP`.
 
 ## Memory placement
 
@@ -104,18 +104,28 @@ the budget is reached.
 
 ## Context memory
 
-The model advertises 262,144 positions. The current runner preallocates FP32 KV
-for every configured slot. Qwen3-Next has twelve full-attention layers, so KV
-cost is:
+The model advertises 262,144 positions. Qwen3-Next has twelve full-attention
+layers. The runner stores K/V in FP16 superpages shared across those layers:
 
 ```text
-48 KiB × maximum_context × worker_capacity
+page tokens                    256
+one layer K + V                512 KiB/page
+twelve full-attention layers     6 MiB/page
+logical KV per token            24 KiB/request
 ```
 
-The certified profile is four slots × 4096 tokens (about 768 MiB KV). Larger
-values are configurable but are not certified. Paged, on-demand FP16/BF16 KV
-and chunked prefill are required before long context becomes a production
-claim.
+At admission, each request reserves `ceil((prompt + output) / 256)` page
+credits. Physical CUDA pages are allocated only when prefill/decode first
+enters them, then retained in a reusable high-water pool. A released request
+returns its pages and credits. The default 4096 × four-slot profile needs at
+most 64 pages, or 384 MiB—not 768 MiB reserved at startup.
+
+Attention uses online softmax and constant shared memory instead of storing one
+score per context token. This removes the previous kernel launch ceiling for
+large contexts. It does not make 262K fast: prefill still invokes one causal
+forward per token and full attention remains quadratic. Chunked prefill,
+FlashAttention-class kernels, RoPE validation, and staged SLO/correctness gates
+are required before raising the certified 4096 limit.
 
 ## Failure model
 

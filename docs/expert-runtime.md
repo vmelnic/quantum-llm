@@ -120,22 +120,29 @@ Gated DeltaNet with persistent Conv/recurrent state. Dense projection, routed
 expert grouping and aggregation operate on a microbatch. KV/Conv/DeltaNet state
 is isolated by worker slot; weights/cache are shared.
 
-The current KV implementation is FP32 and preallocated:
+The KV implementation uses on-demand FP16 pages:
 
 ```text
-KV bytes = 48 KiB × maximum_context × worker_capacity
+logical FP16 KV bytes = 24 KiB × admitted context tokens
 ```
 
+KV is reserved in 256-token, 6 MiB superpages spanning all twelve full-attention
+layers. Page credits are acquired per request, physical pages are allocated on
+first use, and released pages enter a bounded reuse pool. Online-softmax
+attention does not allocate a score array proportional to context length.
+
 Only 4096 context with capacity four is certified. The model's 262K position
-metadata is not a runtime guarantee.
+metadata remains outside the runtime guarantee until efficient prefill and
+long-context gates pass.
 
 ## Worker protocol
 
 The local line-framed protocol supports:
 
-- startup `ready` with protocol/capacity;
-- `BEGIN` to allocate request state and prefill;
-- protocol-v2 `STEP` to decode several active request IDs together;
+- startup `ready` with protocol/capacity and KV page geometry;
+- protocol-v3 `BEGIN` with an exact context reservation, then prefill;
+- `STEP` to decode several active request IDs together;
+- `STATS` for current KV page allocation/reservation;
 - `END` to release/cancel request state;
 - `SHUTDOWN` for orderly worker exit.
 

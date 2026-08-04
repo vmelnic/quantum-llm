@@ -128,11 +128,13 @@ def _text_content(content: Any, param: str) -> str:
 class CudaWorker:
     def __init__(self, executable: Path, container: Path, max_context: int,
                  startup_timeout: float, requested_capacity: int,
-                 ram_cache_gib: int, vram_cache_gib: int) -> None:
-        command = [str(executable), str(container), "--worker", str(max_context)]
-        if requested_capacity > 1:
-            command.extend((str(ram_cache_gib), str(vram_cache_gib),
-                            str(requested_capacity)))
+                 ram_cache_gib: int, vram_cache_gib: int,
+                 kv_cache_mib: int, kv_page_tokens: int) -> None:
+        command = [
+            str(executable), str(container), "--worker", str(max_context),
+            str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
+            str(kv_cache_mib), str(kv_page_tokens),
+        ]
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -160,11 +162,14 @@ class CudaWorker:
             )
         self.protocol = int(response.get("protocol", 1))
         self.capacity = int(response.get("capacity", 1))
-        if requested_capacity > 1 and (
-            self.protocol < 2 or self.capacity != requested_capacity
-        ):
+        self.kv_page_tokens = int(response.get("kv_page_tokens", 0))
+        self.kv_page_bytes = int(response.get("kv_page_bytes", 0))
+        self.kv_page_capacity = int(response.get("kv_page_capacity", 0))
+        if (self.protocol < 3 or self.capacity != requested_capacity or
+                self.kv_page_tokens != kv_page_tokens or
+                self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0):
             self.process.kill()
-            raise WorkerError("CUDA worker does not support requested batching")
+            raise WorkerError("CUDA worker does not support requested KV/batching contract")
         self.active_ids: set[int] = set()
         self.command_lock = threading.Lock()
 
@@ -195,11 +200,12 @@ class CudaWorker:
             self.process.stdin.flush()
             return self._read()
 
-    def begin(self, request_id: int, prompt_ids: list[int]) -> None:
+    def begin(self, request_id: int, prompt_ids: list[int], context_limit: int) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
         response = self._command(
-            f"BEGIN\t{request_id}\t" + ",".join(str(token) for token in prompt_ids)
+            f"BEGIN\t{request_id}\t{context_limit}\t" +
+            ",".join(str(token) for token in prompt_ids)
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
@@ -246,6 +252,15 @@ class CudaWorker:
 
     def healthy(self) -> bool:
         return self.process.poll() is None
+
+    def stats(self) -> dict[str, int]:
+        response = self._command("STATS")
+        if response.get("type") != "stats":
+            raise WorkerError("unexpected STATS response")
+        return {
+            "allocated_pages": int(response["kv_allocated_pages"]),
+            "reserved_pages": int(response["kv_reserved_pages"]),
+        }
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -343,11 +358,15 @@ class Application:
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
                                  args.startup_timeout, args.worker_capacity,
                                  args.worker_ram_cache_gib,
-                                 args.worker_vram_cache_gib)
+                                 args.worker_vram_cache_gib,
+                                 args.worker_kv_cache_mib,
+                                 args.worker_kv_page_tokens)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
         self.worker_slots = threading.BoundedSemaphore(args.worker_capacity)
+        self.kv_credit_lock = threading.Lock()
+        self.kv_reserved_pages = 0
         self.id_lock = threading.Lock()
         self.next_id = 1
         self.draining = threading.Event()
@@ -398,6 +417,21 @@ class Application:
     def release_worker_slot(self) -> None:
         self.worker_slots.release()
 
+    def acquire_context_credits(self, context_tokens: int) -> int:
+        pages = (context_tokens + self.worker.kv_page_tokens - 1) // \
+            self.worker.kv_page_tokens
+        with self.kv_credit_lock:
+            if self.kv_reserved_pages + pages > self.worker.kv_page_capacity:
+                return 0
+            self.kv_reserved_pages += pages
+        return pages
+
+    def release_context_credits(self, pages: int) -> None:
+        with self.kv_credit_lock:
+            if pages <= 0 or pages > self.kv_reserved_pages:
+                raise RuntimeError("invalid KV context credit release")
+            self.kv_reserved_pages -= pages
+
     def record_decode_batch(self, rows: int) -> None:
         self.increment("decode_batches")
         self.increment("decode_rows", rows)
@@ -418,9 +452,13 @@ class Application:
             latency_samples = {
                 name: sorted(values) for name, values in self.latencies.items()
             }
+        with self.kv_credit_lock:
+            kv_reserved_pages = self.kv_reserved_pages
         lines = [
             "# TYPE expert_service_active_requests gauge",
             f"expert_service_active_requests {active}",
+            "# TYPE expert_service_kv_reserved_pages gauge",
+            f"expert_service_kv_reserved_pages {kv_reserved_pages}",
         ]
         for name, value in counters.items():
             lines.extend((f"# TYPE expert_service_{name}_total counter",
@@ -634,7 +672,7 @@ class Application:
         decoded = ""
         started = time.monotonic()
         previous_token_at: float | None = None
-        self.worker.begin(request_id, prompt_ids)
+        self.worker.begin(request_id, prompt_ids, len(prompt_ids) + maximum)
         try:
             for index in range(maximum):
                 if time.monotonic() - started > self.args.generation_timeout:
@@ -668,6 +706,7 @@ class Application:
     def info(self) -> dict[str, Any]:
         with self.active_lock:
             active = self.active
+        kv_stats = self.worker.stats()
         return {
             "model": self.args.model,
             "build_id": self.args.build_id,
@@ -683,6 +722,13 @@ class Application:
             "maximum_queue": self.args.maximum_queue,
             "worker_capacity": self.args.worker_capacity,
             "worker_protocol": self.worker.protocol,
+            "worker_kv": {
+                "dtype": "fp16",
+                "page_tokens": self.worker.kv_page_tokens,
+                "page_bytes": self.worker.kv_page_bytes,
+                "page_capacity": self.worker.kv_page_capacity,
+                **kv_stats,
+            },
             "runtime_config": {
                 "host": self.args.host,
                 "port": self.args.port,
@@ -692,6 +738,8 @@ class Application:
                 "worker_capacity": self.args.worker_capacity,
                 "worker_ram_cache_gib": self.args.worker_ram_cache_gib,
                 "worker_vram_cache_gib": self.args.worker_vram_cache_gib,
+                "worker_kv_cache_mib": self.args.worker_kv_cache_mib,
+                "worker_kv_page_tokens": self.args.worker_kv_page_tokens,
                 "microbatch_window_ms": self.args.microbatch_window_ms,
                 "latency_window": self.args.latency_window,
                 "queue_timeout_seconds": self.args.queue_timeout,
@@ -941,6 +989,16 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.SERVICE_UNAVAILABLE,
                         "all model slots are busy", "server_error", code="overloaded")
             return
+        context_pages = self.app.acquire_context_credits(
+            len(request.prompt_ids) + request.maximum
+        )
+        if not context_pages:
+            self.app.release_worker_slot()
+            self.app.release()
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE,
+                        "KV context capacity is exhausted", "server_error",
+                        code="context_capacity_exhausted")
+            return
         prefix = {"chat": "chatcmpl-", "completion": "cmpl-", "responses": "resp_"}[endpoint]
         request_uuid = prefix + uuid.uuid4().hex
         message_uuid = "msg_" + uuid.uuid4().hex
@@ -1084,6 +1142,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._sse({"type": "error", "code": "generation_failed",
                            "message": "generation failed", "param": None})
         finally:
+            self.app.release_context_credits(context_pages)
             self.app.release_worker_slot()
             self.app.release()
 
@@ -1106,6 +1165,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-capacity", type=int, default=1)
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
     parser.add_argument("--worker-vram-cache-gib", type=int, default=14)
+    parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
+    parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)
@@ -1123,6 +1184,7 @@ def main() -> int:
     if (args.maximum_queue < 0 or args.max_context < 2 or
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
+        args.worker_kv_cache_mib < 1 or args.worker_kv_page_tokens < 1 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
     if (args.host not in {"127.0.0.1", "::1", "localhost"} and

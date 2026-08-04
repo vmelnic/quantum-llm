@@ -97,6 +97,26 @@ struct Int8Matrix final {
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, void* stream) noexcept;
 
+// Paged FP16 KV variant. Every page is one allocation containing K then V for
+// every full-attention layer. The page table contains device page bases for a
+// single request slot. Attention uses online softmax and has constant shared
+// memory with respect to context length.
+[[nodiscard]] Status qwen3_next_qkv_rope_cache_paged_fp16(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t position, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float epsilon, float rope_theta,
+    void* stream) noexcept;
+
+[[nodiscard]] Status qwen3_next_attention_decode_paged_fp16(
+    const float* q_and_gate, const void* const* page_table,
+    float* output, std::uint32_t context_tokens,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* stream) noexcept;
+
 struct Qwen3NextDeltaLaunch final {
   const float* projected_qkvz{};  // [2*key_dim + 2*value_dim]
   const float* projected_ba{};    // [2*value_heads]

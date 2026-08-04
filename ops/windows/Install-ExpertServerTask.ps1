@@ -13,6 +13,8 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [int]$WorkerKvCacheMiB = 2048,
+    [int]$WorkerKvPageTokens = 256,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -26,7 +28,8 @@ param(
 . (Join-Path $PSScriptRoot "Common.ps1")
 
 if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
-    $MaximumContext -lt 2 -or $MaximumNewTokens -lt 1) {
+    $MaximumContext -lt 2 -or $MaximumNewTokens -lt 1 -or
+    $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1) {
     throw "Invalid service limits"
 }
 $startScript = Join-Path $PSScriptRoot "Start-P6ExpertServer.ps1"
@@ -51,6 +54,8 @@ $taskArguments.AddRange([string[]]@(
     "-WorkerCapacity", [string]$WorkerCapacity,
     "-WorkerRamCacheGiB", [string]$WorkerRamCacheGiB,
     "-WorkerVramCacheGiB", [string]$WorkerVramCacheGiB,
+    "-WorkerKvCacheMiB", [string]$WorkerKvCacheMiB,
+    "-WorkerKvPageTokens", [string]$WorkerKvPageTokens,
     "-MicrobatchWindowMs", $MicrobatchWindowMs.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-LatencyWindow", [string]$LatencyWindow,
     "-QueueTimeoutSeconds", $QueueTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),

@@ -4,9 +4,11 @@ This roadmap records direction, not a compatibility promise.
 
 ## Phase 1 — long-context and cold-path production work
 
-1. Paged, on-demand FP16/BF16 KV cache with per-request credits.
-2. Mixed context lengths without reserving maximum context for every slot.
-3. Chunked prefill and efficient full-attention kernels.
+1. ~~Paged, on-demand FP16 KV cache with per-request credits.~~ Implemented in
+   worker protocol v3.
+2. ~~Mixed context lengths without reserving maximum context for every slot.~~
+   Implemented through page-credit admission.
+3. Chunked prefill and FlashAttention-class full-attention kernels.
 4. Certified 8K → 16K → 32K → 64K gates.
 5. Workload-trained warm expert sets and non-blocking prefetch.
 6. End-to-end SLOs for TTFT, inter-token latency, throughput, and memory.

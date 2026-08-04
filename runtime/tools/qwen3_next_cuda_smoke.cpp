@@ -169,6 +169,7 @@ double check_batched_router() {
 
 double check_full_attention() {
   constexpr std::uint32_t query_heads = 16, kv_heads = 2, dim = 256;
+  constexpr std::uint32_t tokens = 3, page_tokens = 2;
   std::vector<float> q(static_cast<std::size_t>(query_heads) * 2U * dim);
   std::vector<float> k(kv_heads * dim), v(kv_heads * dim), norm(dim);
   for (std::size_t i = 0; i < q.size(); ++i) q[i] = pattern(i, 0.11F);
@@ -188,7 +189,8 @@ double check_full_attention() {
     }
   }
   DeviceBuffer<float> d_q(q.size()), d_k(k.size()), d_v(v.size()), d_norm(norm.size());
-  DeviceBuffer<float> d_k_cache(k.size()), d_v_cache(v.size()), d_output(expected.size());
+  DeviceBuffer<float> d_k_cache(tokens * k.size()), d_v_cache(tokens * v.size()),
+      d_output(expected.size()), d_paged_output(expected.size());
   d_q.upload(q); d_k.upload(k); d_v.upload(v); d_norm.upload(norm);
   status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
       d_q.get(), d_k.get(), d_v.get(), d_norm.get(), d_norm.get(),
@@ -198,7 +200,43 @@ double check_full_attention() {
       d_q.get(), d_k_cache.get(), d_v_cache.get(), d_output.get(), 1,
       query_heads, kv_heads, dim, nullptr));
   cuda_check(cudaDeviceSynchronize(), "attention synchronize");
-  return maximum_error(d_output.download(), expected);
+  const auto one_token_error = maximum_error(d_output.download(), expected);
+
+  const auto page_elements = static_cast<std::size_t>(page_tokens) * kv_heads * dim;
+  DeviceBuffer<std::uint16_t> d_page0(2U * page_elements),
+      d_page1(2U * page_elements);
+  DeviceBuffer<void*> d_page_table(2);
+  d_page_table.upload({d_page0.get(), d_page1.get()});
+  for (std::uint32_t position = 0; position < tokens; ++position) {
+    d_q.upload(q); d_k.upload(k); d_v.upload(v);
+    status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
+        d_q.get(), d_k.get(), d_v.get(), d_norm.get(), d_norm.get(),
+        d_k_cache.get(), d_v_cache.get(), position, query_heads, kv_heads, dim,
+        64, 1.0e-6F, 10000000.0F, nullptr));
+    d_q.upload(q); d_k.upload(k); d_v.upload(v);
+    status_check(
+        expert::runtime::cuda::qwen3_next_qkv_rope_cache_paged_fp16(
+            d_q.get(), d_k.get(), d_v.get(), d_norm.get(), d_norm.get(),
+            position < page_tokens ? static_cast<void*>(d_page0.get())
+                                   : static_cast<void*>(d_page1.get()),
+            0, page_tokens, position, query_heads, kv_heads, dim, 64,
+            1.0e-6F, 10000000.0F, nullptr));
+  }
+  status_check(expert::runtime::cuda::qwen3_next_attention_decode_paged_fp16(
+      d_q.get(), reinterpret_cast<const void* const*>(d_page_table.get()),
+      d_paged_output.get(), tokens, 0, page_tokens, query_heads, kv_heads, dim,
+      nullptr));
+  d_q.upload(q); d_k.upload(k); d_v.upload(v);
+  status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
+      d_q.get(), d_k.get(), d_v.get(), d_norm.get(), d_norm.get(),
+      d_k_cache.get(), d_v_cache.get(), tokens - 1U, query_heads, kv_heads, dim,
+      64, 1.0e-6F, 10000000.0F, nullptr));
+  status_check(expert::runtime::cuda::qwen3_next_attention_decode(
+      d_q.get(), d_k_cache.get(), d_v_cache.get(), d_output.get(), tokens,
+      query_heads, kv_heads, dim, nullptr));
+  cuda_check(cudaDeviceSynchronize(), "paged attention synchronize");
+  return std::max(one_token_error,
+                  maximum_error(d_paged_output.download(), d_output.download()));
 }
 
 double check_delta() {
@@ -304,7 +342,7 @@ int main() {
     const auto attention = check_full_attention();
     const auto delta = check_delta();
     const bool valid = rms < 2.0e-6 && batched_gemv < 2.0e-6 &&
-                       batched_router < 2.0e-6 && attention < 2.0e-6 &&
+                       batched_router < 2.0e-6 && attention < 2.0e-4 &&
                        delta < 2.0e-5;
     std::cout << "{\"valid\":" << (valid ? "true" : "false")
               << ",\"qwen_rms_max_abs\":" << rms

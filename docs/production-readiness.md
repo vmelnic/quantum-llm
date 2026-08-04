@@ -15,7 +15,7 @@ general multi-tenant or internet-facing production service.
 | bounded memory and queues | ready for pilot | explicit RAM/VRAM/staging/KV budgets and bounded admission |
 | API client compatibility | ready for text/greedy subset | verified with OpenAI SDK; unsupported capabilities fail explicitly |
 | cancellation and drain | ready for pilot | client FIN/RST cancellation and full descendant-tree stop |
-| context window | limited | 4096 certified; model's 262K architecture limit is not operational |
+| context window | limited | paged FP16 KV/credits implemented; 4096 certified; efficient long prefill missing |
 | cold latency | not ready | cold service p95 remains far below the hot throughput target |
 | authentication | partial | one shared bearer key; no identity, tenant, or rotation service |
 | TLS / edge security | missing | requires external reverse proxy and firewall |
@@ -28,17 +28,15 @@ general multi-tenant or internet-facing production service.
 
 ## P0 blockers for broader production
 
-### Long-context memory and prefill
+### Long-context prefill and qualification
 
-The runtime preallocates FP32 KV for every slot:
+Completed: paged on-demand FP16 KV, per-request page credits, bounded reuse,
+worker protocol v3, page observability, and constant-shared-memory online
+decode attention.
 
-```text
-48 KiB × maximum_context × worker_capacity
-```
-
-Required work: paged on-demand KV, FP16/BF16 storage, per-request context
-credits, chunked prefill, efficient long-attention kernels, and correctness /
-memory gates at 8K, 16K, 32K, and 64K. Do not claim 262K before it passes.
+Required work: chunked prefill, FlashAttention-class kernels, mixed-length
+batch scheduling, RoPE/numerical validation, and correctness/memory/SLO gates
+at 8K, 16K, 32K, and 64K. Do not claim 262K before it passes.
 
 ### Cold-path latency
 
