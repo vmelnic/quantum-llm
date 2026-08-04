@@ -20,8 +20,21 @@ if (Test-Path $artifact) {
 # preserve an item containing spaces. Reject those here because Hugging Face
 # repository ids cannot contain whitespace, then pass one deterministic string.
 if ($ModelId -match "\s") { throw "ModelId cannot contain whitespace: $ModelId" }
+$escapedModel = [WildcardPattern]::Escape($ModelId)
+$existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+    Where-Object {
+        $_.Name -in @("python.exe", "hf.exe") -and
+        $_.CommandLine -like "*download*$escapedModel*"
+    } | Select-Object -First 1
+if ($null -ne $existing) {
+    throw "P6 download is already running as PID $($existing.ProcessId)"
+}
 $arguments = "download $ModelId --max-workers $MaxWorkers"
-$process = Start-Process -FilePath $hf -ArgumentList $arguments `
+# Keep a cmd.exe parent alive around the Python launcher. Directly starting the
+# hf.exe console shim can exit before its Python/Xet descendants are observable
+# when this script itself is invoked through non-interactive SSH.
+$cmdArguments = "/d /c $hf $arguments"
+$process = Start-Process -FilePath $env:ComSpec -ArgumentList $cmdArguments `
     -RedirectStandardOutput $stdout -RedirectStandardError $stderr `
     -PassThru -WindowStyle Hidden
 Start-Sleep -Milliseconds 500
