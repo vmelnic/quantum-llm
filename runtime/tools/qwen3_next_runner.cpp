@@ -143,10 +143,14 @@ struct PhaseTelemetry final {
   std::uint64_t expert_cache_wait_ns{};
   std::uint64_t expert_compute_ns{};
   std::uint64_t cpu_expert_ns{};
+  std::uint64_t gpu_expert_ns{};
+  std::uint64_t cpu_gpu_overlap_ns{};
   std::uint64_t cpu_expert_groups{};
   std::uint64_t cpu_expert_selections{};
+  std::uint64_t gpu_expert_selections{};
   std::uint64_t adaptive_promotions{};
   std::uint64_t cpu_result_h2d_bytes{};
+  std::uint64_t cpu_result_map_h2d_bytes{};
   std::uint64_t final_head_ns{};
 };
 
@@ -169,10 +173,14 @@ PhaseTelemetry phase_delta(const PhaseTelemetry& value,
       value.expert_cache_wait_ns - baseline.expert_cache_wait_ns,
       value.expert_compute_ns - baseline.expert_compute_ns,
       value.cpu_expert_ns - baseline.cpu_expert_ns,
+      value.gpu_expert_ns - baseline.gpu_expert_ns,
+      value.cpu_gpu_overlap_ns - baseline.cpu_gpu_overlap_ns,
       value.cpu_expert_groups - baseline.cpu_expert_groups,
       value.cpu_expert_selections - baseline.cpu_expert_selections,
+      value.gpu_expert_selections - baseline.gpu_expert_selections,
       value.adaptive_promotions - baseline.adaptive_promotions,
       value.cpu_result_h2d_bytes - baseline.cpu_result_h2d_bytes,
+      value.cpu_result_map_h2d_bytes - baseline.cpu_result_map_h2d_bytes,
       value.final_head_ns - baseline.final_head_ns,
   };
 }
@@ -184,6 +192,23 @@ void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
                                 ? phase.forward_wall_ns - classified
                                 : 0ULL;
   constexpr double ns_per_second = 1'000'000'000.0;
+  const auto cpu_ns_per_selection =
+      phase.cpu_expert_selections
+          ? static_cast<double>(phase.cpu_expert_ns) /
+                static_cast<double>(phase.cpu_expert_selections)
+          : 0.0;
+  const auto gpu_ns_per_selection =
+      phase.gpu_expert_selections
+          ? static_cast<double>(phase.gpu_expert_ns) /
+                static_cast<double>(phase.gpu_expert_selections)
+          : 0.0;
+  const auto overlap_denominator =
+      std::min(phase.cpu_expert_ns, phase.gpu_expert_ns);
+  const auto overlap_ratio =
+      overlap_denominator
+          ? static_cast<double>(phase.cpu_gpu_overlap_ns) /
+                static_cast<double>(overlap_denominator)
+          : 0.0;
   output << ",\"forward_calls\":" << phase.forward_calls
          << ",\"forward_wall_seconds\":"
          << phase.forward_wall_ns / ns_per_second
@@ -202,10 +227,22 @@ void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
          << phase.expert_compute_ns / ns_per_second
          << ",\"cpu_expert_seconds\":"
          << phase.cpu_expert_ns / ns_per_second
+         << ",\"gpu_expert_seconds\":"
+         << phase.gpu_expert_ns / ns_per_second
+         << ",\"cpu_gpu_overlap_seconds\":"
+         << phase.cpu_gpu_overlap_ns / ns_per_second
          << ",\"cpu_expert_groups\":" << phase.cpu_expert_groups
          << ",\"cpu_expert_selections\":" << phase.cpu_expert_selections
+         << ",\"gpu_expert_selections\":" << phase.gpu_expert_selections
+         << ",\"cpu_expert_ns_per_selection\":"
+         << cpu_ns_per_selection
+         << ",\"gpu_expert_ns_per_selection\":"
+         << gpu_ns_per_selection
+         << ",\"cpu_gpu_overlap_ratio\":" << overlap_ratio
          << ",\"adaptive_promotions\":" << phase.adaptive_promotions
          << ",\"cpu_result_h2d_bytes\":" << phase.cpu_result_h2d_bytes
+         << ",\"cpu_result_map_h2d_bytes\":"
+         << phase.cpu_result_map_h2d_bytes
          << ",\"final_head_seconds\":"
          << phase.final_head_ns / ns_per_second
          << ",\"unattributed_seconds\":"
@@ -332,6 +369,14 @@ class Qwen3NextModel final {
                "create attention-done event");
     cuda_check(cudaEventCreate(&shared_done_event_), "create shared-done event");
     cuda_check(cudaEventCreate(&router_done_event_), "create router-done event");
+    expert_start_events_.resize(layers_);
+    expert_done_events_.resize(layers_);
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      cuda_check(cudaEventCreate(&expert_start_events_[layer]),
+                 "create expert-start event");
+      cuda_check(cudaEventCreate(&expert_done_events_[layer]),
+                 "create expert-done event");
+    }
   }
 
   std::uint32_t forward(std::uint32_t token, std::uint32_t position) {
@@ -346,6 +391,9 @@ class Qwen3NextModel final {
       std::span<const std::uint32_t> state_slots = {},
       bool causal_same_slot = false) {
     const auto forward_started = std::chrono::steady_clock::now();
+    const auto cpu_expert_before = phase_.cpu_expert_ns;
+    const auto gpu_expert_before = phase_.gpu_expert_ns;
+    const auto expert_compute_before = phase_.expert_compute_ns;
     if (tokens.empty() || tokens.size() != positions.size() ||
         tokens.size() > capacity_ ||
         (!state_slots.empty() && state_slots.size() != tokens.size()))
@@ -429,6 +477,23 @@ class Qwen3NextModel final {
                           result.size() * sizeof(result[0]),
                           cudaMemcpyDeviceToHost),
                "copy generated tokens");
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      float milliseconds = 0.0F;
+      cuda_check(cudaEventElapsedTime(&milliseconds,
+                                      expert_start_events_[layer],
+                                      expert_done_events_[layer]),
+                 "measure GPU expert lane");
+      phase_.gpu_expert_ns +=
+          static_cast<std::uint64_t>(milliseconds * 1'000'000.0F);
+    }
+    const auto cpu_expert_delta = phase_.cpu_expert_ns - cpu_expert_before;
+    const auto gpu_expert_delta = phase_.gpu_expert_ns - gpu_expert_before;
+    const auto expert_compute_delta =
+        phase_.expert_compute_ns - expert_compute_before;
+    if (cpu_expert_delta + gpu_expert_delta > expert_compute_delta) {
+      phase_.cpu_gpu_overlap_ns +=
+          cpu_expert_delta + gpu_expert_delta - expert_compute_delta;
+    }
     phase_.final_head_ns += elapsed_ns(final_head_started);
     ++phase_.forward_calls;
     phase_.forward_wall_ns += elapsed_ns(forward_started);
@@ -1013,12 +1078,17 @@ class Qwen3NextModel final {
     phase_.dense_router_ns += attention_ns + shared_ns + router_ns;
     phase_.expert_cache_wait_ns += elapsed_ns(cache_started);
     const auto expert_started = std::chrono::steady_clock::now();
+    cuda_check(cudaEventRecord(expert_start_events_[layer]),
+               "record expert lane start");
     if (!split_execution) {
         status_check(expert::runtime::cuda::launch_moe_batch({
             normalized_, nullptr, nullptr, nullptr, nullptr, routing_scores_,
             routing_indices_, moe_intermediate_, moe_output_, rows, hidden_,
             expert_width_, top_k_, experts_, nullptr,
             directory_->device_entries(), layer}));
+        phase_.gpu_expert_selections += selection_count;
+        cuda_check(cudaEventRecord(expert_done_events_[layer]),
+                   "record expert lane done");
       } else {
         if (route_pinned) {
           status_check(expert::runtime::cuda::launch_moe_selection_batch({
@@ -1028,6 +1098,10 @@ class Qwen3NextModel final {
               rows, hidden_, expert_width_, top_k_, experts_, nullptr,
               directory_->device_entries(), layer}));
         }
+        phase_.gpu_expert_selections +=
+            selection_count - compact_cpu_selection_count;
+        cuda_check(cudaEventRecord(expert_done_events_[layer]),
+                   "record expert lane done");
         if (!cpu_groups.empty()) {
           const auto cpu_started = std::chrono::steady_clock::now();
           status_check(cpu_executor_->execute(
@@ -1056,6 +1130,9 @@ class Qwen3NextModel final {
                                      cudaMemcpyHostToDevice, nullptr),
                      "copy CPU expert outputs");
           phase_.cpu_result_h2d_bytes += output_bytes;
+          phase_.cpu_result_map_h2d_bytes +=
+              static_cast<std::uint64_t>(selection_count) *
+              (sizeof(std::uint8_t) + sizeof(std::uint32_t));
         }
         status_check(expert::runtime::cuda::launch_moe_aggregate({
             moe_selection_output_,
@@ -1134,6 +1211,7 @@ class Qwen3NextModel final {
   std::vector<void*> free_kv_pages_;
   std::vector<std::uint32_t> slot_context_limits_;
   std::vector<float*> conv_state_, recurrent_state_;
+  std::vector<cudaEvent_t> expert_start_events_, expert_done_events_;
   cudaEvent_t layer_start_event_{}, attention_done_event_{},
       shared_done_event_{}, router_done_event_{};
 };

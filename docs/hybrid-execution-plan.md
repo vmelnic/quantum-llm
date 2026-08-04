@@ -68,6 +68,38 @@ Measured result on the qualified mixed batch:
 
 ## Stage 2 — critical-path telemetry and dynamic scheduling
 
+### Stage 2a — measured CPU/GPU expert lanes — completed
+
+The runner records CUDA events around the resident GPU expert lane for every
+layer and combines them with the existing host-timed CPU lane and full expert
+phase. Telemetry now publishes CPU/GPU selections, nanoseconds per selection,
+compact result/map H2D bytes, and observed overlap. `cpu_gpu_overlap_seconds`
+is a conservative lower bound:
+
+```text
+max(0, CPU expert time + GPU expert time - whole expert-phase wall time)
+```
+
+The whole expert phase also contains compact result transfer and stable
+aggregation, so the overlap value intentionally does not attribute that
+overhead to either compute lane.
+
+On the qualified mixed batch, instrumentation measured:
+
+- 9,523 CPU selections at 112,652 ns/selection;
+- 58,157 GPU selections at 6,953.87 ns/selection;
+- 1.07279 s CPU lane, 0.404417 s GPU lane, and at least 0.136184 s overlap;
+- 78,012,416 result bytes plus 320,950 mapping bytes transferred CPU→GPU;
+- 42.5398 tok/s aggregate, exact interleaved/chunked outputs, zero SSD misses,
+  and zero pagefile use.
+
+This evidence shows that a CPU selection is roughly 16.2 times as expensive as
+a resident GPU selection on this workload. It does not imply that every
+RAM-resident expert should be uploaded: upload, eviction, queue debt, expert
+record size, and reuse horizon still decide whether a miss amortizes.
+
+### Stage 2b — dynamic lane scheduler — next
+
 Measure per layer and execution epoch:
 
 - CPU queue and compute time;

@@ -77,6 +77,11 @@ Adaptive placement observes reuse and measured execution cost. Placement is
 frozen at a safe request/warmup boundary for deterministic latency measurement;
 the frozen hot path performs no expert-weight H2D.
 
+The runner measures resident GPU expert work with per-layer CUDA events and
+CPU expert work with the host steady clock. It publishes selection-normalized
+lane costs and a conservative overlap lower bound. These measurements form the
+cost basis for dynamic placement; they do not prescribe a fixed CPU share.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

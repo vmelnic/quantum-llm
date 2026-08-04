@@ -46,6 +46,31 @@ The compact byte count is exactly `9,521 × 2,048 × 4`; no unused top-k slots
 are transferred. Despite minor route/cache-count variation between runs, H2D
 fell 85.05%, output equality remained exact, and pagefile growth remained zero.
 
+### CPU/GPU expert-lane telemetry
+
+A subsequent run added one CUDA event pair per layer around resident expert
+execution. Throughput was 42.5398 tok/s, a 0.14% difference from the compact
+path's 42.5976 tok/s. This is within run variation and leaves the 30 tok/s gate
+with substantial headroom.
+
+| Measurement | Result |
+|---|---:|
+| CPU expert selections | 9,523 |
+| resident GPU expert selections | 58,157 |
+| CPU expert time | 1.07279 s |
+| resident GPU expert time | 0.404417 s |
+| CPU time per selection | 112,652 ns |
+| GPU time per selection | 6,953.87 ns |
+| observed CPU/GPU overlap | at least 0.136184 s (33.67% of the shorter lane) |
+| compact result H2D | 78,012,416 B |
+| compact map H2D | 320,950 B |
+
+GPU time is measured by CUDA events; CPU time and the enclosing expert phase
+use a steady host clock. The overlap is therefore reported as a conservative
+lower bound, not a full CUDA timeline. Transfer and aggregation remain in the
+enclosing phase. These measurements are inputs to the dynamic scheduler, not a
+fixed CPU/GPU split policy.
+
 This gate uses paged FP16 KV and online-softmax attention. One 6 MiB page was
 physically sufficient for each short gate request. The batch run retained exact
 batched-versus-isolated token equality, used no pagefile growth, and kept at

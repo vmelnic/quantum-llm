@@ -178,6 +178,14 @@ bytes, cache high-water marks, executor time, batch rows, TTFT and inter-token
 latency. Metrics windows are bounded. A benchmark must identify cold/warm/frozen
 placement and cannot infer hot-path throughput from configuration alone.
 
+Expert-lane telemetry distinguishes CPU and resident-GPU selections and time,
+reports nanoseconds per selection, and accounts separately for compact CPU
+results and selection-map H2D bytes. GPU time uses CUDA events. Observed
+CPU/GPU overlap is the positive difference between the sum of both lane times
+and the enclosing expert-phase wall time; because transfer and aggregation are
+inside that enclosing phase, this is a lower bound rather than a complete
+critical-path trace.
+
 Chunked prefill shares the normal transformer microbatch implementation. The
 full-model gate requires its generated sequence to equal scalar prefill plus
 decode exactly. The implementation does not claim FlashAttention or an
