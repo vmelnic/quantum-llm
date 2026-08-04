@@ -116,6 +116,15 @@ ieșire în `artifacts/p6-download-exit.json`; faptul că procesul s-a oprit nu
 este confundat cu un checkpoint complet. Relansarea este resumabilă și
 duplicatele active sunt refuzate.
 
+Cleanup-ul opțional al cache-urilor de laborator păstrează strict OLMoE și
+checkpoint-ul P6 și scrie lista/dimensiunea fiecărei ținte în artifact:
+
+```powershell
+Remove-HuggingFaceCacheExceptP6.ps1 -ConfirmDeletion
+```
+
+Operația nu folosește Recycle Bin; cache-urile eliminate necesită redownload.
+
 La 41/41, preflight-ul reconstruiește exact ordinea compilerului din
 `weight_map`: dense pack, apoi experți `(layer, expert)` și reclamare numai după
 ultimul tensor necesar din fiecare shard. Artefactul include fiecare eveniment
