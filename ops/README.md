@@ -89,6 +89,7 @@ rezumabil și statusul lui se lansează astfel:
 ```powershell
 Start-P6ModelDownload.ps1 -MaxWorkers 4
 Get-P6ModelDownload.ps1
+Invoke-P6Preflight.ps1
 ```
 
 Compilerul folosește `-Adapter qwen3_next`. Modelul include un decoder auxiliar
@@ -96,6 +97,11 @@ MTP; adaptorul îl clasifică și îl păstrează explicit. Nu se șterge și nu
 niciun checkpoint existent. Înaintea conversiei trebuie asigurat spațiu pentru
 checkpoint plus container; pe instalația curentă există numai C:, deci fluxul
 de conversie nu pornește dacă preflight-ul nu confirmă capacitatea.
+Opțiunea `Invoke-ExpertPack.ps1 -ReclaimSourceShards` este distructivă și nu
+este activată implicit: după ce un pack și starea sa au fost fsync-uite, ea
+jurnalizează și elimină numai shard-urile sursă care nu mai au niciun tensor de
+consumat. Astfel conversia poate continua cu headroom limitat; checkpoint-ul
+sursă trebuie redescărcat ulterior dacă este necesar din nou.
 
 ## Fluxul de lucru
 

@@ -21,7 +21,9 @@ __device__ float block_sum(float value) {
     }
     __syncthreads();
   }
-  return sums[0];
+  const float result = sums[0];
+  __syncthreads();
+  return result;
 }
 
 __global__ void gate_up_silu(

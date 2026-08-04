@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstring>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -47,6 +48,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     CacheState state{CacheState::absent};
     std::map<std::uint64_t, std::shared_ptr<Waiter>> waiters;
     std::shared_ptr<FixedBufferPool::Lease> host;
+    std::shared_ptr<std::vector<std::byte>> host_copy;
     std::shared_ptr<IDeviceAllocation> device;
     std::uint64_t ram_reserved{};
     std::uint64_t vram_reserved{};
@@ -98,9 +100,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   }
 
   void release_host_locked(Entry& entry) noexcept {
-    if (entry.host) {
-      entry.host.reset();
-    }
+    entry.host.reset();
+    entry.host_copy.reset();
     if (entry.ram_reserved != 0) {
       ram_bytes -= entry.ram_reserved;
       entry.ram_reserved = 0;
@@ -162,7 +163,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           entry->state == CacheState::failed) {
         continue;
       }
-      const bool useful = (need_ram && entry->host) ||
+      const bool useful = (need_ram && (entry->host || entry->host_copy)) ||
                           (need_vram && entry->device);
       if (!useful) {
         continue;
@@ -176,17 +177,20 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       return false;
     }
 
-    if (need_ram && candidate->host) {
+    if (need_ram && (candidate->host || candidate->host_copy)) {
       release_host_locked(*candidate);
     }
     if (need_vram && candidate->device) {
       release_device_locked(*candidate);
       if (candidate->state == CacheState::vram_ready) {
-        transition_locked(*candidate, candidate->host ? CacheState::ram_ready
-                                                      : CacheState::absent);
+        transition_locked(*candidate,
+                          (candidate->host || candidate->host_copy)
+                              ? CacheState::ram_ready
+                              : CacheState::absent);
       }
     }
-    if (candidate->state == CacheState::ram_ready && !candidate->host) {
+    if (candidate->state == CacheState::ram_ready && !candidate->host &&
+        !candidate->host_copy) {
       transition_locked(*candidate, CacheState::absent);
     }
     Telemetry::add(metrics.eviction_count_);
@@ -231,7 +235,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (entry->waiters.empty() || entry->abandon) {
         continue;
       }
-      if (entry->state == CacheState::ram_ready && entry->host) {
+      if (entry->state == CacheState::ram_ready &&
+          (entry->host || entry->host_copy)) {
         transition_locked(*entry, CacheState::gpu_uploading);
         Telemetry::add(metrics.upload_started_);
         return {TaskKind::upload, entry};
@@ -314,9 +319,23 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   }
 
   void start_upload(const std::shared_ptr<Entry>& entry) {
-    const auto buffer = entry->host->buffer();
-    const auto bytes = std::span<const std::byte>(
-        buffer.data, static_cast<std::size_t>(entry->record.stored_bytes));
+    const auto count = static_cast<std::size_t>(entry->record.stored_bytes);
+    std::span<const std::byte> bytes;
+    if (entry->host) {
+      const auto buffer = entry->host->buffer();
+      bytes = std::span<const std::byte>(buffer.data, count);
+    } else if (entry->host_copy) {
+      bytes = std::span<const std::byte>(entry->host_copy->data(), count);
+    } else {
+      {
+        std::lock_guard lock(mutex);
+        fail_entry_locked(*entry,
+                          Status(ErrorCode::internal,
+                                 "RAM-ready expert has no host bytes"));
+      }
+      drive();
+      return;
+    }
     const auto validated = validate_expert_record(bytes, entry->key, entry->record);
     if (!validated.status.ok()) {
       {
@@ -326,6 +345,22 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       }
       drive();
       return;
+    }
+
+    if (config.retain_host_copy && !entry->host_copy) {
+      try {
+        entry->host_copy = std::make_shared<std::vector<std::byte>>(count);
+        std::memcpy(entry->host_copy->data(), bytes.data(), count);
+      } catch (const std::bad_alloc&) {
+        {
+          std::lock_guard lock(mutex);
+          fail_entry_locked(*entry,
+                            Status(ErrorCode::backpressure,
+                                   "cannot allocate pageable RAM cache copy"));
+        }
+        drive();
+        return;
+      }
     }
 
     auto weak = weak_from_this();
@@ -426,6 +461,10 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         Telemetry::add(metrics.uploaded_bytes_, result.uploaded_bytes);
         if (!config.retain_host_copy) {
           release_host_locked(entry);
+        } else {
+          // The long-lived RAM tier is pageable. Pinned buffers remain a
+          // bounded staging resource and return to the fixed pool after H2D.
+          entry.host.reset();
         }
         update_usage_locked();
         satisfy_ready_waiters_locked(iterator->second);
@@ -669,7 +708,8 @@ std::optional<CacheEntrySnapshot> ExpertCache::inspect(
   }
   const auto& entry = *iterator->second;
   return CacheEntrySnapshot{entry.state, entry.references, entry.waiters.size(),
-                            entry.host != nullptr, entry.device != nullptr};
+                            entry.host != nullptr || entry.host_copy != nullptr,
+                            entry.device != nullptr};
 }
 
 TelemetrySnapshot ExpertCache::telemetry() const noexcept {

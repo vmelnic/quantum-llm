@@ -23,8 +23,20 @@ struct Int8Matrix final {
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;
+// Qwen3-Next stores zero-centered RMSNorm weights and applies (1 + weight).
+[[nodiscard]] Status qwen3_next_rms_norm(
+    const float* input, const float* weight, float* output,
+    std::uint32_t elements, float epsilon, void* stream) noexcept;
 [[nodiscard]] Status add_in_place(float* destination, const float* source,
                                   std::uint32_t elements, void* stream) noexcept;
+
+[[nodiscard]] Status silu_product(const float* gate, const float* up,
+                                  float* output, std::uint32_t elements,
+                                  void* stream) noexcept;
+[[nodiscard]] Status sigmoid_scale_in_place(float* values,
+                                            const float* gate,
+                                            std::uint32_t elements,
+                                            void* stream) noexcept;
 
 // Normalizes Q/K, applies HF OLMoE rotary embedding, and writes K/V for the
 // current position into persistent caches [context, heads, head_dim].
@@ -43,6 +55,52 @@ struct Int8Matrix final {
     const float* input, const float* router_weights, std::uint32_t hidden,
     std::uint32_t experts, std::uint32_t top_k, float* logits,
     float* topk_scores, std::uint32_t* topk_indices, void* stream) noexcept;
+
+[[nodiscard]] Status router_topk_normalized(
+    const float* input, const float* router_weights, std::uint32_t hidden,
+    std::uint32_t experts, std::uint32_t top_k, float* logits,
+    float* topk_scores, std::uint32_t* topk_indices, void* stream) noexcept;
+
+// Qwen3-Next full attention. q_and_gate is laid out per query head as
+// [query(head_dim), output_gate(head_dim)]. K/V caches retain only KV heads.
+[[nodiscard]] Status qwen3_next_qkv_rope_cache(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, float* key_cache,
+    float* value_cache, std::uint32_t position, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float epsilon, float rope_theta,
+    void* stream) noexcept;
+
+[[nodiscard]] Status qwen3_next_attention_decode(
+    const float* q_and_gate, const float* key_cache,
+    const float* value_cache, float* output, std::uint32_t context_tokens,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* stream) noexcept;
+
+struct Qwen3NextDeltaLaunch final {
+  const float* projected_qkvz{};  // [2*key_dim + 2*value_dim]
+  const float* projected_ba{};    // [2*value_heads]
+  const float* conv_weights{};    // [2*key_dim + value_dim, 1, kernel]
+  const float* dt_bias{};         // [value_heads]
+  const float* a_log{};           // [value_heads]
+  const float* norm_weight{};     // [value_head_dim]
+  float* conv_state{};            // [conv_dim, kernel]
+  float* recurrent_state{};       // [value_heads, key_head_dim, value_head_dim]
+  float* conv_output{};           // [conv_dim] workspace
+  float* output{};                // [value_dim]
+  std::uint32_t key_heads{};
+  std::uint32_t value_heads{};
+  std::uint32_t key_head_dim{};
+  std::uint32_t value_head_dim{};
+  std::uint32_t conv_kernel{};
+  float epsilon{};
+  void* stream{};
+};
+
+// Exact one-token recurrent Gated DeltaNet update, including causal depthwise
+// convolution, q/k L2 normalization, recurrent state and gated RMSNorm.
+[[nodiscard]] Status qwen3_next_delta_decode(
+    const Qwen3NextDeltaLaunch& launch) noexcept;
 
 [[nodiscard]] Status argmax(const float* values, std::uint32_t count,
                             std::uint32_t* output, void* stream) noexcept;

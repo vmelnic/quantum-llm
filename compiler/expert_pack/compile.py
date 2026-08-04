@@ -54,6 +54,7 @@ class CompileOptions:
     source_id: str | None = None
     source_revision: str | None = None
     resume: bool = False
+    reclaim_source_shards: bool = False
 
 
 def _utc_now() -> str:
@@ -81,6 +82,7 @@ def _option_contract(options: CompileOptions, source_files: list[dict[str, objec
         "max_expert_pack_bytes": options.max_expert_pack_bytes,
         "source_id": options.source_id,
         "source_revision": options.source_revision,
+        "reclaim_source_shards": options.reclaim_source_shards,
         "source_files": source_files,
     }
 
@@ -92,7 +94,77 @@ def _new_state(contract_hash: str, source_files: list[dict[str, object]]) -> dic
         "source_files": source_files,
         "dense": [],
         "experts": [],
+        "reclaimed_source_shards": [],
     }
+
+
+def _reclaim_consumed_source_shards(
+    partial: Path,
+    checkpoint: SafeTensorCheckpoint,
+    adapted: AdaptedModel,
+    next_expert: int,
+    state: dict[str, object],
+    source_files: list[dict[str, object]],
+) -> None:
+    """Delete only shards whose last compiled tensor is durably committed.
+
+    This is deliberately opt-in. A journal is fsynced before each unlink, and
+    Hugging Face blob targets are removed only when the snapshot symlink
+    resolves inside the same model cache's ``blobs`` directory.
+    """
+
+    future_shards = {
+        tensor.shard
+        for expert in adapted.experts[next_expert:]
+        for tensor in (expert.gate, expert.up, expert.down)
+    }
+    inventory = {str(item["path"]): item for item in source_files}
+    reclaimed = state.setdefault("reclaimed_source_shards", [])
+    if not isinstance(reclaimed, list):
+        raise ResumeError("invalid reclaimed source shard state")
+    reclaimed_names = {
+        str(item.get("path")) for item in reclaimed if isinstance(item, dict)
+    }
+    journal_path = partial / "source-reclaim-journal.json"
+    for shard in checkpoint.shards:
+        if shard in future_shards:
+            continue
+        path = checkpoint.root / shard
+        if not path.exists() and not path.is_symlink():
+            if shard in reclaimed_names:
+                continue
+            raise ResumeError(f"consumed source shard disappeared without journal: {shard}")
+        target: Path | None = None
+        if path.is_symlink():
+            target = path.resolve(strict=True)
+            if checkpoint.root.parent.name != "snapshots":
+                raise ValueError("refusing to reclaim a symlink outside a Hugging Face snapshot")
+            blobs = checkpoint.root.parent.parent / "blobs"
+            if target.parent != blobs:
+                raise ValueError(f"refusing to unlink source target outside cache blobs: {target}")
+        item = inventory.get(shard)
+        if item is None:
+            raise ResumeError(f"source inventory has no shard {shard}")
+        entry = {
+            "path": shard,
+            "bytes": item["bytes"],
+            "sha256": item["sha256"],
+            "experts_committed": next_expert,
+            "restore": "huggingface download of the same pinned revision",
+        }
+        if shard not in reclaimed_names:
+            journal = [*reclaimed, entry]
+            atomic_json(journal_path, {"schema": "expert-pack-source-reclaim-v1",
+                                       "shards": journal})
+            fsync_directory(partial)
+        path.unlink()
+        if target is not None and target.exists():
+            target.unlink()
+        if shard not in reclaimed_names:
+            reclaimed.append(entry)
+            reclaimed_names.add(shard)
+            atomic_json(partial / "compile-state.json", state)
+            fsync_directory(partial)
 
 
 def _discard_uncommitted_files(partial: Path, state: dict[str, object]) -> None:
@@ -426,6 +498,10 @@ def compile_checkpoint(
 
     expert_entries = state["experts"]
     next_expert = len(expert_entries)
+    if options.reclaim_source_shards:
+        _reclaim_consumed_source_shards(
+            partial, checkpoint, adapted, next_expert, state, source_files
+        )
     pack_index = len({entry["pack"] for entry in expert_entries})
     hidden = int(adapted.architecture["hidden_size"])
     intermediate = int(adapted.architecture["intermediate_size"])
@@ -455,6 +531,10 @@ def compile_checkpoint(
         expert_entries.extend(pack_entries)
         state["experts"] = expert_entries
         atomic_json(state_path, state)
+        if options.reclaim_source_shards:
+            _reclaim_consumed_source_shards(
+                partial, checkpoint, adapted, next_expert, state, source_files
+            )
         pack_index += 1
         if _record_hook:
             _record_hook("expert-pack", len(expert_entries))
@@ -483,6 +563,8 @@ def compile_checkpoint(
         "alignment": options.alignment,
         "max_expert_pack_bytes": options.max_expert_pack_bytes,
         "resumed": options.resume,
+        "reclaim_source_shards": options.reclaim_source_shards,
+        "reclaimed_source_shards": state.get("reclaimed_source_shards", []),
         "source_checkpoint_sha256": manifest["source"]["checkpoint_sha256"],
         "manifest_content_sha256": manifest["integrity"]["content_sha256"],
         "source_tensor_count": adapted.source_tensor_count,

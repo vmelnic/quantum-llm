@@ -89,6 +89,9 @@ fairness prin vârstă/deadline. Un request rece nu ține blocată coada ready.
   alinierea efectivă a volumului și `manifest.alignment.direct_io_bytes`;
 - IOCP unic/pool controlat, nu thread blocant per expert;
 - buffers page-locked dintr-un pool fix, cu owner și generation explicite;
+- după H2D, copia RAM de durată este mutată într-un buffer pageable bugetat,
+  iar slotul pinned revine imediat în pool; cache-ul RAM nu poate epuiza
+  staging-ul fix prin simpla retenție a experților;
 - un read direct acoperă `stored_bytes`, inclusiv padding determinist;
 - coalescing numai pentru recorduri vecine compatibile, iar requested/useful/
   read/overfetch bytes se contorizează separat;
@@ -130,6 +133,12 @@ launch. Pointerii weight trebuie să provină dintr-un slot `VRAM_READY` rezerva
 Gate și up sunt un singur grouped dispatch logic; activarea de input nu se
 recuantizează separat pentru cele două proiecții. SiLU/produsul rămân device-
 local, apoi down și acumularea ponderată rulează fără round-trip CPU.
+
+Backend-ul Qwen3-Next adaugă două token mixers exacte: GQA full-attention cu
+partial RoPE și output gate, respectiv Gated DeltaNet cu stare Conv1D și stare
+recurentă persistentă. Normele dense folosesc `(1 + weight)`; norma gated din
+DeltaNet folosește `weight` direct, conform checkpoint-ului. Routerul face
+softmax global, top-k și renormalizare pe selecția top-k înainte de dispatch.
 
 Streams logice:
 

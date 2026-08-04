@@ -348,12 +348,27 @@ experts-000.qpack -> Windows IOCP -> pinned pool -> SHA-256/header validation
 
 Pentru 8 experți OLMoE reali a raportat 50.495.488 bytes citiți,
 50.462.720 bytes urcați, 8 load-uri și rezultat identic numeric cu referința
-CPU (`cosine=1`, `max_abs=1.16415e-09`). Kernelul MoE a măsurat 0,199639
-ms/strat în acest caz.
+CPU (`cosine=1`, `max_abs=1.16415e-09`). Numai două sloturi pinned, în total
+12.623.872 bytes high-water, au alimentat 50.495.488 bytes de cache RAM
+pageable; aceasta validează reciclarea staging-ului. Kernelul MoE a măsurat
+0,202168 ms/strat în această rulare.
 
-Download-ul Qwen3-Next rulează prin Hugging Face Xet. C: este singurul volum și
-avea aproximativ 202 GB liberi la începutul verificării; checkpoint-ul sursă de
-aproximativ 163 GB plus containerul estimat la peste 80 GB nu încap simultan.
-Conversia reală rămâne blocată de preflight-ul de spațiu până când fluxul poate
-elibera controlat shard-uri deja consumate sau este disponibilă capacitate
-suplimentară. Nu se șterg automat modelele existente.
+Kernelurile Qwen3-Next au fost validate separat pe RTX 3090 contra calculelor
+CPU pentru geometria reală: eroare maximă `2,38419e-7` la RMSNorm,
+`7,45058e-9` la full attention GQA/output gate și `1,16415e-9` la Gated
+DeltaNet recurent. Runnerul complet este construit: dense resident pe GPU,
+router exact, shared expert, acquire numai pentru top-10, lease până la
+completion și stări attention/delta persistente.
+
+Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
+containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
+68.641.103.872 bytes RAM fizici. C: este singurul volum, deci sursa de
+162.649.725.440 bytes și containerul nu încap simultan fără reclamare.
+Preflight-ul confirmă că download-ul și conversia cu reclamare sunt fezabile,
+dar conversia fără reclamare nu este.
+
+Compilerul are acum un mod distructiv explicit, oprit implicit: după fsync-ul
+fiecărui pack și al stării, jurnalizează hash-ul shard-ului consumat și elimină
+numai shard-uri fără tensori viitori. Modul trece testul end-to-end, dar nu va
+fi activat pe cache-ul real fără switch-ul operatorului; modelele existente nu
+sunt șterse automat.

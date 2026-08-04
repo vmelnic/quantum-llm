@@ -9,7 +9,8 @@ param(
     [string]$SourceRevision = "local",
     [string]$Adapter = "olmoe",
     [int64]$MaxExpertPackBytes = 4GB,
-    [switch]$Resume
+    [switch]$Resume,
+    [switch]$ReclaimSourceShards
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -35,6 +36,7 @@ try {
             "--max-expert-pack-bytes", [string]$MaxExpertPackBytes
         )
         if ($Resume) { $arguments += "--resume" }
+        if ($ReclaimSourceShards) { $arguments += "--reclaim-source-shards" }
     }
     else {
         $arguments = @("-m", "compiler", "validate", $resolvedPath)

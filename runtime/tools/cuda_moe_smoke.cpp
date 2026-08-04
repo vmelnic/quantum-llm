@@ -181,11 +181,11 @@ int main(int argc, char** argv) {
     auto storage = std::make_shared<expert::runtime::WindowsIocpStorage>(2);
     auto uploader = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
     auto buffers = std::make_shared<expert::runtime::FixedBufferPool>(
-        top_k, slot_bytes, expert::runtime::kExpertPackAlignment,
+        2, slot_bytes, expert::runtime::kExpertPackAlignment,
         std::make_shared<expert::runtime::CudaPinnedAllocator>());
     expert::runtime::ExpertCache cache(
         {{tier_bytes, tier_bytes, tier_bytes},
-         {tier_bytes, tier_bytes, tier_bytes}, false},
+         {tier_bytes, tier_bytes, tier_bytes}, true},
         storage, uploader, buffers);
     std::vector<expert::runtime::AcquireHandle> handles;
     handles.reserve(top_k);
@@ -271,6 +271,8 @@ int main(int argc, char** argv) {
               << ",\"cache_read_bytes\":" << cache_metrics.read_bytes
               << ",\"cache_uploaded_bytes\":" << cache_metrics.uploaded_bytes
               << ",\"cache_loads\":" << cache_metrics.load_completed
+              << ",\"cache_ram_high_water\":" << cache_metrics.ram_high_water
+              << ",\"staging_high_water\":" << cache_metrics.staging_high_water
               << ",\"moe_only_16_layer_ceiling_tps\":" << (1000.0F / (16.0F * kernel_ms))
               << "}\n";
     return max_rel < 0.01 && cosine > 0.999999 ? 0 : 2;

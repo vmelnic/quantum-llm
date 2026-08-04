@@ -25,6 +25,10 @@ def _parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--source-id")
     compile_parser.add_argument("--source-revision")
     compile_parser.add_argument("--resume", action="store_true")
+    compile_parser.add_argument(
+        "--reclaim-source-shards", action="store_true",
+        help="DESTRUCTIVE: unlink source shards only after their records are durably committed",
+    )
 
     validate_parser = commands.add_parser("validate", help="independently validate a completed container")
     validate_parser.add_argument("container", type=Path)
@@ -46,6 +50,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     source_id=args.source_id,
                     source_revision=args.source_revision,
                     resume=args.resume,
+                    reclaim_source_shards=args.reclaim_source_shards,
                 )
             )
         else:
@@ -55,4 +60,3 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     print(json.dumps({"ok": True, "result": result}, sort_keys=True, indent=2))
     return 0
-

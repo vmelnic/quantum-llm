@@ -344,6 +344,25 @@ class ExpertPackTests(unittest.TestCase):
             self.assertTrue(result["validation"]["valid"])
             self.assertFalse(partial.exists())
 
+    def test_opt_in_source_reclamation_only_after_committed_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_fixture(source)
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                reclaim_source_shards=True,
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            self.assertFalse(any(source.glob("*.safetensors")))
+            journal = load_json(output / "source-reclaim-journal.json")
+            self.assertEqual(len(journal["shards"]), 2)
+            self.assertEqual(len(result["report"]["reclaimed_source_shards"]), 2)
+
     def test_corruption_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
