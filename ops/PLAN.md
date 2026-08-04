@@ -404,7 +404,7 @@ Starea curentă:
 | P2 storage/cache | completă și validată pe Windows/RTX 3090 |
 | P3 single-request exact | completă pentru OLMoE; implementată pentru Qwen, așteaptă containerul real |
 | P4 batching | completă pentru OLMoE; Qwen are dense/router/MoE batched, așteaptă măsurarea reală |
-| P5 serviciu | completă și operabilă; launcherul Qwen este pregătit |
+| P5 serviciu | completă și operabilă; profilul Task Scheduler și smoke-ul Qwen sunt pregătite |
 | P6 model > RAM | în curs: download, conversie și gate-urile reale rămân deschise |
 
 Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P0–P5 nu

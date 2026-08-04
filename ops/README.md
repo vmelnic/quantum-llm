@@ -56,6 +56,10 @@ Endpoint-uri:
 - coadă limitată, timeout de queue/generation, cancellation la disconnect și
   graceful drain la `SIGINT`/`SIGTERM`.
 
+`/model-info` include build ID, hash-ul de conținut al manifestului, hash-urile
+indicilor dense/expert și configurația efectivă de runtime (sloturi, cache-uri,
+timeouts și microbatch), fără a expune cheia API.
+
 Front-end-ul negociază protocolul workerului. Cu `-WorkerCapacity 1` păstrează
 traseul v1 single-slot. Launcherul P6 folosește implicit patru sloturi și
 microbatch decode de 2 ms; fiecare slot are stare KV/Conv/DeltaNet separată, dar
@@ -143,6 +147,21 @@ readiness:
 ```powershell
 Start-P6ExpertServer.ps1 -BuildId (git rev-parse --short HEAD)
 ```
+
+După ce gate-ul P6 trece, profilul P6 se instalează separat în Task Scheduler;
+task-ul existent OLMoE nu este suprascris:
+
+```powershell
+Install-ExpertServerTask.ps1 -Profile P6 -Start `
+  -BuildId (git rev-parse --short HEAD)
+Get-ScheduledTask QuantumLLM-P6ExpertServer
+Invoke-P6ServiceSmoke.ps1 -ExpectedBuildId (git rev-parse --short HEAD)
+```
+
+Smoke-ul validează identity/build, health/readiness, completări concurente în
+același worker, streaming terminat cu `[DONE]`, deconectarea clientului și
+contoarele bounded de batching/TTFT/p95. Rezultatul este păstrat în
+`artifacts/p6-service-smoke-latest.json`.
 
 Gate-ul aggregate folosește microbatching real în același proces și același
 cache, nu mai multe copii ale modelului:

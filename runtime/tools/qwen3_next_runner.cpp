@@ -127,6 +127,51 @@ struct Tensor final {
   bool quantized{};
 };
 
+struct PhaseTelemetry final {
+  std::uint64_t forward_calls{};
+  std::uint64_t forward_wall_ns{};
+  std::uint64_t dense_router_ns{};
+  std::uint64_t expert_cache_wait_ns{};
+  std::uint64_t expert_compute_ns{};
+};
+
+std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point started) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - started).count());
+}
+
+PhaseTelemetry phase_delta(const PhaseTelemetry& value,
+                           const PhaseTelemetry& baseline) {
+  return {
+      value.forward_calls - baseline.forward_calls,
+      value.forward_wall_ns - baseline.forward_wall_ns,
+      value.dense_router_ns - baseline.dense_router_ns,
+      value.expert_cache_wait_ns - baseline.expert_cache_wait_ns,
+      value.expert_compute_ns - baseline.expert_compute_ns,
+  };
+}
+
+void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
+  const auto classified = phase.dense_router_ns + phase.expert_cache_wait_ns +
+                          phase.expert_compute_ns;
+  const auto unattributed = phase.forward_wall_ns > classified
+                                ? phase.forward_wall_ns - classified
+                                : 0ULL;
+  constexpr double ns_per_second = 1'000'000'000.0;
+  output << ",\"forward_calls\":" << phase.forward_calls
+         << ",\"forward_wall_seconds\":"
+         << phase.forward_wall_ns / ns_per_second
+         << ",\"dense_attention_router_seconds\":"
+         << phase.dense_router_ns / ns_per_second
+         << ",\"expert_cache_wait_seconds\":"
+         << phase.expert_cache_wait_ns / ns_per_second
+         << ",\"expert_compute_seconds\":"
+         << phase.expert_compute_ns / ns_per_second
+         << ",\"unattributed_seconds\":"
+         << unattributed / ns_per_second;
+}
+
 class Qwen3NextModel final {
  public:
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
@@ -223,6 +268,7 @@ class Qwen3NextModel final {
       std::span<const std::uint32_t> tokens,
       std::span<const std::uint32_t> positions,
       std::span<const std::uint32_t> state_slots = {}) {
+    const auto forward_started = std::chrono::steady_clock::now();
     if (tokens.empty() || tokens.size() != positions.size() ||
         tokens.size() > capacity_ ||
         (!state_slots.empty() && state_slots.size() != tokens.size()))
@@ -246,6 +292,7 @@ class Qwen3NextModel final {
           hidden_state_ + static_cast<std::size_t>(row) * hidden_, nullptr));
     }
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      const auto layer_started = std::chrono::steady_clock::now();
       const auto prefix = "model.layers." + std::to_string(layer) + ".";
       for (std::uint32_t row = 0; row < rows; ++row)
         status_check(expert::runtime::cuda::qwen3_next_rms_norm(
@@ -266,7 +313,7 @@ class Qwen3NextModel final {
             fp32(prefix + "post_attention_layernorm.weight"),
             normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
             epsilon_, nullptr));
-      run_moe(prefix, layer, rows);
+      run_moe(prefix, layer, rows, layer_started);
     }
     for (std::uint32_t row = 0; row < rows; ++row)
       status_check(expert::runtime::cuda::qwen3_next_rms_norm(
@@ -285,12 +332,15 @@ class Qwen3NextModel final {
                           result.size() * sizeof(result[0]),
                           cudaMemcpyDeviceToHost),
                "copy generated tokens");
+    ++phase_.forward_calls;
+    phase_.forward_wall_ns += elapsed_ns(forward_started);
     return result;
   }
 
   expert::runtime::TelemetrySnapshot telemetry() const {
     return cache_->telemetry();
   }
+  PhaseTelemetry phase_telemetry() const noexcept { return phase_; }
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
@@ -543,7 +593,8 @@ class Qwen3NextModel final {
   }
 
   void run_moe(const std::string& prefix, std::uint32_t layer,
-               std::uint32_t rows) {
+               std::uint32_t rows,
+               std::chrono::steady_clock::time_point layer_started) {
     status_check(expert::runtime::cuda::gemv_batch(
         matrix(prefix + "mlp.shared_expert.gate_proj.weight"), normalized_,
         shared_gate_, rows, nullptr));
@@ -572,6 +623,8 @@ class Qwen3NextModel final {
                           selected.size() * sizeof(selected[0]),
                           cudaMemcpyDeviceToHost),
                "copy selected expert ids");
+    phase_.dense_router_ns += elapsed_ns(layer_started);
+    const auto cache_started = std::chrono::steady_clock::now();
     std::sort(selected.begin(), selected.end());
     selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
     std::vector<expert::runtime::AcquireHandle> handles;
@@ -602,6 +655,8 @@ class Qwen3NextModel final {
       down[expert] = allocation->down();
       down_scales[expert] = allocation->down_scales();
     }
+    phase_.expert_cache_wait_ns += elapsed_ns(cache_started);
+    const auto expert_started = std::chrono::steady_clock::now();
     const auto pointer_bytes = static_cast<std::size_t>(experts_) * sizeof(void*);
     cuda_check(cudaMemcpy(d_gate_up_, gate.data(), pointer_bytes,
                           cudaMemcpyHostToDevice), "copy gate pointers");
@@ -621,6 +676,7 @@ class Qwen3NextModel final {
         hidden_state_, moe_output_, rows * hidden_, nullptr));
     // Leases protect all expert pointers through completion of the batch.
     cuda_check(cudaDeviceSynchronize(), "complete expert layer batch");
+    phase_.expert_compute_ns += elapsed_ns(expert_started);
   }
 
   std::filesystem::path root_;
@@ -634,6 +690,7 @@ class Qwen3NextModel final {
   std::uint64_t model_id_{0x51334e4558540001ULL};
   std::uint64_t total_pack_bytes_{}, dense_read_bytes_{},
       max_expert_record_bytes_{};
+  PhaseTelemetry phase_;
   DevicePack dense_pack_;
   std::unordered_map<std::string, Tensor> tensors_;
   std::vector<expert::runtime::PayloadRecord> expert_records_;
@@ -876,6 +933,7 @@ int main(int argc, char** argv) {
         }
       }
       const auto baseline_metrics = model.telemetry();
+      const auto baseline_phase = model.phase_telemetry();
       model.reset_request();
       const auto started_prompt = std::chrono::steady_clock::now();
       for (std::uint32_t position = 0; position < prompt.size(); ++position) {
@@ -908,6 +966,7 @@ int main(int argc, char** argv) {
           generated.begin() + 1, generated.end(),
           [&](const auto& sequence) { return sequence == generated.front(); });
       const auto metrics = model.telemetry();
+      const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
       const auto measured_read_bytes =
           metrics.read_bytes - baseline_metrics.read_bytes;
       const auto measured_uploaded_bytes =
@@ -965,7 +1024,9 @@ int main(int argc, char** argv) {
                     baseline_metrics.load_deduplicated)
                 << ",\"ram_high_water\":" << metrics.ram_high_water
                 << ",\"vram_high_water\":" << metrics.vram_high_water
-                << ",\"evictions\":" << metrics.eviction_count << "}\n";
+                << ",\"evictions\":" << metrics.eviction_count;
+      print_phase_json(std::cout, phases);
+      std::cout << "}\n";
       return identical ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
@@ -1011,6 +1072,7 @@ int main(int argc, char** argv) {
             predicted, static_cast<std::uint32_t>(tokens.size()) + step);
     }
     const auto baseline_metrics = model.telemetry();
+    const auto baseline_phase = model.phase_telemetry();
     model.reset_request();
     const auto started_prompt = std::chrono::steady_clock::now();
     for (std::uint32_t position = 0; position < tokens.size(); ++position)
@@ -1033,6 +1095,7 @@ int main(int argc, char** argv) {
     const auto decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_decode).count();
     const auto metrics = model.telemetry();
+    const auto phases = phase_delta(model.phase_telemetry(), baseline_phase);
     const auto measured_read_bytes =
         metrics.read_bytes - baseline_metrics.read_bytes;
     const auto measured_uploaded_bytes =
@@ -1068,6 +1131,7 @@ int main(int argc, char** argv) {
               << percentile_ms(inter_token_ms, 0.95)
               << ",\"container_bytes\":" << model.total_pack_bytes()
               << ",\"startup_dense_read_bytes\":" << model.dense_read_bytes()
+              << ",\"startup_dense_h2d_bytes\":" << model.dense_read_bytes()
               << ",\"expert_read_bytes\":" << measured_read_bytes
               << ",\"expert_h2d_bytes\":" << measured_uploaded_bytes
               << ",\"expert_vram_hits\":" << measured_vram_hits
@@ -1087,7 +1151,9 @@ int main(int argc, char** argv) {
                   baseline_metrics.load_deduplicated)
               << ",\"ram_high_water\":" << metrics.ram_high_water
               << ",\"vram_high_water\":" << metrics.vram_high_water
-              << ",\"evictions\":" << metrics.eviction_count << "}\n";
+              << ",\"evictions\":" << metrics.eviction_count;
+    print_phase_json(std::cout, phases);
+    std::cout << "}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "Qwen3-Next runner: " << error.what() << '\n';

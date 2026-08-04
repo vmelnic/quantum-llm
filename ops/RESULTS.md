@@ -390,6 +390,21 @@ Serviciul oprește acum request-ul la tokenul EOS, anulează pasul deja pregăti
 și raportează `finish_reason=stop` plus numărul real de tokenuri, nu limita
 cerută de client; comportamentul de cleanup este acoperit de testul front-end.
 
+Runnerul Qwen publică acum, pentru intervalul măsurat după warmup, timpul de
+wall al forward-urilor și descompunerea fără sincronizări CUDA artificiale în
+`dense_attention_router_seconds`, `expert_cache_wait_seconds`,
+`expert_compute_seconds` și `unattributed_seconds`. Astfel un gate ratat poate
+fi atribuit numeric înainte de orice optimizare. Citirea și transferul H2D al
+`dense.qpack` sunt publicate separat la startup; byte-ii read/H2D și hit/miss ai
+experților rămân contorizați de cache.
+
+Deploy-ul P6 are profil Task Scheduler separat (`QuantumLLM-P6ExpertServer`) și
+un smoke operațional canonic. Acesta verifică identity/build/hash-urile reale
+din `/model-info`, health/readiness, patru completări concurente, SSE `[DONE]`,
+cancellation prin client disconnect și delta contoarelor de batching/TTFT/p95.
+Instalarea task-ului și smoke-ul real rămân după container și gate; pe 3090box
+nu exista niciun task `QuantumLLM*` la verificarea curentă.
+
 Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
 containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
 68.641.103.872 bytes RAM fizici. C: este singurul volum, deci sursa de
