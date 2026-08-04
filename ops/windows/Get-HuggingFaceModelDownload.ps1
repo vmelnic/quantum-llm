@@ -78,5 +78,5 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     exit_code = if ($null -ne $exit) { $exit.exit_code } else { $null }
     exit_error = if ($null -ne $exit) { $exit.error } else { $null }
     stderr_tail = @(Get-Content ([string]$state.stderr) -Tail 8 `
-        -ErrorAction SilentlyContinue)
+        -ErrorAction SilentlyContinue | ForEach-Object { [string]$_ })
 } | ConvertTo-Json -Depth 4
