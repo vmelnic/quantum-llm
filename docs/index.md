@@ -12,6 +12,7 @@
 | [Production readiness](production-readiness.md) | Readiness matrix, known gaps, and release gates |
 | [Roadmap](roadmap.md) | Long-context, performance, and distributed execution phases |
 | [Hybrid execution plan](hybrid-execution-plan.md) | Staged CPU/GPU scheduler implementation and acceptance gates |
+| [Larger-model decision](larger-model-decision.md) | 3090box storage inventory, modern MoE candidates, compatibility gaps, and approval boundary |
 
 The JSON schemas under `schemas/` and the compiler validator are normative for
 Expert Pack. Documentation never overrides executable validation.

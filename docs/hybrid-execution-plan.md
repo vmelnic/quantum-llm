@@ -306,7 +306,7 @@ fields. `balanced` remains the only qualified SLO profile; the earlier
 one-observation and prefetch-off experiments bound `latency` and `capacity`
 without treating three identical full runs as useful evidence.
 
-## Stage 6 — larger-model decision
+## Stage 6 — larger-model decision — completed
 
 Disk cleanup and model downloads are separate operator decisions. Research
 must report exact reclaimable paths, retained assets, free-space requirements,
@@ -317,6 +317,12 @@ explicit approval.
 The next checkpoint should exercise a real architectural requirement: a larger
 expert directory, greater active mass, a new routing structure, or storage
 sharding. Size alone is not sufficient justification.
+
+The read-only [larger-model decision record](larger-model-decision.md) protects
+the current source and pack, identifies at most 14.50 GiB of conservative
+cleanup, and recommends Qwen3.5-122B-A10B-FP8 only after a representative FP8
+decoder/adapter vertical slice. DeepSeek-V4-Flash is the second target. No
+cleanup or download was performed.
 
 ## Longer-term boundary
 
