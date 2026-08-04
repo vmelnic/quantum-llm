@@ -12,7 +12,7 @@ sys.modules.setdefault(
     "transformers", types.SimpleNamespace(AutoTokenizer=object)
 )
 
-from ops.python.expert_server import ContinuousDecodeBatcher
+from ops.python.expert_server import Application, ContinuousDecodeBatcher
 
 
 class FakeWorker:
@@ -55,6 +55,39 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(len(worker.calls[0]), 4)
         self.assertEqual(observed, [4])
         self.assertEqual(results, {1: 10, 2: 20, 3: 30, 4: 41})
+
+    def test_generation_stops_and_cancels_after_eos(self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+
+            def begin(self, request_id: int, _prompt: list[int]) -> None:
+                self.active_ids.add(request_id)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+        class Batcher:
+            def step(self, _request_id: int, _final: bool) -> int:
+                return 7
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return ",".join(str(token) for token in tokens)
+
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(generation_timeout=10.0)
+        app.request_id = lambda: 1
+        app.worker = Worker()
+        app.decode_batcher = Batcher()
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = {7}
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+
+        result = list(app.generate([3], 5))
+        self.assertEqual(result, [(7, "7")])
+        self.assertEqual(app.worker.active_ids, set())
 
 
 if __name__ == "__main__":

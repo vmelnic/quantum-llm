@@ -245,6 +245,13 @@ class Application:
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
         )
+        eos = self.tokenizer.eos_token_id
+        if eos is None:
+            self.eos_token_ids: set[int] = set()
+        elif isinstance(eos, int):
+            self.eos_token_ids = {eos}
+        else:
+            self.eos_token_ids = {int(token) for token in eos}
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
                                  args.startup_timeout, args.worker_capacity,
                                  args.worker_ram_cache_gib,
@@ -406,6 +413,8 @@ class Application:
                 delta = current[len(decoded):] if current.startswith(decoded) else current
                 decoded = current
                 yield token, delta
+                if token in self.eos_token_ids:
+                    break
         finally:
             if request_id in self.worker.active_ids:
                 self.worker.cancel(request_id)
@@ -529,6 +538,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         request_uuid = "cmpl-" + uuid.uuid4().hex
         created = int(time.time())
+        completion_count = 0
+        finish_reason = "length"
         try:
             if stream:
                 self.send_response(HTTPStatus.OK)
@@ -536,14 +547,19 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache")
                 self.send_header("Connection", "close")
                 self.end_headers()
-                for _token, delta in self.app.generate(prompt_ids, maximum):
+                for token, delta in self.app.generate(prompt_ids, maximum):
+                    completion_count += 1
+                    if token in self.app.eos_token_ids:
+                        finish_reason = "stop"
                     choice = {"index": 0, "finish_reason": None}
                     choice["delta" if chat else "text"] = ({"content": delta} if chat else delta)
                     chunk = {"id": request_uuid, "object": "chat.completion.chunk" if chat else "text_completion",
                              "created": created, "model": self.app.args.model, "choices": [choice]}
                     self.wfile.write(b"data: " + json.dumps(chunk, separators=(",", ":")).encode() + b"\n\n")
                     self.wfile.flush()
-                final_choice: dict[str, Any] = {"index": 0, "finish_reason": "length"}
+                final_choice: dict[str, Any] = {
+                    "index": 0, "finish_reason": finish_reason
+                }
                 final_choice["delta" if chat else "text"] = ({} if chat else "")
                 final_chunk = {"id": request_uuid,
                     "object": "chat.completion.chunk" if chat else "text_completion",
@@ -553,8 +569,16 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
             else:
-                text = "".join(delta for _token, delta in self.app.generate(prompt_ids, maximum))
-                choice: dict[str, Any] = {"index": 0, "finish_reason": "length"}
+                pieces: list[str] = []
+                for token, delta in self.app.generate(prompt_ids, maximum):
+                    completion_count += 1
+                    pieces.append(delta)
+                    if token in self.app.eos_token_ids:
+                        finish_reason = "stop"
+                text = "".join(pieces)
+                choice: dict[str, Any] = {
+                    "index": 0, "finish_reason": finish_reason
+                }
                 if chat:
                     choice["message"] = {"role": "assistant", "content": text}
                 else:
@@ -563,8 +587,8 @@ class Handler(BaseHTTPRequestHandler):
                     "object": "chat.completion" if chat else "text_completion",
                     "created": created, "model": self.app.args.model, "choices": [choice],
                     "usage": {"prompt_tokens": len(prompt_ids),
-                              "completion_tokens": maximum,
-                              "total_tokens": len(prompt_ids) + maximum}})
+                              "completion_tokens": completion_count,
+                              "total_tokens": len(prompt_ids) + completion_count}})
             self.app.increment("completed")
         except (BrokenPipeError, ConnectionResetError):
             self.app.increment("cancelled")

@@ -360,6 +360,15 @@ DeltaNet recurent. Runnerul complet este construit: dense resident pe GPU,
 router exact, shared expert, acquire numai pentru top-10, lease până la
 completion și stări attention/delta persistente.
 
+Semantica a fost auditată și contra implementării Transformers `5.14.1`, fișier
+`modeling_qwen3_next.py` cu SHA-256
+`bc6ee64d65d9b42c021c2f5bef7a79a2823fc3fd511db7a0335b5e9bf8a088b4`.
+Au fost verificate explicit: layout-ul query/output-gate, RMSNorm
+zero-centered, partial RoPE, GQA scaling, ordinea Conv1D, Q/K L2 plus
+`1/sqrt(head_dim)`, `exp(-exp(A_log)*softplus(a+dt_bias))`, update-ul recurent,
+gated RMSNorm, shared expert și renormalizarea top-k. Nu s-a găsit o abatere de
+formulă în decode-ul one-token.
+
 Traseul aggregate Qwen3-Next este de asemenea construit, dar încă nemăsurat pe
 containerul real: proiecțiile INT8/F32 și routerul sunt batched, selecțiile
 duplicate sunt încărcate o singură dată per strat, iar toate rândurile intră
@@ -377,6 +386,9 @@ După adăugarea ferestrei de latență, un al doilea smoke persistent cu trei
 tokenuri a publicat TTFT `0,344 s`, inter-token p95 `0,031 s`, trei batch-uri și
 trei rânduri. Aceste valori validează exportul metricilor pe OLMoE și nu sunt
 folosite drept rezultat P6 pentru Qwen3-Next.
+Serviciul oprește acum request-ul la tokenul EOS, anulează pasul deja pregătit
+și raportează `finish_reason=stop` plus numărul real de tokenuri, nu limita
+cerută de client; comportamentul de cleanup este acoperit de testul front-end.
 
 Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
 containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
