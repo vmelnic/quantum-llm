@@ -111,8 +111,8 @@ semantic identice.
 
 ## 1. Formatul Expert Pack v1 (working name)
 
-`Expert Pack` este un nume intern temporar. Conceptul formatului este propus de
-acest proiect și nu are încă o implementare. Nu folosim numele `QMOE`: acesta
+`Expert Pack` este un nume intern temporar. Formatul este propus și implementat
+de acest proiect. Nu folosim numele `QMOE`: acesta
 aparține deja proiectului [QMoE](https://github.com/IST-DASLab/qmoe), care face
 compresie sub-1-bit și are propriul format și propriile kerneluri. Alegem numele
 public definitiv numai după un collision check.
@@ -394,6 +394,22 @@ El produce:
 mod best-effort, iar API-ul și metricile trebuie să reflecte acest lucru.
 
 ## 4. Etapele de implementare
+
+Starea curentă:
+
+| Fază | Stare |
+|---|---|
+| P0 contract/skeleton | completă |
+| P1 compiler/container | completă pentru OLMoE și Qwen3-Next |
+| P2 storage/cache | completă și validată pe Windows/RTX 3090 |
+| P3 single-request exact | completă pentru OLMoE; implementată pentru Qwen, așteaptă containerul real |
+| P4 batching | completă pentru OLMoE; Qwen are dense/router/MoE batched, așteaptă măsurarea reală |
+| P5 serviciu | completă și operabilă; launcherul Qwen este pregătit |
+| P6 model > RAM | în curs: download, conversie și gate-urile reale rămân deschise |
+
+Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P0–P5 nu
+se redeschid ca experimente; se corectează numai dacă rularea P6 descoperă un
+defect concret.
 
 ### P0 — contract și skeleton
 
@@ -850,26 +866,29 @@ Cheia fazei distribuite este:
 - nu descărcăm încă un model mare înainte ca P0 să poată demonstra fezabilitatea;
 - nu declarăm production pe baza unui prompt scurt sau doar a mediei tok/s.
 
-## 7. Ordinea exactă pentru următoarea sesiune
+## 7. Ordinea exactă pentru continuarea P6
 
-1. recitim acest plan și `RESULTS.md`; nu redeschidem experimentele închise;
-2. creăm specificația `expert-pack-v1` și schema manifestului;
-3. fixăm ABI-ul recordului expert: header, alignment, fused gate+up, down, scales,
-   checksum și quant profile;
-4. creăm skeleton-ul `compiler/` și `runtime/` cu CMake/build Windows;
-5. implementăm calculatorul de fezabilitate și extindem inventarul hardware;
-6. inventariem checkpoint-urile locale numai prin config/headere și selectăm
-   primul adaptor după criteriile P1;
-7. implementăm writer/index/checksum/resume pentru Expert Pack;
-8. abia după un container valid începem `storage/` IOCP și cache state machine;
-9. CUDA grouped MoE și schedulerul vin după ce ABI-ul și lifecycle-ul experților
-   sunt stabile;
-10. serverul vine după execuția exactă și bugetată, nu înainte.
+1. nu întrerupem download-ul Xet; verificăm `Get-P6ModelDownload.ps1` până când
+   raportează 41/41 și zero transferuri incomplete;
+2. rulăm `Invoke-P6Preflight.ps1` și păstrăm artefactul cu disk/RAM estimate;
+3. conversia nu pornește fără aprobarea explicită a operatorului pentru
+   reclamarea shard-urilor sursă, deoarece C: nu poate găzdui simultan sursa și
+   containerul; wrapperul cere textul `DELETE_CONSUMED_SHARDS`;
+4. rulăm `Invoke-P6Conversion.ps1`, cu `-Resume` numai după o întrerupere;
+   jurnalul de reclamare și starea atomică sunt păstrate;
+5. validăm containerul complet independent prin `Invoke-ExpertPack.ps1 -Action
+   Validate`; un pack incomplet sau un hash invalid oprește fluxul;
+6. rulăm Qwen single-request, publicăm TTFT, hot tok/s, bytes SSD/H2D per token,
+   hit VRAM/RAM, miss SSD, high-water și eviction; pagefile/swap nu este acceptat;
+7. rulăm `--batch` la concurența 4 în același proces/cache și publicăm tok/s
+   aggregate, nu suma unor procese cu copii separate ale modelului;
+8. verificăm output-ul determinist și semantica INT8 prin controalele deja
+   fixate; interleaving-ul nu poate schimba secvența fiecărui request;
+9. dacă 10 tok/s single sau 30 tok/s aggregate nu trec, optimizăm numai faza
+   indicată numeric de telemetry (dense, expert compute, H2D sau SSD wait), apoi
+   repetăm gate-ul relevant;
+10. după gate pornim `Start-P6ExpertServer.ps1` și verificăm health, streaming,
+    cancellation și bugetele procesului persistent.
 
-Deciziile deja fixate pentru sesiunea următoare sunt: runtime propriu,
-Windows+CUDA/RTX3090 prima platformă, Expert Pack compute-ready, semantică exactă,
-cache global în bytes, I/O asincron, grouped MoE cross-request și production
-admission/backpressure. macOS/Metal și Expert RPC rămân faze viitoare P7/P8;
-core-ul nu trebuie cuplat ireversibil la Windows/CUDA. Alegerea primului model
-mare și profilul final INT4/INT8 rămân deschise până când calculatorul P0 le
-poate valida numeric.
+RTX 3090/CUDA rămâne backend-ul curent. macOS/Metal și Expert RPC rămân P7/P8,
+fără implementare în această continuare.
