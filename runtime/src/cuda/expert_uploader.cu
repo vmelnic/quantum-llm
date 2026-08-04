@@ -51,6 +51,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
                                        UploadCompletion completion) {
   const auto operation = next_operation_++;
   if (!completion) return operation;
+  std::lock_guard stream_lock(stream_mutex_);
   const auto& sections = request.sections;
   const auto total = static_cast<std::size_t>(
       sections.gate_up_q_bytes + sections.gate_up_scale_bytes +

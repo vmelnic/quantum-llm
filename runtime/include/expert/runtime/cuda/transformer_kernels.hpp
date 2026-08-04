@@ -17,9 +17,18 @@ struct Int8Matrix final {
                                float* output, void* stream) noexcept;
 [[nodiscard]] Status gemv(const Int8Matrix& matrix, const float* input,
                           float* output, void* stream) noexcept;
+// Inputs and outputs are row-major [batch, columns] and [batch, rows]. Blocks
+// for the same matrix row are adjacent so concurrent requests reuse weights.
+[[nodiscard]] Status gemv_batch(const Int8Matrix& matrix, const float* input,
+                                float* output, std::uint32_t batch,
+                                void* stream) noexcept;
 [[nodiscard]] Status gemv_f32(const float* matrix, std::uint32_t rows,
                               std::uint32_t columns, const float* input,
                               float* output, void* stream) noexcept;
+[[nodiscard]] Status gemv_f32_batch(
+    const float* matrix, std::uint32_t rows, std::uint32_t columns,
+    const float* input, float* output, std::uint32_t batch,
+    void* stream) noexcept;
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;
@@ -60,6 +69,11 @@ struct Int8Matrix final {
     const float* input, const float* router_weights, std::uint32_t hidden,
     std::uint32_t experts, std::uint32_t top_k, float* logits,
     float* topk_scores, std::uint32_t* topk_indices, void* stream) noexcept;
+[[nodiscard]] Status router_topk_normalized_batch(
+    const float* input, const float* router_weights, std::uint32_t rows,
+    std::uint32_t hidden, std::uint32_t experts, std::uint32_t top_k,
+    float* logits, float* topk_scores, std::uint32_t* topk_indices,
+    void* stream) noexcept;
 
 // Qwen3-Next full attention. q_and_gate is laid out per query head as
 // [query(head_dim), output_gate(head_dim)]. K/V caches retain only KV heads.

@@ -2,7 +2,9 @@
 
 #include "expert/runtime/expert_cache.hpp"
 
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 
 namespace expert::runtime::cuda {
 
@@ -42,7 +44,8 @@ class CudaExpertUploader final : public IDeviceUploader {
 
  private:
   void* stream_{};
-  std::uint64_t next_operation_{1};
+  std::atomic<std::uint64_t> next_operation_{1};
+  std::mutex stream_mutex_;
 };
 
 }  // namespace expert::runtime::cuda

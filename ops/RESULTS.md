@@ -360,6 +360,13 @@ DeltaNet recurent. Runnerul complet este construit: dense resident pe GPU,
 router exact, shared expert, acquire numai pentru top-10, lease până la
 completion și stări attention/delta persistente.
 
+Traseul aggregate Qwen3-Next este de asemenea construit, dar încă nemăsurat pe
+containerul real: proiecțiile INT8/F32 și routerul sunt batched, selecțiile
+duplicate sunt încărcate o singură dată per strat, iar toate rândurile intră
+într-un singur dispatch MoE. Smoke-ul RTX 3090 măsoară eroare maximă
+`1,67638e-8` pentru GEMV batched și `2,98023e-8` pentru routerul batched.
+Acestea sunt verificări de corectitudine a kernelurilor, nu rezultate tok/s.
+
 Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
 containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
 68.641.103.872 bytes RAM fizici. C: este singurul volum, deci sursa de

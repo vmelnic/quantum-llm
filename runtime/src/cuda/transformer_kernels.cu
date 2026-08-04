@@ -48,6 +48,25 @@ __global__ void int8_gemv_kernel(const std::int8_t* weights,
   if (threadIdx.x == 0) output[row] = partial * scales[row];
 }
 
+__global__ void int8_gemv_batch_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t batch) {
+  const auto work = static_cast<std::uint64_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(work / batch);
+  const auto request = static_cast<std::uint32_t>(work % batch);
+  if (row >= rows) return;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  const auto* activation = input + static_cast<std::size_t>(request) * columns;
+  float partial = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x)
+    partial += static_cast<float>(weight[i]) * activation[i];
+  partial = reduce_sum(partial);
+  if (threadIdx.x == 0)
+    output[static_cast<std::size_t>(request) * rows + row] =
+        partial * scales[row];
+}
+
 __global__ void f32_gemv_kernel(const float* weights, const float* input,
                                 float* output, std::uint32_t rows,
                                 std::uint32_t columns) {
@@ -58,6 +77,23 @@ __global__ void f32_gemv_kernel(const float* weights, const float* input,
   for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x) partial += weight[i] * input[i];
   partial = reduce_sum(partial);
   if (threadIdx.x == 0) output[row] = partial;
+}
+
+__global__ void f32_gemv_batch_kernel(
+    const float* weights, const float* input, float* output,
+    std::uint32_t rows, std::uint32_t columns, std::uint32_t batch) {
+  const auto work = static_cast<std::uint64_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(work / batch);
+  const auto request = static_cast<std::uint32_t>(work % batch);
+  if (row >= rows) return;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  const auto* activation = input + static_cast<std::size_t>(request) * columns;
+  float partial = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x)
+    partial += weight[i] * activation[i];
+  partial = reduce_sum(partial);
+  if (threadIdx.x == 0)
+    output[static_cast<std::size_t>(request) * rows + row] = partial;
 }
 
 __global__ void rms_kernel(const float* input, const float* weight,
@@ -201,6 +237,42 @@ __global__ void router_select_kernel(const float* logits, std::uint32_t experts,
     for (std::uint32_t slot = 0; slot < top_k; ++slot) selected_sum += scores[slot];
     for (std::uint32_t slot = 0; slot < top_k; ++slot) scores[slot] /= selected_sum;
   }
+}
+
+__global__ void router_select_batch_kernel(
+    const float* logits, std::uint32_t experts, std::uint32_t top_k,
+    float* scores, std::uint32_t* indices) {
+  if (threadIdx.x != 0) return;
+  const auto request = static_cast<std::uint32_t>(blockIdx.x);
+  logits += static_cast<std::size_t>(request) * experts;
+  scores += static_cast<std::size_t>(request) * top_k;
+  indices += static_cast<std::size_t>(request) * top_k;
+  float maximum = kNegativeInfinity;
+  for (std::uint32_t i = 0; i < experts; ++i)
+    maximum = fmaxf(maximum, logits[i]);
+  float denominator = 0.0F;
+  for (std::uint32_t i = 0; i < experts; ++i)
+    denominator += expf(logits[i] - maximum);
+  float selected_sum = 0.0F;
+  for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+    float best = -1.0F;
+    std::uint32_t best_index = 0;
+    for (std::uint32_t i = 0; i < experts; ++i) {
+      bool used = false;
+      for (std::uint32_t previous = 0; previous < slot; ++previous)
+        used |= indices[previous] == i;
+      const float probability = expf(logits[i] - maximum) / denominator;
+      if (!used && probability > best) {
+        best = probability;
+        best_index = i;
+      }
+    }
+    scores[slot] = best;
+    indices[slot] = best_index;
+    selected_sum += best;
+  }
+  for (std::uint32_t slot = 0; slot < top_k; ++slot)
+    scores[slot] /= selected_sum;
 }
 
 __global__ void qwen_qkv_rope_kernel(
@@ -463,10 +535,37 @@ Status gemv(const Int8Matrix& m, const float* input, float* output, void* raw) n
   int8_gemv_kernel<<<m.rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(m.weights, m.scales, input, output, m.rows, m.columns);
   return checked(cudaPeekAtLastError(), "int8 gemv");
 }
+Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
+                  std::uint32_t batch, void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !batch)
+    return Status(ErrorCode::invalid_argument, "invalid batched gemv");
+  const auto blocks = static_cast<std::uint64_t>(m.rows) * batch;
+  if (blocks > 0xffffffffULL)
+    return Status(ErrorCode::invalid_argument, "batched gemv grid too large");
+  int8_gemv_batch_kernel<<<static_cast<unsigned>(blocks), kThreads, 0,
+                           static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  return checked(cudaPeekAtLastError(), "int8 batched gemv");
+}
 Status gemv_f32(const float* matrix, std::uint32_t rows, std::uint32_t columns, const float* input, float* output, void* raw) noexcept {
   if (!matrix || !input || !output || !rows || !columns) return Status(ErrorCode::invalid_argument, "invalid f32 gemv");
   f32_gemv_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(matrix, input, output, rows, columns);
   return checked(cudaPeekAtLastError(), "f32 gemv");
+}
+Status gemv_f32_batch(const float* matrix, std::uint32_t rows,
+                      std::uint32_t columns, const float* input, float* output,
+                      std::uint32_t batch, void* raw) noexcept {
+  if (!matrix || !input || !output || !rows || !columns || !batch)
+    return Status(ErrorCode::invalid_argument, "invalid batched f32 gemv");
+  const auto blocks = static_cast<std::uint64_t>(rows) * batch;
+  if (blocks > 0xffffffffULL)
+    return Status(ErrorCode::invalid_argument,
+                  "batched f32 gemv grid too large");
+  f32_gemv_batch_kernel<<<static_cast<unsigned>(blocks), kThreads, 0,
+                          static_cast<cudaStream_t>(raw)>>>(
+      matrix, input, output, rows, columns, batch);
+  return checked(cudaPeekAtLastError(), "f32 batched gemv");
 }
 Status rms_norm(const float* input, const float* weight, float* output, std::uint32_t elements, float epsilon, void* raw) noexcept {
   if (!input || !weight || !output || !elements || epsilon <= 0) return Status(ErrorCode::invalid_argument, "invalid rms norm");
@@ -547,6 +646,23 @@ Status router_topk_normalized(const float* input, const float* weights,
   router_select_kernel<<<1, 1, 0, stream>>>(logits, experts, top_k, scores,
                                              indices, true);
   return checked(cudaPeekAtLastError(), "normalized router select");
+}
+Status router_topk_normalized_batch(
+    const float* input, const float* weights, std::uint32_t rows,
+    std::uint32_t hidden, std::uint32_t experts, std::uint32_t top_k,
+    float* logits, float* scores, std::uint32_t* indices,
+    void* raw) noexcept {
+  if (!input || !weights || !logits || !scores || !indices || !rows ||
+      !hidden || !experts || !top_k || top_k > experts)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid normalized batched router");
+  auto stream = static_cast<cudaStream_t>(raw);
+  auto status = gemv_f32_batch(weights, experts, hidden, input, logits, rows,
+                               raw);
+  if (!status.ok()) return status;
+  router_select_batch_kernel<<<rows, 1, 0, stream>>>(
+      logits, experts, top_k, scores, indices);
+  return checked(cudaPeekAtLastError(), "normalized batched router select");
 }
 Status qwen3_next_qkv_rope_cache(
     float* q_and_gate, float* key, const float* value,

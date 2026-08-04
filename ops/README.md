@@ -103,6 +103,38 @@ jurnalizează și elimină numai shard-urile sursă care nu mai au niciun tensor
 consumat. Astfel conversia poate continua cu headroom limitat; checkpoint-ul
 sursă trebuie redescărcat ulterior dacă este necesar din nou.
 
+Wrapperul P6 refuză un checkpoint incomplet și cere confirmarea literală:
+
+```powershell
+Invoke-P6Conversion.ps1 `
+  -SourceReclamationConfirmation DELETE_CONSUMED_SHARDS
+```
+
+Fără acest argument, pe discul curent conversia este refuzată înainte de orice
+scriere sau ștergere. Pentru recovery după întrerupere se redescărcă shard-urile
+jurnalizate, apoi se folosește aceeași comandă cu `-Resume`.
+
+După conversie și validare, serviciul Qwen3-Next folosește același front-end
+OpenAI-compatible, dar runnerul și containerul P6 explicite. Startup-ul primește
+un timeout mai mare deoarece validează și încarcă `dense.qpack` înainte de
+readiness:
+
+```powershell
+Start-P6ExpertServer.ps1 -BuildId (git rev-parse --short HEAD)
+```
+
+Gate-ul aggregate folosește microbatching real în același proces și același
+cache, nu mai multe copii ale modelului:
+
+```powershell
+expert-qwen3-next-runner.exe C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8 `
+  --batch 151644,872,374 16 4 48 14
+```
+
+Rezultatul publică `concurrency`, `aggregate_forward_tokens`, tok/s aggregate și
+telemetria comună SSD/RAM/VRAM. Numerele devin gate numai după conversia
+checkpoint-ului complet; smoke-ul de kernel nu este tratat ca benchmark de model.
+
 ## Fluxul de lucru
 
 De pe hostul de control (acest repository):

@@ -91,6 +91,82 @@ double check_rms() {
   return maximum_error(d_output.download(), expected);
 }
 
+double check_batched_gemv() {
+  constexpr std::uint32_t rows = 7, columns = 13, batch = 3;
+  std::vector<std::int8_t> weights(rows * columns);
+  std::vector<float> scales(rows), input(batch * columns), expected(batch * rows);
+  for (std::size_t i = 0; i < weights.size(); ++i)
+    weights[i] = static_cast<std::int8_t>(static_cast<int>(i % 11) - 5);
+  for (std::uint32_t row = 0; row < rows; ++row)
+    scales[row] = 0.01F * static_cast<float>(row + 1U);
+  for (std::size_t i = 0; i < input.size(); ++i) input[i] = pattern(i, 0.3F);
+  for (std::uint32_t request = 0; request < batch; ++request) {
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      float sum = 0.0F;
+      for (std::uint32_t column = 0; column < columns; ++column)
+        sum += static_cast<float>(weights[row * columns + column]) *
+               input[request * columns + column];
+      expected[request * rows + row] = sum * scales[row];
+    }
+  }
+  DeviceBuffer<std::int8_t> d_weights(weights.size());
+  DeviceBuffer<float> d_scales(scales.size()), d_input(input.size()),
+      d_output(expected.size());
+  d_weights.upload(weights); d_scales.upload(scales); d_input.upload(input);
+  status_check(expert::runtime::cuda::gemv_batch(
+      {d_weights.get(), d_scales.get(), rows, columns}, d_input.get(),
+      d_output.get(), batch, nullptr));
+  cuda_check(cudaDeviceSynchronize(), "batched gemv synchronize");
+  return maximum_error(d_output.download(), expected);
+}
+
+double check_batched_router() {
+  constexpr std::uint32_t rows = 3, hidden = 5, experts = 8, top_k = 3;
+  std::vector<float> input(rows * hidden), weights(experts * hidden);
+  for (std::size_t i = 0; i < input.size(); ++i) input[i] = pattern(i, 0.4F);
+  for (std::size_t i = 0; i < weights.size(); ++i)
+    weights[i] = pattern(i + 19, 0.6F);
+  DeviceBuffer<float> d_input(input.size()), d_weights(weights.size()),
+      d_logits(rows * experts), d_scores(rows * top_k);
+  DeviceBuffer<std::uint32_t> d_indices(rows * top_k);
+  d_input.upload(input); d_weights.upload(weights);
+  status_check(expert::runtime::cuda::router_topk_normalized_batch(
+      d_input.get(), d_weights.get(), rows, hidden, experts, top_k,
+      d_logits.get(), d_scores.get(), d_indices.get(), nullptr));
+  cuda_check(cudaDeviceSynchronize(), "batched router synchronize");
+  const auto scores = d_scores.download();
+  const auto indices = d_indices.download();
+  double error = 0.0;
+  for (std::uint32_t request = 0; request < rows; ++request) {
+    std::vector<float> logits(experts), probabilities(experts);
+    for (std::uint32_t expert = 0; expert < experts; ++expert)
+      for (std::uint32_t column = 0; column < hidden; ++column)
+        logits[expert] += weights[expert * hidden + column] *
+                          input[request * hidden + column];
+    const auto maximum = *std::max_element(logits.begin(), logits.end());
+    float denominator = 0.0F;
+    for (std::uint32_t expert = 0; expert < experts; ++expert)
+      denominator += probabilities[expert] = std::exp(logits[expert] - maximum);
+    for (auto& value : probabilities) value /= denominator;
+    std::vector<std::uint32_t> order(experts);
+    for (std::uint32_t i = 0; i < experts; ++i) order[i] = i;
+    std::partial_sort(order.begin(), order.begin() + top_k, order.end(),
+                      [&](auto left, auto right) {
+                        return probabilities[left] > probabilities[right];
+                      });
+    float selected_sum = 0.0F;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      selected_sum += probabilities[order[slot]];
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+      const auto offset = request * top_k + slot;
+      if (indices[offset] != order[slot]) return 1.0e9;
+      error = std::max(error, std::abs(static_cast<double>(scores[offset]) -
+          probabilities[order[slot]] / selected_sum));
+    }
+  }
+  return error;
+}
+
 double check_full_attention() {
   constexpr std::uint32_t query_heads = 16, kv_heads = 2, dim = 256;
   std::vector<float> q(static_cast<std::size_t>(query_heads) * 2U * dim);
@@ -223,11 +299,17 @@ double check_delta() {
 int main() {
   try {
     const auto rms = check_rms();
+    const auto batched_gemv = check_batched_gemv();
+    const auto batched_router = check_batched_router();
     const auto attention = check_full_attention();
     const auto delta = check_delta();
-    const bool valid = rms < 2.0e-6 && attention < 2.0e-6 && delta < 2.0e-5;
+    const bool valid = rms < 2.0e-6 && batched_gemv < 2.0e-6 &&
+                       batched_router < 2.0e-6 && attention < 2.0e-6 &&
+                       delta < 2.0e-5;
     std::cout << "{\"valid\":" << (valid ? "true" : "false")
               << ",\"qwen_rms_max_abs\":" << rms
+              << ",\"batched_gemv_max_abs\":" << batched_gemv
+              << ",\"batched_router_max_abs\":" << batched_router
               << ",\"full_attention_max_abs\":" << attention
               << ",\"delta_max_abs\":" << delta << "}\n";
     return valid ? 0 : 2;

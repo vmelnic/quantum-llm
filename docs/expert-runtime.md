@@ -139,6 +139,11 @@ partial RoPE și output gate, respectiv Gated DeltaNet cu stare Conv1D și stare
 recurentă persistentă. Normele dense folosesc `(1 + weight)`; norma gated din
 DeltaNet folosește `weight` direct, conform checkpoint-ului. Routerul face
 softmax global, top-k și renormalizare pe selecția top-k înainte de dispatch.
+În microbatch, proiecțiile dense consumă toate activările într-o singură lansare
+și ordonează blocurile astfel încât request-urile să reutilizeze aceeași linie de
+weights. Selecțiile sunt deduplicate pe strat, apoi toate rândurile folosesc un
+singur dispatch MoE batched și același cache global; stările KV/Conv/DeltaNet
+rămân izolate per slot.
 
 Streams logice:
 

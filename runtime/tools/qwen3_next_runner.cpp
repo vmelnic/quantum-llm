@@ -131,8 +131,10 @@ class Qwen3NextModel final {
  public:
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
                  std::uint64_t ram_cache_bytes,
-                 std::uint64_t vram_cache_bytes)
-      : root_(root), max_context_(max_context) {
+                 std::uint64_t vram_cache_bytes,
+                 std::uint32_t capacity = 1)
+      : root_(root), max_context_(max_context), capacity_(capacity) {
+    if (!capacity_) throw std::runtime_error("request capacity is zero");
     const auto document = expert::core::json::Parse(read_text(root / "manifest.json"));
     const auto& manifest = document.AsObject("manifest");
     const auto& architecture =
@@ -212,38 +214,65 @@ class Qwen3NextModel final {
   }
 
   std::uint32_t forward(std::uint32_t token, std::uint32_t position) {
-    if (position >= max_context_ || token >= vocab_)
-      throw std::runtime_error("token/position outside capacity");
-    status_check(expert::runtime::cuda::embedding(
-        matrix("model.embed_tokens.weight"), token, hidden_state_, nullptr));
+    const std::array tokens{token};
+    const std::array positions{position};
+    return forward_batch(tokens, positions).front();
+  }
+
+  std::vector<std::uint32_t> forward_batch(
+      std::span<const std::uint32_t> tokens,
+      std::span<const std::uint32_t> positions) {
+    if (tokens.empty() || tokens.size() != positions.size() ||
+        tokens.size() > capacity_)
+      throw std::runtime_error("invalid Qwen3-Next microbatch");
+    const auto rows = static_cast<std::uint32_t>(tokens.size());
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      if (positions[row] >= max_context_ || tokens[row] >= vocab_)
+        throw std::runtime_error("token/position outside capacity");
+      status_check(expert::runtime::cuda::embedding(
+          matrix("model.embed_tokens.weight"), tokens[row],
+          hidden_state_ + static_cast<std::size_t>(row) * hidden_, nullptr));
+    }
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
       const auto prefix = "model.layers." + std::to_string(layer) + ".";
-      status_check(expert::runtime::cuda::qwen3_next_rms_norm(
-          hidden_state_, fp32(prefix + "input_layernorm.weight"), normalized_,
-          hidden_, epsilon_, nullptr));
+      for (std::uint32_t row = 0; row < rows; ++row)
+        status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+            hidden_state_ + static_cast<std::size_t>(row) * hidden_,
+            fp32(prefix + "input_layernorm.weight"),
+            normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
+            epsilon_, nullptr));
       if ((layer + 1U) % full_interval_ == 0) {
-        run_full_attention(prefix, layer, position);
+        run_full_attention(prefix, layer, positions, rows);
       } else {
-        run_delta(prefix, layer);
+        run_delta(prefix, layer, rows);
       }
       status_check(expert::runtime::cuda::add_in_place(
-          hidden_state_, residual_, hidden_, nullptr));
-      status_check(expert::runtime::cuda::qwen3_next_rms_norm(
-          hidden_state_, fp32(prefix + "post_attention_layernorm.weight"),
-          normalized_, hidden_, epsilon_, nullptr));
-      run_moe(prefix, layer);
+          hidden_state_, residual_, rows * hidden_, nullptr));
+      for (std::uint32_t row = 0; row < rows; ++row)
+        status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+            hidden_state_ + static_cast<std::size_t>(row) * hidden_,
+            fp32(prefix + "post_attention_layernorm.weight"),
+            normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
+            epsilon_, nullptr));
+      run_moe(prefix, layer, rows);
     }
-    status_check(expert::runtime::cuda::qwen3_next_rms_norm(
-        hidden_state_, fp32("model.norm.weight"), normalized_, hidden_, epsilon_,
-        nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix("lm_head.weight"), normalized_, logits_, nullptr));
-    status_check(expert::runtime::cuda::argmax(logits_, vocab_, output_token_,
-                                               nullptr));
-    std::uint32_t result = 0;
-    cuda_check(cudaMemcpy(&result, output_token_, sizeof(result),
+    for (std::uint32_t row = 0; row < rows; ++row)
+      status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+          hidden_state_ + static_cast<std::size_t>(row) * hidden_,
+          fp32("model.norm.weight"),
+          normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
+          epsilon_, nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+    for (std::uint32_t row = 0; row < rows; ++row)
+      status_check(expert::runtime::cuda::argmax(
+          logits_ + static_cast<std::size_t>(row) * vocab_, vocab_,
+          output_token_ + row, nullptr));
+    std::vector<std::uint32_t> result(rows);
+    cuda_check(cudaMemcpy(result.data(), output_token_,
+                          result.size() * sizeof(result[0]),
                           cudaMemcpyDeviceToHost),
-               "copy generated token");
+               "copy generated tokens");
     return result;
   }
 
@@ -252,6 +281,24 @@ class Qwen3NextModel final {
   }
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
+  void reset_request() {
+    const auto conv_elements =
+        (static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
+         static_cast<std::size_t>(value_heads_) * value_head_dim_) *
+        conv_kernel_;
+    const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
+                                    key_head_dim_ * value_head_dim_;
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      if ((layer + 1U) % full_interval_ != 0) {
+        cuda_check(cudaMemset(conv_state_[layer], 0,
+                              capacity_ * conv_elements * sizeof(float)),
+                   "reset delta conv state");
+        cuda_check(cudaMemset(recurrent_state_[layer], 0,
+                              capacity_ * recurrent_elements * sizeof(float)),
+                   "reset delta recurrent state");
+      }
+    }
+  }
 
  private:
   const expert::runtime::cuda::Int8Matrix& matrix(const std::string& name) const {
@@ -326,34 +373,36 @@ class Qwen3NextModel final {
         static_cast<std::size_t>(2U) * value_heads_ * value_head_dim_;
     const auto conv_size = static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
                            static_cast<std::size_t>(value_heads_) * value_head_dim_;
-    hidden_state_ = device_allocate<float>(hidden_);
-    normalized_ = device_allocate<float>(hidden_);
-    residual_ = device_allocate<float>(hidden_);
-    query_gate_ = device_allocate<float>(query_size);
-    key_ = device_allocate<float>(key_value_size);
-    value_ = device_allocate<float>(key_value_size);
-    attention_ = device_allocate<float>(query_heads_ * head_dim_);
-    projected_qkvz_ = device_allocate<float>(projected_size);
-    projected_ba_ = device_allocate<float>(2U * value_heads_);
-    delta_output_ = device_allocate<float>(value_heads_ * value_head_dim_);
-    conv_output_ = device_allocate<float>(conv_size);
-    shared_gate_ = device_allocate<float>(shared_width_);
-    shared_up_ = device_allocate<float>(shared_width_);
-    shared_intermediate_ = device_allocate<float>(shared_width_);
-    shared_output_ = device_allocate<float>(hidden_);
-    shared_scalar_ = device_allocate<float>(1);
-    router_logits_ = device_allocate<float>(experts_);
-    routing_scores_ = device_allocate<float>(top_k_);
-    routing_indices_ = device_allocate<std::uint32_t>(top_k_);
+    hidden_state_ = device_allocate<float>(capacity_ * hidden_);
+    normalized_ = device_allocate<float>(capacity_ * hidden_);
+    residual_ = device_allocate<float>(capacity_ * hidden_);
+    query_gate_ = device_allocate<float>(capacity_ * query_size);
+    key_ = device_allocate<float>(capacity_ * key_value_size);
+    value_ = device_allocate<float>(capacity_ * key_value_size);
+    attention_ = device_allocate<float>(capacity_ * query_heads_ * head_dim_);
+    projected_qkvz_ = device_allocate<float>(capacity_ * projected_size);
+    projected_ba_ = device_allocate<float>(capacity_ * 2U * value_heads_);
+    delta_output_ =
+        device_allocate<float>(capacity_ * value_heads_ * value_head_dim_);
+    conv_output_ = device_allocate<float>(capacity_ * conv_size);
+    shared_gate_ = device_allocate<float>(capacity_ * shared_width_);
+    shared_up_ = device_allocate<float>(capacity_ * shared_width_);
+    shared_intermediate_ = device_allocate<float>(capacity_ * shared_width_);
+    shared_output_ = device_allocate<float>(capacity_ * hidden_);
+    shared_scalar_ = device_allocate<float>(capacity_);
+    router_logits_ = device_allocate<float>(capacity_ * experts_);
+    routing_scores_ = device_allocate<float>(capacity_ * top_k_);
+    routing_indices_ =
+        device_allocate<std::uint32_t>(capacity_ * top_k_);
     moe_intermediate_ = device_allocate<float>(
-        static_cast<std::size_t>(top_k_) * expert_width_);
-    moe_output_ = device_allocate<float>(hidden_);
-    logits_ = device_allocate<float>(vocab_);
-    output_token_ = device_allocate<std::uint32_t>(1);
-    d_gate_up_ = device_allocate<const std::int8_t*>(top_k_);
-    d_gate_scales_ = device_allocate<const float*>(top_k_);
-    d_down_ = device_allocate<const std::int8_t*>(top_k_);
-    d_down_scales_ = device_allocate<const float*>(top_k_);
+        static_cast<std::size_t>(capacity_) * top_k_ * expert_width_);
+    moe_output_ = device_allocate<float>(capacity_ * hidden_);
+    logits_ = device_allocate<float>(capacity_ * vocab_);
+    output_token_ = device_allocate<std::uint32_t>(capacity_);
+    d_gate_up_ = device_allocate<const std::int8_t*>(experts_);
+    d_gate_scales_ = device_allocate<const float*>(experts_);
+    d_down_ = device_allocate<const std::int8_t*>(experts_);
+    d_down_scales_ = device_allocate<const float*>(experts_);
 
     key_cache_.resize(layers_);
     value_cache_.resize(layers_);
@@ -365,97 +414,141 @@ class Qwen3NextModel final {
                                     key_head_dim_ * value_head_dim_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
       if ((layer + 1U) % full_interval_ == 0) {
-        key_cache_[layer] = device_allocate<float>(kv_elements);
-        value_cache_[layer] = device_allocate<float>(kv_elements);
+        key_cache_[layer] = device_allocate<float>(capacity_ * kv_elements);
+        value_cache_[layer] = device_allocate<float>(capacity_ * kv_elements);
       } else {
-        conv_state_[layer] = device_allocate<float>(conv_elements);
-        recurrent_state_[layer] = device_allocate<float>(recurrent_elements);
+        conv_state_[layer] =
+            device_allocate<float>(capacity_ * conv_elements);
+        recurrent_state_[layer] =
+            device_allocate<float>(capacity_ * recurrent_elements);
         cuda_check(cudaMemset(conv_state_[layer], 0,
-                              conv_elements * sizeof(float)),
+                              capacity_ * conv_elements * sizeof(float)),
                    "zero delta conv state");
         cuda_check(cudaMemset(recurrent_state_[layer], 0,
-                              recurrent_elements * sizeof(float)),
+                              capacity_ * recurrent_elements * sizeof(float)),
                    "zero delta recurrent state");
       }
     }
   }
   void run_full_attention(const std::string& prefix, std::uint32_t layer,
-                          std::uint32_t position) {
-    status_check(expert::runtime::cuda::gemv(
+                          std::span<const std::uint32_t> positions,
+                          std::uint32_t rows) {
+    const auto query_size = 2U * query_heads_ * head_dim_;
+    const auto kv_size = kv_heads_ * head_dim_;
+    const auto attention_size = query_heads_ * head_dim_;
+    const auto cache_stride = static_cast<std::size_t>(max_context_) * kv_size;
+    status_check(expert::runtime::cuda::gemv_batch(
         matrix(prefix + "self_attn.q_proj.weight"), normalized_, query_gate_,
+        rows, nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "self_attn.k_proj.weight"), normalized_, key_, rows,
         nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "self_attn.k_proj.weight"), normalized_, key_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "self_attn.v_proj.weight"), normalized_, value_, nullptr));
-    status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
-        query_gate_, key_, value_, fp32(prefix + "self_attn.q_norm.weight"),
-        fp32(prefix + "self_attn.k_norm.weight"), key_cache_[layer],
-        value_cache_[layer], position, query_heads_, kv_heads_, head_dim_,
-        rotary_dim_, epsilon_, rope_theta_, nullptr));
-    status_check(expert::runtime::cuda::qwen3_next_attention_decode(
-        query_gate_, key_cache_[layer], value_cache_[layer], attention_,
-        position + 1U, query_heads_, kv_heads_, head_dim_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "self_attn.o_proj.weight"), attention_, residual_,
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "self_attn.v_proj.weight"), normalized_, value_, rows,
         nullptr));
-  }
-  void run_delta(const std::string& prefix, std::uint32_t layer) {
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "linear_attn.in_proj_qkvz.weight"), normalized_,
-        projected_qkvz_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "linear_attn.in_proj_ba.weight"), normalized_,
-        projected_ba_, nullptr));
-    status_check(expert::runtime::cuda::qwen3_next_delta_decode({
-        projected_qkvz_, projected_ba_, fp32(prefix + "linear_attn.conv1d.weight"),
-        fp32(prefix + "linear_attn.dt_bias"), fp32(prefix + "linear_attn.A_log"),
-        fp32(prefix + "linear_attn.norm.weight"), conv_state_[layer],
-        recurrent_state_[layer], conv_output_, delta_output_, key_heads_,
-        value_heads_, key_head_dim_, value_head_dim_, conv_kernel_, epsilon_,
-        nullptr}));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "linear_attn.out_proj.weight"), delta_output_, residual_,
+    for (std::uint32_t row = 0; row < rows; ++row) {
+      status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
+          query_gate_ + static_cast<std::size_t>(row) * query_size,
+          key_ + static_cast<std::size_t>(row) * kv_size,
+          value_ + static_cast<std::size_t>(row) * kv_size,
+          fp32(prefix + "self_attn.q_norm.weight"),
+          fp32(prefix + "self_attn.k_norm.weight"),
+          key_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          value_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          positions[row], query_heads_, kv_heads_, head_dim_, rotary_dim_,
+          epsilon_, rope_theta_, nullptr));
+      status_check(expert::runtime::cuda::qwen3_next_attention_decode(
+          query_gate_ + static_cast<std::size_t>(row) * query_size,
+          key_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          value_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          attention_ + static_cast<std::size_t>(row) * attention_size,
+          positions[row] + 1U, query_heads_, kv_heads_, head_dim_, nullptr));
+    }
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "self_attn.o_proj.weight"), attention_, residual_, rows,
         nullptr));
   }
-  void run_moe(const std::string& prefix, std::uint32_t layer) {
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "mlp.shared_expert.gate_proj.weight"), normalized_,
-        shared_gate_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "mlp.shared_expert.up_proj.weight"), normalized_,
-        shared_up_, nullptr));
-    status_check(expert::runtime::cuda::silu_product(
-        shared_gate_, shared_up_, shared_intermediate_, shared_width_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "mlp.shared_expert.down_proj.weight"),
-        shared_intermediate_, shared_output_, nullptr));
-    status_check(expert::runtime::cuda::gemv(
-        matrix(prefix + "mlp.shared_expert_gate.weight"), normalized_,
-        shared_scalar_, nullptr));
-    status_check(expert::runtime::cuda::sigmoid_scale_in_place(
-        shared_output_, shared_scalar_, hidden_, nullptr));
-    status_check(expert::runtime::cuda::router_topk_normalized(
-        normalized_, fp32(prefix + "mlp.gate.weight"), hidden_, experts_, top_k_,
-        router_logits_, routing_scores_, routing_indices_, nullptr));
 
-    std::vector<std::uint32_t> selected(top_k_);
+  void run_delta(const std::string& prefix, std::uint32_t layer,
+                 std::uint32_t rows) {
+    const auto projected_size = 2U * key_heads_ * key_head_dim_ +
+                                2U * value_heads_ * value_head_dim_;
+    const auto ba_size = 2U * value_heads_;
+    const auto delta_size = value_heads_ * value_head_dim_;
+    const auto conv_size = 2U * key_heads_ * key_head_dim_ + delta_size;
+    const auto conv_state_size = conv_size * conv_kernel_;
+    const auto recurrent_size = value_heads_ * key_head_dim_ * value_head_dim_;
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "linear_attn.in_proj_qkvz.weight"), normalized_,
+        projected_qkvz_, rows, nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "linear_attn.in_proj_ba.weight"), normalized_,
+        projected_ba_, rows, nullptr));
+    for (std::uint32_t row = 0; row < rows; ++row)
+      status_check(expert::runtime::cuda::qwen3_next_delta_decode({
+          projected_qkvz_ + static_cast<std::size_t>(row) * projected_size,
+          projected_ba_ + static_cast<std::size_t>(row) * ba_size,
+          fp32(prefix + "linear_attn.conv1d.weight"),
+          fp32(prefix + "linear_attn.dt_bias"),
+          fp32(prefix + "linear_attn.A_log"),
+          fp32(prefix + "linear_attn.norm.weight"),
+          conv_state_[layer] + static_cast<std::size_t>(row) * conv_state_size,
+          recurrent_state_[layer] +
+              static_cast<std::size_t>(row) * recurrent_size,
+          conv_output_ + static_cast<std::size_t>(row) * conv_size,
+          delta_output_ + static_cast<std::size_t>(row) * delta_size,
+          key_heads_, value_heads_, key_head_dim_, value_head_dim_,
+          conv_kernel_, epsilon_, nullptr}));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "linear_attn.out_proj.weight"), delta_output_,
+        residual_, rows, nullptr));
+  }
+
+  void run_moe(const std::string& prefix, std::uint32_t layer,
+               std::uint32_t rows) {
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "mlp.shared_expert.gate_proj.weight"), normalized_,
+        shared_gate_, rows, nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "mlp.shared_expert.up_proj.weight"), normalized_,
+        shared_up_, rows, nullptr));
+    status_check(expert::runtime::cuda::silu_product(
+        shared_gate_, shared_up_, shared_intermediate_, rows * shared_width_,
+        nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "mlp.shared_expert.down_proj.weight"),
+        shared_intermediate_, shared_output_, rows, nullptr));
+    status_check(expert::runtime::cuda::gemv_batch(
+        matrix(prefix + "mlp.shared_expert_gate.weight"), normalized_,
+        shared_scalar_, rows, nullptr));
+    for (std::uint32_t row = 0; row < rows; ++row)
+      status_check(expert::runtime::cuda::sigmoid_scale_in_place(
+          shared_output_ + static_cast<std::size_t>(row) * hidden_,
+          shared_scalar_ + row, hidden_, nullptr));
+    status_check(expert::runtime::cuda::router_topk_normalized_batch(
+        normalized_, fp32(prefix + "mlp.gate.weight"), rows, hidden_, experts_,
+        top_k_, router_logits_, routing_scores_, routing_indices_, nullptr));
+
+    std::vector<std::uint32_t> selected(static_cast<std::size_t>(rows) * top_k_);
     cuda_check(cudaMemcpy(selected.data(), routing_indices_,
                           selected.size() * sizeof(selected[0]),
                           cudaMemcpyDeviceToHost),
                "copy selected expert ids");
+    std::sort(selected.begin(), selected.end());
+    selected.erase(std::unique(selected.begin(), selected.end()), selected.end());
     std::vector<expert::runtime::AcquireHandle> handles;
-    handles.reserve(top_k_);
+    handles.reserve(selected.size());
     for (const auto expert : selected) {
+      if (expert >= experts_) throw std::runtime_error("router expert out of range");
       const auto& record = expert_records_.at(
           static_cast<std::size_t>(layer) * experts_ + expert);
       handles.push_back(cache_->acquire({model_id_, layer, expert, 1}, record));
     }
     std::vector<expert::runtime::ExpertLease> leases;
-    std::vector<const std::int8_t*> gate(top_k_), down(top_k_);
-    std::vector<const float*> gate_scales(top_k_), down_scales(top_k_);
-    leases.reserve(top_k_);
-    for (std::uint32_t slot = 0; slot < top_k_; ++slot) {
+    std::vector<const std::int8_t*> gate(experts_), down(experts_);
+    std::vector<const float*> gate_scales(experts_), down_scales(experts_);
+    leases.reserve(selected.size());
+    for (std::size_t slot = 0; slot < selected.size(); ++slot) {
       auto acquired = handles[slot].get();
       if (!acquired.status.ok())
         throw std::runtime_error("expert acquire failed: " +
@@ -465,35 +558,35 @@ class Qwen3NextModel final {
           dynamic_cast<const expert::runtime::cuda::CudaExpertAllocation*>(
               leases.back().get());
       if (!allocation) throw std::runtime_error("unexpected expert allocation");
-      gate[slot] = allocation->gate_up();
-      gate_scales[slot] = allocation->gate_up_scales();
-      down[slot] = allocation->down();
-      down_scales[slot] = allocation->down_scales();
+      const auto expert = selected[slot];
+      gate[expert] = allocation->gate_up();
+      gate_scales[expert] = allocation->gate_up_scales();
+      down[expert] = allocation->down();
+      down_scales[expert] = allocation->down_scales();
     }
-    cuda_check(cudaMemcpy(d_gate_up_, gate.data(), top_k_ * sizeof(gate[0]),
+    const auto pointer_bytes = static_cast<std::size_t>(experts_) * sizeof(void*);
+    cuda_check(cudaMemcpy(d_gate_up_, gate.data(), pointer_bytes,
                           cudaMemcpyHostToDevice), "copy gate pointers");
-    cuda_check(cudaMemcpy(d_gate_scales_, gate_scales.data(),
-                          top_k_ * sizeof(gate_scales[0]), cudaMemcpyHostToDevice),
-               "copy gate scale pointers");
-    cuda_check(cudaMemcpy(d_down_, down.data(), top_k_ * sizeof(down[0]),
+    cuda_check(cudaMemcpy(d_gate_scales_, gate_scales.data(), pointer_bytes,
+                          cudaMemcpyHostToDevice), "copy gate scale pointers");
+    cuda_check(cudaMemcpy(d_down_, down.data(), pointer_bytes,
                           cudaMemcpyHostToDevice), "copy down pointers");
-    cuda_check(cudaMemcpy(d_down_scales_, down_scales.data(),
-                          top_k_ * sizeof(down_scales[0]), cudaMemcpyHostToDevice),
-               "copy down scale pointers");
-    status_check(expert::runtime::cuda::launch_moe_single_token({
+    cuda_check(cudaMemcpy(d_down_scales_, down_scales.data(), pointer_bytes,
+                          cudaMemcpyHostToDevice), "copy down scale pointers");
+    status_check(expert::runtime::cuda::launch_moe_batch({
         normalized_, d_gate_up_, d_gate_scales_, d_down_, d_down_scales_,
-        routing_scores_, nullptr, moe_intermediate_, moe_output_, hidden_,
-        expert_width_, top_k_, top_k_, nullptr}));
+        routing_scores_, routing_indices_, moe_intermediate_, moe_output_, rows,
+        hidden_, expert_width_, top_k_, experts_, nullptr}));
     status_check(expert::runtime::cuda::add_in_place(
-        moe_output_, shared_output_, hidden_, nullptr));
+        moe_output_, shared_output_, rows * hidden_, nullptr));
     status_check(expert::runtime::cuda::add_in_place(
-        hidden_state_, moe_output_, hidden_, nullptr));
-    // Leases protect pointers until all kernels that consume them complete.
-    cuda_check(cudaDeviceSynchronize(), "complete expert layer");
+        hidden_state_, moe_output_, rows * hidden_, nullptr));
+    // Leases protect all expert pointers through completion of the batch.
+    cuda_check(cudaDeviceSynchronize(), "complete expert layer batch");
   }
 
   std::filesystem::path root_;
-  std::uint32_t max_context_{};
+  std::uint32_t max_context_{}, capacity_{};
   std::uint32_t hidden_{}, expert_width_{}, vocab_{}, layers_{};
   std::uint32_t query_heads_{}, kv_heads_{}, head_dim_{}, experts_{}, top_k_{};
   std::uint32_t full_interval_{}, conv_kernel_{}, key_head_dim_{},
@@ -535,10 +628,168 @@ std::vector<std::uint32_t> parse_tokens(std::string_view text) {
   return result;
 }
 
+std::vector<std::string_view> split_tabs(std::string_view line) {
+  std::vector<std::string_view> fields;
+  while (true) {
+    const auto tab = line.find('\t');
+    fields.push_back(line.substr(0, tab));
+    if (tab == std::string_view::npos) break;
+    line.remove_prefix(tab + 1U);
+  }
+  return fields;
+}
+
+int worker_loop(Qwen3NextModel& model) {
+  std::uint64_t active_id = 0;
+  std::uint32_t predicted = 0, next_position = 0;
+  std::cout << "{\"type\":\"ready\",\"protocol\":1}\n" << std::flush;
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    try {
+      const auto fields = split_tabs(line);
+      if (fields[0] == "PING") {
+        if (fields.size() != 1) throw std::runtime_error("invalid PING");
+        std::cout << "{\"type\":\"pong\"}\n" << std::flush;
+      } else if (fields[0] == "BEGIN") {
+        if (fields.size() != 3 || active_id != 0)
+          throw std::runtime_error("invalid BEGIN");
+        const auto request_id = std::stoull(std::string(fields[1]));
+        if (!request_id) throw std::runtime_error("request id zero");
+        const auto prompt = parse_tokens(fields[2]);
+        model.reset_request();
+        for (std::uint32_t position = 0; position < prompt.size(); ++position)
+          predicted = model.forward(prompt[position], position);
+        next_position = static_cast<std::uint32_t>(prompt.size());
+        active_id = request_id;
+        std::cout << "{\"type\":\"begun\",\"id\":" << request_id
+                  << "}\n" << std::flush;
+      } else if (fields[0] == "NEXT") {
+        if (fields.size() != 3) throw std::runtime_error("invalid NEXT");
+        const auto id = std::stoull(std::string(fields[1]));
+        if (!id || id != active_id) throw std::runtime_error("NEXT request mismatch");
+        if (fields[2] != "0" && fields[2] != "1")
+          throw std::runtime_error("NEXT final flag must be 0 or 1");
+        const bool final = fields[2] == "1";
+        const auto token = predicted;
+        if (!final) predicted = model.forward(token, next_position++);
+        std::cout << "{\"type\":\"token\",\"id\":" << id
+                  << ",\"token\":" << token << "}\n" << std::flush;
+        if (final) active_id = 0;
+      } else if (fields[0] == "END") {
+        if (fields.size() != 2 || active_id == 0 ||
+            std::stoull(std::string(fields[1])) != active_id)
+          throw std::runtime_error("END request mismatch");
+        const auto id = active_id;
+        active_id = 0;
+        std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
+                  << std::flush;
+      } else if (fields[0] == "SHUTDOWN") {
+        if (fields.size() != 1 || active_id)
+          throw std::runtime_error("invalid SHUTDOWN");
+        std::cout << "{\"type\":\"shutdown\"}\n" << std::flush;
+        return 0;
+      } else {
+        throw std::runtime_error("unknown worker command");
+      }
+    } catch (const std::exception& error) {
+      std::cerr << "worker command failed: " << error.what() << '\n';
+      std::cout << "{\"type\":\"error\",\"active_id\":" << active_id
+                << "}\n" << std::flush;
+    }
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
+      if (argc < 4 || argc > 8)
+        throw std::runtime_error(
+            "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
+            "[concurrency] [ram-gib] [vram-gib]");
+      const auto prompt = parse_tokens(argv[3]);
+      const auto new_tokens = argc >= 5
+          ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
+      const auto concurrency = argc >= 6
+          ? static_cast<std::uint32_t>(std::stoul(argv[5])) : 4U;
+      const auto ram_gib = argc >= 7 ? std::stoull(argv[6]) : 48ULL;
+      const auto vram_gib = argc >= 8 ? std::stoull(argv[7]) : 14ULL;
+      if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
+        throw std::runtime_error("zero batched runtime setting");
+      const auto max_context =
+          static_cast<std::uint32_t>(prompt.size()) + new_tokens;
+      const auto started_load = std::chrono::steady_clock::now();
+      Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
+                           vram_gib << 30U, concurrency);
+      const auto load_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started_load).count();
+      std::vector<std::uint32_t> batch_tokens(concurrency),
+          positions(concurrency), predicted;
+      const auto started_prompt = std::chrono::steady_clock::now();
+      for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+        std::fill(batch_tokens.begin(), batch_tokens.end(), prompt[position]);
+        std::fill(positions.begin(), positions.end(), position);
+        predicted = model.forward_batch(batch_tokens, positions);
+      }
+      const auto prompt_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started_prompt).count();
+      std::vector<std::vector<std::uint32_t>> generated(concurrency);
+      const auto started_decode = std::chrono::steady_clock::now();
+      for (std::uint32_t step = 0; step < new_tokens; ++step) {
+        for (std::uint32_t row = 0; row < concurrency; ++row)
+          generated[row].push_back(predicted[row]);
+        if (step + 1U < new_tokens) {
+          std::fill(positions.begin(), positions.end(),
+                    static_cast<std::uint32_t>(prompt.size()) + step);
+          predicted = model.forward_batch(predicted, positions);
+        }
+      }
+      const auto decode_seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started_decode).count();
+      const auto forwards = static_cast<std::uint64_t>(new_tokens - 1U) *
+                            concurrency;
+      const bool identical = std::all_of(
+          generated.begin() + 1, generated.end(),
+          [&](const auto& sequence) { return sequence == generated.front(); });
+      const auto metrics = model.telemetry();
+      std::cout << "{\"tokens\":[";
+      for (std::size_t i = 0; i < generated.front().size(); ++i) {
+        if (i) std::cout << ',';
+        std::cout << generated.front()[i];
+      }
+      std::cout << "],\"concurrency\":" << concurrency
+                << ",\"identical_outputs\":"
+                << (identical ? "true" : "false")
+                << ",\"model_load_seconds\":" << load_seconds
+                << ",\"prompt_seconds\":" << prompt_seconds
+                << ",\"decode_seconds\":" << decode_seconds
+                << ",\"aggregate_forward_tokens\":" << forwards
+                << ",\"tokens_per_second\":"
+                << (forwards ? forwards / decode_seconds : 0.0)
+                << ",\"container_bytes\":" << model.total_pack_bytes()
+                << ",\"expert_read_bytes\":" << metrics.read_bytes
+                << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
+                << ",\"expert_loads\":" << metrics.load_completed
+                << ",\"expert_deduplicated\":" << metrics.load_deduplicated
+                << ",\"ram_high_water\":" << metrics.ram_high_water
+                << ",\"vram_high_water\":" << metrics.vram_high_water
+                << ",\"evictions\":" << metrics.eviction_count << "}\n";
+      return identical ? 0 : 2;
+    }
+    if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
+      if (argc > 6)
+        throw std::runtime_error(
+            "worker usage: <container> --worker [max-context] [ram-gib] [vram-gib]");
+      const auto max_context = argc >= 4
+          ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
+      const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
+      const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
+      Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
+                           vram_gib << 30U);
+      return worker_loop(model);
+    }
     if (argc < 3 || argc > 6) {
       std::cerr << "usage: expert-qwen3-next-runner <container> <token-ids-csv> "
                    "[new-tokens] [ram-cache-gib] [vram-cache-gib]\n";
