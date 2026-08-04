@@ -178,7 +178,9 @@ contoarele bounded de batching/TTFT/p95. Rezultatul este păstrat în
 `artifacts/p6-service-smoke-latest.json`.
 
 Gate-ul aggregate folosește microbatching real în același proces și același
-cache, nu mai multe copii ale modelului:
+cache, nu mai multe copii ale modelului. Poarta canonică folosește patru
+prompturi diferite și compară fiecare secvență batched cu execuția sa izolată;
+replicarea aceluiași prompt nu poate satisface poarta de corectitudine:
 
 ```powershell
 expert-qwen3-next-runner.exe C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8 `
@@ -190,16 +192,22 @@ telemetria comună SSD/RAM/VRAM. Numerele devin gate numai după conversia
 checkpoint-ului complet; smoke-ul de kernel nu este tratat ca benchmark de model.
 Implicit, runnerul face un warmup complet în același proces, resetează numai
 starea request-ului și începe apoi contoarele gate-ului; cache-ul de experți
-rămâne intact. Wrapperul canonic rulează ambele porți și monitorizează memoria și
-pagefile-ul pe toată durata:
+rămâne intact. Wrapperul canonic rulează ambele porți și monitorizează working
+set-ul, memoria privată, minimul de RAM fizic liber și pagefile-ul pe toată
+durata:
 
 ```powershell
-Invoke-P6Gate.ps1 -Mode Both -NewTokens 32 -Concurrency 4
+Invoke-P6Gate.ps1 -Mode Both -NewTokens 32 -Concurrency 4 `
+  -MinimumFreePhysicalGiB 2
 ```
 
-Gate-ul `no_swap` este strict: pagefile usage trebuie să fie zero înainte și
-după fiecare rulare. Un delta zero peste un pagefile deja folosit nu este raportat
-ca succes. Artefactul rezultat este `artifacts/p6-gate-latest.json`.
+Pagefile-ul Windows rămâne activ ca mecanism de siguranță al sistemului de
+operare. Gate-ul demonstrează că runtime-ul nu se bazează pe el: utilizarea
+pagefile-ului nu poate crește față de baseline pe durata rulării, iar RAM-ul
+fizic liber nu poate coborî sub rezerva declarată. Utilizarea deja existentă a
+pagefile-ului de către Windows sau alte procese este raportată, dar nu
+invalidează singură workload-ul. Artefactul rezultat este
+`artifacts/p6-gate-latest.json`.
 
 ## Fluxul de lucru
 

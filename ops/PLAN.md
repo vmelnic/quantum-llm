@@ -400,12 +400,12 @@ Starea curentă:
 | Fază | Stare |
 |---|---|
 | P0 contract/skeleton | completă |
-| P1 compiler/container | completă pentru OLMoE și Qwen3-Next |
+| P1 compiler/container | completă; containerul Qwen3-Next real este validat independent |
 | P2 storage/cache | completă și validată pe Windows/RTX 3090 |
-| P3 single-request exact | completă pentru OLMoE; implementată pentru Qwen, așteaptă containerul real |
+| P3 single-request exact | completă pentru OLMoE; Qwen este implementat și așteaptă gate-ul real |
 | P4 batching | completă pentru OLMoE; Qwen are dense/router/MoE batched, așteaptă măsurarea reală |
 | P5 serviciu | completă și operabilă; profilul Task Scheduler și smoke-ul Qwen sunt pregătite |
-| P6 model > RAM | în curs: download, conversie și gate-urile reale rămân deschise |
+| P6 model > RAM | în curs: downloadul, conversia și validarea sunt complete; gate-urile reale rămân deschise |
 
 Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P0–P5 nu
 se redeschid ca experimente; se corectează numai dacă rularea P6 descoperă un
@@ -532,7 +532,9 @@ checkpoint-ului:
 
 Poarta finală:
 
-- modelul complet nu este rezident în RAM și sistemul nu folosește swap;
+- modelul complet nu este rezident în RAM, runtime-ul nu mărește utilizarea
+  pagefile-ului și păstrează rezerva declarată de RAM fizic; pagefile-ul Windows
+  poate rămâne activ ca mecanism de siguranță al sistemului;
 - cel puțin 10 tok/s single-stream hot;
 - cel puțin 30 tok/s aggregate la concurența declarată;
 - cold miss bytes/token, hit/reuse, TTFT și p95 sunt publicate;
@@ -879,7 +881,9 @@ Cheia fazei distribuite este:
 5. validăm containerul complet independent prin `Invoke-ExpertPack.ps1 -Action
    Validate`; un pack incomplet sau un hash invalid oprește fluxul;
 6. rulăm Qwen single-request, publicăm TTFT, hot tok/s, bytes SSD/H2D per token,
-   hit VRAM/RAM, miss SSD, high-water și eviction; pagefile/swap nu este acceptat;
+   hit VRAM/RAM, miss SSD, high-water și eviction; utilizarea pagefile-ului
+   existentă la baseline este permisă, dar workload-ul nu o poate crește și
+   trebuie să păstreze rezerva declarată de RAM fizic;
 7. rulăm `--batch` la concurența 4 în același proces/cache și publicăm tok/s
    aggregate, nu suma unor procese cu copii separate ale modelului;
 8. verificăm output-ul determinist și semantica INT8 prin controalele deja

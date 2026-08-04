@@ -723,6 +723,20 @@ std::vector<std::uint32_t> parse_tokens(std::string_view text) {
   return result;
 }
 
+std::vector<std::vector<std::uint32_t>> parse_prompt_batch(
+    std::string_view text) {
+  std::vector<std::vector<std::uint32_t>> result;
+  while (true) {
+    const auto separator = text.find(';');
+    const auto prompt = text.substr(0, separator);
+    if (prompt.empty()) throw std::runtime_error("empty prompt in batch");
+    result.push_back(parse_tokens(prompt));
+    if (separator == std::string_view::npos) break;
+    text.remove_prefix(separator + 1U);
+  }
+  return result;
+}
+
 double percentile_ms(std::vector<double> values, double fraction) {
   if (values.empty()) return 0.0;
   std::sort(values.begin(), values.end());
@@ -899,7 +913,7 @@ int main(int argc, char** argv) {
         throw std::runtime_error(
             "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
             "[concurrency] [ram-gib] [vram-gib] [warmup-rounds]");
-      const auto prompt = parse_tokens(argv[3]);
+      auto prompts = parse_prompt_batch(argv[3]);
       const auto new_tokens = argc >= 5
           ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
       const auto concurrency = argc >= 6
@@ -910,37 +924,62 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 1U;
       if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
         throw std::runtime_error("zero batched runtime setting");
-      const auto max_context =
-          static_cast<std::uint32_t>(prompt.size()) + new_tokens;
+      if (prompts.size() == 1U) prompts.resize(concurrency, prompts.front());
+      if (prompts.size() != concurrency)
+        throw std::runtime_error(
+            "batch prompt count must be one or equal concurrency");
+      const bool identical_prompts = std::all_of(
+          prompts.begin() + 1, prompts.end(),
+          [&](const auto& prompt) { return prompt == prompts.front(); });
+      const auto longest_prompt = std::max_element(
+          prompts.begin(), prompts.end(),
+          [](const auto& left, const auto& right) {
+            return left.size() < right.size();
+          })->size();
+      const auto max_context = static_cast<std::uint32_t>(longest_prompt) +
+                               new_tokens;
       const auto started_load = std::chrono::steady_clock::now();
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                            vram_gib << 30U, concurrency);
       const auto load_seconds = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started_load).count();
-      std::vector<std::uint32_t> batch_tokens(concurrency),
-          positions(concurrency), predicted;
+      std::vector<std::uint32_t> batch_tokens, positions, state_slots,
+          predicted(concurrency);
+      std::vector<std::uint32_t> all_slots(concurrency);
+      std::iota(all_slots.begin(), all_slots.end(), 0U);
+      const auto prefill = [&]() {
+        std::fill(predicted.begin(), predicted.end(), 0U);
+        for (std::uint32_t position = 0; position < longest_prompt; ++position) {
+          batch_tokens.clear();
+          positions.clear();
+          state_slots.clear();
+          for (std::uint32_t row = 0; row < concurrency; ++row) {
+            if (position >= prompts[row].size()) continue;
+            batch_tokens.push_back(prompts[row][position]);
+            positions.push_back(position);
+            state_slots.push_back(row);
+          }
+          const auto outputs =
+              model.forward_batch(batch_tokens, positions, state_slots);
+          for (std::size_t index = 0; index < state_slots.size(); ++index)
+            predicted[state_slots[index]] = outputs[index];
+        }
+      };
       for (std::uint32_t round = 0; round < warmup_rounds; ++round) {
         model.reset_request();
-        for (std::uint32_t position = 0; position < prompt.size(); ++position) {
-          std::fill(batch_tokens.begin(), batch_tokens.end(), prompt[position]);
-          std::fill(positions.begin(), positions.end(), position);
-          predicted = model.forward_batch(batch_tokens, positions);
-        }
+        prefill();
         for (std::uint32_t step = 0; step + 1U < new_tokens; ++step) {
-          std::fill(positions.begin(), positions.end(),
-                    static_cast<std::uint32_t>(prompt.size()) + step);
-          predicted = model.forward_batch(predicted, positions);
+          positions.resize(concurrency);
+          for (std::uint32_t row = 0; row < concurrency; ++row)
+            positions[row] = static_cast<std::uint32_t>(prompts[row].size()) + step;
+          predicted = model.forward_batch(predicted, positions, all_slots);
         }
       }
       const auto baseline_metrics = model.telemetry();
       const auto baseline_phase = model.phase_telemetry();
       model.reset_request();
       const auto started_prompt = std::chrono::steady_clock::now();
-      for (std::uint32_t position = 0; position < prompt.size(); ++position) {
-        std::fill(batch_tokens.begin(), batch_tokens.end(), prompt[position]);
-        std::fill(positions.begin(), positions.end(), position);
-        predicted = model.forward_batch(batch_tokens, positions);
-      }
+      prefill();
       const auto prompt_seconds = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started_prompt).count();
       std::vector<std::vector<std::uint32_t>> generated(concurrency);
@@ -950,10 +989,11 @@ int main(int argc, char** argv) {
         for (std::uint32_t row = 0; row < concurrency; ++row)
           generated[row].push_back(predicted[row]);
         if (step + 1U < new_tokens) {
-          std::fill(positions.begin(), positions.end(),
-                    static_cast<std::uint32_t>(prompt.size()) + step);
+          positions.resize(concurrency);
+          for (std::uint32_t row = 0; row < concurrency; ++row)
+            positions[row] = static_cast<std::uint32_t>(prompts[row].size()) + step;
           const auto step_started = std::chrono::steady_clock::now();
-          predicted = model.forward_batch(predicted, positions);
+          predicted = model.forward_batch(predicted, positions, all_slots);
           inter_token_ms.push_back(std::chrono::duration<double, std::milli>(
               std::chrono::steady_clock::now() - step_started).count());
         }
@@ -962,7 +1002,7 @@ int main(int argc, char** argv) {
           std::chrono::steady_clock::now() - started_decode).count();
       const auto forwards = static_cast<std::uint64_t>(new_tokens - 1U) *
                             concurrency;
-      const bool identical = std::all_of(
+      const bool identical_outputs = std::all_of(
           generated.begin() + 1, generated.end(),
           [&](const auto& sequence) { return sequence == generated.front(); });
       const auto metrics = model.telemetry();
@@ -977,20 +1017,53 @@ int main(int argc, char** argv) {
           metrics.acquire_ram_hits - baseline_metrics.acquire_ram_hits;
       const auto measured_ssd_misses =
           metrics.acquire_ssd_misses - baseline_metrics.acquire_ssd_misses;
-      const auto model_forwards =
-          (static_cast<std::uint64_t>(prompt.size()) + new_tokens - 1U) *
-          concurrency;
+      const auto prompt_forwards = std::accumulate(
+          prompts.begin(), prompts.end(), std::uint64_t{0},
+          [](std::uint64_t total, const auto& prompt) {
+            return total + prompt.size();
+          });
+      const auto model_forwards = prompt_forwards + forwards;
       const auto acquires =
           measured_vram_hits + measured_ram_hits + measured_ssd_misses;
+
+      std::vector<std::vector<std::uint32_t>> isolated(concurrency);
+      for (std::uint32_t row = 0; row < concurrency; ++row) {
+        model.reset_slot(0);
+        std::uint32_t isolated_prediction = 0;
+        for (std::uint32_t position = 0; position < prompts[row].size(); ++position)
+          isolated_prediction = model.forward(prompts[row][position], position);
+        for (std::uint32_t step = 0; step < new_tokens; ++step) {
+          isolated[row].push_back(isolated_prediction);
+          if (step + 1U < new_tokens)
+            isolated_prediction = model.forward(
+                isolated_prediction,
+                static_cast<std::uint32_t>(prompts[row].size()) + step);
+        }
+      }
+      const bool interleaving_match = isolated == generated;
       std::cout << "{\"tokens\":[";
       for (std::size_t i = 0; i < generated.front().size(); ++i) {
         if (i) std::cout << ',';
         std::cout << generated.front()[i];
       }
+      std::cout << "],\"request_tokens\":[";
+      for (std::size_t row = 0; row < generated.size(); ++row) {
+        if (row) std::cout << ',';
+        std::cout << '[';
+        for (std::size_t token = 0; token < generated[row].size(); ++token) {
+          if (token) std::cout << ',';
+          std::cout << generated[row][token];
+        }
+        std::cout << ']';
+      }
       std::cout << "],\"concurrency\":" << concurrency
                 << ",\"warmup_rounds\":" << warmup_rounds
+                << ",\"mixed_prompts\":"
+                << (!identical_prompts ? "true" : "false")
                 << ",\"identical_outputs\":"
-                << (identical ? "true" : "false")
+                << (identical_outputs ? "true" : "false")
+                << ",\"interleaving_match\":"
+                << (interleaving_match ? "true" : "false")
                 << ",\"model_load_seconds\":" << load_seconds
                 << ",\"prompt_seconds\":" << prompt_seconds
                 << ",\"warm_ttft_seconds\":" << prompt_seconds
@@ -1027,7 +1100,7 @@ int main(int argc, char** argv) {
                 << ",\"evictions\":" << metrics.eviction_count;
       print_phase_json(std::cout, phases);
       std::cout << "}\n";
-      return identical ? 0 : 2;
+      return interleaving_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
       if (argc > 7)

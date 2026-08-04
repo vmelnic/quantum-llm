@@ -331,7 +331,8 @@ Concluzia actuală nu este „mai multe teste”, ci o separare de arhitectură:
 
 ## P6 — fundația modelului mai mare decât RAM
 
-Stare: **ÎN IMPLEMENTARE; compilerul și traseul cache→CUDA sunt validate**.
+Stare: **ÎN IMPLEMENTARE; containerul real este validat, gate-urile P6 rămân
+deschise**.
 
 Ținta aleasă este `Qwen/Qwen3-Next-80B-A3B-Instruct`: 48 straturi, 512
 experți/strat, top-10, hidden 2048 și expert width 512. Adaptorul strict
@@ -405,33 +406,31 @@ cancellation prin client disconnect și delta contoarelor de batching/TTFT/p95.
 Instalarea task-ului și smoke-ul real rămân după container și gate; pe 3090box
 nu exista niciun task `QuantumLLM*` la verificarea curentă.
 
-Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
-containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
-68.641.103.872 bytes RAM fizici. C: este singurul volum, deci sursa de
-162.649.725.440 bytes și containerul nu încap simultan fără reclamare.
-Preflight-ul confirmă că download-ul și conversia cu reclamare sunt fezabile,
-dar conversia fără reclamare nu este.
+Download-ul Xet s-a încheiat autoritativ cu `41/41` shard-uri, zero transferuri
+incomplete și exit code `0`; checkpoint-ul sursă ocupă `162.682.287.693` bytes
+în cache. Conversia reală a fost făcută fără `--reclaim-source-shards`, după
+curățarea celorlalte cache-uri Hugging Face. Sursa Qwen rămâne integrală pentru
+repack, alături de fixture-ul OLMoE.
 
-Ordinea de reclamare a fost simulată din `weight_map` și mărimile oficiale ale
-celor 41 de shard-uri, nu doar din masa totală. Un record are `3.162.112` bytes,
-un pack de 4 GiB ține 1.358 experți, iar conversia produce 19 pack-uri. Shard-ul
-41 (dense/MTP) se poate reclama imediat după `dense.qpack`; apoi se eliberează
-2–3 shard-uri per pack. La proiecția curentă de spațiu după download, minimum-ul
-este aproximativ `49,93 GiB` liberi, mult peste safety margin-ul de 8 GiB.
-Preflight-ul va recalcula aceeași curbă din dimensiunile locale înainte de a
-permite conversia reală.
+Containerul publicat atomic în
+`work/models/qwen3-next-80b-expert-pack-int8` are:
 
-Prima execuție Xet s-a oprit fără stdout/stderr după 10/41 shard-uri; `hf
-download --dry-run` a confirmat autoritativ că mai lipseau 31 fișiere și 122,7
-GB, deci oprirea procesului nu a fost acceptată drept succes. Launcherul rulează
-acum prin task-ul independent `QuantumLLM-P6ModelDownload`, refuză duplicatele
-și păstrează codul/eroarea finală în `p6-download-exit.json`. Identitatea task-
-ului este derivată din `WindowsIdentity`, deoarece sesiunile SSH raportează
-incorect `USERDOMAIN=WORKGROUP`. Același fix este folosit de deploy-ul
-serviciului.
+- `20` pack-uri: un `dense.qpack` și `19` pack-uri de experți;
+- `81.903.198.208` bytes în total, dintre care `4.191.133.696` dense și
+  `77.712.064.512` experți;
+- `2.216` tensori dense și `24.576` records de experți;
+- `1.517.813.760` bytes activi per token pentru top-10 înainte de cache reuse;
+- manifest content SHA-256
+  `55cc761ae66f294f2ad423421cb4d87462aaafea9ccae0c4b89efdaab04656e3`;
+- source checkpoint SHA-256
+  `5557a28a802a5195953c9f63e15f9117b58c4e49ec56ec711e94e7b699d77a13`.
 
-Compilerul are acum un mod distructiv explicit, oprit implicit: după fsync-ul
-fiecărui pack și al stării, jurnalizează hash-ul shard-ului consumat și elimină
-numai shard-uri fără tensori viitori. Modul trece testul end-to-end, dar nu va
-fi activat pe cache-ul real fără switch-ul operatorului; modelele existente nu
-sunt șterse automat.
+Conversia a durat `3.371,421 s`. Validatorul lansat separat de conversie a
+recitit containerul complet și a raportat `valid=true`, aceleași `20` pack-uri,
+`24.576` experți și același manifest hash. Astfel poarta P1 pentru containerul
+real este închisă; următoarea dovadă este gate-ul de inferență P6.
+
+Compilerul păstrează și modul distructiv explicit, oprit implicit. El poate
+reclama numai shard-uri confirmate ca fiind consumate, dar nu a fost folosit la
+această conversie și nu va fi aplicat checkpoint-ului Qwen păstrat pentru
+repack.

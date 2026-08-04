@@ -3,10 +3,12 @@ param(
     [string]$Mode = "Both",
     [string]$Container = "C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8",
     [string]$PromptTokenIds = "151644,872,374",
+    [string]$BatchPromptTokenIds = "151644,872,374;151644,9707,374;151644,17,488,17;151644,3696,13362",
     [int]$NewTokens = 32,
     [int]$Concurrency = 4,
     [int]$RamCacheGiB = 48,
     [int]$VramCacheGiB = 14,
+    [int]$MinimumFreePhysicalGiB = 2,
     [int]$WarmupRounds = 1,
     [double]$SingleTokensPerSecond = 10.0,
     [double]$AggregateTokensPerSecond = 30.0
@@ -16,7 +18,8 @@ param(
 Initialize-ExperimentDirectories
 
 if ($NewTokens -lt 2 -or $Concurrency -lt 1 -or $RamCacheGiB -lt 1 -or
-    $VramCacheGiB -lt 1 -or $WarmupRounds -lt 0) {
+    $VramCacheGiB -lt 1 -or $MinimumFreePhysicalGiB -lt 1 -or
+    $WarmupRounds -lt 0) {
     throw "Invalid P6 gate settings"
 }
 $runner = Join-Path $script:RepoRoot `
@@ -41,6 +44,7 @@ function Invoke-GateRun {
     $stdout = Join-Path $script:RepoRoot "logs\p6-gate-$Name.stdout.log"
     $stderr = Join-Path $script:RepoRoot "logs\p6-gate-$Name.stderr.log"
     $pagefileBefore = Get-PagefileUsageMiB
+    $pagefilePeak = $pagefileBefore
     $minimumFreePhysical = [int64]::MaxValue
     $peakWorkingSet = [int64]0
     $peakPrivateBytes = [int64]0
@@ -53,6 +57,7 @@ function Invoke-GateRun {
         $peakPrivateBytes = [Math]::Max($peakPrivateBytes, [int64]$process.PrivateMemorySize64)
         $freePhysical = [int64](Get-CimInstance Win32_OperatingSystem).FreePhysicalMemory * 1KB
         $minimumFreePhysical = [Math]::Min($minimumFreePhysical, $freePhysical)
+        $pagefilePeak = [Math]::Max($pagefilePeak, (Get-PagefileUsageMiB))
         Start-Sleep -Milliseconds 500
     }
     $process.Refresh()
@@ -64,7 +69,12 @@ function Invoke-GateRun {
     $line = Get-Content $stdout -Tail 1 -ErrorAction Stop
     $model = $line | ConvertFrom-Json
     $pagefileAfter = Get-PagefileUsageMiB
+    $pagefilePeak = [Math]::Max($pagefilePeak, $pagefileAfter)
+    $pagefileGrowth = [Math]::Max([int64]0, $pagefilePeak - $pagefileBefore)
     $physicalRam = [int64](Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory
+    $minimumFreePhysicalRequired = [int64]$MinimumFreePhysicalGiB * 1GB
+    $memoryHeadroomPass = $minimumFreePhysical -ge $minimumFreePhysicalRequired
+    $swapIndependencePass = $pagefileGrowth -eq 0 -and $memoryHeadroomPass
     return [PSCustomObject]@{
         mode = $Name
         started_utc = $started.ToString("o")
@@ -72,12 +82,22 @@ function Invoke-GateRun {
         required_tokens_per_second = $RequiredTokensPerSecond
         measured_tokens_per_second = [double]$model.tokens_per_second
         speed_gate_pass = [double]$model.tokens_per_second -ge $RequiredTokensPerSecond
+        correctness_gate_pass = if ($Name -eq "batch") {
+            [bool]$model.mixed_prompts -and [bool]$model.interleaving_match
+        } else { $true }
         container_bytes = [int64]$model.container_bytes
         physical_ram_bytes = $physicalRam
         container_larger_than_ram = [int64]$model.container_bytes -gt $physicalRam
         pagefile_usage_mib_before = $pagefileBefore
+        pagefile_usage_mib_peak = $pagefilePeak
         pagefile_usage_mib_after = $pagefileAfter
-        no_swap_gate_pass = $pagefileBefore -eq 0 -and $pagefileAfter -eq 0
+        pagefile_growth_mib = $pagefileGrowth
+        minimum_free_physical_required_bytes = $minimumFreePhysicalRequired
+        memory_headroom_gate_pass = $memoryHeadroomPass
+        swap_independence_gate_pass = $swapIndependencePass
+        # Backward-compatible field name. The invariant is workload independence
+        # from swap, not disabling a system-wide Windows safety mechanism.
+        no_swap_gate_pass = $swapIndependencePass
         peak_working_set_bytes = $peakWorkingSet
         peak_private_bytes = $peakPrivateBytes
         minimum_free_physical_bytes = $minimumFreePhysical
@@ -92,7 +112,7 @@ if ($Mode -in @("Single", "Both")) {
         -RequiredTokensPerSecond $SingleTokensPerSecond
 }
 if ($Mode -in @("Batch", "Both")) {
-    $arguments = "$Container --batch $PromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds"
+    $arguments = "$Container --batch $BatchPromptTokenIds $NewTokens $Concurrency $RamCacheGiB $VramCacheGiB $WarmupRounds"
     $runs += Invoke-GateRun -Name "batch" -Arguments $arguments `
         -RequiredTokensPerSecond $AggregateTokensPerSecond
 }
@@ -100,10 +120,11 @@ if ($Mode -in @("Batch", "Both")) {
 $overall = $true
 foreach ($run in $runs) {
     $overall = $overall -and $run.speed_gate_pass -and
-        $run.container_larger_than_ram -and $run.no_swap_gate_pass
+        $run.correctness_gate_pass -and $run.container_larger_than_ram -and
+        $run.no_swap_gate_pass
 }
 $result = [PSCustomObject]@{
-    schema_version = 1
+    schema_version = 2
     timestamp_utc = [DateTime]::UtcNow.ToString("o")
     model_id = "Qwen/Qwen3-Next-80B-A3B-Instruct"
     mode = $Mode
