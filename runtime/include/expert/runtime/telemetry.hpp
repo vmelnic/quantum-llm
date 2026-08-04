@@ -9,6 +9,9 @@ namespace expert::runtime {
 struct ExpertCacheCore;
 
 struct TelemetrySnapshot final {
+  std::uint64_t acquire_vram_hits{};
+  std::uint64_t acquire_ram_hits{};
+  std::uint64_t acquire_ssd_misses{};
   std::uint64_t load_started{};
   std::uint64_t load_deduplicated{};
   std::uint64_t load_completed{};
@@ -49,6 +52,9 @@ class Telemetry final {
                        std::uint64_t value) noexcept;
 
   std::atomic<std::uint64_t> load_started_{0};
+  std::atomic<std::uint64_t> acquire_vram_hits_{0};
+  std::atomic<std::uint64_t> acquire_ram_hits_{0};
+  std::atomic<std::uint64_t> acquire_ssd_misses_{0};
   std::atomic<std::uint64_t> load_deduplicated_{0};
   std::atomic<std::uint64_t> load_completed_{0};
   std::atomic<std::uint64_t> upload_started_{0};

@@ -771,6 +771,12 @@ int main(int argc, char** argv) {
                 << ",\"container_bytes\":" << model.total_pack_bytes()
                 << ",\"expert_read_bytes\":" << metrics.read_bytes
                 << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
+                << ",\"expert_vram_hits\":" << metrics.acquire_vram_hits
+                << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
+                << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
+                << ",\"expert_acquires\":"
+                << (metrics.acquire_vram_hits + metrics.acquire_ram_hits +
+                    metrics.acquire_ssd_misses)
                 << ",\"expert_loads\":" << metrics.load_completed
                 << ",\"expert_deduplicated\":" << metrics.load_deduplicated
                 << ",\"ram_high_water\":" << metrics.ram_high_water
@@ -836,6 +842,12 @@ int main(int argc, char** argv) {
               << ",\"startup_dense_read_bytes\":" << model.dense_read_bytes()
               << ",\"expert_read_bytes\":" << metrics.read_bytes
               << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
+              << ",\"expert_vram_hits\":" << metrics.acquire_vram_hits
+              << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
+              << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
+              << ",\"expert_acquires\":"
+              << (metrics.acquire_vram_hits + metrics.acquire_ram_hits +
+                  metrics.acquire_ssd_misses)
               << ",\"expert_loads\":" << metrics.load_completed
               << ",\"expert_deduplicated\":" << metrics.load_deduplicated
               << ",\"ram_high_water\":" << metrics.ram_high_water

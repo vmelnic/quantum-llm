@@ -411,7 +411,8 @@ void test_concurrent_load_dedup_and_visibility() {
           "ready leases are not reference-counted");
   const auto metrics = harness.cache.telemetry();
   require(metrics.load_started == 1 &&
-              metrics.load_deduplicated == kCallers - 1,
+              metrics.load_deduplicated == kCallers - 1 &&
+              metrics.acquire_ssd_misses == kCallers,
           "load dedup telemetry mismatch");
 }
 
@@ -528,7 +529,13 @@ void test_ram_hit_reuploads_after_vram_eviction() {
   auto result = ram_hit.get();
   require(result.status.ok() && result.lease,
           "RAM hit did not republish after VRAM reservation");
-  require(harness.cache.telemetry().upload_completed == 3,
+  auto vram_hit = harness.cache.acquire(first.key, first.record).get();
+  require(vram_hit.status.ok() && vram_hit.lease,
+          "VRAM hit did not return a lease immediately");
+  const auto metrics = harness.cache.telemetry();
+  require(metrics.upload_completed == 3 && metrics.acquire_ram_hits == 1 &&
+              metrics.acquire_vram_hits == 1 &&
+              metrics.acquire_ssd_misses == 2,
           "RAM reupload telemetry mismatch");
 }
 

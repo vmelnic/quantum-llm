@@ -517,6 +517,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
                       "expert is quarantined after a failed load"),
                {}});
         } else if (entry.state == CacheState::vram_ready && entry.device) {
+          Telemetry::add(metrics.acquire_vram_hits_);
           ++entry.references;
           entry.last_access = ++access_clock;
           auto weak = weak_from_this();
@@ -528,6 +529,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
                  }
                })});
         } else {
+          if (entry.state == CacheState::ram_ready ||
+              entry.state == CacheState::gpu_uploading) {
+            Telemetry::add(metrics.acquire_ram_hits_);
+          } else if (entry.state == CacheState::absent ||
+                     entry.state == CacheState::ssd_loading) {
+            Telemetry::add(metrics.acquire_ssd_misses_);
+          }
           if (!entry.waiters.empty() || entry.state != CacheState::absent) {
             Telemetry::add(metrics.load_deduplicated_);
           }

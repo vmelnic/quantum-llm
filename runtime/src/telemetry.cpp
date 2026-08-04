@@ -25,6 +25,9 @@ void Telemetry::maximize(std::atomic<std::uint64_t>& target,
 
 TelemetrySnapshot Telemetry::snapshot() const noexcept {
   TelemetrySnapshot result;
+  result.acquire_vram_hits = acquire_vram_hits_.load(std::memory_order_relaxed);
+  result.acquire_ram_hits = acquire_ram_hits_.load(std::memory_order_relaxed);
+  result.acquire_ssd_misses = acquire_ssd_misses_.load(std::memory_order_relaxed);
 #define EXPERT_SNAPSHOT(field) \
   result.field = field##_.load(std::memory_order_relaxed)
   EXPERT_SNAPSHOT(load_started);
