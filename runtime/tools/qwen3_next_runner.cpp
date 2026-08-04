@@ -221,14 +221,26 @@ class Qwen3NextModel final {
 
   std::vector<std::uint32_t> forward_batch(
       std::span<const std::uint32_t> tokens,
-      std::span<const std::uint32_t> positions) {
+      std::span<const std::uint32_t> positions,
+      std::span<const std::uint32_t> state_slots = {}) {
     if (tokens.empty() || tokens.size() != positions.size() ||
-        tokens.size() > capacity_)
+        tokens.size() > capacity_ ||
+        (!state_slots.empty() && state_slots.size() != tokens.size()))
       throw std::runtime_error("invalid Qwen3-Next microbatch");
     const auto rows = static_cast<std::uint32_t>(tokens.size());
+    std::vector<std::uint32_t> default_slots;
+    if (state_slots.empty()) {
+      default_slots.resize(rows);
+      std::iota(default_slots.begin(), default_slots.end(), 0U);
+      state_slots = default_slots;
+    }
+    std::vector<bool> seen_slots(capacity_);
     for (std::uint32_t row = 0; row < rows; ++row) {
       if (positions[row] >= max_context_ || tokens[row] >= vocab_)
         throw std::runtime_error("token/position outside capacity");
+      if (state_slots[row] >= capacity_ || seen_slots[state_slots[row]])
+        throw std::runtime_error("invalid or duplicate request state slot");
+      seen_slots[state_slots[row]] = true;
       status_check(expert::runtime::cuda::embedding(
           matrix("model.embed_tokens.weight"), tokens[row],
           hidden_state_ + static_cast<std::size_t>(row) * hidden_, nullptr));
@@ -242,9 +254,9 @@ class Qwen3NextModel final {
             normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
             epsilon_, nullptr));
       if ((layer + 1U) % full_interval_ == 0) {
-        run_full_attention(prefix, layer, positions, rows);
+        run_full_attention(prefix, layer, positions, state_slots, rows);
       } else {
-        run_delta(prefix, layer, rows);
+        run_delta(prefix, layer, state_slots, rows);
       }
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, residual_, rows * hidden_, nullptr));
@@ -281,6 +293,27 @@ class Qwen3NextModel final {
   }
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
+  std::uint32_t capacity() const noexcept { return capacity_; }
+  void reset_slot(std::uint32_t slot) {
+    if (slot >= capacity_) throw std::runtime_error("state slot out of range");
+    const auto conv_elements =
+        (static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
+         static_cast<std::size_t>(value_heads_) * value_head_dim_) *
+        conv_kernel_;
+    const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
+                                    key_head_dim_ * value_head_dim_;
+    for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      if ((layer + 1U) % full_interval_ != 0) {
+        cuda_check(cudaMemset(conv_state_[layer] + slot * conv_elements, 0,
+                              conv_elements * sizeof(float)),
+                   "reset delta conv slot");
+        cuda_check(cudaMemset(
+                       recurrent_state_[layer] + slot * recurrent_elements, 0,
+                       recurrent_elements * sizeof(float)),
+                   "reset delta recurrent slot");
+      }
+    }
+  }
   void reset_request() {
     const auto conv_elements =
         (static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
@@ -432,6 +465,7 @@ class Qwen3NextModel final {
   }
   void run_full_attention(const std::string& prefix, std::uint32_t layer,
                           std::span<const std::uint32_t> positions,
+                          std::span<const std::uint32_t> state_slots,
                           std::uint32_t rows) {
     const auto query_size = 2U * query_heads_ * head_dim_;
     const auto kv_size = kv_heads_ * head_dim_;
@@ -447,20 +481,22 @@ class Qwen3NextModel final {
         matrix(prefix + "self_attn.v_proj.weight"), normalized_, value_, rows,
         nullptr));
     for (std::uint32_t row = 0; row < rows; ++row) {
+      const auto state_offset =
+          static_cast<std::size_t>(state_slots[row]) * cache_stride;
       status_check(expert::runtime::cuda::qwen3_next_qkv_rope_cache(
           query_gate_ + static_cast<std::size_t>(row) * query_size,
           key_ + static_cast<std::size_t>(row) * kv_size,
           value_ + static_cast<std::size_t>(row) * kv_size,
           fp32(prefix + "self_attn.q_norm.weight"),
           fp32(prefix + "self_attn.k_norm.weight"),
-          key_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
-          value_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          key_cache_[layer] + state_offset,
+          value_cache_[layer] + state_offset,
           positions[row], query_heads_, kv_heads_, head_dim_, rotary_dim_,
           epsilon_, rope_theta_, nullptr));
       status_check(expert::runtime::cuda::qwen3_next_attention_decode(
           query_gate_ + static_cast<std::size_t>(row) * query_size,
-          key_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
-          value_cache_[layer] + static_cast<std::size_t>(row) * cache_stride,
+          key_cache_[layer] + state_offset,
+          value_cache_[layer] + state_offset,
           attention_ + static_cast<std::size_t>(row) * attention_size,
           positions[row] + 1U, query_heads_, kv_heads_, head_dim_, nullptr));
     }
@@ -470,6 +506,7 @@ class Qwen3NextModel final {
   }
 
   void run_delta(const std::string& prefix, std::uint32_t layer,
+                 std::span<const std::uint32_t> state_slots,
                  std::uint32_t rows) {
     const auto projected_size = 2U * key_heads_ * key_head_dim_ +
                                 2U * value_heads_ * value_head_dim_;
@@ -492,9 +529,10 @@ class Qwen3NextModel final {
           fp32(prefix + "linear_attn.dt_bias"),
           fp32(prefix + "linear_attn.A_log"),
           fp32(prefix + "linear_attn.norm.weight"),
-          conv_state_[layer] + static_cast<std::size_t>(row) * conv_state_size,
+          conv_state_[layer] +
+              static_cast<std::size_t>(state_slots[row]) * conv_state_size,
           recurrent_state_[layer] +
-              static_cast<std::size_t>(row) * recurrent_size,
+              static_cast<std::size_t>(state_slots[row]) * recurrent_size,
           conv_output_ + static_cast<std::size_t>(row) * conv_size,
           delta_output_ + static_cast<std::size_t>(row) * delta_size,
           key_heads_, value_heads_, key_head_dim_, value_head_dim_,
@@ -639,10 +677,17 @@ std::vector<std::string_view> split_tabs(std::string_view line) {
   return fields;
 }
 
+struct WorkerRequest final {
+  std::uint32_t slot{};
+  std::uint32_t predicted{};
+  std::uint32_t next_position{};
+};
+
 int worker_loop(Qwen3NextModel& model) {
-  std::uint64_t active_id = 0;
-  std::uint32_t predicted = 0, next_position = 0;
-  std::cout << "{\"type\":\"ready\",\"protocol\":1}\n" << std::flush;
+  std::unordered_map<std::uint64_t, WorkerRequest> active;
+  std::vector<bool> used_slots(model.capacity());
+  std::cout << "{\"type\":\"ready\",\"protocol\":2,\"capacity\":"
+            << model.capacity() << "}\n" << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
     try {
@@ -651,40 +696,120 @@ int worker_loop(Qwen3NextModel& model) {
         if (fields.size() != 1) throw std::runtime_error("invalid PING");
         std::cout << "{\"type\":\"pong\"}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
-        if (fields.size() != 3 || active_id != 0)
-          throw std::runtime_error("invalid BEGIN");
+        if (fields.size() != 3) throw std::runtime_error("invalid BEGIN");
         const auto request_id = std::stoull(std::string(fields[1]));
-        if (!request_id) throw std::runtime_error("request id zero");
+        if (!request_id || active.contains(request_id))
+          throw std::runtime_error("invalid or duplicate request id");
+        const auto available =
+            std::find(used_slots.begin(), used_slots.end(), false);
+        if (available == used_slots.end())
+          throw std::runtime_error("worker request capacity exhausted");
+        const auto slot = static_cast<std::uint32_t>(
+            std::distance(used_slots.begin(), available));
         const auto prompt = parse_tokens(fields[2]);
-        model.reset_request();
-        for (std::uint32_t position = 0; position < prompt.size(); ++position)
-          predicted = model.forward(prompt[position], position);
-        next_position = static_cast<std::uint32_t>(prompt.size());
-        active_id = request_id;
+        model.reset_slot(slot);
+        std::uint32_t predicted = 0;
+        for (std::uint32_t position = 0; position < prompt.size(); ++position) {
+          const std::array token{prompt[position]}, positions{position}, slots{slot};
+          predicted = model.forward_batch(token, positions, slots).front();
+        }
+        used_slots[slot] = true;
+        active.emplace(request_id,
+                       WorkerRequest{slot, predicted,
+                                     static_cast<std::uint32_t>(prompt.size())});
         std::cout << "{\"type\":\"begun\",\"id\":" << request_id
-                  << "}\n" << std::flush;
+                  << ",\"slot\":" << slot << "}\n" << std::flush;
       } else if (fields[0] == "NEXT") {
         if (fields.size() != 3) throw std::runtime_error("invalid NEXT");
         const auto id = std::stoull(std::string(fields[1]));
-        if (!id || id != active_id) throw std::runtime_error("NEXT request mismatch");
+        const auto iterator = active.find(id);
+        if (!id || iterator == active.end())
+          throw std::runtime_error("NEXT request mismatch");
         if (fields[2] != "0" && fields[2] != "1")
           throw std::runtime_error("NEXT final flag must be 0 or 1");
         const bool final = fields[2] == "1";
-        const auto token = predicted;
-        if (!final) predicted = model.forward(token, next_position++);
+        const auto token = iterator->second.predicted;
+        if (!final) {
+          const std::array tokens{token}, positions{iterator->second.next_position},
+              slots{iterator->second.slot};
+          iterator->second.predicted =
+              model.forward_batch(tokens, positions, slots).front();
+          ++iterator->second.next_position;
+        }
         std::cout << "{\"type\":\"token\",\"id\":" << id
                   << ",\"token\":" << token << "}\n" << std::flush;
-        if (final) active_id = 0;
+        if (final) {
+          used_slots[iterator->second.slot] = false;
+          active.erase(iterator);
+        }
+      } else if (fields[0] == "STEP") {
+        if (fields.size() < 2 || fields.size() > model.capacity() + 1U)
+          throw std::runtime_error("invalid STEP field count");
+        struct Step final {
+          std::uint64_t id{};
+          bool final{};
+          std::uint32_t token{};
+        };
+        std::vector<Step> steps;
+        std::vector<std::uint32_t> tokens, positions, slots;
+        std::vector<std::uint64_t> advancing_ids;
+        steps.reserve(fields.size() - 1U);
+        for (std::size_t field = 1; field < fields.size(); ++field) {
+          const auto separator = fields[field].find(',');
+          if (separator == std::string_view::npos)
+            throw std::runtime_error("invalid STEP item");
+          const auto id = std::stoull(std::string(fields[field].substr(0, separator)));
+          const auto flag = fields[field].substr(separator + 1U);
+          if (!id || (flag != "0" && flag != "1") ||
+              std::any_of(steps.begin(), steps.end(),
+                          [&](const Step& step) { return step.id == id; }))
+            throw std::runtime_error("invalid STEP request");
+          const auto iterator = active.find(id);
+          if (iterator == active.end())
+            throw std::runtime_error("STEP request mismatch");
+          const bool final = flag == "1";
+          steps.push_back({id, final, iterator->second.predicted});
+          if (!final) {
+            tokens.push_back(iterator->second.predicted);
+            positions.push_back(iterator->second.next_position);
+            slots.push_back(iterator->second.slot);
+            advancing_ids.push_back(id);
+          }
+        }
+        if (!tokens.empty()) {
+          const auto predicted = model.forward_batch(tokens, positions, slots);
+          for (std::size_t index = 0; index < advancing_ids.size(); ++index) {
+            auto& request = active.at(advancing_ids[index]);
+            request.predicted = predicted[index];
+            ++request.next_position;
+          }
+        }
+        std::cout << "{\"type\":\"batch\",\"items\":[";
+        for (std::size_t index = 0; index < steps.size(); ++index) {
+          if (index) std::cout << ',';
+          std::cout << "{\"id\":" << steps[index].id
+                    << ",\"token\":" << steps[index].token << '}';
+        }
+        std::cout << "]}\n" << std::flush;
+        for (const auto& step : steps) {
+          if (step.final) {
+            used_slots[active.at(step.id).slot] = false;
+            active.erase(step.id);
+          }
+        }
       } else if (fields[0] == "END") {
-        if (fields.size() != 2 || active_id == 0 ||
-            std::stoull(std::string(fields[1])) != active_id)
+        if (fields.size() != 2)
           throw std::runtime_error("END request mismatch");
-        const auto id = active_id;
-        active_id = 0;
+        const auto id = std::stoull(std::string(fields[1]));
+        const auto iterator = active.find(id);
+        if (!id || iterator == active.end())
+          throw std::runtime_error("END request mismatch");
+        used_slots[iterator->second.slot] = false;
+        active.erase(iterator);
         std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
                   << std::flush;
       } else if (fields[0] == "SHUTDOWN") {
-        if (fields.size() != 1 || active_id)
+        if (fields.size() != 1 || !active.empty())
           throw std::runtime_error("invalid SHUTDOWN");
         std::cout << "{\"type\":\"shutdown\"}\n" << std::flush;
         return 0;
@@ -693,8 +818,8 @@ int worker_loop(Qwen3NextModel& model) {
       }
     } catch (const std::exception& error) {
       std::cerr << "worker command failed: " << error.what() << '\n';
-      std::cout << "{\"type\":\"error\",\"active_id\":" << active_id
-                << "}\n" << std::flush;
+      std::cout << "{\"type\":\"error\",\"active_requests\":"
+                << active.size() << "}\n" << std::flush;
     }
   }
   return 0;
@@ -785,15 +910,18 @@ int main(int argc, char** argv) {
       return identical ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
-      if (argc > 6)
+      if (argc > 7)
         throw std::runtime_error(
-            "worker usage: <container> --worker [max-context] [ram-gib] [vram-gib]");
+            "worker usage: <container> --worker [max-context] [ram-gib] "
+            "[vram-gib] [capacity]");
       const auto max_context = argc >= 4
           ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
       const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
       const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
+      const auto capacity = argc >= 7
+          ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 1U;
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
-                           vram_gib << 30U);
+                           vram_gib << 30U, capacity);
       return worker_loop(model);
     }
     if (argc < 3 || argc > 6) {

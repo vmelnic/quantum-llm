@@ -53,7 +53,8 @@ try {
         "--preset", $preset
     )
     Invoke-CheckedNative -Command $python -Arguments @(
-        "-m", "unittest", "-v", "tests.compiler.test_expert_pack"
+        "-m", "unittest", "-v", "tests.compiler.test_expert_pack",
+        "tests.server.test_expert_server"
     )
 }
 finally {

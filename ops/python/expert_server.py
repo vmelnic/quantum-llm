@@ -38,9 +38,14 @@ class WorkerError(RuntimeError):
 
 class CudaWorker:
     def __init__(self, executable: Path, container: Path, max_context: int,
-                 startup_timeout: float) -> None:
+                 startup_timeout: float, requested_capacity: int,
+                 ram_cache_gib: int, vram_cache_gib: int) -> None:
+        command = [str(executable), str(container), "--worker", str(max_context)]
+        if requested_capacity > 1:
+            command.extend((str(ram_cache_gib), str(vram_cache_gib),
+                            str(requested_capacity)))
         self.process = subprocess.Popen(
-            [str(executable), str(container), "--worker", str(max_context)],
+            command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, encoding="utf-8", bufsize=1,
         )
@@ -64,7 +69,15 @@ class CudaWorker:
             raise WorkerError("CUDA worker did not become ready") from (
                 response if isinstance(response, Exception) else None
             )
-        self.active_id: int | None = None
+        self.protocol = int(response.get("protocol", 1))
+        self.capacity = int(response.get("capacity", 1))
+        if requested_capacity > 1 and (
+            self.protocol < 2 or self.capacity != requested_capacity
+        ):
+            self.process.kill()
+            raise WorkerError("CUDA worker does not support requested batching")
+        self.active_ids: set[int] = set()
+        self.command_lock = threading.Lock()
 
     def _copy_stderr(self) -> None:
         assert self.process.stderr
@@ -85,38 +98,62 @@ class CudaWorker:
         return payload
 
     def _command(self, command: str) -> dict[str, Any]:
-        if self.process.poll() is not None:
-            raise WorkerError("CUDA worker is not running")
-        assert self.process.stdin
-        self.process.stdin.write(command + "\n")
-        self.process.stdin.flush()
-        return self._read()
+        with self.command_lock:
+            if self.process.poll() is not None:
+                raise WorkerError("CUDA worker is not running")
+            assert self.process.stdin
+            self.process.stdin.write(command + "\n")
+            self.process.stdin.flush()
+            return self._read()
 
     def begin(self, request_id: int, prompt_ids: list[int]) -> None:
-        if self.active_id is not None:
-            raise WorkerError("worker protocol overlap")
+        if request_id in self.active_ids:
+            raise WorkerError("duplicate worker request")
         response = self._command(
             f"BEGIN\t{request_id}\t" + ",".join(str(token) for token in prompt_ids)
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
-        self.active_id = request_id
+        self.active_ids.add(request_id)
 
     def next(self, request_id: int, final: bool) -> int:
         response = self._command(f"NEXT\t{request_id}\t{1 if final else 0}")
         if response.get("type") != "token" or response.get("id") != request_id:
             raise WorkerError("unexpected NEXT response")
         if final:
-            self.active_id = None
+            self.active_ids.discard(request_id)
         return int(response["token"])
 
+    def step(self, items: list[tuple[int, bool]]) -> dict[int, int]:
+        if not items or len(items) > self.capacity:
+            raise WorkerError("invalid decode batch")
+        if self.protocol < 2:
+            if len(items) != 1:
+                raise WorkerError("protocol v1 cannot batch decode")
+            request_id, final = items[0]
+            return {request_id: self.next(request_id, final)}
+        response = self._command("STEP\t" + "\t".join(
+            f"{request_id},{1 if final else 0}" for request_id, final in items
+        ))
+        if response.get("type") != "batch" or not isinstance(response.get("items"), list):
+            raise WorkerError("unexpected STEP response")
+        result = {int(item["id"]): int(item["token"])
+                  for item in response["items"]}
+        expected = {request_id for request_id, _final in items}
+        if set(result) != expected:
+            raise WorkerError("STEP response request mismatch")
+        for request_id, final in items:
+            if final:
+                self.active_ids.discard(request_id)
+        return result
+
     def cancel(self, request_id: int) -> None:
-        if self.active_id != request_id:
+        if request_id not in self.active_ids:
             return
         response = self._command(f"END\t{request_id}")
         if response.get("type") != "ended":
             raise WorkerError("unexpected END response")
-        self.active_id = None
+        self.active_ids.discard(request_id)
 
     def healthy(self) -> bool:
         return self.process.poll() is None
@@ -125,12 +162,79 @@ class CudaWorker:
         if self.process.poll() is not None:
             return
         try:
-            if self.active_id is not None:
-                self.cancel(self.active_id)
+            for request_id in list(self.active_ids):
+                self.cancel(request_id)
             self._command("SHUTDOWN")
             self.process.wait(timeout=10)
         except Exception:
             self.process.kill()
+
+
+class DecodeWaiter:
+    def __init__(self, request_id: int, final: bool) -> None:
+        self.request_id = request_id
+        self.final = final
+        self.event = threading.Event()
+        self.token: int | None = None
+        self.error: Exception | None = None
+
+
+class ContinuousDecodeBatcher:
+    def __init__(self, worker: CudaWorker, window_ms: float,
+                 on_batch: Any) -> None:
+        self.worker = worker
+        self.window_seconds = window_ms / 1000.0
+        self.on_batch = on_batch
+        self.pending: queue.Queue[DecodeWaiter | None] = queue.Queue()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def step(self, request_id: int, final: bool) -> int:
+        waiter = DecodeWaiter(request_id, final)
+        self.pending.put(waiter)
+        waiter.event.wait()
+        if waiter.error is not None:
+            raise waiter.error
+        if waiter.token is None:
+            raise WorkerError("decode batch returned no token")
+        return waiter.token
+
+    def _run(self) -> None:
+        while True:
+            first = self.pending.get()
+            if first is None:
+                return
+            batch = [first]
+            deadline = time.monotonic() + self.window_seconds
+            while len(batch) < self.worker.capacity:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                try:
+                    item = self.pending.get(timeout=remaining)
+                except queue.Empty:
+                    break
+                if item is None:
+                    self.pending.put(None)
+                    break
+                batch.append(item)
+            try:
+                tokens = self.worker.step([
+                    (item.request_id, item.final) for item in batch
+                ])
+                self.on_batch(len(batch))
+                for item in batch:
+                    item.token = tokens[item.request_id]
+            except Exception as error:
+                for item in batch:
+                    item.error = error
+            finally:
+                for item in batch:
+                    item.event.set()
+
+    def close(self) -> None:
+        self.pending.put(None)
+        self.thread.join(timeout=10)
 
 
 class Application:
@@ -141,9 +245,13 @@ class Application:
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
         )
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
-                                 args.startup_timeout)
-        self.worker_lock = threading.Lock()
-        self.capacity = threading.BoundedSemaphore(args.maximum_queue + 1)
+                                 args.startup_timeout, args.worker_capacity,
+                                 args.worker_ram_cache_gib,
+                                 args.worker_vram_cache_gib)
+        self.capacity = threading.BoundedSemaphore(
+            args.maximum_queue + args.worker_capacity
+        )
+        self.worker_slots = threading.BoundedSemaphore(args.worker_capacity)
         self.id_lock = threading.Lock()
         self.next_id = 1
         self.draining = threading.Event()
@@ -153,7 +261,11 @@ class Application:
         self.metrics = {
             "admitted": 0, "rejected": 0, "completed": 0,
             "failed": 0, "cancelled": 0, "generated_tokens": 0,
+            "decode_batches": 0, "decode_rows": 0,
         }
+        self.decode_batcher = ContinuousDecodeBatcher(
+            self.worker, args.microbatch_window_ms, self.record_decode_batch
+        )
         log("service_ready", model=args.model, build=args.build_id,
             manifest=self.manifest["indexes"]["experts_sha256"])
 
@@ -179,6 +291,16 @@ class Application:
         with self.active_lock:
             self.active -= 1
         self.capacity.release()
+
+    def acquire_worker_slot(self) -> bool:
+        return self.worker_slots.acquire(timeout=self.args.queue_timeout)
+
+    def release_worker_slot(self) -> None:
+        self.worker_slots.release()
+
+    def record_decode_batch(self, rows: int) -> None:
+        self.increment("decode_batches")
+        self.increment("decode_rows", rows)
 
     def increment(self, name: str, value: int = 1) -> None:
         with self.metric_lock:
@@ -232,25 +354,26 @@ class Application:
         generated: list[int] = []
         decoded = ""
         started = time.monotonic()
-        with self.worker_lock:
-            self.worker.begin(request_id, prompt_ids)
-            try:
-                for index in range(maximum):
-                    if time.monotonic() - started > self.args.generation_timeout:
-                        raise TimeoutError("generation deadline exceeded")
-                    token = self.worker.next(request_id, index + 1 == maximum)
-                    self.increment("generated_tokens")
-                    generated.append(token)
-                    current = self.tokenizer.decode(
-                        generated, skip_special_tokens=False,
-                        clean_up_tokenization_spaces=False,
-                    )
-                    delta = current[len(decoded):] if current.startswith(decoded) else current
-                    decoded = current
-                    yield token, delta
-            finally:
-                if self.worker.active_id == request_id:
-                    self.worker.cancel(request_id)
+        self.worker.begin(request_id, prompt_ids)
+        try:
+            for index in range(maximum):
+                if time.monotonic() - started > self.args.generation_timeout:
+                    raise TimeoutError("generation deadline exceeded")
+                token = self.decode_batcher.step(
+                    request_id, index + 1 == maximum
+                )
+                self.increment("generated_tokens")
+                generated.append(token)
+                current = self.tokenizer.decode(
+                    generated, skip_special_tokens=False,
+                    clean_up_tokenization_spaces=False,
+                )
+                delta = current[len(decoded):] if current.startswith(decoded) else current
+                decoded = current
+                yield token, delta
+        finally:
+            if request_id in self.worker.active_ids:
+                self.worker.cancel(request_id)
 
     def info(self) -> dict[str, Any]:
         with self.active_lock:
@@ -265,6 +388,8 @@ class Application:
             "masses": self.manifest["masses"],
             "active_requests": active,
             "maximum_queue": self.args.maximum_queue,
+            "worker_capacity": self.args.worker_capacity,
+            "worker_protocol": self.worker.protocol,
             "draining": self.draining.is_set(),
         }
 
@@ -276,6 +401,7 @@ class Application:
                 if self.active == 0:
                     break
             time.sleep(0.05)
+        self.decode_batcher.close()
         self.worker.close()
 
 
@@ -361,6 +487,11 @@ class Handler(BaseHTTPRequestHandler):
         if not self.app.acquire():
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, "service overloaded or draining", "overload_error")
             return
+        if not self.app.acquire_worker_slot():
+            self.app.release()
+            self._error(HTTPStatus.SERVICE_UNAVAILABLE,
+                        "all model slots are busy", "overload_error")
+            return
         request_uuid = "cmpl-" + uuid.uuid4().hex
         created = int(time.time())
         try:
@@ -413,6 +544,7 @@ class Handler(BaseHTTPRequestHandler):
             if not stream:
                 self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed", "server_error")
         finally:
+            self.app.release_worker_slot()
             self.app.release()
 
 
@@ -429,6 +561,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-context", type=int, default=4096)
     parser.add_argument("--maximum-new-tokens", type=int, default=512)
     parser.add_argument("--maximum-queue", type=int, default=8)
+    parser.add_argument("--worker-capacity", type=int, default=1)
+    parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
+    parser.add_argument("--worker-vram-cache-gib", type=int, default=14)
+    parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)
     parser.add_argument("--queue-timeout", type=float, default=1.0)
     parser.add_argument("--generation-timeout", type=float, default=120.0)
@@ -441,7 +577,10 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     global LOG_FILE
     args = parse_args()
-    if args.maximum_queue < 0 or args.max_context < 2 or args.maximum_new_tokens < 1:
+    if (args.maximum_queue < 0 or args.max_context < 2 or
+        args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
+        args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
+        args.microbatch_window_ms < 0):
         raise SystemExit("invalid service limits")
     if args.log_file:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)

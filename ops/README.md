@@ -56,6 +56,18 @@ Endpoint-uri:
 - coadă limitată, timeout de queue/generation, cancellation la disconnect și
   graceful drain la `SIGINT`/`SIGTERM`.
 
+Front-end-ul negociază protocolul workerului. Cu `-WorkerCapacity 1` păstrează
+traseul v1 single-slot. Launcherul P6 folosește implicit patru sloturi și
+microbatch decode de 2 ms; fiecare slot are stare KV/Conv/DeltaNet separată, dar
+toate request-urile împart dense weights și cache-ul de experți:
+
+```powershell
+Start-P6ExpertServer.ps1 -WorkerCapacity 4 -MicrobatchWindowMs 2
+```
+
+`/metrics` expune `decode_batches_total` și `decode_rows_total`, astfel încât
+batch size-ul efectiv poate fi calculat și nu este doar o setare declarată.
+
 Pentru bind non-loopback se setează obligatoriu `EXPERT_API_KEY` în mediul
 procesului și clienții trimit `Authorization: Bearer ...`. Containerul și
 tokenizerul sunt strict locale; startup-ul nu descarcă nimic.

@@ -145,6 +145,13 @@ weights. Selecțiile sunt deduplicate pe strat, apoi toate rândurile folosesc u
 singur dispatch MoE batched și același cache global; stările KV/Conv/DeltaNet
 rămân izolate per slot.
 
+Workerul persistent Qwen folosește protocolul local v2: mai multe request-uri
+pot deține simultan sloturi KV/Conv/DeltaNet, iar `STEP` avansează până la
+capacitatea negociată într-un singur `forward_batch`. Front-end-ul adună pașii
+concurenți într-o fereastră configurabilă și păstrează protocolul v1 pentru
+runner-ele single-slot. Admission rezervă un slot înainte de a trimite headere
+HTTP/SSE; lipsa unui slot produce overload explicit, nu suprascriere de stare.
+
 Streams logice:
 
 - compute: dense/router/grouped experts/aggregation;

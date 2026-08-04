@@ -7,6 +7,10 @@ param(
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
     [int]$MaximumContext = 4096,
+    [int]$WorkerCapacity = 1,
+    [int]$WorkerRamCacheGiB = 48,
+    [int]$WorkerVramCacheGiB = 14,
+    [double]$MicrobatchWindowMs = 2.0,
     [int]$StartupTimeoutSeconds = 120,
     [string]$BuildId = "development"
 )
@@ -41,6 +45,10 @@ if (-not $Tokenizer) {
     --port $Port `
     --maximum-queue $MaximumQueue `
     --max-context $MaximumContext `
+    --worker-capacity $WorkerCapacity `
+    --worker-ram-cache-gib $WorkerRamCacheGiB `
+    --worker-vram-cache-gib $WorkerVramCacheGiB `
+    --microbatch-window-ms $MicrobatchWindowMs `
     --startup-timeout $StartupTimeoutSeconds `
     --model $ModelId `
     --build-id $BuildId `

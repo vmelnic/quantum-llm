@@ -367,6 +367,13 @@ duplicate sunt încărcate o singură dată per strat, iar toate rândurile intr
 `1,67638e-8` pentru GEMV batched și `2,98023e-8` pentru routerul batched.
 Acestea sunt verificări de corectitudine a kernelurilor, nu rezultate tok/s.
 
+Serviciul persistent nu mai serializează întregul request: protocolul Qwen v2
+ține patru sloturi de stare izolate și `STEP` execută decode-ul concurent prin
+același `forward_batch`. Batcherul front-end a trecut testul cu patru thread-uri
+într-un singur worker step. Compatibilitatea protocolului OLMoE v1 a fost
+revalidată end-to-end prin API: `/ready=true`, completarea canonică `Paris.` și
+metrici `decode_batches=2`, `decode_rows=2` pentru două tokenuri.
+
 Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
 containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei
 68.641.103.872 bytes RAM fizici. C: este singurul volum, deci sursa de

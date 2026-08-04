@@ -3,6 +3,10 @@ param(
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
     [int]$MaximumContext = 4096,
+    [int]$WorkerCapacity = 4,
+    [int]$WorkerRamCacheGiB = 48,
+    [int]$WorkerVramCacheGiB = 14,
+    [double]$MicrobatchWindowMs = 2.0,
     [int]$StartupTimeoutSeconds = 600,
     [string]$BuildId = "development"
 )
@@ -20,5 +24,9 @@ $runner = Join-Path $repoRoot `
     -Port $Port `
     -MaximumQueue $MaximumQueue `
     -MaximumContext $MaximumContext `
+    -WorkerCapacity $WorkerCapacity `
+    -WorkerRamCacheGiB $WorkerRamCacheGiB `
+    -WorkerVramCacheGiB $WorkerVramCacheGiB `
+    -MicrobatchWindowMs $MicrobatchWindowMs `
     -StartupTimeoutSeconds $StartupTimeoutSeconds `
     -BuildId $BuildId
