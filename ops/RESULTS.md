@@ -572,7 +572,7 @@ fără al doilea GPU și fără a șterge checkpoint-ul sursă.
 ### Deploy persistent P6
 
 Task Scheduler rulează profilul `QuantumLLM-P6ExpertServer` pe loopback cu
-build ID `2383494`, worker protocol 2, capacitate 4, cache RAM 48 GiB și cache
+build ID `ecfa984`, worker protocol 2, capacitate 4, cache RAM 48 GiB și cache
 VRAM 18 GiB. `/model-info` publică manifest hash
 `55cc761ae66f294f2ad423421cb4d87462aaafea9ccae0c4b89efdaab04656e3` și
 experts index hash
@@ -588,7 +588,23 @@ trimițând `END` workerului. Smoke-ul final a trecut cu:
 - SSE terminat cu `[DONE]` și `cancellation_observed=true`;
 - model/build/container identity corecte;
 - TTFT p95 `15,109 s` și inter-token p95 `2,563 s` pe smoke-ul operațional
-  rece; acestea nu înlocuiesc gate-urile hot de throughput.
+rece; acestea nu înlocuiesc gate-urile hot de throughput.
+
+Contractul HTTP a fost extins și documentat normativ în
+`docs/openai-api.md`. Pe lângă Completions și Chat Completions, serviciul oferă
+acum Responses API JSON și SSE cu evenimente tipate, model retrieval,
+content-parts text moderne, stop sequences cross-token, usage streaming,
+`x-request-id` și erori OpenAI cu `param`/`code`. Parametrii care ar necesita
+logits, sampling, multimodal sau tool calling sunt refuzați explicit; nu sunt
+ignorați în tăcere.
+
+Smoke-ul deploy-ului `ecfa984` a trecut cu 8 request-uri complete, Responses
+JSON + streaming, Chat Completions, usage-only streaming chunk, eroare precisă
+pentru sampling indisponibil și cancellation la disconnect. Au fost observate
+21 batch-uri / 32 rows (batch efectiv `1,5238`), TTFT p95 `23,812 s` și
+inter-token p95 `2,469 s` în fereastra rece. Separat, SDK-ul oficial OpenAI a
+parsat cu succes `responses.create`, stream-ul Responses, stream-ul Chat și
+`models.retrieve` contra implementării HTTP.
 
 Installerul oprește acum arborele de procese al aceluiași repo/port înainte de
 reînregistrare; aceasta previne ca un worker vechi să păstreze portul și VRAM la
