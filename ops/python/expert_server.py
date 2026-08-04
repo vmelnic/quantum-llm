@@ -13,6 +13,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from collections.abc import Mapping
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -263,6 +264,10 @@ class Application:
             "failed": 0, "cancelled": 0, "generated_tokens": 0,
             "decode_batches": 0, "decode_rows": 0,
         }
+        self.latencies: dict[str, deque[float]] = {
+            "ttft_seconds": deque(maxlen=args.latency_window),
+            "inter_token_seconds": deque(maxlen=args.latency_window),
+        }
         self.decode_batcher = ContinuousDecodeBatcher(
             self.worker, args.microbatch_window_ms, self.record_decode_batch
         )
@@ -306,11 +311,18 @@ class Application:
         with self.metric_lock:
             self.metrics[name] += value
 
+    def observe_latency(self, name: str, value: float) -> None:
+        with self.metric_lock:
+            self.latencies[name].append(value)
+
     def metrics_text(self) -> str:
         with self.active_lock:
             active = self.active
         with self.metric_lock:
             counters = dict(self.metrics)
+            latency_samples = {
+                name: sorted(values) for name, values in self.latencies.items()
+            }
         lines = [
             "# TYPE expert_service_active_requests gauge",
             f"expert_service_active_requests {active}",
@@ -318,6 +330,20 @@ class Application:
         for name, value in counters.items():
             lines.extend((f"# TYPE expert_service_{name}_total counter",
                           f"expert_service_{name}_total {value}"))
+        for name, values in latency_samples.items():
+            def percentile(fraction: float) -> float:
+                if not values:
+                    return 0.0
+                index = max(0, int(len(values) * fraction + 0.999999) - 1)
+                return values[min(index, len(values) - 1)]
+            lines.extend((
+                f"# TYPE expert_service_{name}_p50 gauge",
+                f"expert_service_{name}_p50 {percentile(0.50)}",
+                f"# TYPE expert_service_{name}_p95 gauge",
+                f"expert_service_{name}_p95 {percentile(0.95)}",
+                f"# TYPE expert_service_{name}_count gauge",
+                f"expert_service_{name}_count {len(values)}",
+            ))
         lines.extend(("# TYPE expert_service_ready gauge",
                       f"expert_service_ready {int(self.worker.healthy() and not self.draining.is_set())}"))
         return "\n".join(lines) + "\n"
@@ -354,6 +380,7 @@ class Application:
         generated: list[int] = []
         decoded = ""
         started = time.monotonic()
+        previous_token_at: float | None = None
         self.worker.begin(request_id, prompt_ids)
         try:
             for index in range(maximum):
@@ -362,6 +389,14 @@ class Application:
                 token = self.decode_batcher.step(
                     request_id, index + 1 == maximum
                 )
+                token_at = time.monotonic()
+                if previous_token_at is None:
+                    self.observe_latency("ttft_seconds", token_at - started)
+                else:
+                    self.observe_latency(
+                        "inter_token_seconds", token_at - previous_token_at
+                    )
+                previous_token_at = token_at
                 self.increment("generated_tokens")
                 generated.append(token)
                 current = self.tokenizer.decode(
@@ -565,6 +600,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
     parser.add_argument("--worker-vram-cache-gib", type=int, default=14)
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
+    parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)
     parser.add_argument("--queue-timeout", type=float, default=1.0)
     parser.add_argument("--generation-timeout", type=float, default=120.0)
@@ -580,7 +616,7 @@ def main() -> int:
     if (args.maximum_queue < 0 or args.max_context < 2 or
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
-        args.microbatch_window_ms < 0):
+        args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
     if args.log_file:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)

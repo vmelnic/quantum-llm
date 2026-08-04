@@ -11,6 +11,7 @@ param(
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 14,
     [double]$MicrobatchWindowMs = 2.0,
+    [int]$LatencyWindow = 4096,
     [int]$StartupTimeoutSeconds = 120,
     [string]$BuildId = "development"
 )
@@ -49,6 +50,7 @@ if (-not $Tokenizer) {
     --worker-ram-cache-gib $WorkerRamCacheGiB `
     --worker-vram-cache-gib $WorkerVramCacheGiB `
     --microbatch-window-ms $MicrobatchWindowMs `
+    --latency-window $LatencyWindow `
     --startup-timeout $StartupTimeoutSeconds `
     --model $ModelId `
     --build-id $BuildId `

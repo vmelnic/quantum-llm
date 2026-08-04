@@ -373,6 +373,10 @@ același `forward_batch`. Batcherul front-end a trecut testul cu patru thread-ur
 într-un singur worker step. Compatibilitatea protocolului OLMoE v1 a fost
 revalidată end-to-end prin API: `/ready=true`, completarea canonică `Paris.` și
 metrici `decode_batches=2`, `decode_rows=2` pentru două tokenuri.
+După adăugarea ferestrei de latență, un al doilea smoke persistent cu trei
+tokenuri a publicat TTFT `0,344 s`, inter-token p95 `0,031 s`, trei batch-uri și
+trei rânduri. Aceste valori validează exportul metricilor pe OLMoE și nu sunt
+folosite drept rezultat P6 pentru Qwen3-Next.
 
 Download-ul Qwen3-Next rulează prin Hugging Face Xet. Estimarea exactă a
 containerului pentru geometria fixată este 81.749.057.536 bytes, peste cei

@@ -67,6 +67,9 @@ Start-P6ExpertServer.ps1 -WorkerCapacity 4 -MicrobatchWindowMs 2
 
 `/metrics` expune `decode_batches_total` și `decode_rows_total`, astfel încât
 batch size-ul efectiv poate fi calculat și nu este doar o setare declarată.
+Aceeași fereastră bounded publică `ttft_seconds_p50/p95` și
+`inter_token_seconds_p50/p95`; numărul de eșantioane este vizibil, iar memoria
+metricilor nu crește odată cu durata procesului.
 
 Pentru bind non-loopback se setează obligatoriu `EXPERT_API_KEY` în mediul
 procesului și clienții trimit `Authorization: Bearer ...`. Containerul și

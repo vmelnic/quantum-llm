@@ -666,6 +666,14 @@ std::vector<std::uint32_t> parse_tokens(std::string_view text) {
   return result;
 }
 
+double percentile_ms(std::vector<double> values, double fraction) {
+  if (values.empty()) return 0.0;
+  std::sort(values.begin(), values.end());
+  const auto index = static_cast<std::size_t>(
+      std::ceil(fraction * static_cast<double>(values.size()))) - 1U;
+  return values[std::min(index, values.size() - 1U)];
+}
+
 std::vector<std::string_view> split_tabs(std::string_view line) {
   std::vector<std::string_view> fields;
   while (true) {
@@ -861,6 +869,7 @@ int main(int argc, char** argv) {
       const auto prompt_seconds = std::chrono::duration<double>(
           std::chrono::steady_clock::now() - started_prompt).count();
       std::vector<std::vector<std::uint32_t>> generated(concurrency);
+      std::vector<double> inter_token_ms;
       const auto started_decode = std::chrono::steady_clock::now();
       for (std::uint32_t step = 0; step < new_tokens; ++step) {
         for (std::uint32_t row = 0; row < concurrency; ++row)
@@ -868,7 +877,10 @@ int main(int argc, char** argv) {
         if (step + 1U < new_tokens) {
           std::fill(positions.begin(), positions.end(),
                     static_cast<std::uint32_t>(prompt.size()) + step);
+          const auto step_started = std::chrono::steady_clock::now();
           predicted = model.forward_batch(predicted, positions);
+          inter_token_ms.push_back(std::chrono::duration<double, std::milli>(
+              std::chrono::steady_clock::now() - step_started).count());
         }
       }
       const auto decode_seconds = std::chrono::duration<double>(
@@ -879,6 +891,12 @@ int main(int argc, char** argv) {
           generated.begin() + 1, generated.end(),
           [&](const auto& sequence) { return sequence == generated.front(); });
       const auto metrics = model.telemetry();
+      const auto model_forwards =
+          (static_cast<std::uint64_t>(prompt.size()) + new_tokens - 1U) *
+          concurrency;
+      const auto acquires = metrics.acquire_vram_hits +
+                            metrics.acquire_ram_hits +
+                            metrics.acquire_ssd_misses;
       std::cout << "{\"tokens\":[";
       for (std::size_t i = 0; i < generated.front().size(); ++i) {
         if (i) std::cout << ',';
@@ -889,10 +907,17 @@ int main(int argc, char** argv) {
                 << (identical ? "true" : "false")
                 << ",\"model_load_seconds\":" << load_seconds
                 << ",\"prompt_seconds\":" << prompt_seconds
+                << ",\"warm_ttft_seconds\":" << prompt_seconds
+                << ",\"cold_ttft_seconds\":"
+                << (load_seconds + prompt_seconds)
                 << ",\"decode_seconds\":" << decode_seconds
                 << ",\"aggregate_forward_tokens\":" << forwards
                 << ",\"tokens_per_second\":"
                 << (forwards ? forwards / decode_seconds : 0.0)
+                << ",\"inter_token_p50_ms\":"
+                << percentile_ms(inter_token_ms, 0.50)
+                << ",\"inter_token_p95_ms\":"
+                << percentile_ms(inter_token_ms, 0.95)
                 << ",\"container_bytes\":" << model.total_pack_bytes()
                 << ",\"expert_read_bytes\":" << metrics.read_bytes
                 << ",\"expert_h2d_bytes\":" << metrics.uploaded_bytes
@@ -900,8 +925,12 @@ int main(int argc, char** argv) {
                 << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
                 << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
                 << ",\"expert_acquires\":"
-                << (metrics.acquire_vram_hits + metrics.acquire_ram_hits +
-                    metrics.acquire_ssd_misses)
+                << acquires
+                << ",\"cold_bytes_per_forward\":"
+                << (model_forwards ? metrics.read_bytes / model_forwards : 0)
+                << ",\"vram_hit_ratio\":"
+                << (acquires ? static_cast<double>(metrics.acquire_vram_hits) /
+                                   static_cast<double>(acquires) : 0.0)
                 << ",\"expert_loads\":" << metrics.load_completed
                 << ",\"expert_deduplicated\":" << metrics.load_deduplicated
                 << ",\"ram_high_water\":" << metrics.ram_high_water
@@ -946,16 +975,26 @@ int main(int argc, char** argv) {
     const auto prompt_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_prompt).count();
     const auto started_decode = std::chrono::steady_clock::now();
+    std::vector<double> inter_token_ms;
     for (std::uint32_t generated = 0; generated < new_tokens; ++generated) {
       tokens.push_back(predicted);
       if (generated + 1U < new_tokens)
+      {
+        const auto step_started = std::chrono::steady_clock::now();
         predicted = model.forward(
             predicted, static_cast<std::uint32_t>(tokens.size() - 1U));
+        inter_token_ms.push_back(std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - step_started).count());
+      }
     }
     const auto decode_seconds = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started_decode).count();
     const auto metrics = model.telemetry();
     const auto forwards = new_tokens > 0 ? new_tokens - 1U : 0U;
+    const auto model_forwards =
+        static_cast<std::uint64_t>(tokens.size() - new_tokens) + forwards;
+    const auto acquires = metrics.acquire_vram_hits + metrics.acquire_ram_hits +
+                          metrics.acquire_ssd_misses;
     std::cout << "{\"tokens\":[";
     for (std::size_t i = 0; i < tokens.size(); ++i) {
       if (i) std::cout << ',';
@@ -963,9 +1002,16 @@ int main(int argc, char** argv) {
     }
     std::cout << "],\"model_load_seconds\":" << load_seconds
               << ",\"prompt_seconds\":" << prompt_seconds
+              << ",\"warm_ttft_seconds\":" << prompt_seconds
+              << ",\"cold_ttft_seconds\":"
+              << (load_seconds + prompt_seconds)
               << ",\"decode_seconds\":" << decode_seconds
               << ",\"tokens_per_second\":"
               << (forwards ? forwards / decode_seconds : 0.0)
+              << ",\"inter_token_p50_ms\":"
+              << percentile_ms(inter_token_ms, 0.50)
+              << ",\"inter_token_p95_ms\":"
+              << percentile_ms(inter_token_ms, 0.95)
               << ",\"container_bytes\":" << model.total_pack_bytes()
               << ",\"startup_dense_read_bytes\":" << model.dense_read_bytes()
               << ",\"expert_read_bytes\":" << metrics.read_bytes
@@ -974,8 +1020,12 @@ int main(int argc, char** argv) {
               << ",\"expert_ram_hits\":" << metrics.acquire_ram_hits
               << ",\"expert_ssd_misses\":" << metrics.acquire_ssd_misses
               << ",\"expert_acquires\":"
-              << (metrics.acquire_vram_hits + metrics.acquire_ram_hits +
-                  metrics.acquire_ssd_misses)
+              << acquires
+              << ",\"cold_bytes_per_forward\":"
+              << (model_forwards ? metrics.read_bytes / model_forwards : 0)
+              << ",\"vram_hit_ratio\":"
+              << (acquires ? static_cast<double>(metrics.acquire_vram_hits) /
+                                 static_cast<double>(acquires) : 0.0)
               << ",\"expert_loads\":" << metrics.load_completed
               << ",\"expert_deduplicated\":" << metrics.load_deduplicated
               << ",\"ram_high_water\":" << metrics.ram_high_water

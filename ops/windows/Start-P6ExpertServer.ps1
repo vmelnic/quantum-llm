@@ -7,6 +7,7 @@ param(
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 14,
     [double]$MicrobatchWindowMs = 2.0,
+    [int]$LatencyWindow = 4096,
     [int]$StartupTimeoutSeconds = 600,
     [string]$BuildId = "development"
 )
@@ -28,5 +29,6 @@ $runner = Join-Path $repoRoot `
     -WorkerRamCacheGiB $WorkerRamCacheGiB `
     -WorkerVramCacheGiB $WorkerVramCacheGiB `
     -MicrobatchWindowMs $MicrobatchWindowMs `
+    -LatencyWindow $LatencyWindow `
     -StartupTimeoutSeconds $StartupTimeoutSeconds `
     -BuildId $BuildId
