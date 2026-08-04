@@ -421,6 +421,15 @@ este aproximativ `49,93 GiB` liberi, mult peste safety margin-ul de 8 GiB.
 Preflight-ul va recalcula aceeași curbă din dimensiunile locale înainte de a
 permite conversia reală.
 
+Prima execuție Xet s-a oprit fără stdout/stderr după 10/41 shard-uri; `hf
+download --dry-run` a confirmat autoritativ că mai lipseau 31 fișiere și 122,7
+GB, deci oprirea procesului nu a fost acceptată drept succes. Launcherul rulează
+acum prin task-ul independent `QuantumLLM-P6ModelDownload`, refuză duplicatele
+și păstrează codul/eroarea finală în `p6-download-exit.json`. Identitatea task-
+ului este derivată din `WindowsIdentity`, deoarece sesiunile SSH raportează
+incorect `USERDOMAIN=WORKGROUP`. Același fix este folosit de deploy-ul
+serviciului.
+
 Compilerul are acum un mod distructiv explicit, oprit implicit: după fsync-ul
 fiecărui pack și al stării, jurnalizează hash-ul shard-ului consumat și elimină
 numai shard-uri fără tensori viitori. Modul trece testul end-to-end, dar nu va

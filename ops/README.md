@@ -111,6 +111,11 @@ Get-P6ModelDownload.ps1
 Invoke-P6Preflight.ps1
 ```
 
+Launcherul rulează `hf` printr-un worker urmărit și păstrează separat codul de
+ieșire în `artifacts/p6-download-exit.json`; faptul că procesul s-a oprit nu
+este confundat cu un checkpoint complet. Relansarea este resumabilă și
+duplicatele active sunt refuzate.
+
 La 41/41, preflight-ul reconstruiește exact ordinea compilerului din
 `weight_map`: dense pack, apoi experți `(layer, expert)` și reclamare numai după
 ultimul tensor necesar din fiecare shard. Artefactul include fiecare eveniment
