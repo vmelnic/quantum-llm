@@ -101,7 +101,8 @@ expert::core::SloRequest ParseRequest(std::string_view text) {
          "vram_expert_budget_bytes", "ram_expert_budget_bytes",
          "expected_vram_hit_ppm", "expected_ram_hit_ppm",
          "minimum_workspace_bytes", "minimum_staging_bytes",
-         "kv_bytes_per_request"}, {}, "request");
+         "kv_bytes_per_request"},
+        {"measured_non_io_nanoseconds_per_token"}, "request");
     expert::core::SloRequest result;
     result.target_tokens_per_second_milli = Required(root, "target_tokens_per_second_milli", "request").AsU64("target_tokens_per_second_milli");
     result.concurrency = Required(root, "concurrency", "request").AsU64("concurrency");
@@ -112,6 +113,11 @@ expert::core::SloRequest ParseRequest(std::string_view text) {
     result.minimum_workspace_bytes = Required(root, "minimum_workspace_bytes", "request").AsU64("minimum_workspace_bytes");
     result.minimum_staging_bytes = Required(root, "minimum_staging_bytes", "request").AsU64("minimum_staging_bytes");
     result.kv_bytes_per_request = Required(root, "kv_bytes_per_request", "request").AsU64("kv_bytes_per_request");
+    if (const auto measured = root.find("measured_non_io_nanoseconds_per_token");
+        measured != root.end()) {
+        result.measured_non_io_nanoseconds_per_token =
+            measured->second.AsU64("measured_non_io_nanoseconds_per_token");
+    }
     return result;
 }
 

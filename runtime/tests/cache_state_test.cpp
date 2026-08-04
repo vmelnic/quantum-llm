@@ -1,10 +1,13 @@
+#include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -47,9 +50,11 @@ struct FixtureRecord final {
   std::vector<std::byte> bytes;
 };
 
-FixtureRecord make_record(std::uint32_t expert_id, std::uint64_t file_offset = 0) {
+FixtureRecord make_record(std::uint32_t expert_id,
+                          std::uint64_t file_offset = 0,
+                          std::uint32_t layer = 3) {
   FixtureRecord result;
-  result.key = {0x0123456789abcdefULL, 3, expert_id,
+  result.key = {0x0123456789abcdefULL, layer, expert_id,
                 er::kExpertQuantAbiInt8PerRow};
   result.bytes.resize(er::kExpertPackAlignment);
   for (std::size_t index = er::kExpertHeaderBytes; index < result.bytes.size();
@@ -63,7 +68,7 @@ FixtureRecord make_record(std::uint32_t expert_id, std::uint64_t file_offset = 0
   write_le<std::uint16_t>(header + 10, er::kExpertHeaderBytes);
   write_le<std::uint32_t>(header + 12, 0x0fU);
   write_le<std::uint32_t>(header + 16, er::kExpertQuantAbiInt8PerRow);
-  write_le<std::int32_t>(header + 20, 3);
+  write_le<std::int32_t>(header + 20, static_cast<std::int32_t>(layer));
   write_le<std::int32_t>(header + 24, static_cast<std::int32_t>(expert_id));
   write_le<std::uint32_t>(header + 28, 16);
   write_le<std::uint32_t>(header + 32, 8);
@@ -264,14 +269,15 @@ struct Harness final {
   er::ExpertCache cache;
 
   explicit Harness(std::uint64_t budget = 8192, std::size_t slots = 2,
-                   std::uint64_t vram_budget = 0)
+                   std::uint64_t vram_budget = 0,
+                   er::CachePlacementConfig placement = {})
       : buffers(std::make_shared<er::FixedBufferPool>(
             slots, er::kExpertPackAlignment, er::kExpertPackAlignment)),
         cache({{budget, budget, std::min<std::uint64_t>(4096, budget)},
                {vram_budget ? vram_budget : budget,
                 vram_budget ? vram_budget : budget,
                 std::min<std::uint64_t>(4096,
-                    vram_budget ? vram_budget : budget)}, true},
+                    vram_budget ? vram_budget : budget)}, true, placement},
               storage, uploader, buffers) {}
 
   er::AcquireResult finish(er::AcquireHandle& handle,
@@ -535,8 +541,177 @@ void test_ram_hit_reuploads_after_vram_eviction() {
   const auto metrics = harness.cache.telemetry();
   require(metrics.upload_completed == 3 && metrics.acquire_ram_hits == 1 &&
               metrics.acquire_vram_hits == 1 &&
-              metrics.acquire_ssd_misses == 2,
+              metrics.acquire_ssd_misses == 2 &&
+              metrics.record_validations == 2 &&
+              metrics.validated_ram_reuses == 1,
           "RAM reupload telemetry mismatch");
+}
+
+void test_host_lease_protects_validated_ram_copy() {
+  Harness harness(8192, 1, 4096);
+  const auto first = make_record(24, 0);
+  const auto second = make_record(25, 4096);
+  auto first_handle = harness.cache.acquire(first.key, first.record);
+  auto first_result = harness.finish(first_handle, first);
+  first_result.lease = {};
+  auto second_handle = harness.cache.acquire(second.key, second.record);
+  auto second_result = harness.finish(second_handle, second);
+  second_result.lease = {};
+
+  auto host = harness.cache.try_acquire_host(first.key, first.record);
+  require(host && host->bytes().size() == first.bytes.size() &&
+              host->sections().hidden == 16,
+          "validated host lease was not exposed from RAM tier");
+  static_cast<void>(harness.cache.trim());
+  const auto protected_entry = harness.cache.inspect(first.key);
+  require(protected_entry && protected_entry->has_host_copy &&
+              protected_entry->reference_count == 1,
+          "host lease did not protect RAM copy from trim");
+  host.reset();
+  static_cast<void>(harness.cache.trim());
+  const auto released_entry = harness.cache.inspect(first.key);
+  require(released_entry && !released_entry->has_host_copy,
+          "released host lease remained unevictable");
+}
+
+void test_cpu_executor_writes_only_named_selections() {
+  auto fixture = make_record(26);
+  auto* bytes = fixture.bytes.data();
+  std::fill_n(bytes + 256, 256, std::byte{1});
+  std::fill_n(bytes + 768, 128, std::byte{1});
+  const float scale = 0.01F;
+  for (std::size_t offset = 512; offset < 576; offset += sizeof(float))
+    std::memcpy(bytes + offset, &scale, sizeof(scale));
+  for (std::size_t offset = 1024; offset < 1088; offset += sizeof(float))
+    std::memcpy(bytes + offset, &scale, sizeof(scale));
+  expert::runtime::cpu::ExpertExecutor executor(2);
+  const er::ExpertSections sections{16, 8, 256, 512, 512, 64,
+                                    768, 128, 1024, 64};
+  const expert::runtime::cpu::ExpertWorkGroup group{
+      fixture.bytes, sections, {0, 3}};
+  std::vector<float> inputs(2 * 16, 1.0F);
+  std::vector<float> outputs(2 * 2 * 16, -123.0F);
+  const auto status = executor.execute(std::span(&group, 1), inputs, 2, 2,
+                                       outputs);
+  require(status.ok(), "CPU expert executor rejected valid fixture");
+  for (std::size_t column = 0; column < 16; ++column) {
+    require(std::isfinite(outputs[column]) &&
+                outputs[column] == outputs[3 * 16 + column],
+            "CPU expert output is invalid or row reuse changed result");
+    require(outputs[16 + column] == -123.0F &&
+                outputs[2 * 16 + column] == -123.0F,
+            "CPU expert executor overwrote an unnamed selection");
+  }
+}
+
+void test_layer_partitioned_eviction_protects_other_layers() {
+  Harness harness(16384, 2, 6144, {2, 1, 0, 0});
+  const auto layer0_old = make_record(30, 0, 0);
+  const auto layer1_hot = make_record(31, 4096, 1);
+  const auto layer0_new = make_record(32, 8192, 0);
+
+  auto first_handle = harness.cache.acquire(layer0_old.key, layer0_old.record);
+  auto first = harness.finish(first_handle, layer0_old);
+  first.lease = {};
+  auto second_handle = harness.cache.acquire(layer1_hot.key, layer1_hot.record);
+  auto second = harness.finish(second_handle, layer1_hot);
+  second.lease = {};
+
+  auto third_handle = harness.cache.acquire(layer0_new.key, layer0_new.record);
+  require(harness.cache.inspect(layer0_old.key)->state ==
+              er::CacheState::ram_ready,
+          "layer partition did not evict from the requesting layer");
+  require(harness.cache.inspect(layer1_hot.key)->state ==
+              er::CacheState::vram_ready,
+          "layer partition evicted another layer's protected working set");
+  auto third = harness.finish(third_handle, layer0_new);
+  require(third.status.ok() && third.lease,
+          "replacement expert did not become ready");
+  require(harness.cache.telemetry().same_partition_evictions == 1,
+          "same-partition eviction telemetry mismatch");
+}
+
+void test_frequency_admission_protects_reused_expert() {
+  Harness harness(24576, 4, 12288, {2, 1, 8192, 0, 4096});
+  const auto hot = make_record(40, 0, 0);
+  const auto cold_a = make_record(41, 4096, 0);
+  const auto incoming = make_record(42, 8192, 0);
+
+  const auto load = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    auto result = harness.finish(handle, fixture);
+    result.lease = {};
+  };
+  load(hot);
+  for (int reuse = 0; reuse < 3; ++reuse) {
+    auto hit = harness.cache.acquire(hot.key, hot.record).get();
+    require(hit.status.ok() && hit.lease, "hot expert reuse failed");
+  }
+  load(cold_a);
+
+  auto incoming_handle = harness.cache.acquire(incoming.key, incoming.record);
+  require(harness.cache.inspect(hot.key)->state == er::CacheState::vram_ready,
+          "one-hit admission evicted the reused expert");
+  require(harness.cache.inspect(cold_a.key)->state ==
+              er::CacheState::ram_ready,
+          "transient admission did not recycle the one-hit slot");
+  auto incoming_result = harness.finish(incoming_handle, incoming);
+  require(incoming_result.status.ok() && incoming_result.lease,
+          "frequency-admitted expert did not publish");
+}
+
+void test_vram_replacement_requires_a_strictly_colder_victim() {
+  Harness harness(16384, 4, 8192);
+  const auto candidate = make_record(50, 0, 0);
+  const auto resident_a = make_record(51, 4096, 0);
+  const auto resident_b = make_record(52, 8192, 0);
+  const auto load = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_success(er::kExpertPackAlignment);
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "placement fixture failed to load expert");
+    result.lease = {};
+  };
+  load(candidate);
+  load(resident_a);
+  require(harness.cache.record_access(resident_a.key, 4),
+          "fixture did not protect the intended resident");
+  load(resident_b);
+  require(harness.cache.inspect(candidate.key)->state ==
+              er::CacheState::ram_ready,
+          "fixture did not create a RAM promotion candidate");
+  const std::array candidate_accesses{er::ExpertAccess{candidate.key, 8}};
+  require(harness.cache.record_accesses(candidate_accesses) == 8,
+          "batched route feedback did not update candidate frequency");
+
+  auto lease_a = harness.cache.acquire(resident_a.key, resident_a.record).get();
+  auto lease_b = harness.cache.acquire(resident_b.key, resident_b.record).get();
+  require(lease_a.lease && lease_b.lease,
+          "resident protection leases were not acquired");
+  require(!harness.cache.vram_admission_would_improve(candidate.key,
+                                                       candidate.record),
+          "admission selected an in-flight VRAM victim");
+  lease_a.lease = {};
+  require(harness.cache.vram_admission_would_improve(candidate.key,
+                                                      candidate.record),
+          "hot RAM candidate did not outrank a colder VRAM resident");
+  er::AdaptivePlacementPlanner planner(harness.cache);
+  planner.consider(candidate.key, candidate.record, 1);
+  require(planner.telemetry().scheduled == 1 &&
+              harness.uploader->pending_count() == 1,
+          "admitted promotion did not enter the asynchronous uploader");
+  harness.uploader->complete_success(er::kExpertPackAlignment);
+  planner.poll();
+  require(planner.telemetry().completed == 1 &&
+              harness.cache.inspect(candidate.key)->state ==
+                  er::CacheState::vram_ready,
+          "asynchronous promotion did not publish its VRAM entry");
+  require(planner.quiesce(10ms).ok() && planner.frozen(),
+          "placement epoch did not quiesce and freeze");
+  planner.resume();
+  require(!planner.frozen(), "placement epoch did not resume");
 }
 
 }  // namespace
@@ -549,6 +724,11 @@ int main() {
     test_budget_eviction_refcount_and_cancellation();
     test_short_read_checksum_and_upload_fail_closed();
     test_ram_hit_reuploads_after_vram_eviction();
+    test_host_lease_protects_validated_ram_copy();
+    test_cpu_executor_writes_only_named_selections();
+    test_layer_partitioned_eviction_protects_other_layers();
+    test_frequency_admission_protects_reused_expert();
+    test_vram_replacement_requires_a_strictly_colder_victim();
     std::cout << "expert_runtime_tests: PASS\n";
     return 0;
   } catch (const std::exception& error) {

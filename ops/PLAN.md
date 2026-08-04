@@ -85,20 +85,20 @@ request + KV slots -----> admission/backpressure
 dense/attention/router exact pe GPU
         |
         v
-work items (request, token, layer, expert, weight)
+device dispatch plan (row, layer, expert, weight, residency generation)
         |
         v
-scheduler global expert-centric
-   |                 |                    |
-   | VRAM hit        | RAM hit            | SSD miss
-   v                 v                    v
-grouped CUDA      async H2D          IOCP read în buffer pinned
-GEMM                 |                    |
-   |                 +------> cache VRAM <-+
-   +-------------------------> grouped CUDA GEMM
-                                 |
-                                 v
-                         agregare top-k exactă
+heterogeneous expert executor
+   |
+   +-- VRAM_READY ------> grouped CUDA kernel ------------------+
+   |                                                           |
+   +-- RAM_READY -------> pinned slab -> H2D -> CUDA kernel ----+-->
+   |                    (coalesced, double-buffered)            |   per-selection
+   |                                                           |   outputs
+   +-- RAM_READY -------> CPU kernel lângă weights -------------+       |
+   |                    (numai dacă modelul de cost îl alege)           v
+   |                                                        agregare top-k
+   +-- SSD/remote ------> materializare într-un tier de mai sus    exactă/stabilă
                                  |
                                  v
                          următorul strat/request
@@ -108,6 +108,108 @@ Unitatea de scheduling nu este modelul sau request-ul complet, ci expertul
 selectat într-un strat. Request-urile independente pot avansa în ordine diferită;
 ordinea operațiilor din interiorul fiecărui request și agregarea top-k rămân
 semantic identice.
+
+`GPU-driven` nu înseamnă că toate weights trebuie să încapă în VRAM și nici că
+orice miss trebuie copiat obligatoriu în VRAM. Înseamnă că traseul hot — router,
+deduplicare, grouping, verificarea rezidenței și agregarea — rămâne pe GPU. GPU
+păstrează un director compact de sloturi și generații. Numai miss-urile sunt
+publicate într-un ring bounded către control plane; acesta alege executorul,
+fără să reconstruiască lista completă top-k pe CPU.
+
+### Executor heterogen și model de cost
+
+Un expert selectat are trei căi locale exacte, fără a schimba top-k sau
+checkpoint-ul cuantizat:
+
+1. **GPU resident**: weights sunt deja într-un slot VRAM versionat;
+2. **GPU streamed**: mai mulți experți RAM-ready sunt împachetați într-un slab
+   pinned mare, transferați coalesced într-un ring VRAM prealocat și calculați
+   înainte de reutilizarea generației slab-ului;
+3. **CPU local**: kernelul host calculează direct din copia RAM, în paralel cu
+   grupurile GPU, iar numai activarea și rezultatul de ordinul KB traversează
+   CPU/GPU.
+
+Plannerul nu folosește praguri inventate. Pentru fiecare grup estimează:
+
+```text
+cost_gpu_resident = queue_gpu + kernel_gpu
+cost_gpu_stream   = queue_h2d + memcpy_RAM_to_pinned
+                  + bytes / measured_coalesced_H2D + kernel_gpu
+cost_cpu_local    = queue_cpu + bytes / measured_RAM_bandwidth
+                  + kernel_cpu + activation/result transfer
+```
+
+Alege costul de completion minim care respectă credits, deadline-ul și
+compatibilitatea `quant_abi`. Estimările sunt actualizate cu EWMA din timpii
+reali și fiecare decizie este contorizată. Dacă o cale nu a fost măsurată sau nu
+are kernel pentru ABI-ul curent, ea nu este eligibilă.
+
+Ieșirile sunt păstrate per selecție `(row, top-k slot)`. Un kernel final aplică
+routing weights în ordinea stabilă din ABI după ce toate grupurile au terminat.
+Astfel CPU, slab-ul și slotul resident pot rula în paralel fără să schimbe
+rezultatul printr-o altă ordine de acumulare.
+
+Această separare este și baza pentru worker-ul remote: remote compute devine un
+al patrulea executor cu același contract, nu o ramură specială a modelului.
+
+### Două plafoane independente
+
+Gate-ul mixt Qwen acceptat a mutat `31.289.622.528` bytes pentru 124 tokeni,
+aproximativ 252 MB/token. La 30 tok/s ar cere aproximativ 7,57 GB/s H2D util.
+RTX 3090 este conectat PCIe Gen3 x16, deci cerința nu depășește automat link-ul,
+dar uploaderul curent face alocare și patru copii per expert, iar RAM hit-urile
+ulterioare pornesc din memorie pageable. Cei 14,29 s de cache wait arată că
+această implementare nu exploatează link-ul; slab streaming este o schimbare de
+data plane, nu încă un tuning LRU.
+
+Eliminarea completă a cache wait-ului tot nu atinge 30 tok/s: gate-ul acceptat
+are aproximativ 11,13 s de muncă non-I/O pentru 124 tokeni, un plafon măsurat de
+circa 11,14 tok/s aggregate. Kernelurile actuale sunt o referință exactă, dar
+lansează mii de blocuri GEMV mici și nu reutilizează suficient weights între
+rânduri. De aceea optimizarea grouped/persistent a compute-path-ului este o
+poartă separată și obligatorie; cache-ul nu poate compensa un plafon compute sub
+SLO.
+
+Pe 3090box, Ryzen 5 5600 are 6C/12T, AVX2 și două DIMM-uri DDR4-3200 de 32 GiB.
+CPU-local este eligibil numai după măsurarea unui expert real; nu presupunem că
+acest CPU poate alimenta singur 30 tok/s. Similar, nu presupunem un al doilea
+GPU și nu fixăm INT4 drept condiție a arhitecturii. Quantizarea este un ABI al
+containerului și kernelului, nu soluția implicită la placement.
+
+Această separare este obligatorie pentru modele de ordinul sutelor de miliarde
+sau 1T: metadata completă poate fi indexată, dar numai un working set bugetat
+este materializat. Niciun nivel nu presupune că nivelul următor poate ține
+modelul complet.
+
+### Placement ierarhic pentru 1T
+
+Aceeași adresă logică `(model, layer, expert, quant_abi)` poate avea placement:
+
+```text
+VRAM hot slot -> RAM warm page -> SSD local record -> remote expert worker
+```
+
+Plannerul separă două clase de spațiu la fiecare nivel:
+
+- **resident**: experți aleși după frecvență/beneficiu și protejați de traficul
+  tranzitoriu;
+- **transient**: sloturi reutilizabile pentru miss-urile exacte ale stratului
+  curent.
+
+Bugetele se partitionează pe strat sau grup de straturi. Un sweep prin ultimele
+straturi nu poate evacua întregul working set al primelor straturi. În interiorul
+partiției, victimele sunt alese determinist după clasă, reuse/hotness și vârstă.
+Politica rămâne pluggable, dar orice predictor este doar o optimizare: miss-ul
+real rămâne exact și fail-closed.
+
+Directorul device nu conține modelul, ci numai câte o intrare mică per expert:
+pointerii compute-ready, slot, generație, stare și ABI. Pentru un milion de
+experți, zeci de bytes/intrare înseamnă zeci de MB de metadata, nu weights de
+ordinul TB. Dacă și această metadata devine prea mare, directorul se
+partitionează pe layer-window fără să schimbe protocolul de slot/generație.
+
+Control plane-ul poate decide ulterior între RAM, SSD și worker remote prin
+aceeași cerere de miss. Transportul și storage-ul nu intră în kernel ABI.
 
 ## 1. Formatul Expert Pack v1 (working name)
 
@@ -242,7 +344,9 @@ dictează structura v1.
 
 ### `cache/`
 
-Cache-ul este global și bugetat în bytes, nu `N experți per strat`.
+Cache-ul are un index global, dar capacitatea nu folosește un LRU global unic.
+Este bugetat în bytes și partitionat pe layer/layer-group, cu o rezervă
+tranzitorie explicită; nu presupune `N experți` de aceeași dimensiune.
 
 Fiecare expert trece printr-o mașină de stări explicită:
 
@@ -260,10 +364,21 @@ Sunt obligatorii:
 - watermark high/low și backpressure înainte de OOM;
 - expertul în execuție sau rezervat nu poate fi evicted;
 - hotness și reuse distance măsurate global, pe strat și pe request class;
+- nicio partiție nu poate consuma prin recență bugetul resident al tuturor
+  celorlalte partiții;
+- sloturile device au generație; un descriptor vechi nu poate referi weights
+  încărcate ulterior în același slot;
 - politica de admission/eviction este pluggable, dar v1 începe determinist și
   explicabil; nu introducem un predictor înainte de traces reale;
 - nicio copie duplicată în RAM dacă singurul owner valid este deja VRAM și
   politica permite eliberarea host copy.
+- un `host lease` immutable poate ține copia RAM validată pe durata compute-ului
+  CPU sau a copierii într-un slab pinned, exact cum device lease protejează
+  slotul VRAM;
+- pool-ul pinned este staging bounded, nu cache de zeci de GB; RAM cache rămâne
+  pageable și este copiat coalesced în staging numai când plannerul alege H2D;
+- slab-urile VRAM sunt prealocate, au generație și credits proprii și nu intră în
+  politica LFU a sloturilor resident.
 
 ### `scheduler/`
 
@@ -279,15 +394,18 @@ Schedulerul menține:
 Algoritmul per strat:
 
 1. dense/attention/router rulează pe GPU;
-2. top-k exact generează work items;
-3. work items sunt grupate după expert peste request-urile disponibile;
-4. experții VRAM-ready rulează imediat prin grouped GEMM;
-5. pentru RAM-ready începe `cudaMemcpyAsync`;
-6. pentru ABSENT începe I/O în buffer pinned;
-7. între timp sunt servite alte grupuri/request-uri gata;
-8. după terminarea tuturor top-k pentru un token, rezultatele sunt ponderate și
-   agregate în ordinea numerică definită de ABI;
-9. request-ul avansează la stratul următor.
+2. top-k exact este compactat și grupat pe GPU;
+3. directorul device separă sloturile ready de miss-uri și verifică generația;
+4. grupurile VRAM-ready rulează imediat prin executorul CUDA grouped;
+5. numai miss-urile deduplicate intră în ring-ul bounded al control plane-ului;
+6. plannerul alege pentru fiecare grup RAM-ready între CPU-local și un slab H2D
+   coalesced; ABSENT pornește I/O către RAM, nu un upload individual implicit;
+7. GPU-ready, H2D și CPU-local rulează concurent, cu cozi/credits separate;
+8. completion scrie ieșirea per selecție; publicarea într-un slot resident este
+   o decizie separată de admission și nu este necesară pentru slab;
+9. după terminarea tuturor top-k pentru un token, un kernel device aplică
+   ponderile în ordinea stabilă definită de ABI;
+10. request-ul avansează la stratul următor.
 
 Reordonarea între request-uri este permisă. Aproximarea routerului, drop-ul unui
 expert sau schimbarea top-k nu sunt permise în modul exact.
@@ -297,16 +415,33 @@ expert sau schimbarea top-k nu sunt permise în modul exact.
 Backend-ul inițial țintește RTX 3090, SM86:
 
 - dense/attention/router/lm_head rezidente și executate pe GPU;
-- kernel cuantizat fused gate+up pentru toate rândurile grupate ale expertului;
-- activarea de intrare este cuantizată o singură dată pentru gate+up;
+- kernel weight-only cuantizat fused gate+up pentru toate rândurile grupate ale
+  expertului, selectat după `quant_abi`;
+- gruparea este expert-major, astfel încât rândurile care aleg același expert
+  reutilizează weights; kernelul de referință row-major rămâne oracle, nu calea
+  production;
+- backend-ul poate folosi CUDA cores, Tensor Cores sau o bibliotecă vendor, dar
+  trebuie să respecte toleranța numerică declarată și layout-ul versionat;
 - SiLU și produsul gate×up sunt fuzionate sau păstrate device-local;
 - grouped down projection și weighted accumulation device-local;
 - streams separate pentru compute, H2D și eventual preload;
+- ring VRAM de slab-uri prealocate și două sau mai multe buffers pinned pentru
+  pack/copy/compute suprapus, fără `cudaMalloc`/`cudaFree` per expert;
 - CUDA events pentru dependențe și eviction sigur;
 - buffers și graph shapes prealocate pentru batch sizes acceptate;
 - niciun round-trip GPU->CPU între router și agregarea MoE;
 - kernelul expune o ABI stabilă pentru quant type/group size/layout;
 - o cale de referință precisă validează kernelul, dar nu intră în hot path.
+
+CPU backend-ul local este un executor, nu noul owner al modelului:
+
+- kernel vectorizat după capabilitatea detectată (AVX2 pe Ryzen 5 5600);
+- grupează toate rândurile care aleg același expert și parcurge weights o dată;
+- citește numai dintr-un host lease validat și scrie ieșiri per selecție;
+- nu este eligibil până când un expert real al ABI-ului curent trece
+  corectitudinea și publică bytes/s, rows/s și timpul gate/up/down;
+- thread pool bounded și affinity configurabilă; nu blochează control plane-ul
+  IOCP sau thread-ul serverului.
 
 Reducerile structurale urmărite față de prototipul OLMoE sunt verificabile:
 
@@ -379,6 +514,9 @@ ssd_bandwidth
 pcie_bandwidth
 active_expert_bytes_per_token
 expected_concurrency/reuse
+measured_non_io_nanoseconds_per_token
+measured_coalesced_h2d_bandwidth
+measured_cpu_expert_cost_by_rows
 ```
 
 El produce:
@@ -389,6 +527,8 @@ El produce:
 - hit/reuse minim necesar;
 - concurența minimă necesară pentru amortizare;
 - un plan `feasible`, `degraded` sau `impossible` cu explicație numerică.
+- executorii eligibili și punctul de crossover CPU-local versus slab H2D;
+- plafonul compute măsurat, separat de plafonul storage/H2D.
 
 `impossible` nu pornește cu promisiunea SLO. Operatorul poate porni explicit în
 mod best-effort, iar API-ul și metricile trebuie să reflecte acest lucru.
@@ -401,15 +541,17 @@ Starea curentă:
 |---|---|
 | P0 contract/skeleton | completă |
 | P1 compiler/container | completă; containerul Qwen3-Next real este validat independent |
-| P2 storage/cache | completă și validată pe Windows/RTX 3090 |
-| P3 single-request exact | completă pentru OLMoE; Qwen este implementat și așteaptă gate-ul real |
-| P4 batching | completă pentru OLMoE; Qwen are dense/router/MoE batched, așteaptă măsurarea reală |
+| P2 storage/cache | completă pentru P6: IOCP, cache RAM/VRAM, host lease, director GPU, LFU cu feedback batched și placement adaptiv asincron pe epoci |
+| P3 single-request exact | completă: gate Qwen PASS la 31,7312 tok/s cu cache expert 18 GiB |
+| P4 batching | completă: 31,1004 tok/s aggregate la concurență 4, interleaving exact și zero H2D weights după warmup |
 | P5 serviciu | completă și operabilă; profilul Task Scheduler și smoke-ul Qwen sunt pregătite |
-| P6 model > RAM | în curs: downloadul, conversia și validarea sunt complete; gate-urile reale rămân deschise |
+| P6 model > RAM | completă: 81,90 GB > 68,64 GB RAM, single și aggregate PASS, zero creștere pagefile și >24 GiB RAM fizic liber |
 
-Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P0–P5 nu
-se redeschid ca experimente; se corectează numai dacă rularea P6 descoperă un
-defect concret.
+Rezultatele și commit-urile validate sunt consemnate în `RESULTS.md`. P6 a
+înlocuit eviction-ul global, promovarea obligatorie a fiecărui RAM hit și
+rebalansarea în hot path cu director GPU, executor CPU/GPU per selecție și
+placement adaptiv asincron pe epoci. Slab streaming rămâne un executor viitor
+compatibil, nu o condiție pentru poarta închisă.
 
 ### P0 — contract și skeleton
 
@@ -868,31 +1010,22 @@ Cheia fazei distribuite este:
 - nu descărcăm încă un model mare înainte ca P0 să poată demonstra fezabilitatea;
 - nu declarăm production pe baza unui prompt scurt sau doar a mediei tok/s.
 
-## 7. Ordinea exactă pentru continuarea P6
+## 7. Închiderea P6 și handoff
 
-1. nu întrerupem download-ul Xet; verificăm `Get-P6ModelDownload.ps1` până când
-   raportează 41/41 și zero transferuri incomplete;
-2. rulăm `Invoke-P6Preflight.ps1` și păstrăm artefactul cu disk/RAM estimate;
-3. conversia nu pornește fără aprobarea explicită a operatorului pentru
-   reclamarea shard-urilor sursă, deoarece C: nu poate găzdui simultan sursa și
-   containerul; wrapperul cere textul `DELETE_CONSUMED_SHARDS`;
-4. rulăm `Invoke-P6Conversion.ps1`, cu `-Resume` numai după o întrerupere;
-   jurnalul de reclamare și starea atomică sunt păstrate;
-5. validăm containerul complet independent prin `Invoke-ExpertPack.ps1 -Action
-   Validate`; un pack incomplet sau un hash invalid oprește fluxul;
-6. rulăm Qwen single-request, publicăm TTFT, hot tok/s, bytes SSD/H2D per token,
-   hit VRAM/RAM, miss SSD, high-water și eviction; utilizarea pagefile-ului
-   existentă la baseline este permisă, dar workload-ul nu o poate crește și
-   trebuie să păstreze rezerva declarată de RAM fizic;
-7. rulăm `--batch` la concurența 4 în același proces/cache și publicăm tok/s
-   aggregate, nu suma unor procese cu copii separate ale modelului;
-8. verificăm output-ul determinist și semantica INT8 prin controalele deja
-   fixate; interleaving-ul nu poate schimba secvența fiecărui request;
-9. dacă 10 tok/s single sau 30 tok/s aggregate nu trec, optimizăm numai faza
-   indicată numeric de telemetry (dense, expert compute, H2D sau SSD wait), apoi
-   repetăm gate-ul relevant;
-10. după gate pornim `Start-P6ExpertServer.ps1` și verificăm health, streaming,
-    cancellation și bugetele procesului persistent.
+Download-ul, conversia, validarea independentă și ambele gate-uri sunt închise.
+Checkpoint-ul Hugging Face și Expert Pack-ul Qwen rămân păstrate integral.
+Configurația canonică este 48 GiB cache RAM, 18 GiB cache VRAM, warmup o epocă,
+concurență 4. Rezultatele sunt `31,7312 tok/s` single și `31,1004 tok/s`
+aggregate, cu zero creștere pagefile și zero H2D weights în ferestrele
+măsurate.
+
+Handoff-ul operațional este:
+
+1. instalăm/reinstalăm profilul persistent P6 cu configurația canonică;
+2. verificăm health, model-info, streaming, cancellation, overload și bugetele;
+3. păstrăm separat artefactele PASS single/batch și procedura de rollback;
+4. nu ștergem checkpoint-ul sursă sau Expert Pack-ul după deploy;
+5. abia după smoke-ul serviciului marcăm deploy-ul canonic în `RESULTS.md`.
 
 RTX 3090/CUDA rămâne backend-ul curent. macOS/Metal și Expert RPC rămân P7/P8,
 fără implementare în această continuare.

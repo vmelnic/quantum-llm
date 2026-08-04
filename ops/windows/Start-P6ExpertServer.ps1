@@ -5,7 +5,7 @@ param(
     [int]$MaximumContext = 4096,
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
-    [int]$WorkerVramCacheGiB = 14,
+    [int]$WorkerVramCacheGiB = 18,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [int]$StartupTimeoutSeconds = 600,

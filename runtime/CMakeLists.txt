@@ -8,8 +8,10 @@ option(EXPERT_RUNTIME_ENABLE_CUDA_PINNED "Use cudaHostAlloc for the fixed host p
 option(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE "Build SM86 Expert Pack kernels" OFF)
 
 add_library(expert_runtime STATIC
+  src/adaptive_placement.cpp
   src/buffer_pool.cpp
   src/cache_state.cpp
+  src/cpu/expert_executor.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
   src/scheduler.cpp
@@ -31,6 +33,14 @@ endif()
 find_package(Threads REQUIRED)
 target_link_libraries(expert_runtime PUBLIC Threads::Threads)
 
+if(MSVC)
+  set_source_files_properties(src/cpu/expert_executor.cpp
+    PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
+  set_source_files_properties(src/cpu/expert_executor.cpp
+    PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+endif()
+
 if(WIN32)
   target_sources(expert_runtime PRIVATE src/windows_iocp_storage.cpp)
 endif()
@@ -46,6 +56,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   enable_language(CUDA)
   find_package(CUDAToolkit 12.1 REQUIRED)
   target_sources(expert_runtime PRIVATE
+    src/cuda/expert_directory.cu
     src/cuda/expert_uploader.cu
     src/cuda/moe_kernels.cu
     src/cuda/transformer_kernels.cu)
@@ -62,6 +73,14 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   add_executable(expert-cuda-moe-smoke tools/cuda_moe_smoke.cpp)
   target_compile_features(expert-cuda-moe-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-cuda-moe-smoke PRIVATE expert_runtime CUDA::cudart)
+  add_executable(expert-path-probe tools/expert_path_probe.cpp)
+  target_compile_features(expert-path-probe PRIVATE cxx_std_20)
+  target_link_libraries(expert-path-probe PRIVATE expert_runtime CUDA::cudart)
+  if(MSVC)
+    target_compile_options(expert-path-probe PRIVATE /arch:AVX2)
+  else()
+    target_compile_options(expert-path-probe PRIVATE -mavx2 -mfma)
+  endif()
   add_executable(expert-qwen3-next-cuda-smoke tools/qwen3_next_cuda_smoke.cpp)
   target_compile_features(expert-qwen3-next-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-qwen3-next-cuda-smoke PRIVATE expert_runtime CUDA::cudart)

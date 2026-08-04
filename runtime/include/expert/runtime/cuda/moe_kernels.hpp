@@ -1,5 +1,6 @@
 #pragma once
 
+#include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/storage.hpp"
 
 #include <cstddef>
@@ -22,6 +23,8 @@ struct MoeLaunch final {
   std::uint32_t top_k{};
   std::uint32_t expert_table_size{};  // top_k when expert_indices is null.
   void* stream{};         // cudaStream_t without leaking CUDA headers.
+  const DeviceExpertEntry* directory_entries{};
+  std::uint32_t directory_layer{};
 };
 
 struct MoeBatchLaunch final {
@@ -40,6 +43,37 @@ struct MoeBatchLaunch final {
   std::uint32_t top_k{};
   std::uint32_t expert_table_size{};
   void* stream{};
+  const DeviceExpertEntry* directory_entries{};
+  std::uint32_t directory_layer{};
+};
+
+struct MoeSelectionBatchLaunch final {
+  const float* input{};                   // [rows, hidden]
+  const float* routing_weights{};         // retained for ABI symmetry
+  const std::uint32_t* expert_indices{};  // [rows, top_k]
+  const std::uint8_t* selection_mask{};   // [rows, top_k], null means all
+  float* intermediate{};                  // [rows, top_k, intermediate]
+  float* selection_outputs{};             // [rows, top_k, hidden]
+  std::uint32_t rows{};
+  std::uint32_t hidden_size{};
+  std::uint32_t intermediate_size{};
+  std::uint32_t top_k{};
+  std::uint32_t expert_table_size{};
+  void* stream{};
+  const DeviceExpertEntry* directory_entries{};
+  std::uint32_t directory_layer{};
+};
+
+struct MoeAggregateLaunch final {
+  const float* selection_outputs{};  // primary [rows, top_k, hidden]
+  const float* alternate_outputs{};  // optional secondary buffer
+  const std::uint8_t* primary_mask{};  // 1 selects primary, 0 secondary
+  const float* routing_weights{};     // [rows, top_k]
+  float* output{};                    // [rows, hidden]
+  std::uint32_t rows{};
+  std::uint32_t hidden_size{};
+  std::uint32_t top_k{};
+  void* stream{};
 };
 
 // Exact Expert Pack INT8-per-row decode path. The first launch computes fused
@@ -48,5 +82,9 @@ struct MoeBatchLaunch final {
 // deterministic numeric order.
 [[nodiscard]] Status launch_moe_single_token(const MoeLaunch& launch) noexcept;
 [[nodiscard]] Status launch_moe_batch(const MoeBatchLaunch& launch) noexcept;
+[[nodiscard]] Status launch_moe_selection_batch(
+    const MoeSelectionBatchLaunch& launch) noexcept;
+[[nodiscard]] Status launch_moe_aggregate(
+    const MoeAggregateLaunch& launch) noexcept;
 
 }  // namespace expert::runtime::cuda

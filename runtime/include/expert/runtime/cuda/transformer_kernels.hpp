@@ -22,6 +22,12 @@ struct Int8Matrix final {
 [[nodiscard]] Status gemv_batch(const Int8Matrix& matrix, const float* input,
                                 float* output, std::uint32_t batch,
                                 void* stream) noexcept;
+// Large-output projection path (for example lm_head). One warp keeps several
+// request accumulators and reads each weight row once. Bounded to batch <= 8 to
+// avoid the register-pressure regression observed on smaller dense matrices.
+[[nodiscard]] Status gemv_batch_weight_reuse(
+    const Int8Matrix& matrix, const float* input, float* output,
+    std::uint32_t batch, void* stream) noexcept;
 [[nodiscard]] Status gemv_f32(const float* matrix, std::uint32_t rows,
                               std::uint32_t columns, const float* input,
                               float* output, void* stream) noexcept;
@@ -118,5 +124,9 @@ struct Qwen3NextDeltaLaunch final {
 
 [[nodiscard]] Status argmax(const float* values, std::uint32_t count,
                             std::uint32_t* output, void* stream) noexcept;
+[[nodiscard]] Status argmax_batch(const float* values, std::uint32_t count,
+                                  std::uint32_t batch,
+                                  std::uint32_t* output,
+                                  void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

@@ -24,6 +24,11 @@
     "expected_ram_hit_ppm": { "type": "integer", "minimum": 0, "maximum": 1000000 },
     "minimum_workspace_bytes": { "type": "integer", "minimum": 0 },
     "minimum_staging_bytes": { "type": "integer", "minimum": 1 },
-    "kv_bytes_per_request": { "type": "integer", "minimum": 1 }
+    "kv_bytes_per_request": { "type": "integer", "minimum": 1 },
+    "measured_non_io_nanoseconds_per_token": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Optional same-model evidence; excludes storage/H2D wait but includes compute and mandatory control overhead."
+    }
   }
 }

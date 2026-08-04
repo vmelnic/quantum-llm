@@ -40,6 +40,8 @@ struct SloRequest {
     std::uint64_t minimum_workspace_bytes{};
     std::uint64_t minimum_staging_bytes{};
     std::uint64_t kv_bytes_per_request{};
+    // Optional evidence from the same model/backend. Zero means unknown.
+    std::uint64_t measured_non_io_nanoseconds_per_token{};
 };
 
 enum class FeasibilityStatus { kFeasible, kDegraded, kImpossible };
@@ -64,6 +66,7 @@ struct FeasibilityDecision {
     std::uint64_t theoretical_minimum_concurrency{};
     std::uint64_t vram_expert_capacity_count{};
     std::uint64_t ram_expert_capacity_count{};
+    std::uint64_t measured_non_io_ceiling_tokens_per_second_milli{};
     std::vector<Constraint> constraints;
 };
 

@@ -121,6 +121,24 @@ void TestHardVramRefusalPrecedesBandwidth() {
           "first hard limiting resource must be stable");
 }
 
+void TestMeasuredNonIoCeilingRefusesUnreachableSlo() {
+    auto request = ColdTenTokensPerSecond();
+    request.expected_vram_hit_ppm = 950'000ULL;
+    request.measured_non_io_nanoseconds_per_token = 89'760'000ULL;
+    request.target_tokens_per_second_milli = 30'000ULL;
+    auto hardware = Box3090();
+    hardware.storage_bandwidth_measured = true;
+    hardware.h2d_bandwidth_measured = true;
+    const auto decision = expert::core::EvaluateFeasibility(
+        OlmoeManifest(), hardware, request);
+    Check(decision.status == expert::core::FeasibilityStatus::kImpossible,
+          "measured compute/control lower bound must refuse unreachable SLO");
+    Check(decision.limiting_resource == "measured_non_io_ceiling",
+          "measured non-I/O ceiling must identify the limiting resource");
+    Check(decision.measured_non_io_ceiling_tokens_per_second_milli == 11'140ULL,
+          "measured non-I/O tok/s ceiling must be explicit");
+}
+
 }  // namespace
 
 int main() {
@@ -129,6 +147,7 @@ int main() {
         TestImpossibleBandwidthRefusal();
         TestHotPlanFitsButUnmeasuredIsDegraded();
         TestHardVramRefusalPrecedesBandwidth();
+        TestMeasuredNonIoCeilingRefusesUnreachableSlo();
         std::cout << "P0 core contract tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

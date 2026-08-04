@@ -3,9 +3,12 @@
 #include <cuda_runtime_api.h>
 
 #include <cstddef>
+#include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 namespace expert::runtime::cuda {
 namespace {
@@ -17,15 +20,31 @@ Status cuda_failure(const char* operation, cudaError_t error) {
 
 }  // namespace
 
+struct CudaExpertPool final {
+  cudaStream_t stream{};
+  std::mutex mutex;
+
+  ~CudaExpertPool() {
+    if (stream != nullptr) {
+      static_cast<void>(cudaStreamSynchronize(stream));
+      static_cast<void>(cudaStreamDestroy(stream));
+    }
+  }
+};
+
 CudaExpertAllocation::CudaExpertAllocation(
-    void* storage, std::size_t bytes, const std::int8_t* gate_up,
+    std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
+    const std::int8_t* gate_up,
     const float* gate_up_scales, const std::int8_t* down,
     const float* down_scales) noexcept
-    : storage_(storage), bytes_(bytes), gate_up_(gate_up),
+    : pool_(std::move(pool)), storage_(storage), bytes_(bytes), gate_up_(gate_up),
       gate_up_scales_(gate_up_scales), down_(down), down_scales_(down_scales) {}
 
 CudaExpertAllocation::~CudaExpertAllocation() {
-  if (storage_ != nullptr) static_cast<void>(cudaFree(storage_));
+  if (storage_ != nullptr && pool_) {
+    std::lock_guard lock(pool_->mutex);
+    static_cast<void>(cudaFreeAsync(storage_, pool_->stream));
+  }
 }
 
 std::size_t CudaExpertAllocation::bytes() const noexcept { return bytes_; }
@@ -34,31 +53,51 @@ const float* CudaExpertAllocation::gate_up_scales() const noexcept { return gate
 const std::int8_t* CudaExpertAllocation::down() const noexcept { return down_; }
 const float* CudaExpertAllocation::down_scales() const noexcept { return down_scales_; }
 
-CudaExpertUploader::CudaExpertUploader() {
+CudaExpertUploader::CudaExpertUploader() : pool_(std::make_shared<CudaExpertPool>()) {
+  int pools_supported = 0;
+  if (const auto error = cudaDeviceGetAttribute(
+          &pools_supported, cudaDevAttrMemoryPoolsSupported, 0);
+      error != cudaSuccess || pools_supported == 0) {
+    throw std::runtime_error("CUDA device does not support stream-ordered memory pools");
+  }
   cudaStream_t stream{};
   if (const auto error = cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
       error != cudaSuccess) {
     throw std::runtime_error(std::string("cudaStreamCreate: ") + cudaGetErrorString(error));
   }
-  stream_ = stream;
+  pool_->stream = stream;
+  cudaMemPool_t memory_pool{};
+  if (const auto error = cudaDeviceGetDefaultMemPool(&memory_pool, 0);
+      error != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaDeviceGetDefaultMemPool: ") +
+                             cudaGetErrorString(error));
+  }
+  auto threshold = std::numeric_limits<std::uint64_t>::max();
+  if (const auto error = cudaMemPoolSetAttribute(
+          memory_pool, cudaMemPoolAttrReleaseThreshold, &threshold);
+      error != cudaSuccess) {
+    throw std::runtime_error(std::string("cudaMemPoolSetAttribute: ") +
+                             cudaGetErrorString(error));
+  }
 }
 
-CudaExpertUploader::~CudaExpertUploader() {
-  if (stream_ != nullptr) static_cast<void>(cudaStreamDestroy(static_cast<cudaStream_t>(stream_)));
-}
+CudaExpertUploader::~CudaExpertUploader() = default;
 
 OperationId CudaExpertUploader::upload(UploadRequest request,
                                        UploadCompletion completion) {
   const auto operation = next_operation_++;
   if (!completion) return operation;
-  std::lock_guard stream_lock(stream_mutex_);
+  std::unique_lock stream_lock(pool_->mutex);
   const auto& sections = request.sections;
   const auto total = static_cast<std::size_t>(
       sections.gate_up_q_bytes + sections.gate_up_scale_bytes +
       sections.down_q_bytes + sections.down_scale_bytes);
   void* raw = nullptr;
-  if (const auto error = cudaMalloc(&raw, total); error != cudaSuccess) {
-    completion({cuda_failure("cudaMalloc expert", error), {}, 0});
+  const auto stream = pool_->stream;
+  auto error = cudaMallocAsync(&raw, total, stream);
+  if (error != cudaSuccess) {
+    stream_lock.unlock();
+    completion({cuda_failure("cudaMallocAsync expert", error), {}, 0});
     return operation;
   }
   auto* cursor = static_cast<std::byte*>(raw);
@@ -70,34 +109,39 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   cursor += sections.down_q_bytes;
   auto* down_scales = reinterpret_cast<float*>(cursor);
   const auto source = request.complete_record.data();
-  const auto stream = static_cast<cudaStream_t>(stream_);
   const auto copy = [&](void* destination, std::uint64_t offset,
                         std::uint64_t bytes) {
-    return cudaMemcpyAsync(destination, source + offset, static_cast<std::size_t>(bytes),
+    return cudaMemcpyAsync(destination, source + offset,
+                           static_cast<std::size_t>(bytes),
                            cudaMemcpyHostToDevice, stream);
   };
-  cudaError_t error = copy(gate, sections.gate_up_q_offset, sections.gate_up_q_bytes);
+  error = copy(gate, sections.gate_up_q_offset, sections.gate_up_q_bytes);
   if (error == cudaSuccess)
-    error = copy(gate_scales, sections.gate_up_scale_offset, sections.gate_up_scale_bytes);
+    error = copy(gate_scales, sections.gate_up_scale_offset,
+                 sections.gate_up_scale_bytes);
   if (error == cudaSuccess)
     error = copy(down, sections.down_q_offset, sections.down_q_bytes);
   if (error == cudaSuccess)
-    error = copy(down_scales, sections.down_scale_offset, sections.down_scale_bytes);
+    error = copy(down_scales, sections.down_scale_offset,
+                 sections.down_scale_bytes);
   if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess) {
-    static_cast<void>(cudaFree(raw));
+    static_cast<void>(cudaFreeAsync(raw, stream));
+    static_cast<void>(cudaStreamSynchronize(stream));
+    stream_lock.unlock();
     completion({cuda_failure("expert H2D", error), {}, 0});
     return operation;
   }
   auto allocation = std::make_shared<CudaExpertAllocation>(
-      raw, total, gate, gate_scales, down, down_scales);
+      pool_, raw, total, gate, gate_scales, down, down_scales);
+  stream_lock.unlock();
   completion({Status::success(), std::move(allocation), total});
   return operation;
 }
 
 void CudaExpertUploader::cancel(OperationId) noexcept {
-  // v1 upload is bounded and synchronous; cancellation is observed before the
-  // next cache operation. The asynchronous implementation will use events.
+  // v1 upload is bounded and synchronous; cache abandonment is observed before
+  // the next cache operation.
 }
 
 }  // namespace expert::runtime::cuda

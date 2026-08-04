@@ -16,6 +16,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -163,16 +164,24 @@ int main(int argc, char** argv) {
     float* d_input{};
     float* d_intermediate{};
     float* d_output{};
+    float* d_selection_output{};
     float* d_routing{};
+    std::uint32_t* d_indices{};
     device_allocate(d_input, input.size() * sizeof(float), "cudaMalloc input");
     device_allocate(d_intermediate, static_cast<std::size_t>(top_k) * width * sizeof(float), "cudaMalloc intermediate");
     device_allocate(d_output, hidden * sizeof(float), "cudaMalloc output");
+    device_allocate(d_selection_output,
+                    static_cast<std::size_t>(top_k) * hidden * sizeof(float),
+                    "cudaMalloc selection output");
     device_allocate(d_routing, routing.size() * sizeof(float), "cudaMalloc routing");
+    device_allocate(d_indices, top_k * sizeof(std::uint32_t),
+                    "cudaMalloc expert indices");
     cuda_check(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input");
     cuda_check(cudaMemcpy(d_routing, routing.data(), routing.size() * sizeof(float), cudaMemcpyHostToDevice), "copy routing");
-
-    std::vector<const std::int8_t*> gate_ptrs(top_k), down_ptrs(top_k);
-    std::vector<const float*> gate_scale_ptrs(top_k), down_scale_ptrs(top_k);
+    std::vector<std::uint32_t> indices(top_k);
+    std::iota(indices.begin(), indices.end(), 0U);
+    cuda_check(cudaMemcpy(d_indices, indices.data(), top_k * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice), "copy expert indices");
     const auto slot_bytes = static_cast<std::size_t>(
         std::max_element(records.begin(), records.end(), [](const auto& left, const auto& right) {
           return left.payload.stored_bytes < right.payload.stored_bytes;
@@ -180,13 +189,16 @@ int main(int argc, char** argv) {
     const auto tier_bytes = static_cast<std::uint64_t>(slot_bytes) * top_k;
     auto storage = std::make_shared<expert::runtime::WindowsIocpStorage>(2);
     auto uploader = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
+    auto directory =
+        std::make_shared<expert::runtime::cuda::CudaExpertDirectory>(
+            0, 1, 1, top_k, top_k);
     auto buffers = std::make_shared<expert::runtime::FixedBufferPool>(
         2, slot_bytes, expert::runtime::kExpertPackAlignment,
         std::make_shared<expert::runtime::CudaPinnedAllocator>());
     expert::runtime::ExpertCache cache(
         {{tier_bytes, tier_bytes, tier_bytes},
          {tier_bytes, tier_bytes, tier_bytes}, true},
-        storage, uploader, buffers);
+        storage, uploader, buffers, directory);
     std::vector<expert::runtime::AcquireHandle> handles;
     handles.reserve(top_k);
     for (std::uint32_t i = 0; i < top_k; ++i) {
@@ -201,31 +213,30 @@ int main(int argc, char** argv) {
                                  std::string(acquired.status.message()));
       }
       leases.push_back(std::move(acquired.lease));
-      const auto* allocation = dynamic_cast<const expert::runtime::cuda::CudaExpertAllocation*>(
-          leases.back().get());
-      if (allocation == nullptr) throw std::runtime_error("unexpected cache allocation type");
-      gate_ptrs[i] = allocation->gate_up();
-      gate_scale_ptrs[i] = allocation->gate_up_scales();
-      down_ptrs[i] = allocation->down();
-      down_scale_ptrs[i] = allocation->down_scales();
     }
-    const std::int8_t** d_gate_ptrs{};
-    const std::int8_t** d_down_ptrs{};
-    const float** d_gate_scale_ptrs{};
-    const float** d_down_scale_ptrs{};
-    device_allocate(d_gate_ptrs, top_k * sizeof(*d_gate_ptrs), "cudaMalloc gate pointers");
-    device_allocate(d_down_ptrs, top_k * sizeof(*d_down_ptrs), "cudaMalloc down pointers");
-    device_allocate(d_gate_scale_ptrs, top_k * sizeof(*d_gate_scale_ptrs), "cudaMalloc gate scale pointers");
-    device_allocate(d_down_scale_ptrs, top_k * sizeof(*d_down_scale_ptrs), "cudaMalloc down scale pointers");
-    cuda_check(cudaMemcpy(d_gate_ptrs, gate_ptrs.data(), top_k * sizeof(*d_gate_ptrs), cudaMemcpyHostToDevice), "copy gate pointers");
-    cuda_check(cudaMemcpy(d_down_ptrs, down_ptrs.data(), top_k * sizeof(*d_down_ptrs), cudaMemcpyHostToDevice), "copy down pointers");
-    cuda_check(cudaMemcpy(d_gate_scale_ptrs, gate_scale_ptrs.data(), top_k * sizeof(*d_gate_scale_ptrs), cudaMemcpyHostToDevice), "copy gate scale pointers");
-    cuda_check(cudaMemcpy(d_down_scale_ptrs, down_scale_ptrs.data(), top_k * sizeof(*d_down_scale_ptrs), cudaMemcpyHostToDevice), "copy down scale pointers");
-
-    expert::runtime::cuda::MoeLaunch launch{d_input, d_gate_ptrs, d_gate_scale_ptrs, d_down_ptrs, d_down_scale_ptrs, d_routing, nullptr, d_intermediate, d_output, hidden, width, top_k, top_k, nullptr};
+    const auto plan = directory->pin_or_collect_misses(
+        0, d_indices, top_k, nullptr);
+    if (!plan.status.ok() || !plan.missing_experts.empty())
+      throw std::runtime_error("CUDA directory did not publish acquired experts");
+    expert::runtime::cuda::MoeLaunch launch{
+        d_input, nullptr, nullptr, nullptr, nullptr, d_routing, d_indices,
+        d_intermediate, d_output, hidden, width, top_k, top_k, nullptr,
+        directory->device_entries(), 0};
     const auto status = expert::runtime::cuda::launch_moe_single_token(launch);
     if (!status.ok()) throw std::runtime_error(std::string(status.message()));
     cuda_check(cudaDeviceSynchronize(), "MoE synchronize");
+    auto split_status = expert::runtime::cuda::launch_moe_selection_batch({
+        d_input, d_routing, d_indices, nullptr, d_intermediate,
+        d_selection_output, 1, hidden, width, top_k, top_k, nullptr,
+        directory->device_entries(), 0});
+    if (!split_status.ok())
+      throw std::runtime_error(std::string(split_status.message()));
+    split_status = expert::runtime::cuda::launch_moe_aggregate({
+        d_selection_output, nullptr, nullptr, d_routing, d_output, 1, hidden,
+        top_k, nullptr});
+    if (!split_status.ok())
+      throw std::runtime_error(std::string(split_status.message()));
+    cuda_check(cudaDeviceSynchronize(), "split MoE synchronize");
     constexpr int kWarmup = 10;
     constexpr int kIterations = 100;
     for (int iteration = 0; iteration < kWarmup; ++iteration) {
@@ -262,6 +273,9 @@ int main(int argc, char** argv) {
       norm_b += static_cast<double>(reference[i]) * reference[i];
     }
     const double cosine = dot / std::sqrt(norm_a * norm_b);
+    const auto release_status = directory->release_pins(nullptr);
+    if (!release_status.ok())
+      throw std::runtime_error(std::string(release_status.message()));
     const auto cache_metrics = cache.telemetry();
     std::cout << "{\"valid\":" << (max_rel < 0.01 && cosine > 0.999999 ? "true" : "false")
               << ",\"top_k\":" << top_k << ",\"hidden\":" << hidden

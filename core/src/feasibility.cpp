@@ -121,6 +121,11 @@ FeasibilityDecision EvaluateFeasibility(const ManifestResources& manifest,
         result.ram_expert_capacity_count = request.ram_expert_budget_bytes /
                                            manifest.average_expert_record_bytes;
     }
+    if (request.measured_non_io_nanoseconds_per_token != 0U) {
+        result.measured_non_io_ceiling_tokens_per_second_milli =
+            SaturatingMultiply(1'000'000'000ULL, 1000U) /
+            request.measured_non_io_nanoseconds_per_token;
+    }
 
     const auto kv_bytes = SaturatingMultiply(request.kv_bytes_per_request,
                                              request.concurrency);
@@ -152,6 +157,14 @@ FeasibilityDecision EvaluateFeasibility(const ManifestResources& manifest,
         ram_required, hardware.available_ram_bytes);
     add("disk_capacity", "container_file_bytes <= disk_free_bytes",
         manifest.total_file_bytes, hardware.disk_free_bytes);
+    if (request.measured_non_io_nanoseconds_per_token != 0U) {
+        const auto required_non_io_nanoseconds_per_second = MultiplyDivideCeil(
+            request.measured_non_io_nanoseconds_per_token,
+            request.target_tokens_per_second_milli, 1000U);
+        add("measured_non_io_ceiling",
+            "measured_non_io_ns_per_token * target_tokens_per_second <= 1 second",
+            required_non_io_nanoseconds_per_second, 1'000'000'000ULL);
+    }
     add("storage_bandwidth", "cold_bytes_per_token * target_tokens_per_second <= sustained_storage_read_bytes_per_second",
         storage_required_bps, hardware.sustained_storage_read_bytes_per_second);
     add("pcie_h2d_bandwidth", "h2d_bytes_per_token * target_tokens_per_second <= sustained_h2d_bytes_per_second",
@@ -211,6 +224,8 @@ std::string DecisionToCanonicalJson(const FeasibilityDecision& decision) {
            << ",\"h2d_bytes_per_token_budget\":"
            << decision.h2d_bytes_per_token_budget
            << ",\"limiting_resource\":" << EscapeJson(decision.limiting_resource)
+           << ",\"measured_non_io_ceiling_tokens_per_second_milli\":"
+           << decision.measured_non_io_ceiling_tokens_per_second_milli
            << ",\"ram_expert_capacity_count\":"
            << decision.ram_expert_capacity_count
            << ",\"required_storage_avoidance_ppm\":"

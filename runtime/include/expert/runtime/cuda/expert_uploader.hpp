@@ -4,13 +4,17 @@
 
 #include <atomic>
 #include <cstdint>
+#include <memory>
 #include <mutex>
 
 namespace expert::runtime::cuda {
 
+struct CudaExpertPool;
+
 class CudaExpertAllocation final : public IDeviceAllocation {
  public:
-  CudaExpertAllocation(void* storage, std::size_t bytes,
+  CudaExpertAllocation(std::shared_ptr<CudaExpertPool> pool, void* storage,
+                       std::size_t bytes,
                        const std::int8_t* gate_up, const float* gate_up_scales,
                        const std::int8_t* down, const float* down_scales) noexcept;
   ~CudaExpertAllocation() override;
@@ -24,6 +28,7 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   [[nodiscard]] const float* down_scales() const noexcept;
 
  private:
+  std::shared_ptr<CudaExpertPool> pool_;
   void* storage_{};
   std::size_t bytes_{};
   const std::int8_t* gate_up_{};
@@ -43,9 +48,8 @@ class CudaExpertUploader final : public IDeviceUploader {
   void cancel(OperationId operation) noexcept override;
 
  private:
-  void* stream_{};
+  std::shared_ptr<CudaExpertPool> pool_;
   std::atomic<std::uint64_t> next_operation_{1};
-  std::mutex stream_mutex_;
 };
 
 }  // namespace expert::runtime::cuda

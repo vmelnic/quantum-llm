@@ -35,6 +35,8 @@ TelemetrySnapshot Telemetry::snapshot() const noexcept {
   EXPERT_SNAPSHOT(load_completed);
   EXPERT_SNAPSHOT(upload_started);
   EXPERT_SNAPSHOT(upload_completed);
+  EXPERT_SNAPSHOT(record_validations);
+  EXPERT_SNAPSHOT(validated_ram_reuses);
   EXPERT_SNAPSHOT(requested_bytes);
   EXPERT_SNAPSHOT(useful_bytes);
   EXPERT_SNAPSHOT(read_bytes);
@@ -43,9 +45,15 @@ TelemetrySnapshot Telemetry::snapshot() const noexcept {
   EXPERT_SNAPSHOT(ram_high_water);
   EXPERT_SNAPSHOT(vram_bytes);
   EXPERT_SNAPSHOT(vram_high_water);
+  EXPERT_SNAPSHOT(vram_resident_bytes);
+  EXPERT_SNAPSHOT(vram_transient_bytes);
+  EXPERT_SNAPSHOT(vram_resident_high_water);
+  EXPERT_SNAPSHOT(vram_transient_high_water);
   EXPERT_SNAPSHOT(staging_bytes);
   EXPERT_SNAPSHOT(staging_high_water);
   EXPERT_SNAPSHOT(eviction_count);
+  EXPERT_SNAPSHOT(same_partition_evictions);
+  EXPERT_SNAPSHOT(over_quota_evictions);
   EXPERT_SNAPSHOT(stalled_by_budget);
   EXPERT_SNAPSHOT(cancellation_count);
   EXPERT_SNAPSHOT(short_read_errors);

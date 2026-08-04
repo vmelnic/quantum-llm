@@ -9,20 +9,98 @@ execuția distribuită sunt faze viitoare și nu fac parte din ABI-ul v1.
 ```text
 manifest/index -> feasibility/admission -> request state
                                            |
-router exact -> work (layer,expert,row) -> scheduler expert-centric
+router exact -> device dispatch plan -> scheduler expert-centric
                                            |
-                         +-----------------+----------------+
-                         | VRAM hit        | RAM hit        | SSD miss
-                         v                 v                v
-                     grouped CUDA     async H2D      IOCP direct read
-                         +-----------------+----------------+
-                                           v
-                                weighted exact aggregation
+                +--------------------------+--------------------------+
+                |                          |                          |
+          VRAM resident              RAM -> pinned slab          RAM host lease
+          grouped CUDA               -> H2D -> CUDA              -> CPU kernel
+                |                          |                          |
+                +---------- per-selection exact outputs -------------+
+                                           |
+                                stable weighted aggregation
 ```
 
 Core-ul folosește IDs, byte budgets, stări și interfețe; handle-urile Win32 și
 tipurile CUDA rămân în backend-urile lor. Nicio dependență Colibri/llama.cpp și
-nicio cale Metal/network nu intră în build-ul curent.
+nicio cale Metal/network nu intră în build-ul curent. Contractul de placement
+acceptă însă tiers locale sau remote, astfel încât un model 1T să nu impună o
+rescriere a data plane-ului.
+
+## Data plane GPU-driven, control plane ierarhic
+
+GPU-driven descrie cine orchestrează traseul hot, nu locul unde se află modelul
+complet. Routerul scrie selecțiile direct într-un plan device. Un kernel le
+deduplică/grupează și consultă un director device cu intrări versionate. Ready
+work continuă pe GPU; numai cheile lipsă sunt copiate într-un miss ring bounded.
+
+CPU/storage nu reconstruiește lista completă de pointeri la fiecare strat. El
+rezolvă miss-ul din RAM, SSD sau ulterior dintr-un worker și alege un executor.
+Un miss poate fi admis într-un slot resident, calculat tranzitoriu într-un slab
+VRAM sau calculat lângă copia RAM. Slotul/slab-ul nu poate fi reutilizat până
+când toate event-urile generației vechi s-au terminat.
+
+## Contractul executorului heterogen
+
+Unitatea comună este un `ExpertWorkGroup`: un singur `(layer, expert,
+quant_abi)` și toate selecțiile din microbatch care îl cer. El conține host sau
+device lease, indicii rândurilor, sloturile top-k, deadline-ul și destinațiile
+per-selecție. Executorii disponibili sunt:
+
+- `cuda_resident`: consumă o generație publicată în director;
+- `cuda_slab`: copiază mai multe grupuri RAM-ready într-un slab pinned/device
+  prealocat și publică pointerii numai pentru durata generației tranzitorii;
+- `cpu_local`: consumă host lease și calculează în thread pool-ul bounded;
+- `remote_worker`: rezervat P8, cu aceeași ieșire semantică.
+
+Plannerul alege după completion time măsurat, queue depth și credits. Nicio cale
+nemăsurată nu este considerată gratuită. Alegerea executorului nu schimbă
+routerul, routing weights, precizia declarată sau ordinea finală de acumulare.
+
+Fiecare executor scrie `selection_output[row, top_k_slot, hidden]`. După event-
+urile tuturor selecțiilor, un kernel device aplică routing weights în ordinea
+stabilă din ABI. Astfel execuția concurentă CPU/GPU nu introduce o ordine
+numerică dependentă de completion.
+
+Costurile minime urmărite online sunt:
+
+```text
+resident = gpu_queue + gpu_kernel(rows, abi)
+slab     = h2d_queue + host_pack + bytes/h2d_Bps + gpu_kernel(rows, abi)
+cpu      = cpu_queue + cpu_kernel(bytes, rows, abi) + result_copy
+```
+
+EWMA-urile sunt separate după ABI, geometrie și bucket de rows. Timeout-ul sau
+lipsa credits produce backpressure/failure explicit, nu drop de expert.
+
+Indexul logic este global, dar memoria este partitionată pe layer/layer-group și
+pe două clase: resident și transient. Astfel, parcurgerea secvențială a unui
+model cu multe straturi nu produce evacuarea ciclică observată la Qwen3-Next.
+Pentru modele 1T, directorul conține metadata de ordinul zecilor de bytes per
+expert și poate fi windowed; weights rămân pagini în tiers, nu intrări în
+director.
+
+Admission-ul v1 este determinist și folosește LFU cu aging periodic bounded,
+astfel încât o distribuție veche să nu blocheze permanent un workload nou.
+Opțional, plannerul poate rezerva un pool transient separat: primul acces intră
+în acel ring, iar promovarea cere reuse și o frecvență strict mai mare decât
+victima resident. Mecanismul este o decizie de placement, nu un default: pe
+Qwen3-Next 80B măsurarea lui a fost mai lentă decât pool-ul LFU comun.
+
+Placement-ul adaptiv rulează în epoci. Într-o epocă de observație, toate
+rutele GPU și CPU actualizează LFU în batch pe strat, iar costul CPU per
+selecție este urmărit prin EWMA. Un expert RAM devine candidat numai după ce
+reuse debt-ul său depășește costul conservator H2D și există suficienți
+rezidenți VRAM strict mai reci. Promovarea folosește `AcquireHandle` asincron:
+invocarea curentă continuă pe CPU, iar upload-ul poate ajuta numai tokeni
+viitori.
+
+La bariera de warmup/request, plannerul drenează promovările admise și îngheață
+placement-ul. În epoch-ul frozen nu există promotion, H2D de weights, copiere
+de rută pentru control sau actualizare LFU/debt. Miss-urile RAM continuă prin
+executorul CPU exact. Această separare împiedică rebalansarea să introducă
+jitter în decode și permite reluarea explicită a observației la o frontieră
+sigură de workload.
 
 ## Mașina de stări a containerului
 
@@ -62,6 +140,12 @@ Reguli obligatorii:
   dependente; top-k incomplet nu continuă;
 - high watermark oprește admission/load, low watermark îl reactivează;
 - bugetele VRAM, RAM cache, staging și KV sunt independente și în bytes.
+- `HostExpertLease` protejează copia RAM validată cât timp este folosită de CPU
+  sau copiată într-un slab; nu necesită promovare implicită în VRAM;
+- slab-urile pinned/device au state și generații separate de cache entry și sunt
+  restituite ca unitate după ultimul event dependent;
+- memoria pageable de durată nu este sursă directă pentru mii de copii CUDA
+  mici; grupurile alese pentru H2D sunt coalesced într-un staging pinned bounded.
 
 ## Request și work item
 
@@ -111,7 +195,8 @@ Container ABI:
 - weighted accumulation este device-local și folosește o ordine stabilă
   `(request,row,expert_id)` pentru modul exact.
 
-Descriptorul de dispatch nu conține pointeri host și nu expune layout implicit:
+Descriptorul CUDA resident/slab nu conține pointeri host și nu expune layout
+implicit:
 
 ```text
 ExpertBatchV1
@@ -129,10 +214,19 @@ ExpertBatchV1
 ```
 
 Backend-ul validează `abi_id`, SM capability, dimensiunile și bounds înainte de
-launch. Pointerii weight trebuie să provină dintr-un slot `VRAM_READY` rezervat.
-Gate și up sunt un singur grouped dispatch logic; activarea de input nu se
-recuantizează separat pentru cele două proiecții. SiLU/produsul rămân device-
-local, apoi down și acumularea ponderată rulează fără round-trip CPU.
+launch. Pointerii weight trebuie să provină dintr-un slot `VRAM_READY` rezervat
+sau dintr-o generație activă a ring-ului slab. Calea CPU are un descriptor
+separat cu `HostExpertLease`; pointerii host nu sunt publicați în directorul
+device. Gate și up sunt un singur grouped dispatch logic. SiLU/produsul rămân
+device-local pentru CUDA, apoi down scrie ieșirea per selecție fără round-trip
+CPU.
+
+Kernelul row-major FP32-activation existent este oracle-ul exact al ABI-ului,
+nu contractul de performanță. Kernelul production grupează expert-major și
+reutilizează weights pentru toate rândurile acelui expert. Poate schimba
+tiling-ul, tipul intern al activării sau primitivele SM86 numai dacă profilul
+numeric declarat trece față de oracle; o asemenea schimbare este versionată în
+`kernel_abi`, nu activată în tăcere.
 
 Backend-ul Qwen3-Next adaugă două token mixers exacte: GQA full-attention cu
 partial RoPE și output gate, respectiv Gated DeltaNet cu stare Conv1D și stare
@@ -178,13 +272,14 @@ cold_budget_B_per_token = sustained_storage_Bps / T
 h2d_budget_B_per_token  = sustained_H2D_Bps / T
 required_storage_avoidance = ceil((active - cold_budget) / active * 1e6)
 resident_vram = dense + workspace + kv_per_request * concurrency
+compute_ceiling = 1e9 / measured_non_io_nanoseconds_per_token
 ```
 
 Se verifică în ordine stabilă: VRAM rezident, VRAM total cu cache, RAM cu
-staging/cache, disk capacity, storage bandwidth și PCIe/H2D bandwidth. Prima
-constrângere eșuată este `limiting_resource`, împreună cu `required`, `available`
-și formula. Bandwidth modelat, nu măsurat, nu poate produce `feasible`; produce
-cel mult `degraded`.
+staging/cache, disk capacity, storage bandwidth, PCIe/H2D bandwidth și plafonul
+compute măsurat. Prima constrângere eșuată este `limiting_resource`, împreună cu
+`required`, `available` și formula. Bandwidth sau compute modelat, nu măsurat,
+nu poate produce `feasible`; produce cel mult `degraded`.
 
 Exit code-ul CLI este 0 pentru feasible/degraded, 2 pentru impossible și 65
 pentru manifest/inventory/request invalid. Inputurile canonice și decizia au

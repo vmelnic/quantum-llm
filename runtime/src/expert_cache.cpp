@@ -8,6 +8,7 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
@@ -50,10 +51,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::shared_ptr<FixedBufferPool::Lease> host;
     std::shared_ptr<std::vector<std::byte>> host_copy;
     std::shared_ptr<IDeviceAllocation> device;
+    std::optional<ExpertSections> validated_sections;
     std::uint64_t ram_reserved{};
     std::uint64_t vram_reserved{};
     std::uint64_t references{};
     std::uint64_t last_access{};
+    std::uint32_t frequency{};
+    bool vram_resident{true};
     OperationId io_operation{};
     OperationId upload_operation{};
     bool abandon{};
@@ -68,14 +72,58 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   ExpertCacheCore(ExpertCacheConfig cache_config,
                   std::shared_ptr<IAsyncStorage> async_storage,
                   std::shared_ptr<IDeviceUploader> device_uploader,
-                  std::shared_ptr<FixedBufferPool> buffer_pool)
+                  std::shared_ptr<FixedBufferPool> buffer_pool,
+                  std::shared_ptr<IDeviceResidencyDirectory> device_directory)
       : config(cache_config),
         storage(std::move(async_storage)),
         uploader(std::move(device_uploader)),
-        buffers(std::move(buffer_pool)) {
+        buffers(std::move(buffer_pool)),
+        directory(std::move(device_directory)),
+        ram_partition_bytes(config.placement.layer_partition_count),
+        vram_partition_bytes(config.placement.layer_partition_count) {
     if (!valid_budget(config.ram) || !valid_budget(config.vram) || !storage ||
-        !uploader || !buffers || buffers->alignment() < kExpertPackAlignment) {
+        !uploader || !buffers || buffers->alignment() < kExpertPackAlignment ||
+        config.placement.layer_partition_count == 0 ||
+        config.placement.layers_per_partition == 0 ||
+        config.placement.ram_shared_burst_bytes >=
+            config.ram.high_watermark_bytes ||
+        config.placement.vram_shared_burst_bytes >=
+            config.vram.high_watermark_bytes ||
+        config.placement.vram_transient_bytes >=
+            config.vram.high_watermark_bytes) {
       throw std::invalid_argument("invalid expert cache configuration");
+    }
+  }
+
+  [[nodiscard]] std::size_t partition_for(const ExpertKey& key) const noexcept {
+    const auto partition =
+        key.layer / config.placement.layers_per_partition;
+    return std::min<std::size_t>(partition,
+                                 ram_partition_bytes.size() - 1U);
+  }
+
+  [[nodiscard]] std::uint64_t partition_quota(
+      const TierBudget& tier, std::uint64_t shared_burst) const noexcept {
+    return (tier.high_watermark_bytes - shared_burst) /
+           config.placement.layer_partition_count;
+  }
+
+  void reserve_ram_locked(Entry& entry, std::uint64_t bytes) noexcept {
+    entry.ram_reserved += bytes;
+    ram_bytes += bytes;
+    ram_partition_bytes[partition_for(entry.key)] += bytes;
+  }
+
+  void reserve_vram_locked(Entry& entry, std::uint64_t bytes,
+                           bool resident) noexcept {
+    entry.vram_resident = resident;
+    entry.vram_reserved += bytes;
+    vram_bytes += bytes;
+    if (resident) {
+      vram_resident_bytes += bytes;
+      vram_partition_bytes[partition_for(entry.key)] += bytes;
+    } else {
+      vram_transient_bytes += bytes;
     }
   }
 
@@ -89,28 +137,60 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     entry.state = next;
   }
 
+  void touch_locked(Entry& entry) noexcept {
+    entry.last_access = ++access_clock;
+    if (entry.frequency != std::numeric_limits<std::uint32_t>::max()) {
+      ++entry.frequency;
+    }
+    // Bounded, deterministic aging lets placement follow a changed workload
+    // without scanning the cache in the decode hot path.
+    if ((access_clock & 0xffffU) == 0U) {
+      for (auto& [key, candidate] : entries) {
+        (void)key;
+        candidate->frequency = (candidate->frequency + 1U) / 2U;
+      }
+    }
+  }
+
   void update_usage_locked() noexcept {
     Telemetry::set(metrics.ram_bytes_, ram_bytes);
     Telemetry::set(metrics.vram_bytes_, vram_bytes);
+    Telemetry::set(metrics.vram_resident_bytes_, vram_resident_bytes);
+    Telemetry::set(metrics.vram_transient_bytes_, vram_transient_bytes);
     const auto staging = buffers->bytes_in_use();
     Telemetry::set(metrics.staging_bytes_, staging);
     Telemetry::maximize(metrics.ram_high_water_, ram_bytes);
     Telemetry::maximize(metrics.vram_high_water_, vram_bytes);
+    Telemetry::maximize(metrics.vram_resident_high_water_,
+                        vram_resident_bytes);
+    Telemetry::maximize(metrics.vram_transient_high_water_,
+                        vram_transient_bytes);
     Telemetry::maximize(metrics.staging_high_water_, staging);
   }
 
   void release_host_locked(Entry& entry) noexcept {
     entry.host.reset();
     entry.host_copy.reset();
+    entry.validated_sections.reset();
     if (entry.ram_reserved != 0) {
+      ram_partition_bytes[partition_for(entry.key)] -= entry.ram_reserved;
       ram_bytes -= entry.ram_reserved;
       entry.ram_reserved = 0;
     }
   }
 
   void release_device_locked(Entry& entry) noexcept {
+    if (entry.device && directory) {
+      directory->retire(entry.key);
+    }
     entry.device.reset();
     if (entry.vram_reserved != 0) {
+      if (entry.vram_resident) {
+        vram_resident_bytes -= entry.vram_reserved;
+        vram_partition_bytes[partition_for(entry.key)] -= entry.vram_reserved;
+      } else {
+        vram_transient_bytes -= entry.vram_reserved;
+      }
       vram_bytes -= entry.vram_reserved;
       entry.vram_reserved = 0;
     }
@@ -153,8 +233,19 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   }
 
   bool evict_one_locked(bool need_ram, bool need_vram,
-                        const ExpertKey* excluded) {
+                        const ExpertKey* excluded,
+                        std::optional<std::size_t> required_partition = {},
+                        bool over_quota_only = false,
+                        std::optional<bool> required_vram_class = {},
+                        std::optional<std::uint32_t>
+                            maximum_frequency_exclusive = {}) {
     std::shared_ptr<Entry> candidate;
+    std::uint64_t candidate_excess{};
+    std::uint32_t candidate_frequency{};
+    const auto ram_quota = partition_quota(
+        config.ram, config.placement.ram_shared_burst_bytes);
+    const auto vram_quota = partition_quota(
+        config.vram, config.placement.vram_shared_burst_bytes);
     for (const auto& [key, entry] : entries) {
       if ((excluded != nullptr && key == *excluded) || entry->references != 0 ||
           !entry->waiters.empty() ||
@@ -168,9 +259,41 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (!useful) {
         continue;
       }
-      if (!candidate || entry->last_access < candidate->last_access ||
-          (entry->last_access == candidate->last_access && key < candidate->key)) {
+      if (need_vram && required_vram_class &&
+          (!entry->device ||
+           entry->vram_resident != *required_vram_class)) {
+        continue;
+      }
+      if (maximum_frequency_exclusive &&
+          entry->frequency >= *maximum_frequency_exclusive) {
+        continue;
+      }
+      const auto partition = partition_for(key);
+      if (required_partition && partition != *required_partition) {
+        continue;
+      }
+      const auto ram_excess =
+          need_ram && ram_partition_bytes[partition] > ram_quota
+              ? ram_partition_bytes[partition] - ram_quota
+              : 0;
+      const auto vram_excess =
+          need_vram && vram_partition_bytes[partition] > vram_quota
+              ? vram_partition_bytes[partition] - vram_quota
+              : 0;
+      const auto excess = std::max(ram_excess, vram_excess);
+      if (over_quota_only && excess == 0) {
+        continue;
+      }
+      if (!candidate || entry->frequency < candidate_frequency ||
+          (entry->frequency == candidate_frequency &&
+           (excess > candidate_excess ||
+            (excess == candidate_excess &&
+             (entry->last_access < candidate->last_access ||
+              (entry->last_access == candidate->last_access &&
+               key < candidate->key)))))) {
         candidate = entry;
+        candidate_excess = excess;
+        candidate_frequency = entry->frequency;
       }
     }
     if (!candidate) {
@@ -194,42 +317,118 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       transition_locked(*candidate, CacheState::absent);
     }
     Telemetry::add(metrics.eviction_count_);
+    if (required_partition) {
+      Telemetry::add(metrics.same_partition_evictions_);
+    } else if (candidate_excess != 0) {
+      Telemetry::add(metrics.over_quota_evictions_);
+    }
     update_usage_locked();
     return true;
   }
 
-  bool make_capacity_locked(std::uint64_t ram_need, std::uint64_t vram_need,
-                            const ExpertKey& key) {
-    if (ram_need > config.ram.high_watermark_bytes ||
-        vram_need > config.vram.high_watermark_bytes) {
+  bool make_partition_capacity_locked(std::uint64_t ram_need,
+                                      const ExpertKey& key) {
+    if (config.placement.layer_partition_count == 1) {
+      return true;
+    }
+    const auto partition = partition_for(key);
+    const auto ram_limit =
+        partition_quota(config.ram,
+                        config.placement.ram_shared_burst_bytes) +
+        config.placement.ram_shared_burst_bytes;
+    if (ram_need > ram_limit) {
       return false;
     }
-    const bool ram_pressured =
-        ram_bytes + ram_need > config.ram.high_watermark_bytes;
-    const bool vram_pressured =
-        vram_bytes + vram_need > config.vram.high_watermark_bytes;
-    const bool pressured = ram_pressured || vram_pressured;
-    while (ram_bytes + ram_need > config.ram.high_watermark_bytes ||
-           vram_bytes + vram_need > config.vram.high_watermark_bytes) {
-      const bool need_ram =
-          ram_bytes + ram_need > config.ram.high_watermark_bytes;
-      const bool need_vram =
-          vram_bytes + vram_need > config.vram.high_watermark_bytes;
-      if (!evict_one_locked(need_ram, need_vram, &key)) {
+    while (ram_partition_bytes[partition] + ram_need > ram_limit) {
+      const bool need_partition_ram =
+          ram_partition_bytes[partition] + ram_need > ram_limit;
+      if (!evict_one_locked(need_partition_ram, false, &key,
+                            partition)) {
         Telemetry::add(metrics.stalled_by_budget_);
         return false;
       }
     }
-    if (pressured) {
+    return true;
+  }
+
+  bool make_vram_class_capacity_locked(std::uint64_t vram_need,
+                                       const ExpertKey& key,
+                                       bool resident,
+                                       std::uint32_t admission_frequency) {
+    if (vram_need == 0) return true;
+    const auto transient_limit =
+        config.placement.vram_transient_bytes;
+    const auto admission_limit =
+        resident && transient_limit != 0
+            ? std::optional<std::uint32_t>(admission_frequency)
+            : std::nullopt;
+    const auto limit = resident
+                           ? config.vram.high_watermark_bytes - transient_limit
+                           : transient_limit;
+    if (vram_need > limit) return false;
+    auto& usage = resident ? vram_resident_bytes : vram_transient_bytes;
+    while (usage + vram_need > limit) {
+      bool evicted = false;
+      if (resident && config.placement.layer_partition_count > 1) {
+        const auto partition = partition_for(key);
+        const auto quota = partition_quota(
+            config.vram, config.placement.vram_shared_burst_bytes);
+        if (vram_partition_bytes[partition] + vram_need > quota) {
+          evicted = evict_one_locked(false, true, &key, partition, false,
+                                     true, admission_limit);
+        }
+      }
+      if (!evicted &&
+          !evict_one_locked(false, true, &key, {}, false, resident,
+                            admission_limit)) {
+        Telemetry::add(metrics.stalled_by_budget_);
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void promote_vram_locked(Entry& entry) {
+    if (!entry.device || entry.vram_resident || entry.vram_reserved == 0 ||
+        config.placement.vram_transient_bytes == 0 ||
+        entry.frequency < 2 ||
+        !make_vram_class_capacity_locked(entry.vram_reserved, entry.key,
+                                         true, entry.frequency)) {
+      return;
+    }
+    vram_transient_bytes -= entry.vram_reserved;
+    vram_resident_bytes += entry.vram_reserved;
+    vram_partition_bytes[partition_for(entry.key)] += entry.vram_reserved;
+    entry.vram_resident = true;
+    update_usage_locked();
+  }
+
+  bool make_capacity_locked(std::uint64_t ram_need, std::uint64_t vram_need,
+                            const ExpertKey& key, bool resident,
+                            std::uint32_t admission_frequency) {
+    if (ram_need > config.ram.high_watermark_bytes ||
+        vram_need > config.vram.high_watermark_bytes) {
+      return false;
+    }
+    if (!make_partition_capacity_locked(ram_need, key) ||
+        !make_vram_class_capacity_locked(vram_need, key, resident,
+                                         admission_frequency)) {
+      return false;
+    }
+    const bool ram_pressured =
+        ram_bytes + ram_need > config.ram.high_watermark_bytes;
+    while (ram_bytes + ram_need > config.ram.high_watermark_bytes) {
+      if (!evict_one_locked(true, false, &key, {}, true) &&
+          !evict_one_locked(true, false, &key)) {
+        Telemetry::add(metrics.stalled_by_budget_);
+        return false;
+      }
+    }
+    if (ram_pressured && config.placement.layer_partition_count == 1) {
       // Continue evicting toward low watermarks when safe, creating headroom
       // for a burst instead of oscillating at the high mark.
-      while (((ram_pressured && ram_bytes > config.ram.low_watermark_bytes) ||
-              (vram_pressured && vram_bytes > config.vram.low_watermark_bytes)) &&
-             evict_one_locked(ram_pressured &&
-                                  ram_bytes > config.ram.low_watermark_bytes,
-                              vram_pressured &&
-                                  vram_bytes > config.vram.low_watermark_bytes,
-                              &key)) {
+      while (ram_bytes > config.ram.low_watermark_bytes &&
+             evict_one_locked(true, false, &key)) {
       }
     }
     return ram_bytes + ram_need <= config.ram.high_watermark_bytes &&
@@ -245,12 +444,21 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (entry->state == CacheState::ram_ready &&
           (entry->host || entry->host_copy)) {
         if (entry->vram_reserved == 0) {
+          bool resident =
+              config.placement.vram_transient_bytes == 0 ||
+              entry->frequency >= 2;
           if (!make_capacity_locked(0, entry->record.stored_bytes,
-                                    entry->key)) {
-            continue;
+                                    entry->key, resident,
+                                    entry->frequency)) {
+            if (!resident ||
+                !make_capacity_locked(0, entry->record.stored_bytes,
+                                      entry->key, false,
+                                      entry->frequency)) {
+              continue;
+            }
+            resident = false;
           }
-          entry->vram_reserved = entry->record.stored_bytes;
-          vram_bytes += entry->vram_reserved;
+          reserve_vram_locked(*entry, entry->record.stored_bytes, resident);
           update_usage_locked();
         }
         transition_locked(*entry, CacheState::gpu_uploading);
@@ -267,9 +475,19 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
                                  "expert record exceeds fixed staging slot"));
         continue;
       }
+      bool resident =
+          config.placement.vram_transient_bytes == 0 ||
+          entry->frequency >= 2;
       if (!make_capacity_locked(entry->record.stored_bytes,
-                                entry->record.stored_bytes, entry->key)) {
-        continue;
+                                entry->record.stored_bytes, entry->key,
+                                resident, entry->frequency)) {
+        if (!resident ||
+            !make_capacity_locked(entry->record.stored_bytes,
+                                  entry->record.stored_bytes, entry->key,
+                                  false, entry->frequency)) {
+          continue;
+        }
+        resident = false;
       }
       auto host = buffers->try_acquire(
           static_cast<std::size_t>(entry->record.stored_bytes));
@@ -278,10 +496,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         continue;
       }
       entry->host = std::move(host);
-      entry->ram_reserved = entry->record.stored_bytes;
-      entry->vram_reserved = entry->record.stored_bytes;
-      ram_bytes += entry->ram_reserved;
-      vram_bytes += entry->vram_reserved;
+      reserve_ram_locked(*entry, entry->record.stored_bytes);
+      reserve_vram_locked(*entry, entry->record.stored_bytes, resident);
       transition_locked(*entry, CacheState::ssd_loading);
       Telemetry::add(metrics.load_started_);
       Telemetry::add(metrics.requested_bytes_, entry->record.stored_bytes);
@@ -352,15 +568,25 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       drive();
       return;
     }
-    const auto validated = validate_expert_record(bytes, entry->key, entry->record);
-    if (!validated.status.ok()) {
-      {
-        std::lock_guard lock(mutex);
-        Telemetry::add(metrics.checksum_errors_);
-        fail_entry_locked(*entry, validated.status);
+    ExpertSections sections;
+    if (entry->validated_sections) {
+      sections = *entry->validated_sections;
+      Telemetry::add(metrics.validated_ram_reuses_);
+    } else {
+      const auto validated =
+          validate_expert_record(bytes, entry->key, entry->record);
+      Telemetry::add(metrics.record_validations_);
+      if (!validated.status.ok()) {
+        {
+          std::lock_guard lock(mutex);
+          Telemetry::add(metrics.checksum_errors_);
+          fail_entry_locked(*entry, validated.status);
+        }
+        drive();
+        return;
       }
-      drive();
-      return;
+      sections = validated.record.sections;
+      entry->validated_sections = sections;
     }
 
     if (config.retain_host_copy && !entry->host_copy) {
@@ -380,7 +606,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
 
     auto weak = weak_from_this();
-    UploadRequest request{entry->key, validated.record.sections, bytes};
+    UploadRequest request{entry->key, sections, bytes};
     const auto operation = uploader->upload(
         request, [weak, key = entry->key](UploadResult result) mutable {
           if (auto core = weak.lock()) {
@@ -469,21 +695,35 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           const auto released = entry.vram_reserved - result.allocation->bytes();
           entry.vram_reserved -= released;
           vram_bytes -= released;
+          if (entry.vram_resident) {
+            vram_resident_bytes -= released;
+            vram_partition_bytes[partition_for(entry.key)] -= released;
+          } else {
+            vram_transient_bytes -= released;
+          }
         }
-        entry.device = std::move(result.allocation);
-        transition_locked(entry, CacheState::vram_ready);
-        entry.last_access = ++access_clock;
-        Telemetry::add(metrics.upload_completed_);
-        Telemetry::add(metrics.uploaded_bytes_, result.uploaded_bytes);
-        if (!config.retain_host_copy) {
-          release_host_locked(entry);
-        } else {
-          // The long-lived RAM tier is pageable. Pinned buffers remain a
-          // bounded staging resource and return to the fixed pool after H2D.
-          entry.host.reset();
+        if (directory) {
+          const auto published = directory->publish(entry.key, result.allocation);
+          if (!published.ok()) {
+            Telemetry::add(metrics.upload_errors_);
+            fail_entry_locked(entry, published);
+          }
         }
-        update_usage_locked();
-        satisfy_ready_waiters_locked(iterator->second);
+        if (entry.state != CacheState::failed) {
+          entry.device = std::move(result.allocation);
+          transition_locked(entry, CacheState::vram_ready);
+          Telemetry::add(metrics.upload_completed_);
+          Telemetry::add(metrics.uploaded_bytes_, result.uploaded_bytes);
+          if (!config.retain_host_copy) {
+            release_host_locked(entry);
+          } else {
+            // The long-lived RAM tier is pageable. Pinned buffers remain a
+            // bounded staging resource and return to the fixed pool after H2D.
+            entry.host.reset();
+          }
+          update_usage_locked();
+          satisfy_ready_waiters_locked(iterator->second);
+        }
       }
     }
     drive();
@@ -506,6 +746,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           iterator->second->record = record;
         }
         auto& entry = *iterator->second;
+        touch_locked(entry);
+        promote_vram_locked(entry);
         if (!same_record(entry.record, record)) {
           waiter->promise.set_value(
               {Status(ErrorCode::invalid_argument,
@@ -519,7 +761,6 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         } else if (entry.state == CacheState::vram_ready && entry.device) {
           Telemetry::add(metrics.acquire_vram_hits_);
           ++entry.references;
-          entry.last_access = ++access_clock;
           auto weak = weak_from_this();
           waiter->promise.set_value(
               {Status::success(),
@@ -555,6 +796,90 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       drive();
     }
     return handle;
+  }
+
+  std::optional<HostExpertLease> try_acquire_host(
+      const ExpertKey& key, const PayloadRecord& record,
+      bool record_access) {
+    std::lock_guard lock(mutex);
+    if (shutting_down) return std::nullopt;
+    const auto iterator = entries.find(key);
+    if (iterator == entries.end()) return std::nullopt;
+    auto& entry = *iterator->second;
+    if (!same_record(entry.record, record) || !entry.host_copy ||
+        !entry.validated_sections ||
+        (entry.state != CacheState::ram_ready &&
+         entry.state != CacheState::vram_ready)) {
+      return std::nullopt;
+    }
+    if (record_access) touch_locked(entry);
+    ++entry.references;
+    Telemetry::add(metrics.acquire_ram_hits_);
+    auto weak = weak_from_this();
+    return HostExpertLease(
+        entry.host_copy, *entry.validated_sections,
+        [weak, key]() noexcept {
+          if (auto core = weak.lock()) core->release_reference(key);
+        });
+  }
+
+  bool record_access(const ExpertKey& key, std::uint32_t count) {
+    if (count == 0) return false;
+    std::lock_guard lock(mutex);
+    if (shutting_down) return false;
+    const auto iterator = entries.find(key);
+    if (iterator == entries.end()) return false;
+    for (std::uint32_t access = 0; access < count; ++access) {
+      touch_locked(*iterator->second);
+    }
+    return true;
+  }
+
+  std::uint64_t record_accesses(std::span<const ExpertAccess> accesses) {
+    std::lock_guard lock(mutex);
+    if (shutting_down) return 0;
+    std::uint64_t recorded = 0;
+    for (const auto& access : accesses) {
+      if (access.count == 0) continue;
+      const auto iterator = entries.find(access.key);
+      if (iterator == entries.end()) continue;
+      for (std::uint32_t item = 0; item < access.count; ++item) {
+        touch_locked(*iterator->second);
+      }
+      recorded += access.count;
+    }
+    return recorded;
+  }
+
+  bool vram_admission_would_improve(const ExpertKey& key,
+                                    const PayloadRecord& record) {
+    std::lock_guard lock(mutex);
+    if (shutting_down) return false;
+    const auto iterator = entries.find(key);
+    if (iterator == entries.end()) return false;
+    const auto& entry = *iterator->second;
+    if (!same_record(entry.record, record) || entry.device ||
+        (!entry.host && !entry.host_copy) ||
+        entry.state != CacheState::ram_ready) {
+      return false;
+    }
+    const auto need = entry.record.stored_bytes;
+    if (vram_bytes + need <= config.vram.high_watermark_bytes) return true;
+    const auto deficit =
+        vram_bytes + need - config.vram.high_watermark_bytes;
+    std::uint64_t colder_bytes = 0;
+    for (const auto& [candidate_key, candidate] : entries) {
+      if (candidate_key == key || !candidate->device ||
+          candidate->references != 0 || !candidate->waiters.empty() ||
+          candidate->frequency >= entry.frequency ||
+          candidate->state == CacheState::gpu_uploading ||
+          candidate->state == CacheState::failed) {
+        continue;
+      }
+      colder_bytes += candidate->vram_reserved;
+      if (colder_bytes >= deficit) return true;
+    }
+    return false;
   }
 
   void cancel_waiter(const ExpertKey& key, std::uint64_t waiter_id) noexcept {
@@ -646,6 +971,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   std::shared_ptr<IAsyncStorage> storage;
   std::shared_ptr<IDeviceUploader> uploader;
   std::shared_ptr<FixedBufferPool> buffers;
+  std::shared_ptr<IDeviceResidencyDirectory> directory;
   mutable std::mutex mutex;
   std::map<ExpertKey, std::shared_ptr<Entry>> entries;
   Telemetry metrics;
@@ -653,6 +979,10 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
   std::uint64_t access_clock{};
   std::uint64_t ram_bytes{};
   std::uint64_t vram_bytes{};
+  std::uint64_t vram_resident_bytes{};
+  std::uint64_t vram_transient_bytes{};
+  std::vector<std::uint64_t> ram_partition_bytes;
+  std::vector<std::uint64_t> vram_partition_bytes;
   bool shutting_down{};
 };
 
@@ -693,6 +1023,47 @@ void ExpertLease::reset() noexcept {
   }
 }
 
+HostExpertLease::HostExpertLease(
+    std::shared_ptr<const std::vector<std::byte>> bytes,
+    ExpertSections sections, std::function<void()> release) noexcept
+    : bytes_(std::move(bytes)), sections_(sections),
+      release_(std::move(release)) {}
+
+HostExpertLease::HostExpertLease(HostExpertLease&& other) noexcept
+    : bytes_(std::move(other.bytes_)), sections_(other.sections_),
+      release_(std::move(other.release_)) {}
+
+HostExpertLease& HostExpertLease::operator=(HostExpertLease&& other) noexcept {
+  if (this != &other) {
+    reset();
+    bytes_ = std::move(other.bytes_);
+    sections_ = other.sections_;
+    release_ = std::move(other.release_);
+  }
+  return *this;
+}
+
+HostExpertLease::~HostExpertLease() { reset(); }
+
+HostExpertLease::operator bool() const noexcept { return bytes_ != nullptr; }
+
+std::span<const std::byte> HostExpertLease::bytes() const noexcept {
+  if (!bytes_) return {};
+  return *bytes_;
+}
+
+const ExpertSections& HostExpertLease::sections() const noexcept {
+  return sections_;
+}
+
+void HostExpertLease::reset() noexcept {
+  bytes_.reset();
+  if (release_) {
+    auto release = std::move(release_);
+    release();
+  }
+}
+
 AcquireHandle::AcquireHandle(std::future<AcquireResult> future,
                              std::function<void()> cancel) noexcept
     : future_(std::move(future)), cancel_(std::move(cancel)) {}
@@ -707,10 +1078,12 @@ void AcquireHandle::cancel() noexcept {
 ExpertCache::ExpertCache(ExpertCacheConfig config,
                          std::shared_ptr<IAsyncStorage> storage,
                          std::shared_ptr<IDeviceUploader> uploader,
-                         std::shared_ptr<FixedBufferPool> buffers)
+                         std::shared_ptr<FixedBufferPool> buffers,
+                         std::shared_ptr<IDeviceResidencyDirectory> directory)
     : core_(std::make_shared<ExpertCacheCore>(config, std::move(storage),
                                                std::move(uploader),
-                                               std::move(buffers))) {}
+                                               std::move(buffers),
+                                               std::move(directory))) {}
 
 ExpertCache::~ExpertCache() {
   if (core_) {
@@ -721,6 +1094,25 @@ ExpertCache::~ExpertCache() {
 AcquireHandle ExpertCache::acquire(const ExpertKey& key,
                                    const PayloadRecord& record) {
   return core_->acquire(key, record);
+}
+
+std::optional<HostExpertLease> ExpertCache::try_acquire_host(
+    const ExpertKey& key, const PayloadRecord& record, bool record_access) {
+  return core_->try_acquire_host(key, record, record_access);
+}
+
+bool ExpertCache::record_access(const ExpertKey& key, std::uint32_t count) {
+  return core_->record_access(key, count);
+}
+
+std::uint64_t ExpertCache::record_accesses(
+    std::span<const ExpertAccess> accesses) {
+  return core_->record_accesses(accesses);
+}
+
+bool ExpertCache::vram_admission_would_improve(
+    const ExpertKey& key, const PayloadRecord& record) {
+  return core_->vram_admission_would_improve(key, record);
 }
 
 std::optional<CacheEntrySnapshot> ExpertCache::inspect(

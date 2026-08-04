@@ -7,7 +7,7 @@ param(
     [int]$NewTokens = 32,
     [int]$Concurrency = 4,
     [int]$RamCacheGiB = 48,
-    [int]$VramCacheGiB = 14,
+    [int]$VramCacheGiB = 18,
     [int]$MinimumFreePhysicalGiB = 2,
     [int]$WarmupRounds = 1,
     [double]$SingleTokensPerSecond = 10.0,
@@ -60,14 +60,27 @@ function Invoke-GateRun {
         $pagefilePeak = [Math]::Max($pagefilePeak, (Get-PagefileUsageMiB))
         Start-Sleep -Milliseconds 500
     }
+    # PowerShell can leave ExitCode unset after polling HasExited on a process
+    # started with redirected streams. WaitForExit also flushes both log files.
+    $process.WaitForExit()
     $process.Refresh()
-    if ($process.ExitCode -ne 0) {
+    $exitCode = $process.ExitCode
+    $line = Get-Content $stdout -Tail 1 -ErrorAction SilentlyContinue
+    try {
+        $model = $line | ConvertFrom-Json -ErrorAction Stop
+    } catch {
         $tail = @(Get-Content $stderr -Tail 30 -ErrorAction SilentlyContinue) -join `
             [Environment]::NewLine
-        throw "P6 $Name runner failed with $($process.ExitCode):$([Environment]::NewLine)$tail"
+        throw "P6 $Name runner produced no valid result (exit=$exitCode):$([Environment]::NewLine)$tail"
     }
-    $line = Get-Content $stdout -Tail 1 -ErrorAction Stop
-    $model = $line | ConvertFrom-Json
+    # Windows PowerShell 5.1 may leave ExitCode unset after HasExited polling
+    # with redirected streams. A non-null failure still wins; otherwise the
+    # runner's final JSON is its atomic success record.
+    if ($null -ne $exitCode -and $exitCode -ne 0) {
+        $tail = @(Get-Content $stderr -Tail 30 -ErrorAction SilentlyContinue) -join `
+            [Environment]::NewLine
+        throw "P6 $Name runner failed with $exitCode`:$([Environment]::NewLine)$tail"
+    }
     $pagefileAfter = Get-PagefileUsageMiB
     $pagefilePeak = [Math]::Max($pagefilePeak, $pagefileAfter)
     $pagefileGrowth = [Math]::Max([int64]0, $pagefilePeak - $pagefileBefore)

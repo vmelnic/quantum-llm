@@ -10,7 +10,17 @@ namespace expert::runtime::cuda {
 namespace {
 
 constexpr unsigned kThreads = 256;
+constexpr unsigned kWarpSize = 32;
+constexpr unsigned kWarpsPerBlock = kThreads / kWarpSize;
+constexpr unsigned kMaximumRouterTopK = 32;
+constexpr unsigned kMaximumWeightReuseBatch = 8;
 constexpr float kNegativeInfinity = -3.402823466e+38F;
+
+__device__ float warp_sum(float value) {
+  for (unsigned offset = kWarpSize / 2; offset; offset >>= 1U)
+    value += __shfl_down_sync(0xffffffffU, value, offset);
+  return value;
+}
 
 __device__ float reduce_sum(float value) {
   __shared__ float shared[kThreads];
@@ -37,62 +47,98 @@ __global__ void int8_gemv_kernel(const std::int8_t* weights,
                                  const float* scales, const float* input,
                                  float* output, std::uint32_t rows,
                                  std::uint32_t columns) {
-  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(blockIdx.x * kWarpsPerBlock + warp);
   if (row >= rows) return;
   float partial = 0.0F;
   const auto* weight = weights + static_cast<std::size_t>(row) * columns;
-  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x) {
+  for (std::uint32_t i = lane; i < columns; i += kWarpSize) {
     partial += static_cast<float>(weight[i]) * input[i];
   }
-  partial = reduce_sum(partial);
-  if (threadIdx.x == 0) output[row] = partial * scales[row];
+  partial = warp_sum(partial);
+  if (lane == 0) output[row] = partial * scales[row];
 }
 
 __global__ void int8_gemv_batch_kernel(
     const std::int8_t* weights, const float* scales, const float* input,
     float* output, std::uint32_t rows, std::uint32_t columns,
     std::uint32_t batch) {
-  const auto work = static_cast<std::uint64_t>(blockIdx.x);
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto work = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerBlock + warp;
   const auto row = static_cast<std::uint32_t>(work / batch);
   const auto request = static_cast<std::uint32_t>(work % batch);
   if (row >= rows) return;
   const auto* weight = weights + static_cast<std::size_t>(row) * columns;
   const auto* activation = input + static_cast<std::size_t>(request) * columns;
   float partial = 0.0F;
-  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x)
+  for (std::uint32_t i = lane; i < columns; i += kWarpSize)
     partial += static_cast<float>(weight[i]) * activation[i];
-  partial = reduce_sum(partial);
-  if (threadIdx.x == 0)
+  partial = warp_sum(partial);
+  if (lane == 0)
     output[static_cast<std::size_t>(request) * rows + row] =
         partial * scales[row];
+}
+
+__global__ void int8_gemv_batch_weight_reuse_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  float partial[kMaximumWeightReuseBatch]{};
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  for (std::uint32_t column = lane; column < columns; column += kWarpSize) {
+    const auto value = static_cast<float>(weight[column]);
+    for (std::uint32_t request = 0; request < batch; ++request) {
+      partial[request] +=
+          value * input[static_cast<std::size_t>(request) * columns + column];
+    }
+  }
+  for (std::uint32_t request = 0; request < batch; ++request) {
+    const auto sum = warp_sum(partial[request]);
+    if (lane == 0) {
+      output[static_cast<std::size_t>(request) * rows + row] =
+          sum * scales[row];
+    }
+  }
 }
 
 __global__ void f32_gemv_kernel(const float* weights, const float* input,
                                 float* output, std::uint32_t rows,
                                 std::uint32_t columns) {
-  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(blockIdx.x * kWarpsPerBlock + warp);
   if (row >= rows) return;
   float partial = 0.0F;
   const auto* weight = weights + static_cast<std::size_t>(row) * columns;
-  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x) partial += weight[i] * input[i];
-  partial = reduce_sum(partial);
-  if (threadIdx.x == 0) output[row] = partial;
+  for (std::uint32_t i = lane; i < columns; i += kWarpSize)
+    partial += weight[i] * input[i];
+  partial = warp_sum(partial);
+  if (lane == 0) output[row] = partial;
 }
 
 __global__ void f32_gemv_batch_kernel(
     const float* weights, const float* input, float* output,
     std::uint32_t rows, std::uint32_t columns, std::uint32_t batch) {
-  const auto work = static_cast<std::uint64_t>(blockIdx.x);
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto work = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerBlock + warp;
   const auto row = static_cast<std::uint32_t>(work / batch);
   const auto request = static_cast<std::uint32_t>(work % batch);
   if (row >= rows) return;
   const auto* weight = weights + static_cast<std::size_t>(row) * columns;
   const auto* activation = input + static_cast<std::size_t>(request) * columns;
   float partial = 0.0F;
-  for (std::uint32_t i = threadIdx.x; i < columns; i += blockDim.x)
+  for (std::uint32_t i = lane; i < columns; i += kWarpSize)
     partial += weight[i] * activation[i];
-  partial = reduce_sum(partial);
-  if (threadIdx.x == 0)
+  partial = warp_sum(partial);
+  if (lane == 0)
     output[static_cast<std::size_t>(request) * rows + row] = partial;
 }
 
@@ -216,6 +262,33 @@ __global__ void router_select_kernel(const float* logits, std::uint32_t experts,
                                      std::uint32_t* indices,
                                      bool normalize_selected) {
   if (threadIdx.x != 0) return;
+  if (normalize_selected) {
+    float selected_maximum = kNegativeInfinity;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+      float best = kNegativeInfinity;
+      std::uint32_t best_index = 0;
+      for (std::uint32_t i = 0; i < experts; ++i) {
+        bool used = false;
+        for (std::uint32_t previous = 0; previous < slot; ++previous)
+          used |= indices[previous] == i;
+        if (!used && logits[i] > best) {
+          best = logits[i];
+          best_index = i;
+        }
+      }
+      scores[slot] = best;
+      indices[slot] = best_index;
+      selected_maximum = fmaxf(selected_maximum, best);
+    }
+    float selected_sum = 0.0F;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+      scores[slot] = expf(scores[slot] - selected_maximum);
+      selected_sum += scores[slot];
+    }
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      scores[slot] /= selected_sum;
+    return;
+  }
   float maximum = kNegativeInfinity;
   for (std::uint32_t i = 0; i < experts; ++i) maximum = fmaxf(maximum, logits[i]);
   float denominator = 0.0F;
@@ -232,47 +305,67 @@ __global__ void router_select_kernel(const float* logits, std::uint32_t experts,
     scores[slot] = best;
     indices[slot] = best_index;
   }
-  if (normalize_selected) {
-    float selected_sum = 0.0F;
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) selected_sum += scores[slot];
-    for (std::uint32_t slot = 0; slot < top_k; ++slot) scores[slot] /= selected_sum;
-  }
 }
 
 __global__ void router_select_batch_kernel(
     const float* logits, std::uint32_t experts, std::uint32_t top_k,
     float* scores, std::uint32_t* indices) {
-  if (threadIdx.x != 0) return;
   const auto request = static_cast<std::uint32_t>(blockIdx.x);
   logits += static_cast<std::size_t>(request) * experts;
   scores += static_cast<std::size_t>(request) * top_k;
   indices += static_cast<std::size_t>(request) * top_k;
-  float maximum = kNegativeInfinity;
-  for (std::uint32_t i = 0; i < experts; ++i)
-    maximum = fmaxf(maximum, logits[i]);
-  float denominator = 0.0F;
-  for (std::uint32_t i = 0; i < experts; ++i)
-    denominator += expf(logits[i] - maximum);
-  float selected_sum = 0.0F;
+  __shared__ float candidate_values[kThreads];
+  __shared__ std::uint32_t candidate_indices[kThreads];
+  __shared__ float selected_values[kMaximumRouterTopK];
+  __shared__ std::uint32_t selected_indices[kMaximumRouterTopK];
   for (std::uint32_t slot = 0; slot < top_k; ++slot) {
-    float best = -1.0F;
-    std::uint32_t best_index = 0;
-    for (std::uint32_t i = 0; i < experts; ++i) {
+    float best = kNegativeInfinity;
+    std::uint32_t best_index = 0xffffffffU;
+    for (std::uint32_t i = threadIdx.x; i < experts; i += blockDim.x) {
       bool used = false;
       for (std::uint32_t previous = 0; previous < slot; ++previous)
-        used |= indices[previous] == i;
-      const float probability = expf(logits[i] - maximum) / denominator;
-      if (!used && probability > best) {
-        best = probability;
+        used |= selected_indices[previous] == i;
+      if (!used && (logits[i] > best ||
+                    (logits[i] == best && i < best_index))) {
+        best = logits[i];
         best_index = i;
       }
     }
-    scores[slot] = best;
-    indices[slot] = best_index;
-    selected_sum += best;
+    candidate_values[threadIdx.x] = best;
+    candidate_indices[threadIdx.x] = best_index;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride; stride >>= 1U) {
+      if (threadIdx.x < stride) {
+        const auto other_value = candidate_values[threadIdx.x + stride];
+        const auto other_index = candidate_indices[threadIdx.x + stride];
+        if (other_value > candidate_values[threadIdx.x] ||
+            (other_value == candidate_values[threadIdx.x] &&
+             other_index < candidate_indices[threadIdx.x])) {
+          candidate_values[threadIdx.x] = other_value;
+          candidate_indices[threadIdx.x] = other_index;
+        }
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+      selected_values[slot] = candidate_values[0];
+      selected_indices[slot] = candidate_indices[0];
+    }
+    __syncthreads();
   }
-  for (std::uint32_t slot = 0; slot < top_k; ++slot)
-    scores[slot] /= selected_sum;
+  if (threadIdx.x == 0) {
+    float selected_maximum = kNegativeInfinity;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      selected_maximum = fmaxf(selected_maximum, selected_values[slot]);
+    float selected_sum = 0.0F;
+    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
+      scores[slot] = expf(selected_values[slot] - selected_maximum);
+      indices[slot] = selected_indices[slot];
+      selected_sum += scores[slot];
+    }
+    for (std::uint32_t slot = 0; slot < top_k; ++slot)
+      scores[slot] /= selected_sum;
+  }
 }
 
 __global__ void qwen_qkv_rope_kernel(
@@ -508,15 +601,39 @@ __global__ void qwen_delta_recurrent_kernel(
   }
 }
 
-__global__ void argmax_kernel(const float* values, std::uint32_t count,
-                              std::uint32_t* output) {
-  if (threadIdx.x != 0) return;
+__global__ void argmax_batch_kernel(const float* values, std::uint32_t count,
+                                    std::uint32_t* output) {
+  const auto request = static_cast<std::uint32_t>(blockIdx.x);
+  values += static_cast<std::size_t>(request) * count;
+  __shared__ float best_values[kThreads];
+  __shared__ std::uint32_t best_indices[kThreads];
   float best = kNegativeInfinity;
-  std::uint32_t index = 0;
-  for (std::uint32_t i = 0; i < count; ++i) {
-    if (values[i] > best) { best = values[i]; index = i; }
+  std::uint32_t index = 0xffffffffU;
+  for (std::uint32_t item = threadIdx.x; item < count;
+       item += blockDim.x) {
+    const auto value = values[item];
+    if (value > best || (value == best && item < index)) {
+      best = value;
+      index = item;
+    }
   }
-  *output = index;
+  best_values[threadIdx.x] = best;
+  best_indices[threadIdx.x] = index;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      const auto other_value = best_values[threadIdx.x + stride];
+      const auto other_index = best_indices[threadIdx.x + stride];
+      if (other_value > best_values[threadIdx.x] ||
+          (other_value == best_values[threadIdx.x] &&
+           other_index < best_indices[threadIdx.x])) {
+        best_values[threadIdx.x] = other_value;
+        best_indices[threadIdx.x] = other_index;
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) output[request] = best_indices[0];
 }
 
 Status checked(cudaError_t error, const char* name) {
@@ -532,7 +649,8 @@ Status embedding(const Int8Matrix& m, std::uint32_t token, float* output, void* 
 }
 Status gemv(const Int8Matrix& m, const float* input, float* output, void* raw) noexcept {
   if (!m.weights || !m.scales || !input || !output || !m.rows || !m.columns) return Status(ErrorCode::invalid_argument, "invalid gemv");
-  int8_gemv_kernel<<<m.rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(m.weights, m.scales, input, output, m.rows, m.columns);
+  const auto blocks = (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  int8_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(m.weights, m.scales, input, output, m.rows, m.columns);
   return checked(cudaPeekAtLastError(), "int8 gemv");
 }
 Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
@@ -543,14 +661,30 @@ Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
   const auto blocks = static_cast<std::uint64_t>(m.rows) * batch;
   if (blocks > 0xffffffffULL)
     return Status(ErrorCode::invalid_argument, "batched gemv grid too large");
-  int8_gemv_batch_kernel<<<static_cast<unsigned>(blocks), kThreads, 0,
+  const auto grid = (blocks + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  int8_gemv_batch_kernel<<<static_cast<unsigned>(grid), kThreads, 0,
                            static_cast<cudaStream_t>(raw)>>>(
       m.weights, m.scales, input, output, m.rows, m.columns, batch);
   return checked(cudaPeekAtLastError(), "int8 batched gemv");
 }
+Status gemv_batch_weight_reuse(const Int8Matrix& m, const float* input,
+                               float* output, std::uint32_t batch,
+                               void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !batch || batch > kMaximumWeightReuseBatch)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid weight-reuse batched gemv");
+  const auto blocks =
+      (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  int8_gemv_batch_weight_reuse_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  return checked(cudaPeekAtLastError(), "weight-reuse int8 batched gemv");
+}
 Status gemv_f32(const float* matrix, std::uint32_t rows, std::uint32_t columns, const float* input, float* output, void* raw) noexcept {
   if (!matrix || !input || !output || !rows || !columns) return Status(ErrorCode::invalid_argument, "invalid f32 gemv");
-  f32_gemv_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(matrix, input, output, rows, columns);
+  const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  f32_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(matrix, input, output, rows, columns);
   return checked(cudaPeekAtLastError(), "f32 gemv");
 }
 Status gemv_f32_batch(const float* matrix, std::uint32_t rows,
@@ -562,7 +696,8 @@ Status gemv_f32_batch(const float* matrix, std::uint32_t rows,
   if (blocks > 0xffffffffULL)
     return Status(ErrorCode::invalid_argument,
                   "batched f32 gemv grid too large");
-  f32_gemv_batch_kernel<<<static_cast<unsigned>(blocks), kThreads, 0,
+  const auto grid = (blocks + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  f32_gemv_batch_kernel<<<static_cast<unsigned>(grid), kThreads, 0,
                           static_cast<cudaStream_t>(raw)>>>(
       matrix, input, output, rows, columns, batch);
   return checked(cudaPeekAtLastError(), "f32 batched gemv");
@@ -653,14 +788,15 @@ Status router_topk_normalized_batch(
     float* logits, float* scores, std::uint32_t* indices,
     void* raw) noexcept {
   if (!input || !weights || !logits || !scores || !indices || !rows ||
-      !hidden || !experts || !top_k || top_k > experts)
+      !hidden || !experts || !top_k || top_k > experts ||
+      top_k > kMaximumRouterTopK)
     return Status(ErrorCode::invalid_argument,
                   "invalid normalized batched router");
   auto stream = static_cast<cudaStream_t>(raw);
   auto status = gemv_f32_batch(weights, experts, hidden, input, logits, rows,
                                raw);
   if (!status.ok()) return status;
-  router_select_batch_kernel<<<rows, 1, 0, stream>>>(
+  router_select_batch_kernel<<<rows, kThreads, 0, stream>>>(
       logits, experts, top_k, scores, indices);
   return checked(cudaPeekAtLastError(), "normalized batched router select");
 }
@@ -736,8 +872,18 @@ Status qwen3_next_delta_decode(const Qwen3NextDeltaLaunch& launch) noexcept {
 }
 Status argmax(const float* values, std::uint32_t count, std::uint32_t* output, void* raw) noexcept {
   if (!values || !count || !output) return Status(ErrorCode::invalid_argument, "invalid argmax");
-  argmax_kernel<<<1, 1, 0, static_cast<cudaStream_t>(raw)>>>(values, count, output);
+  argmax_batch_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(values, count, output);
   return checked(cudaPeekAtLastError(), "argmax");
+}
+Status argmax_batch(const float* values, std::uint32_t count,
+                    std::uint32_t batch, std::uint32_t* output,
+                    void* raw) noexcept {
+  if (!values || !count || !batch || !output)
+    return Status(ErrorCode::invalid_argument, "invalid batched argmax");
+  argmax_batch_kernel<<<batch, kThreads, 0,
+                        static_cast<cudaStream_t>(raw)>>>(values, count,
+                                                          output);
+  return checked(cudaPeekAtLastError(), "batched argmax");
 }
 
 }  // namespace expert::runtime::cuda

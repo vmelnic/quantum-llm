@@ -331,8 +331,8 @@ Concluzia actuală nu este „mai multe teste”, ci o separare de arhitectură:
 
 ## P6 — fundația modelului mai mare decât RAM
 
-Stare: **ÎN IMPLEMENTARE; containerul real este validat, gate-urile P6 rămân
-deschise**.
+Stare: **SINGLE PASS; CORECTITUDINE BATCH PASS; THROUGHPUT AGGREGATE RĂMÂNE
+DESCHIS**.
 
 Ținta aleasă este `Qwen/Qwen3-Next-80B-A3B-Instruct`: 48 straturi, 512
 experți/strat, top-10, hidden 2048 și expert width 512. Adaptorul strict
@@ -434,3 +434,137 @@ Compilerul păstrează și modul distructiv explicit, oprit implicit. El poate
 reclama numai shard-uri confirmate ca fiind consumate, dar nu a fost folosit la
 această conversie și nu va fi aplicat checkpoint-ului Qwen păstrat pentru
 repack.
+
+### Gate-urile Qwen reale și revizia de arhitectură
+
+Gate-ul single canonic, cu cache expert de 17 GiB, a produs `13,6968 tok/s`,
+p95 `77,5434 ms`, zero SSD/H2D după warmup și zero evictions. Working set-ul
+observat a fost `17.442.209.792` bytes RAM și `17.419.628.544` bytes VRAM. Modelul
+de `81.903.198.208` bytes rămâne mai mare decât cei `68.641.103.872` bytes RAM
+fizici, iar pagefile-ul nu a crescut.
+
+Gate-ul mixt cu patru prompturi diferite a păstrat exact output-ul fiecărui
+request față de execuția izolată (`interleaving_match=true`), dar a produs numai
+`5,23099 tok/s` aggregate. Cauza măsurată nu a fost SSD-ul: zero miss-uri SSD,
+dar un working set RAM de `35.440.951.296` bytes a concurat pentru aproximativ
+18,25 GB VRAM, producând `21.080` evictions, `39.459.409.920` bytes H2D și
+`12,598 s` cache wait.
+
+Acest rezultat a invalidat două alegeri ale prototipului: LRU global și
+dispatch-ul care copia expert IDs GPU->CPU și reconstruia patru tabele de
+pointeri CPU->GPU la fiecare strat. Revizia implementată introduce:
+
+- cote VRAM/RAM pe layer-group plus rezervă comună pentru burst;
+- admission după frecvență cu aging, astfel încât traficul one-hit să nu
+  evacueze automat working set-ul reutilizat;
+- director GPU cu pointer, stare, generație și device refcount per expert;
+- deduplicare prin hash dimensionat după selecțiile active, nu după numărul
+  total de experți;
+- hot path miss-only; lista completă ready este returnată CPU numai pe cold
+  path, ca să fie lease-uită înaintea load-urilor;
+- kernels MoE care consumă direct directorul device, fără pointer tables host.
+
+Primul gate după director + partitionare, înainte de admission-ul LFU, a rămas
+FAIL la `4,74454 tok/s`: `38.354.104.320` bytes H2D, `20.523` evictions și
+`17,3081 s` cache wait. Acesta demonstrează că partitionarea singură nu este o
+soluție și fixează baseline-ul pentru politica resident/transient. Rezultatul
+nu este prezentat drept progres de viteză. Build-ul MSVC/NVCC, testele
+deterministe și smoke-ul cu opt experți reali au trecut; smoke-ul directorului
+a produs `cosine=1`, `max_abs=9,31323e-10`.
+
+Admission-ul LFU cu aging a îmbunătățit gate-ul mixt la `5,37435 tok/s`, a
+redus H2D la `31.289.622.528` bytes, evictions la `19.354` și cache wait la
+`14,2896 s`, păstrând `interleaving_match=true`. Reducerea este reală, dar
+insuficientă: scorul singur admitea în continuare fiecare miss în același pool.
+
+O revizie separă fizic bugetul VRAM în resident și transient. Pentru profilul
+de 17 GiB au fost testate 16 GiB resident + 1 GiB ring transient. Bugetele au
+fost respectate exact (`17.179.611.136` și `1.073.741.824` bytes high-water),
+dar gate-ul a regresat la `5,05507 tok/s`, `31.570.685.952` bytes H2D, `23.607`
+evictions și `16,3525 s` cache wait. Corectitudinea a rămas PASS.
+
+Mecanismul rămâne configurabil pentru modele la care izolarea cold traffic este
+obligatorie, dar este dezactivat implicit pentru Qwen. Plannerul viitor trebuie
+să-l activeze dintr-un model numeric de cost, nu dintr-un prag hard-coded.
+Baseline-ul acceptat pentru continuarea compute-path este LFU-ul comun de
+`5,37435 tok/s`.
+
+### Step-back: costurile executorului heterogen
+
+Stare: **CPU-LOCAL ALES PENTRU PRIMUL VERTICAL SLICE; SLAB H2D RĂMÂNE TIER
+VALID**.
+
+Inventarul relevant al 3090box este Ryzen 5 5600 6C/12T cu AVX2, 64 GiB în două
+DIMM-uri DDR4-3200 și RTX 3090 conectat PCIe Gen3 x16. Alegerea nu se bazează pe
+un al doilea GPU și nu cere schimbarea explicită la INT4.
+
+`expert-path-probe` a folosit 64 de recorduri Qwen reale, în total 202.375.168
+bytes, deci working set-ul probei depășește cache-urile CPU. Rezultatele sunt:
+
+| Cale | Geometrie | Rezultat |
+|---|---:|---:|
+| RAM pageable -> slab pinned | 202,38 MB | 16,13–16,37 GiB/s |
+| slab pinned -> RTX 3090 | 202,38 MB | 12,46 GiB/s |
+| CPU AVX2 grouped | 1 row/expert, 6 threads | 6.203 experți/s; 18,27 GiB/s efectiv |
+| CPU AVX2 grouped | 4 rows/expert, 6 threads | 5.059 experți/s; 14,90 GiB/s efectiv |
+
+Kernelul CPU păstrează weights expert-major și le reutilizează între rânduri.
+Față de referința scalară a aceluiași record a produs cosine `1` și max-abs
+`2,32831e-9` pentru ambele bucket-uri.
+
+În gate-ul LFU, cele 9.590 promovări RAM->VRAM pentru 124 tokeni înseamnă circa
+77,34 grupuri expert miss/token. La 30 tok/s ar cere aproximativ 2.320 grupuri/s,
+sub cele 5.059 grupuri/s măsurate chiar la patru rânduri. Aceasta nu dovedește
+încă SLO-ul end-to-end: latența per strat, copiile activation/result și
+concurența cu GPU-ul trebuie integrate și măsurate. Dovedește însă că pe această
+mașină CPU-local este candidatul corect pentru primul vertical slice și că nu
+trebuie să copiem automat fiecare RAM hit în VRAM.
+
+Slab H2D rămâne important pentru alte distribuții și alte CPU-uri. Pentru
+payload-ul observat de aproximativ 252 MB/token, link-ul măsurat are bandwidth
+brut suficient pentru 30 tok/s, dar pack-ul în pinned staging consumă încă o
+trecere prin RAM și trebuie suprapus prin double buffering. Nu îl implementăm
+înaintea CPU-local pe 3090box, dar contractul executorului îl păstrează.
+
+Separat, eliminarea cache wait-ului nu rezolvă P4. Baseline-ul LFU are aproximativ
+11,13 s non-I/O pentru 124 tokeni, adică un plafon de circa 11,14 tok/s aggregate.
+Kernelurile GPU grouped/persistent rămân obligatorii după verticala CPU-local.
+
+### P6 final — executor heterogen și placement pe epoci
+
+Verticala finală nu promovează obligatoriu fiecare RAM hit. Selecțiile
+VRAM-ready rulează prin directorul CUDA, iar selecțiile RAM-ready folosesc
+thread pool-ul AVX2 și întorc ieșiri per selecție pentru agregare stabilă pe
+GPU. Plannerul generic urmărește costul CPU, reuse debt și frecvența tuturor
+rutelor. Promovările RAM->VRAM sunt asincrone și admise numai dacă pot înlocui
+rezidenți strict mai reci.
+
+Rebalansarea se încheie la o barieră explicită, după care placement-ul rămâne
+frozen pe durata decode-ului. Încercarea de a promova sincron în hot path a fost
+respinsă: `14,5708 tok/s`, `4.973.875.200` bytes H2D și `1.575` promovări în
+fereastra măsurată. Varianta asincronă fără epoch freeze a fost de asemenea
+respinsă: `22,5733 tok/s`, `3.818.041.344` bytes H2D și `1.209` promovări.
+Aceste rezultate rămân evidence pentru motivul barierei, nu configurații
+acceptate.
+
+Configurația finală folosește 48 GiB cache RAM și 18 GiB cache VRAM pe RTX 3090.
+Artefactul `p6-gate-single-18g-pass.json` raportează:
+
+- `31,7312 tok/s` single-stream, peste pragul de 10;
+- correctness PASS, zero creștere pagefile;
+- zero selecții CPU, zero promovări și zero H2D weights după warmup.
+
+Artefactul `p6-gate-batch-18g-pass.json` raportează:
+
+- `31,1004 tok/s` aggregate la patru prompturi diferite, peste pragul de 30;
+- `interleaving_match=true` și correctness PASS;
+- `3,98709 s` pentru 124 forward tokens;
+- hit-rate VRAM `0,853185`;
+- `9.847` selecții și `8.617` grupuri executate CPU în `1,10878 s`;
+- zero promovări și zero H2D weights în fereastra măsurată;
+- high-water `19.327.082.496` bytes cache VRAM și `35.440.951.296` bytes cache RAM;
+- minimum `26.729.181.184` bytes RAM fizic liber și zero creștere pagefile.
+
+Containerul de `81.903.198.208` bytes este mai mare decât cei
+`68.641.103.872` bytes RAM fizici, iar ambele SLO-uri P6 sunt astfel închise
+fără al doilea GPU și fără a șterge checkpoint-ul sursă.
