@@ -83,6 +83,9 @@ class DeepSeekDecodeController final {
   [[nodiscard]] Status configure_hybrid(
       std::shared_ptr<cpu::DeepSeekPackedExecutor> executor,
       std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept;
+  [[nodiscard]] bool hybrid_configured() const noexcept {
+    return cpu_executor_ != nullptr && hybrid_workspace_ != nullptr;
+  }
   // Called only after needs_experts. Spans remain owned by scheduler host
   // leases until the suspended layer completes or is cancelled.
   [[nodiscard]] Status stage_cpu_placements(

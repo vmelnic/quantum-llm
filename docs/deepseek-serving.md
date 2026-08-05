@@ -93,6 +93,12 @@ The timing counters deliberately describe their measured boundary:
 The scheduler/cache counters can overlap their parent worker counter and must
 not be summed with it as independent wall time. They exist to attribute the
 parent interval and compare deltas between two snapshots.
+
+Each live request owns one non-blocking CUDA stream and one reusable hybrid
+workspace. RoPE values for the configured context are precomputed once into a
+bounded resident device table. `worker_execution` exposes these effective
+contracts; no per-token workspace allocation or host RoPE upload remains in the
+production path.
 Startup performs hard RAM, VRAM, request-state, and logical KV-credit
 preflights before the ready message. These defaults fit the qualified 64 GiB
 RAM / 24 GiB VRAM class, but operators must lower them when other processes

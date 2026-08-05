@@ -189,35 +189,34 @@ std::array<float, 32U> rope_values(std::uint32_t position, bool sine,
   return result;
 }
 
-er::cuda::DeepSeekDecodeRope upload_rope(std::uint32_t position,
-                                         float* device) {
-  std::array<std::array<float, 32U>, 8U> values{};
-  values[0] = rope_values(position, false, false);
-  values[1] = rope_values(position, true, false);
-  values[2] = rope_values(position, false, true);
-  values[3] = rope_values(position, true, true);
+std::array<std::array<float, 32U>, 8U> rope_row(std::uint32_t position) {
+  std::array<std::array<float, 32U>, 8U> result{};
+  result[0] = rope_values(position, false, false);
+  result[1] = rope_values(position, true, false);
+  result[2] = rope_values(position, false, true);
+  result[3] = rope_values(position, true, true);
   const auto start4 = position + 1U >= 4U ? position + 1U - 4U : 0U;
   const auto start128 = position + 1U >= 128U ? position + 1U - 128U : 0U;
-  values[4] = rope_values(start4, false, true);
-  values[5] = rope_values(start4, true, true);
-  values[6] = rope_values(start128, false, true);
-  values[7] = rope_values(start128, true, true);
-  cuda_check(cudaMemcpy(device, values.data(), sizeof(values),
-                        cudaMemcpyHostToDevice),
-             "upload DeepSeek worker RoPE");
-  return {device, device + 32U, device + 64U, device + 96U,
-          device + 128U, device + 160U, device + 192U, device + 224U};
+  result[4] = rope_values(start4, false, true);
+  result[5] = rope_values(start4, true, true);
+  result[6] = rope_values(start128, false, true);
+  result[7] = rope_values(start128, true, true);
+  return result;
 }
 
 struct Request final {
   std::shared_ptr<er::cuda::DeepSeekRequestState> state;
   std::shared_ptr<er::cuda::DeepSeekDecodeController> controller;
-  float* rope{};
+  cudaStream_t stream{};
   std::uint32_t predicted{};
   std::uint32_t next_position{};
   std::uint32_t context_limit{};
   std::uint32_t slot{};
-  ~Request() { if (rope) static_cast<void>(cudaFree(rope)); }
+  ~Request() {
+    controller.reset();
+    state.reset();
+    if (stream) static_cast<void>(cudaStreamDestroy(stream));
+  }
 };
 
 struct WorkerTelemetry final {
@@ -276,7 +275,7 @@ class Model final {
     cuda_check(cudaMemGetInfo(&free, &total), "inspect DeepSeek worker VRAM");
     const auto fixed = artifacts_.dense_device_bytes +
                        artifacts_.typed_source_bytes +
-                       request_bytes_ * capacity_;
+                       request_bytes_ * capacity_ + rope_table_bytes();
     require(fixed + vram_bytes_ + (1ULL << 30U) <= free,
             "DeepSeek worker VRAM preflight failed");
 
@@ -316,6 +315,7 @@ class Model final {
     const auto shared_status = er::ResidentExpertSet::load(
         *cache_, artifacts_.shared, shared_);
     require(shared_status.ok(), shared_status.message());
+    initialize_rope_table();
     cpu_ = std::make_shared<er::cpu::DeepSeekPackedExecutor>(
         er::cpu::DeepSeekPackedExecutorConfig{
             std::max(1U, std::thread::hardware_concurrency()),
@@ -351,22 +351,31 @@ class Model final {
     const auto saved = census_->save(bundle_.census);
     if (!saved.ok())
       std::cerr << "route census save failed: " << saved.message() << '\n';
+    scheduler_.reset();
+    if (rope_table_) static_cast<void>(cudaFree(rope_table_));
   }
 
   std::unique_ptr<Request> create_request() {
     auto state = er::cuda::create_deepseek_request_state(
         model_, {max_context_, request_bytes_});
     require(state.status.ok() && state.state, state.status.message());
-    auto controller = er::cuda::create_deepseek_decode_controller(
-        state.state, directory_);
-    require(controller.status.ok() && controller.controller,
-            controller.status.message());
     auto request = std::make_unique<Request>();
     request->state = std::move(state.state);
+    cuda_check(cudaStreamCreateWithFlags(&request->stream,
+                                         cudaStreamNonBlocking),
+               "create DeepSeek request stream");
+    auto controller = er::cuda::create_deepseek_decode_controller(
+        request->state, directory_, request->stream);
+    require(controller.status.ok() && controller.controller,
+            controller.status.message());
     request->controller = std::move(controller.controller);
-    cuda_check(cudaMalloc(reinterpret_cast<void**>(&request->rope),
-                          8U * 32U * sizeof(float)),
-               "allocate DeepSeek request RoPE");
+    auto workspace = er::cuda::create_deepseek_ffn_hybrid_workspace();
+    require(workspace.status.ok() && workspace.workspace,
+            workspace.status.ok() ? "hybrid workspace returned no ownership"
+                                  : workspace.status.message());
+    const auto configured = request->controller->configure_hybrid(
+        cpu_, std::move(workspace.workspace));
+    require(configured.ok(), configured.message());
     return request;
   }
 
@@ -385,13 +394,14 @@ class Model final {
     for (std::size_t index = 0U; index < requests.size(); ++index) {
       require(positions[index] < requests[index]->context_limit,
               "DeepSeek reserved context exhausted");
-      const auto embedded = requests[index]->state->embed(tokens[index]);
+      const auto embedded = requests[index]->state->embed(
+          tokens[index], requests[index]->stream);
       require(embedded.ok(), embedded.message());
       const auto operation = next_operation_++;
       const auto submitted = scheduler_->submit(
           operation, requests[index]->controller,
           {requests[index]->state->current_streams(),
-           upload_rope(positions[index], requests[index]->rope),
+           rope_at(positions[index]),
            positions[index], tokens[index], 0U, 43U});
       require(submitted.ok(), submitted.message());
       operations.push_back(operation);
@@ -424,12 +434,18 @@ class Model final {
     const auto output_started = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> result(requests.size());
     for (std::size_t index = 0U; index < requests.size(); ++index) {
-      const auto projected = requests[index]->state->project_logits();
+      const auto projected = requests[index]->state->project_logits(
+          requests[index]->stream);
       require(projected.ok(), projected.message());
-      cuda_check(cudaMemcpy(&result[index],
-                            requests[index]->state->sampled_token(),
-                            sizeof(std::uint32_t), cudaMemcpyDeviceToHost),
-                 "copy DeepSeek sampled token");
+      cuda_check(cudaMemcpyAsync(&result[index],
+                                 requests[index]->state->sampled_token(),
+                                 sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                                 requests[index]->stream),
+                 "queue DeepSeek sampled token copy");
+    }
+    for (std::size_t index = 0U; index < requests.size(); ++index) {
+      cuda_check(cudaStreamSynchronize(requests[index]->stream),
+                 "complete DeepSeek sampled token copy");
       const auto retired = scheduler_->retire(operations[index]);
       require(retired.ok(), retired.message());
     }
@@ -483,6 +499,37 @@ class Model final {
   }
 
  private:
+  static constexpr std::uint64_t rope_row_values = 8ULL * 32U;
+  std::uint64_t rope_table_bytes() const noexcept {
+    return static_cast<std::uint64_t>(max_context_) * rope_row_values *
+           sizeof(float);
+  }
+
+  void initialize_rope_table() {
+    std::vector<std::array<std::array<float, 32U>, 8U>> host(max_context_);
+    for (std::uint32_t position = 0U; position < max_context_; ++position)
+      host[position] = rope_row(position);
+    float* candidate = nullptr;
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&candidate),
+                          rope_table_bytes()),
+               "allocate DeepSeek RoPE table");
+    const auto copied = cudaMemcpy(candidate, host.data(), rope_table_bytes(),
+                                   cudaMemcpyHostToDevice);
+    if (copied != cudaSuccess) {
+      static_cast<void>(cudaFree(candidate));
+      cuda_check(copied, "upload DeepSeek RoPE table");
+    }
+    rope_table_ = candidate;
+  }
+
+  er::cuda::DeepSeekDecodeRope rope_at(std::uint32_t position) const {
+    require(position < max_context_, "DeepSeek RoPE position is out of range");
+    auto* row = rope_table_ + static_cast<std::size_t>(position) *
+                                 rope_row_values;
+    return {row, row + 32U, row + 64U, row + 96U,
+            row + 128U, row + 160U, row + 192U, row + 224U};
+  }
+
   void warm_from_census() {
     if (placement_ == "capacity") return;
     const auto usage = cache_->usage();
@@ -538,6 +585,7 @@ class Model final {
   std::shared_ptr<er::ExtentGatherStorage> storage_;
   std::shared_ptr<er::FixedBufferPool> buffers_;
   std::shared_ptr<er::cuda::DeepSeekResidentModelState> model_;
+  float* rope_table_{};
   std::shared_ptr<er::cuda::CudaExpertDirectory> directory_;
   std::shared_ptr<er::cuda::CudaExpertUploader> uploader_;
   std::unique_ptr<er::ExpertCache> cache_;
@@ -572,6 +620,8 @@ int worker_loop(Model& model) {
             << model.capacity()
             << ",\"prefill_mode\":\"causal_sequential\""
             << ",\"prefill_chunk_tokens\":1"
+            << ",\"request_stream_mode\":\"per_request_nonblocking\""
+            << ",\"rope_mode\":\"resident_table\""
             << ",\"kv_dtype\":\"bf16\""
             << ",\"kv_allocation\":\"preallocated\""
             << ",\"kv_page_tokens\":" << model.kv_page_tokens()

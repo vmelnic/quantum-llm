@@ -332,6 +332,15 @@ chat claim. It proves that learned startup residency removes SSD/H2D from a
 known route and also shows that the remaining GPU/controller path still needs
 about a 2.04x reduction to reach a 33.3 ms/model-step target.
 
+Moving the hybrid workspace to request ownership, assigning a non-blocking
+stream per request, and replacing per-step RoPE generation/upload with a
+resident context table preserved token `19923`. The same five-step warm route
+took 341.509 ms versus 340.886 ms before the change, effectively unchanged for
+single-stream decode. This is expected: it removes allocation and default-stream
+coupling needed for concurrency, but the existing per-layer directory barriers
+still serialize one request. No single-stream speedup is claimed for this
+slice.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

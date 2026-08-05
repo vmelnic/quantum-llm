@@ -64,9 +64,11 @@ router output or generated tokens.
 
 ## P1 — persistent asynchronous execution
 
-- [ ] Give every request a persistent non-default CUDA stream, reusable hybrid
-  workspace, RoPE storage, and event set.
-- [ ] Precompute bounded RoPE tables or generate RoPE on device; remove the
+- [x] Give every request a persistent non-default CUDA stream and reusable
+  hybrid workspace.
+- [ ] Give every request a persistent CUDA event set for asynchronous directory,
+  upload, compute, and release dependencies.
+- [x] Precompute bounded RoPE tables or generate RoPE on device; remove the
   synchronous per-step host upload.
 - [ ] Keep directory hit planning on device. Return only compact miss metadata
   to the host and replace per-layer `cudaStreamSynchronize` calls with event

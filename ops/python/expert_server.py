@@ -165,6 +165,10 @@ class CudaWorker:
         self.capacity = int(response.get("capacity", 1))
         self.prefill_mode = str(response.get("prefill_mode", ""))
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
+        self.request_stream_mode = str(
+            response.get("request_stream_mode", "default")
+        )
+        self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
         self.kv_page_tokens = int(response.get("kv_page_tokens", 0))
@@ -787,6 +791,10 @@ class Application:
             "worker_prefill": {
                 "mode": self.worker.prefill_mode,
                 "chunk_tokens": self.worker.prefill_chunk_tokens,
+            },
+            "worker_execution": {
+                "request_stream_mode": self.worker.request_stream_mode,
+                "rope_mode": self.worker.rope_mode,
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,

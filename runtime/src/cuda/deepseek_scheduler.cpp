@@ -580,7 +580,7 @@ Status DeepSeekDecodeScheduler::submit(
     return {ErrorCode::backpressure,
             "DeepSeek scheduled request capacity exhausted"};
   }
-  if (core_->hybrid.cpu_executor) {
+  if (core_->hybrid.cpu_executor && !controller->hybrid_configured()) {
     auto workspace = create_deepseek_ffn_hybrid_workspace();
     if (!workspace.status.ok() || !workspace.workspace) {
       ++core_->metrics.rejected_requests;
