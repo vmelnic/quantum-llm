@@ -384,8 +384,14 @@ struct DeepSeekDecodeScheduler::Core final {
           break;
         }
         for (auto& resolved : result->experts) {
+          if (resolved.placement != ExpertPlacementKind::device ||
+              !resolved.device_lease) {
+            fail(request, {ErrorCode::internal,
+                           "DeepSeek device resolve returned host placement"});
+            break;
+          }
           request.leases.push_back(
-              {resolved.key.expert, std::move(resolved.lease)});
+              {resolved.key.expert, std::move(resolved.device_lease)});
         }
       }
       if (request.state == DeepSeekScheduledState::waiting_for_experts &&

@@ -10,14 +10,33 @@
 
 namespace expert::runtime {
 
+enum class ExpertResolveTarget : std::uint8_t {
+  device,
+  host_ready,
+};
+
+enum class ExpertPlacementKind : std::uint8_t {
+  device,
+  host,
+};
+
 struct ExpertResolveRequest final {
   ExpertKey key;
   PayloadRecord record;
+  ExpertResolveTarget target{ExpertResolveTarget::device};
 };
 
 struct ResolvedExpert final {
   ExpertKey key;
-  ExpertLease lease;
+  ExpertPlacementKind placement{ExpertPlacementKind::device};
+  ExpertLease device_lease;
+  HostExpertLease host_lease;
+
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return placement == ExpertPlacementKind::device
+               ? static_cast<bool>(device_lease)
+               : static_cast<bool>(host_lease);
+  }
 };
 
 struct ExpertResolveResult final {

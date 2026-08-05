@@ -244,11 +244,14 @@ terminal failure unwind pending waiters, leases, and controller pins.
 
 The scheduler submits a bounded union of `(layer, expert)` records to
 `IExpertStore`, rather than exposing individual cache futures as its placement
-contract. It receives either the complete ordered lease set or one explicit
-failure. The local store still deduplicates immutable records through
-`ExpertCache`; compact-GPU, CPU-local, and remote-owner stores can implement the
-same batch boundary without changing request state. Global credits count
-experts, not batch objects, so batching cannot bypass I/O or memory bounds.
+contract. Every member names an explicit target (`device` or `host_ready`) and
+the result owns the corresponding device or validated compact-host lease. The
+store publishes either the complete ordered placement set or one explicit
+failure; a host target never silently promotes or falls back. The local store
+still deduplicates immutable records through `ExpertCache`, while remote-owner
+stores can implement the same batch boundary without changing request state.
+Global credits count experts, not batch objects, so batching cannot bypass I/O
+or memory bounds.
 
 `MemoryResourceGovernor` is the single admission authority above these tiers.
 Dense state, KV pages, request workspaces, and network staging are explicit

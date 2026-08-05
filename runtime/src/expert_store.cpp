@@ -17,8 +17,11 @@ Status copy_status(const Status& status) {
 struct ExpertResolveHandle::Core final {
   struct Item final {
     ExpertKey key;
+    ExpertResolveTarget target{ExpertResolveTarget::device};
     AcquireHandle handle;
     std::optional<AcquireResult> result;
+    std::optional<HostExpertLease> host;
+    std::optional<Status> error;
   };
   std::vector<Item> items;
   bool terminal{};
@@ -44,6 +47,16 @@ std::optional<ExpertResolveResult> ExpertResolveHandle::poll() {
   if (!valid()) return std::nullopt;
   bool complete = true;
   for (auto& item : core_->items) {
+    if (item.error) {
+      for (auto& unresolved : core_->items) {
+        if (unresolved.target == ExpertResolveTarget::device &&
+            !unresolved.result)
+          unresolved.handle.cancel();
+      }
+      core_->terminal = true;
+      return ExpertResolveResult{copy_status(*item.error), {}};
+    }
+    if (item.target == ExpertResolveTarget::host_ready) continue;
     if (item.result) continue;
     if (item.handle.wait_for(std::chrono::milliseconds(0)) !=
         std::future_status::ready) {
@@ -69,7 +82,13 @@ std::optional<ExpertResolveResult> ExpertResolveHandle::poll() {
   resolved.status = Status::success();
   resolved.experts.reserve(core_->items.size());
   for (auto& item : core_->items) {
-    resolved.experts.push_back({item.key, std::move(item.result->lease)});
+    if (item.target == ExpertResolveTarget::host_ready) {
+      resolved.experts.push_back({item.key, ExpertPlacementKind::host, {},
+                                  std::move(*item.host)});
+    } else {
+      resolved.experts.push_back({item.key, ExpertPlacementKind::device,
+                                  std::move(item.result->lease), {}});
+    }
   }
   core_->terminal = true;
   return resolved;
@@ -78,7 +97,8 @@ std::optional<ExpertResolveResult> ExpertResolveHandle::poll() {
 void ExpertResolveHandle::cancel() noexcept {
   if (!core_ || core_->terminal) return;
   for (auto& item : core_->items) {
-    if (!item.result) item.handle.cancel();
+    if (item.target == ExpertResolveTarget::device && !item.result)
+      item.handle.cancel();
   }
   core_->terminal = true;
 }
@@ -95,8 +115,19 @@ ExpertResolveHandle LocalExpertStore::resolve(
   auto core = std::make_unique<ExpertResolveHandle::Core>();
   core->items.reserve(requests.size());
   for (const auto& request : requests) {
-    core->items.push_back(
-        {request.key, cache_.acquire(request.key, request.record), {}});
+    ExpertResolveHandle::Core::Item item;
+    item.key = request.key;
+    item.target = request.target;
+    if (request.target == ExpertResolveTarget::host_ready) {
+      item.host = cache_.try_acquire_host(request.key, request.record);
+      if (!item.host) {
+        item.error.emplace(ErrorCode::backpressure,
+                           "requested expert is not ready in host memory");
+      }
+    } else {
+      item.handle = cache_.acquire(request.key, request.record);
+    }
+    core->items.push_back(std::move(item));
   }
   return ExpertResolveHandle(std::move(core));
 }

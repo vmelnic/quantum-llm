@@ -450,7 +450,10 @@ void test_expert_store_resolves_complete_ordered_union() {
               resolved->experts.size() == 2U &&
               resolved->experts[0].key == second.key &&
               resolved->experts[1].key == first.key &&
-              resolved->experts[0].lease && resolved->experts[1].lease,
+              resolved->experts[0].placement == er::ExpertPlacementKind::device &&
+              resolved->experts[1].placement == er::ExpertPlacementKind::device &&
+              resolved->experts[0].device_lease &&
+              resolved->experts[1].device_lease,
           "expert store changed order or omitted a union member");
   require(!batch.valid() && !batch.poll(),
           "terminal expert store handle was reusable");
@@ -461,6 +464,19 @@ void test_expert_store_resolves_complete_ordered_union() {
   };
   require(!store.resolve(duplicate).valid(),
           "expert store accepted duplicate immutable keys");
+
+  const std::array host_request = {
+      er::ExpertResolveRequest{second.key, second.record,
+                               er::ExpertResolveTarget::host_ready}};
+  auto host_batch = store.resolve(host_request);
+  auto host_resolved = host_batch.poll();
+  require(host_resolved && host_resolved->status.ok() &&
+              host_resolved->experts.size() == 1U &&
+              host_resolved->experts[0].placement ==
+                  er::ExpertPlacementKind::host &&
+              host_resolved->experts[0].host_lease &&
+              !host_resolved->experts[0].device_lease,
+          "expert store did not publish a retained host placement");
 }
 
 class TestMemoryTier final : public er::ITrimmableMemoryTier {
