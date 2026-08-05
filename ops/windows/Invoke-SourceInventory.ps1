@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Snapshot,
     [switch]$TensorGroups,
-    [ValidateSet("deepseek_v4")][string]$Contract
+    [ValidateSet("deepseek_v4")][string]$Contract,
+    [switch]$EstimateRepresentations
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -20,6 +21,7 @@ try {
     $arguments = @("-m", "compiler", "inspect-source", "--source", $source)
     if ($TensorGroups) { $arguments += "--tensor-groups" }
     if ($Contract) { $arguments += @("--contract", $Contract) }
+    if ($EstimateRepresentations) { $arguments += "--estimate-representations" }
     & $python.Source @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Source inventory exited with code $LASTEXITCODE"

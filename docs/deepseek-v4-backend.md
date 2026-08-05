@@ -64,3 +64,27 @@ closed.
 
 This decoder establishes source semantics only. It does not select the final
 GPU-cache representation and is not wired into Expert Pack v1.
+
+## Representation estimate
+
+`--estimate-representations` derives payload bytes from the validated tensor
+geometry without opening weight payloads. It intentionally excludes container
+headers, alignment, indexes, runtime buffers, dense decode expansion, and KV
+cache, so it is a format comparison rather than a disk/VRAM capacity promise.
+
+On the pinned checkpoint:
+
+| Representation | Payload bytes | Consequence |
+|---|---:|---|
+| Source, compact routed FP4 | 159,609,485,896 | Baseline; routed experts occupy 150,592,290,816 bytes. |
+| All routed experts expanded to FP8 | 292,502,338,120 | Adds 132,892,852,224 bytes before container overhead. |
+| All routed experts expanded to INT8-per-row | 292,854,135,368 | Adds 133,244,649,472 bytes before container overhead. |
+
+One main-model expert is 13,369,344 source bytes and 25,198,592 bytes in the
+candidate INT8 compute cache. Six selected experts for one layer require
+151,191,552 cache bytes if none are already resident. A nominal 1 GiB cache
+holds 42 such experts, before allocator/workspace overhead.
+
+Therefore eager expansion is rejected as the default direction. Compact cold
+storage plus bounded, eviction-aware compute admission remains the working ABI
+decision; the real expert slice must still validate quality and decode cost.

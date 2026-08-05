@@ -36,6 +36,11 @@ contract exhaustively validates names, dtypes, shapes, byte lengths, routing,
 CSA/HCA, MTP, and quantization metadata. It remains source-only and cannot
 start an Expert Pack conversion.
 
+Add `--estimate-representations` with that contract to compare compact source,
+eager FP8, eager INT8-per-row, and one-expert hot-cache payload sizes. The
+estimate reads metadata only and explicitly excludes container/runtime
+overhead.
+
 ## Install
 
 From the repository root:

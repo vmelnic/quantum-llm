@@ -11,7 +11,11 @@ from types import SimpleNamespace
 from compiler.expert_pack.adapters import adapt_checkpoint
 from compiler.expert_pack.compile import CompileOptions, compile_checkpoint
 from compiler.expert_pack.constants import EXPERT_HEADER_STRUCT, HEADER_BYTES, PACK_ALIGNMENT
-from compiler.expert_pack.deepseek_v4 import _build_expected, validate_deepseek_v4_source
+from compiler.expert_pack.deepseek_v4 import (
+    _build_expected,
+    estimate_deepseek_v4_representations,
+    validate_deepseek_v4_source,
+)
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
@@ -301,6 +305,24 @@ class ExpertPackTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(AdapterError, "metadata mismatch"):
             validate_deepseek_v4_source(checkpoint)
+
+    def test_deepseek_v4_representation_estimate_is_metadata_only(self) -> None:
+        checkpoint = _deepseek_metadata_checkpoint()
+        estimate = estimate_deepseek_v4_representations(checkpoint)
+        self.assertTrue(estimate["payload_only"])
+        self.assertEqual(estimate["source_checkpoint"]["bytes"], 159609485896)
+        self.assertEqual(
+            estimate["source_checkpoint"]["routed_expert_bytes"], 150592290816
+        )
+        self.assertEqual(estimate["eager_fp8_routed_experts"]["bytes"], 292502338120)
+        self.assertEqual(
+            estimate["eager_int8_per_row_routed_experts"]["bytes"], 292854135368
+        )
+        cache = estimate["hot_int8_cache"]
+        self.assertEqual(cache["source_bytes_per_expert"], 13369344)
+        self.assertEqual(cache["compute_bytes_per_expert"], 25198592)
+        self.assertEqual(cache["compute_bytes_for_top_k_one_layer"], 151191552)
+        self.assertEqual(cache["experts_per_gib"], 42)
 
     def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

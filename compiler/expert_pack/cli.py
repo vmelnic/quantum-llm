@@ -7,7 +7,10 @@ from typing import Sequence
 
 from .compile import CompileOptions, compile_checkpoint
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE
-from .deepseek_v4 import validate_deepseek_v4_source
+from .deepseek_v4 import (
+    estimate_deepseek_v4_representations,
+    validate_deepseek_v4_source,
+)
 from .errors import ExpertPackError
 from .safetensors import SafeTensorCheckpoint
 from .source_inventory import inspect_source
@@ -51,6 +54,11 @@ def _parser() -> argparse.ArgumentParser:
         choices=("deepseek_v4",),
         help="apply an exhaustive source-only architecture contract",
     )
+    inspect_parser.add_argument(
+        "--estimate-representations",
+        action="store_true",
+        help="derive DeepSeek compact/eager/hot-cache payload sizes without conversion",
+    )
     return parser
 
 
@@ -82,6 +90,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             if args.contract == "deepseek_v4":
                 result["contract"] = validate_deepseek_v4_source(checkpoint)
+            if args.estimate_representations:
+                if args.contract != "deepseek_v4":
+                    raise ValueError("--estimate-representations requires --contract deepseek_v4")
+                result["representation_estimates"] = (
+                    estimate_deepseek_v4_representations(checkpoint)
+                )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
         return 2

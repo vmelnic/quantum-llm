@@ -336,3 +336,84 @@ def validate_deepseek_v4_source(checkpoint: SafeTensorCheckpoint) -> dict[str, o
             "dense_matrices": "fp8-e4m3-with-ue8m0-block128x128",
         },
     }
+
+
+def estimate_deepseek_v4_representations(
+    checkpoint: SafeTensorCheckpoint,
+) -> dict[str, object]:
+    """Derive payload sizes without reading or converting tensor contents."""
+
+    contract = validate_deepseek_v4_source(checkpoint)
+    routed_weight_bytes = 0
+    routed_scale_bytes = 0
+    eager_fp8_weight_bytes = 0
+    eager_fp8_scale_bytes = 0
+    eager_int8_weight_bytes = 0
+    eager_int8_scale_bytes = 0
+    expert_source_bytes: dict[tuple[str, int, int], int] = defaultdict(int)
+    expert_int8_bytes: dict[tuple[str, int, int], int] = defaultdict(int)
+
+    expert_pattern = re.compile(
+        r"^(?P<namespace>layers|mtp)\.(?P<layer>\d+)\.ffn\.experts\."
+        r"(?P<expert>\d+)\.w[123]\.(?P<kind>weight|scale)$"
+    )
+    for name, info in checkpoint.tensors.items():
+        match = expert_pattern.fullmatch(name)
+        if match is None:
+            continue
+        key = (match["namespace"], int(match["layer"]), int(match["expert"]))
+        expert_source_bytes[key] += info.nbytes
+        if match["kind"] == "scale":
+            routed_scale_bytes += info.nbytes
+            continue
+
+        routed_weight_bytes += info.nbytes
+        rows, packed_columns = info.shape
+        logical_columns = packed_columns * 2
+        logical_weight_bytes = rows * logical_columns
+        eager_fp8_weight_bytes += logical_weight_bytes
+        eager_int8_weight_bytes += logical_weight_bytes
+        eager_fp8_scale_bytes += (rows // 128) * (logical_columns // 128)
+        eager_int8_scale_bytes += rows * 4
+        expert_int8_bytes[key] += logical_weight_bytes + rows * 4
+
+    source_bytes = int(contract["tensor_bytes"])
+    compact_routed_bytes = routed_weight_bytes + routed_scale_bytes
+    non_routed_bytes = source_bytes - compact_routed_bytes
+    eager_fp8_bytes = non_routed_bytes + eager_fp8_weight_bytes + eager_fp8_scale_bytes
+    eager_int8_bytes = non_routed_bytes + eager_int8_weight_bytes + eager_int8_scale_bytes
+
+    main_keys = sorted(key for key in expert_source_bytes if key[0] == "layers")
+    if not main_keys:
+        raise AdapterError("DeepSeek-V4 representation estimate found no routed experts")
+    source_sizes = {expert_source_bytes[key] for key in main_keys}
+    int8_sizes = {expert_int8_bytes[key] for key in main_keys}
+    if len(source_sizes) != 1 or len(int8_sizes) != 1:
+        raise AdapterError("DeepSeek-V4 routed experts are not size-uniform")
+    source_expert_bytes = next(iter(source_sizes))
+    int8_expert_bytes = next(iter(int8_sizes))
+    top_k = int(checkpoint.config["num_experts_per_tok"])
+
+    return {
+        "format": "deepseek-v4-representation-estimate-v1",
+        "payload_only": True,
+        "source_checkpoint": {
+            "bytes": source_bytes,
+            "routed_expert_bytes": compact_routed_bytes,
+            "non_routed_bytes": non_routed_bytes,
+        },
+        "eager_fp8_routed_experts": {
+            "bytes": eager_fp8_bytes,
+            "delta_from_source_bytes": eager_fp8_bytes - source_bytes,
+        },
+        "eager_int8_per_row_routed_experts": {
+            "bytes": eager_int8_bytes,
+            "delta_from_source_bytes": eager_int8_bytes - source_bytes,
+        },
+        "hot_int8_cache": {
+            "source_bytes_per_expert": source_expert_bytes,
+            "compute_bytes_per_expert": int8_expert_bytes,
+            "compute_bytes_for_top_k_one_layer": int8_expert_bytes * top_k,
+            "experts_per_gib": (1024**3) // int8_expert_bytes,
+        },
+    }
