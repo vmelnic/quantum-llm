@@ -74,6 +74,11 @@ void test_deepseek_compact_admission_validation() {
   std::vector<std::byte> bytes(13'369'344U);
   for (std::size_t index = 0; index < bytes.size(); ++index)
     bytes[index] = static_cast<std::byte>((index * 29U + 7U) & 0xffU);
+  for (const auto offset : {4'194'304U, 8'650'752U, 13'107'200U}) {
+    for (std::size_t index = offset; index < offset + 262'144U; ++index) {
+      if (bytes[index] == std::byte{0xff}) bytes[index] = std::byte{0xfe};
+    }
+  }
   er::PayloadRecord record;
   record.stored_bytes = bytes.size();
   record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
@@ -91,6 +96,10 @@ void test_deepseek_compact_admission_validation() {
   bytes.back() ^= std::byte{1};
   require(!er::validate_expert_admission(bytes, key, record).status.ok(),
           "corrupt DeepSeek compact admission was accepted");
+  bytes = std::vector<std::byte>(13'369'344U);
+  bytes[4'194'304U] = std::byte{0xff};
+  require(!er::validate_expert_admission(bytes, key, record, false).status.ok(),
+          "trusted DeepSeek compact admission accepted a UE8M0 NaN");
 }
 
 void test_deepseek_fp8_shared_admission_validation() {

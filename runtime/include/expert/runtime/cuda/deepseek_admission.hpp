@@ -14,6 +14,7 @@ struct DeepSeekAdmissionLaunch {
   std::uint32_t rows{};
   std::uint32_t columns{};
   void* stream{};
+  bool source_validated{};
 };
 
 struct DeepSeekFp8AdmissionLaunch {
@@ -26,9 +27,9 @@ struct DeepSeekFp8AdmissionLaunch {
   void* stream{};
 };
 
-// Converts one projection into deepseek-sm86-int8-per-row-v1. The call is
-// synchronous only for the source-validity flag; cache publication happens
-// after it returns success.
+// Converts one projection into deepseek-sm86-int8-per-row-v1. A caller that
+// has already validated all UE8M0 scale bytes may enqueue asynchronously;
+// otherwise the call synchronizes to report invalid source values.
 [[nodiscard]] Status admit_deepseek_projection(
     const DeepSeekAdmissionLaunch& launch) noexcept;
 

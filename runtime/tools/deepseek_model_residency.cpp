@@ -922,6 +922,7 @@ int main(int argc, char** argv) {
     require(full_sampled_token < 129280U,
             "full DeepSeek token is outside vocabulary");
     const auto full_scheduler_state = full_scheduler.snapshot();
+    const auto full_cache_state = full_cache.telemetry();
     require(full_scheduler_state.completed_requests ==
                 43U * full_inputs.size() &&
                 full_scheduler_state.layer_advances >= 43U * full_inputs.size(),
@@ -1018,6 +1019,12 @@ int main(int argc, char** argv) {
               << full_scheduler_state.layer_advances
               << ",\"full_token_cold_acquires\":"
               << full_scheduler_state.acquires_started
+              << ",\"full_cache_read_bytes\":"
+              << full_cache_state.read_bytes
+              << ",\"full_cache_uploaded_bytes\":"
+              << full_cache_state.uploaded_bytes
+              << ",\"full_cache_vram_high_water\":"
+              << full_cache_state.vram_high_water
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

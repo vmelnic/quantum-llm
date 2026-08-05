@@ -27,7 +27,7 @@ __device__ float decode_value(const std::uint8_t* packed,
   const auto scale_code =
       scales[static_cast<std::size_t>(row) * (columns / 32U) + column / 32U];
   if (scale_code == 255U) {
-    atomicExch(invalid, 1U);
+    if (invalid != nullptr) atomicExch(invalid, 1U);
     return 0.0F;
   }
   return kFp4Values[code] * ldexpf(1.0F, static_cast<int>(scale_code) - 127);
@@ -154,6 +154,12 @@ Status admit_deepseek_projection(
     return Status(ErrorCode::invalid_argument, "invalid DeepSeek admission launch");
   }
   const auto stream = static_cast<cudaStream_t>(launch.stream);
+  if (launch.source_validated) {
+    compact_to_int8<<<launch.rows, kThreads, 0, stream>>>(
+        launch.packed_fp4, launch.ue8m0_scales, launch.int8_rows,
+        launch.row_scales, launch.rows, launch.columns, nullptr);
+    return failure(cudaPeekAtLastError(), "DeepSeek admission launch");
+  }
   unsigned* invalid = nullptr;
   auto error = cudaMallocAsync(&invalid, sizeof(unsigned), stream);
   if (error == cudaSuccess) error = cudaMemsetAsync(invalid, 0, sizeof(unsigned), stream);

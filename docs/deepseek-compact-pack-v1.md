@@ -61,8 +61,10 @@ pack, while legacy extent catalogs still resolve against the checkpoint.
 Version 1 removes six-way scattered reads and creates the stable input layout
 for a direct compressed CUDA kernel. Until that kernel is selected by the
 device ABI, admission still expands a cold record into the existing
-25,198,592-byte INT8 SM86 slot on the GPU. The pack alone improves I/O shape
-but does not claim to remove conversion cost.
+25,198,592-byte INT8 SM86 slot on the GPU. Validated FP4 projections are queued
+without per-projection host synchronization; publication retains one final
+stream barrier. The pack alone improves I/O shape but does not claim to remove
+conversion cost.
 
 A direct-FP4 qualification prototype kept routed records compact in VRAM and
 performed FP4 dequantization inside gate/up/down. It was numerically correct,

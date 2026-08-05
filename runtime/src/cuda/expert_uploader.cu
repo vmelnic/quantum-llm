@@ -130,7 +130,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1) {
         admission = admit_deepseek_projection(
             {compact + weight_offset, compact + scale_offset, output,
-             output_scales, rows, columns, stream});
+             output_scales, rows, columns, stream, true});
       } else if (request.source_abi ==
                  kExpertSourceAbiDeepSeekFp8Block128V1) {
         admission = admit_deepseek_fp8_projection(
@@ -150,8 +150,14 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
              down, down_scales, 4096U, 2048U);
     }
     if (compact_raw != nullptr) {
-      static_cast<void>(cudaFreeAsync(compact_raw, stream));
-      static_cast<void>(cudaStreamSynchronize(stream));
+      const auto free_error = cudaFreeAsync(compact_raw, stream);
+      if (admission.ok() && free_error != cudaSuccess) {
+        admission = cuda_failure("DeepSeek compact release", free_error);
+      }
+      const auto synchronize_error = cudaStreamSynchronize(stream);
+      if (admission.ok() && synchronize_error != cudaSuccess) {
+        admission = cuda_failure("DeepSeek compact admission", synchronize_error);
+      }
     }
     if (!admission.ok()) {
       static_cast<void>(cudaFreeAsync(raw, stream));

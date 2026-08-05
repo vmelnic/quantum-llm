@@ -2,6 +2,7 @@
 
 #include "expert/runtime/sha256.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <limits>
@@ -203,6 +204,21 @@ ExpertAdmissionValidation validate_expert_admission(
   compact.w2_weight_bytes = weight_bytes;
   compact.w2_scale_offset = compact.w2_weight_offset + weight_bytes;
   compact.w2_scale_bytes = scale_bytes;
+  if (!fp8) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3U> scales = {{
+        {compact.w1_scale_offset, compact.w1_scale_bytes},
+        {compact.w3_scale_offset, compact.w3_scale_bytes},
+        {compact.w2_scale_offset, compact.w2_scale_bytes},
+    }};
+    for (const auto& [offset, count] : scales) {
+      const auto begin = bytes.begin() + static_cast<std::size_t>(offset);
+      const auto end = begin + static_cast<std::size_t>(count);
+      if (std::find(begin, end, std::byte{0xff}) != end) {
+        return admission_failure(ErrorCode::checksum_mismatch,
+                                 "DeepSeek compact source contains UE8M0 NaN");
+      }
+    }
+  }
   ExpertSections target{};
   target.hidden = 4096U;
   target.intermediate = 2048U;
