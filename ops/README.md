@@ -37,6 +37,8 @@ remote files.
 | `Invoke-DeepSeekHcaSlice.ps1` | real F32 HCA pre/Sinkhorn/post CUDA correctness gate |
 | `Invoke-DeepSeekTypedResidency.ps1` | stream all 834 BF16/F32/I64 tensors into typed model state |
 | `Invoke-DeepSeekModelResidency.ps1` | publish model/request state and qualify catalog-backed asynchronous layer resume |
+| `Start-DeepSeekCompactPack.ps1` | start resumable durable DeepSeek compact-pack publication outside repository scratch |
+| `Get-DeepSeekCompactPack.ps1` | report authenticated layer-shard progress and final publication state |
 | `Invoke-DeepSeekCsaSlice.ps1` | validate real ratio-4/128 CSA compressor decode state on CUDA |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
 | `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |

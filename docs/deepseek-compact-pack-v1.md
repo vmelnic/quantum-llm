@@ -56,6 +56,22 @@ Pass the resulting directory as `-RoutedCatalog` to the model launcher. The
 loader detects the packed headers and resolves payload shards relative to the
 pack, while legacy extent catalogs still resolve against the checkpoint.
 
+For a durable asynchronous publication, choose an explicit model-store path
+outside repository `work/` and run:
+
+```powershell
+.\ops\windows\Start-DeepSeekCompactPack.ps1 `
+  -Snapshot C:\path\to\snapshot `
+  -RoutedCatalog C:\path\to\routed-catalog `
+  -Output C:\path\to\model-store\deepseek-v4-flash\compact-pack-v1
+
+.\ops\windows\Get-DeepSeekCompactPack.ps1
+```
+
+The start command rejects a destination under scratch, verifies remaining
+space plus safety headroom, and resumes committed layer shards. It never
+deletes or modifies the source checkpoint.
+
 ## Current compute boundary
 
 Version 1 removes six-way scattered reads and creates the stable input layout
