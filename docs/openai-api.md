@@ -166,9 +166,11 @@ Model metadata is therefore not exposed as an operational API promise. If
 concurrent requests exhaust KV page credits, admission returns HTTP `503` with code
 `context_capacity_exhausted` before streaming starts.
 
-`/model-info.worker_kv` reports FP16 dtype, page geometry, total page capacity,
-currently reserved pages, and physically allocated high-water pages.
-`/model-info.worker_prefill` reports the causal chunk mode and current maximum
+`/model-info.worker_kv` reports the backend dtype and allocation strategy, page
+geometry, total logical page capacity, currently reserved pages, and physical
+allocation expressed in the same page geometry. Qwen uses on-demand FP16 pages;
+DeepSeek currently uses preallocated BF16 request state.
+`/model-info.worker_prefill` reports the backend's causal prefill mode and maximum
 tokens per chunk.
 
 `/model-info.worker_placement` is the authoritative effective placement

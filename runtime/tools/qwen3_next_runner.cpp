@@ -1523,11 +1523,16 @@ int worker_loop(Qwen3NextModel& model) {
   std::unordered_map<std::uint64_t, WorkerRequest> active;
   std::vector<bool> used_slots(model.capacity());
   std::cout << "{\"type\":\"ready\",\"protocol\":4,\"capacity\":"
-            << model.capacity() << ",\"prefill_chunk_tokens\":"
+            << model.capacity()
+            << ",\"prefill_mode\":\"causal_chunked\""
+            << ",\"prefill_chunk_tokens\":"
             << model.prefill_chunk_tokens() << ",\"kv_page_tokens\":"
             << model.kv_page_tokens() << ",\"kv_page_bytes\":"
             << model.kv_page_bytes() << ",\"kv_page_capacity\":"
-            << model.kv_page_capacity() << ",\"placement_profile\":\""
+            << model.kv_page_capacity()
+            << ",\"kv_dtype\":\"fp16\""
+            << ",\"kv_allocation\":\"paged_on_demand\""
+            << ",\"placement_profile\":\""
             << model.placement_profile() << "\",\"ram_cache_bytes\":"
             << model.ram_cache_bytes() << ",\"vram_cache_bytes\":"
             << model.vram_cache_bytes()

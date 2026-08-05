@@ -163,7 +163,10 @@ class CudaWorker:
             )
         self.protocol = int(response.get("protocol", 1))
         self.capacity = int(response.get("capacity", 1))
+        self.prefill_mode = str(response.get("prefill_mode", ""))
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
+        self.kv_dtype = str(response.get("kv_dtype", ""))
+        self.kv_allocation = str(response.get("kv_allocation", ""))
         self.kv_page_tokens = int(response.get("kv_page_tokens", 0))
         self.kv_page_bytes = int(response.get("kv_page_bytes", 0))
         self.kv_page_capacity = int(response.get("kv_page_capacity", 0))
@@ -179,7 +182,10 @@ class CudaWorker:
         expected_prefetch = placement_profile != "capacity"
         expected_observations = 1 if placement_profile == "latency" else 2
         if (self.protocol < 4 or self.capacity != requested_capacity or
-                self.prefill_chunk_tokens != requested_capacity or
+                self.prefill_mode not in {"causal_chunked", "causal_sequential"} or
+                not 1 <= self.prefill_chunk_tokens <= requested_capacity or
+                self.kv_dtype not in {"fp16", "bf16"} or
+                self.kv_allocation not in {"paged_on_demand", "preallocated"} or
                 self.kv_page_tokens != kv_page_tokens or
                 self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0 or
                 self.placement_profile != placement_profile or
@@ -754,11 +760,12 @@ class Application:
                 ),
             },
             "worker_prefill": {
-                "mode": "causal_chunked",
+                "mode": self.worker.prefill_mode,
                 "chunk_tokens": self.worker.prefill_chunk_tokens,
             },
             "worker_kv": {
-                "dtype": "fp16",
+                "dtype": self.worker.kv_dtype,
+                "allocation": self.worker.kv_allocation,
                 "page_tokens": self.worker.kv_page_tokens,
                 "page_bytes": self.worker.kv_page_bytes,
                 "page_capacity": self.worker.kv_page_capacity,

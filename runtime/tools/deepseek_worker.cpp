@@ -419,6 +419,9 @@ class Model final {
   std::uint64_t kv_page_capacity() const noexcept {
     return kv_page_capacity_;
   }
+  std::uint64_t kv_pages_per_request() const noexcept {
+    return (max_context_ + kv_page_tokens_ - 1U) / kv_page_tokens_;
+  }
   const std::string& placement() const noexcept { return placement_; }
   er::cuda::DeepSeekDecodeSchedulerSnapshot scheduler_snapshot() const {
     return scheduler_->snapshot();
@@ -469,7 +472,10 @@ int worker_loop(Model& model) {
   std::unordered_map<std::uint64_t, Active> active;
   std::cout << "{\"type\":\"ready\",\"protocol\":4,\"capacity\":"
             << model.capacity()
-            << ",\"prefill_chunk_tokens\":" << model.capacity()
+            << ",\"prefill_mode\":\"causal_sequential\""
+            << ",\"prefill_chunk_tokens\":1"
+            << ",\"kv_dtype\":\"bf16\""
+            << ",\"kv_allocation\":\"preallocated\""
             << ",\"kv_page_tokens\":" << model.kv_page_tokens()
             << ",\"kv_page_bytes\":" << model.kv_page_bytes()
             << ",\"kv_page_capacity\":" << model.kv_page_capacity()
@@ -492,8 +498,18 @@ int worker_loop(Model& model) {
         require(fields.size() == 1U, "invalid STATS");
         const auto scheduler = model.scheduler_snapshot();
         const auto census = model.census_snapshot();
+        std::uint64_t reserved_pages = 0U;
+        for (const auto& [id, item] : active) {
+          static_cast<void>(id);
+          reserved_pages +=
+              (item.request->context_limit + model.kv_page_tokens() - 1U) /
+              model.kv_page_tokens();
+        }
         std::cout << "{\"type\":\"stats\",\"active_requests\":"
-                  << active.size() << ",\"route_observations\":"
+                  << active.size() << ",\"kv_allocated_pages\":"
+                  << active.size() * model.kv_pages_per_request()
+                  << ",\"kv_reserved_pages\":" << reserved_pages
+                  << ",\"route_observations\":"
                   << scheduler.route_observations
                   << ",\"census_routes\":" << census.completed_routes
                   << "}\n" << std::flush;

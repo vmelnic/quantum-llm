@@ -213,7 +213,9 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "architecture": {}, "masses": {},
         }
         app.worker = types.SimpleNamespace(
-            protocol=4, prefill_chunk_tokens=4, kv_page_tokens=256,
+            protocol=4, prefill_mode="causal_sequential",
+            prefill_chunk_tokens=1, kv_dtype="bf16",
+            kv_allocation="preallocated", kv_page_tokens=256,
             kv_page_bytes=1024, kv_page_capacity=8192,
             placement_profile="capacity", ram_cache_bytes=48 << 30,
             vram_cache_bytes=18 << 30, placement_prefetch_enabled=False,
@@ -232,6 +234,11 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         })
         self.assertEqual(info["runtime_config"]["placement_profile"],
                          "capacity")
+        self.assertEqual(info["worker_prefill"], {
+            "mode": "causal_sequential", "chunk_tokens": 1,
+        })
+        self.assertEqual(info["worker_kv"]["dtype"], "bf16")
+        self.assertEqual(info["worker_kv"]["allocation"], "preallocated")
 
     def test_concurrent_rows_share_one_worker_step(self) -> None:
         worker = FakeWorker()
