@@ -31,6 +31,11 @@ Use `--tensor-groups` during adapter development to group numeric layer/expert
 IDs while retaining each observed dtype and shape variant. This is still a
 metadata-only operation; it can produce a long JSON report.
 
+For the pinned DeepSeek-V4-Flash geometry, add `--contract deepseek_v4`. The
+contract exhaustively validates names, dtypes, shapes, byte lengths, routing,
+CSA/HCA, MTP, and quantization metadata. It remains source-only and cannot
+start an Expert Pack conversion.
+
 ## Install
 
 From the repository root:

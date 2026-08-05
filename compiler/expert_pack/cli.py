@@ -7,6 +7,7 @@ from typing import Sequence
 
 from .compile import CompileOptions, compile_checkpoint
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE
+from .deepseek_v4 import validate_deepseek_v4_source
 from .errors import ExpertPackError
 from .safetensors import SafeTensorCheckpoint
 from .source_inventory import inspect_source
@@ -45,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="include metadata grouped by tensor name pattern, dtype, and shape",
     )
+    inspect_parser.add_argument(
+        "--contract",
+        choices=("deepseek_v4",),
+        help="apply an exhaustive source-only architecture contract",
+    )
     return parser
 
 
@@ -69,10 +75,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "validate":
             result = validate_container(args.container)
         else:
+            checkpoint = SafeTensorCheckpoint(args.source)
             result = inspect_source(
-                SafeTensorCheckpoint(args.source),
+                checkpoint,
                 include_tensor_groups=args.tensor_groups,
             )
+            if args.contract == "deepseek_v4":
+                result["contract"] = validate_deepseek_v4_source(checkpoint)
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
         return 2

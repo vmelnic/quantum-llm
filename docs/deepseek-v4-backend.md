@@ -1,0 +1,55 @@
+# DeepSeek-V4-Flash backend
+
+DeepSeek-V4-Flash is the next architecture backend, not an input alias for the
+Qwen runtime and not an automatic Expert Pack v1 conversion.
+
+## Pinned source contract
+
+The `deepseek-v4-flash-source-v1` contract validates the complete checkpoint
+before payload decoding begins. It requires a one-to-one partition of every
+tensor name and validates dtype, shape, byte length, layer/expert bounds, the
+CSA compression schedule, MTP namespace, hash-router tensors, and FP4/FP8
+quantization metadata.
+
+Run the read-only gate with:
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler inspect-source `
+  --source C:\path\to\snapshot `
+  --contract deepseek_v4
+```
+
+The pinned checkpoint contract covers:
+
+- 43 transformer layers and one MTP layer;
+- 256 routed experts per layer, top-6 routing, and one shared expert;
+- packed FP4 E2M1 routed weights with UE8M0 block-32 scales;
+- FP8 E4M3 dense/shared matrices with UE8M0 128×128 block scales;
+- CSA compressors/indexers and manifold-constrained hyper-connections;
+- 1,048,576 configured positions.
+
+Passing this gate proves source identity and metadata compatibility. It does
+not prove numeric decoding, model correctness, runtime support, context
+capacity, or throughput.
+
+The pinned revision has passed this gate on the target Windows host: 46 shards,
+69,187 tensors, and 159,609,485,896 tensor bytes formed an exact contract and
+role partition. No payload or source file was changed by the qualification.
+
+## ABI boundary
+
+Expert Pack v1 remains the tested OLMoE/Qwen INT8-per-row format. DeepSeek will
+receive a separate, versioned representation because expanding all compact FP4
+experts to INT8 would increase storage and I/O without benefiting every compute
+tier.
+
+The planned SM86 placement model is:
+
+1. keep the cold expert directory in compact FP4 plus scales on SSD/RAM;
+2. decode only admitted hot experts into a compute-ready RTX 3090 cache;
+3. keep dense/attention state under a separate SM86 ABI;
+4. preserve the compact source representation for future CPU and distributed
+   expert workers.
+
+No full conversion starts until the FP4/UE8M0 decoder, a real expert slice,
+numeric comparison, and output-space estimate pass independently.

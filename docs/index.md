@@ -13,6 +13,7 @@
 | [Roadmap](roadmap.md) | Long-context, performance, and distributed execution phases |
 | [Hybrid execution plan](hybrid-execution-plan.md) | Staged CPU/GPU scheduler implementation and acceptance gates |
 | [Larger-model decision](larger-model-decision.md) | Modern MoE candidates, compatibility gaps, workspace rules, and target selection |
+| [DeepSeek-V4-Flash backend](deepseek-v4-backend.md) | Pinned source contract, quantization boundary, and SM86 placement direction |
 
 The JSON schemas under `schemas/` and the compiler validator are normative for
 Expert Pack. Documentation never overrides executable validation.

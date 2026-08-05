@@ -6,12 +6,14 @@ import struct
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from compiler.expert_pack.adapters import adapt_checkpoint
 from compiler.expert_pack.compile import CompileOptions, compile_checkpoint
 from compiler.expert_pack.constants import EXPERT_HEADER_STRUCT, HEADER_BYTES, PACK_ALIGNMENT
+from compiler.expert_pack.deepseek_v4 import _build_expected, validate_deepseek_v4_source
 from compiler.expert_pack.errors import AdapterError, ValidationError
-from compiler.expert_pack.safetensors import SafeTensorCheckpoint
+from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
 from compiler.expert_pack.util import load_json, sha256_file
 from compiler.expert_pack.validate import validate_container
@@ -220,7 +222,86 @@ def _make_qwen3_next_fixture(root: Path, include_mtp: bool = False) -> None:
     _write_safetensors(root / "model.safetensors", tensors)
 
 
+def _deepseek_v4_config() -> dict[str, object]:
+    ratios = [0, 0]
+    ratios.extend(4 if layer % 2 else 128 for layer in range(1, 42))
+    ratios.append(0)
+    return {
+        "architectures": ["DeepseekV4ForCausalLM"],
+        "model_type": "deepseek_v4",
+        "expert_dtype": "fp4",
+        "hidden_act": "silu",
+        "hidden_size": 4096,
+        "moe_intermediate_size": 2048,
+        "n_routed_experts": 256,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 6,
+        "num_hidden_layers": 43,
+        "num_hash_layers": 3,
+        "num_nextn_predict_layers": 1,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "q_lora_rank": 1024,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "index_head_dim": 128,
+        "index_n_heads": 64,
+        "hc_mult": 4,
+        "vocab_size": 129280,
+        "max_position_embeddings": 1048576,
+        "compress_ratios": ratios,
+        "quantization_config": {
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "quant_method": "fp8",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
+    }
+
+
+def _deepseek_metadata_checkpoint() -> SimpleNamespace:
+    config = _deepseek_v4_config()
+    expected = _build_expected(config, 0)
+    tensors = {}
+    for name, item in expected.items():
+        nbytes = 1
+        for dimension in item.shape:
+            nbytes *= dimension
+        if item.dtype in ("BF16", "F16"):
+            nbytes *= 2
+        elif item.dtype == "F32":
+            nbytes *= 4
+        elif item.dtype in ("I64", "U64", "F64"):
+            nbytes *= 8
+        tensors[name] = TensorInfo(name, "synthetic.safetensors", item.dtype, item.shape, 0, nbytes)
+    return SimpleNamespace(config=config, tensors=tensors)
+
+
 class ExpertPackTests(unittest.TestCase):
+    def test_deepseek_v4_contract_is_byte_exact_and_fail_closed(self) -> None:
+        checkpoint = _deepseek_metadata_checkpoint()
+        result = validate_deepseek_v4_source(checkpoint)
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["tensor_count"], 69187)
+        self.assertEqual(result["tensor_bytes"], 159609485896)
+        self.assertEqual(result["mtp_namespace"], 0)
+
+        removed = checkpoint.tensors.pop("layers.42.ffn.experts.255.w3.scale")
+        with self.assertRaisesRegex(AdapterError, "partition mismatch"):
+            validate_deepseek_v4_source(checkpoint)
+        checkpoint.tensors[removed.name] = removed
+
+        name = "layers.0.ffn.experts.0.w1.weight"
+        original = checkpoint.tensors[name]
+        checkpoint.tensors[name] = TensorInfo(
+            original.name, original.shard, original.dtype, (2048, 2047), original.offset,
+            original.nbytes,
+        )
+        with self.assertRaisesRegex(AdapterError, "metadata mismatch"):
+            validate_deepseek_v4_source(checkpoint)
+
     def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
