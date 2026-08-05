@@ -341,6 +341,25 @@ coupling needed for concurrency, but the existing per-layer directory barriers
 still serialize one request. No single-stream speedup is claimed for this
 slice.
 
+A subsequent barrier-attribution run again emitted token `19923` and executed
+215 layers over five model steps. Wall time inside the model step was 406.708 ms
+and controller advancement was 377.690 ms. The controller partition was:
+
+| synchronized controller interval | total | per layer |
+| --- | ---: | ---: |
+| attention/router host submission | 38.855 ms | 0.181 ms |
+| directory plan, including attention/router drain | 201.041 ms | 0.935 ms |
+| FFN host submission | 11.269 ms | 0.052 ms |
+| directory release, including FFN drain | 126.442 ms | 0.588 ms |
+
+The two drain intervals account for 86.7% of controller time. This measurement
+does not imply that synchronization alone costs 327 ms: it includes the GPU
+work that precedes each barrier. It does prove that the host serializes every
+layer twice and that request streams cannot overlap while the directory uses a
+shared scratch allocation. The next runtime slice is therefore a per-request,
+event-driven directory transaction; GPU-event timings remain necessary before
+choosing the first kernel to replace.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

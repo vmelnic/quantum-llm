@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <string>
 #include <utility>
@@ -112,9 +113,14 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
 DeepSeekDecodeAdvanceResult
 DeepSeekDecodeController::plan_and_execute() noexcept {
   const auto view = request_->layer(current_layer_);
+  const auto plan_started = std::chrono::steady_clock::now();
   auto plan = directory_->pin_or_collect_misses(
       current_layer_, view.ffn_state->expert_indices(),
       view.ffn_state->selection_count(), stream_, true);
+  telemetry_.directory_plan_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - plan_started)
+          .count());
   if (!plan.status.ok()) return fail(std::move(plan.status));
   if (plan.selected_experts.size() != 7U ||
       plan.selected_experts.back() != 256U) {
@@ -164,6 +170,7 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
     return fail({ErrorCode::internal,
                  "DeepSeek directory returned no execution pin"});
 
+  const auto ffn_started = std::chrono::steady_clock::now();
   const auto execute = cpu_groups.empty()
       ? deepseek_ffn_execute(
             {view.ffn_weights, view.ffn_state, directory_->device_entries(),
@@ -174,8 +181,17 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
              request_->streams_b_, request_->streams_a_,
              hybrid_workspace_.get(), cpu_executor_.get(), cpu_groups,
              directory_->experts_per_layer(), stream_});
+  telemetry_.ffn_submit_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - ffn_started)
+          .count());
   if (!execute.ok()) return fail(execute);
+  const auto release_started = std::chrono::steady_clock::now();
   const auto release = directory_->release_pins(pin_id_, stream_);
+  telemetry_.directory_release_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - release_started)
+          .count());
   pin_id_ = 0U;
   if (!release.ok()) return fail(release);
 
@@ -222,6 +238,7 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
     return fail({ErrorCode::invalid_argument,
                  "DeepSeek decode is missing group-start RoPE"});
   }
+  const auto attention_route_started = std::chrono::steady_clock::now();
   const auto attention = deepseek_attention_decode(
       {view.attention_weights, view.attention_state, request_->streams_a_,
        request_->streams_b_,
@@ -233,6 +250,10 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
       {view.ffn_weights, view.ffn_state, request_->streams_b_, token_id_,
        1e-6F, 20U, stream_});
   if (!route.ok()) return fail(route);
+  telemetry_.attention_route_submit_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - attention_route_started)
+          .count());
   return plan_and_execute();
 }
 

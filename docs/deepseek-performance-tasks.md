@@ -25,12 +25,16 @@ one subsystem.
 
 ## P0 — truthful attribution and contracts
 
-- [ ] Add cumulative nanosecond counters for directory planning/release,
-  storage wait, RAM retention copy, H2D admission, routed CUDA, CPU experts,
-  shared FFN, dense attention/state, output head, and whole model steps.
-- [ ] Publish cache hits/misses, bytes, high-water marks, uploader counters,
-  scheduler counters, and stage times through worker `STATS` and the HTTP
-  metrics/model-info surface.
+- [x] Add cumulative nanosecond counters for the whole model step, output head,
+  controller, directory planning/release, storage wait, RAM retention copy,
+  H2D admission, and CPU experts.
+- [ ] Split the two synchronized controller intervals into GPU-event timings
+  for dense attention/router, routed CUDA, shared FFN, and aggregation. The
+  current `directory_plan_ns` and `directory_release_ns` deliberately include
+  those kernels and therefore cannot be added to future device timings.
+- [x] Publish cache hits/misses, bytes, high-water marks, uploader counters,
+  scheduler counters, and existing stage times through worker `STATS` and the
+  HTTP metrics/model-info surface.
 - [ ] Add a reset or delta-snapshot boundary so one request can be attributed
   without restarting the worker.
 - [x] Stop advertising placement prefetch merely because a placement profile
@@ -66,8 +70,18 @@ router output or generated tokens.
 
 - [x] Give every request a persistent non-default CUDA stream and reusable
   hybrid workspace.
-- [ ] Give every request a persistent CUDA event set for asynchronous directory,
-  upload, compute, and release dependencies.
+- [ ] Replace the synchronous directory transaction with one request-owned
+  state machine:
+  1. enqueue route hash, pinning, compact miss metadata, gated FFN, pin release,
+     and a completion event on the request stream;
+  2. return `pending_cuda` without blocking the scheduler thread;
+  3. on a hot route, consume the event and advance directly to the next layer;
+  4. on a miss, expose exact missing and selected IDs, acquire them through the
+     bounded cache pipeline, and resume FFN without recomputing attention;
+  5. retain eviction protection until the last consuming kernel completes.
+- [ ] Give every request a persistent CUDA event set and private directory
+  scratch (hash keys, pin flags, counters, miss IDs, selected IDs). No request
+  may overwrite another request's in-flight planning or release metadata.
 - [x] Precompute bounded RoPE tables or generate RoPE on device; remove the
   synchronous per-step host upload.
 - [ ] Keep directory hit planning on device. Return only compact miss metadata

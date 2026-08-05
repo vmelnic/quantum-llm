@@ -208,6 +208,7 @@ struct Request final {
   std::shared_ptr<er::cuda::DeepSeekRequestState> state;
   std::shared_ptr<er::cuda::DeepSeekDecodeController> controller;
   cudaStream_t stream{};
+  er::cuda::DeepSeekDecodeTelemetry controller_telemetry;
   std::uint32_t predicted{};
   std::uint32_t next_position{};
   std::uint32_t context_limit{};
@@ -226,6 +227,10 @@ struct WorkerTelemetry final {
   std::uint64_t embed_rope_submit_ns{};
   std::uint64_t scheduler_poll_ns{};
   std::uint64_t output_head_ns{};
+  std::uint64_t attention_route_submit_ns{};
+  std::uint64_t directory_plan_ns{};
+  std::uint64_t ffn_submit_ns{};
+  std::uint64_t directory_release_ns{};
   std::uint64_t warm_start_candidates{};
   std::uint64_t warm_start_loaded{};
   std::uint64_t warm_start_bytes{};
@@ -431,6 +436,21 @@ class Model final {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - scheduler_started)
             .count());
+    for (auto* request : requests) {
+      const auto current = request->controller->telemetry();
+      telemetry_.attention_route_submit_ns +=
+          current.attention_route_submit_ns -
+          request->controller_telemetry.attention_route_submit_ns;
+      telemetry_.directory_plan_ns +=
+          current.directory_plan_ns -
+          request->controller_telemetry.directory_plan_ns;
+      telemetry_.ffn_submit_ns +=
+          current.ffn_submit_ns - request->controller_telemetry.ffn_submit_ns;
+      telemetry_.directory_release_ns +=
+          current.directory_release_ns -
+          request->controller_telemetry.directory_release_ns;
+      request->controller_telemetry = current;
+    }
     const auto output_started = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> result(requests.size());
     for (std::size_t index = 0U; index < requests.size(); ++index) {
@@ -742,6 +762,14 @@ int worker_loop(Model& model) {
                   << worker.scheduler_poll_ns
                   << ",\"worker_output_head_ns\":"
                   << worker.output_head_ns
+                  << ",\"worker_attention_route_submit_ns\":"
+                  << worker.attention_route_submit_ns
+                  << ",\"worker_directory_plan_ns\":"
+                  << worker.directory_plan_ns
+                  << ",\"worker_ffn_submit_ns\":"
+                  << worker.ffn_submit_ns
+                  << ",\"worker_directory_release_ns\":"
+                  << worker.directory_release_ns
                   << ",\"worker_warm_start_candidates\":"
                   << worker.warm_start_candidates
                   << ",\"worker_warm_start_loaded\":"

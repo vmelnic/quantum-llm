@@ -66,6 +66,13 @@ struct DeepSeekCpuExpertPlacement final {
 
 struct DeepSeekDecodeControllerResult;
 
+struct DeepSeekDecodeTelemetry final {
+  std::uint64_t attention_route_submit_ns{};
+  std::uint64_t directory_plan_ns{};
+  std::uint64_t ffn_submit_ns{};
+  std::uint64_t directory_release_ns{};
+};
+
 // Executes one layer per advance() call. A cache miss returns control without
 // recomputing attention/router; after the caller publishes the missing experts,
 // advance() replans and resumes the same FFN. Independent directory pin tokens
@@ -95,6 +102,9 @@ class DeepSeekDecodeController final {
     return complete_ ? request_->streams_a_ : nullptr;
   }
   [[nodiscard]] bool active() const noexcept { return active_; }
+  [[nodiscard]] DeepSeekDecodeTelemetry telemetry() const noexcept {
+    return telemetry_;
+  }
   [[nodiscard]] std::uint32_t current_layer() const noexcept {
     return current_layer_;
   }
@@ -127,6 +137,7 @@ class DeepSeekDecodeController final {
   std::shared_ptr<cpu::DeepSeekPackedExecutor> cpu_executor_;
   std::shared_ptr<DeepSeekFfnHybridWorkspace> hybrid_workspace_;
   std::vector<DeepSeekCpuExpertPlacement> cpu_placements_;
+  DeepSeekDecodeTelemetry telemetry_;
   bool active_{};
   bool waiting_for_experts_{};
   bool complete_{};
