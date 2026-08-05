@@ -4,6 +4,7 @@
 #include "expert/runtime/expert_store.hpp"
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
+#include "expert/runtime/placement_profile.hpp"
 #include "expert/runtime/resource_governor.hpp"
 #include "expert/runtime/route_census.hpp"
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
@@ -1367,6 +1368,38 @@ void test_route_census_is_bounded_ranked_and_recoverable() {
   std::filesystem::remove_all(root, cleanup_error);
 }
 
+void test_placement_profile_uses_measurements_and_exact_budgets() {
+  const er::PlacementProfileInput input{
+      {8'000'000.0, 700'000.0, 10.0e9, 6U, 6U, 64U << 20U},
+      {64ULL << 30U, 8ULL << 30U, 4ULL << 30U, 16ULL << 20U, 6U, 1024U},
+      {24ULL << 30U, 8ULL << 30U, 1ULL << 30U, 16ULL << 20U, 7U, 512U},
+      0.25, 64U, 32U};
+  const auto plan = er::solve_placement_profile(input);
+  require(plan.status.ok() && plan.host_expert_slots == 1024U &&
+              plan.host_cache_bytes == (16ULL << 30U) &&
+              plan.device_expert_slots == 512U &&
+              plan.device_cache_bytes == (8ULL << 30U) &&
+              plan.governor.host_budget_bytes == (64ULL << 30U) &&
+              plan.governor.device_budget_bytes == (24ULL << 30U) &&
+              plan.dispatch.initial_cpu_ns_per_selection == 8'000'000.0 &&
+              plan.dispatch.initial_gpu_ns_per_selection == 700'000.0 &&
+              plan.dispatch.initial_h2d_bytes_per_second == 10.0e9,
+          "placement profile did not preserve measurements and hard caps");
+
+  auto insufficient = input;
+  insufficient.device.minimum_expert_slots = 513U;
+  require(!er::solve_placement_profile(insufficient).status.ok(),
+          "placement profile silently reduced a required device minimum");
+  auto unmeasured = input;
+  unmeasured.costs.h2d_sample_bytes = 0U;
+  require(!er::solve_placement_profile(unmeasured).status.ok(),
+          "placement profile accepted an unmeasured transfer cost");
+  auto overcommitted = input;
+  overcommitted.host.fixed_bytes = 61ULL << 30U;
+  require(!er::solve_placement_profile(overcommitted).status.ok(),
+          "placement profile accepted fixed host overcommit");
+}
+
 }  // namespace
 
 int main() {
@@ -1395,6 +1428,7 @@ int main() {
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();
     test_route_census_is_bounded_ranked_and_recoverable();
+    test_placement_profile_uses_measurements_and_exact_budgets();
     std::cout << "expert_runtime_tests: PASS\n";
     return 0;
   } catch (const std::exception& error) {

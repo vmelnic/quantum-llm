@@ -1,3 +1,8 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_decode.hpp"
@@ -12,6 +17,7 @@
 #include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/gather_storage.hpp"
+#include "expert/runtime/placement_profile.hpp"
 #include "expert/runtime/resident_expert_set.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 
@@ -22,6 +28,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -672,10 +679,11 @@ int main(int argc, char** argv) {
     check(cudaEventCreate(&ffn_start), "create FFN start event");
     check(cudaEventCreate(&ffn_stop), "create FFN stop event");
     check(cudaEventRecord(ffn_start), "record FFN start");
+    er::cuda::DeepSeekFfnExecutionTiming ffn_timing;
     const auto ffn_status = er::cuda::deepseek_ffn_execute({
         &oracle_ffn, ffn_state.state.get(), expert_directory->device_entries(),
         device_output + 3U * token_stream_values, device_block_output,
-        257U, nullptr});
+        257U, nullptr, &ffn_timing});
     require(ffn_status.ok(), std::string(ffn_status.message()));
     check(cudaEventRecord(ffn_stop), "record FFN stop");
     check(cudaEventSynchronize(ffn_stop), "synchronize FFN");
@@ -755,6 +763,42 @@ int main(int argc, char** argv) {
     const auto cpu_metrics = cpu_executor.telemetry();
     require(cpu_metrics.workers_used_last == cpu_metrics.maximum_threads,
             "real DeepSeek CPU expert did not engage every logical worker");
+    require(ffn_timing.routed_selections == 6U &&
+                ffn_timing.routed_gpu_ms > 0.0F,
+            "DeepSeek routed GPU timing was not measured");
+
+    void* h2d_host = nullptr;
+    void* h2d_device = nullptr;
+    const auto h2d_record_bytes = cpu_leases.front().bytes().size();
+    check(cudaHostAlloc(&h2d_host, h2d_record_bytes, cudaHostAllocPortable),
+          "allocate DeepSeek H2D profile host buffer");
+    check(cudaMalloc(&h2d_device, h2d_record_bytes),
+          "allocate DeepSeek H2D profile device buffer");
+    std::memcpy(h2d_host, cpu_leases.front().bytes().data(), h2d_record_bytes);
+    check(cudaMemcpy(h2d_device, h2d_host, h2d_record_bytes,
+                     cudaMemcpyHostToDevice),
+          "warm DeepSeek H2D profile transfer");
+    constexpr std::uint32_t h2d_iterations = 8U;
+    check(cudaEventRecord(ffn_start), "record H2D profile start");
+    for (std::uint32_t iteration = 0U; iteration < h2d_iterations;
+         ++iteration) {
+      check(cudaMemcpyAsync(h2d_device, h2d_host, h2d_record_bytes,
+                            cudaMemcpyHostToDevice),
+            "run DeepSeek H2D profile transfer");
+    }
+    check(cudaEventRecord(ffn_stop), "record H2D profile stop");
+    check(cudaEventSynchronize(ffn_stop), "synchronize H2D profile");
+    float h2d_profile_ms = 0.0F;
+    check(cudaEventElapsedTime(&h2d_profile_ms, ffn_start, ffn_stop),
+          "measure DeepSeek H2D profile");
+    require(h2d_profile_ms > 0.0F, "DeepSeek H2D profile measured zero time");
+    const auto h2d_profile_bytes =
+        static_cast<std::uint64_t>(h2d_record_bytes) * h2d_iterations;
+    const auto h2d_profile_bytes_per_second =
+        static_cast<double>(h2d_profile_bytes) * 1000.0 /
+        h2d_profile_ms;
+    check(cudaFree(h2d_device), "free DeepSeek H2D profile device buffer");
+    check(cudaFreeHost(h2d_host), "free DeepSeek H2D profile host buffer");
     float* device_hybrid_output = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_hybrid_output),
                      token_stream_values * sizeof(float)),
@@ -1226,6 +1270,64 @@ int main(int argc, char** argv) {
     std::size_t free_resident = 0U;
     check(cudaMemGetInfo(&free_resident, &total),
           "cudaMemGetInfo resident model");
+    MEMORYSTATUSEX memory_status{};
+    memory_status.dwLength = sizeof(memory_status);
+    require(GlobalMemoryStatusEx(&memory_status) != 0,
+            "GlobalMemoryStatusEx failed during placement profile");
+    const auto cpu_ns_per_selection =
+        std::chrono::duration<double, std::nano>(cpu_stopped - cpu_started)
+            .count() /
+        cpu_route.size();
+    const auto gpu_ns_per_selection =
+        static_cast<double>(ffn_timing.routed_gpu_ms) * 1.0e6 /
+        ffn_timing.routed_selections;
+    const auto host_committed =
+        memory_status.ullTotalPhys - memory_status.ullAvailPhys;
+    const auto host_fixed =
+        host_committed >= full_cache_state.ram_bytes
+            ? host_committed - full_cache_state.ram_bytes
+            : 0U;
+    const auto device_committed = total - free_resident;
+    const auto device_fixed =
+        device_committed >= full_cache_state.vram_bytes
+            ? device_committed - full_cache_state.vram_bytes
+            : 0U;
+    constexpr std::uint64_t host_emergency = 4ULL << 30U;
+    constexpr std::uint64_t device_emergency = 1ULL << 30U;
+    const er::PlacementProfileInput measured_profile{
+        {cpu_ns_per_selection, gpu_ns_per_selection,
+         h2d_profile_bytes_per_second, cpu_route.size(),
+         ffn_timing.routed_selections, h2d_profile_bytes},
+        {memory_status.ullTotalPhys, host_fixed, host_emergency,
+         ffn.front().record.stored_bytes, 6U, 11'008U},
+        {total, device_fixed, device_emergency,
+         ffn.front().record.stored_bytes, 7U, 11'008U},
+        0.125, 256U, 256U};
+    const auto placement_plan =
+        er::solve_placement_profile(measured_profile);
+    require(placement_plan.status.ok() &&
+                placement_plan.host_expert_slots >= 6U &&
+                placement_plan.device_expert_slots >= 7U,
+            std::string(placement_plan.status.message()));
+    er::HybridDispatchPlanner measured_planner(placement_plan.dispatch);
+    std::vector<er::HybridDispatchCandidate> measured_candidates;
+    measured_candidates.reserve(cpu_route.size());
+    for (const auto expert : cpu_route) {
+      measured_candidates.push_back(
+          {expert, 1U, ffn.front().record.stored_bytes,
+           false, true, true});
+    }
+    const auto measured_dispatch = measured_planner.plan(measured_candidates);
+    require(measured_dispatch.status.ok() &&
+                measured_dispatch.decisions.size() == cpu_route.size(),
+            std::string(measured_dispatch.status.message()));
+    const auto measured_cpu_decisions = static_cast<std::uint64_t>(
+        std::count_if(measured_dispatch.decisions.begin(),
+                      measured_dispatch.decisions.end(), [](const auto& item) {
+                        return item.executor == er::HybridExecutor::cpu_local;
+                      }));
+    const auto measured_gpu_decisions =
+        measured_dispatch.decisions.size() - measured_cpu_decisions;
     const auto startup_ms = std::chrono::duration<double, std::milli>(
                                 stopped - started).count();
     std::cout << "{\"ok\":true,\"dense_tensors\":" << model->dense_size()
@@ -1312,6 +1414,27 @@ int main(int argc, char** argv) {
               << scheduler_state.hybrid_layers
               << ",\"scheduler_route_observations\":"
               << scheduler_state.route_observations
+              << ",\"profile_cpu_ns_per_selection\":"
+              << cpu_ns_per_selection
+              << ",\"profile_gpu_ns_per_selection\":"
+              << gpu_ns_per_selection
+              << ",\"profile_h2d_bytes_per_second\":"
+              << h2d_profile_bytes_per_second
+              << ",\"profile_h2d_sample_bytes\":" << h2d_profile_bytes
+              << ",\"profile_host_cache_bytes\":"
+              << placement_plan.host_cache_bytes
+              << ",\"profile_device_cache_bytes\":"
+              << placement_plan.device_cache_bytes
+              << ",\"profile_host_expert_slots\":"
+              << placement_plan.host_expert_slots
+              << ",\"profile_device_expert_slots\":"
+              << placement_plan.device_expert_slots
+              << ",\"profile_dispatch_cpu_decisions\":"
+              << measured_cpu_decisions
+              << ",\"profile_dispatch_gpu_decisions\":"
+              << measured_gpu_decisions
+              << ",\"profile_dispatch_projected_ns\":"
+              << measured_dispatch.projected_critical_ns
               << ",\"controller_resume_max_abs_error\":" << resumed_maximum
               << ",\"full_token_input\":" << full_inputs.front()
               << ",\"full_token_output\":" << full_sampled_token

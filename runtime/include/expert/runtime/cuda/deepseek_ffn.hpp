@@ -90,6 +90,11 @@ struct DeepSeekFfnRouteLaunch final {
 [[nodiscard]] Status deepseek_ffn_route(
     const DeepSeekFfnRouteLaunch& launch) noexcept;
 
+struct DeepSeekFfnExecutionTiming final {
+  float routed_gpu_ms{};
+  std::uint32_t routed_selections{};
+};
+
 struct DeepSeekFfnExecuteLaunch final {
   const DeepSeekFfnBinding* weights{};
   DeepSeekFfnState* state{};
@@ -98,6 +103,7 @@ struct DeepSeekFfnExecuteLaunch final {
   float* updated_streams{}; // [4, 4096]
   std::uint32_t experts_per_layer{257U};
   void* stream{};
+  DeepSeekFfnExecutionTiming* timing{};
 };
 
 // Requires an active directory pin covering state.expert_indices()[0..7).

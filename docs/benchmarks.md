@@ -400,6 +400,16 @@ matched exactly. This proves the scheduler lifecycle and placement boundary;
 the synthetic planner costs used to force the branch are intentionally excluded
 from performance claims.
 
+## DeepSeek measured placement profile
+
+The real-layer qualification now separately measures all-core CPU, routed-only
+CUDA, and pinned compact-record H2D costs. One run produced 9.342 ms per CPU
+expert, 0.543 ms per CUDA expert, and 3.393 GB/s over a 106,954,752-byte H2D
+sample. Seeded with those values, the bounded critical-path solver assigned a
+six-cold-expert RAM fixture as two CPU plus four upload/GPU decisions, projecting
+18.685 ms. This is a placement calibration, not tokens/s, and the fixture does
+not replace an end-to-end cold/warm service gate.
+
 ## Benchmark rules
 
 Any published result must include:

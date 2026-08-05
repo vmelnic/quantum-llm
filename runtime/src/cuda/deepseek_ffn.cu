@@ -206,6 +206,19 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
   if (!status.ok()) return status;
   auto& state = *launch.state;
   const auto layer = launch.weights->layer;
+  cudaEvent_t routed_start{}, routed_stop{};
+  if (launch.timing) {
+    auto error = cudaEventCreate(&routed_start);
+    if (error == cudaSuccess) error = cudaEventCreate(&routed_stop);
+    if (error == cudaSuccess)
+      error = cudaEventRecord(routed_start,
+                              static_cast<cudaStream_t>(launch.stream));
+    if (error != cudaSuccess) {
+      if (routed_stop) static_cast<void>(cudaEventDestroy(routed_stop));
+      if (routed_start) static_cast<void>(cudaEventDestroy(routed_start));
+      return failure(error, "start DeepSeek routed timing");
+    }
+  }
   status = launch_moe_selection_batch({
       state.ffn_input_, state.routing_weights_, state.expert_indices_, nullptr,
       state.routed_intermediate_, state.routed_selection_outputs_,
@@ -213,7 +226,24 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
       state.routed_q_intermediate_, state.routed_q_intermediate_scales_,
       1U, kHidden, kIntermediate, kTopK, launch.experts_per_layer, launch.stream,
       launch.directory_entries, layer, 10.0F, true, true});
-  if (!status.ok()) return status;
+  if (!status.ok()) {
+    if (routed_stop) static_cast<void>(cudaEventDestroy(routed_stop));
+    if (routed_start) static_cast<void>(cudaEventDestroy(routed_start));
+    return status;
+  }
+  if (launch.timing) {
+    auto error = cudaEventRecord(routed_stop,
+                                 static_cast<cudaStream_t>(launch.stream));
+    if (error == cudaSuccess) error = cudaEventSynchronize(routed_stop);
+    if (error == cudaSuccess)
+      error = cudaEventElapsedTime(&launch.timing->routed_gpu_ms,
+                                   routed_start, routed_stop);
+    static_cast<void>(cudaEventDestroy(routed_stop));
+    static_cast<void>(cudaEventDestroy(routed_start));
+    if (error != cudaSuccess)
+      return failure(error, "finish DeepSeek routed timing");
+    launch.timing->routed_selections = kTopK;
+  }
   status = launch_moe_aggregate({
       state.routed_selection_outputs_, nullptr, nullptr, nullptr,
       state.routing_weights_, state.routed_output_, 0U, 1U, kHidden, kTopK,

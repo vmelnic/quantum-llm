@@ -92,8 +92,10 @@ This roadmap records direction, not a compatibility promise.
     one host resolve, and one hybrid layer. A fixed 43×256 route census now
     records completed scheduler routes, derives globally/per-layer bounded warm
     sets, and persists alternating model-bound SHA-256 generations with corrupt-
-    newest fallback. Next feed measured queue/storage/lane costs into placement
-    instead of using forced qualification costs.
+    newest fallback. Routed-only CUDA, all-core CPU, and pinned H2D calibration
+    now seed a fail-closed placement/memory solver; a real profile selected a
+    two-CPU/four-GPU cold split from measured costs. Next publish durable packs
+    and have the production worker own profile lifecycle and online updates.
 
 ## Phase 1 — long-context and cold-path production work
 

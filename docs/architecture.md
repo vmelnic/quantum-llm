@@ -145,6 +145,14 @@ are rejected when the model hash or quantization ABI changes. The complete
 DeepSeek table is about 518 KiB and contains no prompt, token, activation, or
 request identity.
 
+Planner seeds come from a measured placement profile, not family defaults.
+Qualification times only routed CUDA selections, all-core compact CPU experts,
+and pinned H2D transfer, then requires nonzero sample evidence for each. A
+separate fail-closed solver subtracts explicit fixed allocations and emergency
+headroom from operator-approved host/device envelopes and returns whole compact
+expert slots plus the matching memory-governor configuration. Required minima
+are never silently reduced.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full
