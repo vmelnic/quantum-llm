@@ -346,23 +346,27 @@ er::cuda::DeepSeekDecodeRope upload_rope(std::uint32_t position,
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 8 || argc > 10) {
+    if (argc < 8 || argc > 11) {
       std::cerr << "usage: expert-deepseek-model-residency "
                    "<dense-bundle> <typed-bundle> <checkpoint> "
                    "<attention-oracle> <routed-catalog> <io-oracle> "
-                   "<shared-set> [prompt-token-file] [max-new-tokens]\n";
+                   "<shared-set> [prompt-token-file] [max-new-tokens] "
+                   "[host-cache-gib]\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
     const auto prompt = argc >= 9
                             ? std::optional(prompt_tokens(argv[8]))
                             : std::nullopt;
-    const auto max_new_tokens = argc == 10
+    const auto max_new_tokens = argc >= 10
                                     ? static_cast<std::uint32_t>(
                                           std::stoul(argv[9]))
                                     : 1U;
     require(max_new_tokens >= 1U && max_new_tokens <= 16U,
             "max-new-tokens must be in [1,16]");
+    const auto host_cache_gib =
+        argc == 11 ? static_cast<std::uint64_t>(std::stoull(argv[10])) : 0U;
+    require(host_cache_gib <= 48U, "host-cache-gib must be in [0,48]");
     er::DeepSeekExpertCatalog routed_catalog;
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
@@ -835,12 +839,17 @@ int main(int argc, char** argv) {
         4U, 25'167'360U, er::kExpertPackAlignment,
         std::make_shared<er::CudaPinnedAllocator>());
     er::ExpertCacheConfig full_config;
-    full_config.ram = {4ULL * 25'167'360U, 4ULL * 25'167'360U,
-                       25'167'360U};
+    const auto host_cache_bytes = host_cache_gib << 30U;
+    const auto full_ram_bytes =
+        std::max<std::uint64_t>(4ULL * 25'167'360U, host_cache_bytes);
+    const auto full_ram_low = host_cache_bytes == 0U
+                                  ? 25'167'360U
+                                  : host_cache_bytes * 7U / 8U;
+    full_config.ram = {full_ram_bytes, full_ram_bytes, full_ram_low};
     full_config.vram = {shared_hot_bytes + routed_cache_bytes,
                         shared_hot_bytes + routed_cache_bytes,
                         25'198'592U};
-    full_config.retain_host_copy = false;
+    full_config.retain_host_copy = host_cache_bytes != 0U;
     // The complete catalog was SHA-256 authenticated when it was generated
     // from this content-addressed checkpoint snapshot.
     full_config.trusted_immutable_source = true;
@@ -944,6 +953,7 @@ int main(int argc, char** argv) {
     const auto full_token_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - full_started).count();
     std::vector<std::uint32_t> generated_tokens{full_sampled_token};
+    const auto prefill_cache_state = full_cache.telemetry();
     const auto decode_started = std::chrono::steady_clock::now();
     for (std::uint32_t generated = 1U; generated < max_new_tokens;
          ++generated) {
@@ -1114,6 +1124,7 @@ int main(int argc, char** argv) {
               << ",\"full_token_output\":" << full_sampled_token
               << ",\"full_token_ms\":" << full_token_ms
               << ",\"routed_cache_slots\":" << routed_cache_slots
+              << ",\"host_cache_bytes\":" << host_cache_bytes
               << ",\"generated_tokens\":" << generated_tokens.size()
               << ",\"decode_generated_ms\":" << decode_ms
               << ",\"decode_ms_per_token\":"
@@ -1172,6 +1183,13 @@ int main(int argc, char** argv) {
               << full_scheduler_state.acquires_started
               << ",\"full_cache_read_bytes\":"
               << full_cache_state.read_bytes
+              << ",\"decode_cache_read_bytes\":"
+              << (full_cache_state.read_bytes - prefill_cache_state.read_bytes)
+              << ",\"decode_cache_ram_hits\":"
+              << (full_cache_state.acquire_ram_hits -
+                  prefill_cache_state.acquire_ram_hits)
+              << ",\"full_cache_ram_high_water\":"
+              << full_cache_state.ram_high_water
               << ",\"full_cache_uploaded_bytes\":"
               << full_cache_state.uploaded_bytes
               << ",\"full_cache_vram_high_water\":"

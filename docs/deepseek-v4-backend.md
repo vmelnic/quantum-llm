@@ -204,6 +204,15 @@ six selections expanded into transient SM86 INT8 compute slots. Route traces
 remain evidence for admission and prefetch; they are not a hard-coded routing
 oracle.
 
+The first tier is now wired into the full-model runner as a bounded pageable
+RAM cache. `HostCacheGiB` accepts `0…48`, defaults to 32 for prompt runs, and
+uses a 7/8 low watermark while pinned staging remains a separate fixed pool.
+On the same eight-token sequence, a 32 GiB budget reached a 20.40 GB high
+watermark, reduced total source reads from 35.80 GB to 20.40 GB, and recorded
+1,152 decode RAM hits. Post-prefill decode read 7.94 GB and improved from 0.311
+to 0.516 tok/s with identical token IDs. The extra pageable copy increased
+cold prompt time, so this is an L2 placement result, not an SLO pass.
+
 The checkpoint remains authoritative: the qualification bundle now contains
 only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
 expert payload is retained. Extents must cover the compact destination exactly

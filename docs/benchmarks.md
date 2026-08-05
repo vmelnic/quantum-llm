@@ -323,6 +323,13 @@ the compact RAM/VRAM hierarchy described in the DeepSeek backend document; it
 does not justify comparing the diagnostic rate with the qualified Qwen hot
 batch results above.
 
+Enabling the first bounded tier with a 32 GiB pageable RAM budget preserved the
+same eight generated token IDs. Total expert reads fell from 35.80 GB to 20.40
+GB; 7.94 GB occurred after prefill, with 1,152 RAM-cache hits. Decode improved
+from 0.311 to 0.516 tok/s, while the cache high watermark remained 20.40 GB.
+This validates the RAM tier and also shows that repeated H2D plus FP4→INT8
+admission remains far from the latency target.
+
 ## Benchmark rules
 
 Any published result must include:
