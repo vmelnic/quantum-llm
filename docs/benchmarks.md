@@ -311,6 +311,27 @@ Windows desktop.
 
 ## DeepSeek-V4-Flash route trace
 
+### Census-driven warm start
+
+The production worker now consumes its authenticated route census before
+readiness. After one qualified five-token `Hi` path populated 215 routed-layer
+observations, restart selected 864 unique expert-layer records. It loaded
+11,551,113,216 routed bytes in 6.27 seconds and reported the placement state as
+`ready` rather than merely `observing`.
+
+Repeating the same five-token path after a second warm restart produced the
+same token `19923` and completed without a scheduler suspension, routed acquire,
+RAM placement, or CPU placement. The five model steps took 340.886 ms in total,
+or 68.177 ms/model step (14.67 model steps/s). Controller advancement accounted
+for 323.820 ms, scheduler polling for 329.084 ms, and the complete output heads
+for 11.149 ms. These nested counters overlap their parent interval and are not
+summed.
+
+This is a warm, route-repeated model-step result, not a 14.67 tok/s arbitrary
+chat claim. It proves that learned startup residency removes SSD/H2D from a
+known route and also shows that the remaining GPU/controller path still needs
+about a 2.04x reduction to reach a 33.3 ms/model-step target.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

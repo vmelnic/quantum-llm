@@ -70,6 +70,14 @@ cache, two request slots, 4096 context tokens, and a balanced placement policy.
 `placement_prefetch_state=observing` means the worker is collecting route
 evidence only. It does not report prefetch as enabled until a bounded warm-load
 or lookahead consumer is actually active.
+When an authenticated prior census exists, balanced and latency profiles fill
+the bounded RAM tier before worker readiness and report
+`placement_prefetch_state=ready`. Capacity mode deliberately reports
+`disabled`. The warm load is globally bounded by the configured RAM cache and
+uses a per-layer cap so one layer cannot consume the complete tier.
+The first production qualification loaded 864 routed records (11.55 GB) in
+6.27 seconds. A repeated five-step route then used no scheduler suspension and
+took 340.886 ms of worker model-step time while preserving token `19923`.
 
 `STATS`, `/model-info`, and `/metrics` expose cumulative worker attribution.
 The timing counters deliberately describe their measured boundary:

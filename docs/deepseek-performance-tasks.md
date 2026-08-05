@@ -46,10 +46,10 @@ must not imply that a policy is active when it is only collecting evidence.
 
 ## P1 — learned residency and warm start
 
-- [ ] Consume `RouteCensus::stable_warm_set()` at worker startup.
-- [ ] Convert the byte budgets into deterministic per-layer RAM and VRAM warm
+- [x] Consume `RouteCensus::stable_warm_set()` at worker startup.
+- [x] Convert the byte budgets into deterministic per-layer RAM and VRAM warm
   sets while reserving dense, shared, KV, request, staging, and OS headroom.
-- [ ] Bulk-load the selected set with bounded concurrency before declaring the
+- [x] Bulk-load the selected set with bounded concurrency before declaring the
   warm tier ready; allow readiness to distinguish service-ready from warm-ready.
 - [ ] Seed a model-family hot list when no census exists, and replace it with
   measured evidence after a completed workload.

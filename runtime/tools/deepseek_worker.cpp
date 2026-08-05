@@ -227,6 +227,10 @@ struct WorkerTelemetry final {
   std::uint64_t embed_rope_submit_ns{};
   std::uint64_t scheduler_poll_ns{};
   std::uint64_t output_head_ns{};
+  std::uint64_t warm_start_candidates{};
+  std::uint64_t warm_start_loaded{};
+  std::uint64_t warm_start_bytes{};
+  std::uint64_t warm_start_ns{};
 };
 
 class Model final {
@@ -334,6 +338,7 @@ class Model final {
           17U, bundle_.model_hash, er::kExpertQuantAbiDeepSeekSm86,
           43U, 256U, 6U, 4096U});
     }
+    warm_from_census();
     scheduler_ = std::make_unique<er::cuda::DeepSeekDecodeScheduler>(
         er::cuda::DeepSeekDecodeSchedulerConfig{
             17U, capacity_, std::max<std::uint32_t>(6U, capacity_ * 2U),
@@ -470,12 +475,57 @@ class Model final {
   }
   WorkerTelemetry worker_snapshot() const noexcept { return telemetry_; }
   const char* prefetch_state() const noexcept {
-    // A census is persisted, but no warm-load or lookahead consumer is wired
-    // yet. Policy intent is not active data movement.
-    return placement_ == "capacity" ? "disabled" : "observing";
+    if (placement_ == "capacity") return "disabled";
+    return telemetry_.warm_start_loaded == 0U ? "observing" : "ready";
+  }
+  bool prefetch_enabled() const noexcept {
+    return telemetry_.warm_start_loaded != 0U;
   }
 
  private:
+  void warm_from_census() {
+    if (placement_ == "capacity") return;
+    const auto usage = cache_->usage();
+    if (usage.ram_bytes >= ram_bytes_) return;
+    constexpr std::uint64_t routed_record_bytes = 13'369'344U;
+    const auto maximum_entries = static_cast<std::size_t>(
+        (ram_bytes_ - usage.ram_bytes) / routed_record_bytes);
+    if (maximum_entries == 0U) return;
+    const auto maximum_per_layer =
+        (maximum_entries + er::kDeepSeekCatalogLayers - 1U) /
+        er::kDeepSeekCatalogLayers;
+    auto warm = census_->stable_warm_set(maximum_entries, maximum_per_layer);
+    telemetry_.warm_start_candidates = warm.size();
+    if (warm.empty()) return;
+    const auto started = std::chrono::steady_clock::now();
+    // stable_warm_set() is hottest-first. Loading in reverse ensures that, if
+    // the device tier fills, later/hotter entries displace earlier/cooler ones.
+    for (auto item = warm.rbegin(); item != warm.rend(); ++item) {
+      const auto* record = catalog_.find(item->key.layer, item->key.expert);
+      require(record != nullptr, "route census references an absent expert");
+      auto handle = cache_->acquire(item->key, *record);
+      while (handle.wait_for(std::chrono::milliseconds(1)) !=
+             std::future_status::ready) {
+        std::this_thread::yield();
+      }
+      auto acquired = handle.get();
+      require(acquired.status.ok() && acquired.lease,
+              acquired.status.ok() ? "warm start returned no device lease"
+                                   : acquired.status.message());
+      acquired.lease = {};
+      const auto evidence = static_cast<std::uint32_t>(
+          std::min<std::uint64_t>(item->total_selections, 255U));
+      require(cache_->record_access(item->key, std::max(1U, evidence)),
+              "warm-start expert disappeared before heat publication");
+      ++telemetry_.warm_start_loaded;
+      telemetry_.warm_start_bytes += record->stored_bytes;
+    }
+    telemetry_.warm_start_ns = static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+  }
+
   Bundle bundle_;
   std::uint32_t max_context_{}, capacity_{};
   std::uint64_t ram_bytes_{}, vram_bytes_{}, request_bytes_{}, next_operation_{1U};
@@ -530,7 +580,8 @@ int worker_loop(Model& model) {
             << ",\"placement_profile\":\"" << model.placement()
             << "\",\"ram_cache_bytes\":" << model.ram_bytes()
             << ",\"vram_cache_bytes\":" << model.vram_bytes()
-            << ",\"placement_prefetch_enabled\":false"
+            << ",\"placement_prefetch_enabled\":"
+            << (model.prefetch_enabled() ? "true" : "false")
             << ",\"placement_prefetch_state\":\""
             << model.prefetch_state() << '\"'
             << ",\"placement_minimum_observations\":"
@@ -641,6 +692,14 @@ int worker_loop(Model& model) {
                   << worker.scheduler_poll_ns
                   << ",\"worker_output_head_ns\":"
                   << worker.output_head_ns
+                  << ",\"worker_warm_start_candidates\":"
+                  << worker.warm_start_candidates
+                  << ",\"worker_warm_start_loaded\":"
+                  << worker.warm_start_loaded
+                  << ",\"worker_warm_start_bytes\":"
+                  << worker.warm_start_bytes
+                  << ",\"worker_warm_start_ns\":"
+                  << worker.warm_start_ns
                   << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
         require(fields.size() == 4U, "invalid BEGIN");

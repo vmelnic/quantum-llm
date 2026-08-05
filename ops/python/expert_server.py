@@ -193,8 +193,10 @@ class CudaWorker:
                 self.placement_profile != placement_profile or
                 self.ram_cache_bytes != ram_cache_gib << 30 or
                 self.vram_cache_bytes != vram_cache_gib << 30 or
-                self.placement_prefetch_enabled or
-                self.placement_prefetch_state not in {"disabled", "observing"} or
+                self.placement_prefetch_state not in
+                    {"disabled", "observing", "ready"} or
+                self.placement_prefetch_enabled !=
+                    (self.placement_prefetch_state == "ready") or
                 (placement_profile == "capacity" and
                  self.placement_prefetch_state != "disabled") or
                 self.placement_minimum_observations != expected_observations):
