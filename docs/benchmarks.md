@@ -35,6 +35,28 @@ well below the throughput target. This result establishes the complete
 attention/router/cache/MoE/HCA execution contract and locates the next compute
 boundary. It is not a full-model tokens/s claim.
 
+### First complete chat prompt
+
+The official DeepSeek encoder turns `Hi` into five input tokens. A single
+request retained its KV/compressed-attention state while executing all 43
+layers at every position, then projected 129,280 logits. The result was:
+
+| Measurement | Result |
+|---|---:|
+| prompt tokens | 5 |
+| layer advances | 430 (suspend + resume) |
+| routed acquisitions | 1,286 |
+| prompt decode | 19.91 s |
+| average prompt decode | 3.98 s/token |
+| greedy token | 19,923 (`Hello`) |
+
+This proves end-to-end checkpoint execution and tokenizer compatibility; it
+does not meet the throughput SLO. The 64-entry global routed cache used about
+10.7 GB total VRAM during execution and released back to the normal driver
+baseline after exit. A larger seven-routed-slots-per-layer policy was rejected:
+route turnover forced costly allocation and FP8-to-INT8 admission churn and did
+not complete the five-token prompt within five minutes.
+
 The separate uncompressed layer-0 gate exercises the checkpoint's
 `compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
 the full block matched its independent oracle with RMSE `3.55e-5` and maximum

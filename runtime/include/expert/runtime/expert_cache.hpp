@@ -84,6 +84,9 @@ struct ExpertCacheConfig final {
   TierBudget vram;
   bool retain_host_copy{true};
   CachePlacementConfig placement;
+  // Safe only after a complete catalog has authenticated an immutable source.
+  // Geometry and ABI validation remain mandatory on every admission.
+  bool trusted_immutable_source{false};
 };
 
 class ExpertLease final {

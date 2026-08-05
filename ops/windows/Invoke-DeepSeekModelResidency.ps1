@@ -3,7 +3,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Snapshot,
     [string]$RoutedCatalog,
-    [ValidateSet(0, 2)][int]$OracleLayer = 2
+    [ValidateSet(0, 2)][int]$OracleLayer = 2,
+    [string]$Prompt
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -20,6 +21,7 @@ $dense = Join-Path $bundle "dense"
 $typed = Join-Path $bundle "typed"
 $oracle = Join-Path $bundle "attention-oracle"
 $ioOracle = Join-Path $bundle "io-oracle"
+$shared = Join-Path $bundle "shared"
 $catalog = if ($RoutedCatalog) {
     [System.IO.Path]::GetFullPath($RoutedCatalog)
 } else {
@@ -48,13 +50,33 @@ try {
     & $python.Source -m compiler export-deepseek-io-oracle --source $source `
         --output $ioOracle | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek I/O oracle export failed" }
-    $nativeRaw = & $executable $dense $typed $source $oracle $catalog `
-        $ioOracle | Out-String
+    & $python.Source -m compiler export-deepseek-shared-set --source $source `
+        --output $shared | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DeepSeek shared-set export failed" }
+    $nativeArguments = @($dense, $typed, $source, $oracle, $catalog,
+        $ioOracle, $shared)
+    $promptTokens = $null
+    if ($Prompt) {
+        $promptTokens = Join-Path $bundle "prompt-tokens.txt"
+        & $python.Source (Join-Path $script:RepoRoot `
+            "ops\python\deepseek_prompt_codec.py") --snapshot $source encode `
+            --prompt $Prompt --thinking-mode chat --output $promptTokens | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "DeepSeek prompt encoding failed" }
+        $nativeArguments += $promptTokens
+    }
+    $nativeRaw = & $executable @nativeArguments | Out-String
     if ($LASTEXITCODE -ne 0) {
         Write-Output $nativeRaw
         throw "DeepSeek model residency failed"
     }
     $native = $nativeRaw | ConvertFrom-Json
+    if ($Prompt) {
+        $decoded = & $python.Source (Join-Path $script:RepoRoot `
+            "ops\python\deepseek_prompt_codec.py") --snapshot $source decode `
+            --tokens ([string]$native.full_token_output) | ConvertFrom-Json
+        $native | Add-Member -NotePropertyName generated_text `
+            -NotePropertyValue $decoded.text
+    }
     $result = [PSCustomObject]@{
         schema_version = 1
         model_id = $ModelId

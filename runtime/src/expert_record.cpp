@@ -160,7 +160,7 @@ ExpertRecordValidation validate_expert_record(
 
 ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& key,
-    const PayloadRecord& expected) noexcept {
+    const PayloadRecord& expected, bool verify_payload_sha256) noexcept {
   if (key.quant_abi == kExpertQuantAbiInt8PerRow &&
       expected.source_abi == kExpertSourceAbiExpertPackV1) {
     const auto validated = validate_expert_record(bytes, key, expected);
@@ -185,7 +185,8 @@ ExpertAdmissionValidation validate_expert_admission(
     return admission_failure(ErrorCode::checksum_mismatch,
                              "DeepSeek compact admission geometry mismatch");
   }
-  if (!constant_time_equal(sha256(bytes), expected.payload_sha256)) {
+  if (verify_payload_sha256 &&
+      !constant_time_equal(sha256(bytes), expected.payload_sha256)) {
     return admission_failure(ErrorCode::checksum_mismatch,
                              "DeepSeek compact payload SHA-256 mismatch");
   }

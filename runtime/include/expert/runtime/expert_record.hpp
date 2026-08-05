@@ -74,6 +74,7 @@ struct ExpertRecordValidation final {
 // or a compact DeepSeek staging payload and returns the exact device target.
 [[nodiscard]] ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& expected_key,
-    const PayloadRecord& expected_record) noexcept;
+    const PayloadRecord& expected_record,
+    bool verify_payload_sha256 = true) noexcept;
 
 }  // namespace expert::runtime

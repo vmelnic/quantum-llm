@@ -26,6 +26,8 @@
 #include <iostream>
 #include <cmath>
 #include <memory>
+#include <numbers>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -203,6 +205,40 @@ std::vector<er::ResidentExpertSpec> ffn_specs(
   return result;
 }
 
+std::vector<er::ResidentExpertSpec> shared_specs(
+    const std::filesystem::path& root,
+    const std::filesystem::path& source_root) {
+  std::ifstream input(root / "shared-set.tsv");
+  std::string line;
+  require(static_cast<bool>(std::getline(input, line)) &&
+              line == "deepseek-shared-residency-v1",
+          "invalid shared residency header");
+  std::vector<er::ResidentExpertSpec> result;
+  while (std::getline(input, line)) {
+    const auto item = fields(line);
+    require(item.size() == 4U, "invalid shared residency row");
+    const auto layer = static_cast<std::uint32_t>(std::stoul(item[0]));
+    const auto bytes = std::stoull(item[1]);
+    require(layer == result.size() && layer < 43U && bytes == 25'167'360ULL,
+            "shared residency geometry is not canonical");
+    er::PayloadRecord record;
+    record.extents = extents(root / relative(item[3]), source_root, 6U);
+    record.stored_bytes = bytes;
+    record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
+    record.device_bytes = 25'198'592ULL;
+    record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
+    record.alignment = er::kExpertPackAlignment;
+    record.header_bytes = 0U;
+    record.payload_sha256 = digest(item[2]);
+    result.push_back({{17U, layer, 256U,
+                       er::kExpertQuantAbiDeepSeekSm86},
+                      std::move(record)});
+  }
+  require(input.eof() && result.size() == 43U,
+          "shared residency set is incomplete");
+  return result;
+}
+
 std::vector<float> floats(const std::filesystem::path& path,
                           std::size_t expected) {
   std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -237,21 +273,95 @@ std::uint32_t compression_ratio(std::uint32_t layer) {
   return layer % 2U == 0U ? 4U : 128U;
 }
 
+std::vector<std::uint32_t> prompt_tokens(
+    const std::filesystem::path& path) {
+  std::ifstream input(path);
+  std::vector<std::uint32_t> result;
+  std::uint64_t token = 0U;
+  while (input >> token) {
+    require(token < 129280U, "prompt token is outside vocabulary");
+    result.push_back(static_cast<std::uint32_t>(token));
+  }
+  require(input.eof() && !result.empty(), "prompt token file is invalid");
+  return result;
+}
+
+std::array<float, 32U> rope_values(std::uint32_t position, bool sine,
+                                   bool compressed) {
+  std::array<float, 32U> result{};
+  constexpr double dimension = 64.0;
+  constexpr double factor = 16.0;
+  constexpr double original_context = 65536.0;
+  constexpr double beta_fast = 32.0;
+  constexpr double beta_slow = 1.0;
+  const double base = compressed ? 160000.0 : 10000.0;
+  const auto correction = [&](double rotations) {
+    return dimension * std::log(original_context /
+                                (rotations * 2.0 * std::numbers::pi)) /
+           (2.0 * std::log(base));
+  };
+  const double low = std::clamp(std::floor(correction(beta_fast)), 0.0, 31.0);
+  const double high = std::clamp(std::ceil(correction(beta_slow)), 0.0, 31.0);
+  for (std::size_t index = 0U; index < result.size(); ++index) {
+    double frequency = std::pow(base, -(2.0 * index) / dimension);
+    if (compressed) {
+      const double ramp = std::clamp(
+          (static_cast<double>(index) - low) / std::max(high - low, 1e-3),
+          0.0, 1.0);
+      const double smooth = 1.0 - ramp;
+      frequency = frequency / factor * (1.0 - smooth) + frequency * smooth;
+    }
+    const double angle = static_cast<double>(position) * frequency;
+    result[index] = static_cast<float>(sine ? std::sin(angle) : std::cos(angle));
+  }
+  return result;
+}
+
+er::cuda::DeepSeekDecodeRope upload_rope(std::uint32_t position,
+                                         float* device) {
+  std::array<std::array<float, 32U>, 8U> values{};
+  values[0] = rope_values(position, false, false);
+  values[1] = rope_values(position, true, false);
+  values[2] = rope_values(position, false, true);
+  values[3] = rope_values(position, true, true);
+  const auto ratio_four_start = position + 1U >= 4U
+                                    ? position + 1U - 4U
+                                    : 0U;
+  const auto ratio_128_start = position + 1U >= 128U
+                                  ? position + 1U - 128U
+                                  : 0U;
+  values[4] = rope_values(ratio_four_start, false, true);
+  values[5] = rope_values(ratio_four_start, true, true);
+  values[6] = rope_values(ratio_128_start, false, true);
+  values[7] = rope_values(ratio_128_start, true, true);
+  check(cudaMemcpy(device, values.data(), sizeof(values),
+                   cudaMemcpyHostToDevice), "upload DeepSeek RoPE");
+  return {device + 0U * 32U, device + 1U * 32U,
+          device + 2U * 32U, device + 3U * 32U,
+          device + 4U * 32U, device + 5U * 32U,
+          device + 6U * 32U, device + 7U * 32U};
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 7) {
+    if (argc != 8 && argc != 9) {
       std::cerr << "usage: expert-deepseek-model-residency "
                    "<dense-bundle> <typed-bundle> <checkpoint> "
-                   "<attention-oracle> <routed-catalog> <io-oracle>\n";
+                   "<attention-oracle> <routed-catalog> <io-oracle> "
+                   "<shared-set> [prompt-token-file]\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
+    const auto prompt = argc == 9
+                            ? std::optional(prompt_tokens(argv[8]))
+                            : std::nullopt;
     er::DeepSeekExpertCatalog routed_catalog;
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
     require(catalog_status.ok(), std::string(catalog_status.message()));
+    const auto all_shared = shared_specs(argv[7], source);
     std::uint64_t dense_source = 0U, dense_device = 0U, maximum_dense = 0U;
     std::uint64_t typed_source = 0U;
     const auto dense = dense_specs(argv[1], source, dense_source, dense_device,
@@ -708,6 +818,92 @@ int main(int argc, char** argv) {
     }
     require(resumed_maximum < 1e-2F,
             "resumed decode controller exceeds block oracle tolerance");
+
+    constexpr std::uint64_t shared_hot_bytes = 43ULL * 25'198'592U;
+    constexpr std::uint64_t routed_cache_bytes = 64ULL * 25'198'592U;
+    auto full_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
+        17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 64U);
+    auto full_buffers = std::make_shared<er::FixedBufferPool>(
+        4U, 25'167'360U, er::kExpertPackAlignment,
+        std::make_shared<er::CudaPinnedAllocator>());
+    er::ExpertCacheConfig full_config;
+    full_config.ram = {4ULL * 25'167'360U, 4ULL * 25'167'360U,
+                       25'167'360U};
+    full_config.vram = {shared_hot_bytes + routed_cache_bytes,
+                        shared_hot_bytes + routed_cache_bytes,
+                        25'198'592U};
+    full_config.retain_host_copy = false;
+    // The complete catalog was SHA-256 authenticated when it was generated
+    // from this content-addressed checkpoint snapshot.
+    full_config.trusted_immutable_source = true;
+    er::ExpertCache full_cache(full_config, expert_storage, expert_uploader,
+                               full_buffers, full_directory);
+    er::ResidentExpertSet full_shared;
+    auto full_status = er::ResidentExpertSet::load(
+        full_cache, all_shared, full_shared);
+    require(full_status.ok() && full_shared.size() == 43U,
+            std::string(full_status.message()));
+    auto full_request = er::cuda::create_deepseek_request_state(
+        model, {4096U, request_size.total_bytes});
+    require(full_request.status.ok() && full_request.state,
+            std::string(full_request.status.message()));
+    auto full_controller = er::cuda::create_deepseek_decode_controller(
+        full_request.state, full_directory, nullptr);
+    require(full_controller.status.ok() && full_controller.controller,
+            std::string(full_controller.status.message()));
+    er::cuda::DeepSeekDecodeScheduler full_scheduler(
+        {17U, 1U, 4U, 1U}, full_cache, routed_catalog);
+    float* full_rope = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&full_rope),
+                     8U * 32U * sizeof(float)),
+          "allocate full-model RoPE");
+    const std::vector<std::uint32_t> full_inputs =
+        prompt ? *prompt : std::vector<std::uint32_t>{42U};
+    const auto full_started = std::chrono::steady_clock::now();
+    const auto full_deadline = full_started + std::chrono::minutes(5);
+    for (std::uint32_t position = 0U; position < full_inputs.size(); ++position) {
+      const auto token = full_inputs[position];
+      full_status = full_request.state->embed(token);
+      require(full_status.ok(), std::string(full_status.message()));
+      const auto request_id = 2U + position;
+      full_status = full_scheduler.submit(
+          request_id, full_controller.controller,
+          {full_request.state->current_streams(), upload_rope(position, full_rope),
+           position, token, 0U, 43U});
+      require(full_status.ok(), std::string(full_status.message()));
+      for (;;) {
+        full_status = full_scheduler.poll();
+        require(full_status.ok(), std::string(full_status.message()));
+        const auto scheduled = full_scheduler.inspect(request_id);
+        require(scheduled.has_value(), "full DeepSeek request disappeared");
+        if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
+          break;
+        require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
+                    scheduled->state !=
+                        er::cuda::DeepSeekScheduledState::cancelled,
+                std::string(scheduled->status.message()));
+        require(std::chrono::steady_clock::now() < full_deadline,
+                "full DeepSeek prompt timed out");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      full_status = full_scheduler.retire(request_id);
+      require(full_status.ok(), std::string(full_status.message()));
+    }
+    full_status = full_request.state->project_logits();
+    require(full_status.ok(), std::string(full_status.message()));
+    check(cudaDeviceSynchronize(), "synchronize full DeepSeek token");
+    std::uint32_t full_sampled_token = 0U;
+    check(cudaMemcpy(&full_sampled_token, full_request.state->sampled_token(),
+                     sizeof(full_sampled_token), cudaMemcpyDeviceToHost),
+          "copy full DeepSeek sampled token");
+    require(full_sampled_token < 129280U,
+            "full DeepSeek token is outside vocabulary");
+    const auto full_scheduler_state = full_scheduler.snapshot();
+    require(full_scheduler_state.completed_requests == full_inputs.size() &&
+                full_scheduler_state.layer_advances >= 43U * full_inputs.size(),
+            "full DeepSeek scheduler did not complete every layer");
+    const auto full_token_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - full_started).count();
     double squared = 0.0;
     float maximum = 0.0F;
     std::array<float, decode_tokens> token_maximum{};
@@ -784,6 +980,20 @@ int main(int argc, char** argv) {
               << scheduler_peak_acquires
               << ",\"scheduler_peak_leases\":" << scheduler_peak_leases
               << ",\"controller_resume_max_abs_error\":" << resumed_maximum
+              << ",\"full_token_input\":" << full_inputs.front()
+              << ",\"full_token_output\":" << full_sampled_token
+              << ",\"full_token_ms\":" << full_token_ms
+              << ",\"prompt_tokens\":" << full_inputs.size()
+              << ",\"prompt_token_ids\":[";
+    for (std::size_t index = 0U; index < full_inputs.size(); ++index) {
+      if (index != 0U) std::cout << ',';
+      std::cout << full_inputs[index];
+    }
+    std::cout << "]"
+              << ",\"full_token_layer_advances\":"
+              << full_scheduler_state.layer_advances
+              << ",\"full_token_cold_acquires\":"
+              << full_scheduler_state.acquires_started
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

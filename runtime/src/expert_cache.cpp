@@ -633,7 +633,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       Telemetry::add(metrics.validated_ram_reuses_);
     } else {
       const auto validated =
-          validate_expert_admission(bytes, entry->key, entry->record);
+          validate_expert_admission(bytes, entry->key, entry->record,
+                                    !config.trusted_immutable_source);
       Telemetry::add(metrics.record_validations_);
       if (!validated.status.ok()) {
         {

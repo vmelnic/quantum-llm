@@ -584,6 +584,24 @@ Request-owned I/O state expands one embedding row into four streams, applies
 the official BF16 boundaries around HC collapse/final RMSNorm, projects all
 129,280 logits, and computes greedy argmax. Against a bounded independent
 oracle, embedding was bit-exact, logits had `6.89e-7` RMSE and `5.72e-6`
-maximum error, and argmax matched token 65,270. The remaining full-model
-boundary is tokenizer integration, a token-level controller that joins this
-front/back path to `[0,43)`, and the HTTP worker—not expert orchestration.
+maximum error, and argmax matched token 65,270.
+
+The native token loop now joins that front/back path to all 43 layers while
+retaining request-owned attention state across prompt positions. The launcher
+uses the checkpoint's official `encoding/encoding_dsv4.py` codec and
+`tokenizer.json`; it does not approximate the chat format. RoPE is generated
+per position for base, YaRN-compressed, ratio-four group-start, and ratio-128
+group-start coordinates.
+
+The first real chat prompt, `Hi`, encoded to the official five-token sequence
+`[0, 128803, 23166, 128804, 128822]`. The runtime consumed all five positions,
+executed 43 layers per position, projected the complete vocabulary, and
+greedily produced token `19923`, which decodes to `Hello`. The complete prompt
+decode took 19.91 seconds on the qualification host.
+
+The serving boundary is still incomplete: this runner currently exposes one
+generated token as a qualification path, not a persistent HTTP worker. Cold
+expert admission also remains the dominant cost. A 43-partition cache was
+rejected after it caused severe allocation/admission churn on changing routes;
+the bounded global 64-expert window completed the same prompt more than 15×
+faster. Persistent compute-ready expert packs are the next cold-path boundary.

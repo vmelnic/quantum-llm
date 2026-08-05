@@ -39,12 +39,14 @@ Status DeepSeekDecodeController::begin(
     return {ErrorCode::invalid_argument, "invalid DeepSeek decode begin"};
   }
   const auto stream = static_cast<cudaStream_t>(stream_);
-  const auto status = cuda_status(
-      cudaMemcpyAsync(request_->streams_a_, launch.input_streams,
-                      kStreamValues * sizeof(float), cudaMemcpyDeviceToDevice,
-                      stream),
-      "copy DeepSeek input streams");
-  if (!status.ok()) return status;
+  if (launch.input_streams != request_->streams_a_) {
+    const auto status = cuda_status(
+        cudaMemcpyAsync(request_->streams_a_, launch.input_streams,
+                        kStreamValues * sizeof(float), cudaMemcpyDeviceToDevice,
+                        stream),
+        "copy DeepSeek input streams");
+    if (!status.ok()) return status;
+  }
   rope_ = launch.rope;
   position_ = launch.position;
   token_id_ = launch.token_id;

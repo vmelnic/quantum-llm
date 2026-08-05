@@ -35,8 +35,14 @@ This roadmap records direction, not a compatibility promise.
 9. ~~Add embedding, output head, and greedy sampling.~~ The request-owned I/O
    state reuses resident typed weights, is included in preflight accounting,
    and matches an independent full-vocabulary oracle.
-10. Add tokenizer integration, a token-level `[0,43)` controller, and the HTTP
-    worker boundary for DeepSeek.
+10. ~~Add official tokenizer integration and a token-level `[0,43)`
+    controller.~~ A five-token real chat prompt now preserves state across all
+    layers and produces the expected decoded response boundary. Extend it to
+    multi-token generation and connect the persistent HTTP worker.
+11. Replace miss-time FP8-to-INT8 conversion/allocation with persistent
+    compute-ready expert packs. The attempted per-layer VRAM cache regressed
+    badly under route turnover and was removed; the bounded global cache is the
+    qualified baseline.
 
 ## Phase 1 — long-context and cold-path production work
 
