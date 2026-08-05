@@ -629,3 +629,9 @@ allocations plus 795 slot reuses without changing output or materially changing
 latency. The recycler capacity is supplied by placement policy rather than
 being inferred from total model size, so metadata and storage remain bounded
 for substantially larger models.
+
+Autoregressive execution now continues after the first sampled token and
+reports TTFT separately from decode latency. In the first two-token run, the
+second token took 3.83 seconds and triggered 258 new routed acquisitions,
+exactly six per layer. This establishes that global LRU/LFU turnover, rather
+than request-state reconstruction, dominates current single-stream decode.

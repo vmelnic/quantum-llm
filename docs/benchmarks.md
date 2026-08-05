@@ -75,6 +75,16 @@ warm run, so the change is throughput-neutral at this cache size. Its value is
 bounded allocator behavior and enabling a larger active set without repeating
 the allocation storm; it is not reported as a tokens/s gain.
 
+### First autoregressive decode token
+
+The controller was extended past TTFT while retaining all 43 layers of
+attention, HCA, and KV state. Feeding the sampled `Hello` token back into the
+model produced token ID 3 next. That complete decode step took 3.83 seconds
+(`0.261 tok/s`) and added exactly 258 routed acquisitions: six misses in every
+layer. This is the real single-stream inter-token baseline, not prompt
+throughput. It proves that the 64-slot global cache loses the entire previous
+token's routed working set before traversal returns to the same layer.
+
 The separate uncompressed layer-0 gate exercises the checkpoint's
 `compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
 the full block matched its independent oracle with RMSE `3.55e-5` and maximum

@@ -39,8 +39,10 @@ This roadmap records direction, not a compatibility promise.
     controller.~~ A five-token real chat prompt now preserves state across all
     layers and produces the expected decoded response boundary. Layer-major
     prefill reduced that prompt from 19.91 to 3.74 seconds without changing the
-    output. Add grouped multi-row kernels, multi-token generation, and the
-    persistent HTTP worker.
+    output. Multi-token autoregressive state is now functional; its first real
+    decode measurement is 0.261 tok/s because all 258 routed selections miss
+    the 64-slot global cache. Add grouped multi-row kernels and the persistent
+    HTTP worker.
 11. ~~Publish a resumable compact routed-expert pack.~~ The 147.17 GB artifact
     contains 43 aligned layer shards and preserves all 11,008 authenticated
     FP4 records. It reduced a warm five-token prompt from 3.74 to 3.61 seconds,

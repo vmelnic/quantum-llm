@@ -346,17 +346,23 @@ er::cuda::DeepSeekDecodeRope upload_rope(std::uint32_t position,
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 8 && argc != 9) {
+    if (argc < 8 || argc > 10) {
       std::cerr << "usage: expert-deepseek-model-residency "
                    "<dense-bundle> <typed-bundle> <checkpoint> "
                    "<attention-oracle> <routed-catalog> <io-oracle> "
-                   "<shared-set> [prompt-token-file]\n";
+                   "<shared-set> [prompt-token-file] [max-new-tokens]\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
-    const auto prompt = argc == 9
+    const auto prompt = argc >= 9
                             ? std::optional(prompt_tokens(argv[8]))
                             : std::nullopt;
+    const auto max_new_tokens = argc == 10
+                                    ? static_cast<std::uint32_t>(
+                                          std::stoul(argv[9]))
+                                    : 1U;
+    require(max_new_tokens >= 1U && max_new_tokens <= 16U,
+            "max-new-tokens must be in [1,16]");
     er::DeepSeekExpertCatalog routed_catalog;
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
@@ -820,7 +826,9 @@ int main(int argc, char** argv) {
             "resumed decode controller exceeds block oracle tolerance");
 
     constexpr std::uint64_t shared_hot_bytes = 43ULL * 25'198'592U;
-    constexpr std::uint64_t routed_cache_bytes = 64ULL * 25'198'592U;
+    constexpr std::uint64_t routed_cache_slots = 64U;
+    constexpr std::uint64_t routed_cache_bytes =
+        routed_cache_slots * 25'198'592U;
     auto full_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
         17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 64U);
     auto full_buffers = std::make_shared<er::FixedBufferPool>(
@@ -923,15 +931,62 @@ int main(int argc, char** argv) {
           "copy full DeepSeek sampled token");
     require(full_sampled_token < 129280U,
             "full DeepSeek token is outside vocabulary");
+    const auto full_token_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - full_started).count();
+    std::vector<std::uint32_t> generated_tokens{full_sampled_token};
+    const auto decode_started = std::chrono::steady_clock::now();
+    for (std::uint32_t generated = 1U; generated < max_new_tokens;
+         ++generated) {
+      const auto position = static_cast<std::uint32_t>(full_inputs.size()) +
+                            generated - 1U;
+      const auto token = generated_tokens.back();
+      full_status = full_request.state->embed(token);
+      require(full_status.ok(), std::string(full_status.message()));
+      const auto request_id =
+          2U + 43ULL * full_inputs.size() + generated;
+      full_status = full_scheduler.submit(
+          request_id, full_controller.controller,
+          {full_request.state->current_streams(),
+           upload_rope(position, full_rope), position, token, 0U, 43U});
+      require(full_status.ok(), std::string(full_status.message()));
+      for (;;) {
+        full_status = full_scheduler.poll();
+        require(full_status.ok(), std::string(full_status.message()));
+        const auto scheduled = full_scheduler.inspect(request_id);
+        require(scheduled.has_value(), "generated DeepSeek request disappeared");
+        if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
+          break;
+        require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
+                    scheduled->state !=
+                        er::cuda::DeepSeekScheduledState::cancelled,
+                std::string(scheduled->status.message()));
+        require(std::chrono::steady_clock::now() < full_deadline,
+                "DeepSeek generation timed out");
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+      }
+      full_status = full_scheduler.retire(request_id);
+      require(full_status.ok(), std::string(full_status.message()));
+      full_status = full_request.state->project_logits();
+      require(full_status.ok(), std::string(full_status.message()));
+      check(cudaDeviceSynchronize(), "synchronize generated DeepSeek token");
+      std::uint32_t sampled = 0U;
+      check(cudaMemcpy(&sampled, full_request.state->sampled_token(),
+                       sizeof(sampled), cudaMemcpyDeviceToHost),
+            "copy generated DeepSeek token");
+      require(sampled < 129280U,
+              "generated DeepSeek token is outside vocabulary");
+      generated_tokens.push_back(sampled);
+    }
+    const auto decode_ms = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - decode_started).count();
     const auto full_scheduler_state = full_scheduler.snapshot();
     const auto full_cache_state = full_cache.telemetry();
     const auto full_upload_state = full_uploader->telemetry();
     require(full_scheduler_state.completed_requests ==
-                43U * full_inputs.size() &&
-                full_scheduler_state.layer_advances >= 43U * full_inputs.size(),
+                43U * full_inputs.size() + max_new_tokens - 1U &&
+                full_scheduler_state.layer_advances >=
+                    43U * (full_inputs.size() + max_new_tokens - 1U),
             "full DeepSeek scheduler did not complete every layer");
-    const auto full_token_ms = std::chrono::duration<double, std::milli>(
-        std::chrono::steady_clock::now() - full_started).count();
     double squared = 0.0;
     float maximum = 0.0F;
     std::array<float, decode_tokens> token_maximum{};
@@ -1011,6 +1066,23 @@ int main(int argc, char** argv) {
               << ",\"full_token_input\":" << full_inputs.front()
               << ",\"full_token_output\":" << full_sampled_token
               << ",\"full_token_ms\":" << full_token_ms
+              << ",\"routed_cache_slots\":" << routed_cache_slots
+              << ",\"generated_tokens\":" << generated_tokens.size()
+              << ",\"decode_generated_ms\":" << decode_ms
+              << ",\"decode_ms_per_token\":"
+              << (generated_tokens.size() > 1U
+                      ? decode_ms / (generated_tokens.size() - 1U)
+                      : 0.0)
+              << ",\"decode_tokens_per_second\":"
+              << (generated_tokens.size() > 1U && decode_ms > 0.0
+                      ? 1000.0 * (generated_tokens.size() - 1U) / decode_ms
+                      : 0.0)
+              << ",\"generated_token_ids\":[";
+    for (std::size_t index = 0U; index < generated_tokens.size(); ++index) {
+      if (index != 0U) std::cout << ',';
+      std::cout << generated_tokens[index];
+    }
+    std::cout << "]"
               << ",\"prompt_tokens\":" << full_inputs.size()
               << ",\"prompt_token_ids\":[";
     for (std::size_t index = 0U; index < full_inputs.size(); ++index) {

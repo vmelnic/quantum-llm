@@ -4,7 +4,8 @@ param(
     [string]$Snapshot,
     [string]$RoutedCatalog,
     [ValidateSet(0, 2)][int]$OracleLayer = 2,
-    [string]$Prompt
+    [string]$Prompt,
+    [ValidateRange(1, 16)][int]$MaxNewTokens = 1
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -63,6 +64,10 @@ try {
             --prompt $Prompt --thinking-mode chat --output $promptTokens | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "DeepSeek prompt encoding failed" }
         $nativeArguments += $promptTokens
+        if ($MaxNewTokens -ne 1) { $nativeArguments += $MaxNewTokens }
+    }
+    elseif ($MaxNewTokens -ne 1) {
+        throw "MaxNewTokens greater than one requires Prompt"
     }
     $nativeRaw = & $executable @nativeArguments | Out-String
     if ($LASTEXITCODE -ne 0) {
@@ -71,9 +76,10 @@ try {
     }
     $native = $nativeRaw | ConvertFrom-Json
     if ($Prompt) {
+        $generatedTokens = $native.generated_token_ids -join ","
         $decoded = & $python.Source (Join-Path $script:RepoRoot `
             "ops\python\deepseek_prompt_codec.py") --snapshot $source decode `
-            --tokens ([string]$native.full_token_output) | ConvertFrom-Json
+            --tokens $generatedTokens | ConvertFrom-Json
         $native | Add-Member -NotePropertyName generated_text `
             -NotePropertyValue $decoded.text
     }
