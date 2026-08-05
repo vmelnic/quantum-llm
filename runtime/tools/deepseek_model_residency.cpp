@@ -346,12 +346,12 @@ er::cuda::DeepSeekDecodeRope upload_rope(std::uint32_t position,
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 8 || argc > 11) {
+    if (argc < 8 || argc > 12) {
       std::cerr << "usage: expert-deepseek-model-residency "
                    "<dense-bundle> <typed-bundle> <checkpoint> "
                    "<attention-oracle> <routed-catalog> <io-oracle> "
                    "<shared-set> [prompt-token-file] [max-new-tokens] "
-                   "[host-cache-gib]\n";
+                   "[host-cache-gib] [compact-vram-cache-gib]\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
@@ -365,8 +365,12 @@ int main(int argc, char** argv) {
     require(max_new_tokens >= 1U && max_new_tokens <= 16U,
             "max-new-tokens must be in [1,16]");
     const auto host_cache_gib =
-        argc == 11 ? static_cast<std::uint64_t>(std::stoull(argv[10])) : 0U;
+        argc >= 11 ? static_cast<std::uint64_t>(std::stoull(argv[10])) : 0U;
     require(host_cache_gib <= 48U, "host-cache-gib must be in [0,48]");
+    const auto compact_cache_gib =
+        argc == 12 ? static_cast<std::uint64_t>(std::stoull(argv[11])) : 0U;
+    require(compact_cache_gib <= 10U,
+            "compact-vram-cache-gib must be in [0,10]");
     er::DeepSeekExpertCatalog routed_catalog;
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
@@ -840,6 +844,7 @@ int main(int argc, char** argv) {
         std::make_shared<er::CudaPinnedAllocator>());
     er::ExpertCacheConfig full_config;
     const auto host_cache_bytes = host_cache_gib << 30U;
+    const auto compact_cache_bytes = compact_cache_gib << 30U;
     const auto full_ram_bytes =
         std::max<std::uint64_t>(4ULL * 25'167'360U, host_cache_bytes);
     const auto full_ram_low = host_cache_bytes == 0U
@@ -854,7 +859,8 @@ int main(int argc, char** argv) {
     // from this content-addressed checkpoint snapshot.
     full_config.trusted_immutable_source = true;
     auto full_uploader = std::make_shared<er::cuda::CudaExpertUploader>(
-        er::cuda::CudaExpertUploaderOptions{routed_cache_bytes, true});
+        er::cuda::CudaExpertUploaderOptions{
+            routed_cache_bytes, true, compact_cache_bytes});
     er::ExpertCache full_cache(full_config, expert_storage, full_uploader,
                                full_buffers, full_directory);
     er::ResidentExpertSet full_shared;
@@ -1125,6 +1131,7 @@ int main(int argc, char** argv) {
               << ",\"full_token_ms\":" << full_token_ms
               << ",\"routed_cache_slots\":" << routed_cache_slots
               << ",\"host_cache_bytes\":" << host_cache_bytes
+              << ",\"compact_vram_cache_bytes\":" << compact_cache_bytes
               << ",\"generated_tokens\":" << generated_tokens.size()
               << ",\"decode_generated_ms\":" << decode_ms
               << ",\"decode_ms_per_token\":"
@@ -1206,6 +1213,16 @@ int main(int argc, char** argv) {
               << full_upload_state.device_bytes_high_water
               << ",\"full_upload_staging_allocations\":"
               << full_upload_state.staging_allocations
+              << ",\"compact_cache_hits\":"
+              << full_upload_state.compact_cache_hits
+              << ",\"compact_cache_misses\":"
+              << full_upload_state.compact_cache_misses
+              << ",\"compact_cache_evictions\":"
+              << full_upload_state.compact_cache_evictions
+              << ",\"compact_h2d_bytes\":"
+              << full_upload_state.compact_h2d_bytes
+              << ",\"compact_cache_high_water\":"
+              << full_upload_state.compact_cache_high_water
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

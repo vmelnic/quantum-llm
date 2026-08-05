@@ -17,6 +17,9 @@ struct CudaExpertUploaderOptions final {
   std::uint64_t recycled_capacity_bytes{};
   // Reuse one serialized compact-source staging allocation across admissions.
   bool persistent_staging{};
+  // Retain immutable compact DeepSeek FP4 records on device independently of
+  // expanded compute slots. Zero disables this L1 tier.
+  std::uint64_t compact_cache_capacity_bytes{};
 };
 
 struct CudaExpertUploaderTelemetry final {
@@ -27,6 +30,12 @@ struct CudaExpertUploaderTelemetry final {
   std::uint64_t recycled_bytes{};
   std::uint64_t device_bytes_high_water{};
   std::uint64_t staging_allocations{};
+  std::uint64_t compact_cache_hits{};
+  std::uint64_t compact_cache_misses{};
+  std::uint64_t compact_cache_evictions{};
+  std::uint64_t compact_h2d_bytes{};
+  std::uint64_t compact_cache_bytes{};
+  std::uint64_t compact_cache_high_water{};
 };
 
 class CudaExpertAllocation final : public IDeviceAllocation {

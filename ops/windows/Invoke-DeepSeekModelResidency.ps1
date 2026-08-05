@@ -6,7 +6,8 @@ param(
     [ValidateSet(0, 2)][int]$OracleLayer = 2,
     [string]$Prompt,
     [ValidateRange(1, 16)][int]$MaxNewTokens = 1,
-    [ValidateRange(0, 48)][int]$HostCacheGiB = 32
+    [ValidateRange(0, 48)][int]$HostCacheGiB = 32,
+    [ValidateRange(0, 10)][int]$CompactVramCacheGiB = 8
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -65,10 +66,16 @@ try {
             --prompt $Prompt --thinking-mode chat --output $promptTokens | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "DeepSeek prompt encoding failed" }
         $nativeArguments += $promptTokens
-        if ($MaxNewTokens -ne 1 -or $HostCacheGiB -ne 0) {
+        if ($MaxNewTokens -ne 1 -or $HostCacheGiB -ne 0 -or
+            $CompactVramCacheGiB -ne 0) {
             $nativeArguments += $MaxNewTokens
         }
-        if ($HostCacheGiB -ne 0) { $nativeArguments += $HostCacheGiB }
+        if ($HostCacheGiB -ne 0 -or $CompactVramCacheGiB -ne 0) {
+            $nativeArguments += $HostCacheGiB
+        }
+        if ($CompactVramCacheGiB -ne 0) {
+            $nativeArguments += $CompactVramCacheGiB
+        }
     }
     elseif ($MaxNewTokens -ne 1) {
         throw "MaxNewTokens greater than one requires Prompt"

@@ -213,6 +213,14 @@ watermark, reduced total source reads from 35.80 GB to 20.40 GB, and recorded
 to 0.516 tok/s with identical token IDs. The extra pageable copy increased
 cold prompt time, so this is an L2 placement result, not an SLO pass.
 
+The CUDA uploader now owns a separate routed-only compact L1. Its byte budget
+is independent of expanded slots, lookup is keyed by immutable expert identity,
+and LRU touch/eviction are O(1). An 8 GiB run reached 8.58 GB, recorded 1,003
+hits and 1,594 misses, evicted 952 records, and transferred 21.31 GB of compact
+payload. The generated IDs were unchanged and decode improved only from 0.516
+to 0.553 tok/s. This validates tier separation, but also isolates repeated
+FP4→INT8 admission and compute-slot churn as the dominant miss cost.
+
 The checkpoint remains authoritative: the qualification bundle now contains
 only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
 expert payload is retained. Extents must cover the compact destination exactly

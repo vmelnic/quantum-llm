@@ -330,6 +330,12 @@ from 0.311 to 0.516 tok/s, while the cache high watermark remained 20.40 GB.
 This validates the RAM tier and also shows that repeated H2D plus FP4→INT8
 admission remains far from the latency target.
 
+Adding an independent 8 GiB routed compact-VRAM L1 preserved the same output
+and left about 4.75 GB VRAM free. It recorded 1,003 hits, 1,594 misses, 952 LRU
+evictions, and 21.31 GB compact H2D. Decode moved only to 0.553 tok/s. The small
+gain rejects H2D-only optimization as the next focus: expanded-slot admission
+and route-safe compute residency must be fixed before kernel throughput claims.
+
 ## Benchmark rules
 
 Any published result must include:

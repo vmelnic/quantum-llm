@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <iterator>
+#include <list>
 #include <limits>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -26,15 +29,31 @@ Status cuda_failure(const char* operation, cudaError_t error) {
 }  // namespace
 
 struct CudaExpertPool final {
+  struct CompactEntry final {
+    void* storage{};
+    std::size_t bytes{};
+    std::list<ExpertKey>::iterator lru;
+  };
+
   cudaStream_t stream{};
   mutable std::mutex mutex;
   std::uint64_t recycled_capacity_bytes{};
+  std::uint64_t compact_cache_capacity_bytes{};
   bool persistent_staging{};
   std::unordered_map<std::size_t, std::vector<void*>> recycled;
   void* staging{};
   std::size_t staging_bytes{};
   std::uint64_t device_slot_bytes{};
+  std::map<ExpertKey, CompactEntry> compact_cache;
+  std::list<ExpertKey> compact_lru;
   CudaExpertUploaderTelemetry metrics;
+
+  void update_device_high_water_locked() noexcept {
+    metrics.device_bytes_high_water = std::max(
+        metrics.device_bytes_high_water,
+        device_slot_bytes + static_cast<std::uint64_t>(staging_bytes) +
+            metrics.compact_cache_bytes);
+  }
 
   cudaError_t acquire_locked(std::size_t bytes, void** output) {
     auto iterator = recycled.find(bytes);
@@ -49,9 +68,7 @@ struct CudaExpertPool final {
     if (error == cudaSuccess) {
       ++metrics.device_allocations;
       device_slot_bytes += bytes;
-      metrics.device_bytes_high_water = std::max(
-          metrics.device_bytes_high_water,
-          device_slot_bytes + static_cast<std::uint64_t>(staging_bytes));
+      update_device_high_water_locked();
     }
     return error;
   }
@@ -96,9 +113,7 @@ struct CudaExpertPool final {
     if (error == cudaSuccess) {
       staging_bytes = bytes;
       ++metrics.staging_allocations;
-      metrics.device_bytes_high_water = std::max(
-          metrics.device_bytes_high_water,
-          device_slot_bytes + static_cast<std::uint64_t>(staging_bytes));
+      update_device_high_water_locked();
       *output = staging;
     }
     return error;
@@ -108,6 +123,9 @@ struct CudaExpertPool final {
     if (stream != nullptr) {
       for (const auto& [_, slots] : recycled) {
         for (auto* slot : slots) static_cast<void>(cudaFreeAsync(slot, stream));
+      }
+      for (const auto& [_, entry] : compact_cache) {
+        static_cast<void>(cudaFreeAsync(entry.storage, stream));
       }
       if (staging != nullptr) static_cast<void>(cudaFreeAsync(staging, stream));
       static_cast<void>(cudaStreamSynchronize(stream));
@@ -151,6 +169,8 @@ CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
   }
   pool_->stream = stream;
   pool_->recycled_capacity_bytes = options.recycled_capacity_bytes;
+  pool_->compact_cache_capacity_bytes =
+      options.compact_cache_capacity_bytes;
   pool_->persistent_staging = options.persistent_staging;
   cudaMemPool_t memory_pool{};
   if (const auto error = cudaDeviceGetDefaultMemPool(&memory_pool, 0);
@@ -202,10 +222,70 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   const auto source = request.complete_record.data();
   if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86) {
     void* compact_raw = nullptr;
-    error = pool_->staging_locked(request.complete_record.size(), &compact_raw);
-    if (error == cudaSuccess) {
-      error = cudaMemcpyAsync(compact_raw, source, request.complete_record.size(),
-                              cudaMemcpyHostToDevice, stream);
+    bool compact_cached = false;
+    const auto compact_bytes = request.complete_record.size();
+    const bool compact_cache_eligible =
+        request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
+        pool_->compact_cache_capacity_bytes >= compact_bytes;
+    if (compact_cache_eligible) {
+      const auto cached = pool_->compact_cache.find(request.key);
+      if (cached != pool_->compact_cache.end()) {
+        compact_raw = cached->second.storage;
+        pool_->compact_lru.splice(pool_->compact_lru.end(),
+                                  pool_->compact_lru,
+                                  cached->second.lru);
+        ++pool_->metrics.compact_cache_hits;
+        compact_cached = true;
+        error = cudaSuccess;
+      } else {
+        ++pool_->metrics.compact_cache_misses;
+        while (pool_->metrics.compact_cache_bytes + compact_bytes >
+               pool_->compact_cache_capacity_bytes) {
+          if (pool_->compact_lru.empty()) break;
+          const auto victim = pool_->compact_cache.find(
+              pool_->compact_lru.front());
+          if (victim == pool_->compact_cache.end()) break;
+          error = cudaFreeAsync(victim->second.storage, stream);
+          if (error != cudaSuccess) break;
+          pool_->metrics.compact_cache_bytes -= victim->second.bytes;
+          pool_->compact_lru.pop_front();
+          pool_->compact_cache.erase(victim);
+          ++pool_->metrics.compact_cache_evictions;
+        }
+        if (error == cudaSuccess &&
+            pool_->metrics.compact_cache_bytes + compact_bytes <=
+                pool_->compact_cache_capacity_bytes) {
+          error = cudaMallocAsync(&compact_raw, compact_bytes, stream);
+          if (error == cudaSuccess) {
+            error = cudaMemcpyAsync(compact_raw, source, compact_bytes,
+                                    cudaMemcpyHostToDevice, stream);
+          }
+          if (error == cudaSuccess) {
+            pool_->compact_lru.push_back(request.key);
+            pool_->compact_cache.emplace(
+                request.key,
+                CudaExpertPool::CompactEntry{
+                    compact_raw, compact_bytes,
+                    std::prev(pool_->compact_lru.end())});
+            pool_->metrics.compact_cache_bytes += compact_bytes;
+            pool_->metrics.compact_h2d_bytes += compact_bytes;
+            pool_->metrics.compact_cache_high_water = std::max(
+                pool_->metrics.compact_cache_high_water,
+                pool_->metrics.compact_cache_bytes);
+            pool_->update_device_high_water_locked();
+            compact_cached = true;
+          } else if (compact_raw != nullptr) {
+            static_cast<void>(cudaFreeAsync(compact_raw, stream));
+            compact_raw = nullptr;
+          }
+        }
+      }
+    } else {
+      error = pool_->staging_locked(compact_bytes, &compact_raw);
+      if (error == cudaSuccess) {
+        error = cudaMemcpyAsync(compact_raw, source, compact_bytes,
+                                cudaMemcpyHostToDevice, stream);
+      }
     }
     Status admission = error == cudaSuccess
                            ? Status::success()
@@ -239,7 +319,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
              down, down_scales, 4096U, 2048U);
     }
     if (compact_raw != nullptr) {
-      if (!pool_->persistent_staging) {
+      if (!compact_cached && !pool_->persistent_staging) {
         const auto free_error = cudaFreeAsync(compact_raw, stream);
         if (admission.ok() && free_error != cudaSuccess) {
           admission = cuda_failure("DeepSeek compact release", free_error);
