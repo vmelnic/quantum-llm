@@ -204,4 +204,11 @@ Because one shared expert is used on every token at every layer, production
 placement should treat these 43 slots as dense/resident model state rather than
 router-driven cache entries. They occupy about 1.01 GiB in total before
 allocator overhead. The validated cache lifecycle remains the loading and
-integrity mechanism; the model planner will pin them during startup.
+integrity mechanism.
+
+Startup residency now loads and pins all 43 shared experts through one fixed
+25 MB staging slot. The source gather read 1,082,196,480 bytes and published
+1,083,539,456 bytes of compute-ready slots in 3.59 seconds. Every layer was
+visible in the CUDA directory, and teardown released the complete logical
+allocation. VRAM headroom is checked before the first read; partial startup
+failure releases every lease acquired by that startup transaction.

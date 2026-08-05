@@ -74,6 +74,11 @@ target ABI alone never guesses how bytes should be interpreted. Shared experts
 are integrity-loaded through the cache, then planner-pinned as always-active
 model state rather than admitted by routed frequency.
 
+`ResidentExpertSet` owns those long-lived leases. Its startup path is serial by
+design: one pinned source slot bounds host memory while VRAM accumulates only
+the declared final allocations. Duplicate keys fail before I/O. A load failure
+releases the partial set and trims its now-unreferenced cache entries.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution

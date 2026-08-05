@@ -17,6 +17,7 @@ add_library(expert_runtime STATIC
   src/expert_record.cpp
   src/gather_storage.cpp
   src/hybrid_dispatch.cpp
+  src/resident_expert_set.cpp
   src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp
@@ -93,6 +94,13 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_compile_features(expert-deepseek-admission-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-deepseek-admission-smoke PRIVATE
     expert_runtime CUDA::cudart)
+  if(WIN32)
+    add_executable(expert-deepseek-shared-residency
+      tools/deepseek_shared_residency.cpp)
+    target_compile_features(expert-deepseek-shared-residency PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-shared-residency PRIVATE
+      expert_runtime CUDA::cudart)
+  endif()
   add_executable(expert-qwen3-next-runner tools/qwen3_next_runner.cpp)
   target_compile_features(expert-qwen3-next-runner PRIVATE cxx_std_20)
   target_link_libraries(expert-qwen3-next-runner PRIVATE expert_runtime expert_core CUDA::cudart)

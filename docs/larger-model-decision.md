@@ -117,5 +117,7 @@ independently proven.
 - Complete: the real FP8 shared expert is bitwise-equal to the independent
   PyTorch decode, admits into the common SM86 slot through the cache, and runs
   gate/up/down CUDA from that slot.
-- Next: pin all 43 shared slots as model state and implement dense/CSA/HCA
-  execution.
+- Complete: all 43 shared slots are atomically described, loaded through one
+  bounded staging slot, pinned as model state, directory-verified, and released
+  at teardown; measured startup was 3.59 seconds.
+- Next: implement dense FP8, HCA, and CSA/attention execution.

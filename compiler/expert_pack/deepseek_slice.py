@@ -434,3 +434,66 @@ def export_deepseek_shared_expert(
         format_name="deepseek-fp8-shared-expert-extents-v1",
         source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
     )
+
+
+def export_deepseek_shared_set(
+    checkpoint: SafeTensorCheckpoint, *, output: Path
+) -> dict[str, object]:
+    """Atomically describe every main-model shared expert without repacking."""
+
+    validate_deepseek_v4_source(checkpoint)
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"shared set output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    entries: list[dict[str, object]] = []
+    source_bytes = 0
+    try:
+        for layer in range(43):
+            prefix = f"layers.{layer}.ffn.shared_experts"
+            names = tuple(
+                f"{prefix}.{projection}.{kind}"
+                for projection in ("w1", "w3", "w2")
+                for kind in ("weight", "scale")
+            )
+            relative = Path(f"layer-{layer:02d}")
+            manifest = _export_deepseek_extents(
+                checkpoint, names=names, output=partial / relative,
+                layer=layer, expert="shared",
+                format_name="deepseek-fp8-shared-expert-extents-v1",
+                source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+            )
+            entry = {
+                "layer": layer,
+                "descriptor": str(relative / "extents.tsv"),
+                "bytes": manifest["bytes"],
+                "sha256": manifest["combined"]["sha256"],
+            }
+            entries.append(entry)
+            source_bytes += int(manifest["bytes"])
+        with (partial / "shared-set.tsv").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as index:
+            index.write("deepseek-shared-residency-v1\n")
+            for entry in entries:
+                index.write(
+                    f"{entry['layer']}\t{entry['bytes']}\t{entry['sha256']}\t"
+                    f"{entry['descriptor']}\n"
+                )
+            index.flush()
+            os.fsync(index.fileno())
+        result = {
+            "format": "deepseek-shared-residency-v1",
+            "source_abi": "deepseek-fp8-e4m3-ue8m0-block128-v1",
+            "target_abi": "deepseek-sm86-int8-per-row-v1",
+            "layers": entries,
+            "source_bytes": source_bytes,
+            "device_bytes": 43 * 25_198_592,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise

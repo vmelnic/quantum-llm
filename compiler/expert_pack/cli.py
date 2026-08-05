@@ -14,6 +14,7 @@ from .deepseek_v4 import (
 from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_shared_expert,
+    export_deepseek_shared_set,
     qualify_deepseek_expert,
     qualify_deepseek_shared_expert,
 )
@@ -98,6 +99,12 @@ def _parser() -> argparse.ArgumentParser:
     shared_parser.add_argument("--source", type=Path, required=True)
     shared_parser.add_argument("--output", type=Path, required=True)
     shared_parser.add_argument("--layer", type=int, default=0)
+    shared_set_parser = commands.add_parser(
+        "export-deepseek-shared-set",
+        help="describe all 43 shared experts for bounded startup residency",
+    )
+    shared_set_parser.add_argument("--source", type=Path, required=True)
+    shared_set_parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -153,10 +160,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 expert=args.expert, output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-shared":
             result = export_deepseek_shared_expert(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 output=args.output,
+            )
+        else:
+            result = export_deepseek_shared_set(
+                SafeTensorCheckpoint(args.source), output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

@@ -57,6 +57,10 @@ to the always-active FP8 shared expert. E4M3FN weights and UE8M0 128×128 block
 scales are independently compared with PyTorch before the SM86 candidate hash
 is accepted.
 
+`export-deepseek-shared-set` validates the checkpoint once and atomically emits
+the 43 small extent descriptors used for startup residency. It hashes about
+1.08 GB of authoritative source payload but copies none of it.
+
 ## Install
 
 From the repository root:
