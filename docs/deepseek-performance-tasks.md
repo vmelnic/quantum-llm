@@ -90,6 +90,10 @@ router output or generated tokens.
 - [ ] Keep directory hit planning on device. Return only compact miss metadata
   to the host and replace per-layer `cudaStreamSynchronize` calls with event
   dependencies.
+- [x] Evaluate an all-device guarded hot transaction for CUDA 12.1. The guard
+  was correct but rejected: checking `missing_count` in every batch-one FFN
+  block regressed the repeated five-step route from 342.421 ms to 396.999 ms.
+  Revisit only with a lower-overhead conditional graph/launch mechanism.
 - [x] Release directory pins asynchronously after the last consuming kernel,
   with fixed device metadata slots recycled only after completion events.
 - [ ] Split I/O completion, RAM admission, H2D, and CUDA publication into

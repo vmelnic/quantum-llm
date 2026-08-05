@@ -391,6 +391,17 @@ concurrent lifecycle correctness, not aggregate throughput: the setup still
 prefilled the two prompts sequentially and the extra route exceeded the learned
 warm set.
 
+An attempted all-device continuation placed a `missing_count` guard in every
+routed, aggregate, shared, and HCA CUDA kernel so a hot plan could execute FFN
+without returning to the host. Token `19923` and the zero-miss contract were
+preserved, but two repeated measurements took 411.763 ms and 396.999 ms for the
+same five model steps. The latter is 15.9% slower than the 342.421 ms
+request-private-event result. CUDA 12.1 on the target host exposes no conditional
+graph node API, and the per-block global predicate is too expensive for this
+batch-one path. The implementation was removed before commit. A future guarded
+transaction requires a cheaper conditional launch mechanism; it must not
+reintroduce this rejected branch in every FFN block.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route
