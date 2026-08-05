@@ -24,6 +24,9 @@ struct DeepSeekDecodeSchedulerConfig final {
   std::size_t maximum_requests{};
   std::size_t maximum_inflight_acquires{};
   std::size_t maximum_layer_advances_per_poll{};
+  // Retain the most recent six routed experts for every layer and controller.
+  // This deterministic working set is bounded by 6 * layer count.
+  bool retain_previous_route{};
 };
 
 struct DeepSeekScheduledRequestSnapshot final {
@@ -40,6 +43,7 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::size_t runnable_requests{};
   std::size_t waiting_requests{};
   std::size_t inflight_acquires{};
+  std::size_t retained_working_set_experts{};
   std::uint64_t submitted_requests{};
   std::uint64_t rejected_requests{};
   std::uint64_t layer_advances{};

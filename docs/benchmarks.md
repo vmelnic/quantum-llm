@@ -336,6 +336,14 @@ evictions, and 21.31 GB compact H2D. Decode moved only to 0.553 tok/s. The small
 gain rejects H2D-only optimization as the next focus: expanded-slot admission
 and route-safe compute residency must be fixed before kernel throughput claims.
 
+The route-safe 258-slot compute working set then completed the same eight-token
+run without the stalls seen in earlier large-cache experiments. It eliminated
+840 admissions through exact consecutive reuse, but 966 remained; 594 were
+first-touch records and caused the same 7.94 GB of post-prefill SATA reads.
+Decode measured 0.557 tok/s with identical output. This establishes the current
+hardware lower bound: first-touch storage, not retained-route eviction or GEMV,
+dominates the single stream.
+
 ## Benchmark rules
 
 Any published result must include:

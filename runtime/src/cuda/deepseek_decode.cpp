@@ -72,7 +72,7 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
   waiting_for_experts_ = false;
   complete_ = false;
   return {std::move(status), DeepSeekDecodeProgress::layer_complete,
-          current_layer_, {}};
+          current_layer_, {}, {}, {}};
 }
 
 DeepSeekDecodeAdvanceResult
@@ -94,11 +94,14 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
                 trace.routed_experts.begin());
     route_trace_.push_back(trace);
   }
+  std::vector<std::uint32_t> routed_experts(
+      plan.selected_experts.begin(), plan.selected_experts.begin() + 6U);
   pin_id_ = plan.pin_id;
   if (!plan.missing_experts.empty()) {
     waiting_for_experts_ = true;
     return {Status::success(), DeepSeekDecodeProgress::needs_experts,
-            current_layer_, std::move(plan.missing_experts)};
+            current_layer_, std::move(plan.missing_experts),
+            std::move(plan.ready_experts), std::move(routed_experts)};
   }
   if (pin_id_ == 0U)
     return fail({ErrorCode::internal,
@@ -119,17 +122,17 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
     active_ = false;
     complete_ = true;
     return {Status::success(), DeepSeekDecodeProgress::token_complete,
-            completed_layer, {}};
+            completed_layer, {}, {}, std::move(routed_experts)};
   }
   return {Status::success(), DeepSeekDecodeProgress::layer_complete,
-          completed_layer, {}};
+          completed_layer, {}, {}, std::move(routed_experts)};
 }
 
 DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
   if (!active_) {
     return {{ErrorCode::invalid_argument,
              "DeepSeek decode controller is not active"},
-            DeepSeekDecodeProgress::layer_complete, current_layer_, {}};
+            DeepSeekDecodeProgress::layer_complete, current_layer_, {}, {}, {}};
   }
   if (waiting_for_experts_) {
     const auto release = directory_->release_pins(pin_id_, stream_);

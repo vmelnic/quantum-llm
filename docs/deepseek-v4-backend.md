@@ -221,6 +221,23 @@ payload. The generated IDs were unchanged and decode improved only from 0.516
 to 0.553 tok/s. This validates tier separation, but also isolates repeated
 FP4→INT8 admission and compute-slot churn as the dominant miss cost.
 
+Route-safe compute residency is now deterministic. On a mixed hit/miss plan,
+the controller exposes both sets and the scheduler converts every ready routed
+entry into a cache lease before it starts a miss acquisition. This prevents an
+eviction from waiting on the same directory pin that the suspended controller
+owns. The scheduler retains the last six experts per layer and controller,
+automatically releases stale route members, and drops abandoned controller
+working sets through weak ownership. The bound is exactly 258 routed experts.
+
+The former large-cache stalls did not reproduce. An eight-token run retained
+the expected 258 entries, and consecutive route reuse removed 840 admissions.
+Decode still required 966 admissions and 7.94 GB of SATA reads: 372 records
+came from RAM, while 594 expert-layer keys were first touches. Throughput was
+0.557 tok/s with unchanged token IDs. Only layers 0–2 use the token-ID hash
+router; the remaining 40 learned routers cannot be resolved before their input
+activation exists. Therefore speculative prefetch alone cannot bridge the
+single-stream bandwidth gap on this host.
+
 The checkpoint remains authoritative: the qualification bundle now contains
 only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
 expert payload is retained. Extents must cover the compact destination exactly

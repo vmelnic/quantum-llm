@@ -56,8 +56,13 @@ This roadmap records direction, not a compatibility promise.
     set across decode tokens, and use grouped/Tensor Core execution. Bounded
     persistent device slots are complete (795 reuses from 107 allocations in
     the real prompt). Exact route tracing rejected a larger history-only INT8
-    active set; compact RAM L2, compact VRAM L1, and transient compute-ready
-    slots replace that direction.
+    active set. Compact RAM L2 and compact VRAM L1 are now bounded and
+    instrumented. Route-safe leases plus a 258-entry previous-route working set
+    removed 840 admissions in an eight-token run without the former stalls,
+    but 594 first-touch records still read 7.94 GB from SATA. The next capacity
+    step must place the cold compact tier in higher-bandwidth RAM/NVMe or move
+    expert compute to a memory-owning worker; more local INT8 history cannot
+    meet the single-stream target.
 
 ## Phase 1 — long-context and cold-path production work
 

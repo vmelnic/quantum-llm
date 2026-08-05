@@ -7,7 +7,7 @@ param(
     [string]$Prompt,
     [ValidateRange(1, 16)][int]$MaxNewTokens = 1,
     [ValidateRange(0, 48)][int]$HostCacheGiB = 32,
-    [ValidateRange(0, 10)][int]$CompactVramCacheGiB = 8
+    [ValidateRange(0, 10)][int]$CompactVramCacheGiB = 4
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")

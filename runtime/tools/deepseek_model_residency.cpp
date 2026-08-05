@@ -834,7 +834,7 @@ int main(int argc, char** argv) {
             "resumed decode controller exceeds block oracle tolerance");
 
     constexpr std::uint64_t shared_hot_bytes = 43ULL * 25'198'592U;
-    constexpr std::uint64_t routed_cache_slots = 64U;
+    constexpr std::uint64_t routed_cache_slots = 258U;
     constexpr std::uint64_t routed_cache_bytes =
         routed_cache_slots * 25'198'592U;
     auto full_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
@@ -877,7 +877,7 @@ int main(int argc, char** argv) {
     require(full_controller.status.ok() && full_controller.controller,
             std::string(full_controller.status.message()));
     er::cuda::DeepSeekDecodeScheduler full_scheduler(
-        {17U, 1U, 4U, 1U}, full_cache, routed_catalog);
+        {17U, 1U, 4U, 1U, true}, full_cache, routed_catalog);
     float* full_rope = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&full_rope),
                      8U * 32U * sizeof(float)),
@@ -960,6 +960,8 @@ int main(int argc, char** argv) {
         std::chrono::steady_clock::now() - full_started).count();
     std::vector<std::uint32_t> generated_tokens{full_sampled_token};
     const auto prefill_cache_state = full_cache.telemetry();
+    const auto prefill_scheduler_state = full_scheduler.snapshot();
+    const auto prefill_upload_state = full_uploader->telemetry();
     const auto decode_started = std::chrono::steady_clock::now();
     for (std::uint32_t generated = 1U; generated < max_new_tokens;
          ++generated) {
@@ -1188,6 +1190,8 @@ int main(int argc, char** argv) {
               << full_scheduler_state.layer_advances
               << ",\"full_token_cold_acquires\":"
               << full_scheduler_state.acquires_started
+              << ",\"retained_working_set_experts\":"
+              << full_scheduler_state.retained_working_set_experts
               << ",\"full_cache_read_bytes\":"
               << full_cache_state.read_bytes
               << ",\"decode_cache_read_bytes\":"
@@ -1195,6 +1199,12 @@ int main(int argc, char** argv) {
               << ",\"decode_cache_ram_hits\":"
               << (full_cache_state.acquire_ram_hits -
                   prefill_cache_state.acquire_ram_hits)
+              << ",\"decode_cold_acquires\":"
+              << (full_scheduler_state.acquires_started -
+                  prefill_scheduler_state.acquires_started)
+              << ",\"decode_uploaded_bytes\":"
+              << (full_cache_state.uploaded_bytes -
+                  prefill_cache_state.uploaded_bytes)
               << ",\"full_cache_ram_high_water\":"
               << full_cache_state.ram_high_water
               << ",\"full_cache_uploaded_bytes\":"
@@ -1223,6 +1233,12 @@ int main(int argc, char** argv) {
               << full_upload_state.compact_h2d_bytes
               << ",\"compact_cache_high_water\":"
               << full_upload_state.compact_cache_high_water
+              << ",\"decode_compact_cache_hits\":"
+              << (full_upload_state.compact_cache_hits -
+                  prefill_upload_state.compact_cache_hits)
+              << ",\"decode_compact_cache_misses\":"
+              << (full_upload_state.compact_cache_misses -
+                  prefill_upload_state.compact_cache_misses)
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

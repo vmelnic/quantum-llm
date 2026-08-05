@@ -3,6 +3,7 @@
 #include "expert/runtime/expert_record.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -37,6 +38,14 @@ struct HeldLease final {
   ExpertLease lease;
 };
 
+using LayerWorkingSet =
+    std::array<std::vector<HeldLease>, kDeepSeekLayers>;
+
+struct ControllerWorkingSet final {
+  std::weak_ptr<DeepSeekDecodeController> controller;
+  LayerWorkingSet layers;
+};
+
 struct ScheduledRequest final {
   std::uint64_t id{};
   std::shared_ptr<DeepSeekDecodeController> controller;
@@ -61,6 +70,7 @@ struct DeepSeekDecodeScheduler::Core final {
   ExpertCache& cache;
   const DeepSeekExpertCatalog& catalog;
   std::map<std::uint64_t, std::unique_ptr<ScheduledRequest>> requests;
+  std::map<DeepSeekDecodeController*, ControllerWorkingSet> working_sets;
   std::deque<std::uint64_t> runnable;
   std::deque<std::uint64_t> acquisition_round_robin;
   std::size_t inflight_acquires{};
@@ -109,12 +119,148 @@ struct DeepSeekDecodeScheduler::Core final {
     ++metrics.failed_requests;
   }
 
+  [[nodiscard]] bool route_contains(
+      const DeepSeekDecodeAdvanceResult& result,
+      std::uint32_t expert) const noexcept {
+    return std::find(result.routed_experts.begin(),
+                     result.routed_experts.end(), expert) !=
+           result.routed_experts.end();
+  }
+
+  [[nodiscard]] std::vector<HeldLease>* layer_working_set(
+      ScheduledRequest& request, std::uint32_t layer) {
+    if (!config.retain_previous_route) return nullptr;
+    auto [iterator, inserted] = working_sets.try_emplace(
+        request.controller.get());
+    if (inserted) iterator->second.controller = request.controller;
+    return &iterator->second.layers[layer];
+  }
+
+  void prune_working_sets() {
+    std::erase_if(working_sets, [](const auto& item) {
+      return item.second.controller.expired();
+    });
+  }
+
+  Status acquire_ready_lease(ScheduledRequest& request,
+                             std::uint32_t layer,
+                             std::uint32_t expert) {
+    const auto* record = catalog.find(layer, expert);
+    if (!record) {
+      return {ErrorCode::invalid_argument,
+              "DeepSeek ready expert is absent from the catalog"};
+    }
+    ExpertKey key{config.model_id, layer, expert,
+                  kExpertQuantAbiDeepSeekSm86};
+    auto handle = cache.acquire(key, *record);
+    if (handle.wait_for(0ms) != std::future_status::ready) {
+      handle.cancel();
+      return {ErrorCode::internal,
+              "directory-ready DeepSeek expert is not cache-ready"};
+    }
+    auto acquired = handle.get();
+    if (!acquired.status.ok() || !acquired.lease) {
+      return acquired.status.ok()
+                 ? Status(ErrorCode::internal,
+                          "DeepSeek ready expert returned no cache lease")
+                 : copied_status(acquired.status);
+    }
+    request.leases.push_back({expert, std::move(acquired.lease)});
+    return Status::success();
+  }
+
+  Status reconcile_working_set(
+      ScheduledRequest& request,
+      const DeepSeekDecodeAdvanceResult& result) {
+    if (result.routed_experts.size() != 6U) {
+      return {ErrorCode::internal,
+              "DeepSeek scheduler received an invalid routed set"};
+    }
+    std::set<std::uint32_t> unique(result.routed_experts.begin(),
+                                   result.routed_experts.end());
+    if (unique.size() != result.routed_experts.size() ||
+        *unique.rbegin() >= kDeepSeekCatalogExperts) {
+      return {ErrorCode::internal,
+              "DeepSeek scheduler received invalid routed experts"};
+    }
+    if (auto* retained = layer_working_set(request, result.layer)) {
+      std::erase_if(*retained, [&](const HeldLease& value) {
+        return !route_contains(result, value.expert);
+      });
+    }
+    return Status::success();
+  }
+
+  Status retain_completed_route(
+      ScheduledRequest& request,
+      const DeepSeekDecodeAdvanceResult& result) {
+    if (!config.retain_previous_route) {
+      request.leases.clear();
+      return Status::success();
+    }
+    auto status = reconcile_working_set(request, result);
+    if (!status.ok()) return status;
+    auto* retained = layer_working_set(request, result.layer);
+    for (auto& held : request.leases) {
+      const bool duplicate = std::any_of(
+          retained->begin(), retained->end(), [&](const HeldLease& value) {
+            return value.expert == held.expert;
+          });
+      if (route_contains(result, held.expert) && !duplicate) {
+        retained->push_back({held.expert, std::move(held.lease)});
+      }
+    }
+    request.leases.clear();
+    for (const auto expert : result.routed_experts) {
+      const bool held = std::any_of(
+          retained->begin(), retained->end(), [expert](const HeldLease& value) {
+            return value.expert == expert;
+          });
+      if (held) continue;
+      status = acquire_ready_lease(request, result.layer, expert);
+      if (!status.ok()) return status;
+      retained->push_back(
+          {request.leases.back().expert,
+           std::move(request.leases.back().lease)});
+      request.leases.pop_back();
+    }
+    if (retained->size() != result.routed_experts.size()) {
+      return {ErrorCode::internal,
+              "DeepSeek retained route has the wrong cardinality"};
+    }
+    return Status::success();
+  }
+
   Status wait_for_experts(
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
     if (result.missing_experts.empty()) {
       return {ErrorCode::internal,
               "DeepSeek controller suspended without missing experts"};
+    }
+    auto status = reconcile_working_set(request, result);
+    if (!status.ok()) return status;
+    auto* retained = layer_working_set(request, result.layer);
+    for (const auto expert : result.ready_experts) {
+      if (expert == kDeepSeekCatalogExperts) continue;
+      if (!route_contains(result, expert)) {
+        return {ErrorCode::internal,
+                "DeepSeek controller returned an unrelated ready expert"};
+      }
+      const bool already_held =
+          (retained != nullptr &&
+           std::any_of(retained->begin(), retained->end(),
+                       [expert](const HeldLease& value) {
+                         return value.expert == expert;
+                       })) ||
+          std::any_of(request.leases.begin(), request.leases.end(),
+                      [expert](const HeldLease& value) {
+                        return value.expert == expert;
+                      });
+      if (!already_held) {
+        status = acquire_ready_lease(request, result.layer, expert);
+        if (!status.ok()) return status;
+      }
     }
     std::set<std::uint32_t> unique;
     for (const auto expert : result.missing_experts) {
@@ -128,7 +274,12 @@ struct DeepSeekDecodeScheduler::Core final {
       }
       const auto held = std::any_of(
           request.leases.begin(), request.leases.end(),
-          [expert](const HeldLease& value) { return value.expert == expert; });
+          [expert](const HeldLease& value) { return value.expert == expert; }) ||
+          (retained != nullptr &&
+           std::any_of(retained->begin(), retained->end(),
+                       [expert](const HeldLease& value) {
+                         return value.expert == expert;
+                       }));
       if (held) {
         return {ErrorCode::internal,
                 "leased DeepSeek expert is absent from the device directory"};
@@ -251,6 +402,7 @@ Status DeepSeekDecodeScheduler::submit(
     std::uint64_t request_id,
     std::shared_ptr<DeepSeekDecodeController> controller,
     const DeepSeekDecodeBegin& begin) {
+  core_->prune_working_sets();
   if (request_id == 0U || !controller || core_->requests.contains(request_id)) {
     ++core_->metrics.rejected_requests;
     return {ErrorCode::invalid_argument,
@@ -304,15 +456,25 @@ Status DeepSeekDecodeScheduler::poll() {
         if (!status.ok()) core_->fail(request, copied_status(status));
         break;
       }
-      case DeepSeekDecodeProgress::layer_complete:
-        request.leases.clear();
+      case DeepSeekDecodeProgress::layer_complete: {
+        const auto retained = core_->retain_completed_route(request, result);
+        if (!retained.ok()) {
+          core_->fail(request, copied_status(retained));
+          break;
+        }
         core_->enqueue_runnable(request);
         break;
-      case DeepSeekDecodeProgress::token_complete:
-        request.leases.clear();
+      }
+      case DeepSeekDecodeProgress::token_complete: {
+        const auto retained = core_->retain_completed_route(request, result);
+        if (!retained.ok()) {
+          core_->fail(request, copied_status(retained));
+          break;
+        }
         request.state = DeepSeekScheduledState::complete;
         ++core_->metrics.completed_requests;
         break;
+      }
     }
   }
   core_->service_acquisitions();
@@ -367,12 +529,19 @@ DeepSeekDecodeSchedulerSnapshot DeepSeekDecodeScheduler::snapshot() const
   result.inflight_acquires = core_->inflight_acquires;
   result.runnable_requests = 0U;
   result.waiting_requests = 0U;
+  result.retained_working_set_experts = 0U;
   for (const auto& [id, request] : core_->requests) {
     (void)id;
     if (request->state == DeepSeekScheduledState::runnable)
       ++result.runnable_requests;
     if (request->state == DeepSeekScheduledState::waiting_for_experts)
       ++result.waiting_requests;
+  }
+  for (const auto& [controller, working_set] : core_->working_sets) {
+    (void)controller;
+    for (const auto& layer : working_set.layers) {
+      result.retained_working_set_experts += layer.size();
+    }
   }
   return result;
 }

@@ -44,6 +44,12 @@ struct DeepSeekDecodeAdvanceResult final {
   DeepSeekDecodeProgress progress{DeepSeekDecodeProgress::layer_complete};
   std::uint32_t layer{};
   std::vector<std::uint32_t> missing_experts;
+  // Ready entries are device-pinned across a cold-plan suspension. The
+  // scheduler must convert them to cache leases before loading misses so an
+  // eviction cannot wait on the controller's own directory pin.
+  std::vector<std::uint32_t> ready_experts;
+  // Exact routed selection excluding the invariant shared expert.
+  std::vector<std::uint32_t> routed_experts;
 };
 
 struct DeepSeekRouteTraceEntry final {
