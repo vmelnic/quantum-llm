@@ -23,6 +23,12 @@ six completed and the resumed block retained the same `4.76e-4` maximum error.
 This is a bounded orchestration result, not a claim that parallel cache waiters
 make one physical staging slot perform parallel I/O.
 
+The main-model edge gate reuses resident BF16 embedding/head weights. One real
+embedding row matched bit-for-bit; the complete 129,280-logit projection
+matched its independent row-streamed oracle with `6.89e-7` RMSE and `5.72e-6`
+maximum error, including the same greedy token (65,270). This is correctness
+evidence; head latency is not yet reported as a throughput optimization.
+
 The cold 410 ms is outside the hot compute interval. Conversely, 14.77 ms is
 one layer, not one generated token; extrapolating it across 43 layers would be
 well below the throughput target. This result establishes the complete

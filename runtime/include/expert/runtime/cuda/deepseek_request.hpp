@@ -22,6 +22,7 @@ struct DeepSeekRequestStateSize final {
   Status status;
   std::uint64_t attention_bytes{};
   std::uint64_t ffn_bytes{};
+  std::uint64_t io_bytes{};
   std::uint64_t stream_bytes{};
   std::uint64_t total_bytes{};
 };
@@ -57,6 +58,18 @@ class DeepSeekRequestState final {
   }
   [[nodiscard]] DeepSeekLayerStateView layer(
       std::uint32_t index) const noexcept;
+  [[nodiscard]] Status embed(std::uint32_t token,
+                             void* stream = nullptr) noexcept;
+  [[nodiscard]] Status project_logits(void* stream = nullptr) noexcept;
+  [[nodiscard]] const float* current_streams() const noexcept {
+    return streams_a_;
+  }
+  [[nodiscard]] const float* logits() const noexcept {
+    return io_state_ ? io_state_->logits() : nullptr;
+  }
+  [[nodiscard]] const std::uint32_t* sampled_token() const noexcept {
+    return io_state_ ? io_state_->sampled_token() : nullptr;
+  }
 
  private:
   friend DeepSeekRequestStateResult create_deepseek_request_state(
@@ -71,6 +84,8 @@ class DeepSeekRequestState final {
   std::array<std::shared_ptr<DeepSeekAttentionState>, kDeepSeekLayers>
       attention_states_{};
   std::array<std::shared_ptr<DeepSeekFfnState>, kDeepSeekLayers> ffn_states_{};
+  DeepSeekIoBinding io_weights_{};
+  std::shared_ptr<DeepSeekIoState> io_state_;
   std::uint32_t max_context_tokens_{};
   std::uint64_t bytes_{};
   float* stream_allocation_{};

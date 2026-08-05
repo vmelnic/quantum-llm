@@ -165,6 +165,33 @@ Status DeepSeekResidentModelState::bind_ffn(
   return Status::success();
 }
 
+Status DeepSeekResidentModelState::bind_io(
+    DeepSeekIoBinding& destination) const noexcept {
+  DeepSeekIoBinding bound;
+  const bool valid =
+      bind_tensor(typed_, "embed.weight", DeepSeekDtype::bf16,
+                  static_cast<std::uint64_t>(kDeepSeekVocab) *
+                      kDeepSeekHidden,
+                  bound.embedding) &&
+      bind_tensor(typed_, "norm.weight", DeepSeekDtype::bf16,
+                  kDeepSeekHidden, bound.final_norm) &&
+      bind_tensor(typed_, "head.weight", DeepSeekDtype::bf16,
+                  static_cast<std::uint64_t>(kDeepSeekVocab) *
+                      kDeepSeekHidden,
+                  bound.head) &&
+      bind_tensor(typed_, "hc_head_fn", DeepSeekDtype::f32,
+                  4ULL * 4U * kDeepSeekHidden, bound.head_function) &&
+      bind_tensor(typed_, "hc_head_base", DeepSeekDtype::f32, 4U,
+                  bound.head_base) &&
+      bind_tensor(typed_, "hc_head_scale", DeepSeekDtype::f32, 1U,
+                  bound.head_scale);
+  if (!valid)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek I/O binding is missing or has incompatible model state"};
+  destination = bound;
+  return Status::success();
+}
+
 void DeepSeekResidentModelState::clear() noexcept {
   dense_.clear();
   typed_.clear();

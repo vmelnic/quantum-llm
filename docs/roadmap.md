@@ -32,8 +32,11 @@ This roadmap records direction, not a compatibility promise.
    concurrent requests, layer advances, and cache acquisitions; it retains
    leases across suspended layers and was qualified with six catalog-backed
    cold routed experts under a two-acquire limit.
-9. Add embedding, output head, tokenizer, sampling, and the HTTP worker
-   boundary for DeepSeek.
+9. ~~Add embedding, output head, and greedy sampling.~~ The request-owned I/O
+   state reuses resident typed weights, is included in preflight accounting,
+   and matches an independent full-vocabulary oracle.
+10. Add tokenizer integration, a token-level `[0,43)` controller, and the HTTP
+    worker boundary for DeepSeek.
 
 ## Phase 1 — long-context and cold-path production work
 

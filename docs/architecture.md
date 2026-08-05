@@ -211,8 +211,9 @@ transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string
 lookups or per-layer uploads in the hot path.
 
-One `DeepSeekRequestState` owns the mutable attention and FFN state for all 43
-layers and retains the immutable model object that its bindings reference. The
+One `DeepSeekRequestState` owns the mutable attention, FFN, HC-head/logits, and
+four-stream state for all 43 layers and retains the immutable model object that
+its bindings reference. The
 factory first computes the exact complete CUDA footprint, checks a caller-owned
 per-request budget, binds every layer, and only then publishes a fully built
 request. Partial allocation or a missing layer never becomes schedulable. The
@@ -240,3 +241,9 @@ acquisition window. It never blocks on I/O. Request and acquisition queues are
 round-robin; the cache still deduplicates identical expert loads across
 requests. Acquired leases live through FFN resume, while cancellation and every
 terminal failure unwind pending waiters, leases, and controller pins.
+
+The same request owns the model edges: BF16 embedding gather expands directly
+into its four input streams; after layer 42, HC-head collapse, final RMSNorm,
+the untied BF16 vocabulary projection, and greedy argmax write into a fixed
+615,460-byte I/O allocation. The 2+ GiB embedding/head weights remain part of
+the immutable typed model state and are never copied per request.

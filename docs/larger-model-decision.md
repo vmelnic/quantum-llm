@@ -173,7 +173,7 @@ independently proven.
   matched its independent oracle within `2.20e-4` maximum error.
 - Complete: a budget-preflighted request owner transactionally retains all 43
   attention/FFN states and their immutable model bindings; the 4,096-token
-  footprint including ping-pong streams is 78,403,584 bytes.
+  footprint including model I/O and ping-pong streams is 79,019,044 bytes.
 - Complete: the layer controller suspends on exact cold misses and resumes the
   same routed/shared FFN after normal cache publication without recomputing
   attention or weakening top-k.

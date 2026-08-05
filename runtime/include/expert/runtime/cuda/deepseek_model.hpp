@@ -1,6 +1,7 @@
 #pragma once
 
 #include "expert/runtime/cuda/deepseek_dense.hpp"
+#include "expert/runtime/cuda/deepseek_io.hpp"
 #include "expert/runtime/cuda/deepseek_typed.hpp"
 
 #include <cstdint>
@@ -78,6 +79,8 @@ class DeepSeekResidentModelState final {
       DeepSeekAttentionBinding& destination) const noexcept;
   [[nodiscard]] Status bind_ffn(
       std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept;
+  [[nodiscard]] Status bind_io(
+      DeepSeekIoBinding& destination) const noexcept;
 
   [[nodiscard]] std::uint64_t bytes() const noexcept {
     return dense_.bytes() + typed_.bytes();

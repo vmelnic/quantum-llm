@@ -112,6 +112,13 @@ shared expert source extents and composes an independent full-block output
 through the admitted SM86 ABI. The runtime still loads the authoritative full
 checkpoint through its normal model-state/cache paths.
 
+`export-deepseek-io-oracle` closes the main-model boundary around the untied
+BF16 embedding and output head. It expands one real embedding row, applies the
+four-stream HC head and final RMSNorm with the checkpoint's BF16 rounding
+boundaries, then scans the 129,280-row head through a bounded row buffer. The
+small output contains expected streams, logits, and greedy argmax; it does not
+copy either roughly 1 GiB source tensor.
+
 ## Install
 
 From the repository root:

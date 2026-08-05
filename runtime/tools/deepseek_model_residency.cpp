@@ -241,10 +241,10 @@ std::uint32_t compression_ratio(std::uint32_t layer) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 6) {
+    if (argc != 7) {
       std::cerr << "usage: expert-deepseek-model-residency "
                    "<dense-bundle> <typed-bundle> <checkpoint> "
-                   "<attention-oracle> <routed-catalog>\n";
+                   "<attention-oracle> <routed-catalog> <io-oracle>\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
@@ -295,6 +295,48 @@ int main(int argc, char** argv) {
     require(request.status.ok() && request.state &&
                 request.state->bytes() == request_size.total_bytes,
             std::string(request.status.message()));
+    const auto io_input = integers(
+        std::filesystem::path(argv[6]) / "input.u32", 1U);
+    const auto expected_io_streams = floats(
+        std::filesystem::path(argv[6]) / "streams.f32", 4U * 4096U);
+    const auto expected_logits = floats(
+        std::filesystem::path(argv[6]) / "logits.f32", 129280U);
+    const auto expected_sampled = integers(
+        std::filesystem::path(argv[6]) / "sampled.u32", 1U);
+    auto io_status = request.state->embed(io_input[0]);
+    require(io_status.ok(), std::string(io_status.message()));
+    check(cudaDeviceSynchronize(), "synchronize DeepSeek embedding");
+    std::vector<float> actual_io_streams(4U * 4096U);
+    check(cudaMemcpy(actual_io_streams.data(), request.state->current_streams(),
+                     actual_io_streams.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy DeepSeek embedding");
+    float embedding_maximum = 0.0F;
+    for (std::size_t index = 0U; index < actual_io_streams.size(); ++index)
+      embedding_maximum = std::max(
+          embedding_maximum,
+          std::abs(actual_io_streams[index] - expected_io_streams[index]));
+    require(embedding_maximum == 0.0F,
+            "DeepSeek embedding differs from the BF16 source row");
+    io_status = request.state->project_logits();
+    require(io_status.ok(), std::string(io_status.message()));
+    check(cudaDeviceSynchronize(), "synchronize DeepSeek output head");
+    std::vector<float> actual_logits(129280U);
+    std::uint32_t actual_sampled = 0U;
+    check(cudaMemcpy(actual_logits.data(), request.state->logits(),
+                     actual_logits.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy DeepSeek logits");
+    check(cudaMemcpy(&actual_sampled, request.state->sampled_token(),
+                     sizeof(actual_sampled), cudaMemcpyDeviceToHost),
+          "copy DeepSeek sampled token");
+    double logits_squared = 0.0;
+    float logits_maximum = 0.0F;
+    for (std::size_t index = 0U; index < actual_logits.size(); ++index) {
+      const auto error = std::abs(actual_logits[index] - expected_logits[index]);
+      logits_maximum = std::max(logits_maximum, error);
+      logits_squared += static_cast<double>(error) * error;
+    }
+    require(actual_sampled == expected_sampled[0] && logits_maximum < 0.1F,
+            "DeepSeek output head differs from the independent oracle");
     std::uint32_t ratio_zero_layers = 0U, ratio_four_layers = 0U;
     std::uint32_t ratio_128_layers = 0U;
     for (std::uint32_t layer = 0U;
@@ -705,7 +747,13 @@ int main(int argc, char** argv) {
               << ",\"request_attention_bytes\":"
               << request_size.attention_bytes
               << ",\"request_ffn_bytes\":" << request_size.ffn_bytes
+              << ",\"request_io_bytes\":" << request_size.io_bytes
               << ",\"request_stream_bytes\":" << request_size.stream_bytes
+              << ",\"embedding_max_abs_error\":" << embedding_maximum
+              << ",\"head_rmse\":"
+              << std::sqrt(logits_squared / actual_logits.size())
+              << ",\"head_max_abs_error\":" << logits_maximum
+              << ",\"head_sampled_token\":" << actual_sampled
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
               << ",\"decode_tokens\":" << decode_tokens
               << ",\"attention_ms\":" << attention_ms

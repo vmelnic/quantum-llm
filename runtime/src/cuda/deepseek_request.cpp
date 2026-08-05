@@ -29,31 +29,36 @@ bool add_checked(std::uint64_t value, std::uint64_t& total) noexcept {
 
 DeepSeekRequestStateSize deepseek_request_state_size(
     std::uint32_t max_context_tokens) noexcept {
-  DeepSeekRequestStateSize result{Status::success(), 0U, 0U, kStreamBytes,
-                                  0U};
+  DeepSeekRequestStateSize result{Status::success(), 0U, 0U,
+                                  deepseek_io_state_size(), kStreamBytes, 0U};
   for (const auto ratio : kCompressionRatios) {
     const auto size = deepseek_attention_state_size(ratio, max_context_tokens);
-    if (!size.status.ok()) return {size.status, 0U, 0U, 0U, 0U};
+    if (!size.status.ok()) return {size.status, 0U, 0U, 0U, 0U, 0U};
     if (!add_checked(size.bytes, result.attention_bytes)) {
       return {{ErrorCode::invalid_argument,
-               "DeepSeek attention state size overflow"}, 0U, 0U, 0U, 0U};
+               "DeepSeek attention state size overflow"},
+              0U, 0U, 0U, 0U, 0U};
     }
   }
   const auto ffn_layer_bytes = deepseek_ffn_state_size();
   if (ffn_layer_bytes > std::numeric_limits<std::uint64_t>::max() /
                              kDeepSeekLayers) {
     return {{ErrorCode::invalid_argument, "DeepSeek FFN state size overflow"},
-            0U, 0U, 0U, 0U};
+            0U, 0U, 0U, 0U, 0U};
   }
   result.ffn_bytes = ffn_layer_bytes * kDeepSeekLayers;
   result.total_bytes = result.attention_bytes;
   if (!add_checked(result.ffn_bytes, result.total_bytes)) {
     return {{ErrorCode::invalid_argument, "DeepSeek request state size overflow"},
-            0U, 0U, 0U, 0U};
+            0U, 0U, 0U, 0U, 0U};
+  }
+  if (!add_checked(result.io_bytes, result.total_bytes)) {
+    return {{ErrorCode::invalid_argument, "DeepSeek I/O state size overflow"},
+            0U, 0U, 0U, 0U, 0U};
   }
   if (!add_checked(result.stream_bytes, result.total_bytes)) {
     return {{ErrorCode::invalid_argument, "DeepSeek stream state size overflow"},
-            0U, 0U, 0U, 0U};
+            0U, 0U, 0U, 0U, 0U};
   }
   return result;
 }
@@ -68,6 +73,17 @@ DeepSeekLayerStateView DeepSeekRequestState::layer(
   return {&attention_weights_[index], attention_states_[index].get(),
           &ffn_weights_[index], ffn_states_[index].get(),
           kCompressionRatios[index]};
+}
+
+Status DeepSeekRequestState::embed(std::uint32_t token,
+                                   void* stream) noexcept {
+  return deepseek_embed(io_weights_, token, streams_a_, stream);
+}
+
+Status DeepSeekRequestState::project_logits(void* stream) noexcept {
+  if (!io_state_)
+    return {ErrorCode::internal, "DeepSeek request has no I/O state"};
+  return deepseek_head(io_weights_, streams_a_, *io_state_, 1e-6F, stream);
 }
 
 DeepSeekRequestStateResult create_deepseek_request_state(
@@ -90,8 +106,17 @@ DeepSeekRequestStateResult create_deepseek_request_state(
   candidate->model_ = std::move(model);
   candidate->max_context_tokens_ = config.max_context_tokens;
   std::uint64_t actual_bytes = 0U;
+  auto status = candidate->model_->bind_io(candidate->io_weights_);
+  if (!status.ok()) return {status, {}};
+  auto io = create_deepseek_io_state();
+  if (!io.status.ok()) return {io.status, {}};
+  candidate->io_state_ = std::move(io.state);
+  if (!add_checked(candidate->io_state_->bytes(), actual_bytes)) {
+    return {{ErrorCode::internal,
+             "DeepSeek allocated I/O state size overflow"}, {}};
+  }
   for (std::uint32_t layer = 0U; layer < kDeepSeekLayers; ++layer) {
-    auto status = candidate->model_->bind_attention(
+    status = candidate->model_->bind_attention(
         layer, kCompressionRatios[layer],
         candidate->attention_weights_[layer]);
     if (!status.ok()) return {status, {}};

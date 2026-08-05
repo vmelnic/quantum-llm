@@ -16,6 +16,7 @@ from .deepseek_slice import (
     export_deepseek_routed_catalog,
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
+    export_deepseek_io_oracle,
     export_deepseek_csa_slice,
     export_deepseek_attention_oracle,
     export_deepseek_typed_set,
@@ -113,6 +114,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     routed_catalog_parser.add_argument("--source", type=Path, required=True)
     routed_catalog_parser.add_argument("--output", type=Path, required=True)
+    io_oracle_parser = commands.add_parser(
+        "export-deepseek-io-oracle",
+        help="emit an independent embedding and output-head oracle",
+    )
+    io_oracle_parser.add_argument("--source", type=Path, required=True)
+    io_oracle_parser.add_argument("--output", type=Path, required=True)
+    io_oracle_parser.add_argument("--token", type=int, default=42)
+    io_oracle_parser.add_argument("--row-chunk", type=int, default=512)
     shared_parser = commands.add_parser(
         "export-deepseek-shared",
         help="describe one FP8 shared expert as bounded SafeTensors extents",
@@ -230,6 +239,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "export-deepseek-routed-catalog":
             result = export_deepseek_routed_catalog(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        elif args.command == "export-deepseek-io-oracle":
+            result = export_deepseek_io_oracle(
+                SafeTensorCheckpoint(args.source), output=args.output,
+                token=args.token, row_chunk=args.row_chunk,
             )
         elif args.command == "export-deepseek-shared":
             result = export_deepseek_shared_expert(

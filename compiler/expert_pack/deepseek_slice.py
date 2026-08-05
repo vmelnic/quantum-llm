@@ -1567,6 +1567,113 @@ def export_deepseek_routed_catalog(
         raise
 
 
+def export_deepseek_io_oracle(
+    checkpoint: SafeTensorCheckpoint, *, output: Path, token: int = 42,
+    row_chunk: int = 512,
+) -> dict[str, object]:
+    """Emit an independent embedding → HC head → logits oracle."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for the DeepSeek I/O oracle")
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= token < 129_280 or row_chunk <= 0:
+        raise AdapterError("invalid DeepSeek I/O oracle token or row chunk")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"DeepSeek I/O oracle output exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+
+    def tensor(name: str, shape: tuple[int, ...], dtype: str) -> object:
+        info = checkpoint.tensors[name]
+        if info.shape != shape or info.dtype != dtype:
+            raise SourceFormatError(f"invalid DeepSeek I/O tensor: {name}")
+        with checkpoint.open_tensor(name) as view:
+            if dtype == "BF16":
+                return _bf16_to_f32(view.raw, shape).copy()
+            return np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
+
+    try:
+        embedding_info = checkpoint.tensors["embed.weight"]
+        if embedding_info.shape != (129_280, 4096) or \
+                embedding_info.dtype != "BF16":
+            raise SourceFormatError("invalid DeepSeek embedding geometry")
+        with (checkpoint.root / embedding_info.shard).open(
+            "rb", buffering=0
+        ) as source:
+            source.seek(embedding_info.offset + token * 4096 * 2)
+            raw = source.read(4096 * 2)
+        if len(raw) != 4096 * 2:
+            raise SourceFormatError("truncated DeepSeek embedding row")
+        embedding = _bf16_to_f32(raw, (4096,)).copy()
+        streams = np.repeat(embedding[None, :], 4, axis=0)
+        flat = streams.reshape(-1).astype(np.float32)
+        function = tensor("hc_head_fn", (4, 4 * 4096), "F32")
+        base = tensor("hc_head_base", (4,), "F32")
+        scale = tensor("hc_head_scale", (1,), "F32")
+        inverse = np.float32(
+            1.0 / math.sqrt(float(np.mean(np.square(flat, dtype=np.float32))) + 1e-6)
+        )
+        mixes = np.matmul(function, flat * inverse, dtype=np.float32)
+        pre = 1.0 / (1.0 + np.exp(-(mixes * scale[0] + base))) + 1e-6
+        collapsed = np.sum(pre[:, None] * streams, axis=0, dtype=np.float32)
+        collapsed = _bf16_to_f32(
+            _f32_to_bf16_words(collapsed).tobytes(), (4096,)
+        ).copy()
+        norm = tensor("norm.weight", (4096,), "BF16")
+        inverse = np.float32(
+            1.0 / math.sqrt(
+                float(np.mean(np.square(collapsed, dtype=np.float32))) + 1e-6
+            )
+        )
+        normalized = collapsed * inverse * norm
+        normalized = _bf16_to_f32(
+            _f32_to_bf16_words(normalized).tobytes(), (4096,)
+        ).copy()
+
+        head_info = checkpoint.tensors["head.weight"]
+        if head_info.shape != (129_280, 4096) or head_info.dtype != "BF16":
+            raise SourceFormatError("invalid DeepSeek output-head geometry")
+        logits = np.empty(129_280, dtype="<f4")
+        row_bytes = 4096 * 2
+        with (checkpoint.root / head_info.shard).open(
+            "rb", buffering=0
+        ) as source:
+            for first in range(0, 129_280, row_chunk):
+                count = min(row_chunk, 129_280 - first)
+                source.seek(head_info.offset + first * row_bytes)
+                raw = source.read(count * row_bytes)
+                if len(raw) != count * row_bytes:
+                    raise SourceFormatError("truncated DeepSeek output-head rows")
+                matrix = _bf16_to_f32(raw, (count, 4096))
+                logits[first:first + count] = np.matmul(
+                    matrix, normalized, dtype=np.float32
+                )
+        sampled = int(np.argmax(logits))
+        (partial / "streams.f32").write_bytes(streams.astype("<f4").tobytes())
+        (partial / "logits.f32").write_bytes(logits.tobytes())
+        (partial / "sampled.u32").write_bytes(
+            sampled.to_bytes(4, "little", signed=False)
+        )
+        (partial / "input.u32").write_bytes(
+            token.to_bytes(4, "little", signed=False)
+        )
+        result = {
+            "format": "deepseek-io-oracle-v1",
+            "token": token,
+            "hidden": 4096,
+            "vocab": 129_280,
+            "sampled_token": sampled,
+            "row_chunk": row_chunk,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise
+
+
 def export_deepseek_shared_expert(
     checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
 ) -> dict[str, object]:

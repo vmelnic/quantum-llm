@@ -139,6 +139,13 @@ exact top-6 route is present. Other runnable requests continue while a route is
 on SSD/I/O/H2D. Shared expert 256 is not silently loaded from the routed catalog:
 it must be held by the resident model set, otherwise the request fails closed.
 
+DeepSeek request admission also budgets the complete output surface: HC-head
+workspace, 129,280 FP32 logits, and one sampled token. Embedding and head
+bindings point into the immutable typed model state. The runtime rounds at the
+same BF16 boundaries as the reference before final normalization/projection;
+greedy argmax is device-side, so ordinary decode does not copy full logits to
+the host.
+
 `HybridDispatchPlanner` receives one unique candidate per routed expert. It
 keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
 balances flexible RAM misses by projected critical path. Current synchronous

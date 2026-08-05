@@ -19,6 +19,7 @@ $bundle = Join-Path (Join-Path $script:RepoRoot "work") "deepseek-model-$stamp"
 $dense = Join-Path $bundle "dense"
 $typed = Join-Path $bundle "typed"
 $oracle = Join-Path $bundle "attention-oracle"
+$ioOracle = Join-Path $bundle "io-oracle"
 $catalog = if ($RoutedCatalog) {
     [System.IO.Path]::GetFullPath($RoutedCatalog)
 } else {
@@ -44,7 +45,11 @@ try {
     & $python.Source -m compiler export-deepseek-attention-oracle --source $source `
         --output $oracle --layer $OracleLayer | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek attention oracle export failed" }
-    $nativeRaw = & $executable $dense $typed $source $oracle $catalog | Out-String
+    & $python.Source -m compiler export-deepseek-io-oracle --source $source `
+        --output $ioOracle | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DeepSeek I/O oracle export failed" }
+    $nativeRaw = & $executable $dense $typed $source $oracle $catalog `
+        $ioOracle | Out-String
     if ($LASTEXITCODE -ne 0) {
         Write-Output $nativeRaw
         throw "DeepSeek model residency failed"

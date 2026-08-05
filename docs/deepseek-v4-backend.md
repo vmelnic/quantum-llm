@@ -529,9 +529,10 @@ owner. Construction is transactional and budgeted:
 4. allocate all layer states into a private candidate;
 5. publish only after all 43 layers are complete.
 
-At a 4,096-token context the complete state is 78,403,584 bytes: 70,060,544
-bytes of attention/cache/workspace state, 8,211,968 bytes of FFN workspace, and
-131,072 bytes for the two four-stream ping-pong buffers.
+At a 4,096-token context the complete state is 79,019,044 bytes: 70,060,544
+bytes of attention/cache/workspace state, 8,211,968 bytes of FFN workspace,
+615,460 bytes for HC-head/logits/argmax state, and 131,072 bytes for the two
+four-stream ping-pong buffers.
 The real model gate confirmed all 43 bindings and rejected a budget one byte
 below the estimate before allocation. Execution order is owned separately by
 the decode controller and its non-blocking outer scheduler, so request-state
@@ -575,5 +576,14 @@ The real layer-2 gate kept the shared expert resident, admitted six routed
 experts from the complete catalog with a two-acquire global limit, and resumed
 without rerunning attention or routing. It observed six completed acquisitions,
 a peak of two in flight, and reproduced the block oracle with `4.76122e-4`
-maximum error. The remaining full-model boundary is embedding, output head,
-tokenizer/sampling, and connection to the HTTP worker—not expert orchestration.
+maximum error.
+
+The resident model now binds the untied BF16 embedding, final norm, output
+head, and F32 HC-head controls without creating another weight allocation.
+Request-owned I/O state expands one embedding row into four streams, applies
+the official BF16 boundaries around HC collapse/final RMSNorm, projects all
+129,280 logits, and computes greedy argmax. Against a bounded independent
+oracle, embedding was bit-exact, logits had `6.89e-7` RMSE and `5.72e-6`
+maximum error, and argmax matched token 65,270. The remaining full-model
+boundary is tokenizer integration, a token-level controller that joins this
+front/back path to `[0,43)`, and the HTTP worker—not expert orchestration.
