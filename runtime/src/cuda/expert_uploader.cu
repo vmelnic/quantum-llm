@@ -1,4 +1,6 @@
 #include "expert/runtime/cuda/expert_uploader.hpp"
+#include "expert/runtime/cuda/deepseek_admission.hpp"
+#include "expert/runtime/expert_record.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -109,6 +111,51 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   cursor += sections.down_q_bytes;
   auto* down_scales = reinterpret_cast<float*>(cursor);
   const auto source = request.complete_record.data();
+  if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86) {
+    void* compact_raw = nullptr;
+    error = cudaMallocAsync(&compact_raw, request.complete_record.size(), stream);
+    if (error == cudaSuccess) {
+      error = cudaMemcpyAsync(compact_raw, source, request.complete_record.size(),
+                              cudaMemcpyHostToDevice, stream);
+    }
+    Status admission = error == cudaSuccess
+                           ? Status::success()
+                           : cuda_failure("DeepSeek compact H2D", error);
+    const auto* compact = static_cast<const std::uint8_t*>(compact_raw);
+    const auto launch = [&](std::uint64_t weight_offset,
+                            std::uint64_t scale_offset, std::int8_t* output,
+                            float* output_scales, std::uint32_t rows,
+                            std::uint32_t columns) {
+      if (!admission.ok()) return;
+      admission = admit_deepseek_projection(
+          {compact + weight_offset, compact + scale_offset, output,
+           output_scales, rows, columns, stream});
+    };
+    if (admission.ok()) {
+      launch(request.compact.w1_weight_offset, request.compact.w1_scale_offset,
+             gate, gate_scales, 2048U, 4096U);
+      launch(request.compact.w3_weight_offset, request.compact.w3_scale_offset,
+             gate + 2048ULL * 4096U, gate_scales + 2048U, 2048U, 4096U);
+      launch(request.compact.w2_weight_offset, request.compact.w2_scale_offset,
+             down, down_scales, 4096U, 2048U);
+    }
+    if (compact_raw != nullptr) {
+      static_cast<void>(cudaFreeAsync(compact_raw, stream));
+      static_cast<void>(cudaStreamSynchronize(stream));
+    }
+    if (!admission.ok()) {
+      static_cast<void>(cudaFreeAsync(raw, stream));
+      static_cast<void>(cudaStreamSynchronize(stream));
+      stream_lock.unlock();
+      completion({admission, {}, 0});
+      return operation;
+    }
+    auto allocation = std::make_shared<CudaExpertAllocation>(
+        pool_, raw, total, gate, gate_scales, down, down_scales);
+    stream_lock.unlock();
+    completion({Status::success(), std::move(allocation), total});
+    return operation;
+  }
   const auto copy = [&](void* destination, std::uint64_t offset,
                         std::uint64_t bytes) {
     return cudaMemcpyAsync(destination, source + offset,

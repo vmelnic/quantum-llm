@@ -41,6 +41,7 @@ struct UploadRequest final {
   ExpertKey key;
   ExpertSections sections;
   std::span<const std::byte> complete_record;
+  DeepSeekCompactSections compact;
 };
 
 struct UploadResult final {

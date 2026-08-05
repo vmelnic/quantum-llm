@@ -69,6 +69,29 @@ void test_deepseek_compact_and_sm86_hot_abi() {
   require(rejected, "DeepSeek hot-cache ABI accepted unsafe alignment");
 }
 
+void test_deepseek_compact_admission_validation() {
+  std::vector<std::byte> bytes(13'369'344U);
+  for (std::size_t index = 0; index < bytes.size(); ++index)
+    bytes[index] = static_cast<std::byte>((index * 29U + 7U) & 0xffU);
+  er::PayloadRecord record;
+  record.stored_bytes = bytes.size();
+  record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
+  record.device_bytes = 25'198'592U;
+  record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
+  record.header_bytes = 0U;
+  record.alignment = 1U;
+  record.payload_sha256 = er::sha256(bytes);
+  const er::ExpertKey key{17U, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86};
+  const auto valid = er::validate_expert_admission(bytes, key, record);
+  require(valid.status.ok() && valid.target.hidden == 4096U &&
+              valid.target.down_scale_offset == 25'182'208U &&
+              valid.compact.w2_scale_offset == 13'107'200U,
+          "valid DeepSeek compact admission was rejected");
+  bytes.back() ^= std::byte{1};
+  require(!er::validate_expert_admission(bytes, key, record).status.ok(),
+          "corrupt DeepSeek compact admission was accepted");
+}
+
 template <typename T>
 void write_le(std::byte* output, T value) {
   using Unsigned = std::make_unsigned_t<T>;
@@ -971,6 +994,7 @@ void test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic() {
 int main() {
   try {
     test_deepseek_compact_and_sm86_hot_abi();
+    test_deepseek_compact_admission_validation();
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();
     test_ready_first_grouped_scheduler();

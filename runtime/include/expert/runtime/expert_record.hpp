@@ -13,6 +13,9 @@ inline constexpr std::uint16_t kExpertPackVersion = 1;
 inline constexpr std::uint32_t kExpertHeaderBytes = 256;
 inline constexpr std::uint32_t kExpertPackAlignment = 4096;
 inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow = 1;
+inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 = 2;
+inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
+inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 = 2;
 
 struct ExpertSections final {
   std::uint32_t hidden{};
@@ -33,6 +36,27 @@ struct ValidatedExpertRecord final {
   std::span<const std::byte> payload;
 };
 
+struct DeepSeekCompactSections final {
+  std::uint64_t w1_weight_offset{};
+  std::uint64_t w1_weight_bytes{};
+  std::uint64_t w1_scale_offset{};
+  std::uint64_t w1_scale_bytes{};
+  std::uint64_t w3_weight_offset{};
+  std::uint64_t w3_weight_bytes{};
+  std::uint64_t w3_scale_offset{};
+  std::uint64_t w3_scale_bytes{};
+  std::uint64_t w2_weight_offset{};
+  std::uint64_t w2_weight_bytes{};
+  std::uint64_t w2_scale_offset{};
+  std::uint64_t w2_scale_bytes{};
+};
+
+struct ExpertAdmissionValidation final {
+  Status status;
+  ExpertSections target;
+  DeepSeekCompactSections compact;
+};
+
 struct ExpertRecordValidation final {
   Status status;
   ValidatedExpertRecord record;
@@ -45,5 +69,10 @@ struct ExpertRecordValidation final {
     std::span<const std::byte> bytes, const ExpertKey& expected_key,
     const PayloadRecord& expected_record) noexcept;
 
-}  // namespace expert::runtime
+// Representation-aware cache gate. It validates either an Expert Pack record
+// or a compact DeepSeek staging payload and returns the exact device target.
+[[nodiscard]] ExpertAdmissionValidation validate_expert_admission(
+    std::span<const std::byte> bytes, const ExpertKey& expected_key,
+    const PayloadRecord& expected_record) noexcept;
 
+}  // namespace expert::runtime

@@ -32,6 +32,7 @@ bool same_record(const PayloadRecord& left, const PayloadRecord& right) {
          left.stored_bytes == right.stored_bytes &&
          left.decoded_bytes == right.decoded_bytes &&
          left.device_bytes == right.device_bytes &&
+         left.source_abi == right.source_abi &&
          left.header_bytes == right.header_bytes &&
          left.alignment == right.alignment &&
          constant_time_equal(left.payload_sha256, right.payload_sha256);
@@ -59,6 +60,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::shared_ptr<std::vector<std::byte>> host_copy;
     std::shared_ptr<IDeviceAllocation> device;
     std::optional<ExpertSections> validated_sections;
+    DeepSeekCompactSections validated_compact;
     std::uint64_t ram_reserved{};
     std::uint64_t vram_reserved{};
     std::uint64_t references{};
@@ -623,12 +625,14 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       return;
     }
     ExpertSections sections;
+    DeepSeekCompactSections compact;
     if (entry->validated_sections) {
       sections = *entry->validated_sections;
+      compact = entry->validated_compact;
       Telemetry::add(metrics.validated_ram_reuses_);
     } else {
       const auto validated =
-          validate_expert_record(bytes, entry->key, entry->record);
+          validate_expert_admission(bytes, entry->key, entry->record);
       Telemetry::add(metrics.record_validations_);
       if (!validated.status.ok()) {
         {
@@ -639,8 +643,10 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         drive();
         return;
       }
-      sections = validated.record.sections;
+      sections = validated.target;
+      compact = validated.compact;
       entry->validated_sections = sections;
+      entry->validated_compact = compact;
     }
 
     if (config.retain_host_copy && !entry->host_copy) {
@@ -660,7 +666,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
 
     auto weak = weak_from_this();
-    UploadRequest request{entry->key, sections, bytes};
+    UploadRequest request{entry->key, sections, bytes, compact};
     const auto operation = uploader->upload(
         request, [weak, key = entry->key](UploadResult result) mutable {
           if (auto core = weak.lock()) {
@@ -860,7 +866,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     const auto iterator = entries.find(key);
     if (iterator == entries.end()) return std::nullopt;
     auto& entry = *iterator->second;
-    if (!same_record(entry.record, record) || !entry.host_copy ||
+    if (record.source_abi != kExpertSourceAbiExpertPackV1 ||
+        !same_record(entry.record, record) || !entry.host_copy ||
         !entry.validated_sections ||
         (entry.state != CacheState::ram_ready &&
          entry.state != CacheState::vram_ready)) {

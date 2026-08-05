@@ -53,6 +53,9 @@ struct PayloadRecord final {
   // Exact device allocation produced by admission. Zero preserves the legacy
   // invariant that stored bytes and device bytes are equal.
   std::uint64_t device_bytes{};
+  // Source payload ABI. One is Expert Pack v1; two is the compact DeepSeek
+  // staging order validated before CUDA admission.
+  std::uint32_t source_abi{1};
   std::uint32_t header_bytes{256};
   std::uint32_t alignment{4096};
   Sha256Digest payload_sha256{};

@@ -230,28 +230,35 @@ def export_deepseek_compact_expert(
     total_bytes = 0
     try:
         prefix = f"layers.{layer}.ffn.experts.{expert}"
-        for projection in ("w1", "w2", "w3"):
-            for kind in ("weight", "scale"):
-                name = f"{prefix}.{projection}.{kind}"
-                info = checkpoint.tensors[name]
-                filename = f"{projection}.{kind}.bin"
-                digest = hashlib.sha256()
-                with checkpoint.open_tensor(name) as view, (
-                    partial / filename
-                ).open("xb") as handle:
-                    digest.update(view.raw)
-                    write_all(handle, view.raw)
-                    handle.flush()
-                    os.fsync(handle.fileno())
-                tensors.append({
-                    "name": name,
-                    "file": filename,
-                    "dtype": info.dtype,
-                    "shape": list(info.shape),
-                    "bytes": info.nbytes,
-                    "sha256": digest.hexdigest(),
-                })
-                total_bytes += info.nbytes
+        combined_digest = hashlib.sha256()
+        combined_path = partial / "expert.compact.bin"
+        with combined_path.open("xb") as combined:
+            for projection in ("w1", "w3", "w2"):
+                for kind in ("weight", "scale"):
+                    name = f"{prefix}.{projection}.{kind}"
+                    info = checkpoint.tensors[name]
+                    filename = f"{projection}.{kind}.bin"
+                    digest = hashlib.sha256()
+                    with checkpoint.open_tensor(name) as view, (
+                        partial / filename
+                    ).open("xb") as handle:
+                        digest.update(view.raw)
+                        combined_digest.update(view.raw)
+                        write_all(handle, view.raw)
+                        write_all(combined, view.raw)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    tensors.append({
+                        "name": name,
+                        "file": filename,
+                        "dtype": info.dtype,
+                        "shape": list(info.shape),
+                        "bytes": info.nbytes,
+                        "sha256": digest.hexdigest(),
+                    })
+                    total_bytes += info.nbytes
+            combined.flush()
+            os.fsync(combined.fileno())
         manifest = {
             "format": "deepseek-compact-expert-fixture-v1",
             "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
@@ -259,6 +266,11 @@ def export_deepseek_compact_expert(
             "layer": layer,
             "expert": expert,
             "bytes": total_bytes,
+            "combined": {
+                "file": combined_path.name,
+                "bytes": total_bytes,
+                "sha256": combined_digest.hexdigest(),
+            },
             "tensors": tensors,
         }
         atomic_json(partial / "manifest.json", manifest)

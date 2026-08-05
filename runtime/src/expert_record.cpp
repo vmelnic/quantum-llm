@@ -32,6 +32,11 @@ ExpertRecordValidation failure(ErrorCode code, std::string message) noexcept {
   return {Status(code, std::move(message)), {}};
 }
 
+ExpertAdmissionValidation admission_failure(ErrorCode code,
+                                             std::string message) noexcept {
+  return {Status(code, std::move(message)), {}, {}};
+}
+
 bool multiply(std::uint64_t left, std::uint64_t right,
               std::uint64_t& result) noexcept {
   if (left != 0 && right > std::numeric_limits<std::uint64_t>::max() / left) {
@@ -151,6 +156,60 @@ ExpertRecordValidation validate_expert_record(
   }
 
   return {Status::success(), {sections, bytes, payload}};
+}
+
+ExpertAdmissionValidation validate_expert_admission(
+    std::span<const std::byte> bytes, const ExpertKey& key,
+    const PayloadRecord& expected) noexcept {
+  if (key.quant_abi == kExpertQuantAbiInt8PerRow &&
+      expected.source_abi == kExpertSourceAbiExpertPackV1) {
+    const auto validated = validate_expert_record(bytes, key, expected);
+    return {validated.status, validated.record.sections, {}};
+  }
+  if (key.quant_abi != kExpertQuantAbiDeepSeekSm86 ||
+      expected.source_abi != kExpertSourceAbiDeepSeekCompactV1) {
+    return admission_failure(ErrorCode::invalid_argument,
+                             "unsupported source/target expert ABI pair");
+  }
+  constexpr std::uint64_t kWeightBytes = 4'194'304U;
+  constexpr std::uint64_t kScaleBytes = 262'144U;
+  constexpr std::uint64_t kSourceBytes = 13'369'344U;
+  constexpr std::uint64_t kDeviceBytes = 25'198'592U;
+  if (expected.stored_bytes != kSourceBytes || bytes.size() != kSourceBytes ||
+      expected.device_bytes != kDeviceBytes || expected.header_bytes != 0U ||
+      expected.decoded_bytes != 3ULL * 4096U * 2048U * sizeof(float)) {
+    return admission_failure(ErrorCode::checksum_mismatch,
+                             "DeepSeek compact admission geometry mismatch");
+  }
+  if (!constant_time_equal(sha256(bytes), expected.payload_sha256)) {
+    return admission_failure(ErrorCode::checksum_mismatch,
+                             "DeepSeek compact payload SHA-256 mismatch");
+  }
+  DeepSeekCompactSections compact{};
+  compact.w1_weight_offset = 0U;
+  compact.w1_weight_bytes = kWeightBytes;
+  compact.w1_scale_offset = compact.w1_weight_offset + kWeightBytes;
+  compact.w1_scale_bytes = kScaleBytes;
+  compact.w3_weight_offset = compact.w1_scale_offset + kScaleBytes;
+  compact.w3_weight_bytes = kWeightBytes;
+  compact.w3_scale_offset = compact.w3_weight_offset + kWeightBytes;
+  compact.w3_scale_bytes = kScaleBytes;
+  compact.w2_weight_offset = compact.w3_scale_offset + kScaleBytes;
+  compact.w2_weight_bytes = kWeightBytes;
+  compact.w2_scale_offset = compact.w2_weight_offset + kWeightBytes;
+  compact.w2_scale_bytes = kScaleBytes;
+  ExpertSections target{};
+  target.hidden = 4096U;
+  target.intermediate = 2048U;
+  target.gate_up_q_offset = 0U;
+  target.gate_up_q_bytes = 16'777'216U;
+  target.gate_up_scale_offset = 16'777'216U;
+  target.gate_up_scale_bytes = 16'384U;
+  target.down_q_offset = 16'793'600U;
+  target.down_q_bytes = 8'388'608U;
+  target.down_scale_offset = 25'182'208U;
+  target.down_scale_bytes = 16'384U;
+  return {Status::success(), target, compact};
 }
 
 }  // namespace expert::runtime
