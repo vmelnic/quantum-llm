@@ -155,3 +155,14 @@ consume roughly 58 ms before GEMM, so 30 tok/s cannot depend on cold loading at
 every layer. Hot residency, look-ahead prefetch, concurrent admission, and
 request batching remain essential. The next gate executes gate/up/down GEMM
 directly from the admitted slot and compares its output with a CPU reference.
+
+That GEMM gate now also passes for the same real expert. The existing SM86
+INT8-per-row MoE kernels consumed the admitted slot without repacking and
+completed gate + up + SiLU + down in 0.493 ms for one deterministic activation.
+Against the CPU calculation, output RMSE was `1.02e-8` and maximum absolute
+error was `4.47e-8`.
+
+This proves the compact source → CUDA admission → compute path end to end for
+one expert. It does not imply model tok/s: top-6 scheduling across 43 layers,
+shared experts, dense FP8 tensors, CSA/HCA attention, routing, KV state, cache
+misses, and concurrent requests still have to be integrated and measured.

@@ -104,5 +104,7 @@ independently proven.
   ABI, with exact layout enforced by native runtime tests.
 - Complete: compact H2D plus SM86 admission for one real expert; the complete
   hot slot is byte-identical to the independent candidate and takes 9.73 ms.
-- Next: execute and qualify gate/up/down GEMM from that admitted slot, then
-  connect publication, eviction, and prefetch to the runtime cache.
+- Complete: gate/up/SILU/down CUDA execution directly from the admitted slot;
+  one real expert takes 0.493 ms and matches the CPU output within `4.47e-8`.
+- Next: connect atomic publication, eviction, and prefetch to the runtime cache,
+  then implement shared-expert and dense/CSA/HCA execution.

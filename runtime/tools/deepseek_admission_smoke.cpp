@@ -1,14 +1,17 @@
 #include "expert/runtime/cuda/deepseek_admission.hpp"
+#include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/sha256.hpp"
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <cmath>
 #include <iomanip>
 #include <iostream>
 #include <stdexcept>
@@ -57,6 +60,35 @@ std::string hex_digest(const er::Sha256Digest& digest) {
     output << std::setw(2) << std::to_integer<unsigned>(value);
   }
   return output.str();
+}
+
+std::vector<float> cpu_expert(const std::vector<std::byte>& slot,
+                              const er::DeepSeekSm86HotLayout& layout,
+                              const er::DeepSeekExpertGeometry& geometry,
+                              const std::vector<float>& input) {
+  const auto* gate = reinterpret_cast<const std::int8_t*>(slot.data() + layout.gate_up_q.offset);
+  const auto* scales = reinterpret_cast<const float*>(slot.data() + layout.gate_up_scales.offset);
+  const auto* down = reinterpret_cast<const std::int8_t*>(slot.data() + layout.down_q.offset);
+  const auto* down_scales = reinterpret_cast<const float*>(slot.data() + layout.down_scales.offset);
+  std::vector<float> intermediate(geometry.intermediate);
+  for (std::uint32_t row = 0; row < geometry.intermediate; ++row) {
+    double g = 0.0, u = 0.0;
+    for (std::uint32_t column = 0; column < geometry.hidden; ++column) {
+      g += gate[static_cast<std::size_t>(row) * geometry.hidden + column] * input[column];
+      u += gate[(static_cast<std::size_t>(geometry.intermediate + row) * geometry.hidden) + column] * input[column];
+    }
+    const auto gf = static_cast<float>(g) * scales[row];
+    const auto uf = static_cast<float>(u) * scales[geometry.intermediate + row];
+    intermediate[row] = (gf / (1.0F + std::exp(-gf))) * uf;
+  }
+  std::vector<float> output(geometry.hidden);
+  for (std::uint32_t row = 0; row < geometry.hidden; ++row) {
+    double sum = 0.0;
+    for (std::uint32_t column = 0; column < geometry.intermediate; ++column)
+      sum += down[static_cast<std::size_t>(row) * geometry.intermediate + column] * intermediate[column];
+    output[row] = static_cast<float>(sum) * down_scales[row];
+  }
+  return output;
 }
 
 }  // namespace
@@ -131,10 +163,62 @@ int main(int argc, char** argv) {
     if (actual_hash != expected_hash) {
       throw std::runtime_error("CUDA hot-slot hash mismatch: " + actual_hash);
     }
+    std::vector<float> input(geometry.hidden);
+    for (std::uint32_t i = 0; i < geometry.hidden; ++i)
+      input[i] = std::sin(static_cast<float>(i) * 0.013F) * 0.25F;
+    const auto reference = cpu_expert(result, layout, geometry, input);
+    float *d_input{}, *d_intermediate{}, *d_output{}, *d_routing{};
+    const std::int8_t** d_gate_table{};
+    const std::int8_t** d_down_table{};
+    const float** d_gate_scale_table{};
+    const float** d_down_scale_table{};
+    check(cudaMalloc(reinterpret_cast<void**>(&d_input), input.size() * sizeof(float)), "cudaMalloc input");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_intermediate), geometry.intermediate * sizeof(float)), "cudaMalloc intermediate");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_output), geometry.hidden * sizeof(float)), "cudaMalloc output");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_routing), sizeof(float)), "cudaMalloc routing");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_gate_table), sizeof(void*)), "cudaMalloc gate table");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_down_table), sizeof(void*)), "cudaMalloc down table");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_gate_scale_table), sizeof(void*)), "cudaMalloc gate scale table");
+    check(cudaMalloc(reinterpret_cast<void**>(&d_down_scale_table), sizeof(void*)), "cudaMalloc down scale table");
+    const std::int8_t* h_gate = gate_q;
+    const std::int8_t* h_down = down_q;
+    const float* h_gate_s = gate_s;
+    const float* h_down_s = down_s;
+    const float routing = 1.0F;
+    check(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input");
+    check(cudaMemcpy(d_routing, &routing, sizeof(float), cudaMemcpyHostToDevice), "copy routing");
+    check(cudaMemcpy(d_gate_table, &h_gate, sizeof(void*), cudaMemcpyHostToDevice), "copy gate table");
+    check(cudaMemcpy(d_down_table, &h_down, sizeof(void*), cudaMemcpyHostToDevice), "copy down table");
+    check(cudaMemcpy(d_gate_scale_table, &h_gate_s, sizeof(void*), cudaMemcpyHostToDevice), "copy gate scales");
+    check(cudaMemcpy(d_down_scale_table, &h_down_s, sizeof(void*), cudaMemcpyHostToDevice), "copy down scales");
+    check(cudaEventRecord(start), "record GEMM start");
+    const er::cuda::MoeLaunch moe{d_input, d_gate_table, d_gate_scale_table,
+        d_down_table, d_down_scale_table, d_routing, nullptr, d_intermediate,
+        d_output, geometry.hidden, geometry.intermediate, 1U, 1U, nullptr,
+        nullptr, 0U};
+    const auto moe_status = er::cuda::launch_moe_single_token(moe);
+    if (!moe_status.ok()) throw std::runtime_error(std::string(moe_status.message()));
+    check(cudaEventRecord(stop), "record GEMM stop");
+    check(cudaEventSynchronize(stop), "synchronize GEMM");
+    float gemm_ms = 0.0F;
+    check(cudaEventElapsedTime(&gemm_ms, start, stop), "GEMM elapsed");
+    std::vector<float> gpu_output(geometry.hidden);
+    check(cudaMemcpy(gpu_output.data(), d_output, gpu_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy GEMM output");
+    double squared = 0.0;
+    float max_error = 0.0F;
+    for (std::size_t i = 0; i < gpu_output.size(); ++i) {
+      const auto error = std::abs(gpu_output[i] - reference[i]);
+      max_error = std::max(max_error, error);
+      squared += static_cast<double>(error) * error;
+    }
+    const auto rmse = std::sqrt(squared / gpu_output.size());
     std::cout << "{\"ok\":true,\"abi\":\"" << er::kDeepSeekSm86HotAbi
               << "\",\"bytes\":" << layout.slot_bytes
               << ",\"sha256\":\"" << actual_hash
-              << "\",\"h2d_and_admission_ms\":" << elapsed_ms << "}\n";
+              << "\",\"h2d_and_admission_ms\":" << elapsed_ms
+              << ",\"expert_gemm_ms\":" << gemm_ms
+              << ",\"output_rmse\":" << rmse
+              << ",\"output_max_abs_error\":" << max_error << "}\n";
     check(cudaEventDestroy(start), "cudaEventDestroy start");
     check(cudaEventDestroy(stop), "cudaEventDestroy stop");
     check(cudaFree(hot), "cudaFree hot");
