@@ -1,4 +1,5 @@
 #include "expert/runtime/adaptive_placement.hpp"
+#include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
@@ -35,6 +36,37 @@ void require(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+void test_deepseek_compact_and_sm86_hot_abi() {
+  const auto geometry = er::DeepSeekExpertGeometry::v4_flash();
+  require(geometry.valid(), "DeepSeek-V4 geometry is invalid");
+  require(geometry.compact_weight_bytes(er::DeepSeekProjection::w1_gate) ==
+              4'194'304U &&
+              geometry.compact_scale_bytes(er::DeepSeekProjection::w1_gate) ==
+                  262'144U &&
+              geometry.compact_expert_bytes() == 13'369'344U,
+          "DeepSeek compact ABI byte geometry changed");
+
+  const auto layout = er::make_deepseek_sm86_hot_layout(geometry);
+  require(layout.alignment == 256U && layout.gate_up_q.offset == 0U &&
+              layout.gate_up_q.bytes == 16'777'216U &&
+              layout.gate_up_scales.offset == 16'777'216U &&
+              layout.gate_up_scales.bytes == 16'384U &&
+              layout.down_q.offset == 16'793'600U &&
+              layout.down_q.bytes == 8'388'608U &&
+              layout.down_scales.offset == 25'182'208U &&
+              layout.down_scales.bytes == 16'384U &&
+              layout.slot_bytes == 25'198'592U,
+          "DeepSeek SM86 hot-cache ABI layout changed");
+
+  bool rejected = false;
+  try {
+    static_cast<void>(er::make_deepseek_sm86_hot_layout(geometry, 192U));
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected, "DeepSeek hot-cache ABI accepted unsafe alignment");
 }
 
 template <typename T>
@@ -914,6 +946,7 @@ void test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic() {
 
 int main() {
   try {
+    test_deepseek_compact_and_sm86_hot_abi();
     test_state_machine_and_sha256();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();

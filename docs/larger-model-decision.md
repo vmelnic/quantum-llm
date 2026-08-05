@@ -100,5 +100,7 @@ independently proven.
 - Complete: FP4 E2M1 and UE8M0 numerical decoding with exhaustive value tests.
 - Complete: one real routed expert slice, bitwise PyTorch reference comparison,
   INT8 error metrics, and metadata-derived representation/space measurements.
-- Next: freeze the compact-source/hot-cache ABI and implement an SM86 expert
-  admission plus GEMM vertical slice before any full conversion.
+- Complete: platform-neutral compact-source and 25,198,592-byte SM86 hot-slot
+  ABI, with exact layout enforced by native runtime tests.
+- Next: implement SM86 expert admission plus GEMM against that slot before any
+  full conversion.

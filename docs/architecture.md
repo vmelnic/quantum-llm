@@ -193,3 +193,7 @@ distributed coordinator, expert worker, placement protocol
 
 Distributed execution will move activations to the node that owns an expert,
 not pretend that remote RAM is local memory.
+
+DeepSeek's compact-source and derived SM86-cache boundary is specified in
+[DeepSeek-V4-Flash backend](deepseek-v4-backend.md). It deliberately does not
+reinterpret the Expert Pack v1 ABI used by the current Qwen/OLMoE backend.

@@ -112,3 +112,28 @@ byte stream.
 This passes source decode correctness for one complete expert. It does not yet
 prove model-level quality, CUDA kernel throughput, cache admission latency, or
 the final on-disk/cache ABI.
+
+## Frozen expert boundary v1
+
+Two ABIs are now distinct and platform-neutral:
+
+- `deepseek-fp4-e2m1-ue8m0-block32-v1` describes immutable compact source
+  tensors. It is not a new copy of the checkpoint and remains suitable for
+  SSD, RAM, CPU, or remote ownership.
+- `deepseek-sm86-int8-per-row-v1` describes one admitted compute slot on RTX
+  3090. It is derived and evictable; it is never the authoritative model copy.
+
+The SM86 slot is 256-byte aligned and contains:
+
+| Section | Offset | Bytes |
+|---|---:|---:|
+| fused w1 gate + w3 up INT8 rows | 0 | 16,777,216 |
+| fused w1 + w3 FP32 row scales | 16,777,216 | 16,384 |
+| w2 down INT8 rows | 16,793,600 | 8,388,608 |
+| w2 FP32 row scales | 25,182,208 | 16,384 |
+| total slot | 0 | 25,198,592 |
+
+The runtime exposes this geometry as a backend-neutral contract rather than
+changing Expert Pack v1 constants. Next, CUDA admission must consume the
+compact source, populate exactly this slot, publish it only after completion,
+and reproduce the qualified candidate hash/output.

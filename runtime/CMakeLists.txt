@@ -12,6 +12,7 @@ add_library(expert_runtime STATIC
   src/buffer_pool.cpp
   src/cache_state.cpp
   src/cpu/expert_executor.cpp
+  src/deepseek_expert.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
   src/hybrid_dispatch.cpp
