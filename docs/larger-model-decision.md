@@ -108,6 +108,8 @@ independently proven.
   one real expert takes 0.493 ms and matches the CPU output within `4.47e-8`.
 - Complete: representation-aware cache capacity; compact bytes and expanded
   device bytes are budgeted independently before I/O or publication.
-- Next: add the compact-record validator/uploader behind the existing atomic
-  publication, eviction, deduplication, and prefetch lifecycle; then implement
-  shared-expert and dense/CSA/HCA execution.
+- Complete: compact-record validation and CUDA admission run behind the existing
+  IOCP, pinned-buffer, single-flight cache, atomic directory publication, and
+  eviction lifecycle. Two concurrent requests produced one read and one upload.
+- Next: replace the one-expert combined fixture with direct bounded SafeTensors
+  extent gathering, then implement shared-expert and dense/CSA/HCA execution.

@@ -61,6 +61,13 @@ as compact DeepSeek FP4 → SM86 INT8 must declare the exact hot allocation befo
 I/O begins; the cache reserves that larger value and refuses work that cannot
 fit. Upload completion may shrink a reservation but may never exceed it.
 
+`source_abi` and the key's target `quant_abi` form a fail-closed pair. Expert
+Pack v1 records continue through their existing validator and uploader.
+DeepSeek compact records are SHA-256 checked as complete 13,369,344-byte
+staging payloads, decoded only inside the CUDA uploader, and published as exact
+25,198,592-byte SM86 slots. Compact source bytes are never exposed through the
+host INT8 executor.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution
@@ -156,6 +163,11 @@ remain independent operator inputs.
   retention;
 - useful, requested, physical-read and overfetch bytes are measured separately;
 - EOF, short completion, checksum mismatch and device removal fail closed.
+
+DeepSeek qualification currently materializes one temporary combined staging
+record. Production-scale ingestion will gather bounded extents directly from
+the immutable SafeTensors shards; it will not repack or duplicate the full
+checkpoint.
 
 ## CUDA ABI
 

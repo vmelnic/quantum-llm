@@ -1,27 +1,37 @@
-#include "expert/runtime/cuda/deepseek_admission.hpp"
+#include "expert/runtime/buffer_pool.hpp"
+#include "expert/runtime/cuda/expert_directory.hpp"
+#include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/deepseek_expert.hpp"
+#include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/sha256.hpp"
+#if defined(_WIN32)
+#include "expert/runtime/windows_iocp_storage.hpp"
+#endif
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
-#include <array>
+#include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
-#include <fstream>
-#include <cmath>
 #include <iomanip>
 #include <iostream>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sstream>
 #include <vector>
 
 namespace er = expert::runtime;
 
 namespace {
+
+constexpr std::uint64_t kCompactBytes = 13'369'344U;
+constexpr std::uint64_t kHotBytes = 25'198'592U;
 
 void check(cudaError_t error, const char* operation) {
   if (error != cudaSuccess) {
@@ -30,28 +40,27 @@ void check(cudaError_t error, const char* operation) {
   }
 }
 
-std::vector<std::uint8_t> read_file(const std::filesystem::path& path,
-                                    std::size_t expected) {
-  std::ifstream stream(path, std::ios::binary | std::ios::ate);
-  if (!stream || static_cast<std::size_t>(stream.tellg()) != expected) {
-    throw std::runtime_error("compact fixture size mismatch: " + path.string());
-  }
-  std::vector<std::uint8_t> bytes(expected);
-  stream.seekg(0);
-  stream.read(reinterpret_cast<char*>(bytes.data()),
-              static_cast<std::streamsize>(bytes.size()));
-  if (!stream) throw std::runtime_error("short compact fixture read");
-  return bytes;
+void require(bool condition, const std::string& message) {
+  if (!condition) throw std::runtime_error(message);
 }
 
-struct DeviceInput {
-  std::uint8_t* weight{};
-  std::uint8_t* scale{};
-  ~DeviceInput() {
-    if (weight) static_cast<void>(cudaFree(weight));
-    if (scale) static_cast<void>(cudaFree(scale));
+std::uint8_t hex_nibble(char value) {
+  if (value >= '0' && value <= '9') return value - '0';
+  if (value >= 'a' && value <= 'f') return value - 'a' + 10U;
+  if (value >= 'A' && value <= 'F') return value - 'A' + 10U;
+  throw std::runtime_error("invalid SHA-256 hex digit");
+}
+
+er::Sha256Digest parse_digest(const std::string& value) {
+  if (value.size() != 64U) throw std::runtime_error("invalid SHA-256 length");
+  er::Sha256Digest result{};
+  for (std::size_t index = 0; index < result.size(); ++index) {
+    result[index] = static_cast<std::byte>(
+        (hex_nibble(value[index * 2U]) << 4U) |
+        hex_nibble(value[index * 2U + 1U]));
   }
-};
+  return result;
+}
 
 std::string hex_digest(const er::Sha256Digest& digest) {
   std::ostringstream output;
@@ -66,163 +75,275 @@ std::vector<float> cpu_expert(const std::vector<std::byte>& slot,
                               const er::DeepSeekSm86HotLayout& layout,
                               const er::DeepSeekExpertGeometry& geometry,
                               const std::vector<float>& input) {
-  const auto* gate = reinterpret_cast<const std::int8_t*>(slot.data() + layout.gate_up_q.offset);
-  const auto* scales = reinterpret_cast<const float*>(slot.data() + layout.gate_up_scales.offset);
-  const auto* down = reinterpret_cast<const std::int8_t*>(slot.data() + layout.down_q.offset);
-  const auto* down_scales = reinterpret_cast<const float*>(slot.data() + layout.down_scales.offset);
+  const auto* gate = reinterpret_cast<const std::int8_t*>(
+      slot.data() + layout.gate_up_q.offset);
+  const auto* scales = reinterpret_cast<const float*>(
+      slot.data() + layout.gate_up_scales.offset);
+  const auto* down = reinterpret_cast<const std::int8_t*>(
+      slot.data() + layout.down_q.offset);
+  const auto* down_scales = reinterpret_cast<const float*>(
+      slot.data() + layout.down_scales.offset);
   std::vector<float> intermediate(geometry.intermediate);
   for (std::uint32_t row = 0; row < geometry.intermediate; ++row) {
-    double g = 0.0, u = 0.0;
+    double gate_sum = 0.0;
+    double up_sum = 0.0;
     for (std::uint32_t column = 0; column < geometry.hidden; ++column) {
-      g += gate[static_cast<std::size_t>(row) * geometry.hidden + column] * input[column];
-      u += gate[(static_cast<std::size_t>(geometry.intermediate + row) * geometry.hidden) + column] * input[column];
+      gate_sum += gate[static_cast<std::size_t>(row) * geometry.hidden + column] *
+                  input[column];
+      up_sum += gate[(static_cast<std::size_t>(geometry.intermediate + row) *
+                      geometry.hidden) + column] *
+                input[column];
     }
-    const auto gf = static_cast<float>(g) * scales[row];
-    const auto uf = static_cast<float>(u) * scales[geometry.intermediate + row];
-    intermediate[row] = (gf / (1.0F + std::exp(-gf))) * uf;
+    const auto gate_value = static_cast<float>(gate_sum) * scales[row];
+    const auto up_value = static_cast<float>(up_sum) *
+                          scales[geometry.intermediate + row];
+    intermediate[row] =
+        (gate_value / (1.0F + std::exp(-gate_value))) * up_value;
   }
   std::vector<float> output(geometry.hidden);
   for (std::uint32_t row = 0; row < geometry.hidden; ++row) {
     double sum = 0.0;
-    for (std::uint32_t column = 0; column < geometry.intermediate; ++column)
-      sum += down[static_cast<std::size_t>(row) * geometry.intermediate + column] * intermediate[column];
+    for (std::uint32_t column = 0; column < geometry.intermediate; ++column) {
+      sum += down[static_cast<std::size_t>(row) * geometry.intermediate + column] *
+             intermediate[column];
+    }
     output[row] = static_cast<float>(sum) * down_scales[row];
   }
   return output;
 }
 
+struct DeviceBuffers final {
+  float* input{};
+  float* intermediate{};
+  float* output{};
+  float* routing{};
+  const std::int8_t** gate_table{};
+  const std::int8_t** down_table{};
+  const float** gate_scale_table{};
+  const float** down_scale_table{};
+
+  ~DeviceBuffers() {
+    if (input) static_cast<void>(cudaFree(input));
+    if (intermediate) static_cast<void>(cudaFree(intermediate));
+    if (output) static_cast<void>(cudaFree(output));
+    if (routing) static_cast<void>(cudaFree(routing));
+    if (gate_table) static_cast<void>(cudaFree(gate_table));
+    if (down_table) static_cast<void>(cudaFree(down_table));
+    if (gate_scale_table) static_cast<void>(cudaFree(gate_scale_table));
+    if (down_scale_table) static_cast<void>(cudaFree(down_scale_table));
+  }
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 3) {
-      std::cerr << "usage: expert-deepseek-admission-smoke <bundle> <expected-sha256>\n";
+#if !defined(_WIN32)
+    (void)argc;
+    (void)argv;
+    throw std::runtime_error("DeepSeek IOCP admission smoke requires Windows");
+#else
+    if (argc != 4) {
+      std::cerr << "usage: expert-deepseek-admission-smoke <bundle> "
+                   "<expected-hot-sha256> <compact-sha256>\n";
       return 64;
     }
     const std::filesystem::path root = argv[1];
-    const std::string expected_hash = argv[2];
+    const std::string expected_hot_hash = argv[2];
+    const auto compact_hash = parse_digest(argv[3]);
     const auto geometry = er::DeepSeekExpertGeometry::v4_flash();
     const auto layout = er::make_deepseek_sm86_hot_layout(geometry);
-    const std::array projections{er::DeepSeekProjection::w1_gate,
-                                 er::DeepSeekProjection::w3_up,
-                                 er::DeepSeekProjection::w2_down};
-    const std::array names{"w1", "w3", "w2"};
-    std::array<DeviceInput, 3> device{};
-    std::array<std::vector<std::uint8_t>, 3> weights;
-    std::array<std::vector<std::uint8_t>, 3> scales;
-    for (std::size_t index = 0; index < projections.size(); ++index) {
-      weights[index] = read_file(root / (std::string(names[index]) + ".weight.bin"),
-          geometry.compact_weight_bytes(projections[index]));
-      scales[index] = read_file(root / (std::string(names[index]) + ".scale.bin"),
-          geometry.compact_scale_bytes(projections[index]));
-      check(cudaMalloc(reinterpret_cast<void**>(&device[index].weight),
-                       weights[index].size()), "cudaMalloc compact weight");
-      check(cudaMalloc(reinterpret_cast<void**>(&device[index].scale),
-                       scales[index].size()), "cudaMalloc compact scale");
+    require(layout.slot_bytes == kHotBytes, "unexpected DeepSeek hot geometry");
+
+    er::PayloadRecord record;
+    record.path = root / "expert.compact.bin";
+    record.record_offset = 0U;
+    record.stored_bytes = kCompactBytes;
+    record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
+    record.device_bytes = kHotBytes;
+    record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
+    record.header_bytes = 0U;
+    record.alignment = er::kExpertPackAlignment;
+    record.payload_sha256 = compact_hash;
+    const er::ExpertKey key{17U, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86};
+
+    auto storage = std::make_shared<er::WindowsIocpStorage>(1U);
+    auto uploader = std::make_shared<er::cuda::CudaExpertUploader>();
+    auto allocator = std::make_shared<er::CudaPinnedAllocator>();
+    auto buffers = std::make_shared<er::FixedBufferPool>(
+        1U, kCompactBytes, er::kExpertPackAlignment, allocator);
+    auto directory = std::make_shared<er::cuda::CudaExpertDirectory>(
+        key.model_id, key.quant_abi, 1U, 1U, 8U);
+    er::ExpertCacheConfig config;
+    config.ram = {kCompactBytes * 2U, kCompactBytes * 2U, kCompactBytes};
+    config.vram = {kHotBytes * 2U, kHotBytes * 2U, kHotBytes};
+    config.retain_host_copy = false;
+    er::ExpertCache cache(config, storage, uploader, buffers, directory);
+
+    const auto cache_start = std::chrono::steady_clock::now();
+    auto first_handle = cache.acquire(key, record);
+    auto second_handle = cache.acquire(key, record);
+    auto first = first_handle.get();
+    auto second = second_handle.get();
+    const auto cache_stop = std::chrono::steady_clock::now();
+    require(first.status.ok(), std::string(first.status.message()));
+    require(second.status.ok(), std::string(second.status.message()));
+    require(first.lease.get() == second.lease.get(),
+            "concurrent cache acquires did not deduplicate admission");
+    const auto* allocation = dynamic_cast<const er::cuda::CudaExpertAllocation*>(
+        first.lease.get());
+    require(allocation != nullptr && allocation->bytes() == kHotBytes,
+            "cache did not return a DeepSeek CUDA allocation");
+
+    std::uint32_t* selected = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&selected), sizeof(std::uint32_t)),
+          "cudaMalloc selected expert");
+    const std::uint32_t selected_host = 0U;
+    check(cudaMemcpy(selected, &selected_host, sizeof(selected_host),
+                     cudaMemcpyHostToDevice),
+          "copy selected expert");
+    const auto plan = directory->pin_or_collect_misses(0U, selected, 1U, nullptr);
+    check(cudaFree(selected), "cudaFree selected expert");
+    require(plan.status.ok() && plan.missing_experts.empty() &&
+                plan.unique_experts == 1U,
+            "published expert was not visible in CUDA directory");
+    const auto release_status = directory->release_pins(nullptr);
+    require(release_status.ok(), std::string(release_status.message()));
+
+    std::vector<std::byte> result(layout.slot_bytes);
+    check(cudaMemcpy(result.data() + layout.gate_up_q.offset,
+                     allocation->gate_up(), layout.gate_up_q.bytes,
+                     cudaMemcpyDeviceToHost),
+          "copy admitted gate/up");
+    check(cudaMemcpy(result.data() + layout.gate_up_scales.offset,
+                     allocation->gate_up_scales(),
+                     layout.gate_up_scales.bytes, cudaMemcpyDeviceToHost),
+          "copy admitted gate/up scales");
+    check(cudaMemcpy(result.data() + layout.down_q.offset, allocation->down(),
+                     layout.down_q.bytes, cudaMemcpyDeviceToHost),
+          "copy admitted down");
+    check(cudaMemcpy(result.data() + layout.down_scales.offset,
+                     allocation->down_scales(), layout.down_scales.bytes,
+                     cudaMemcpyDeviceToHost),
+          "copy admitted down scales");
+    const auto actual_hash = hex_digest(er::sha256(result));
+    require(actual_hash == expected_hot_hash,
+            "cache CUDA hot-slot hash mismatch: " + actual_hash);
+
+    std::vector<float> input(geometry.hidden);
+    for (std::uint32_t index = 0; index < geometry.hidden; ++index) {
+      input[index] = std::sin(static_cast<float>(index) * 0.013F) * 0.25F;
     }
-    std::uint8_t* hot = nullptr;
-    check(cudaMalloc(reinterpret_cast<void**>(&hot), layout.slot_bytes),
-          "cudaMalloc hot slot");
-    cudaEvent_t start{}, stop{};
+    const auto reference = cpu_expert(result, layout, geometry, input);
+    DeviceBuffers device;
+    check(cudaMalloc(reinterpret_cast<void**>(&device.input),
+                     input.size() * sizeof(float)),
+          "cudaMalloc input");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.intermediate),
+                     geometry.intermediate * sizeof(float)),
+          "cudaMalloc intermediate");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.output),
+                     geometry.hidden * sizeof(float)),
+          "cudaMalloc output");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.routing), sizeof(float)),
+          "cudaMalloc routing");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.gate_table), sizeof(void*)),
+          "cudaMalloc gate table");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.down_table), sizeof(void*)),
+          "cudaMalloc down table");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.gate_scale_table),
+                     sizeof(void*)),
+          "cudaMalloc gate scale table");
+    check(cudaMalloc(reinterpret_cast<void**>(&device.down_scale_table),
+                     sizeof(void*)),
+          "cudaMalloc down scale table");
+    const auto* gate = allocation->gate_up();
+    const auto* down = allocation->down();
+    const auto* gate_scales = allocation->gate_up_scales();
+    const auto* down_scales = allocation->down_scales();
+    const float routing = 1.0F;
+    check(cudaMemcpy(device.input, input.data(), input.size() * sizeof(float),
+                     cudaMemcpyHostToDevice),
+          "copy input");
+    check(cudaMemcpy(device.routing, &routing, sizeof(float),
+                     cudaMemcpyHostToDevice),
+          "copy routing");
+    check(cudaMemcpy(device.gate_table, &gate, sizeof(void*),
+                     cudaMemcpyHostToDevice),
+          "copy gate table");
+    check(cudaMemcpy(device.down_table, &down, sizeof(void*),
+                     cudaMemcpyHostToDevice),
+          "copy down table");
+    check(cudaMemcpy(device.gate_scale_table, &gate_scales, sizeof(void*),
+                     cudaMemcpyHostToDevice),
+          "copy gate scales");
+    check(cudaMemcpy(device.down_scale_table, &down_scales, sizeof(void*),
+                     cudaMemcpyHostToDevice),
+          "copy down scales");
+
+    cudaEvent_t start{};
+    cudaEvent_t stop{};
     check(cudaEventCreate(&start), "cudaEventCreate start");
     check(cudaEventCreate(&stop), "cudaEventCreate stop");
-    check(cudaEventRecord(start), "cudaEventRecord start");
-    for (std::size_t index = 0; index < projections.size(); ++index) {
-      check(cudaMemcpy(device[index].weight, weights[index].data(), weights[index].size(),
-                       cudaMemcpyHostToDevice), "copy compact weight");
-      check(cudaMemcpy(device[index].scale, scales[index].data(), scales[index].size(),
-                       cudaMemcpyHostToDevice), "copy compact scale");
-    }
-    auto* gate_q = reinterpret_cast<std::int8_t*>(hot + layout.gate_up_q.offset);
-    auto* gate_s = reinterpret_cast<float*>(hot + layout.gate_up_scales.offset);
-    auto* down_q = reinterpret_cast<std::int8_t*>(hot + layout.down_q.offset);
-    auto* down_s = reinterpret_cast<float*>(hot + layout.down_scales.offset);
-    const auto gate_shape = geometry.matrix(er::DeepSeekProjection::w1_gate);
-    const auto down_shape = geometry.matrix(er::DeepSeekProjection::w2_down);
-    const std::array<er::cuda::DeepSeekAdmissionLaunch, 3> launches{{
-        {device[0].weight, device[0].scale, gate_q, gate_s,
-         gate_shape.rows, gate_shape.columns, nullptr},
-        {device[1].weight, device[1].scale,
-         gate_q + static_cast<std::size_t>(gate_shape.rows) * gate_shape.columns,
-         gate_s + gate_shape.rows, gate_shape.rows, gate_shape.columns, nullptr},
-        {device[2].weight, device[2].scale, down_q, down_s,
-         down_shape.rows, down_shape.columns, nullptr},
-    }};
-    for (const auto& launch : launches) {
-      const auto status = er::cuda::admit_deepseek_projection(launch);
-      if (!status.ok()) throw std::runtime_error(std::string(status.message()));
-    }
-    check(cudaEventRecord(stop), "cudaEventRecord stop");
-    check(cudaEventSynchronize(stop), "cudaEventSynchronize");
-    float elapsed_ms = 0.0F;
-    check(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
-    std::vector<std::byte> result(layout.slot_bytes);
-    check(cudaMemcpy(result.data(), hot, result.size(), cudaMemcpyDeviceToHost),
-          "copy hot slot");
-    const auto actual_hash = hex_digest(er::sha256(result));
-    if (actual_hash != expected_hash) {
-      throw std::runtime_error("CUDA hot-slot hash mismatch: " + actual_hash);
-    }
-    std::vector<float> input(geometry.hidden);
-    for (std::uint32_t i = 0; i < geometry.hidden; ++i)
-      input[i] = std::sin(static_cast<float>(i) * 0.013F) * 0.25F;
-    const auto reference = cpu_expert(result, layout, geometry, input);
-    float *d_input{}, *d_intermediate{}, *d_output{}, *d_routing{};
-    const std::int8_t** d_gate_table{};
-    const std::int8_t** d_down_table{};
-    const float** d_gate_scale_table{};
-    const float** d_down_scale_table{};
-    check(cudaMalloc(reinterpret_cast<void**>(&d_input), input.size() * sizeof(float)), "cudaMalloc input");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_intermediate), geometry.intermediate * sizeof(float)), "cudaMalloc intermediate");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_output), geometry.hidden * sizeof(float)), "cudaMalloc output");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_routing), sizeof(float)), "cudaMalloc routing");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_gate_table), sizeof(void*)), "cudaMalloc gate table");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_down_table), sizeof(void*)), "cudaMalloc down table");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_gate_scale_table), sizeof(void*)), "cudaMalloc gate scale table");
-    check(cudaMalloc(reinterpret_cast<void**>(&d_down_scale_table), sizeof(void*)), "cudaMalloc down scale table");
-    const std::int8_t* h_gate = gate_q;
-    const std::int8_t* h_down = down_q;
-    const float* h_gate_s = gate_s;
-    const float* h_down_s = down_s;
-    const float routing = 1.0F;
-    check(cudaMemcpy(d_input, input.data(), input.size() * sizeof(float), cudaMemcpyHostToDevice), "copy input");
-    check(cudaMemcpy(d_routing, &routing, sizeof(float), cudaMemcpyHostToDevice), "copy routing");
-    check(cudaMemcpy(d_gate_table, &h_gate, sizeof(void*), cudaMemcpyHostToDevice), "copy gate table");
-    check(cudaMemcpy(d_down_table, &h_down, sizeof(void*), cudaMemcpyHostToDevice), "copy down table");
-    check(cudaMemcpy(d_gate_scale_table, &h_gate_s, sizeof(void*), cudaMemcpyHostToDevice), "copy gate scales");
-    check(cudaMemcpy(d_down_scale_table, &h_down_s, sizeof(void*), cudaMemcpyHostToDevice), "copy down scales");
     check(cudaEventRecord(start), "record GEMM start");
-    const er::cuda::MoeLaunch moe{d_input, d_gate_table, d_gate_scale_table,
-        d_down_table, d_down_scale_table, d_routing, nullptr, d_intermediate,
-        d_output, geometry.hidden, geometry.intermediate, 1U, 1U, nullptr,
-        nullptr, 0U};
-    const auto moe_status = er::cuda::launch_moe_single_token(moe);
-    if (!moe_status.ok()) throw std::runtime_error(std::string(moe_status.message()));
+    const er::cuda::MoeLaunch launch{
+        device.input, device.gate_table, device.gate_scale_table,
+        device.down_table, device.down_scale_table, device.routing, nullptr,
+        device.intermediate, device.output, geometry.hidden,
+        geometry.intermediate, 1U, 1U, nullptr, nullptr, 0U};
+    const auto moe_status = er::cuda::launch_moe_single_token(launch);
+    require(moe_status.ok(), std::string(moe_status.message()));
     check(cudaEventRecord(stop), "record GEMM stop");
     check(cudaEventSynchronize(stop), "synchronize GEMM");
     float gemm_ms = 0.0F;
     check(cudaEventElapsedTime(&gemm_ms, start, stop), "GEMM elapsed");
+    check(cudaEventDestroy(start), "cudaEventDestroy start");
+    check(cudaEventDestroy(stop), "cudaEventDestroy stop");
     std::vector<float> gpu_output(geometry.hidden);
-    check(cudaMemcpy(gpu_output.data(), d_output, gpu_output.size() * sizeof(float), cudaMemcpyDeviceToHost), "copy GEMM output");
+    check(cudaMemcpy(gpu_output.data(), device.output,
+                     gpu_output.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "copy GEMM output");
     double squared = 0.0;
     float max_error = 0.0F;
-    for (std::size_t i = 0; i < gpu_output.size(); ++i) {
-      const auto error = std::abs(gpu_output[i] - reference[i]);
+    for (std::size_t index = 0; index < gpu_output.size(); ++index) {
+      const auto error = std::abs(gpu_output[index] - reference[index]);
       max_error = std::max(max_error, error);
       squared += static_cast<double>(error) * error;
     }
     const auto rmse = std::sqrt(squared / gpu_output.size());
-    std::cout << "{\"ok\":true,\"abi\":\"" << er::kDeepSeekSm86HotAbi
-              << "\",\"bytes\":" << layout.slot_bytes
+    const auto telemetry = cache.telemetry();
+    require(telemetry.load_started == 1U &&
+                telemetry.load_deduplicated == 1U &&
+                telemetry.load_completed == 1U &&
+                telemetry.upload_started == 1U &&
+                telemetry.upload_completed == 1U &&
+                telemetry.read_bytes == kCompactBytes &&
+                telemetry.uploaded_bytes == kHotBytes,
+            "cache lifecycle telemetry violated single-flight admission");
+    const auto cache_ms = std::chrono::duration<double, std::milli>(
+                              cache_stop - cache_start)
+                              .count();
+
+    first.lease = {};
+    second.lease = {};
+    const auto trimmed = cache.trim();
+    require(trimmed == kHotBytes && !cache.inspect(key)->has_device_copy,
+            "cache trim did not release admitted DeepSeek expert");
+    std::cout << "{\"ok\":true,\"source_abi\":\""
+              << er::kDeepSeekCompactAbi << "\",\"hot_abi\":\""
+              << er::kDeepSeekSm86HotAbi << "\",\"source_bytes\":"
+              << kCompactBytes << ",\"hot_bytes\":" << layout.slot_bytes
               << ",\"sha256\":\"" << actual_hash
-              << "\",\"h2d_and_admission_ms\":" << elapsed_ms
+              << "\",\"cache_end_to_end_ms\":" << cache_ms
+              << ",\"single_flight_loads\":" << telemetry.load_started
+              << ",\"deduplicated_acquires\":"
+              << telemetry.load_deduplicated
               << ",\"expert_gemm_ms\":" << gemm_ms
               << ",\"output_rmse\":" << rmse
-              << ",\"output_max_abs_error\":" << max_error << "}\n";
-    check(cudaEventDestroy(start), "cudaEventDestroy start");
-    check(cudaEventDestroy(stop), "cudaEventDestroy stop");
-    check(cudaFree(hot), "cudaFree hot");
+              << ",\"output_max_abs_error\":" << max_error
+              << ",\"trimmed_bytes\":" << trimmed << "}\n";
     return 0;
+#endif
   } catch (const std::exception& error) {
     std::cerr << "expert-deepseek-admission-smoke: " << error.what() << '\n';
     return 1;

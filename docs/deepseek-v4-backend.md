@@ -134,31 +134,34 @@ The SM86 slot is 256-byte aligned and contains:
 | total slot | 0 | 25,198,592 |
 
 The runtime exposes this geometry as a backend-neutral contract rather than
-changing Expert Pack v1 constants. Next, CUDA admission must consume the
-compact source, populate exactly this slot, publish it only after completion,
-and reproduce the qualified candidate hash/output.
+changing Expert Pack v1 constants.
 
 ## SM86 admission result
 
-The first CUDA admission gate now passes on RTX 3090. A bounded fixture copies
+The first CUDA admission gate now passes on RTX 3090. A bounded fixture gathers
 the six original compact tensors for one expert without decoding or modifying
-the checkpoint. CUDA transfers 13,369,344 bytes, decodes FP4/UE8M0, performs
-per-row INT8 quantization, and fills the exact 25,198,592-byte hot slot.
+the checkpoint. The production cache reads the resulting 13,369,344-byte
+staging record with IOCP into a pinned buffer. CUDA then decodes FP4/UE8M0,
+performs per-row INT8 quantization, and fills the exact 25,198,592-byte hot
+slot.
 
 The complete device slot matched the independent Python/PyTorch candidate
-SHA-256 byte-for-byte. Measured H2D plus admission latency was 9.73 ms for the
-first real expert. The cache must not publish a slot until this conversion and
-source-validity check succeed.
+SHA-256 byte-for-byte. Direct H2D plus admission measured about 9.5 ms for the
+first real expert. A full cold cache acquisition—including unbuffered I/O,
+SHA-256 validation, admission, publication, and two concurrent waiters—took
+79.5 ms. Both waiters shared exactly one read and one upload. The CUDA directory
+saw the entry only after completion, and eviction released the complete hot
+allocation.
 
 This number also constrains the scheduler: six serial cold admissions would
 consume roughly 58 ms before GEMM, so 30 tok/s cannot depend on cold loading at
 every layer. Hot residency, look-ahead prefetch, concurrent admission, and
-request batching remain essential. The next gate executes gate/up/down GEMM
-directly from the admitted slot and compares its output with a CPU reference.
+request batching remain essential.
 
 That GEMM gate now also passes for the same real expert. The existing SM86
 INT8-per-row MoE kernels consumed the admitted slot without repacking and
-completed gate + up + SiLU + down in 0.493 ms for one deterministic activation.
+completed gate + up + SiLU + down in 0.39–0.52 ms for one deterministic
+activation.
 Against the CPU calculation, output RMSE was `1.02e-8` and maximum absolute
 error was `4.47e-8`.
 
@@ -173,3 +176,10 @@ VRAM capacity is reserved using the expanded hot size before SSD I/O starts;
 an undersized admission remains absent instead of loading data it cannot
 publish. Qwen retains its legacy equal-size behavior through a zero/default
 device-size claim.
+
+The temporary combined record is only a bounded qualification fixture. The
+checkpoint remains authoritative, and full-model operation must not create one
+copied file per expert. The next storage step is a validated gather descriptor
+whose six `(shard, offset, length)` extents are read directly from the original
+SafeTensors files into the same fixed staging buffer. The cache/admission ABI
+does not change when that storage source replaces the fixture.

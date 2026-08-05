@@ -36,9 +36,12 @@ try {
     & $python.Source -m compiler export-deepseek-expert --source $source `
         --output $bundle --layer $Layer --expert $Expert | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek compact fixture export failed" }
+    $manifest = Get-Content (Join-Path $bundle "manifest.json") -Raw |
+        ConvertFrom-Json
 
     $cudaRaw = & $executable $bundle `
-        ([string]$qualification.result.candidate_sha256) | Out-String
+        ([string]$qualification.result.candidate_sha256) `
+        ([string]$manifest.combined.sha256) | Out-String
     if ($LASTEXITCODE -ne 0) {
         Write-Output $cudaRaw
         throw "DeepSeek CUDA admission failed"
