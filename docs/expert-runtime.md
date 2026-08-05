@@ -131,7 +131,7 @@ Operators select a policy goal with `-PlacementProfile` (PowerShell) or
 | Profile | Policy | Evidence boundary |
 |---|---|---|
 | `latency` | Admit prefetch after one recent observation and remove the extra admission margin. | More aggressive warming; not yet an independent throughput SLO. |
-| `balanced` | Require two recent observations and use measured CPU/H2D/GPU critical-path cost. | Qualified default for the 3090box 80B deployment. |
+| `balanced` | Require two recent observations and use measured CPU/H2D/GPU critical-path cost. | Qualified default for the reference 80B deployment. |
 | `capacity` | Disable speculative prefetch and opportunistic RAM→VRAM execution; retain mandatory cold fallback. | Minimizes churn for larger working sets; not a promise that CPU execution is faster. |
 
 These are policy goals, not expert percentages. Resident experts stay on the

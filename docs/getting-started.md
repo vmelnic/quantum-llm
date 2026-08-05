@@ -120,7 +120,7 @@ curl.exe http://127.0.0.1:8080/model-info
 
 Use [the API guide](openai-api.md) for SDK and streaming examples.
 
-`balanced` is the qualified 3090box default. Select `latency` for aggressive
+`balanced` is the qualified reference-host default. Select `latency` for aggressive
 single-stream warming or `capacity` to avoid speculative VRAM churn; see the
 [runtime placement contract](expert-runtime.md#placement-policy) before
 changing it. The choice is visible in `/model-info.worker_placement`.

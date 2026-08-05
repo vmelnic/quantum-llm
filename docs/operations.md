@@ -15,8 +15,8 @@ ignored models, work directories, logs, artifacts, or build output:
 ```bash
 export QUANTUM_LLM_REMOTE=user@gpu-host
 export QUANTUM_LLM_REMOTE_ROOT=C:/quantum-llm
-./ops/sync-to-3090box.sh
-./ops/run-on-3090box.sh Invoke-BuildExpertRuntime.ps1 -Configuration Release
+# Run the POSIX sync wrapper from ops/.
+# Then invoke Invoke-BuildExpertRuntime.ps1 through the remote-script wrapper.
 ```
 
 Sync is non-destructive: obsolete remote source files are not removed. Use a

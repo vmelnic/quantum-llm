@@ -8,10 +8,8 @@
 ```bash
 export QUANTUM_LLM_REMOTE=user@gpu-host
 export QUANTUM_LLM_REMOTE_ROOT=C:/quantum-llm
-
-./ops/sync-to-3090box.sh
-./ops/run-on-3090box.sh Invoke-Inventory.ps1
-./ops/run-on-3090box.sh Invoke-BuildExpertRuntime.ps1 -Configuration Release
+# Run the POSIX sync wrapper, then invoke a script from ops/windows through
+# the remote-script wrapper.
 ```
 
 The sync includes only Git-visible, non-ignored files. It therefore excludes

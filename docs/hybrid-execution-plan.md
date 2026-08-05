@@ -318,11 +318,11 @@ The next checkpoint should exercise a real architectural requirement: a larger
 expert directory, greater active mass, a new routing structure, or storage
 sharding. Size alone is not sufficient justification.
 
-The read-only [larger-model decision record](larger-model-decision.md) protects
-the current source and pack, identifies at most 14.50 GiB of conservative
-cleanup, and recommends Qwen3.5-122B-A10B-FP8 only after a representative FP8
-decoder/adapter vertical slice. DeepSeek-V4-Flash is the second target. No
-cleanup or download was performed.
+The [larger-model decision record](larger-model-decision.md) compares public
+checkpoint properties, compatibility gaps, conversion workspace requirements,
+and failure boundaries without embedding deployment inventory. DeepSeek-V4-
+Flash is the selected next backend target; Qwen3.5-122B remains the lower-risk
+fallback.
 
 ## Longer-term boundary
 

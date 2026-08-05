@@ -1,41 +1,13 @@
 # Larger-model decision record
 
-This is a read-only inventory and model-selection record for the next runtime
-target. It does not authorize deletion, download, conversion, or source-shard
-reclamation. Measurements were taken on `3090box` on 2026-08-04.
+This record compares candidate architectures for the next runtime backend. It
+contains no deployment inventory and does not authorize deletion, download,
+conversion, or source-shard reclamation.
 
-## Storage inventory
-
-The system volume has 930.61 GiB total, 444.13 GiB used, and 486.48 GiB free.
-The following assets are protected:
-
-| Asset | Path | Size |
-|---|---|---:|
-| Original Qwen checkpoint | `C:\Users\vladi\.cache\huggingface\hub\models--Qwen--Qwen3-Next-80B-A3B-Instruct` | 151.510 GiB |
-| Validated Expert Pack | `C:\Users\vladi\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8` | 76.326 GiB |
-
-Neither asset is a cleanup candidate. The source remains necessary for a
-repack if the format or kernel ABI changes.
-
-Conservative reclaim candidates, before any download:
-
-| Candidate | Measured size | Condition |
-|---|---:|---|
-| `C:\Windows\Temp` | 0.513 GiB | Delete only files not held by Windows. |
-| `C:\Users\vladi\AppData\Local\Temp` | 0.001 GiB | Delete only stale files. |
-| `C:\Users\vladi\.cache\huggingface\xet` | 0.235 GiB | Re-creatable transfer cache. |
-| `C:\Users\vladi\.cache\huggingface\datasets` | 0.123 GiB | Re-creatable dataset cache. |
-| `C:\Users\vladi\quantum-llm\out\build` | 0.018 GiB | Re-creatable build tree. |
-| `models--allenai--OLMoE-1B-7B-0125-Instruct` | 12.892 GiB | Only if the OLMoE regression baseline is intentionally retired. |
-| project virtual environment | 0.716 GiB | Only if dependency recreation is acceptable. |
-
-The conservative maximum is about 14.50 GiB, of which 12.892 GiB sacrifices a
-useful baseline. No deletion is required for the recommended checkpoint.
-`C:\Users\vladi\Projects` (91.33 GiB) is explicitly out of scope.
-
-Docker is not counted. Its daemon was stopped and neither the `slm-models`
-volume nor a backing VHD was independently resolved. It must be inventoried
-before making any cleanup claim.
+Selection considers active parameter mass, checkpoint format, routing and
+attention changes, license, implementation reuse, and the disk required to
+retain both source and atomic conversion output. Operators must run a local
+preflight against their own storage and memory budgets.
 
 ## Candidate checkpoints
 
@@ -45,15 +17,14 @@ not marketing parameter estimates.
 | Candidate | Total / active | Geometry | Context | Download | License | Decision |
 |---|---:|---|---:|---:|---|---|
 | [Qwen3.5-122B-A10B](https://huggingface.co/Qwen/Qwen3.5-122B-A10B) | 122B / 10B | 48 layers, 256 experts, top-8, hidden 3072 | 262K | 233.014 GiB BF16 | Apache-2.0 | Safest source dtype, but largest Qwen source. |
-| [Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8) | 122B / 10B | same | 262K | 118.460 GiB | Apache-2.0 | Recommended after FP8 input support. |
+| [Qwen3.5-122B-A10B-FP8](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-FP8) | 122B / 10B | same | 262K | 118.460 GiB | Apache-2.0 | Lower-risk Qwen-family integration after FP8 input support. |
 | [Qwen3.5-122B-A10B-GPTQ-Int4](https://huggingface.co/Qwen/Qwen3.5-122B-A10B-GPTQ-Int4) | 122B / 10B | same | 262K | 73.486 GiB | Apache-2.0 | Smallest, but introduces a second quantization ABI and quality provenance. |
-| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | 284B / 13B | 43 layers, 256 routed experts, top-6 + shared, hidden 4096 | 1M | 148.667 GiB mixed FP4/FP8 | MIT | Strong second target; much larger architecture jump. |
-| [Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8) | 397B / 17B | 60 layers, 512 experts, top-10, hidden 4096 | 262K | 378.302 GiB | Apache-2.0 | Download fits, source plus a new pack has poor safety margin. |
-| [Kimi-K2.7-Code](https://huggingface.co/moonshotai/Kimi-K2.7-Code) | 1T / 32B | 61 layers, 384 routed experts, top-8 + shared, hidden 7168 | 256K | 554.328 GiB | Modified MIT | Future distributed/storage-sharded target; does not fit current free space. |
+| [DeepSeek-V4-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash) | 284B / 13B | 43 layers, 256 routed experts, top-6 + shared, hidden 4096 | 1M | 148.667 GiB mixed FP4/FP8 | MIT | Selected next backend; exercises a materially larger and newer architecture. |
+| [Qwen3.5-397B-A17B-FP8](https://huggingface.co/Qwen/Qwen3.5-397B-A17B-FP8) | 397B / 17B | 60 layers, 512 experts, top-10, hidden 4096 | 262K | 378.302 GiB | Apache-2.0 | Requires a large atomic conversion workspace. |
+| [Kimi-K2.7-Code](https://huggingface.co/moonshotai/Kimi-K2.7-Code) | 1T / 32B | 61 layers, 384 routed experts, top-8 + shared, hidden 7168 | 256K | 554.328 GiB | Modified MIT | Future distributed and storage-sharded target. |
 
-DeepSeek-V4-Pro at 1.6T total / 49B active is also a future target; its
-checkpoint is larger than current free space. It is not a sensible first
-compatibility step.
+DeepSeek-V4-Pro at 1.6T total / 49B active is also a future distributed target,
+not a sensible first compatibility step.
 
 ## Runtime compatibility gap
 
@@ -75,10 +46,10 @@ Qwen3.5-122B is the smallest useful architecture step:
 - qualify tokenizer/chat template, exact routing, dense kernels, KV layout and
   output against a trusted reference implementation.
 
-DeepSeek-V4-Flash additionally requires a `deepseek_v4` adapter, mixed FP4/FP8
+DeepSeek-V4-Flash requires a `deepseek_v4` adapter, mixed FP4/FP8
 source decoding, CSA + HCA attention, manifold-constrained hyper-connections,
-and the model's routing/shared-expert semantics. It is a deliberate second
-backend milestone, not a small repack.
+and the model's routing/shared-expert semantics. It is a new backend, not a
+small repack of the existing Qwen implementation.
 
 ## Pack space and time estimate
 
@@ -95,24 +66,29 @@ decoder exist. This is an engineering estimate; the first representative
 dense tensor and one complete routed layer must measure decode rate, output
 size, and numerical error before a full conversion starts.
 
-With 486.48 GiB currently free, either the 118.460 GiB FP8 source plus the
-estimated pack, or the 233.014 GiB BF16 source plus the estimated pack, fits
-while retaining both protected 80B assets. FP8 leaves materially more room for
-atomic `.partial` output, validation, logs, and failure recovery.
+DeepSeek-V4-Flash cannot use that Qwen scaling factor directly: converting
+mixed FP4/FP8 source tensors into an INT8 compute-ready ABI can make the output
+larger than the downloaded checkpoint. Its preflight must derive output mass
+from the pinned tensor index and a representative converted layer.
+
+Disk preflight must reserve the complete source checkpoint, estimated pack,
+atomic `.partial` output, validation overhead, logs, and a safety margin. Source
+reclamation is never part of the default capacity calculation.
 
 ## Recommendation and approval boundary
 
-1. Implement and test the Qwen3.5 adapter plus streaming FP8 source decode on a
-   representative shard; do not download the full checkpoint merely to test
-   storage.
-2. If the vertical slice preserves the existing pack ABI and numerical
-   tolerance, download `Qwen/Qwen3.5-122B-A10B-FP8` at a pinned revision.
-3. Keep the current Qwen3-Next source and pack. Produce the new pack atomically,
-   validate every record independently, then run correctness/API gates before
-   any performance claim.
-4. Take DeepSeek-V4-Flash next because 284B total / 13B active exercises a
-   genuinely larger directory and a different modern architecture.
+1. Use `deepseek-ai/DeepSeek-V4-Flash` as the next backend target because its
+   284B total / 13B active geometry exercises a genuinely larger directory and
+   a different modern architecture.
+2. Pin every source download to an immutable revision and verify the published
+   SafeTensors index before compiler work begins.
+3. Implement mixed-source decoding and one representative routed layer before
+   starting a full Expert Pack conversion.
+4. Produce packs atomically, validate every record independently, and pass
+   correctness/API gates before making performance claims.
+5. Retain Qwen3.5-122B as the lower-risk fallback if the DeepSeek dense backend
+   cannot initially meet bounded implementation or memory requirements.
 
-Cleanup and download remain separate operator approvals. In particular,
-`DELETE_CONSUMED_SHARDS` must stay disabled for both the protected source and
-the next checkpoint until repacking and rollback are independently proven.
+Cleanup and download remain separate operator actions. In particular,
+`DELETE_CONSUMED_SHARDS` stays disabled until repacking and rollback are
+independently proven.
