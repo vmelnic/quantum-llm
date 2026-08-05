@@ -995,14 +995,15 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     drive();
   }
 
-  std::uint64_t trim() {
+  CacheUsage trim_to(std::uint64_t ram_target,
+                     std::uint64_t vram_target) {
     std::lock_guard lock(mutex);
-    const auto before = ram_bytes + vram_bytes;
     bool progress = true;
-    while (progress) {
-      progress = evict_one_locked(true, true, nullptr);
+    while (progress && (ram_bytes > ram_target || vram_bytes > vram_target)) {
+      progress = evict_one_locked(ram_bytes > ram_target,
+                                  vram_bytes > vram_target, nullptr);
     }
-    return before - (ram_bytes + vram_bytes);
+    return {ram_bytes, vram_bytes};
   }
 
   void shutdown() noexcept {
@@ -1202,6 +1203,21 @@ TelemetrySnapshot ExpertCache::telemetry() const noexcept {
   return core_->metrics.snapshot();
 }
 
-std::uint64_t ExpertCache::trim() { return core_->trim(); }
+CacheUsage ExpertCache::usage() const noexcept {
+  const auto snapshot = core_->metrics.snapshot();
+  return {snapshot.ram_bytes, snapshot.vram_bytes};
+}
+
+std::uint64_t ExpertCache::trim() {
+  const auto before = usage();
+  const auto after = core_->trim_to(0U, 0U);
+  return before.ram_bytes - after.ram_bytes +
+         before.vram_bytes - after.vram_bytes;
+}
+
+CacheUsage ExpertCache::trim_to(std::uint64_t ram_target_bytes,
+                                std::uint64_t vram_target_bytes) {
+  return core_->trim_to(ram_target_bytes, vram_target_bytes);
+}
 
 }  // namespace expert::runtime

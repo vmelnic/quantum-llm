@@ -4,6 +4,7 @@
 #include "expert/runtime/expert_store.hpp"
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
+#include "expert/runtime/resource_governor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
@@ -459,6 +460,64 @@ void test_expert_store_resolves_complete_ordered_union() {
   };
   require(!store.resolve(duplicate).valid(),
           "expert store accepted duplicate immutable keys");
+}
+
+class TestMemoryTier final : public er::ITrimmableMemoryTier {
+ public:
+  TestMemoryTier(std::string_view tier_name, er::MemoryDomain tier_domain,
+                 std::uint64_t used, std::uint64_t protected_bytes)
+      : name_(tier_name), domain_(tier_domain), used_(used),
+        protected_(protected_bytes) {}
+  [[nodiscard]] std::string_view name() const noexcept override { return name_; }
+  [[nodiscard]] er::MemoryDomain domain() const noexcept override {
+    return domain_;
+  }
+  [[nodiscard]] std::uint64_t used_bytes() const noexcept override {
+    return used_;
+  }
+  [[nodiscard]] std::uint64_t protected_bytes() const noexcept override {
+    return protected_;
+  }
+  [[nodiscard]] std::uint64_t trim_to(std::uint64_t target) override {
+    used_ = std::max(protected_, std::min(used_, target));
+    ++trims_;
+    return used_;
+  }
+  [[nodiscard]] std::uint64_t trims() const noexcept { return trims_; }
+
+ private:
+  std::string name_;
+  er::MemoryDomain domain_;
+  std::uint64_t used_{};
+  std::uint64_t protected_{};
+  std::uint64_t trims_{};
+};
+
+void test_resource_governor_trims_before_reserving() {
+  er::MemoryResourceGovernor governor({1000U, 1000U, 100U, 100U});
+  auto transient = std::make_shared<TestMemoryTier>(
+      "transient", er::MemoryDomain::device, 400U, 50U);
+  auto hot = std::make_shared<TestMemoryTier>(
+      "hot", er::MemoryDomain::device, 300U, 200U);
+  governor.register_tier({hot, 20U});
+  governor.register_tier({transient, 10U});
+  require(governor.reserve(er::MemoryDomain::device, 500U).ok(),
+          "resource governor rejected a trimmable reservation");
+  auto snapshot = governor.snapshot();
+  require(snapshot.device_reserved_bytes == 500U &&
+              snapshot.device_tier_bytes == 400U &&
+              transient->used_bytes() == 100U && hot->used_bytes() == 300U &&
+              transient->trims() == 1U && hot->trims() == 0U,
+          "resource governor ignored priority or target accounting");
+  require(!governor.reserve(er::MemoryDomain::device, 250U).ok(),
+          "resource governor overcommitted protected device memory");
+  snapshot = governor.snapshot();
+  require(snapshot.rejected_reservations == 1U &&
+              snapshot.trimmed_bytes == 450U,
+          "resource governor trim/rejection telemetry mismatch");
+  governor.release(er::MemoryDomain::device, 500U);
+  require(governor.snapshot().device_reserved_bytes == 0U,
+          "resource governor did not release reservation credits");
 }
 
 void test_state_machine_and_sha256() {
@@ -1111,6 +1170,7 @@ int main() {
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();
     test_expert_store_resolves_complete_ordered_union();
+    test_resource_governor_trims_before_reserving();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();

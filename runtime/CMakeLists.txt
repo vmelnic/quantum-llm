@@ -20,6 +20,7 @@ add_library(expert_runtime STATIC
   src/gather_storage.cpp
   src/hybrid_dispatch.cpp
   src/resident_expert_set.cpp
+  src/resource_governor.cpp
   src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp

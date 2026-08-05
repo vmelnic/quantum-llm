@@ -183,6 +183,11 @@ struct CacheEntrySnapshot final {
   std::uint64_t placement_temperature{};
 };
 
+struct CacheUsage final {
+  std::uint64_t ram_bytes{};
+  std::uint64_t vram_bytes{};
+};
+
 struct ExpertCacheCore;
 
 struct ExpertAccess final {
@@ -225,9 +230,14 @@ class ExpertCache final {
   [[nodiscard]] std::optional<CacheEntrySnapshot> inspect(
       const ExpertKey& key) const;
   [[nodiscard]] TelemetrySnapshot telemetry() const noexcept;
+  [[nodiscard]] CacheUsage usage() const noexcept;
 
   // Evicts every currently unreferenced copy and returns bytes released.
   std::uint64_t trim();
+  // Trims each tier independently until it reaches the requested target or
+  // only referenced/in-flight entries remain.
+  [[nodiscard]] CacheUsage trim_to(std::uint64_t ram_target_bytes,
+                                   std::uint64_t vram_target_bytes);
 
  private:
   std::shared_ptr<ExpertCacheCore> core_;

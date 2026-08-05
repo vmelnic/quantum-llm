@@ -250,6 +250,13 @@ failure. The local store still deduplicates immutable records through
 same batch boundary without changing request state. Global credits count
 experts, not batch objects, so batching cannot bypass I/O or memory bounds.
 
+`MemoryResourceGovernor` is the single admission authority above these tiers.
+Dense state, KV pages, request workspaces, and network staging are explicit
+reservations. Host and device caches implement `ITrimmableMemoryTier`; before a
+reservation is admitted, lower-priority tiers are trimmed toward declared
+protected floors. If live leases still exceed the physical budget, admission
+fails with backpressure instead of relying on pagefile or CUDA OOM behavior.
+
 The same request owns the model edges: BF16 embedding gather expands directly
 into its four input streams; after layer 42, HC-head collapse, final RMSNorm,
 the untied BF16 vocabulary projection, and greedy argmax write into a fixed

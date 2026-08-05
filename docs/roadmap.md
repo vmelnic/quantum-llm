@@ -68,6 +68,11 @@ This roadmap records direction, not a compatibility promise.
     through `IExpertStore`, preserves request order, cancels the unresolved
     remainder on failure, and accounts backpressure per expert. Packed GPU,
     all-core CPU, SSD, and remote ownership now share one scheduler boundary.
+13. Centralize memory admission. `MemoryResourceGovernor` now accounts fixed
+    host/device reservations, emergency headroom, ordered trimmable tiers, and
+    protected live bytes. `ExpertCache` supports independent RAM/VRAM
+    `trim_to` targets. The DeepSeek production worker must register dense, KV,
+    request, compact-GPU, CPU-host, and staging consumers with this authority.
 
 ## Phase 1 — long-context and cold-path production work
 
