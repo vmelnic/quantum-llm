@@ -43,8 +43,8 @@ if (Test-Path $indexPath -PathType Leaf) {
 $exit = if (Test-Path ([string]$state.exit_status) -PathType Leaf) {
     Get-Content ([string]$state.exit_status) -Raw | ConvertFrom-Json
 } else { $null }
-$elapsed = [Math]::Max(0.001, ([DateTime]::UtcNow -
-    [DateTime]::Parse([string]$state.started_utc)).TotalSeconds)
+$startedUtc = [DateTimeOffset]::Parse([string]$state.started_utc).UtcDateTime
+$elapsed = [Math]::Max(0.001, ([DateTime]::UtcNow - $startedUtc).TotalSeconds)
 $initialCompleteShardBytes = if ($null -ne $state.PSObject.Properties[
         "initial_complete_shard_bytes"]) {
     [int64]$state.initial_complete_shard_bytes
