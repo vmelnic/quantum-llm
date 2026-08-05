@@ -89,9 +89,11 @@ This roadmap records direction, not a compatibility promise.
     actual scheduler state machine as typed host/device leases, with safe
     host-eviction fallback and per-request reusable workspace. A forced
     one-CPU/five-GPU scheduler gate is exact and accounts five device acquires,
-    one host resolve, and one hybrid layer. Next persist bounded route evidence
-    and feed measured queue/storage/lane costs into placement instead of using
-    forced qualification costs.
+    one host resolve, and one hybrid layer. A fixed 43×256 route census now
+    records completed scheduler routes, derives globally/per-layer bounded warm
+    sets, and persists alternating model-bound SHA-256 generations with corrupt-
+    newest fallback. Next feed measured queue/storage/lane costs into placement
+    instead of using forced qualification costs.
 
 ## Phase 1 — long-context and cold-path production work
 

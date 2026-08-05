@@ -914,9 +914,13 @@ int main(int argc, char** argv) {
             8U, 8U, 10.0F, true, true});
     auto scheduler_planner = std::make_shared<er::HybridDispatchPlanner>(
         er::HybridDispatchConfig{1.0, 1.0, 1.0, 0.125, 6U, 32U});
+    auto scheduler_census = std::make_shared<er::RouteCensus>(
+        er::RouteCensusConfig{17U, ffn.front().record.payload_sha256,
+                              er::kExpertQuantAbiDeepSeekSm86, 43U, 256U, 6U,
+                              4096U});
     er::cuda::DeepSeekDecodeScheduler decode_scheduler(
         {17U, 2U, 2U, 1U}, resumed_cache, routed_catalog,
-        {scheduler_cpu, scheduler_planner});
+        {scheduler_cpu, scheduler_planner, scheduler_census});
     const auto submitted = decode_scheduler.submit(
         1U, resumed_controller.controller,
         {device_streams + 3U * token_stream_values,
@@ -960,6 +964,9 @@ int main(int argc, char** argv) {
                 scheduler_state.host_resolves == 1U &&
                 scheduler_state.cpu_placements == 1U &&
                 scheduler_state.hybrid_layers == 1U &&
+                scheduler_state.route_observations == 1U &&
+                scheduler_census->snapshot().completed_routes == 1U &&
+                scheduler_census->snapshot().total_selections == 6U &&
                 scheduler_peak_acquires == 2U &&
                 scheduler_peak_leases > 0U &&
                 scheduler_peak_leases <= 5U &&
@@ -1303,6 +1310,8 @@ int main(int argc, char** argv) {
               << scheduler_state.cpu_placements
               << ",\"scheduler_hybrid_layers\":"
               << scheduler_state.hybrid_layers
+              << ",\"scheduler_route_observations\":"
+              << scheduler_state.route_observations
               << ",\"controller_resume_max_abs_error\":" << resumed_maximum
               << ",\"full_token_input\":" << full_inputs.front()
               << ",\"full_token_output\":" << full_sampled_token

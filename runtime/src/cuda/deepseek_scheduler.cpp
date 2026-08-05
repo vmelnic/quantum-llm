@@ -219,6 +219,12 @@ struct DeepSeekDecodeScheduler::Core final {
   Status retain_completed_route(
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
+    if (hybrid.route_census) {
+      const auto observed = hybrid.route_census->observe(
+          result.layer, result.routed_experts, request.cpu_experts);
+      if (!observed.ok()) return copied_status(observed);
+      ++metrics.route_observations;
+    }
     if (!config.retain_previous_route) {
       if (!request.cpu_experts.empty()) ++metrics.hybrid_layers;
       request.leases.clear();
@@ -524,6 +530,15 @@ DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
       config.maximum_layer_advances_per_poll == 0U ||
       static_cast<bool>(core_->hybrid.cpu_executor) !=
           static_cast<bool>(core_->hybrid.planner) ||
+      (core_->hybrid.route_census &&
+       (core_->hybrid.route_census->config().model_id != config.model_id ||
+        core_->hybrid.route_census->config().quant_abi !=
+            kExpertQuantAbiDeepSeekSm86 ||
+        core_->hybrid.route_census->config().layer_count !=
+            kDeepSeekCatalogLayers ||
+        core_->hybrid.route_census->config().experts_per_layer !=
+            kDeepSeekCatalogExperts ||
+        core_->hybrid.route_census->config().route_width != 6U)) ||
       catalog.size() != static_cast<std::size_t>(kDeepSeekCatalogLayers) *
                             kDeepSeekCatalogExperts) {
     throw std::invalid_argument("invalid DeepSeek decode scheduler contract");

@@ -137,6 +137,14 @@ forced planner costs to exercise one CPU plus five GPU experts exactly. Real
 serving policy must instead be seeded and updated by measured CPU, GPU, H2D,
 storage, and queue costs.
 
+Completed scheduler routes feed a fixed-cardinality route census before their
+leases are released. Its lazy-decayed heat, lifetime count, and consecutive
+reuse evidence produce a deterministic warm set under global and per-layer
+bounds. Two independently authenticated generations survive torn writes and
+are rejected when the model hash or quantization ABI changes. The complete
+DeepSeek table is about 518 KiB and contains no prompt, token, activation, or
+request identity.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

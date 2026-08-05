@@ -5,6 +5,7 @@
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/resource_governor.hpp"
+#include "expert/runtime/route_census.hpp"
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
@@ -19,6 +20,8 @@
 #include <cstring>
 #include <deque>
 #include <future>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -1292,6 +1295,78 @@ void test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic() {
           "hybrid planner did not enforce its candidate bound");
 }
 
+void test_route_census_is_bounded_ranked_and_recoverable() {
+  const std::array identity_bytes{std::byte{1}, std::byte{7}, std::byte{9}};
+  er::RouteCensusConfig config{17U, er::sha256(identity_bytes), 3U,
+                               2U, 8U, 3U, 2U};
+  er::RouteCensus census(config);
+  const std::array first{1U, 2U, 3U};
+  const std::array first_cpu{3U};
+  require(census.observe(0U, first, first_cpu).ok(),
+          "route census rejected a valid first route");
+  const auto root = std::filesystem::temp_directory_path() /
+      ("quantum-route-census-" + std::to_string(
+          std::chrono::steady_clock::now().time_since_epoch().count()));
+  const auto prefix = root / "routes";
+  require(census.save(prefix).ok(),
+          "route census failed to publish generation one");
+  require(std::filesystem::file_size(
+              std::filesystem::path(prefix.string() + ".1")) ==
+              census.snapshot().serialized_bytes,
+          "route census serialized-size accounting changed");
+
+  const std::array second{4U, 5U, 6U};
+  const std::array third{1U, 2U, 4U};
+  const std::array third_cpu{4U};
+  require(census.observe(1U, second).ok() &&
+              census.observe(0U, third, third_cpu).ok(),
+          "route census rejected a valid continuation");
+  const std::array duplicate{1U, 1U, 2U};
+  require(!census.observe(0U, duplicate).ok(),
+          "route census accepted a duplicate route");
+  const auto warm = census.stable_warm_set(3U, 2U);
+  require(warm.size() == 3U && warm[0].key.layer == 0U &&
+              (warm[0].key.expert == 1U || warm[0].key.expert == 2U) &&
+              std::count_if(warm.begin(), warm.end(), [](const auto& value) {
+                return value.key.layer == 0U;
+              }) <= 2,
+          "route census warm ranking or per-layer bound is unstable");
+  const auto before_save = census.snapshot();
+  require(before_save.completed_routes == 3U &&
+              before_save.total_selections == 9U &&
+              before_save.consecutive_reuse_selections == 2U &&
+              before_save.observed_experts == 7U &&
+              census.save(prefix).ok(),
+          "route census accounting or generation two save failed");
+
+  auto loaded = er::RouteCensus::load(prefix, config);
+  require(loaded.status.ok() && loaded.census &&
+              loaded.census->snapshot().generation == 2U &&
+              loaded.census->snapshot().completed_routes == 3U,
+          "route census did not load its newest valid generation");
+  auto mismatch = config;
+  mismatch.model_content_hash[0] ^= std::byte{1};
+  require(!er::RouteCensus::load(prefix, mismatch).status.ok(),
+          "route census accepted a different model identity");
+
+  const auto newest = std::filesystem::path(prefix.string() + ".0");
+  std::fstream corrupt(newest, std::ios::binary | std::ios::in |
+                                   std::ios::out);
+  require(static_cast<bool>(corrupt),
+          "route census corruption fixture could not open newest slot");
+  corrupt.seekp(16);
+  const char changed = static_cast<char>(0xa5);
+  corrupt.write(&changed, 1);
+  corrupt.close();
+  auto recovered = er::RouteCensus::load(prefix, config);
+  require(recovered.status.ok() && recovered.census &&
+              recovered.census->snapshot().generation == 1U &&
+              recovered.census->snapshot().completed_routes == 1U,
+          "route census did not recover the previous authenticated slot");
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+}
+
 }  // namespace
 
 int main() {
@@ -1319,6 +1394,7 @@ int main() {
     test_prefetch_credits_and_stale_epoch_cancel_pending_work();
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();
+    test_route_census_is_bounded_ranked_and_recoverable();
     std::cout << "expert_runtime_tests: PASS\n";
     return 0;
   } catch (const std::exception& error) {

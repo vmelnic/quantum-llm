@@ -15,6 +15,7 @@
 | [Larger-model decision](larger-model-decision.md) | Modern MoE candidates, compatibility gaps, workspace rules, and target selection |
 | [DeepSeek-V4-Flash backend](deepseek-v4-backend.md) | Pinned source contract, quantization boundary, and SM86 placement direction |
 | [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Aligned, resumable native FP4 routed-expert container |
+| [Route census](route-census.md) | Bounded, authenticated route evidence and deterministic warm-set ranking |
 
 The JSON schemas under `schemas/` and the compiler validator are normative for
 Expert Pack. Documentation never overrides executable validation.

@@ -22,6 +22,7 @@ add_library(expert_runtime STATIC
   src/hybrid_dispatch.cpp
   src/resident_expert_set.cpp
   src/resource_governor.cpp
+  src/route_census.cpp
   src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp

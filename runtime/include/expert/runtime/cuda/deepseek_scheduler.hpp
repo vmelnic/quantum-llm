@@ -4,6 +4,7 @@
 #include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
+#include "expert/runtime/route_census.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -55,6 +56,7 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::uint64_t host_resolves{};
   std::uint64_t cpu_placements{};
   std::uint64_t hybrid_layers{};
+  std::uint64_t route_observations{};
   std::uint64_t completed_requests{};
   std::uint64_t failed_requests{};
   std::uint64_t cancelled_requests{};
@@ -63,6 +65,7 @@ struct DeepSeekDecodeSchedulerSnapshot final {
 struct DeepSeekHybridSchedulerDependencies final {
   std::shared_ptr<cpu::DeepSeekPackedExecutor> cpu_executor;
   std::shared_ptr<HybridDispatchPlanner> planner;
+  std::shared_ptr<RouteCensus> route_census;
 };
 
 // Single-owner, non-blocking outer loop for DeepSeek decode controllers.
