@@ -32,6 +32,9 @@ one subsystem.
   for dense attention/router, routed CUDA, shared FFN, and aggregation. The
   current `directory_plan_ns` and `directory_release_ns` deliberately include
   those kernels and therefore cannot be added to future device timings.
+- [x] Capture one external Nsight Systems warm-route kernel census and one
+  Nsight Compute `int8_gemv_vector` launch. Keep profiler overhead and startup
+  conversion kernels out of production throughput claims.
 - [x] Publish cache hits/misses, bytes, high-water marks, uploader counters,
   scheduler counters, and existing stage times through worker `STATS` and the
   HTTP metrics/model-info surface.
@@ -131,6 +134,16 @@ single-request latency and aggregate throughput.
 - [ ] Replace scalar INT8-weight/FP32-activation dense GEMV with an optimized
   decode path using quantized or lower-precision activations and SM86-friendly
   vector/DP4A kernels.
+- [x] Evaluate two warps per row for small-row/long-K INT8 GEMV. Reject it: the
+  zero-miss five-step route took 346.860 ms versus the accepted
+  340.886–342.421 ms baseline, and the changed FP32 reduction order changed
+  later routed expert IDs. The code was removed before commit.
+- [ ] Profile representative BF16, F32, grouped-INT8, and routed-FP4 launches
+  with Nsight Compute, then choose the first kernel by attainable end-to-end
+  reduction rather than by one launch's percentage.
+- [ ] Design the dense replacement around routing stability: either preserve
+  the accepted accumulation order or qualify route divergence and output
+  quality explicitly. Token equality on one prompt is insufficient.
 - [ ] Add grouped INT8-MMA/Tensor Core kernels for prefill and multi-row MoE,
   while retaining the faster measured decode path for batch one.
 - [ ] Tile and tune the direct FP4/UE8M0 routed kernel; unpack reusable weight

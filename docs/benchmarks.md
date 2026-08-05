@@ -402,6 +402,43 @@ batch-one path. The implementation was removed before commit. A future guarded
 transaction requires a cheaper conditional launch mechanism; it must not
 reintroduce this rejected branch in every FFN block.
 
+### Warm-route CUDA profile
+
+Nsight Systems traced one five-step, 215-layer zero-miss route on the accepted
+request-private-event runtime. Startup was included, so the 365-instance
+`fp8_to_int8` admission kernel and startup H2D traffic are excluded from decode
+conclusions. Kernels whose instance counts match the 215/430-layer execution
+show the following approximate split under profiler overhead:
+
+| kernel family | traced GPU time | share of correlated decode kernels |
+| --- | ---: | ---: |
+| dense INT8/BF16/F32 GEMV | 194.5 ms | ~55% |
+| routed packed-FP4 gate/up + down | 96.3 ms | ~27% |
+| shared-expert gate/up + down | 35.4 ms | ~10% |
+| HCA, routing, attention and small transforms | remainder | ~8% |
+
+The profile changes the optimization order: routed FP4 is not the majority of
+the warm critical path, and directory hash/pin/release kernels total well under
+2 ms in the traced five steps. Dense GEMV representation and execution must be
+addressed before another directory micro-optimization can plausibly approach a
+2x single-stream improvement.
+
+Nsight Compute then inspected one 128-block `int8_gemv_vector` launch. It
+measured 10.43 us, 404.05 GB/s, 48.36% DRAM throughput, 25.72% achieved
+occupancy, and only 0.26 waves/SM. Scoreboard waits on memory dependencies
+accounted for about 60.2% of cycles between issued instructions. This proves
+the launch has unused machine capacity, but not that a split-K reduction is
+automatically faster.
+
+A two-warp-per-row variant doubled exposed warps for matrices with at most
+2,048 rows and at least 2,048 columns. On a clean census it preserved token
+`19923` and produced a zero-miss route, but took 346.860 ms for five steps,
+slower than the accepted 340.886–342.421 ms range. Its different FP32 reduction
+tree also changed later router selections, so its census was not warm for the
+original kernel. The variant was removed before commit and the pre-profile
+census was restored. Future dense work must gate routing stability as well as
+final-token equality and speed.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route
