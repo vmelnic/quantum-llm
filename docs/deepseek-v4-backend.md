@@ -473,10 +473,31 @@ expert 256. The control plane can therefore pin/load the complete dependency
 set through one directory operation. Only after that succeeds does `execute`
 run routed and shared SwiGLU, add their outputs, and apply FFN HCA post. Both
 expert paths enforce the checkpoint's gate/up clamp of `10.0`; no expert
-pointer is dereferenced before the directory pin boundary.
+pointer is dereferenced before the directory pin boundary. SwiGLU output is
+rounded to BF16 before the down projection, matching the checkpoint reference;
+this behavior is explicit in the DeepSeek launch and does not alter Qwen.
 
 On the four real layer-2 attention outputs, hash IDs matched the independent
 checkpoint oracle exactly. Routing weights matched with RMSE `7.94e-6` and
 maximum absolute error `2.39e-5`. HCA pre, FFN norm, router projection and
 selection together measured 0.79 ms per token. The bounded FFN request state
-uses 190,976 bytes. Full routed/shared execution is the next composed gate.
+uses 190,976 bytes.
+
+The first complete transformer block is now qualified at layer 2, token three,
+after that token emitted and consumed its first compressed attention slot. The
+cache gathered 105,383,424 authoritative source bytes for the six selected
+routed experts plus shared expert, admitted 176,390,144 compute-ready bytes,
+and published all seven in 410 ms on the cold path. The directory then pinned
+the exact seven dependencies before compute.
+
+Hot execution measured 6.80 ms for attention, 0.78 ms for FFN HCA/norm/route,
+and 7.19 ms for routed top-6 plus shared expert and FFN HCA post. The 16,384
+final stream values matched the independent full-block oracle with RMSE
+`1.04e-4` and maximum absolute error `4.76e-4`. Cold admission is not included
+in the 14.77 ms composed compute path.
+
+This is architectural correctness, not the throughput target: if every one of
+43 layers had the same cost, dense plus MoE compute alone would exceed 630 ms
+per generated token. The next phase must extend ownership across all layers
+while replacing per-token GEMV-style work with batch/tensor-core execution and
+overlapping expert readiness across requests.

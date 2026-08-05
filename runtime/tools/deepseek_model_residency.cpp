@@ -2,8 +2,12 @@
 #include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
+#include "expert/runtime/cuda/expert_directory.hpp"
+#include "expert/runtime/cuda/expert_uploader.hpp"
+#include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/gather_storage.hpp"
+#include "expert/runtime/resident_expert_set.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 
 #include <cuda_runtime_api.h>
@@ -146,6 +150,48 @@ std::vector<er::cuda::DeepSeekTypedSpec> typed_specs(
   return result;
 }
 
+std::vector<er::ResidentExpertSpec> ffn_specs(
+    const std::filesystem::path& oracle_root,
+    const std::filesystem::path& source_root, std::uint64_t& source_bytes) {
+  std::ifstream input(oracle_root / "ffn" / "ffn-set.tsv");
+  std::string line;
+  require(static_cast<bool>(std::getline(input, line)) &&
+              line == "deepseek-ffn-route-set-v1",
+          "invalid FFN route-set header");
+  std::vector<er::ResidentExpertSpec> result;
+  while (std::getline(input, line)) {
+    const auto item = fields(line);
+    require(item.size() == 5U, "invalid FFN route-set row");
+    const auto expert = static_cast<std::uint32_t>(std::stoul(item[0]));
+    const bool shared = item[1] == "shared";
+    require((shared && expert == 256U) ||
+                (!shared && item[1] == "routed" && expert < 256U),
+            "invalid FFN route-set expert kind");
+    const auto bytes = std::stoull(item[2]);
+    require(bytes == (shared ? 25'167'360ULL : 13'369'344ULL),
+            "invalid FFN source byte geometry");
+    er::PayloadRecord record;
+    record.extents = extents(
+        oracle_root / relative(item[4]), source_root, 6U);
+    record.stored_bytes = bytes;
+    record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
+    record.device_bytes = 25'198'592ULL;
+    record.source_abi = shared
+        ? er::kExpertSourceAbiDeepSeekFp8Block128V1
+        : er::kExpertSourceAbiDeepSeekCompactV1;
+    record.alignment = er::kExpertPackAlignment;
+    record.header_bytes = 0U;
+    record.payload_sha256 = digest(item[3]);
+    result.push_back({{17U, 2U, expert, er::kExpertQuantAbiDeepSeekSm86},
+                      std::move(record)});
+    source_bytes += bytes;
+  }
+  require(input.eof() && result.size() == 7U &&
+              result.back().key.expert == 256U,
+          "FFN route set must contain six routed and one shared expert");
+  return result;
+}
+
 std::vector<float> floats(const std::filesystem::path& path,
                           std::size_t expected) {
   std::ifstream input(path, std::ios::binary | std::ios::ate);
@@ -190,6 +236,8 @@ int main(int argc, char** argv) {
     const auto dense = dense_specs(argv[1], source, dense_source, dense_device,
                                    maximum_dense);
     const auto typed = typed_specs(argv[2], source, typed_source);
+    std::uint64_t ffn_source = 0U;
+    const auto ffn = ffn_specs(argv[4], source, ffn_source);
     constexpr std::uint64_t typed_staging = 64ULL * 1024U * 1024U;
     const auto staging = std::max(maximum_dense, typed_staging);
     const auto resident_bytes = dense_device + typed_source;
@@ -211,6 +259,29 @@ int main(int argc, char** argv) {
     require(model.dense_size() == 236U && model.typed_size() == 834U &&
                 model.bytes() == resident_bytes,
             "published model state has inconsistent ownership");
+    auto expert_storage = std::make_shared<er::ExtentGatherStorage>(iocp);
+    auto expert_uploader = std::make_shared<er::cuda::CudaExpertUploader>();
+    auto expert_buffers = std::make_shared<er::FixedBufferPool>(
+        1U, 25'167'360U, er::kExpertPackAlignment,
+        std::make_shared<er::CudaPinnedAllocator>());
+    auto expert_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
+        17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 8U);
+    er::ExpertCacheConfig expert_config;
+    expert_config.ram = {50'334'720U, 50'334'720U, 25'167'360U};
+    expert_config.vram = {7ULL * 25'198'592U, 7ULL * 25'198'592U,
+                          25'198'592U};
+    expert_config.retain_host_copy = false;
+    er::ExpertCache expert_cache(expert_config, expert_storage,
+                                 expert_uploader, expert_buffers,
+                                 expert_directory);
+    er::ResidentExpertSet ffn_resident;
+    const auto ffn_load_started = std::chrono::steady_clock::now();
+    const auto ffn_load_status = er::ResidentExpertSet::load(
+        expert_cache, ffn, ffn_resident);
+    const auto ffn_load_stopped = std::chrono::steady_clock::now();
+    require(ffn_load_status.ok() && ffn_resident.size() == 7U &&
+                ffn_resident.bytes() == 7ULL * 25'198'592U,
+            std::string(ffn_load_status.message()));
     er::cuda::DeepSeekAttentionBinding ratio_four, ratio_128;
     auto bind = model.bind_attention(2U, 4U, ratio_four);
     require(bind.ok(), std::string(bind.message()));
@@ -241,6 +312,9 @@ int main(int argc, char** argv) {
         std::filesystem::path(argv[4]) / "router-scores.f32", router_values);
     const auto expected_router_indices = integers(
         std::filesystem::path(argv[4]) / "router-indices.i32", router_values);
+    const auto expected_block_output = floats(
+        std::filesystem::path(argv[4]) / "block-output.f32",
+        token_stream_values);
     float *device_streams = nullptr, *device_output = nullptr;
     float *device_cosine = nullptr, *device_sine = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_streams),
@@ -336,6 +410,53 @@ int main(int argc, char** argv) {
     }
     require(router_maximum < 1e-3F,
             "hash router weights exceed oracle tolerance");
+    const auto final_route = er::cuda::deepseek_ffn_route({
+        &hash_ffn, ffn_state.state.get(),
+        device_output + 3U * token_stream_values, 3U, 1e-6F, 20U, nullptr});
+    require(final_route.ok(), std::string(final_route.message()));
+    const auto directory_plan = expert_directory->pin_or_collect_misses(
+        2U, ffn_state.state->expert_indices(),
+        ffn_state.state->selection_count(), nullptr);
+    require(directory_plan.status.ok() &&
+                directory_plan.missing_experts.empty() &&
+                directory_plan.unique_experts == 7U,
+            "FFN route dependencies are not resident");
+    float* device_block_output = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&device_block_output),
+                     token_stream_values * sizeof(float)),
+          "allocate block output");
+    cudaEvent_t ffn_start{}, ffn_stop{};
+    check(cudaEventCreate(&ffn_start), "create FFN start event");
+    check(cudaEventCreate(&ffn_stop), "create FFN stop event");
+    check(cudaEventRecord(ffn_start), "record FFN start");
+    const auto ffn_status = er::cuda::deepseek_ffn_execute({
+        &hash_ffn, ffn_state.state.get(), expert_directory->device_entries(),
+        device_output + 3U * token_stream_values, device_block_output,
+        257U, nullptr});
+    require(ffn_status.ok(), std::string(ffn_status.message()));
+    check(cudaEventRecord(ffn_stop), "record FFN stop");
+    check(cudaEventSynchronize(ffn_stop), "synchronize FFN");
+    float ffn_ms = 0.0F;
+    check(cudaEventElapsedTime(&ffn_ms, ffn_start, ffn_stop), "measure FFN");
+    const auto release = expert_directory->release_pins(nullptr);
+    require(release.ok(), std::string(release.message()));
+    std::vector<float> actual_block_output(token_stream_values);
+    check(cudaMemcpy(actual_block_output.data(), device_block_output,
+                     token_stream_values * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy block output");
+    double block_squared = 0.0;
+    float block_maximum = 0.0F;
+    for (std::size_t index = 0U; index < token_stream_values; ++index) {
+      require(std::isfinite(actual_block_output[index]),
+              "transformer block output is non-finite");
+      const auto error = std::abs(
+          actual_block_output[index] - expected_block_output[index]);
+      block_maximum = std::max(block_maximum, error);
+      block_squared += static_cast<double>(error) * error;
+    }
+    require(block_maximum < 1e-2F,
+            "transformer block output exceeds oracle tolerance; max=" +
+                std::to_string(block_maximum));
     double squared = 0.0;
     float maximum = 0.0F;
     std::array<float, decode_tokens> token_maximum{};
@@ -380,6 +501,16 @@ int main(int argc, char** argv) {
               << ",\"router_rmse\":"
               << std::sqrt(router_squared / router_values)
               << ",\"router_max_abs_error\":" << router_maximum
+              << ",\"ffn_experts\":" << ffn_resident.size()
+              << ",\"ffn_source_bytes\":" << ffn_source
+              << ",\"ffn_resident_bytes\":" << ffn_resident.bytes()
+              << ",\"ffn_load_ms\":"
+              << std::chrono::duration<double, std::milli>(
+                     ffn_load_stopped - ffn_load_started).count()
+              << ",\"ffn_execute_ms\":" << ffn_ms
+              << ",\"block_rmse\":"
+              << std::sqrt(block_squared / token_stream_values)
+              << ",\"block_max_abs_error\":" << block_maximum
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

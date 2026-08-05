@@ -26,6 +26,7 @@ struct MoeLaunch final {
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
   float swiglu_limit{};
+  bool bf16_intermediate{};
 };
 
 struct MoeBatchLaunch final {
@@ -47,6 +48,7 @@ struct MoeBatchLaunch final {
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
   float swiglu_limit{};
+  bool bf16_intermediate{};
 };
 
 struct MoeSelectionBatchLaunch final {
@@ -65,6 +67,7 @@ struct MoeSelectionBatchLaunch final {
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
   float swiglu_limit{};
+  bool bf16_intermediate{};
 };
 
 struct MoeAggregateLaunch final {

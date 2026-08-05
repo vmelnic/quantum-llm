@@ -165,5 +165,8 @@ independently proven.
 - Complete: the layer-2 FFN route phase composes HCA/norm and exact hash
   routing, exposes six routed IDs plus shared expert 256 for one directory
   plan, and matches independent IDs/weights.
-- Next: continue optimizing the composed layer, then connect attention to
-  routing/shared/streamed experts in the first complete transformer block.
+- Complete: the first real layer-2 block composes compressed attention,
+  routing, directory pinning, six routed experts, shared expert and FFN HCA;
+  maximum full-block error is `4.76e-4`.
+- Next: extend the block owner across 43 layers and move the dominant dense/MoE
+  paths to batch/tensor-core execution with overlapped expert readiness.

@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/moe_kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
 
 #include <algorithm>
 #include <cmath>
@@ -40,7 +41,8 @@ __global__ void gate_up_silu(
     const float* const* scales, const DeviceExpertEntry* directory,
     std::uint32_t directory_offset, float* intermediate,
     std::uint32_t hidden, std::uint32_t width,
-    const std::uint32_t* indices, float swiglu_limit) {
+    const std::uint32_t* indices, float swiglu_limit,
+    bool bf16_intermediate) {
   const auto slot = static_cast<std::uint32_t>(blockIdx.y);
   const auto expert = indices == nullptr ? slot : indices[slot];
   const auto row = static_cast<std::uint32_t>(blockIdx.x);
@@ -73,8 +75,10 @@ __global__ void gate_up_silu(
       up_sum = fminf(fmaxf(up_sum, -swiglu_limit), swiglu_limit);
     }
     const float silu = gate_sum / (1.0F + expf(-gate_sum));
-    intermediate[static_cast<std::size_t>(slot) * width + row] =
-        silu * up_sum;
+    float value = silu * up_sum;
+    if (bf16_intermediate)
+      value = __bfloat162float(__float2bfloat16_rn(value));
+    intermediate[static_cast<std::size_t>(slot) * width + row] = value;
   }
 }
 
@@ -119,7 +123,8 @@ __global__ void gate_up_silu_batch(
     const float* const* scales, const DeviceExpertEntry* directory,
     std::uint32_t directory_offset, float* intermediate,
     std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k,
-    const std::uint32_t* indices, float swiglu_limit) {
+    const std::uint32_t* indices, float swiglu_limit,
+    bool bf16_intermediate) {
   const auto selection = static_cast<std::uint32_t>(blockIdx.y);
   const auto request_row = selection / top_k;
   const auto slot = selection % top_k;
@@ -153,7 +158,10 @@ __global__ void gate_up_silu_batch(
       up_sum = fminf(fmaxf(up_sum, -swiglu_limit), swiglu_limit);
     }
     const auto offset = (static_cast<std::size_t>(request_row) * top_k + slot) * width + output_row;
-    intermediate[offset] = (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+    float value = (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+    if (bf16_intermediate)
+      value = __bfloat162float(__float2bfloat16_rn(value));
+    intermediate[offset] = value;
   }
 }
 
@@ -197,7 +205,7 @@ __global__ void gate_up_silu_selection_batch(
     std::uint32_t directory_offset, float* intermediate,
     std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k,
     const std::uint32_t* indices, const std::uint8_t* mask,
-    float swiglu_limit) {
+    float swiglu_limit, bool bf16_intermediate) {
   const auto selection = static_cast<std::uint32_t>(blockIdx.y);
   if (mask != nullptr && mask[selection] == 0) return;
   const auto request_row = selection / top_k;
@@ -230,8 +238,11 @@ __global__ void gate_up_silu_selection_batch(
       gate_sum = fminf(gate_sum, swiglu_limit);
       up_sum = fminf(fmaxf(up_sum, -swiglu_limit), swiglu_limit);
     }
+    float value = (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+    if (bf16_intermediate)
+      value = __bfloat162float(__float2bfloat16_rn(value));
     intermediate[static_cast<std::size_t>(selection) * width + output_row] =
-        (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+        value;
   }
 }
 
@@ -319,7 +330,7 @@ Status launch_moe_single_token(const MoeLaunch& launch) noexcept {
       launch.directory_entries,
       launch.directory_layer * launch.expert_table_size, launch.intermediate,
       launch.hidden_size, launch.intermediate_size, launch.expert_indices,
-      launch.swiglu_limit);
+      launch.swiglu_limit, launch.bf16_intermediate);
   auto status = cuda_status(cudaPeekAtLastError(), "gate_up_silu launch");
   if (!status.ok()) return status;
 
@@ -355,7 +366,8 @@ Status launch_moe_batch(const MoeBatchLaunch& launch) noexcept {
       launch.directory_entries,
       launch.directory_layer * launch.expert_table_size, launch.intermediate,
       launch.hidden_size, launch.intermediate_size, launch.top_k,
-      launch.expert_indices, launch.swiglu_limit);
+      launch.expert_indices, launch.swiglu_limit,
+      launch.bf16_intermediate);
   auto status = cuda_status(cudaPeekAtLastError(), "gate_up_silu_batch launch");
   if (!status.ok()) return status;
   const dim3 down_grid(
@@ -391,7 +403,7 @@ Status launch_moe_selection_batch(
       launch.directory_layer * launch.expert_table_size,
       launch.intermediate, launch.hidden_size, launch.intermediate_size,
       launch.top_k, launch.expert_indices, launch.selection_mask,
-      launch.swiglu_limit);
+      launch.swiglu_limit, launch.bf16_intermediate);
   auto status =
       cuda_status(cudaPeekAtLastError(), "gate_up_silu_selection launch");
   if (!status.ok()) return status;

@@ -18,10 +18,9 @@ This roadmap records direction, not a compatibility promise.
    Aligned INT8 vector loads are complete; the end-to-end layer improved 6.6%.
    Standalone activation-INT8 DP4A was measured, regressed, and removed.
    The eight `wo_a` groups now execute in one launch without changing results.
-5. Compose routing, resident shared expert, streamed routed experts, FFN HCA,
-   and attention into the first complete transformer block.
-   Resident hash/learned FFN control bindings and the two-phase route/pin/
-   execute boundary are complete; full expert execution is the next gate.
+5. ~~Compose routing, resident shared expert, streamed routed experts, FFN HCA,
+   and attention into the first complete transformer block.~~ Qualified on the
+   real layer-2 compressed token with an independent full-block oracle.
 6. Extend ownership/state across 43 layers, then add embedding, head,
    tokenizer, sampling, and the HTTP worker boundary.
 

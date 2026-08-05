@@ -153,14 +153,14 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
       state.routing_weights_, state.expert_indices_,
       state.routed_intermediate_, state.routed_output_, kHidden,
       kIntermediate, kTopK, launch.experts_per_layer, launch.stream,
-      launch.directory_entries, layer, 10.0F});
+      launch.directory_entries, layer, 10.0F, true});
   if (!status.ok()) return status;
   status = launch_moe_single_token({
       state.ffn_input_, nullptr, nullptr, nullptr, nullptr,
       state.routing_weights_ + kTopK, state.expert_indices_ + kTopK,
       state.shared_intermediate_, state.shared_output_, kHidden,
       kIntermediate, 1U, launch.experts_per_layer, launch.stream,
-      launch.directory_entries, layer, 10.0F});
+      launch.directory_entries, layer, 10.0F, true});
   if (!status.ok()) return status;
   status = add_in_place(state.routed_output_, state.shared_output_, kHidden,
                         launch.stream);

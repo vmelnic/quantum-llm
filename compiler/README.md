@@ -91,8 +91,10 @@ real typed weights, HCA, Q/KV transforms, sparse attention, and grouped output
 projection for four sequential layer-2 tokens. The fourth token closes and
 consumes the first compressed group. The same oracle then applies the real FFN
 HCA/norm and hash router, emitting expected top-6 IDs and weights for the four
-attention outputs. The runtime still loads the authoritative full checkpoint
-through its normal model-state path.
+attention outputs. For the fourth token it also describes the six routed plus
+shared expert source extents and composes an independent full-block output
+through the admitted SM86 ABI. The runtime still loads the authoritative full
+checkpoint through its normal model-state/cache paths.
 
 ## Install
 

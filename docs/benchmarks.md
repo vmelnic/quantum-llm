@@ -1,5 +1,27 @@
 # Benchmarks and evidence
 
+## DeepSeek-V4-Flash vertical slice
+
+The pinned 284B-class checkpoint has a qualified real layer-2 decode block on
+RTX 3090. The fourth token follows three prior attention updates and emits/consumes
+the first ratio-four compressed slot. It then routes and executes six real
+routed experts plus the always-active shared expert.
+
+| Component | Result |
+|---|---:|
+| attention | 6.80 ms/token |
+| FFN HCA + norm + hash route | 0.78 ms/token |
+| routed top-6 + shared + FFN HCA post | 7.19 ms/token |
+| composed hot compute | 14.77 ms/layer-token |
+| cold gather/admission/publication for seven experts | 410 ms |
+| full-block RMSE / maximum error | `1.04e-4` / `4.76e-4` |
+
+The cold 410 ms is outside the hot compute interval. Conversely, 14.77 ms is
+one layer, not one generated token; extrapolating it across 43 layers would be
+well below the throughput target. This result establishes the complete
+attention/router/cache/MoE/HCA execution contract and locates the next compute
+boundary. It is not a full-model tokens/s claim.
+
 ## Tested configuration
 
 - model: `Qwen/Qwen3-Next-80B-A3B-Instruct`;

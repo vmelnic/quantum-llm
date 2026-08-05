@@ -748,11 +748,17 @@ def export_deepseek_attention_oracle(
         raise SourceFormatError("hash router selected an invalid expert")
 
     route_weights = np.empty((4, 6), dtype=np.float32)
+    ffn_inputs: list[object] = []
+    ffn_posts: list[object] = []
+    ffn_combinations: list[object] = []
     for position in range(4):
-        _, _, _, ffn_collapsed, _ = _deepseek_hca_reference(
+        _, ffn_post, ffn_comb, ffn_collapsed, _ = _deepseek_hca_reference(
             updated[position], ffn_fn, ffn_base, ffn_scale
         )
         ffn_input = rms(ffn_collapsed, ffn_norm)
+        ffn_inputs.append(ffn_input)
+        ffn_posts.append(ffn_post)
+        ffn_combinations.append(ffn_comb)
         partial = np.zeros((256, 32), dtype=np.float32)
         for block in range(4096 // 32):
             begin = block * 32
@@ -765,12 +771,145 @@ def export_deepseek_attention_oracle(
         route_weights[position] = selected / np.sum(selected, dtype=np.float32) * \
             np.float32(1.5)
 
+    def admitted_matrix(name: str, source: str) -> tuple[object, object]:
+        weight_info = checkpoint.tensors[name + ".weight"]
+        scale_info = checkpoint.tensors[name + ".scale"]
+        with checkpoint.open_tensor(name + ".weight") as weight_view, \
+                checkpoint.open_tensor(name + ".scale") as scale_view:
+            if source == "routed":
+                rows, packed_columns = weight_info.shape
+                packed = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(
+                    rows, packed_columns
+                ).copy()
+                scale_codes = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+                    rows, packed_columns // 16
+                ).copy()
+                decoded = _decode_numpy(packed, scale_codes)
+                del packed, scale_codes
+            else:
+                rows, columns = weight_info.shape
+                codes = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(
+                    rows, columns
+                ).copy()
+                scale_codes = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+                    rows // 128, columns // 128
+                ).copy()
+                if bool((scale_codes == 255).any()):
+                    raise SourceFormatError("shared expert contains a UE8M0 NaN")
+                decoded = _fp8_e4m3fn_table()[codes]
+                decoded *= np.repeat(
+                    np.ldexp(
+                        np.ones((rows, columns // 128), dtype=np.float32),
+                        scale_codes[np.arange(rows) // 128].astype(np.int16) - 127,
+                    ),
+                    128, axis=1,
+                )
+                del codes, scale_codes
+        maxima = np.max(np.abs(decoded), axis=1)
+        row_scales = np.where(maxima > 0.0, maxima / 127.0, 1.0).astype(np.float32)
+        quantized = np.clip(
+            np.rint(decoded / row_scales[:, None]), -127, 127
+        ).astype(np.int8)
+        return quantized, row_scales
+
+    def block_matvec(matrix: object, scales: object, vector: object) -> object:
+        rows, columns = matrix.shape
+        partials = np.zeros((rows, 256), dtype=np.float32)
+        vector = np.asarray(vector, dtype=np.float32)
+        for block in range(columns // 256):
+            begin = block * 256
+            partials += matrix[:, begin:begin + 256].astype(np.float32) * \
+                vector[begin:begin + 256]
+        for offset in (128, 64, 32, 16, 8, 4, 2, 1):
+            partials[:, :offset] += partials[:, offset:2 * offset]
+        return partials[:, 0] * scales
+
+    def expert_output(expert: int | str, vector: object) -> object:
+        source = "shared" if expert == "shared" else "routed"
+        base = prefix + ".ffn." + (
+            "shared_experts" if source == "shared" else f"experts.{expert}"
+        )
+        gate_q, gate_scale = admitted_matrix(base + ".w1", source)
+        up_q, up_scale = admitted_matrix(base + ".w3", source)
+        gate = np.minimum(
+            block_matvec(gate_q, gate_scale, vector), np.float32(10.0)
+        )
+        up = np.clip(
+            block_matvec(up_q, up_scale, vector), -10.0, 10.0
+        ).astype(np.float32)
+        intermediate = gate / (np.float32(1.0) + np.exp(-gate)) * up
+        words = _f32_to_bf16_words(intermediate)
+        intermediate = _bf16_to_f32(words.tobytes(), (2048,))
+        down_q, down_scale = admitted_matrix(base + ".w2", source)
+        return block_matvec(down_q, down_scale, intermediate)
+
+    block_position = 3
+    routed_output = np.zeros(4096, dtype=np.float32)
+    for slot, expert in enumerate(route_indices[block_position]):
+        routed_output += route_weights[block_position, slot] * expert_output(
+            int(expert), ffn_inputs[block_position]
+        )
+    ffn_output = routed_output + expert_output(
+        "shared", ffn_inputs[block_position]
+    )
+    block_output = (
+        ffn_posts[block_position][:, None] * ffn_output[None, :] +
+        np.matmul(ffn_combinations[block_position].T, updated[block_position])
+    ).astype("<f4")
+
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
     if output.exists() or partial.exists():
         raise SourceFormatError(f"attention oracle output already exists: {output}")
     output.parent.mkdir(parents=True, exist_ok=True)
     partial.mkdir()
+    ffn_root = partial / "ffn"
+    ffn_root.mkdir()
+    ffn_entries: list[dict[str, object]] = []
+    for expert in sorted(set(int(value) for value in route_indices[3])):
+        relative = Path("ffn") / f"expert-{expert:03d}"
+        manifest = _export_deepseek_extents(
+            checkpoint,
+            names=tuple(
+                f"{prefix}.ffn.experts.{expert}.{projection}.{kind}"
+                for projection in ("w1", "w3", "w2")
+                for kind in ("weight", "scale")
+            ),
+            output=partial / relative, layer=layer, expert=expert,
+            format_name="deepseek-compact-expert-extents-v1",
+            source_abi="deepseek-fp4-e2m1-ue8m0-block32-v1",
+        )
+        ffn_entries.append({
+            "expert": expert, "kind": "routed", "bytes": manifest["bytes"],
+            "sha256": manifest["combined"]["sha256"],
+            "descriptor": str(relative / "extents.tsv"),
+        })
+    relative = Path("ffn") / "shared"
+    shared_manifest = _export_deepseek_extents(
+        checkpoint,
+        names=tuple(
+            f"{prefix}.ffn.shared_experts.{projection}.{kind}"
+            for projection in ("w1", "w3", "w2")
+            for kind in ("weight", "scale")
+        ),
+        output=partial / relative, layer=layer, expert="shared",
+        format_name="deepseek-fp8-shared-expert-extents-v1",
+        source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+    )
+    ffn_entries.append({
+        "expert": 256, "kind": "shared", "bytes": shared_manifest["bytes"],
+        "sha256": shared_manifest["combined"]["sha256"],
+        "descriptor": str(relative / "extents.tsv"),
+    })
+    with (ffn_root / "ffn-set.tsv").open("x", encoding="utf-8", newline="\n") as index:
+        index.write("deepseek-ffn-route-set-v1\n")
+        for entry in ffn_entries:
+            index.write(
+                f"{entry['expert']}\t{entry['kind']}\t{entry['bytes']}\t"
+                f"{entry['sha256']}\t{entry['descriptor']}\n"
+            )
+        index.flush()
+        os.fsync(index.fileno())
     with (partial / "streams.f32").open("xb") as file:
         file.write(np.asarray(streams, dtype="<f4").tobytes())
         file.flush()
@@ -795,6 +934,10 @@ def export_deepseek_attention_oracle(
         file.write(np.asarray(route_indices, dtype="<i4").tobytes())
         file.flush()
         os.fsync(file.fileno())
+    with (partial / "block-output.f32").open("xb") as file:
+        file.write(block_output.tobytes())
+        file.flush()
+        os.fsync(file.fileno())
     result = {
         "format": "deepseek-attention-decode4-oracle-v1",
         "layer": layer,
@@ -804,6 +947,8 @@ def export_deepseek_attention_oracle(
         "output_values": int(updated.size),
         "router_tokens": 4,
         "router_top_k": 6,
+        "block_position": block_position,
+        "ffn_experts": [entry["expert"] for entry in ffn_entries],
     }
     atomic_json(partial / "manifest.json", result)
     os.replace(partial, output)
