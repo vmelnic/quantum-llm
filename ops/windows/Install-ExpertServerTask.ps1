@@ -1,7 +1,8 @@
 param(
-    [ValidateSet("P6")][string]$Profile = "P6",
-    [string]$TaskName = "QuantumLLM-P6ExpertServer",
+    [ValidateSet("P6", "DeepSeekV4Flash")][string]$Profile = "P6",
+    [string]$TaskName = "",
     [string]$Container = "",
+    [string]$Bundle = "",
     [string]$Tokenizer = "",
     [string]$Runner = "",
     [string]$Python = "",
@@ -34,7 +35,22 @@ if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1) {
     throw "Invalid service limits"
 }
-$startScript = Join-Path $PSScriptRoot "Start-P6ExpertServer.ps1"
+if (-not $TaskName) {
+    $TaskName = if ($Profile -eq "P6") {
+        "QuantumLLM-P6ExpertServer"
+    } else {
+        "QuantumLLM-DeepSeekV4Flash"
+    }
+}
+if (($Profile -eq "P6" -and $Bundle) -or
+    ($Profile -eq "DeepSeekV4Flash" -and (-not $Bundle -or $Container))) {
+    throw "Profile model input is invalid"
+}
+$startScript = Join-Path $PSScriptRoot $(if ($Profile -eq "P6") {
+    "Start-P6ExpertServer.ps1"
+} else {
+    "Start-DeepSeekExpertServer.ps1"
+})
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existingTask) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
 [void](Stop-ExpertServerProcessTree -Port $Port)
@@ -68,7 +84,8 @@ $taskArguments.AddRange([string[]]@(
     "-BuildId", (Quote-TaskArgument $BuildId)
 ))
 foreach ($entry in @(
-    @{ Name = "Container"; Value = $Container },
+    @{ Name = if ($Profile -eq "P6") { "Container" } else { "Bundle" };
+       Value = if ($Profile -eq "P6") { $Container } else { $Bundle } },
     @{ Name = "Tokenizer"; Value = $Tokenizer },
     @{ Name = "Runner"; Value = $Runner },
     @{ Name = "Python"; Value = $Python }
@@ -99,6 +116,7 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     endpoint = "http://${HostAddress}:$Port"
     maximum_context = $MaximumContext
     maximum_new_tokens = $MaximumNewTokens
+    model_input = if ($Profile -eq "P6") { $Container } else { $Bundle }
     placement_profile = $PlacementProfile
     started = [bool]$Start
 } | ConvertTo-Json

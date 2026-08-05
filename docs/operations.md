@@ -29,6 +29,10 @@ the release procedure.
 # Install or replace configuration and optionally start
 .\ops\windows\Install-ExpertServerTask.ps1 -Start -BuildId <commit>
 
+# DeepSeek has an independent task and model-specific safe defaults
+.\ops\windows\Install-DeepSeekExpertServerTask.ps1 `
+  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v1 -BuildId <commit>
+
 # Stop and release VRAM; keep the task registered
 .\ops\windows\Stop-ExpertServer.ps1
 

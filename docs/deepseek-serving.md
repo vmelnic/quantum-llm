@@ -89,6 +89,22 @@ development only, `-AllowSourceExtents` permits that storage mode. The gate
 checks model and bundle hashes, backend-specific prefill/KV metadata, one real
 two-token completion, metrics, and complete request/KV cleanup.
 
+For a controlled pilot, register a separate restartable task after the gate
+passes. Registration does not start it unless `-Start` is supplied:
+
+```powershell
+./ops/windows/Install-DeepSeekExpertServerTask.ps1 `
+  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v1 `
+  -BuildId (git rev-parse --short HEAD)
+
+# Explicit lifecycle
+Start-ScheduledTask QuantumLLM-DeepSeekV4Flash
+./ops/windows/Stop-ExpertServer.ps1 `
+  -TaskName QuantumLLM-DeepSeekV4Flash -Port 8080
+./ops/windows/Uninstall-ExpertServerTask.ps1 `
+  -TaskName QuantumLLM-DeepSeekV4Flash -Port 8080
+```
+
 ## Verified vertical slice
 
 The first service gate used the source-extent catalog while the durable pack
