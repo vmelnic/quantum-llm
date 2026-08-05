@@ -106,5 +106,8 @@ independently proven.
   hot slot is byte-identical to the independent candidate and takes 9.73 ms.
 - Complete: gate/up/SILU/down CUDA execution directly from the admitted slot;
   one real expert takes 0.493 ms and matches the CPU output within `4.47e-8`.
-- Next: connect atomic publication, eviction, and prefetch to the runtime cache,
-  then implement shared-expert and dense/CSA/HCA execution.
+- Complete: representation-aware cache capacity; compact bytes and expanded
+  device bytes are budgeted independently before I/O or publication.
+- Next: add the compact-record validator/uploader behind the existing atomic
+  publication, eviction, deduplication, and prefetch lifecycle; then implement
+  shared-expert and dense/CSA/HCA execution.

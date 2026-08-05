@@ -357,6 +357,30 @@ void test_state_machine_and_sha256() {
           "streaming SHA-256 finalize is not idempotent");
 }
 
+void test_expanding_admission_reserves_exact_device_bytes() {
+  auto fixture = make_record(61);
+  fixture.record.device_bytes = 8192;
+  {
+    Harness undersized(8192, 2, 4096);
+    auto blocked = undersized.cache.acquire(fixture.key, fixture.record);
+    require(undersized.storage->pending_count() == 0,
+            "expanding admission started I/O without VRAM capacity");
+    blocked.cancel();
+    require(!blocked.get().status.ok(),
+            "cancelled expanding admission unexpectedly succeeded");
+  }
+  Harness sized(8192, 2, 8192);
+  auto admitted = sized.cache.acquire(fixture.key, fixture.record);
+  require(sized.storage->pending_count() == 1,
+          "valid expanding admission did not start I/O");
+  sized.storage->complete_success(fixture.bytes);
+  sized.uploader->complete_success(8192);
+  auto result = admitted.get();
+  require(result.status.ok() && result.lease &&
+              result.lease.get()->bytes() == 8192,
+          "expanding admission did not publish exact device allocation");
+}
+
 void test_ready_first_grouped_scheduler() {
   er::ContinuousBatchScheduler scheduler({2, 4, 8});
   require(scheduler.admit(1).ok() && scheduler.admit(2).ok(),
@@ -948,6 +972,7 @@ int main() {
   try {
     test_deepseek_compact_and_sm86_hot_abi();
     test_state_machine_and_sha256();
+    test_expanding_admission_reserves_exact_device_bytes();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();

@@ -31,9 +31,14 @@ bool same_record(const PayloadRecord& left, const PayloadRecord& right) {
   return left.path == right.path && left.record_offset == right.record_offset &&
          left.stored_bytes == right.stored_bytes &&
          left.decoded_bytes == right.decoded_bytes &&
+         left.device_bytes == right.device_bytes &&
          left.header_bytes == right.header_bytes &&
          left.alignment == right.alignment &&
          constant_time_equal(left.payload_sha256, right.payload_sha256);
+}
+
+std::uint64_t device_bytes(const PayloadRecord& record) noexcept {
+  return record.device_bytes == 0U ? record.stored_bytes : record.device_bytes;
 }
 
 }  // namespace
@@ -494,18 +499,19 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           bool resident =
               config.placement.vram_transient_bytes == 0 ||
               entry->frequency >= 2;
-          if (!make_capacity_locked(0, entry->record.stored_bytes,
+          const auto vram_need = device_bytes(entry->record);
+          if (!make_capacity_locked(0, vram_need,
                                     entry->key, resident,
                                     temperature_locked(*entry))) {
             if (!resident ||
-                !make_capacity_locked(0, entry->record.stored_bytes,
+                !make_capacity_locked(0, vram_need,
                                       entry->key, false,
                                       temperature_locked(*entry))) {
               continue;
             }
             resident = false;
           }
-          reserve_vram_locked(*entry, entry->record.stored_bytes, resident);
+          reserve_vram_locked(*entry, vram_need, resident);
           update_usage_locked();
         }
         transition_locked(*entry, CacheState::gpu_uploading);
@@ -525,12 +531,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       bool resident =
           config.placement.vram_transient_bytes == 0 ||
           entry->frequency >= 2;
+      const auto vram_need = device_bytes(entry->record);
       if (!make_capacity_locked(entry->record.stored_bytes,
-                                entry->record.stored_bytes, entry->key,
+                                vram_need, entry->key,
                                 resident, temperature_locked(*entry))) {
         if (!resident ||
             !make_capacity_locked(entry->record.stored_bytes,
-                                  entry->record.stored_bytes, entry->key,
+                                  vram_need, entry->key,
                                   false, temperature_locked(*entry))) {
           continue;
         }
@@ -544,7 +551,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       }
       entry->host = std::move(host);
       reserve_ram_locked(*entry, entry->record.stored_bytes);
-      reserve_vram_locked(*entry, entry->record.stored_bytes, resident);
+      reserve_vram_locked(*entry, vram_need, resident);
       transition_locked(*entry, CacheState::ssd_loading);
       Telemetry::add(metrics.load_started_);
       Telemetry::add(metrics.requested_bytes_, entry->record.stored_bytes);
@@ -912,7 +919,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         entry.state != CacheState::ram_ready) {
       return false;
     }
-    const auto need = entry.record.stored_bytes;
+    const auto need = device_bytes(entry.record);
     if (vram_bytes + need <= config.vram.high_watermark_bytes) return true;
     const auto deficit =
         vram_bytes + need - config.vram.high_watermark_bytes;

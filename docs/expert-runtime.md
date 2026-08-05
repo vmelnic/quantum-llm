@@ -55,6 +55,12 @@ Rules:
 - RAM cache, pinned staging, VRAM resident/transient, workspace and KV budgets
   are independent.
 
+`stored_bytes` and `device_bytes` are separate capacity claims. Zero
+`device_bytes` preserves the legacy equal-size path. Expanding admissions such
+as compact DeepSeek FP4 → SM86 INT8 must declare the exact hot allocation before
+I/O begins; the cache reserves that larger value and refuses work that cannot
+fit. Upload completion may shrink a reservation but may never exceed it.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution

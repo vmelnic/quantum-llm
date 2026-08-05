@@ -166,3 +166,10 @@ This proves the compact source → CUDA admission → compute path end to end fo
 one expert. It does not imply model tok/s: top-6 scheduling across 43 layers,
 shared experts, dense FP8 tensors, CSA/HCA attention, routing, KV state, cache
 misses, and concurrent requests still have to be integrated and measured.
+
+The shared cache now distinguishes immutable `stored_bytes` from exact
+`device_bytes`. For DeepSeek these are 13,369,344 and 25,198,592 respectively.
+VRAM capacity is reserved using the expanded hot size before SSD I/O starts;
+an undersized admission remains absent instead of loading data it cannot
+publish. Qwen retains its legacy equal-size behavior through a zero/default
+device-size claim.

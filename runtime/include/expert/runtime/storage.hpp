@@ -50,6 +50,9 @@ struct PayloadRecord final {
   std::uint64_t record_offset{};
   std::uint64_t stored_bytes{};
   std::uint64_t decoded_bytes{};
+  // Exact device allocation produced by admission. Zero preserves the legacy
+  // invariant that stored bytes and device bytes are equal.
+  std::uint64_t device_bytes{};
   std::uint32_t header_bytes{256};
   std::uint32_t alignment{4096};
   Sha256Digest payload_sha256{};
