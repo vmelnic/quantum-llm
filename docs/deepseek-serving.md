@@ -88,9 +88,9 @@ The timing counters deliberately describe their measured boundary:
 - `scheduler_controller_advance_ns` is time inside controller advancement;
 - `worker_attention_route_submit_ns` and `worker_ffn_submit_ns` are CPU launch
   time only;
-- `worker_directory_plan_ns` includes the stream drain for attention/router,
-  while `worker_directory_release_ns` includes the stream drain for routed and
-  shared FFN work;
+- `worker_directory_plan_ns` currently includes the stream drain for the prior
+  queued FFN release plus the current attention/router; after asynchronous pin
+  release, `worker_directory_release_ns` is only CPU enqueue time;
 - `scheduler_expert_wait_ns` covers suspended route resolution;
 - `cache_storage_wait_ns`, `cache_ram_retention_copy_ns`, and
   `cache_upload_wait_ns` measure the cache pipeline stages.

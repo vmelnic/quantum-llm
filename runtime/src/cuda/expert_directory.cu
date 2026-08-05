@@ -166,15 +166,29 @@ struct CudaExpertDirectory::Impl final {
   std::uint32_t* error{};
   std::uint32_t* retired{};
   std::vector<std::uint32_t> generations;
+  struct PinSlot final {
+    std::uint32_t* device_experts{};
+    cudaEvent_t completion{};
+    bool in_use{};
+    bool release_pending{};
+  };
   struct ActivePin final {
     std::uint32_t layer{};
     std::vector<std::uint32_t> experts;
+    std::size_t slot{};
   };
+  std::vector<PinSlot> pin_slots;
   std::unordered_map<std::uint64_t, ActivePin> active_pins;
   std::uint64_t next_pin_id{1U};
   std::mutex mutex;
 
   ~Impl() {
+    for (auto& slot : pin_slots) {
+      if (slot.release_pending && slot.completion)
+        static_cast<void>(cudaEventSynchronize(slot.completion));
+      if (slot.completion) static_cast<void>(cudaEventDestroy(slot.completion));
+      static_cast<void>(cudaFree(slot.device_experts));
+    }
     static_cast<void>(cudaFree(retired));
     static_cast<void>(cudaFree(error));
     static_cast<void>(cudaFree(unique_count));
@@ -227,6 +241,18 @@ CudaExpertDirectory::CudaExpertDirectory(
   allocate(&impl_->error, sizeof(std::uint32_t), "cudaMalloc route error");
   allocate(&impl_->retired, sizeof(std::uint32_t),
            "cudaMalloc retire result");
+  impl_->pin_slots.resize(maximum_active_pins);
+  for (auto& slot : impl_->pin_slots) {
+    allocate(&slot.device_experts,
+             maximum_selections * sizeof(std::uint32_t),
+             "cudaMalloc directory pin slot");
+    if (const auto event_error =
+            cudaEventCreateWithFlags(&slot.completion, cudaEventDisableTiming);
+        event_error != cudaSuccess) {
+      throw std::runtime_error(std::string("cudaEventCreate directory pin: ") +
+                               cudaGetErrorString(event_error));
+    }
+  }
   const auto error = cudaMemset(impl_->entries, 0,
                                 entry_count * sizeof(DeviceExpertEntry));
   if (error != cudaSuccess) {
@@ -437,11 +463,58 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
       continue;
     pinned_experts.push_back(expert);
   }
+  std::size_t pin_slot = impl_->pin_slots.size();
+  for (std::size_t index = 0U; index < impl_->pin_slots.size(); ++index) {
+    auto& slot = impl_->pin_slots[index];
+    if (slot.release_pending) {
+      const auto query = cudaEventQuery(slot.completion);
+      if (query == cudaSuccess) {
+        slot.release_pending = false;
+        slot.in_use = false;
+      } else if (query != cudaErrorNotReady) {
+        release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+            impl_->entries, layer * impl_->experts, impl_->hash_keys,
+            impl_->pinned, impl_->hash_slots);
+        static_cast<void>(cudaStreamSynchronize(stream));
+        result.status = checked(query, "query directory pin slot");
+        return result;
+      }
+    }
+    if (!slot.in_use) {
+      pin_slot = index;
+      break;
+    }
+  }
+  if (pin_slot == impl_->pin_slots.size()) {
+    release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+        impl_->entries, layer * impl_->experts, impl_->hash_keys,
+        impl_->pinned, impl_->hash_slots);
+    static_cast<void>(cudaStreamSynchronize(stream));
+    result.status = Status(ErrorCode::backpressure,
+                           "CUDA directory pin slots exhausted");
+    return result;
+  }
+  auto& slot = impl_->pin_slots[pin_slot];
+  if (!pinned_experts.empty()) {
+    const auto copy_error = cudaMemcpyAsync(
+        slot.device_experts, pinned_experts.data(),
+        pinned_experts.size() * sizeof(std::uint32_t),
+        cudaMemcpyHostToDevice, stream);
+    if (copy_error != cudaSuccess) {
+      release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+          impl_->entries, layer * impl_->experts, impl_->hash_keys,
+          impl_->pinned, impl_->hash_slots);
+      static_cast<void>(cudaStreamSynchronize(stream));
+      result.status = checked(copy_error, "stage directory pin slot");
+      return result;
+    }
+  }
+  slot.in_use = true;
   auto pin_id = impl_->next_pin_id++;
   while (pin_id == 0U || impl_->active_pins.contains(pin_id))
     pin_id = impl_->next_pin_id++;
   impl_->active_pins.emplace(
-      pin_id, Impl::ActivePin{layer, std::move(pinned_experts)});
+      pin_id, Impl::ActivePin{layer, std::move(pinned_experts), pin_slot});
   result.pin_id = pin_id;
   return result;
 }
@@ -456,24 +529,60 @@ Status CudaExpertDirectory::release_pins(std::uint64_t pin_id,
   }
   const auto stream = static_cast<cudaStream_t>(raw_stream);
   auto status = Status::success();
+  auto& slot = impl_->pin_slots[active->second.slot];
   if (!active->second.experts.empty()) {
-    auto error = cudaMemcpyAsync(
-        impl_->missing, active->second.experts.data(),
-        active->second.experts.size() * sizeof(std::uint32_t),
-        cudaMemcpyHostToDevice, stream);
-    if (error == cudaSuccess) {
-      const auto count = static_cast<std::uint32_t>(active->second.experts.size());
-      release_selected_pins<<<(count + kThreads - 1U) / kThreads, kThreads, 0,
-                              stream>>>(
-          impl_->entries, active->second.layer * impl_->experts,
-          impl_->missing, count);
-      error = cudaPeekAtLastError();
-    }
+    const auto count = static_cast<std::uint32_t>(active->second.experts.size());
+    release_selected_pins<<<(count + kThreads - 1U) / kThreads, kThreads, 0,
+                            stream>>>(
+        impl_->entries, active->second.layer * impl_->experts,
+        slot.device_experts, count);
+    auto error = cudaPeekAtLastError();
     if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
     status = checked(error, "release directory pin token");
   }
+  if (status.ok()) {
+    slot.in_use = false;
+    slot.release_pending = false;
+  }
   if (status.ok()) impl_->active_pins.erase(active);
   return status;
+}
+
+Status CudaExpertDirectory::release_pins_async(std::uint64_t pin_id,
+                                               void* raw_stream) noexcept {
+  std::lock_guard lock(impl_->mutex);
+  const auto active = impl_->active_pins.find(pin_id);
+  if (pin_id == 0U || active == impl_->active_pins.end()) {
+    return Status(ErrorCode::invalid_argument,
+                  "CUDA directory pin token is not active");
+  }
+  auto& slot = impl_->pin_slots[active->second.slot];
+  const auto stream = static_cast<cudaStream_t>(raw_stream);
+  if (!active->second.experts.empty()) {
+    const auto count = static_cast<std::uint32_t>(active->second.experts.size());
+    release_selected_pins<<<(count + kThreads - 1U) / kThreads, kThreads, 0,
+                            stream>>>(
+        impl_->entries, active->second.layer * impl_->experts,
+        slot.device_experts, count);
+    auto error = cudaPeekAtLastError();
+    if (error == cudaSuccess)
+      error = cudaEventRecord(slot.completion, stream);
+    if (error != cudaSuccess) {
+      // A successfully launched release kernel still owns the reference
+      // transition. Drain before discarding its bookkeeping when event
+      // publication itself fails, preventing a retry from decrementing twice.
+      static_cast<void>(cudaStreamSynchronize(stream));
+      slot.in_use = false;
+      slot.release_pending = false;
+      impl_->active_pins.erase(active);
+      return checked(error, "enqueue directory pin release");
+    }
+    slot.release_pending = true;
+  } else {
+    slot.in_use = false;
+  }
+  impl_->active_pins.erase(active);
+  return Status::success();
 }
 
 const DeviceExpertEntry* CudaExpertDirectory::device_entries() const noexcept {

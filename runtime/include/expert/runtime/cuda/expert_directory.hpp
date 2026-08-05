@@ -81,6 +81,12 @@ class CudaExpertDirectory final : public IDeviceResidencyDirectory {
       bool keep_ready_pins_on_miss = false);
   [[nodiscard]] Status release_pins(std::uint64_t pin_id,
                                     void* stream) noexcept;
+  // Enqueues reference release after all prior work in stream and returns
+  // without draining it. The request-owned stream must outlive the operation;
+  // the directory retains private device metadata until its completion event
+  // makes the slot reusable.
+  [[nodiscard]] Status release_pins_async(std::uint64_t pin_id,
+                                          void* stream) noexcept;
 
   [[nodiscard]] const DeviceExpertEntry* device_entries() const noexcept;
   [[nodiscard]] std::uint32_t experts_per_layer() const noexcept;

@@ -280,10 +280,11 @@ int main(int argc, char** argv) {
       norm_b += static_cast<double>(reference[i]) * reference[i];
     }
     const double cosine = dot / std::sqrt(norm_a * norm_b);
-    auto release_status = directory->release_pins(concurrent_plan.pin_id,
-                                                  nullptr);
+    auto release_status = directory->release_pins_async(
+        concurrent_plan.pin_id, nullptr);
     if (!release_status.ok())
       throw std::runtime_error(std::string(release_status.message()));
+    cuda_check(cudaDeviceSynchronize(), "asynchronous pin release");
     release_status = directory->release_pins(plan.pin_id, nullptr);
     if (!release_status.ok())
       throw std::runtime_error(std::string(release_status.message()));

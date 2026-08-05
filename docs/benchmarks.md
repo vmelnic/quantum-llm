@@ -360,6 +360,18 @@ shared scratch allocation. The next runtime slice is therefore a per-request,
 event-driven directory transaction; GPU-event timings remain necessary before
 choosing the first kernel to replace.
 
+The first asynchronous slice gave every active pin a fixed device metadata
+slot and completion event, then enqueued reference release after FFN instead of
+draining the request stream. The same route emitted token `19923`; release calls
+fell from 126.442 ms to 1.212 ms over 215 layers. As expected for a dependent
+single stream, most work moved to the next planning drain: plan time rose from
+201.041 ms to 310.988 ms. Whole-model time was 369.761 ms (13.52 model steps/s),
+which is about 9.1% lower than that immediately preceding 406.708 ms sample but
+slower than the earlier 340.886 ms best sample. No stable single-stream speedup
+is claimed. The change is retained because it removes one host barrier per
+layer and makes inter-request overlap possible; private asynchronous planning
+is still required to realize that concurrency.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

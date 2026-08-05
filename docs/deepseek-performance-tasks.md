@@ -87,7 +87,8 @@ router output or generated tokens.
 - [ ] Keep directory hit planning on device. Return only compact miss metadata
   to the host and replace per-layer `cudaStreamSynchronize` calls with event
   dependencies.
-- [ ] Release directory pins asynchronously after the last consuming kernel.
+- [x] Release directory pins asynchronously after the last consuming kernel,
+  with fixed device metadata slots recycled only after completion events.
 - [ ] Split I/O completion, RAM admission, H2D, and CUDA publication into
   separate bounded queues. IOCP completion threads must never wait for CUDA.
 - [ ] Use persistent pack handles instead of `CreateFile`/`CloseHandle` for

@@ -187,7 +187,7 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
           .count());
   if (!execute.ok()) return fail(execute);
   const auto release_started = std::chrono::steady_clock::now();
-  const auto release = directory_->release_pins(pin_id_, stream_);
+  const auto release = directory_->release_pins_async(pin_id_, stream_);
   telemetry_.directory_release_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - release_started)
