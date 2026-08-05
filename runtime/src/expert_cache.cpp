@@ -28,7 +28,8 @@ bool valid_budget(const TierBudget& budget) noexcept {
 }
 
 bool same_record(const PayloadRecord& left, const PayloadRecord& right) {
-  return left.path == right.path && left.record_offset == right.record_offset &&
+  return left.path == right.path && left.extents == right.extents &&
+         left.record_offset == right.record_offset &&
          left.stored_bytes == right.stored_bytes &&
          left.decoded_bytes == right.decoded_bytes &&
          left.device_bytes == right.device_bytes &&

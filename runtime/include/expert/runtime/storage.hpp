@@ -10,6 +10,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace expert::runtime {
 
@@ -45,8 +46,22 @@ class Status final {
 using Sha256Digest = std::array<std::byte, 32>;
 using OperationId = std::uint64_t;
 
+// One immutable source range gathered into a logical payload. Extents permit
+// compact experts to remain in their authoritative SafeTensors shards.
+struct PayloadExtent final {
+  std::filesystem::path path;
+  std::uint64_t source_offset{};
+  std::uint64_t destination_offset{};
+  std::uint64_t bytes{};
+
+  friend bool operator==(const PayloadExtent&, const PayloadExtent&) = default;
+};
+
 struct PayloadRecord final {
   std::filesystem::path path;
+  // Empty selects the legacy contiguous path/record_offset read. Otherwise
+  // these ranges must exactly and non-overlappingly cover stored_bytes.
+  std::vector<PayloadExtent> extents;
   std::uint64_t record_offset{};
   std::uint64_t stored_bytes{};
   std::uint64_t decoded_bytes{};

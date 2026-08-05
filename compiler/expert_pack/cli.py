@@ -73,7 +73,7 @@ def _parser() -> argparse.ArgumentParser:
 
     export_parser = commands.add_parser(
         "export-deepseek-expert",
-        help="copy one compact source expert into a bounded CUDA fixture bundle",
+        help="describe one compact source expert as bounded SafeTensors extents",
     )
     export_parser.add_argument("--source", type=Path, required=True)
     export_parser.add_argument("--output", type=Path, required=True)

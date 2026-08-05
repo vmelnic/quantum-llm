@@ -5,6 +5,7 @@
 #include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/expert_record.hpp"
+#include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/sha256.hpp"
 #if defined(_WIN32)
 #include "expert/runtime/windows_iocp_storage.hpp"
@@ -18,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -59,6 +61,39 @@ er::Sha256Digest parse_digest(const std::string& value) {
         (hex_nibble(value[index * 2U]) << 4U) |
         hex_nibble(value[index * 2U + 1U]));
   }
+  return result;
+}
+
+std::vector<er::PayloadExtent> read_extents(
+    const std::filesystem::path& descriptor_path,
+    const std::filesystem::path& source_root) {
+  std::ifstream input(descriptor_path);
+  std::string line;
+  require(static_cast<bool>(std::getline(input, line)) &&
+              line == "deepseek-compact-extents-v1",
+          "invalid compact extent descriptor header");
+  std::vector<er::PayloadExtent> result;
+  while (std::getline(input, line)) {
+    const auto first = line.find('\t');
+    const auto second = line.find('\t', first + 1U);
+    const auto third = line.find('\t', second + 1U);
+    require(first != std::string::npos && second != std::string::npos &&
+                third != std::string::npos &&
+                line.find('\t', third + 1U) == std::string::npos,
+            "invalid compact extent descriptor row");
+    const auto destination = std::stoull(line.substr(0U, first));
+    const auto bytes = std::stoull(line.substr(first + 1U, second - first - 1U));
+    const auto source = std::stoull(line.substr(second + 1U, third - second - 1U));
+    const std::filesystem::path shard = line.substr(third + 1U);
+    require(!shard.empty() && !shard.is_absolute(),
+            "extent shard must be relative to checkpoint root");
+    for (const auto& component : shard) {
+      require(component != "..", "extent shard may not escape checkpoint root");
+    }
+    result.push_back({source_root / shard, source, destination, bytes});
+  }
+  require(input.eof() && result.size() == 6U,
+          "DeepSeek routed expert must contain exactly six extents");
   return result;
 }
 
@@ -143,20 +178,22 @@ int main(int argc, char** argv) {
     (void)argv;
     throw std::runtime_error("DeepSeek IOCP admission smoke requires Windows");
 #else
-    if (argc != 4) {
-      std::cerr << "usage: expert-deepseek-admission-smoke <bundle> "
-                   "<expected-hot-sha256> <compact-sha256>\n";
+    if (argc != 5) {
+      std::cerr << "usage: expert-deepseek-admission-smoke <descriptor-bundle> "
+                   "<checkpoint-root> <expected-hot-sha256> "
+                   "<compact-sha256>\n";
       return 64;
     }
     const std::filesystem::path root = argv[1];
-    const std::string expected_hot_hash = argv[2];
-    const auto compact_hash = parse_digest(argv[3]);
+    const std::filesystem::path source_root = argv[2];
+    const std::string expected_hot_hash = argv[3];
+    const auto compact_hash = parse_digest(argv[4]);
     const auto geometry = er::DeepSeekExpertGeometry::v4_flash();
     const auto layout = er::make_deepseek_sm86_hot_layout(geometry);
     require(layout.slot_bytes == kHotBytes, "unexpected DeepSeek hot geometry");
 
     er::PayloadRecord record;
-    record.path = root / "expert.compact.bin";
+    record.extents = read_extents(root / "extents.tsv", source_root);
     record.record_offset = 0U;
     record.stored_bytes = kCompactBytes;
     record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
@@ -167,7 +204,8 @@ int main(int argc, char** argv) {
     record.payload_sha256 = compact_hash;
     const er::ExpertKey key{17U, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86};
 
-    auto storage = std::make_shared<er::WindowsIocpStorage>(1U);
+    auto iocp = std::make_shared<er::WindowsIocpStorage>(1U);
+    auto storage = std::make_shared<er::ExtentGatherStorage>(iocp);
     auto uploader = std::make_shared<er::cuda::CudaExpertUploader>();
     auto allocator = std::make_shared<er::CudaPinnedAllocator>();
     auto buffers = std::make_shared<er::FixedBufferPool>(

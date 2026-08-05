@@ -39,7 +39,7 @@ try {
     $manifest = Get-Content (Join-Path $bundle "manifest.json") -Raw |
         ConvertFrom-Json
 
-    $cudaRaw = & $executable $bundle `
+    $cudaRaw = & $executable $bundle $source `
         ([string]$qualification.result.candidate_sha256) `
         ([string]$manifest.combined.sha256) | Out-String
     if ($LASTEXITCODE -ne 0) {

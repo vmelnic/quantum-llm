@@ -11,7 +11,7 @@ from pathlib import Path
 from .deepseek_v4 import validate_deepseek_v4_source
 from .errors import AdapterError, SourceFormatError
 from .safetensors import SafeTensorCheckpoint
-from .util import atomic_json, write_all
+from .util import atomic_json
 
 try:
     import numpy as np
@@ -215,7 +215,7 @@ def qualify_deepseek_expert(
 def export_deepseek_compact_expert(
     checkpoint: SafeTensorCheckpoint, *, layer: int, expert: int, output: Path
 ) -> dict[str, object]:
-    """Copy one immutable compact expert into a small CUDA fixture bundle."""
+    """Describe one compact expert as source extents without copying weights."""
 
     validate_deepseek_v4_source(checkpoint)
     if not 0 <= layer < 43 or not 0 <= expert < 256:
@@ -231,43 +231,44 @@ def export_deepseek_compact_expert(
     try:
         prefix = f"layers.{layer}.ffn.experts.{expert}"
         combined_digest = hashlib.sha256()
-        combined_path = partial / "expert.compact.bin"
-        with combined_path.open("xb") as combined:
+        descriptor_path = partial / "extents.tsv"
+        with descriptor_path.open("x", encoding="utf-8", newline="\n") as descriptor:
+            descriptor.write("deepseek-compact-extents-v1\n")
             for projection in ("w1", "w3", "w2"):
                 for kind in ("weight", "scale"):
                     name = f"{prefix}.{projection}.{kind}"
                     info = checkpoint.tensors[name]
-                    filename = f"{projection}.{kind}.bin"
                     digest = hashlib.sha256()
-                    with checkpoint.open_tensor(name) as view, (
-                        partial / filename
-                    ).open("xb") as handle:
+                    with checkpoint.open_tensor(name) as view:
                         digest.update(view.raw)
                         combined_digest.update(view.raw)
-                        write_all(handle, view.raw)
-                        write_all(combined, view.raw)
-                        handle.flush()
-                        os.fsync(handle.fileno())
+                    if "\t" in info.shard or "\n" in info.shard or "\r" in info.shard:
+                        raise SourceFormatError("SafeTensors shard name is not descriptor-safe")
+                    descriptor.write(
+                        f"{total_bytes}\t{info.nbytes}\t{info.offset}\t{info.shard}\n"
+                    )
                     tensors.append({
                         "name": name,
-                        "file": filename,
+                        "shard": info.shard,
+                        "source_offset": info.offset,
+                        "destination_offset": total_bytes,
                         "dtype": info.dtype,
                         "shape": list(info.shape),
                         "bytes": info.nbytes,
                         "sha256": digest.hexdigest(),
                     })
                     total_bytes += info.nbytes
-            combined.flush()
-            os.fsync(combined.fileno())
+            descriptor.flush()
+            os.fsync(descriptor.fileno())
         manifest = {
-            "format": "deepseek-compact-expert-fixture-v1",
+            "format": "deepseek-compact-expert-extents-v1",
             "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
             "target_abi": "deepseek-sm86-int8-per-row-v1",
             "layer": layer,
             "expert": expert,
             "bytes": total_bytes,
             "combined": {
-                "file": combined_path.name,
+                "descriptor": descriptor_path.name,
                 "bytes": total_bytes,
                 "sha256": combined_digest.hexdigest(),
             },

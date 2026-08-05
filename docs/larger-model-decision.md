@@ -111,5 +111,7 @@ independently proven.
 - Complete: compact-record validation and CUDA admission run behind the existing
   IOCP, pinned-buffer, single-flight cache, atomic directory publication, and
   eviction lifecycle. Two concurrent requests produced one read and one upload.
-- Next: replace the one-expert combined fixture with direct bounded SafeTensors
-  extent gathering, then implement shared-expert and dense/CSA/HCA execution.
+- Complete: direct bounded SafeTensors extent gathering replaces copied expert
+  fixtures; the descriptor is about 3 KiB and the source checkpoint remains the
+  sole authoritative weight copy.
+- Next: implement shared-expert and dense/CSA/HCA execution.

@@ -1,6 +1,7 @@
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
@@ -197,9 +198,11 @@ class ControlledStorage final : public er::IAsyncStorage {
             "fixture/read size mismatch");
     require(pending.request.destination.capacity >= source.size(),
             "destination too small");
-    require(reinterpret_cast<std::uintptr_t>(pending.request.destination.data) %
-                    er::kExpertPackAlignment ==
-                0,
+    require(!pending.request.direct ||
+                reinterpret_cast<std::uintptr_t>(
+                    pending.request.destination.data) %
+                        er::kExpertPackAlignment ==
+                    0,
             "direct-read destination is not 4096 aligned");
     std::copy(source.begin(), source.end(), pending.request.destination.data);
     pending.completion({er::Status::success(), source.size(), source.size()});
@@ -236,6 +239,46 @@ class ControlledStorage final : public er::IAsyncStorage {
   er::OperationId next_id_{1};
   std::size_t read_count_{};
 };
+
+void test_extent_gather_is_exact_and_bounded() {
+  auto backing = std::make_shared<ControlledStorage>();
+  er::ExtentGatherStorage gather(backing);
+  std::array<std::byte, 12> destination{};
+  er::PayloadRecord record;
+  record.stored_bytes = destination.size();
+  record.extents = {
+      {"shard-a", 101U, 0U, 4U},
+      {"shard-b", 202U, 4U, 3U},
+      {"shard-a", 303U, 7U, 5U},
+  };
+  std::promise<er::ReadResult> promise;
+  auto result = promise.get_future();
+  static_cast<void>(gather.read(
+      {record, {destination.data(), destination.size()}, true},
+      [&promise](er::ReadResult read) { promise.set_value(std::move(read)); }));
+  require(backing->pending_count() == 3U,
+          "extent gather did not issue one bounded read per source range");
+  backing->complete_success(
+      {std::byte{1}, std::byte{2}, std::byte{3}, std::byte{4}});
+  backing->complete_success({std::byte{5}, std::byte{6}, std::byte{7}});
+  backing->complete_success({std::byte{8}, std::byte{9}, std::byte{10},
+                             std::byte{11}, std::byte{12}});
+  const auto completed = result.get();
+  require(completed.status.ok() && completed.requested_bytes == 12U &&
+              completed.read_bytes == 12U &&
+              destination[0] == std::byte{1} &&
+              destination[6] == std::byte{7} &&
+              destination[11] == std::byte{12},
+          "extent gather changed source order or byte accounting");
+
+  record.extents[1].destination_offset = 5U;
+  bool rejected = false;
+  static_cast<void>(gather.read(
+      {record, {destination.data(), destination.size()}, true},
+      [&rejected](er::ReadResult read) { rejected = !read.status.ok(); }));
+  require(rejected && backing->pending_count() == 0U,
+          "extent gather accepted a destination gap");
+}
 
 class TestDeviceAllocation final : public er::IDeviceAllocation {
  public:
@@ -995,6 +1038,7 @@ int main() {
   try {
     test_deepseek_compact_and_sm86_hot_abi();
     test_deepseek_compact_admission_validation();
+    test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();
     test_ready_first_grouped_scheduler();

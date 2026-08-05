@@ -15,6 +15,7 @@ add_library(expert_runtime STATIC
   src/deepseek_expert.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
+  src/gather_storage.cpp
   src/hybrid_dispatch.cpp
   src/scheduler.cpp
   src/sha256.cpp

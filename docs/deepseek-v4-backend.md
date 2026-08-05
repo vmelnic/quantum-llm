@@ -138,18 +138,19 @@ changing Expert Pack v1 constants.
 
 ## SM86 admission result
 
-The first CUDA admission gate now passes on RTX 3090. A bounded fixture gathers
-the six original compact tensors for one expert without decoding or modifying
-the checkpoint. The production cache reads the resulting 13,369,344-byte
-staging record with IOCP into a pinned buffer. CUDA then decodes FP4/UE8M0,
-performs per-row INT8 quantization, and fills the exact 25,198,592-byte hot
-slot.
+The first CUDA admission gate now passes on RTX 3090. A small descriptor names
+the six original SafeTensors ranges for one expert without decoding, copying,
+or modifying the checkpoint. The production cache gathers the resulting
+13,369,344 logical bytes with IOCP into a pinned buffer. CUDA then decodes
+FP4/UE8M0, performs per-row INT8 quantization, and fills the exact
+25,198,592-byte hot slot.
 
 The complete device slot matched the independent Python/PyTorch candidate
 SHA-256 byte-for-byte. Direct H2D plus admission measured about 9.5 ms for the
 first real expert. A full cold cache acquisition—including unbuffered I/O,
-SHA-256 validation, admission, publication, and two concurrent waiters—took
-79.5 ms. Both waiters shared exactly one read and one upload. The CUDA directory
+SHA-256 validation, admission, publication, and two concurrent waiters—measured
+49.6 ms with direct source extents. Both waiters shared exactly one logical
+read and one upload. The CUDA directory
 saw the entry only after completion, and eviction released the complete hot
 allocation.
 
@@ -177,9 +178,10 @@ an undersized admission remains absent instead of loading data it cannot
 publish. Qwen retains its legacy equal-size behavior through a zero/default
 device-size claim.
 
-The temporary combined record is only a bounded qualification fixture. The
-checkpoint remains authoritative, and full-model operation must not create one
-copied file per expert. The next storage step is a validated gather descriptor
-whose six `(shard, offset, length)` extents are read directly from the original
-SafeTensors files into the same fixed staging buffer. The cache/admission ABI
-does not change when that storage source replaces the fixture.
+The checkpoint remains authoritative: the qualification bundle now contains
+only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
+expert payload is retained. Extents must cover the compact destination exactly
+without gaps or overlap; the assembled payload still passes one whole-record
+SHA-256 gate before admission. This keeps storage growth independent of model
+parameter count and preserves the same cache/admission ABI for future 1T-class
+checkpoints.

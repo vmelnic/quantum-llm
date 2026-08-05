@@ -164,10 +164,12 @@ remain independent operator inputs.
 - useful, requested, physical-read and overfetch bytes are measured separately;
 - EOF, short completion, checksum mismatch and device removal fail closed.
 
-DeepSeek qualification currently materializes one temporary combined staging
-record. Production-scale ingestion will gather bounded extents directly from
-the immutable SafeTensors shards; it will not repack or duplicate the full
-checkpoint.
+DeepSeek ingestion uses an exact-cover gather descriptor. Six buffered,
+overlapped SafeTensors reads target disjoint offsets in one pinned staging
+buffer, then a whole-payload checksum gates CUDA admission. Buffered children
+are intentional because tensor offsets need not satisfy sector alignment;
+unbuffered aligned reads remain the contiguous-pack path. No full checkpoint or
+per-expert payload copy is created.
 
 ## CUDA ABI
 
