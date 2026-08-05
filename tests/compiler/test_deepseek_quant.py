@@ -4,6 +4,8 @@ import math
 import unittest
 
 from compiler.expert_pack.deepseek_quant import (
+    decode_fp8_e4m3fn,
+    decode_fp8_e4m3fn_values,
     FP4_E2M1_VALUES,
     decode_fp4_e2m1_values,
     decode_scaled_fp4_e2m1_row,
@@ -21,6 +23,18 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    def test_e4m3fn_finite_table_and_nan_codes(self) -> None:
+        self.assertEqual(decode_fp8_e4m3fn(0x00), 0.0)
+        self.assertEqual(decode_fp8_e4m3fn(0x01), 2.0**-9)
+        self.assertEqual(decode_fp8_e4m3fn(0x38), 1.0)
+        self.assertEqual(decode_fp8_e4m3fn(0x7E), 448.0)
+        self.assertEqual(decode_fp8_e4m3fn(0xFE), -448.0)
+        finite = bytes(code for code in range(255) if code != 0x7F)
+        self.assertEqual(len(decode_fp8_e4m3fn_values(finite)), 254)
+        for code in (0x7F, 0xFF):
+            with self.assertRaises(SourceFormatError):
+                decode_fp8_e4m3fn(code)
+
     @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_numpy_slice_decoder_matches_dependency_free_decoder(self) -> None:
         packed = bytes((0x21,)) * 16 + bytes((0x76,)) * 16

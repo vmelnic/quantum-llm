@@ -11,7 +11,12 @@ from .deepseek_v4 import (
     estimate_deepseek_v4_representations,
     validate_deepseek_v4_source,
 )
-from .deepseek_slice import export_deepseek_compact_expert, qualify_deepseek_expert
+from .deepseek_slice import (
+    export_deepseek_compact_expert,
+    export_deepseek_shared_expert,
+    qualify_deepseek_expert,
+    qualify_deepseek_shared_expert,
+)
 from .errors import ExpertPackError
 from .safetensors import SafeTensorCheckpoint
 from .source_inventory import inspect_source
@@ -70,6 +75,13 @@ def _parser() -> argparse.ArgumentParser:
     slice_parser.add_argument("--expert", type=int, default=0)
     slice_parser.add_argument("--row-chunk", type=int, default=128)
     slice_parser.add_argument("--no-torch-reference", action="store_true")
+    shared_slice_parser = commands.add_parser(
+        "qualify-deepseek-shared",
+        help="decode one FP8 shared expert and compare the SM86 candidate",
+    )
+    shared_slice_parser.add_argument("--source", type=Path, required=True)
+    shared_slice_parser.add_argument("--layer", type=int, default=0)
+    shared_slice_parser.add_argument("--row-chunk", type=int, default=128)
 
     export_parser = commands.add_parser(
         "export-deepseek-expert",
@@ -79,6 +91,13 @@ def _parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--layer", type=int, default=0)
     export_parser.add_argument("--expert", type=int, default=0)
+    shared_parser = commands.add_parser(
+        "export-deepseek-shared",
+        help="describe one FP8 shared expert as bounded SafeTensors extents",
+    )
+    shared_parser.add_argument("--source", type=Path, required=True)
+    shared_parser.add_argument("--output", type=Path, required=True)
+    shared_parser.add_argument("--layer", type=int, default=0)
     return parser
 
 
@@ -124,10 +143,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 row_chunk=args.row_chunk,
                 torch_reference=not args.no_torch_reference,
             )
-        else:
+        elif args.command == "qualify-deepseek-shared":
+            result = qualify_deepseek_shared_expert(
+                SafeTensorCheckpoint(args.source), layer=args.layer,
+                row_chunk=args.row_chunk,
+            )
+        elif args.command == "export-deepseek-expert":
             result = export_deepseek_compact_expert(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 expert=args.expert, output=args.output,
+            )
+        else:
+            result = export_deepseek_shared_expert(
+                SafeTensorCheckpoint(args.source), layer=args.layer,
+                output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

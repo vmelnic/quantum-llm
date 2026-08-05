@@ -114,4 +114,8 @@ independently proven.
 - Complete: direct bounded SafeTensors extent gathering replaces copied expert
   fixtures; the descriptor is about 3 KiB and the source checkpoint remains the
   sole authoritative weight copy.
-- Next: implement shared-expert and dense/CSA/HCA execution.
+- Complete: the real FP8 shared expert is bitwise-equal to the independent
+  PyTorch decode, admits into the common SM86 slot through the cache, and runs
+  gate/up/down CUDA from that slot.
+- Next: pin all 43 shared slots as model state and implement dense/CSA/HCA
+  execution.

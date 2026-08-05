@@ -29,6 +29,27 @@ FP4_E2M1_VALUES = (
 )
 
 
+def decode_fp8_e4m3fn(code: int) -> float:
+    """Decode one finite OCP E4M3FN byte; the two NaN encodings fail closed."""
+
+    if isinstance(code, bool) or not isinstance(code, int) or not 0 <= code <= 255:
+        raise SourceFormatError(f"E4M3 code must be one byte, got {code!r}")
+    sign = -1.0 if code & 0x80 else 1.0
+    exponent = (code >> 3) & 0x0F
+    mantissa = code & 0x07
+    if exponent == 0x0F and mantissa == 0x07:
+        raise SourceFormatError("E4M3FN NaN is not a valid model weight")
+    if exponent == 0:
+        return sign * math.ldexp(float(mantissa), -9)
+    return sign * math.ldexp(1.0 + mantissa / 8.0, exponent - 7)
+
+
+def decode_fp8_e4m3fn_values(
+    raw: bytes | bytearray | memoryview,
+) -> tuple[float, ...]:
+    return tuple(decode_fp8_e4m3fn(code) for code in memoryview(raw).cast("B"))
+
+
 def decode_ue8m0(code: int) -> float:
     """Decode one OCP E8M0FNU scale byte into a Python float.
 

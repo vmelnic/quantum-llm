@@ -32,7 +32,6 @@ namespace er = expert::runtime;
 
 namespace {
 
-constexpr std::uint64_t kCompactBytes = 13'369'344U;
 constexpr std::uint64_t kHotBytes = 25'198'592U;
 
 void check(cudaError_t error, const char* operation) {
@@ -178,16 +177,24 @@ int main(int argc, char** argv) {
     (void)argv;
     throw std::runtime_error("DeepSeek IOCP admission smoke requires Windows");
 #else
-    if (argc != 5) {
+    if (argc != 6) {
       std::cerr << "usage: expert-deepseek-admission-smoke <descriptor-bundle> "
                    "<checkpoint-root> <expected-hot-sha256> "
-                   "<compact-sha256>\n";
+                   "<source-sha256> <routed|shared>\n";
       return 64;
     }
     const std::filesystem::path root = argv[1];
     const std::filesystem::path source_root = argv[2];
     const std::string expected_hot_hash = argv[3];
     const auto compact_hash = parse_digest(argv[4]);
+    const std::string source_kind = argv[5];
+    require(source_kind == "routed" || source_kind == "shared",
+            "source kind must be routed or shared");
+    const bool shared = source_kind == "shared";
+    const std::uint64_t source_bytes = shared ? 25'167'360U : 13'369'344U;
+    const std::uint32_t source_abi =
+        shared ? er::kExpertSourceAbiDeepSeekFp8Block128V1
+               : er::kExpertSourceAbiDeepSeekCompactV1;
     const auto geometry = er::DeepSeekExpertGeometry::v4_flash();
     const auto layout = er::make_deepseek_sm86_hot_layout(geometry);
     require(layout.slot_bytes == kHotBytes, "unexpected DeepSeek hot geometry");
@@ -195,25 +202,26 @@ int main(int argc, char** argv) {
     er::PayloadRecord record;
     record.extents = read_extents(root / "extents.tsv", source_root);
     record.record_offset = 0U;
-    record.stored_bytes = kCompactBytes;
+    record.stored_bytes = source_bytes;
     record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
     record.device_bytes = kHotBytes;
-    record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
+    record.source_abi = source_abi;
     record.header_bytes = 0U;
     record.alignment = er::kExpertPackAlignment;
     record.payload_sha256 = compact_hash;
-    const er::ExpertKey key{17U, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86};
+    const er::ExpertKey key{17U, 0U, shared ? 256U : 0U,
+                            er::kExpertQuantAbiDeepSeekSm86};
 
     auto iocp = std::make_shared<er::WindowsIocpStorage>(1U);
     auto storage = std::make_shared<er::ExtentGatherStorage>(iocp);
     auto uploader = std::make_shared<er::cuda::CudaExpertUploader>();
     auto allocator = std::make_shared<er::CudaPinnedAllocator>();
     auto buffers = std::make_shared<er::FixedBufferPool>(
-        1U, kCompactBytes, er::kExpertPackAlignment, allocator);
+        1U, source_bytes, er::kExpertPackAlignment, allocator);
     auto directory = std::make_shared<er::cuda::CudaExpertDirectory>(
-        key.model_id, key.quant_abi, 1U, 1U, 8U);
+        key.model_id, key.quant_abi, 1U, 257U, 8U);
     er::ExpertCacheConfig config;
-    config.ram = {kCompactBytes * 2U, kCompactBytes * 2U, kCompactBytes};
+    config.ram = {source_bytes * 2U, source_bytes * 2U, source_bytes};
     config.vram = {kHotBytes * 2U, kHotBytes * 2U, kHotBytes};
     config.retain_host_copy = false;
     er::ExpertCache cache(config, storage, uploader, buffers, directory);
@@ -236,7 +244,7 @@ int main(int argc, char** argv) {
     std::uint32_t* selected = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&selected), sizeof(std::uint32_t)),
           "cudaMalloc selected expert");
-    const std::uint32_t selected_host = 0U;
+    const std::uint32_t selected_host = key.expert;
     check(cudaMemcpy(selected, &selected_host, sizeof(selected_host),
                      cudaMemcpyHostToDevice),
           "copy selected expert");
@@ -355,7 +363,7 @@ int main(int argc, char** argv) {
                 telemetry.load_completed == 1U &&
                 telemetry.upload_started == 1U &&
                 telemetry.upload_completed == 1U &&
-                telemetry.read_bytes == kCompactBytes &&
+                telemetry.read_bytes == source_bytes &&
                 telemetry.uploaded_bytes == kHotBytes,
             "cache lifecycle telemetry violated single-flight admission");
     const auto cache_ms = std::chrono::duration<double, std::milli>(
@@ -367,10 +375,12 @@ int main(int argc, char** argv) {
     const auto trimmed = cache.trim();
     require(trimmed == kHotBytes && !cache.inspect(key)->has_device_copy,
             "cache trim did not release admitted DeepSeek expert");
+    const auto source_abi_name =
+        shared ? er::kDeepSeekFp8Block128Abi : er::kDeepSeekCompactAbi;
     std::cout << "{\"ok\":true,\"source_abi\":\""
-              << er::kDeepSeekCompactAbi << "\",\"hot_abi\":\""
+              << source_abi_name << "\",\"hot_abi\":\""
               << er::kDeepSeekSm86HotAbi << "\",\"source_bytes\":"
-              << kCompactBytes << ",\"hot_bytes\":" << layout.slot_bytes
+              << source_bytes << ",\"hot_bytes\":" << layout.slot_bytes
               << ",\"sha256\":\"" << actual_hash
               << "\",\"cache_end_to_end_ms\":" << cache_ms
               << ",\"single_flight_loads\":" << telemetry.load_started

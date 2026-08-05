@@ -667,7 +667,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
 
     auto weak = weak_from_this();
-    UploadRequest request{entry->key, sections, bytes, compact};
+    UploadRequest request{entry->key, entry->record.source_abi, sections, bytes,
+                          compact};
     const auto operation = uploader->upload(
         request, [weak, key = entry->key](UploadResult result) mutable {
           if (auto core = weak.lock()) {

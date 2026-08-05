@@ -16,6 +16,7 @@ inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow = 1;
 inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 = 2;
 inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
 inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 = 2;
+inline constexpr std::uint32_t kExpertSourceAbiDeepSeekFp8Block128V1 = 3;
 
 struct ExpertSections final {
   std::uint32_t hidden{};

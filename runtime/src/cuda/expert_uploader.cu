@@ -127,9 +127,19 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
                             float* output_scales, std::uint32_t rows,
                             std::uint32_t columns) {
       if (!admission.ok()) return;
-      admission = admit_deepseek_projection(
-          {compact + weight_offset, compact + scale_offset, output,
-           output_scales, rows, columns, stream});
+      if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1) {
+        admission = admit_deepseek_projection(
+            {compact + weight_offset, compact + scale_offset, output,
+             output_scales, rows, columns, stream});
+      } else if (request.source_abi ==
+                 kExpertSourceAbiDeepSeekFp8Block128V1) {
+        admission = admit_deepseek_fp8_projection(
+            {compact + weight_offset, compact + scale_offset, output,
+             output_scales, rows, columns, stream});
+      } else {
+        admission = Status(ErrorCode::invalid_argument,
+                           "unsupported DeepSeek CUDA source ABI");
+      }
     };
     if (admission.ok()) {
       launch(request.compact.w1_weight_offset, request.compact.w1_scale_offset,

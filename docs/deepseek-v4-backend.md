@@ -185,3 +185,23 @@ without gaps or overlap; the assembled payload still passes one whole-record
 SHA-256 gate before admission. This keeps storage growth independent of model
 parameter count and preserves the same cache/admission ABI for future 1T-class
 checkpoints.
+
+## FP8 shared expert
+
+The always-active shared expert uses a third source ABI,
+`deepseek-fp8-e4m3-ue8m0-block128-v1`. Its three projections contain
+25,167,360 source bytes. E4M3FN values and UE8M0 block scales were decoded
+bit-for-bit identically to PyTorch for the complete layer-0 shared expert.
+
+The shared expert does not require another compute layout: admission produces
+the same 25,198,592-byte `deepseek-sm86-int8-per-row-v1` slot used by routed
+experts. The real slot matched the independent candidate SHA-256 exactly. A
+full cold gather, checksum, CUDA conversion, publication, and two-waiter
+single-flight acquisition measured 88.2 ms; execution measured 0.40 ms, with
+maximum output difference `1.08e-8` against the CPU calculation.
+
+Because one shared expert is used on every token at every layer, production
+placement should treat these 43 slots as dense/resident model state rather than
+router-driven cache entries. They occupy about 1.01 GiB in total before
+allocator overhead. The validated cache lifecycle remains the loading and
+integrity mechanism; the model planner will pin them during startup.

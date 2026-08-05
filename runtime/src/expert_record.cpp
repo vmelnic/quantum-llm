@@ -167,15 +167,19 @@ ExpertAdmissionValidation validate_expert_admission(
     return {validated.status, validated.record.sections, {}};
   }
   if (key.quant_abi != kExpertQuantAbiDeepSeekSm86 ||
-      expected.source_abi != kExpertSourceAbiDeepSeekCompactV1) {
+      (expected.source_abi != kExpertSourceAbiDeepSeekCompactV1 &&
+       expected.source_abi != kExpertSourceAbiDeepSeekFp8Block128V1)) {
     return admission_failure(ErrorCode::invalid_argument,
                              "unsupported source/target expert ABI pair");
   }
-  constexpr std::uint64_t kWeightBytes = 4'194'304U;
-  constexpr std::uint64_t kScaleBytes = 262'144U;
-  constexpr std::uint64_t kSourceBytes = 13'369'344U;
   constexpr std::uint64_t kDeviceBytes = 25'198'592U;
-  if (expected.stored_bytes != kSourceBytes || bytes.size() != kSourceBytes ||
+  const bool fp8 =
+      expected.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1;
+  const std::uint64_t weight_bytes = fp8 ? 8'388'608U : 4'194'304U;
+  const std::uint64_t scale_bytes = fp8 ? 512U : 262'144U;
+  const std::uint64_t source_bytes =
+      fp8 ? 25'167'360U : 13'369'344U;
+  if (expected.stored_bytes != source_bytes || bytes.size() != source_bytes ||
       expected.device_bytes != kDeviceBytes || expected.header_bytes != 0U ||
       expected.decoded_bytes != 3ULL * 4096U * 2048U * sizeof(float)) {
     return admission_failure(ErrorCode::checksum_mismatch,
@@ -187,17 +191,17 @@ ExpertAdmissionValidation validate_expert_admission(
   }
   DeepSeekCompactSections compact{};
   compact.w1_weight_offset = 0U;
-  compact.w1_weight_bytes = kWeightBytes;
-  compact.w1_scale_offset = compact.w1_weight_offset + kWeightBytes;
-  compact.w1_scale_bytes = kScaleBytes;
-  compact.w3_weight_offset = compact.w1_scale_offset + kScaleBytes;
-  compact.w3_weight_bytes = kWeightBytes;
-  compact.w3_scale_offset = compact.w3_weight_offset + kWeightBytes;
-  compact.w3_scale_bytes = kScaleBytes;
-  compact.w2_weight_offset = compact.w3_scale_offset + kScaleBytes;
-  compact.w2_weight_bytes = kWeightBytes;
-  compact.w2_scale_offset = compact.w2_weight_offset + kWeightBytes;
-  compact.w2_scale_bytes = kScaleBytes;
+  compact.w1_weight_bytes = weight_bytes;
+  compact.w1_scale_offset = compact.w1_weight_offset + weight_bytes;
+  compact.w1_scale_bytes = scale_bytes;
+  compact.w3_weight_offset = compact.w1_scale_offset + scale_bytes;
+  compact.w3_weight_bytes = weight_bytes;
+  compact.w3_scale_offset = compact.w3_weight_offset + weight_bytes;
+  compact.w3_scale_bytes = scale_bytes;
+  compact.w2_weight_offset = compact.w3_scale_offset + scale_bytes;
+  compact.w2_weight_bytes = weight_bytes;
+  compact.w2_scale_offset = compact.w2_weight_offset + weight_bytes;
+  compact.w2_scale_bytes = scale_bytes;
   ExpertSections target{};
   target.hidden = 4096U;
   target.intermediate = 2048U;

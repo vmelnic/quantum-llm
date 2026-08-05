@@ -68,6 +68,12 @@ staging payloads, decoded only inside the CUDA uploader, and published as exact
 25,198,592-byte SM86 slots. Compact source bytes are never exposed through the
 host INT8 executor.
 
+FP8 shared experts use a separate source ABI with 128×128 block scales but
+converge on the same SM86 slot. Source ABI therefore selects decoding semantics;
+target ABI alone never guesses how bytes should be interpreted. Shared experts
+are integrity-loaded through the cache, then planner-pinned as always-active
+model state rather than admitted by routed frequency.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution

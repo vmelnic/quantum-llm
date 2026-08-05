@@ -52,6 +52,11 @@ six `(shard, source offset, destination offset, bytes)` ranges. It copies no
 weights. The CUDA admission gate gathers those ranges directly from the
 immutable SafeTensors checkpoint into one bounded staging buffer.
 
+`qualify-deepseek-shared` and `export-deepseek-shared` apply the same boundary
+to the always-active FP8 shared expert. E4M3FN weights and UE8M0 128×128 block
+scales are independently compared with PyTorch before the SM86 candidate hash
+is accepted.
+
 ## Install
 
 From the repository root:

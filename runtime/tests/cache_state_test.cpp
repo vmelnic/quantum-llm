@@ -93,6 +93,28 @@ void test_deepseek_compact_admission_validation() {
           "corrupt DeepSeek compact admission was accepted");
 }
 
+void test_deepseek_fp8_shared_admission_validation() {
+  std::vector<std::byte> bytes(25'167'360U);
+  for (std::size_t index = 0; index < bytes.size(); ++index) {
+    bytes[index] = static_cast<std::byte>((index * 17U + 11U) & 0x7eU);
+  }
+  er::PayloadRecord record;
+  record.stored_bytes = bytes.size();
+  record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
+  record.device_bytes = 25'198'592U;
+  record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
+  record.header_bytes = 0U;
+  record.alignment = 1U;
+  record.payload_sha256 = er::sha256(bytes);
+  const er::ExpertKey key{17U, 0U, 256U, er::kExpertQuantAbiDeepSeekSm86};
+  const auto valid = er::validate_expert_admission(bytes, key, record);
+  require(valid.status.ok() && valid.compact.w1_scale_offset == 8'388'608U &&
+              valid.compact.w3_weight_offset == 8'389'120U &&
+              valid.compact.w2_scale_offset == 25'166'848U &&
+              valid.target.down_scale_offset == 25'182'208U,
+          "valid DeepSeek FP8 shared admission was rejected");
+}
+
 template <typename T>
 void write_le(std::byte* output, T value) {
   using Unsigned = std::make_unsigned_t<T>;
@@ -1038,6 +1060,7 @@ int main() {
   try {
     test_deepseek_compact_and_sm86_hot_abi();
     test_deepseek_compact_admission_validation();
+    test_deepseek_fp8_shared_admission_validation();
     test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();

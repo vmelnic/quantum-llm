@@ -212,14 +212,129 @@ def qualify_deepseek_expert(
     }
 
 
-def export_deepseek_compact_expert(
-    checkpoint: SafeTensorCheckpoint, *, layer: int, expert: int, output: Path
-) -> dict[str, object]:
-    """Describe one compact expert as source extents without copying weights."""
+def _fp8_e4m3fn_table() -> object:
+    table = np.empty(256, dtype=np.float32)
+    for code in range(256):
+        exponent = (code >> 3) & 0x0F
+        mantissa = code & 0x07
+        if exponent == 0x0F and mantissa == 0x07:
+            table[code] = np.nan
+        elif exponent == 0:
+            table[code] = math.ldexp(float(mantissa), -9)
+        else:
+            table[code] = math.ldexp(1.0 + mantissa / 8.0, exponent - 7)
+        if code & 0x80:
+            table[code] = -table[code]
+    return table
 
+
+def qualify_deepseek_shared_expert(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, row_chunk: int = 128
+) -> dict[str, object]:
+    """Qualify the always-active FP8 shared expert and its SM86 candidate."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek shared qualification")
     validate_deepseek_v4_source(checkpoint)
-    if not 0 <= layer < 43 or not 0 <= expert < 256:
-        raise AdapterError("DeepSeek expert bundle key is outside configured bounds")
+    if not 0 <= layer < 43 or row_chunk <= 0:
+        raise AdapterError("invalid DeepSeek shared expert qualification bounds")
+    started = time.perf_counter()
+    table = _fp8_e4m3fn_table()
+    payloads: dict[str, tuple[bytes, bytes]] = {}
+    source_bytes = 0
+    logical_values = 0
+    reference_equal = True
+    prefix = f"layers.{layer}.ffn.shared_experts"
+    for projection in ("w1", "w2", "w3"):
+        weight_name = f"{prefix}.{projection}.weight"
+        scale_name = f"{prefix}.{projection}.scale"
+        weight_info = checkpoint.tensors[weight_name]
+        scale_info = checkpoint.tensors[scale_name]
+        rows, columns = weight_info.shape
+        if scale_info.shape != (rows // 128, columns // 128):
+            raise SourceFormatError(f"FP8 block geometry mismatch for {projection}")
+        quantized_payload = bytearray()
+        row_scale_payload = bytearray()
+        with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
+            scale_name
+        ) as scale_view:
+            weights = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(rows, columns)
+            scales = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+                rows // 128, columns // 128
+            )
+            for first in range(0, rows, row_chunk):
+                last = min(rows, first + row_chunk)
+                weight_codes = weights[first:last]
+                scale_codes = scales[np.arange(first, last) // 128]
+                if bool((scale_codes == 255).any()):
+                    raise SourceFormatError("shared expert contains a UE8M0 NaN scale")
+                decoded = table[weight_codes]
+                decoded *= np.repeat(
+                    np.ldexp(
+                        np.ones(scale_codes.shape, dtype=np.float32),
+                        scale_codes.astype(np.int16) - 127,
+                    ),
+                    128,
+                    axis=1,
+                )
+                if not bool(np.isfinite(decoded).all()):
+                    raise SourceFormatError("shared expert decoded to a non-finite value")
+                try:
+                    import torch
+                except ImportError as error:  # pragma: no cover
+                    raise SourceFormatError("PyTorch is required for FP8 reference") from error
+                torch_weights = torch.from_numpy(weight_codes.copy()).view(
+                    torch.float8_e4m3fn
+                ).float()
+                torch_scales = torch.from_numpy(scale_codes.copy()).view(
+                    torch.float8_e8m0fnu
+                ).float().repeat_interleave(128, dim=1)
+                reference = (torch_weights * torch_scales).numpy()
+                reference_equal &= bool(
+                    np.array_equal(decoded.view(np.uint32), reference.view(np.uint32))
+                )
+                maxima = np.max(np.abs(decoded), axis=1)
+                row_scales = np.where(maxima > 0, maxima / 127.0, 1.0).astype("<f4")
+                quantized = np.clip(
+                    np.rint(decoded / row_scales[:, None]), -127, 127
+                ).astype(np.int8)
+                quantized_payload.extend(quantized.tobytes(order="C"))
+                row_scale_payload.extend(row_scales.tobytes(order="C"))
+                logical_values += int(decoded.size)
+            del weights, scales, weight_codes, scale_codes, decoded, reference
+        payloads[projection] = (bytes(quantized_payload), bytes(row_scale_payload))
+        source_bytes += weight_info.nbytes + scale_info.nbytes
+    digest = hashlib.sha256()
+    for projection, section in (
+        ("w1", 0), ("w3", 0), ("w1", 1),
+        ("w3", 1), ("w2", 0), ("w2", 1),
+    ):
+        digest.update(payloads[projection][section])
+    elapsed = time.perf_counter() - started
+    return {
+        "format": "deepseek-v4-shared-expert-qualification-v1",
+        "layer": layer,
+        "reference": "pytorch-float8-e4m3fn+float8-e8m0fnu",
+        "reference_bitwise_equal": reference_equal,
+        "source_bytes": source_bytes,
+        "logical_values": logical_values,
+        "candidate_int8_bytes": sum(len(part) for value in payloads.values() for part in value),
+        "candidate_abi": "deepseek-sm86-int8-per-row-v1",
+        "candidate_sha256": digest.hexdigest(),
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _export_deepseek_extents(
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    names: tuple[str, ...],
+    output: Path,
+    layer: int,
+    expert: int | str,
+    format_name: str,
+    source_abi: str,
+) -> dict[str, object]:
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
     if output.exists() or partial.exists():
@@ -229,40 +344,37 @@ def export_deepseek_compact_expert(
     tensors: list[dict[str, object]] = []
     total_bytes = 0
     try:
-        prefix = f"layers.{layer}.ffn.experts.{expert}"
         combined_digest = hashlib.sha256()
         descriptor_path = partial / "extents.tsv"
         with descriptor_path.open("x", encoding="utf-8", newline="\n") as descriptor:
             descriptor.write("deepseek-compact-extents-v1\n")
-            for projection in ("w1", "w3", "w2"):
-                for kind in ("weight", "scale"):
-                    name = f"{prefix}.{projection}.{kind}"
-                    info = checkpoint.tensors[name]
-                    digest = hashlib.sha256()
-                    with checkpoint.open_tensor(name) as view:
-                        digest.update(view.raw)
-                        combined_digest.update(view.raw)
-                    if "\t" in info.shard or "\n" in info.shard or "\r" in info.shard:
-                        raise SourceFormatError("SafeTensors shard name is not descriptor-safe")
-                    descriptor.write(
-                        f"{total_bytes}\t{info.nbytes}\t{info.offset}\t{info.shard}\n"
-                    )
-                    tensors.append({
-                        "name": name,
-                        "shard": info.shard,
-                        "source_offset": info.offset,
-                        "destination_offset": total_bytes,
-                        "dtype": info.dtype,
-                        "shape": list(info.shape),
-                        "bytes": info.nbytes,
-                        "sha256": digest.hexdigest(),
-                    })
-                    total_bytes += info.nbytes
+            for name in names:
+                info = checkpoint.tensors[name]
+                digest = hashlib.sha256()
+                with checkpoint.open_tensor(name) as view:
+                    digest.update(view.raw)
+                    combined_digest.update(view.raw)
+                if "\t" in info.shard or "\n" in info.shard or "\r" in info.shard:
+                    raise SourceFormatError("SafeTensors shard name is not descriptor-safe")
+                descriptor.write(
+                    f"{total_bytes}\t{info.nbytes}\t{info.offset}\t{info.shard}\n"
+                )
+                tensors.append({
+                    "name": name,
+                    "shard": info.shard,
+                    "source_offset": info.offset,
+                    "destination_offset": total_bytes,
+                    "dtype": info.dtype,
+                    "shape": list(info.shape),
+                    "bytes": info.nbytes,
+                    "sha256": digest.hexdigest(),
+                })
+                total_bytes += info.nbytes
             descriptor.flush()
             os.fsync(descriptor.fileno())
         manifest = {
-            "format": "deepseek-compact-expert-extents-v1",
-            "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
+            "format": format_name,
+            "source_abi": source_abi,
             "target_abi": "deepseek-sm86-int8-per-row-v1",
             "layer": layer,
             "expert": expert,
@@ -280,3 +392,45 @@ def export_deepseek_compact_expert(
     except Exception:
         # Preserve partial evidence; never delete or alter source tensors.
         raise
+
+
+def export_deepseek_compact_expert(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, expert: int, output: Path
+) -> dict[str, object]:
+    """Describe one compact routed expert without copying weights."""
+
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= layer < 43 or not 0 <= expert < 256:
+        raise AdapterError("DeepSeek expert bundle key is outside configured bounds")
+    prefix = f"layers.{layer}.ffn.experts.{expert}"
+    names = tuple(
+        f"{prefix}.{projection}.{kind}"
+        for projection in ("w1", "w3", "w2")
+        for kind in ("weight", "scale")
+    )
+    return _export_deepseek_extents(
+        checkpoint, names=names, output=output, layer=layer, expert=expert,
+        format_name="deepseek-compact-expert-extents-v1",
+        source_abi="deepseek-fp4-e2m1-ue8m0-block32-v1",
+    )
+
+
+def export_deepseek_shared_expert(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
+) -> dict[str, object]:
+    """Describe one always-active FP8 shared expert without copying weights."""
+
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= layer < 43:
+        raise AdapterError("DeepSeek shared expert layer is outside configured bounds")
+    prefix = f"layers.{layer}.ffn.shared_experts"
+    names = tuple(
+        f"{prefix}.{projection}.{kind}"
+        for projection in ("w1", "w3", "w2")
+        for kind in ("weight", "scale")
+    )
+    return _export_deepseek_extents(
+        checkpoint, names=names, output=output, layer=layer, expert="shared",
+        format_name="deepseek-fp8-shared-expert-extents-v1",
+        source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+    )

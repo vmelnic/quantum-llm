@@ -39,6 +39,7 @@ class IDeviceResidencyDirectory {
 
 struct UploadRequest final {
   ExpertKey key;
+  std::uint32_t source_abi{};
   ExpertSections sections;
   std::span<const std::byte> complete_record;
   DeepSeekCompactSections compact;
