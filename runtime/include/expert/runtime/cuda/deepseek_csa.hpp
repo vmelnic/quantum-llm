@@ -56,4 +56,12 @@ struct DeepSeekCompressorStateResult final {
     const float* normalized, const float* cosine, const float* sine,
     std::uint16_t* cache, std::uint32_t slot, void* stream) noexcept;
 
+// Online-softmax sparse decode. The learned sink contributes to the
+// denominator with a zero value vector. Indices may contain -1 sentinels.
+[[nodiscard]] Status deepseek_sparse_attention_decode(
+    const std::uint16_t* query, const std::uint16_t* kv_cache,
+    const std::int32_t* indices, std::uint32_t selected,
+    const float* attention_sink, std::uint16_t* output,
+    std::uint32_t heads, void* stream) noexcept;
+
 }  // namespace expert::runtime::cuda

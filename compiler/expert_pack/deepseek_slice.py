@@ -593,12 +593,14 @@ def export_deepseek_csa_slice(
         prefix + ".wgate.weight",
         prefix + ".ape",
         prefix + ".norm.weight",
+        f"layers.{layer}.attn.attn_sink",
     )
     expected = (
         ("BF16", (width, 4096)),
         ("BF16", (width, 4096)),
         ("F32", (ratio, width)),
         ("BF16", (512,)),
+        ("F32", (64,)),
     )
     for name, (dtype, shape) in zip(names, expected):
         info = checkpoint.tensors.get(name)
@@ -618,7 +620,7 @@ def export_deepseek_csa_slice(
                 if dtype == "BF16"
                 else np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
             )
-    wkv, wgate, ape, norm = arrays
+    wkv, wgate, ape, norm, attn_sink = arrays
     positions = np.arange(ratio * 4096, dtype=np.float32).reshape(ratio, 4096)
     inputs = (
         np.sin(positions * np.float32(0.005)) * np.float32(0.15)
@@ -631,6 +633,34 @@ def export_deepseek_csa_slice(
     cosine = np.cos(angles).astype("<f4")
     sine = np.sin(angles).astype("<f4")
     cache_words = _deepseek_compressed_kv_reference(output_value, cosine, sine)
+    base_cache = _bf16_to_f32(cache_words.tobytes(), (512,))
+    dimensions = np.arange(512, dtype=np.float32)
+    sparse_cache_values = np.stack(
+        [
+            base_cache * np.float32(0.85 + row * 0.04)
+            + np.sin(dimensions * np.float32(0.01 + row * 0.001)) * np.float32(0.01)
+            for row in range(6)
+        ]
+    )
+    sparse_cache_words = _f32_to_bf16_words(sparse_cache_values)
+    query_values = (
+        np.sin(np.arange(64 * 512, dtype=np.float32).reshape(64, 512) * np.float32(0.004))
+        * np.float32(0.12)
+    )
+    query_words = _f32_to_bf16_words(query_values)
+    query = _bf16_to_f32(query_words.tobytes(), (64, 512))
+    sparse_cache = _bf16_to_f32(sparse_cache_words.tobytes(), (6, 512))
+    sparse_indices = np.asarray((0, 2, 5, -1), dtype="<i4")
+    sparse_output = np.empty((64, 512), dtype=np.float32)
+    attention_scale = np.float32(512.0 ** -0.5)
+    selected = sparse_cache[[0, 2, 5]]
+    for head in range(64):
+        logits = np.matmul(selected, query[head], dtype=np.float32) * attention_scale
+        maximum = max(float(np.max(logits)), float(attn_sink[head]))
+        weights = np.exp(logits - maximum)
+        denominator = float(np.sum(weights)) + math.exp(float(attn_sink[head]) - maximum)
+        sparse_output[head] = np.matmul(weights, selected, dtype=np.float32) / denominator
+    sparse_output_words = _f32_to_bf16_words(sparse_output)
     oracle_path = output / "oracle.f32"
     with oracle_path.open("xb") as oracle:
         oracle.write(inputs.tobytes(order="C"))
@@ -644,6 +674,17 @@ def export_deepseek_csa_slice(
         cache_file.write(cache_words.tobytes(order="C"))
         cache_file.flush()
         os.fsync(cache_file.fileno())
+    sparse_files = {
+        "sparse-q.bf16": query_words,
+        "sparse-cache.bf16": sparse_cache_words,
+        "sparse-indices.i32": sparse_indices,
+        "sparse-output.bf16": sparse_output_words,
+    }
+    for filename, array in sparse_files.items():
+        with (output / filename).open("xb") as sparse_file:
+            sparse_file.write(array.tobytes(order="C"))
+            sparse_file.flush()
+            os.fsync(sparse_file.fileno())
     qualification = {
         "format": "deepseek-csa-decode-oracle-v1",
         "layer": layer,
@@ -658,6 +699,16 @@ def export_deepseek_csa_slice(
         "cache_bytes": cache_path.stat().st_size,
         "cache_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
         "output_l2": float(np.linalg.norm(output_value)),
+        "sparse_attention": {
+            "query": "sparse-q.bf16",
+            "cache": "sparse-cache.bf16",
+            "indices": "sparse-indices.i32",
+            "output": "sparse-output.bf16",
+            "heads": 64,
+            "head_dim": 512,
+            "cache_slots": 6,
+            "selected_slots": 4,
+        },
     }
     atomic_json(output / "oracle.json", qualification)
     manifest["oracle"] = qualification

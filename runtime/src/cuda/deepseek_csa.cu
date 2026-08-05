@@ -110,6 +110,73 @@ __global__ void compressed_kv_publish_kernel(
   }
 }
 
+__device__ float block_sum(float value) {
+  __shared__ float partial[kThreads];
+  partial[threadIdx.x] = value;
+  __syncthreads();
+  for (unsigned stride = kThreads / 2U; stride; stride >>= 1U) {
+    if (threadIdx.x < stride) partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  return partial[0];
+}
+
+__global__ void sparse_attention_decode_kernel(
+    const __nv_bfloat16* query, const __nv_bfloat16* cache,
+    const std::int32_t* indices, std::uint32_t selected,
+    const float* sink, __nv_bfloat16* output) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto lane = static_cast<std::uint32_t>(threadIdx.x);
+  const auto q_base = static_cast<std::size_t>(head) * kHeadDim;
+  float accum0 = 0.0F;
+  float accum1 = 0.0F;
+  __shared__ float maximum;
+  __shared__ float denominator;
+  __shared__ float previous_scale;
+  __shared__ float token_weight;
+  if (lane == 0U) {
+    maximum = sink[head];
+    denominator = 1.0F;
+  }
+  __syncthreads();
+  for (std::uint32_t item = 0; item < selected; ++item) {
+    const auto slot = indices[item];
+    float partial = 0.0F;
+    if (slot >= 0) {
+      partial += __bfloat162float(query[q_base + lane]) *
+                 __bfloat162float(cache[static_cast<std::size_t>(slot) * kHeadDim + lane]);
+      partial += __bfloat162float(query[q_base + lane + kThreads]) *
+                 __bfloat162float(cache[static_cast<std::size_t>(slot) * kHeadDim + lane + kThreads]);
+    }
+    const float dot = block_sum(partial);
+    if (lane == 0U) {
+      if (slot >= 0) {
+        const float score = dot * rsqrtf(static_cast<float>(kHeadDim));
+        const float next_maximum = fmaxf(maximum, score);
+        previous_scale = expf(maximum - next_maximum);
+        token_weight = expf(score - next_maximum);
+        denominator = denominator * previous_scale + token_weight;
+        maximum = next_maximum;
+      } else {
+        previous_scale = 1.0F;
+        token_weight = 0.0F;
+      }
+    }
+    __syncthreads();
+    if (slot >= 0) {
+      const auto cache_base = static_cast<std::size_t>(slot) * kHeadDim;
+      accum0 = accum0 * previous_scale +
+               token_weight * __bfloat162float(cache[cache_base + lane]);
+      accum1 = accum1 * previous_scale +
+               token_weight * __bfloat162float(cache[cache_base + lane + kThreads]);
+    }
+    __syncthreads();
+  }
+  output[q_base + lane] = __float2bfloat16_rn(accum0 / denominator);
+  output[q_base + lane + kThreads] =
+      __float2bfloat16_rn(accum1 / denominator);
+}
+
 }  // namespace
 
 DeepSeekCompressorState::DeepSeekCompressorState(
@@ -219,6 +286,25 @@ Status deepseek_compressed_kv_publish(
   const auto error = cudaPeekAtLastError();
   return error == cudaSuccess ? Status::success()
                               : failure(error, "DeepSeek compressed KV publication");
+}
+
+Status deepseek_sparse_attention_decode(
+    const std::uint16_t* query, const std::uint16_t* kv_cache,
+    const std::int32_t* indices, std::uint32_t selected,
+    const float* attention_sink, std::uint16_t* output,
+    std::uint32_t heads, void* stream) noexcept {
+  if (!query || !kv_cache || !indices || !selected || !attention_sink ||
+      !output || !heads || heads > 64U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek sparse attention launch"};
+  sparse_attention_decode_kernel<<<heads, kThreads, 0,
+                                   static_cast<cudaStream_t>(stream)>>>(
+      reinterpret_cast<const __nv_bfloat16*>(query),
+      reinterpret_cast<const __nv_bfloat16*>(kv_cache), indices, selected,
+      attention_sink, reinterpret_cast<__nv_bfloat16*>(output));
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek sparse attention");
 }
 
 }  // namespace expert::runtime::cuda

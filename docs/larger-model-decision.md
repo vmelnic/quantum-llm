@@ -136,5 +136,8 @@ independently proven.
 - Complete: compressed KV publication applies RoPE64 and the block-64 MXFP8
   QAT boundary, then stores a 1,024-byte BF16 cache slot; both schedules matched
   their independent cache oracle bit-for-bit.
-- Next: add ratio-4 indexing and sparse attention, then compose dense, typed,
-  HCA, and shared ownership.
+- Complete: sparse attention consumes the BF16 cache with online softmax,
+  sentinel handling, and the learned attention sink; the real layer-2 sink
+  passed its independent output oracle.
+- Next: add ratio-4 indexing, then compose dense, typed, HCA, and shared
+  ownership around the first complete attention/model layer.

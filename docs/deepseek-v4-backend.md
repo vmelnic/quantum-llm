@@ -332,3 +332,17 @@ Both the ratio-4 and ratio-128 real slices matched independent PyTorch/NumPy
 cache oracles with zero BF16-word differences. Keeping this cache typed halves
 its VRAM footprint relative to F32 and freezes the producer ABI that the sparse
 attention consumer will read next.
+
+The first sparse-attention consumer now reads BF16 query/cache tensors, accepts
+`-1` sentinel indices, includes the real per-head F32 `attn_sink` in the
+softmax denominator with a zero value vector, and accumulates output with an
+online softmax. Its workspace is constant with respect to context length and
+selected-position count.
+
+On the layer-2 fixture, 32,767 of 32,768 BF16 output values matched the
+independent oracle exactly; the remaining value differed by `3.81e-6`. The
+four-index fixture took 0.047 ms, but this is a correctness measurement rather
+than a production top-k claim. The configured path may consume a 128-position
+window plus as many as 512 indexed compressed positions, so the scalar
+per-position loop must be tiled/batched after the real indexer and complete
+attention layer establish the final workload.

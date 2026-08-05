@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
@@ -62,8 +63,8 @@ std::vector<er::PayloadExtent> extents(const std::filesystem::path& descriptor,
     result.push_back({source / relative(item[3]), std::stoull(item[2]),
                       std::stoull(item[0]), std::stoull(item[1])});
   }
-  require(input.eof() && result.size() == 4U,
-          "CSA slice requires wkv, wgate, ape and norm extents");
+  require(input.eof() && result.size() == 5U,
+          "CSA slice requires wkv, wgate, ape, norm and sink extents");
   return result;
 }
 std::string hex(const er::Sha256Digest& digest) {
@@ -89,7 +90,9 @@ int main(int argc, char** argv) {
     const auto matrix_bytes =
         static_cast<std::size_t>(width) * kHidden * sizeof(std::uint16_t);
     const auto ape_bytes = static_cast<std::size_t>(ratio) * width * sizeof(float);
-    const auto source_bytes = 2U * matrix_bytes + ape_bytes + kNormBytes;
+    constexpr std::size_t sink_bytes = 64U * sizeof(float);
+    const auto source_bytes =
+        2U * matrix_bytes + ape_bytes + kNormBytes + sink_bytes;
     auto pool = std::make_shared<er::FixedBufferPool>(
         1U, source_bytes, 4096U, std::make_shared<er::CudaPinnedAllocator>());
     auto lease = pool->try_acquire(source_bytes);
@@ -131,12 +134,33 @@ int main(int argc, char** argv) {
     std::vector<std::uint16_t> expected_cache(kHeadDim);
     cache_file.read(reinterpret_cast<char*>(expected_cache.data()), kNormBytes);
     require(static_cast<bool>(cache_file), "truncated CSA cache oracle");
+    auto read_fixture = [&](const char* name, std::size_t bytes) {
+      std::ifstream file(std::filesystem::path(argv[1]) / name,
+                         std::ios::binary | std::ios::ate);
+      require(static_cast<bool>(file) &&
+                  static_cast<std::size_t>(file.tellg()) == bytes,
+              std::string("invalid CSA fixture: ") + name);
+      file.seekg(0);
+      std::vector<std::byte> result(bytes);
+      file.read(reinterpret_cast<char*>(result.data()),
+                static_cast<std::streamsize>(bytes));
+      require(static_cast<bool>(file), std::string("truncated CSA fixture: ") + name);
+      return result;
+    };
+    const auto sparse_q = read_fixture("sparse-q.bf16", 64U * kNormBytes);
+    const auto sparse_cache = read_fixture("sparse-cache.bf16", 6U * kNormBytes);
+    const auto sparse_indices = read_fixture("sparse-indices.i32", 4U * sizeof(std::int32_t));
+    const auto sparse_expected = read_fixture("sparse-output.bf16", 64U * kNormBytes);
 
     std::uint16_t *wkv = nullptr, *wgate = nullptr, *norm = nullptr;
     float *ape = nullptr, *input = nullptr, *projected_values = nullptr;
     float *projected_scores = nullptr, *pooled = nullptr, *output = nullptr;
     float *cosine = nullptr, *sine = nullptr;
+    float* sink = nullptr;
     std::uint16_t* cache = nullptr;
+    std::uint16_t *device_sparse_q = nullptr, *device_sparse_cache = nullptr;
+    std::uint16_t* device_sparse_output = nullptr;
+    std::int32_t* device_sparse_indices = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&wkv), matrix_bytes), "allocate CSA wkv");
     check(cudaMalloc(reinterpret_cast<void**>(&wgate), matrix_bytes), "allocate CSA wgate");
     check(cudaMalloc(reinterpret_cast<void**>(&ape), ape_bytes), "allocate CSA ape");
@@ -157,6 +181,16 @@ int main(int argc, char** argv) {
           "allocate CSA sine");
     check(cudaMalloc(reinterpret_cast<void**>(&cache), kNormBytes),
           "allocate CSA cache");
+    check(cudaMalloc(reinterpret_cast<void**>(&sink), sink_bytes),
+          "allocate CSA sink");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sparse_q), sparse_q.size()),
+          "allocate sparse query");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sparse_cache), sparse_cache.size()),
+          "allocate sparse cache");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sparse_indices), sparse_indices.size()),
+          "allocate sparse indices");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sparse_output), sparse_expected.size()),
+          "allocate sparse output");
     check(cudaMemcpy(wkv, source.data(), matrix_bytes, cudaMemcpyHostToDevice),
           "copy CSA wkv");
     check(cudaMemcpy(wgate, source.data() + matrix_bytes, matrix_bytes,
@@ -165,6 +199,9 @@ int main(int argc, char** argv) {
                      cudaMemcpyHostToDevice), "copy CSA ape");
     check(cudaMemcpy(norm, source.data() + 2U * matrix_bytes + ape_bytes,
                      kNormBytes, cudaMemcpyHostToDevice), "copy CSA norm");
+    check(cudaMemcpy(sink,
+                     source.data() + 2U * matrix_bytes + ape_bytes + kNormBytes,
+                     sink_bytes, cudaMemcpyHostToDevice), "copy CSA sink");
     const auto control_offset = static_cast<std::size_t>(ratio) * kHidden + kHeadDim;
     check(cudaMemcpy(cosine, oracle.data() + control_offset, 32U * sizeof(float),
                      cudaMemcpyHostToDevice), "copy CSA cosine");
@@ -216,6 +253,46 @@ int main(int argc, char** argv) {
     for (std::size_t index = 0; index < actual_cache.size(); ++index)
       cache_mismatches += actual_cache[index] != expected_cache[index];
     require(cache_mismatches == 0U, "CSA BF16 cache differs from oracle");
+    check(cudaMemcpy(device_sparse_q, sparse_q.data(), sparse_q.size(),
+                     cudaMemcpyHostToDevice), "copy sparse query");
+    check(cudaMemcpy(device_sparse_cache, sparse_cache.data(), sparse_cache.size(),
+                     cudaMemcpyHostToDevice), "copy sparse cache fixture");
+    check(cudaMemcpy(device_sparse_indices, sparse_indices.data(), sparse_indices.size(),
+                     cudaMemcpyHostToDevice), "copy sparse indices");
+    cudaEvent_t sparse_start{}, sparse_stop{};
+    check(cudaEventCreate(&sparse_start), "create sparse start event");
+    check(cudaEventCreate(&sparse_stop), "create sparse stop event");
+    check(cudaEventRecord(sparse_start), "record sparse start");
+    const auto sparse_status = er::cuda::deepseek_sparse_attention_decode(
+        device_sparse_q, device_sparse_cache, device_sparse_indices, 4U, sink,
+        device_sparse_output, 64U, nullptr);
+    require(sparse_status.ok(), std::string(sparse_status.message()));
+    check(cudaEventRecord(sparse_stop), "record sparse stop");
+    check(cudaEventSynchronize(sparse_stop), "synchronize sparse attention");
+    float sparse_ms = 0.0F;
+    check(cudaEventElapsedTime(&sparse_ms, sparse_start, sparse_stop),
+          "measure sparse attention");
+    std::vector<std::byte> sparse_actual(sparse_expected.size());
+    check(cudaMemcpy(sparse_actual.data(), device_sparse_output, sparse_actual.size(),
+                     cudaMemcpyDeviceToHost), "copy sparse output");
+    const auto* actual_words =
+        reinterpret_cast<const std::uint16_t*>(sparse_actual.data());
+    const auto* expected_words =
+        reinterpret_cast<const std::uint16_t*>(sparse_expected.data());
+    std::size_t sparse_mismatches = 0U;
+    float sparse_maximum = 0.0F;
+    for (std::size_t index = 0; index < sparse_actual.size() / 2U; ++index) {
+      sparse_mismatches += actual_words[index] != expected_words[index];
+      const auto actual_bits = static_cast<std::uint32_t>(actual_words[index]) << 16U;
+      const auto expected_bits = static_cast<std::uint32_t>(expected_words[index]) << 16U;
+      float actual_value = 0.0F, expected_value = 0.0F;
+      std::memcpy(&actual_value, &actual_bits, sizeof(float));
+      std::memcpy(&expected_value, &expected_bits, sizeof(float));
+      sparse_maximum = std::max(sparse_maximum,
+                                std::abs(actual_value - expected_value));
+    }
+    require(sparse_maximum < 2e-3F,
+            "sparse attention output exceeds BF16 oracle tolerance");
     std::cout << "{\"ok\":true,\"layer\":" << layer
               << ",\"compress_ratio\":" << ratio
               << ",\"source_bytes\":" << source_bytes
@@ -223,7 +300,10 @@ int main(int argc, char** argv) {
               << ",\"group_ms\":" << execution_ms
               << ",\"output_rmse\":" << std::sqrt(squared / actual.size())
               << ",\"output_max_abs_error\":" << maximum
-              << ",\"cache_bf16_mismatches\":" << cache_mismatches << "}\n";
+              << ",\"cache_bf16_mismatches\":" << cache_mismatches
+              << ",\"sparse_attention_ms\":" << sparse_ms
+              << ",\"sparse_bf16_mismatches\":" << sparse_mismatches
+              << ",\"sparse_max_abs_error\":" << sparse_maximum << "}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "expert-deepseek-csa-smoke: " << error.what() << '\n';
