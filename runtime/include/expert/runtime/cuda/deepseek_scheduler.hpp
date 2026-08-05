@@ -57,6 +57,9 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::uint64_t cpu_placements{};
   std::uint64_t hybrid_layers{};
   std::uint64_t route_observations{};
+  std::uint64_t controller_advance_ns{};
+  std::uint64_t expert_wait_ns{};
+  std::uint64_t poll_ns{};
   std::uint64_t completed_requests{};
   std::uint64_t failed_requests{};
   std::uint64_t cancelled_requests{};

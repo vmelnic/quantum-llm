@@ -70,6 +70,21 @@ cache, two request slots, 4096 context tokens, and a balanced placement policy.
 `placement_prefetch_state=observing` means the worker is collecting route
 evidence only. It does not report prefetch as enabled until a bounded warm-load
 or lookahead consumer is actually active.
+
+`STATS`, `/model-info`, and `/metrics` expose cumulative worker attribution.
+The timing counters deliberately describe their measured boundary:
+
+- `worker_model_step_ns` covers embedding through sampled-token readback;
+- `worker_embed_rope_submit_ns`, `worker_scheduler_poll_ns`, and
+  `worker_output_head_ns` partition that worker wall path;
+- `scheduler_controller_advance_ns` is time inside controller advancement;
+- `scheduler_expert_wait_ns` covers suspended route resolution;
+- `cache_storage_wait_ns`, `cache_ram_retention_copy_ns`, and
+  `cache_upload_wait_ns` measure the cache pipeline stages.
+
+The scheduler/cache counters can overlap their parent worker counter and must
+not be summed with it as independent wall time. They exist to attribute the
+parent interval and compare deltas between two snapshots.
 Startup performs hard RAM, VRAM, request-state, and logical KV-credit
 preflights before the ready message. These defaults fit the qualified 64 GiB
 RAM / 24 GiB VRAM class, but operators must lower them when other processes

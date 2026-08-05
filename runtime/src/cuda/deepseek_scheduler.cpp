@@ -63,6 +63,7 @@ struct ScheduledRequest final {
   std::vector<HeldLease> leases;
   std::vector<HeldHostLease> host_leases;
   std::vector<std::uint32_t> cpu_experts;
+  std::chrono::steady_clock::time_point expert_wait_started{};
   bool runnable_queued{};
   bool acquire_queued{};
 };
@@ -402,6 +403,7 @@ struct DeepSeekDecodeScheduler::Core final {
       }
     }
     request.state = DeepSeekScheduledState::waiting_for_experts;
+    request.expert_wait_started = std::chrono::steady_clock::now();
     request.layer = result.layer;
     for (const auto expert : result.missing_experts) {
       if (!cpu_selected.contains(expert))
@@ -503,6 +505,15 @@ struct DeepSeekDecodeScheduler::Core final {
       }
       if (request.state == DeepSeekScheduledState::waiting_for_experts &&
           request.queued_experts.empty() && request.inflight.empty()) {
+        if (request.expert_wait_started !=
+            std::chrono::steady_clock::time_point{}) {
+          metrics.expert_wait_ns += static_cast<std::uint64_t>(
+              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() -
+                  request.expert_wait_started)
+                  .count());
+          request.expert_wait_started = {};
+        }
         request.state = DeepSeekScheduledState::runnable;
         enqueue_runnable(request);
       }
@@ -602,6 +613,7 @@ Status DeepSeekDecodeScheduler::submit(
 }
 
 Status DeepSeekDecodeScheduler::poll() {
+  const auto poll_started = std::chrono::steady_clock::now();
   core_->service_acquisitions();
   std::size_t advances = 0U;
   while (advances < core_->config.maximum_layer_advances_per_poll &&
@@ -613,7 +625,12 @@ Status DeepSeekDecodeScheduler::poll() {
     auto& request = *iterator->second;
     request.runnable_queued = false;
     if (request.state != DeepSeekScheduledState::runnable) continue;
+    const auto advance_started = std::chrono::steady_clock::now();
     auto result = request.controller->advance();
+    core_->metrics.controller_advance_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - advance_started)
+            .count());
     ++advances;
     ++core_->metrics.layer_advances;
     request.layer = result.layer;
@@ -650,6 +667,10 @@ Status DeepSeekDecodeScheduler::poll() {
     }
   }
   core_->service_acquisitions();
+  core_->metrics.poll_ns += static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - poll_started)
+          .count());
   return Status::success();
 }
 

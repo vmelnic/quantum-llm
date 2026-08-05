@@ -41,6 +41,9 @@ TelemetrySnapshot Telemetry::snapshot() const noexcept {
   EXPERT_SNAPSHOT(useful_bytes);
   EXPERT_SNAPSHOT(read_bytes);
   EXPERT_SNAPSHOT(uploaded_bytes);
+  EXPERT_SNAPSHOT(storage_wait_ns);
+  EXPERT_SNAPSHOT(ram_retention_copy_ns);
+  EXPERT_SNAPSHOT(upload_wait_ns);
   EXPERT_SNAPSHOT(ram_bytes);
   EXPERT_SNAPSHOT(ram_high_water);
   EXPERT_SNAPSHOT(vram_bytes);

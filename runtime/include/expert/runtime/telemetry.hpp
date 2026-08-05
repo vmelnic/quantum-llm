@@ -23,6 +23,9 @@ struct TelemetrySnapshot final {
   std::uint64_t useful_bytes{};
   std::uint64_t read_bytes{};
   std::uint64_t uploaded_bytes{};
+  std::uint64_t storage_wait_ns{};
+  std::uint64_t ram_retention_copy_ns{};
+  std::uint64_t upload_wait_ns{};
   std::uint64_t ram_bytes{};
   std::uint64_t ram_high_water{};
   std::uint64_t vram_bytes{};
@@ -73,6 +76,9 @@ class Telemetry final {
   std::atomic<std::uint64_t> useful_bytes_{0};
   std::atomic<std::uint64_t> read_bytes_{0};
   std::atomic<std::uint64_t> uploaded_bytes_{0};
+  std::atomic<std::uint64_t> storage_wait_ns_{0};
+  std::atomic<std::uint64_t> ram_retention_copy_ns_{0};
+  std::atomic<std::uint64_t> upload_wait_ns_{0};
   std::atomic<std::uint64_t> ram_bytes_{0};
   std::atomic<std::uint64_t> ram_high_water_{0};
   std::atomic<std::uint64_t> vram_bytes_{0};

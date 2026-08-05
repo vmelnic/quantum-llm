@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -72,6 +73,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     bool vram_resident{true};
     OperationId io_operation{};
     OperationId upload_operation{};
+    std::chrono::steady_clock::time_point load_started_at{};
+    std::chrono::steady_clock::time_point upload_started_at{};
     bool abandon{};
   };
 
@@ -518,6 +521,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           update_usage_locked();
         }
         transition_locked(*entry, CacheState::gpu_uploading);
+        entry->upload_started_at = std::chrono::steady_clock::now();
         Telemetry::add(metrics.upload_started_);
         return {TaskKind::upload, entry};
       }
@@ -556,6 +560,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       reserve_ram_locked(*entry, entry->record.stored_bytes);
       reserve_vram_locked(*entry, vram_need, resident);
       transition_locked(*entry, CacheState::ssd_loading);
+      entry->load_started_at = std::chrono::steady_clock::now();
       Telemetry::add(metrics.load_started_);
       Telemetry::add(metrics.requested_bytes_, entry->record.stored_bytes);
       update_usage_locked();
@@ -652,9 +657,16 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
 
     if (config.retain_host_copy && !entry->host_copy) {
+      const auto copy_started = std::chrono::steady_clock::now();
       try {
         entry->host_copy = std::make_shared<std::vector<std::byte>>(count);
         std::memcpy(entry->host_copy->data(), bytes.data(), count);
+        Telemetry::add(
+            metrics.ram_retention_copy_ns_,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - copy_started)
+                    .count()));
       } catch (const std::bad_alloc&) {
         {
           std::lock_guard lock(mutex);
@@ -698,6 +710,15 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         return;
       }
       auto& entry = *iterator->second;
+      if (entry.load_started_at != std::chrono::steady_clock::time_point{}) {
+        Telemetry::add(
+            metrics.storage_wait_ns_,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - entry.load_started_at)
+                    .count()));
+        entry.load_started_at = {};
+      }
       entry.io_operation = 0;
       Telemetry::add(metrics.read_bytes_, result.read_bytes);
       if (entry.abandon || entry.waiters.empty()) {
@@ -736,6 +757,15 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         return;
       }
       auto& entry = *iterator->second;
+      if (entry.upload_started_at != std::chrono::steady_clock::time_point{}) {
+        Telemetry::add(
+            metrics.upload_wait_ns_,
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - entry.upload_started_at)
+                    .count()));
+        entry.upload_started_at = {};
+      }
       entry.upload_operation = 0;
       if (entry.abandon || entry.waiters.empty()) {
         transition_locked(entry, CacheState::ram_ready);

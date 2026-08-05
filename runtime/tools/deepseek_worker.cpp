@@ -220,6 +220,15 @@ struct Request final {
   ~Request() { if (rope) static_cast<void>(cudaFree(rope)); }
 };
 
+struct WorkerTelemetry final {
+  std::uint64_t model_steps{};
+  std::uint64_t model_rows{};
+  std::uint64_t model_step_ns{};
+  std::uint64_t embed_rope_submit_ns{};
+  std::uint64_t scheduler_poll_ns{};
+  std::uint64_t output_head_ns{};
+};
+
 class Model final {
  public:
   Model(const std::filesystem::path& root, std::uint32_t max_context,
@@ -364,6 +373,8 @@ class Model final {
                 requests.size() == positions.size() &&
                 requests.size() <= capacity_,
             "invalid DeepSeek worker batch");
+    const auto model_step_started = std::chrono::steady_clock::now();
+    const auto submit_started = model_step_started;
     std::vector<std::uint64_t> operations;
     operations.reserve(requests.size());
     for (std::size_t index = 0U; index < requests.size(); ++index) {
@@ -380,6 +391,11 @@ class Model final {
       require(submitted.ok(), submitted.message());
       operations.push_back(operation);
     }
+    telemetry_.embed_rope_submit_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - submit_started)
+            .count());
+    const auto scheduler_started = std::chrono::steady_clock::now();
     std::size_t completed = 0U;
     while (completed != operations.size()) {
       const auto polled = scheduler_->poll();
@@ -396,6 +412,11 @@ class Model final {
       }
       if (completed != operations.size()) std::this_thread::yield();
     }
+    telemetry_.scheduler_poll_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - scheduler_started)
+            .count());
+    const auto output_started = std::chrono::steady_clock::now();
     std::vector<std::uint32_t> result(requests.size());
     for (std::size_t index = 0U; index < requests.size(); ++index) {
       const auto projected = requests[index]->state->project_logits();
@@ -407,6 +428,16 @@ class Model final {
       const auto retired = scheduler_->retire(operations[index]);
       require(retired.ok(), retired.message());
     }
+    telemetry_.output_head_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - output_started)
+            .count());
+    ++telemetry_.model_steps;
+    telemetry_.model_rows += requests.size();
+    telemetry_.model_step_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - model_step_started)
+            .count());
     return result;
   }
 
@@ -437,6 +468,7 @@ class Model final {
   er::HybridDispatchTelemetry planner_snapshot() const {
     return planner_->telemetry();
   }
+  WorkerTelemetry worker_snapshot() const noexcept { return telemetry_; }
   const char* prefetch_state() const noexcept {
     // A census is persisted, but no warm-load or lookahead consumer is wired
     // yet. Policy intent is not active data movement.
@@ -464,6 +496,7 @@ class Model final {
   std::shared_ptr<er::HybridDispatchPlanner> planner_;
   std::shared_ptr<er::RouteCensus> census_;
   std::unique_ptr<er::cuda::DeepSeekDecodeScheduler> scheduler_;
+  WorkerTelemetry telemetry_;
 };
 
 struct Active final {
@@ -518,6 +551,7 @@ int worker_loop(Model& model) {
         const auto uploader = model.uploader_snapshot();
         const auto cpu = model.cpu_snapshot();
         const auto planner = model.planner_snapshot();
+        const auto worker = model.worker_snapshot();
         std::uint64_t reserved_pages = 0U;
         for (const auto& [id, item] : active) {
           static_cast<void>(id);
@@ -541,6 +575,10 @@ int worker_loop(Model& model) {
                   << ",\"cache_uploads_completed\":" << cache.upload_completed
                   << ",\"cache_read_bytes\":" << cache.read_bytes
                   << ",\"cache_uploaded_bytes\":" << cache.uploaded_bytes
+                  << ",\"cache_storage_wait_ns\":" << cache.storage_wait_ns
+                  << ",\"cache_ram_retention_copy_ns\":"
+                  << cache.ram_retention_copy_ns
+                  << ",\"cache_upload_wait_ns\":" << cache.upload_wait_ns
                   << ",\"cache_ram_bytes\":" << cache.ram_bytes
                   << ",\"cache_ram_high_water\":" << cache.ram_high_water
                   << ",\"cache_vram_bytes\":" << cache.vram_bytes
@@ -576,6 +614,11 @@ int worker_loop(Model& model) {
                   << scheduler.cpu_placements
                   << ",\"scheduler_hybrid_layers\":"
                   << scheduler.hybrid_layers
+                  << ",\"scheduler_controller_advance_ns\":"
+                  << scheduler.controller_advance_ns
+                  << ",\"scheduler_expert_wait_ns\":"
+                  << scheduler.expert_wait_ns
+                  << ",\"scheduler_poll_ns\":" << scheduler.poll_ns
                   << ",\"cpu_workers_used_last\":"
                   << cpu.workers_used_last
                   << ",\"cpu_execute_calls\":" << cpu.execute_calls
@@ -589,6 +632,15 @@ int worker_loop(Model& model) {
                   << planner.cpu_cost_wins
                   << ",\"planner_gpu_cost_wins\":"
                   << planner.gpu_cost_wins
+                  << ",\"worker_model_steps\":" << worker.model_steps
+                  << ",\"worker_model_rows\":" << worker.model_rows
+                  << ",\"worker_model_step_ns\":" << worker.model_step_ns
+                  << ",\"worker_embed_rope_submit_ns\":"
+                  << worker.embed_rope_submit_ns
+                  << ",\"worker_scheduler_poll_ns\":"
+                  << worker.scheduler_poll_ns
+                  << ",\"worker_output_head_ns\":"
+                  << worker.output_head_ns
                   << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
         require(fields.size() == 4U, "invalid BEGIN");
