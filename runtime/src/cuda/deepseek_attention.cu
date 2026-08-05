@@ -33,6 +33,14 @@ std::size_t align_up(std::size_t value) {
   return (value + kAlignment - 1U) & ~(kAlignment - 1U);
 }
 
+std::uint64_t compressor_state_bytes(std::uint32_t ratio,
+                                     std::uint32_t head_dim) {
+  if (ratio == 0U) return 0U;
+  const auto rows = ratio == 4U ? 8U : ratio;
+  const auto width = ratio == 4U ? 2U * head_dim : head_dim;
+  return 2ULL * rows * width * sizeof(float);
+}
+
 struct Arena final {
   std::byte* base{};
   std::size_t cursor{};
@@ -214,10 +222,8 @@ std::uint64_t DeepSeekAttentionState::bytes() const noexcept {
 
 DeepSeekAttentionStateResult create_deepseek_attention_state(
     std::uint32_t ratio, std::uint32_t max_context) noexcept {
-  if ((ratio != 0U && ratio != 4U && ratio != 128U) || max_context == 0U ||
-      max_context > 1'048'576U)
-    return {{ErrorCode::invalid_argument,
-             "unsupported DeepSeek attention state geometry"}, {}};
+  const auto size = deepseek_attention_state_size(ratio, max_context);
+  if (!size.status.ok()) return {size.status, {}};
   const auto compressed = ratio == 0U ? 0U : max_context / ratio;
   DeepSeekAttentionState sizing(nullptr, 0U, ratio, max_context, compressed);
   sizing.map(nullptr);
@@ -226,8 +232,8 @@ DeepSeekAttentionStateResult create_deepseek_attention_state(
   if (error != cudaSuccess)
     return {failure(error, "DeepSeek attention state allocation"), {}};
   auto state = std::shared_ptr<DeepSeekAttentionState>(
-      new DeepSeekAttentionState(allocation, sizing.allocation_bytes_, ratio,
-                                 max_context, compressed));
+      new DeepSeekAttentionState(allocation, 0U, ratio, max_context,
+                                 compressed));
   state->map(allocation);
   error = cudaMemset(allocation, 0, state->allocation_bytes_);
   if (error != cudaSuccess)
@@ -243,6 +249,20 @@ DeepSeekAttentionStateResult create_deepseek_attention_state(
     state->index_compressor_ = std::move(index.state);
   }
   return {Status::success(), std::move(state)};
+}
+
+DeepSeekAttentionStateSize deepseek_attention_state_size(
+    std::uint32_t ratio, std::uint32_t max_context) noexcept {
+  if ((ratio != 0U && ratio != 4U && ratio != 128U) || max_context == 0U ||
+      max_context > 1'048'576U)
+    return {{ErrorCode::invalid_argument,
+             "unsupported DeepSeek attention state geometry"}, 0U};
+  const auto compressed = ratio == 0U ? 0U : max_context / ratio;
+  DeepSeekAttentionState sizing(nullptr, 0U, ratio, max_context, compressed);
+  sizing.map(nullptr);
+  const auto compressor_bytes = compressor_state_bytes(ratio, kHeadDim) +
+      (ratio == 4U ? compressor_state_bytes(4U, 128U) : 0U);
+  return {Status::success(), sizing.allocation_bytes_ + compressor_bytes};
 }
 
 Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept {

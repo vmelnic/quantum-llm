@@ -21,10 +21,10 @@ This roadmap records direction, not a compatibility promise.
 5. ~~Compose routing, resident shared expert, streamed routed experts, FFN HCA,
    and attention into the first complete transformer block.~~ Qualified on the
    real layer-2 compressed token with an independent full-block oracle.
-6. Extend ownership/state across 43 layers, then add embedding, head,
-   tokenizer, sampling, and the HTTP worker boundary. The ratio-zero pure
-   sliding-window path used by layers 0, 1, and 42 is complete and independently
-   qualified; the transactional 43-layer owner is next.
+6. ~~Extend ownership/state across 43 layers.~~ A preflight-budgeted request
+   transaction now retains the immutable model plus all 43 attention/FFN
+   states. Next add the layer execution/control loop, then embedding, head,
+   tokenizer, sampling, and the HTTP worker boundary.
 
 ## Phase 1 — long-context and cold-path production work
 

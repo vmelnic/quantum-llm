@@ -515,3 +515,23 @@ A real layer-0 four-token block passed the independent checkpoint oracle with
 attention RMSE `1.18e-5`, maximum attention error `1.41e-4`, full-block RMSE
 `3.55e-5`, and maximum full-block error `2.20e-4`. This validates the missing
 schedule endpoint required before a 43-layer request owner can be constructed.
+
+### Request ownership across 43 layers
+
+`DeepSeekRequestState` now owns one persistent attention state and one FFN
+state for every checkpoint layer. It retains a shared reference to the
+immutable resident model, so pre-bound weight pointers cannot outlive their
+owner. Construction is transactional and budgeted:
+
+1. compute the exact state footprint without allocating;
+2. reject an insufficient per-request CUDA budget with backpressure;
+3. bind the fixed 3×ratio-zero, 20×ratio-four, 20×ratio-128 schedule;
+4. allocate all layer states into a private candidate;
+5. publish only after all 43 layers are complete.
+
+At a 4,096-token context the complete state is 78,272,512 bytes: 70,060,544
+bytes of attention/cache/workspace state plus 8,211,968 bytes of FFN workspace.
+The real model gate confirmed all 43 bindings and rejected a budget one byte
+below the estimate before allocation. This owns state, not yet execution order:
+the next component must drive attention → route → asynchronous expert readiness
+→ execute for each layer while preserving directory pin lifetimes.

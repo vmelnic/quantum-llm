@@ -171,5 +171,8 @@ independently proven.
 - Complete: ratio-zero layers execute the checkpoint's pure 128-token
   sliding-window path without synthetic compressor state; a real layer-0 block
   matched its independent oracle within `2.20e-4` maximum error.
-- Next: extend the block owner across 43 layers and move the dominant dense/MoE
+- Complete: a budget-preflighted request owner transactionally retains all 43
+  attention/FFN states and their immutable model bindings; the 4,096-token
+  footprint is 78,272,512 bytes.
+- Next: add the 43-layer execution/control loop and move the dominant dense/MoE
   paths to batch/tensor-core execution with overlapped expert readiness.

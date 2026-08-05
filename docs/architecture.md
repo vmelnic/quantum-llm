@@ -203,3 +203,11 @@ Its resident dense and dtype-preserving tensors are published as one model
 transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string
 lookups or per-layer uploads in the hot path.
+
+One `DeepSeekRequestState` owns the mutable attention and FFN state for all 43
+layers and retains the immutable model object that its bindings reference. The
+factory first computes the exact complete CUDA footprint, checks a caller-owned
+per-request budget, binds every layer, and only then publishes a fully built
+request. Partial allocation or a missing layer never becomes schedulable. The
+compression schedule is explicit: three pure sliding-window layers, twenty
+ratio-four layers, and twenty ratio-128 layers.

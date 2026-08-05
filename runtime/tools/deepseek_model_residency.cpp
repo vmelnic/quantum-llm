@@ -2,6 +2,7 @@
 #include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
+#include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/expert_cache.hpp"
@@ -263,15 +264,47 @@ int main(int argc, char** argv) {
     er::ExtentGatherStorage storage(iocp);
     er::FixedBufferPool buffers(1U, staging, er::kExpertPackAlignment,
                                 std::make_shared<er::CudaPinnedAllocator>());
-    er::cuda::DeepSeekResidentModelState model;
+    auto model = std::make_shared<er::cuda::DeepSeekResidentModelState>();
     const auto started = std::chrono::steady_clock::now();
     const auto status = er::cuda::DeepSeekResidentModelState::load(
-        storage, buffers, dense, typed, model);
+        storage, buffers, dense, typed, *model);
     const auto stopped = std::chrono::steady_clock::now();
     require(status.ok(), std::string(status.message()));
-    require(model.dense_size() == 236U && model.typed_size() == 834U &&
-                model.bytes() == resident_bytes,
+    require(model->dense_size() == 236U && model->typed_size() == 834U &&
+                model->bytes() == resident_bytes,
             "published model state has inconsistent ownership");
+    const auto request_size = er::cuda::deepseek_request_state_size(4096U);
+    require(request_size.status.ok() && request_size.total_bytes > 1U,
+            std::string(request_size.status.message()));
+    const auto rejected_request = er::cuda::create_deepseek_request_state(
+        model, {4096U, request_size.total_bytes - 1U});
+    require(!rejected_request.status.ok() && !rejected_request.state &&
+                rejected_request.status.code() == er::ErrorCode::backpressure,
+            "request state did not reject an insufficient preflight budget");
+    auto request = er::cuda::create_deepseek_request_state(
+        model, {4096U, request_size.total_bytes});
+    require(request.status.ok() && request.state &&
+                request.state->bytes() == request_size.total_bytes,
+            std::string(request.status.message()));
+    std::uint32_t ratio_zero_layers = 0U, ratio_four_layers = 0U;
+    std::uint32_t ratio_128_layers = 0U;
+    for (std::uint32_t layer = 0U;
+         layer < er::cuda::DeepSeekRequestState::layer_count(); ++layer) {
+      const auto view = request.state->layer(layer);
+      require(view.attention_weights && view.attention_state &&
+                  view.ffn_weights && view.ffn_state &&
+                  view.attention_weights->layer == layer &&
+                  view.ffn_weights->layer == layer &&
+                  view.ffn_state->layer() == layer &&
+                  view.attention_state->compress_ratio() == view.compress_ratio,
+              "incomplete 43-layer request state publication");
+      if (view.compress_ratio == 0U) ++ratio_zero_layers;
+      if (view.compress_ratio == 4U) ++ratio_four_layers;
+      if (view.compress_ratio == 128U) ++ratio_128_layers;
+    }
+    require(ratio_zero_layers == 3U && ratio_four_layers == 20U &&
+                ratio_128_layers == 20U,
+            "request state has the wrong compression schedule");
     auto expert_storage = std::make_shared<er::ExtentGatherStorage>(iocp);
     auto expert_uploader = std::make_shared<er::cuda::CudaExpertUploader>();
     auto expert_buffers = std::make_shared<er::FixedBufferPool>(
@@ -296,26 +329,26 @@ int main(int argc, char** argv) {
                 ffn_resident.bytes() == 7ULL * 25'198'592U,
             std::string(ffn_load_status.message()));
     er::cuda::DeepSeekAttentionBinding sliding_window, ratio_four, ratio_128;
-    auto bind = model.bind_attention(0U, 0U, sliding_window);
+    auto bind = model->bind_attention(0U, 0U, sliding_window);
     require(bind.ok(), std::string(bind.message()));
-    bind = model.bind_attention(2U, 4U, ratio_four);
+    bind = model->bind_attention(2U, 4U, ratio_four);
     require(bind.ok(), std::string(bind.message()));
-    bind = model.bind_attention(3U, 128U, ratio_128);
+    bind = model->bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
     er::cuda::DeepSeekFfnBinding hash_ffn, learned_ffn;
-    bind = model.bind_ffn(2U, hash_ffn);
+    bind = model->bind_ffn(2U, hash_ffn);
     require(bind.ok() && hash_ffn.hash_router && hash_ffn.token_experts &&
                 !hash_ffn.router_bias,
             "invalid hash FFN binding");
-    bind = model.bind_ffn(3U, learned_ffn);
+    bind = model->bind_ffn(3U, learned_ffn);
     require(bind.ok() && !learned_ffn.hash_router && learned_ffn.router_bias &&
                 !learned_ffn.token_experts,
             "invalid learned FFN binding");
     er::cuda::DeepSeekAttentionBinding oracle_attention;
-    bind = model.bind_attention(oracle_layer, oracle_ratio, oracle_attention);
+    bind = model->bind_attention(oracle_layer, oracle_ratio, oracle_attention);
     require(bind.ok(), std::string(bind.message()));
     er::cuda::DeepSeekFfnBinding oracle_ffn;
-    bind = model.bind_ffn(oracle_layer, oracle_ffn);
+    bind = model->bind_ffn(oracle_layer, oracle_ffn);
     require(bind.ok() && oracle_ffn.hash_router,
             "attention oracle requires a hash-routed FFN layer");
     constexpr std::size_t token_stream_values = 4U * 4096U;
@@ -503,10 +536,10 @@ int main(int argc, char** argv) {
           "cudaMemGetInfo resident model");
     const auto startup_ms = std::chrono::duration<double, std::milli>(
                                 stopped - started).count();
-    std::cout << "{\"ok\":true,\"dense_tensors\":" << model.dense_size()
-              << ",\"typed_tensors\":" << model.typed_size()
+    std::cout << "{\"ok\":true,\"dense_tensors\":" << model->dense_size()
+              << ",\"typed_tensors\":" << model->typed_size()
               << ",\"source_bytes\":" << dense_source + typed_source
-              << ",\"resident_bytes\":" << model.bytes()
+              << ",\"resident_bytes\":" << model->bytes()
               << ",\"staging_bytes\":" << staging
               << ",\"startup_ms\":" << startup_ms
               << ",\"oracle_layer\":" << oracle_layer
@@ -514,6 +547,11 @@ int main(int argc, char** argv) {
               << ",\"ratio0_bound\":true,\"ratio4_bound\":true"
               << ",\"ratio128_bound\":true"
               << ",\"hash_ffn_bound\":true,\"learned_ffn_bound\":true"
+              << ",\"request_layers\":" << request.state->layer_count()
+              << ",\"request_4096_bytes\":" << request.state->bytes()
+              << ",\"request_attention_bytes\":"
+              << request_size.attention_bytes
+              << ",\"request_ffn_bytes\":" << request_size.ffn_bytes
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
               << ",\"decode_tokens\":" << decode_tokens
               << ",\"attention_ms\":" << attention_ms

@@ -109,6 +109,12 @@ DeepSeekFfnStateResult create_deepseek_ffn_state(
   return {Status::success(), std::move(state)};
 }
 
+std::uint64_t deepseek_ffn_state_size() noexcept {
+  DeepSeekFfnState sizing(nullptr, 0U, 0U);
+  sizing.map(nullptr);
+  return sizing.bytes();
+}
+
 Status deepseek_ffn_route(const DeepSeekFfnRouteLaunch& launch) noexcept {
   if (!launch.weights || !launch.state || !launch.streams ||
       launch.epsilon <= 0.0F || launch.sinkhorn_iterations == 0U)

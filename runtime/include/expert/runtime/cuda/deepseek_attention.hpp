@@ -9,6 +9,7 @@
 namespace expert::runtime::cuda {
 
 struct DeepSeekAttentionStateResult;
+struct DeepSeekAttentionStateSize;
 
 class DeepSeekAttentionState final {
  public:
@@ -24,6 +25,8 @@ class DeepSeekAttentionState final {
 
  private:
   friend DeepSeekAttentionStateResult create_deepseek_attention_state(
+      std::uint32_t, std::uint32_t) noexcept;
+  friend DeepSeekAttentionStateSize deepseek_attention_state_size(
       std::uint32_t, std::uint32_t) noexcept;
   friend Status deepseek_attention_decode(const struct DeepSeekAttentionLaunch&) noexcept;
   DeepSeekAttentionState(void* allocation, std::uint64_t allocation_bytes,
@@ -60,6 +63,16 @@ struct DeepSeekAttentionStateResult final {
   Status status;
   std::shared_ptr<DeepSeekAttentionState> state;
 };
+
+struct DeepSeekAttentionStateSize final {
+  Status status;
+  std::uint64_t bytes{};
+};
+
+// Computes the exact CUDA allocation footprint before any allocation occurs.
+[[nodiscard]] DeepSeekAttentionStateSize deepseek_attention_state_size(
+    std::uint32_t compress_ratio,
+    std::uint32_t max_context_tokens) noexcept;
 
 // Allocates all per-request sliding-window/CSA cache and workspace up front.
 // Ratio zero is the checkpoint's pure sliding-window mode. No allocation occurs

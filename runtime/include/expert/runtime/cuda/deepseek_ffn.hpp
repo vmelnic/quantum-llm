@@ -33,6 +33,7 @@ class DeepSeekFfnState final {
  private:
   friend DeepSeekFfnStateResult create_deepseek_ffn_state(
       std::uint32_t) noexcept;
+  friend std::uint64_t deepseek_ffn_state_size() noexcept;
   friend Status deepseek_ffn_route(const struct DeepSeekFfnRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute(
       const struct DeepSeekFfnExecuteLaunch&) noexcept;
@@ -54,6 +55,8 @@ struct DeepSeekFfnStateResult final {
   Status status;
   std::shared_ptr<DeepSeekFfnState> state;
 };
+
+[[nodiscard]] std::uint64_t deepseek_ffn_state_size() noexcept;
 
 [[nodiscard]] DeepSeekFfnStateResult create_deepseek_ffn_state(
     std::uint32_t layer) noexcept;
