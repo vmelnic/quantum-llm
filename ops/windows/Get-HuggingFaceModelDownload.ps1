@@ -28,6 +28,7 @@ $incomplete = @(Get-ChildItem (Join-Path $root "blobs") -Filter "*.incomplete" `
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
 $shards = @(Get-ChildItem $snapshot -Filter "model-*.safetensors" -File `
     -ErrorAction SilentlyContinue)
+$completeShardBytes = [int64](($shards | Measure-Object Length -Sum).Sum)
 $indexPath = Join-Path $snapshot "model.safetensors.index.json"
 $indexTensorBytes = [int64]0
 $missingReferencedFiles = @()
@@ -44,11 +45,15 @@ $exit = if (Test-Path ([string]$state.exit_status) -PathType Leaf) {
 } else { $null }
 $elapsed = [Math]::Max(0.001, ([DateTime]::UtcNow -
     [DateTime]::Parse([string]$state.started_utc)).TotalSeconds)
+$initialCompleteShardBytes = if ($null -ne $state.PSObject.Properties[
+        "initial_complete_shard_bytes"]) {
+    [int64]$state.initial_complete_shard_bytes
+} else { [int64]0 }
 $downloadedThisRun = [Math]::Max([int64]0,
-    $blobBytes - [int64]$state.initial_cached_bytes)
+    $completeShardBytes - $initialCompleteShardBytes)
 $bytesPerSecond = [double]$downloadedThisRun / $elapsed
 $remaining = [Math]::Max([int64]0,
-    [int64]$state.expected_download_bytes - $blobBytes)
+    [int64]$state.expected_tensor_bytes - $completeShardBytes)
 $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     $shards.Count -eq [int]$state.expected_shards -and
     $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
@@ -69,6 +74,8 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     missing_referenced_files = $missingReferencedFiles.Count
     index_tensor_bytes = $indexTensorBytes
     expected_tensor_bytes = [int64]$state.expected_tensor_bytes
+    complete_shard_bytes = $completeShardBytes
+    remaining_tensor_bytes = $remaining
     cached_blob_bytes = $blobBytes
     expected_download_bytes = [int64]$state.expected_download_bytes
     bytes_per_second_since_start = $bytesPerSecond

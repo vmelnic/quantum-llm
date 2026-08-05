@@ -57,6 +57,10 @@ if ($null -ne $existing) {
 
 $cacheName = "models--" + ($ModelId -replace "/", "--")
 $cacheRoot = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
+$snapshot = Join-Path (Join-Path $cacheRoot "snapshots") $Revision
+$initialShardBytes = [int64]((Get-ChildItem $snapshot `
+    -Filter "model-*.safetensors" -File -ErrorAction SilentlyContinue |
+    Measure-Object Length -Sum).Sum)
 $cachedBytes = if (Test-Path (Join-Path $cacheRoot "blobs")) {
     [int64]((Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
         -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
@@ -95,6 +99,7 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings `
     expected_tensor_bytes = $ExpectedTensorBytes
     expected_shards = $ExpectedShards
     initial_cached_bytes = $cachedBytes
+    initial_complete_shard_bytes = $initialShardBytes
     free_bytes_before = $freeBytes
     safety_bytes = $SafetyBytes
     max_workers = $MaxWorkers
