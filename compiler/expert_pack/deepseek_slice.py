@@ -6,6 +6,7 @@ import hashlib
 import math
 import os
 import time
+from contextlib import ExitStack
 from pathlib import Path
 
 from .deepseek_v4 import validate_deepseek_v4_source
@@ -1447,6 +1448,123 @@ def export_deepseek_compact_expert(
         format_name="deepseek-compact-expert-extents-v1",
         source_abi="deepseek-fp4-e2m1-ue8m0-block32-v1",
     )
+
+
+def export_deepseek_routed_catalog(
+    checkpoint: SafeTensorCheckpoint, *, output: Path
+) -> dict[str, object]:
+    """Atomically index every routed expert without copying weight payloads."""
+
+    validate_deepseek_v4_source(checkpoint)
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"routed catalog output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    expert_count = 43 * 256
+    extent_count = expert_count * 6
+    source_bytes = 0
+    try:
+        with ExitStack() as stack:
+            catalog = stack.enter_context(
+                (partial / "catalog.tsv").open(
+                    "x", encoding="utf-8", newline="\n"
+                )
+            )
+            extents = stack.enter_context(
+                (partial / "extents.tsv").open(
+                    "x", encoding="utf-8", newline="\n"
+                )
+            )
+            # Cataloging touches 66,048 tensor extents. Keep one unbuffered
+            # handle per shard, but hash through one fixed scratch allocation.
+            # Long-lived mmaps make Windows retain the scanned pages in this
+            # process's working set, which is unacceptable on a serving host.
+            shard_handles: dict[str, object] = {}
+            for shard in checkpoint.shards:
+                shard_handles[shard] = stack.enter_context(
+                    (checkpoint.root / shard).open("rb", buffering=0)
+                )
+            hash_buffer = bytearray(8 * 1024 * 1024)
+            hash_view = memoryview(hash_buffer)
+            catalog.write("deepseek-routed-catalog-v1\n")
+            extents.write("deepseek-routed-extents-v1\n")
+            extent_index = 0
+            for layer in range(43):
+                for expert in range(256):
+                    prefix = f"layers.{layer}.ffn.experts.{expert}"
+                    names = tuple(
+                        f"{prefix}.{projection}.{kind}"
+                        for projection in ("w1", "w3", "w2")
+                        for kind in ("weight", "scale")
+                    )
+                    digest = hashlib.sha256()
+                    destination = 0
+                    first_extent = extent_index
+                    for name in names:
+                        info = checkpoint.tensors[name]
+                        if any(character in info.shard for character in "\t\r\n"):
+                            raise SourceFormatError(
+                                "SafeTensors shard name is not descriptor-safe"
+                            )
+                        handle = shard_handles[info.shard]
+                        handle.seek(info.offset)
+                        remaining = info.nbytes
+                        while remaining:
+                            requested = min(remaining, len(hash_buffer))
+                            count = handle.readinto(hash_view[:requested])
+                            if count is None or count <= 0:
+                                raise SourceFormatError(
+                                    f"truncated DeepSeek tensor payload: {name}"
+                                )
+                            digest.update(hash_view[:count])
+                            remaining -= count
+                        extents.write(
+                            f"{destination}\t{info.nbytes}\t{info.offset}\t"
+                            f"{info.shard}\n"
+                        )
+                        destination += info.nbytes
+                        extent_index += 1
+                    if destination != 13_369_344:
+                        raise SourceFormatError(
+                            "DeepSeek routed expert has invalid compact bytes"
+                        )
+                    catalog.write(
+                        f"{layer}\t{expert}\t{destination}\t"
+                        f"{digest.hexdigest()}\t{first_extent}\t6\n"
+                    )
+                    source_bytes += destination
+                catalog.flush()
+                extents.flush()
+                print(
+                    f"cataloged DeepSeek routed layer {layer + 1}/43 "
+                    f"({source_bytes} source bytes)",
+                    flush=True,
+                )
+            if extent_index != extent_count:
+                raise SourceFormatError("DeepSeek routed extent count mismatch")
+            catalog.flush()
+            os.fsync(catalog.fileno())
+            extents.flush()
+            os.fsync(extents.fileno())
+            hash_view.release()
+        result = {
+            "format": "deepseek-routed-catalog-v1",
+            "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
+            "target_abi": "deepseek-sm86-int8-per-row-v1",
+            "layers": 43,
+            "experts_per_layer": 256,
+            "expert_count": expert_count,
+            "extent_count": extent_count,
+            "source_bytes": source_bytes,
+            "device_bytes_per_expert": 25_198_592,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise
 
 
 def export_deepseek_shared_expert(

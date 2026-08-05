@@ -12,6 +12,7 @@ add_library(expert_runtime STATIC
   src/buffer_pool.cpp
   src/cache_state.cpp
   src/cpu/expert_executor.cpp
+  src/deepseek_catalog.cpp
   src/deepseek_expert.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
@@ -139,6 +140,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     add_executable(expert-deepseek-csa-smoke tools/deepseek_csa_smoke.cpp)
     target_compile_features(expert-deepseek-csa-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-csa-smoke PRIVATE
+      expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-catalog-smoke
+      tools/deepseek_catalog_smoke.cpp)
+    target_compile_features(expert-deepseek-catalog-smoke PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-catalog-smoke PRIVATE
       expert_runtime CUDA::cudart)
   endif()
   add_executable(expert-qwen3-next-runner tools/qwen3_next_runner.cpp)

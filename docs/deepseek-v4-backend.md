@@ -553,8 +553,16 @@ block oracle with `4.76e-4` maximum error. The all-resident path produced the
 same bound. A full request can use range `[0, 43)`; strict subranges remain
 available for qualification and future pipeline placement.
 
-The remaining full-model blocker is no longer layer execution semantics. It is
-the production expert catalog and outer scheduler: all `(layer, expert)` source
-descriptors must be addressable without generating per-route files, and the
-scheduler must own asynchronous acquire handles/leases across suspended
-controllers.
+The production routed catalog now indexes all 11,008 `(layer, expert)` records
+without generating per-route directories or copying model weights. A strict
+runtime parser reconstructs the six exact-cover source extents, hash, compact
+source ABI, and derived SM86 allocation for each key. Publication is atomic;
+truncated, reordered, path-escaping, or geometrically incomplete catalogs fail
+closed. A real boundary smoke loads `(0, 0)` and `(42, 255)` through IOCP,
+extent gather, SHA-256 verification, compact FP4 admission, cache publication,
+CUDA directory pinning, and independent release.
+
+The remaining full-model blocker is the outer asynchronous scheduler. It must
+own acquire handles and leases across suspended controllers, bound concurrent
+cold admissions, wake a request only when its exact route is ready, and keep
+other runnable requests progressing while I/O and admission execute.

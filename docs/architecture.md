@@ -225,3 +225,10 @@ cold route returns its exact missing expert IDs while preserving the computed
 attention/router state. The scheduler can run other requests while the cache
 publishes those experts, then call `advance()` again to replan and resume the
 same FFN. Cancellation and every failure path release any active pin token.
+
+`DeepSeekExpertCatalog` is the immutable source directory behind that boundary.
+It resolves every main-model `(layer, expert)` in O(1) to six SafeTensors
+extents and the exact source/device ABI geometry. The catalog contains metadata
+and hashes only; the original checkpoint remains authoritative and recoverable.
+This keeps startup metadata bounded while allowing future placement planners to
+point the same logical expert at local SSD, RAM, VRAM, or a remote worker.

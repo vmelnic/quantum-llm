@@ -13,6 +13,7 @@ from .deepseek_v4 import (
 )
 from .deepseek_slice import (
     export_deepseek_compact_expert,
+    export_deepseek_routed_catalog,
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
     export_deepseek_csa_slice,
@@ -106,6 +107,12 @@ def _parser() -> argparse.ArgumentParser:
     export_parser.add_argument("--output", type=Path, required=True)
     export_parser.add_argument("--layer", type=int, default=0)
     export_parser.add_argument("--expert", type=int, default=0)
+    routed_catalog_parser = commands.add_parser(
+        "export-deepseek-routed-catalog",
+        help="index all 43x256 routed experts as compact SafeTensors extents",
+    )
+    routed_catalog_parser.add_argument("--source", type=Path, required=True)
+    routed_catalog_parser.add_argument("--output", type=Path, required=True)
     shared_parser = commands.add_parser(
         "export-deepseek-shared",
         help="describe one FP8 shared expert as bounded SafeTensors extents",
@@ -219,6 +226,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = export_deepseek_compact_expert(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 expert=args.expert, output=args.output,
+            )
+        elif args.command == "export-deepseek-routed-catalog":
+            result = export_deepseek_routed_catalog(
+                SafeTensorCheckpoint(args.source), output=args.output,
             )
         elif args.command == "export-deepseek-shared":
             result = export_deepseek_shared_expert(

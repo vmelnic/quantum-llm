@@ -24,9 +24,12 @@ This roadmap records direction, not a compatibility promise.
 6. ~~Extend ownership/state across 43 layers.~~ A preflight-budgeted request
    transaction now retains the immutable model plus all 43 attention/FFN
    states. Concurrent directory pin tokens and the suspend/resume layer control
-   loop are complete. Next add the complete expert catalog and outer async
-   scheduler, then embedding, head, tokenizer, sampling, and the HTTP worker
-   boundary.
+   loop are complete.
+7. ~~Index every main-model routed expert without copying the checkpoint.~~ The
+   atomic catalog contains 11,008 records and 66,048 source extents; the runtime
+   parser and real first/last-expert cache/CUDA boundary are complete.
+8. Add the outer async scheduler, then embedding, head, tokenizer, sampling,
+   and the HTTP worker boundary.
 
 ## Phase 1 — long-context and cold-path production work
 

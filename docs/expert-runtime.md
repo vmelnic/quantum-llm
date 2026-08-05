@@ -124,6 +124,13 @@ outer scheduler acquires the exact missing experts. Resume replans the complete
 top-k, executes only when every dependency is available, and releases the
 request's directory pin after the FFN stream completes.
 
+The immutable DeepSeek routed catalog contains exactly 43 × 256 records in
+layer-major order. Each record reconstructs one `PayloadRecord` from six
+exact-cover SafeTensors extents and declares both compact FP4 source bytes and
+expanded SM86 bytes. Lookup does not parse files, allocate, or hash in the hot
+path. Catalog generation hashes the authoritative source once; normal cache
+admission verifies the selected expert again before publication.
+
 `HybridDispatchPlanner` receives one unique candidate per routed expert. It
 keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
 balances flexible RAM misses by projected critical path. Current synchronous

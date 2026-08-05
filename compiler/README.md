@@ -52,6 +52,21 @@ six `(shard, source offset, destination offset, bytes)` ranges. It copies no
 weights. The CUDA admission gate gathers those ranges directly from the
 immutable SafeTensors checkpoint into one bounded staging buffer.
 
+`export-deepseek-routed-catalog` applies that contract to all 43 × 256 routed
+experts in the main model. It emits one compact lookup table plus one extent
+table; it does not duplicate the 147,169,738,752 source bytes. Every source
+shard handle is opened once and all hashing passes through one fixed 8 MiB
+buffer, so RAM does not grow with checkpoint size. Each complete expert is
+SHA-256 hashed in its six-extent ABI order, and the directory is atomically
+published only after all 11,008 records are present. The auxiliary MTP head is
+intentionally outside this main-decode catalog.
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler export-deepseek-routed-catalog `
+  --source C:\path\to\deepseek-v4-flash-snapshot `
+  --output C:\path\to\deepseek-routed-catalog
+```
+
 `qualify-deepseek-shared` and `export-deepseek-shared` apply the same boundary
 to the always-active FP8 shared expert. E4M3FN weights and UE8M0 128×128 block
 scales are independently compared with PyTorch before the SM86 candidate hash
