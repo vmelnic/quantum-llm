@@ -127,5 +127,8 @@ independently proven.
 - Complete: the real layer-0 attention HCA site runs its exact F32
   RMS-rescale, 24-way projection, sigmoid controls, 20-step Sinkhorn stream
   mixer, collapse, and expansion on CUDA against an independent oracle.
+- Complete: all 834 main-model BF16/F32/I64 tensors stream transactionally
+  into dtype-preserving device state through one fixed 64 MiB staging slot;
+  tensors larger than the slot are hashed and uploaded incrementally.
 - Next: implement typed CSA/attention execution, then compose dense, HCA, and
   shared ownership in the first model-layer runtime.

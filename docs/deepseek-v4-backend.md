@@ -270,3 +270,24 @@ small Sinkhorn kernel can later be fused after the complete layer is correct.
 The next dependency is CSA attention and its typed BF16/F32 compressor,
 normalization, index, and cache state. After that, HCA can wrap a real attention
 sublayer instead of the deterministic validation vector.
+
+## Typed model state
+
+The remaining 834 main-model tensors use BF16, F32, or I64 and occupy
+2,988,256,348 bytes. `DeepSeekTypedSet` retains those dtypes on device rather
+than eagerly expanding BF16 to F32. Stable name lookup is confined to model
+construction; bound execution paths consume typed pointers.
+
+Loading is transactional and chunked. Each device tensor receives one final
+allocation, but source reads, incremental SHA-256, and H2D copies pass through
+one fixed 64 MiB pinned slot. Consequently the roughly 1 GiB embedding/head
+tensors do not require equally large host staging allocations. A failed read,
+hash, allocation, or upload releases the partial candidate and leaves the
+published model state empty.
+
+The complete real set loaded in 9.97 seconds. All 834 name lookups succeeded,
+and resident bytes exactly matched the 2,988,256,348-byte source contract. The
+RTX 3090 reported 21,452,816,384 free CUDA bytes while this set alone was
+resident. This is the typed storage boundary required by HCA, normalization,
+CSA compressors/indexers, routing, embedding, and the output head; individual
+kernels still have to enforce each tensor's dtype and shape contract.

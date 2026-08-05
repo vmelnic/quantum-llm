@@ -76,6 +76,11 @@ the runtime still gathers `fn`, `base`, and `scale` from their original
 SafeTensors extents. The oracle covers stream collapse, the doubly-stochastic
 Sinkhorn matrix, and stream expansion after a deterministic sublayer output.
 
+`export-deepseek-typed-set` emits metadata-only descriptors for all 834
+main-model BF16/F32/I64 tensors. The runtime preserves their source dtype and
+streams tensors larger than its fixed staging slot while calculating one
+incremental SHA-256 over the original byte order.
+
 ## Install
 
 From the repository root:

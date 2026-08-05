@@ -15,6 +15,7 @@ from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
+    export_deepseek_typed_set,
     export_deepseek_dense_set,
     export_deepseek_shared_expert,
     export_deepseek_shared_set,
@@ -137,6 +138,12 @@ def _parser() -> argparse.ArgumentParser:
     hca_parser.add_argument("--output", type=Path, required=True)
     hca_parser.add_argument("--layer", type=int, default=0)
     hca_parser.add_argument("--site", choices=("attn", "ffn"), default="attn")
+    typed_set_parser = commands.add_parser(
+        "export-deepseek-typed-set",
+        help="describe all 834 main-model BF16/F32/I64 tensors for residency",
+    )
+    typed_set_parser.add_argument("--source", type=Path, required=True)
+    typed_set_parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -215,10 +222,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = export_deepseek_dense_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-hca":
             result = export_deepseek_hca_slice(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 site=args.site, output=args.output,
+            )
+        else:
+            result = export_deepseek_typed_set(
+                SafeTensorCheckpoint(args.source), output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

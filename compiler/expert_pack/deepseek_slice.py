@@ -830,3 +830,77 @@ def export_deepseek_dense_set(
         return result
     except Exception:
         raise
+
+
+def export_deepseek_typed_set(
+    checkpoint: SafeTensorCheckpoint, *, output: Path
+) -> dict[str, object]:
+    """Describe all 834 non-quantized main-model tensors without repacking."""
+
+    validate_deepseek_v4_source(checkpoint)
+    names = sorted(
+        name
+        for name, info in checkpoint.tensors.items()
+        if not name.startswith("mtp.") and info.dtype in ("BF16", "F32", "I64")
+    )
+    if len(names) != 834:
+        raise AdapterError(f"expected 834 main-model typed tensors, got {len(names)}")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"typed set output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    entries: list[dict[str, object]] = []
+    total_bytes = 0
+    maximum_bytes = 0
+    try:
+        for index, name in enumerate(names):
+            relative = Path(f"tensor-{index:03d}")
+            info = checkpoint.tensors[name]
+            manifest = _export_deepseek_extents(
+                checkpoint,
+                names=(name,),
+                output=partial / relative,
+                layer=-1,
+                expert=name,
+                format_name="deepseek-typed-tensor-extents-v1",
+                source_abi=f"deepseek-{info.dtype.lower()}-v1",
+                target_abi=f"deepseek-sm86-{info.dtype.lower()}-v1",
+            )
+            entry = {
+                "name": name,
+                "dtype": info.dtype,
+                "shape": list(info.shape),
+                "descriptor": str(relative / "extents.tsv"),
+                "bytes": info.nbytes,
+                "sha256": manifest["combined"]["sha256"],
+            }
+            entries.append(entry)
+            total_bytes += info.nbytes
+            maximum_bytes = max(maximum_bytes, info.nbytes)
+        with (partial / "typed-set.tsv").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as index_file:
+            index_file.write("deepseek-typed-residency-v1\n")
+            for entry in entries:
+                shape = ",".join(str(value) for value in entry["shape"])
+                index_file.write(
+                    f"{entry['name']}\t{entry['dtype']}\t{shape}\t{entry['bytes']}\t"
+                    f"{entry['sha256']}\t{entry['descriptor']}\n"
+                )
+            index_file.flush()
+            os.fsync(index_file.fileno())
+        result = {
+            "format": "deepseek-typed-residency-v1",
+            "tensor_count": len(entries),
+            "source_bytes": total_bytes,
+            "device_bytes": total_bytes,
+            "maximum_tensor_bytes": maximum_bytes,
+            "tensors": entries,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise
