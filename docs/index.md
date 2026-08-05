@@ -15,6 +15,7 @@
 | [Larger-model decision](larger-model-decision.md) | Modern MoE candidates, compatibility gaps, workspace rules, and target selection |
 | [DeepSeek-V4-Flash backend](deepseek-v4-backend.md) | Pinned source contract, quantization boundary, and SM86 placement direction |
 | [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Aligned, resumable native FP4 routed-expert container |
+| [DeepSeek-V4-Flash serving](deepseek-serving.md) | Worker bundle, persistent CUDA process, API startup, and service gate |
 | [Route census](route-census.md) | Bounded, authenticated route evidence and deterministic warm-set ranking |
 | [Measured placement profile](placement-profile.md) | Hardware cost calibration and fail-closed RAM/VRAM budget solver |
 

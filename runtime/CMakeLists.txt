@@ -149,6 +149,10 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     target_compile_features(expert-deepseek-model-residency PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-model-residency PRIVATE
       expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-worker tools/deepseek_worker.cpp)
+    target_compile_features(expert-deepseek-worker PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-worker PRIVATE
+      expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-csa-smoke tools/deepseek_csa_smoke.cpp)
     target_compile_features(expert-deepseek-csa-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-csa-smoke PRIVATE
