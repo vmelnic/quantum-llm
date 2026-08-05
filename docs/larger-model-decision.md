@@ -102,5 +102,7 @@ independently proven.
   INT8 error metrics, and metadata-derived representation/space measurements.
 - Complete: platform-neutral compact-source and 25,198,592-byte SM86 hot-slot
   ABI, with exact layout enforced by native runtime tests.
-- Next: implement SM86 expert admission plus GEMM against that slot before any
-  full conversion.
+- Complete: compact H2D plus SM86 admission for one real expert; the complete
+  hot slot is byte-identical to the independent candidate and takes 9.73 ms.
+- Next: execute and qualify gate/up/down GEMM from that admitted slot, then
+  connect publication, eviction, and prefetch to the runtime cache.

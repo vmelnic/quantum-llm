@@ -47,6 +47,11 @@ and reports deterministic candidate INT8 hashes/error metrics without retaining
 converted weights. NumPy and a PyTorch build with `float8_e8m0fnu` are required
 on the qualification host.
 
+`export-deepseek-expert` copies only the six compact source tensors for one
+expert into a checksummed fixture bundle used by the CUDA admission gate. It
+does not decode weights, mutate the checkpoint, or authorize a full-model
+conversion.
+
 ## Install
 
 From the repository root:

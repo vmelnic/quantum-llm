@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import time
+from pathlib import Path
 
 from .deepseek_v4 import validate_deepseek_v4_source
 from .errors import AdapterError, SourceFormatError
 from .safetensors import SafeTensorCheckpoint
+from .util import atomic_json, write_all
 
 try:
     import numpy as np
@@ -83,8 +86,8 @@ def qualify_deepseek_expert(
         raise ValueError("row_chunk must be positive")
 
     started = time.perf_counter()
-    digest = hashlib.sha256()
     projections: dict[str, object] = {}
+    candidate_payloads: dict[str, tuple[bytes, bytes]] = {}
     total_source_bytes = 0
     total_candidate_bytes = 0
     total_values = 0
@@ -108,6 +111,7 @@ def qualify_deepseek_expert(
         projection_max_error = 0.0
         projection_reference_equal = True
         projection_candidate_bytes = 0
+        projection_q_payload = bytearray()
         projection_scale_payload = bytearray()
         with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
             scale_name
@@ -146,7 +150,7 @@ def qualify_deepseek_expert(
                 projection_values += int(decoded.size)
                 q_bytes = quantized.tobytes(order="C")
                 scale_bytes = row_scales.tobytes(order="C")
-                digest.update(q_bytes)
+                projection_q_payload.extend(q_bytes)
                 projection_scale_payload.extend(scale_bytes)
                 projection_candidate_bytes += len(q_bytes) + len(scale_bytes)
 
@@ -157,9 +161,9 @@ def qualify_deepseek_expert(
                 del reference
             del packed_matrix, scale_matrix
 
-        # Candidate layout is projection INT8 rows followed by all row scales,
-        # independent of the qualification chunk size.
-        digest.update(projection_scale_payload)
+        candidate_payloads[projection] = (
+            bytes(projection_q_payload), bytes(projection_scale_payload)
+        )
 
         projection_mse = projection_squared_error / projection_values
         projections[projection] = {
@@ -178,6 +182,13 @@ def qualify_deepseek_expert(
         maximum_absolute_error = max(maximum_absolute_error, projection_max_error)
 
     total_mse = total_squared_error / total_values
+    digest = hashlib.sha256()
+    # Exact deepseek-sm86-int8-per-row-v1 slot order.
+    for projection, section in (
+        ("w1", 0), ("w3", 0), ("w1", 1),
+        ("w3", 1), ("w2", 0), ("w2", 1),
+    ):
+        digest.update(candidate_payloads[projection][section])
     elapsed = time.perf_counter() - started
     return {
         "format": "deepseek-v4-expert-slice-qualification-v1",
@@ -190,6 +201,7 @@ def qualify_deepseek_expert(
         "source_bytes": total_source_bytes,
         "logical_values": total_values,
         "candidate_int8_bytes": total_candidate_bytes,
+        "candidate_abi": "deepseek-sm86-int8-per-row-v1",
         "candidate_sha256": digest.hexdigest(),
         "mean_squared_error": total_mse,
         "root_mean_squared_error": math.sqrt(total_mse),
@@ -198,3 +210,60 @@ def qualify_deepseek_expert(
         "decoded_values_per_second": total_values / elapsed,
         "projections": projections,
     }
+
+
+def export_deepseek_compact_expert(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, expert: int, output: Path
+) -> dict[str, object]:
+    """Copy one immutable compact expert into a small CUDA fixture bundle."""
+
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= layer < 43 or not 0 <= expert < 256:
+        raise AdapterError("DeepSeek expert bundle key is outside configured bounds")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"expert bundle output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    tensors: list[dict[str, object]] = []
+    total_bytes = 0
+    try:
+        prefix = f"layers.{layer}.ffn.experts.{expert}"
+        for projection in ("w1", "w2", "w3"):
+            for kind in ("weight", "scale"):
+                name = f"{prefix}.{projection}.{kind}"
+                info = checkpoint.tensors[name]
+                filename = f"{projection}.{kind}.bin"
+                digest = hashlib.sha256()
+                with checkpoint.open_tensor(name) as view, (
+                    partial / filename
+                ).open("xb") as handle:
+                    digest.update(view.raw)
+                    write_all(handle, view.raw)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                tensors.append({
+                    "name": name,
+                    "file": filename,
+                    "dtype": info.dtype,
+                    "shape": list(info.shape),
+                    "bytes": info.nbytes,
+                    "sha256": digest.hexdigest(),
+                })
+                total_bytes += info.nbytes
+        manifest = {
+            "format": "deepseek-compact-expert-fixture-v1",
+            "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
+            "target_abi": "deepseek-sm86-int8-per-row-v1",
+            "layer": layer,
+            "expert": expert,
+            "bytes": total_bytes,
+            "tensors": tensors,
+        }
+        atomic_json(partial / "manifest.json", manifest)
+        os.replace(partial, output)
+        return manifest
+    except Exception:
+        # Preserve partial evidence; never delete or alter source tensors.
+        raise

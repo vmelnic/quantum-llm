@@ -29,6 +29,7 @@ remote files.
 | `Start-DeepSeekV4FlashDownload.ps1` | pinned DeepSeek-V4-Flash Xet download profile |
 | `Invoke-SourceInventory.ps1` | read-only validation and dtype/byte inventory for a cached checkpoint |
 | `Invoke-DeepSeekExpertSlice.ps1` | full real-expert decode/reference/INT8 qualification |
+| `Invoke-DeepSeekCudaAdmission.ps1` | compact H2D + SM86 admission hash gate |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
 | `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |
 | `Invoke-P6Conversion.ps1` | pinned Qwen3-Next conversion profile |

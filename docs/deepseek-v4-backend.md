@@ -137,3 +137,21 @@ The runtime exposes this geometry as a backend-neutral contract rather than
 changing Expert Pack v1 constants. Next, CUDA admission must consume the
 compact source, populate exactly this slot, publish it only after completion,
 and reproduce the qualified candidate hash/output.
+
+## SM86 admission result
+
+The first CUDA admission gate now passes on RTX 3090. A bounded fixture copies
+the six original compact tensors for one expert without decoding or modifying
+the checkpoint. CUDA transfers 13,369,344 bytes, decodes FP4/UE8M0, performs
+per-row INT8 quantization, and fills the exact 25,198,592-byte hot slot.
+
+The complete device slot matched the independent Python/PyTorch candidate
+SHA-256 byte-for-byte. Measured H2D plus admission latency was 9.73 ms for the
+first real expert. The cache must not publish a slot until this conversion and
+source-validity check succeed.
+
+This number also constrains the scheduler: six serial cold admissions would
+consume roughly 58 ms before GEMM, so 30 tok/s cannot depend on cold loading at
+every layer. Hot residency, look-ahead prefetch, concurrent admission, and
+request batching remain essential. The next gate executes gate/up/down GEMM
+directly from the admitted slot and compares its output with a CPU reference.
