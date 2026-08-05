@@ -2,9 +2,11 @@
 
 ## Verdict
 
-The repository is suitable for a **controlled pre-production pilot at a
-4096-token context on the tested Windows/RTX 3090 host**. It is not ready for a
-general multi-tenant or internet-facing production service.
+The Qwen backend is suitable for a **controlled pre-production pilot at a
+4096-token context on the tested Windows/RTX 3090 host**. The DeepSeek-V4-Flash
+backend is functionally pilotable at that limit but is not throughput-ready on
+the same host. Neither backend is ready for a general multi-tenant or
+internet-facing production service.
 
 ## Readiness matrix
 
@@ -12,6 +14,7 @@ general multi-tenant or internet-facing production service.
 |---|---|---|
 | model/container integrity | ready | strict schema, pack and record hashes, atomic completion marker |
 | deterministic correctness | ready for tested model | isolated/batched equality and CUDA/compiler tests |
+| DeepSeek durable service path | functional | 43-shard compact pack, persistent worker, API gate, exact cleanup; throughput remains far below target |
 | bounded memory and queues | ready for pilot | explicit RAM/VRAM/staging/KV budgets and bounded admission |
 | API client compatibility | ready for text/greedy subset | verified with OpenAI SDK; unsupported capabilities fail explicitly |
 | cancellation and drain | ready for pilot | client FIN/RST cancellation and full descendant-tree stop |

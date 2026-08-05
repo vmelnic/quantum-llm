@@ -410,6 +410,27 @@ six-cold-expert RAM fixture as two CPU plus four upload/GPU decisions, projectin
 18.685 ms. This is a placement calibration, not tokens/s, and the fixture does
 not replace an end-to-end cold/warm service gate.
 
+## DeepSeek durable-pack service gate
+
+The final 43-shard compact pack contains exactly 147,169,738,752 routed bytes.
+The production worker bundle passed one real HTTP completion with 4096 maximum
+context, two worker slots, 40 GiB RAM cache, 12 GiB VRAM cache, and balanced
+placement:
+
+| quantity | source extents | compact pack |
+| --- | ---: | ---: |
+| prompt tokens | 1 | 1 |
+| output tokens | 2 | 2 |
+| request wall time | 30.52 s | 17.24 s |
+| output | `, I` | `, I` |
+
+The compact layout reduced wall time by about 43.5% for this cold functional
+slice. The production run reported 17.20 seconds TTFT and 0.016 seconds between
+the two API emissions because protocol 4 synchronously prepares the following
+token before returning the current one. Neither value is a 30 tok/s result.
+The gate's purpose is model identity, complete-pack use, real decoding, service
+accounting, and resource cleanup.
+
 ## Benchmark rules
 
 Any published result must include:

@@ -120,6 +120,22 @@ state. This is functional evidence, not the target throughput result. Final
 latency and throughput qualification must use the completed compact pack,
 declare cold/warm placement, and follow the benchmark rules.
 
+The durable publication gate subsequently completed all 43 routed shards at
+exactly 147,169,738,752 payload bytes, published a `compact-pack` worker bundle,
+and passed the production-only service gate. With 4096 configured context,
+two worker slots, a 40 GiB RAM cache, and a 12 GiB VRAM cache, the one-prompt/
+two-output-token request completed in 17.24 seconds and returned `", I"`.
+Context credits and physical request state returned to zero. The final clean
+Windows build passed 4/4 native tests and 32/32 Python tests.
+
+This proves packaging, startup, real inference, HTTP integration, accounting,
+and cleanup. It does **not** satisfy the throughput objective. The measured
+request is roughly 0.12 output tok/s when divided naively by wall time, and the
+reported 17.20-second TTFT includes synchronous preparation of the following
+token under protocol 4. Pack layout removed about 43% of the equivalent
+source-extent wall time (30.52 seconds), but execution and memory movement on
+this host remain the dominant product problem.
+
 ## Current boundary
 
 The worker implements exact greedy decoding. Continuous decode batches rows
@@ -127,4 +143,6 @@ from concurrent HTTP requests into one scheduler poll cycle, while each routed
 layer may place experts on all-core CPU execution or direct compact CUDA
 execution. Sampling controls beyond the API's currently documented behavior,
 long-context qualification beyond 4096, crash-supervised deployment, and the
-final compact-pack service gate remain release work.
+30 tok/s performance target remain release work. The compact-pack service gate
+and task-based pilot deployment path are implemented; a long soak and failure
+campaign have not been run.
