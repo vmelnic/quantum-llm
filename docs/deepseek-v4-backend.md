@@ -231,3 +231,15 @@ maximum output difference `1.79e-7` against the CPU calculation.
 This proves one reusable dense matrix boundary, not the complete attention
 layer. Next the same loader must own all 236 FP8 matrices, while BF16/F32 HCA,
 normalization, compressor and router tensors retain their declared types.
+
+That resident dense loader now passes on the complete main-model FP8 set. It
+read and checksummed 4,775,506,560 source bytes, admitted 4,783,917,056 device
+bytes, and made all 236 matrices available by stable tensor name in 18.03
+seconds. One 33,556,480-byte staging slot bounded host-pinned memory. The
+RTX 3090 still reported about 19.68 GB free while the complete dense FP8 set
+was resident in the qualification process.
+
+The dense set is transactional: duplicate names or inconsistent geometry fail
+before I/O, and any later checksum/admission failure destroys every matrix in
+the partial candidate. This set will be composed with shared residency in the
+model owner; neither allocation class competes with routed-cache eviction.

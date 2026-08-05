@@ -14,6 +14,7 @@ from .deepseek_v4 import (
 from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_fp8_matrix,
+    export_deepseek_dense_set,
     export_deepseek_shared_expert,
     export_deepseek_shared_set,
     qualify_deepseek_expert,
@@ -121,6 +122,12 @@ def _parser() -> argparse.ArgumentParser:
     dense_parser.add_argument("--source", type=Path, required=True)
     dense_parser.add_argument("--output", type=Path, required=True)
     dense_parser.add_argument("--name", required=True)
+    dense_set_parser = commands.add_parser(
+        "export-deepseek-dense-set",
+        help="describe all 236 main-model FP8 matrices for residency",
+    )
+    dense_set_parser.add_argument("--source", type=Path, required=True)
+    dense_set_parser.add_argument("--output", type=Path, required=True)
     return parser
 
 
@@ -190,10 +197,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = export_deepseek_shared_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-fp8-matrix":
             result = export_deepseek_fp8_matrix(
                 SafeTensorCheckpoint(args.source), name=args.name,
                 output=args.output,
+            )
+        else:
+            result = export_deepseek_dense_set(
+                SafeTensorCheckpoint(args.source), output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

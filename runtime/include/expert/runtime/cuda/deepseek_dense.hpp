@@ -1,5 +1,6 @@
 #pragma once
 
+#include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 #include "expert/runtime/storage.hpp"
 
@@ -7,6 +8,9 @@
 #include <cstdint>
 #include <memory>
 #include <span>
+#include <string>
+#include <string_view>
+#include <vector>
 
 namespace expert::runtime::cuda {
 
@@ -39,5 +43,39 @@ struct DeepSeekDenseAdmissionResult final {
 [[nodiscard]] DeepSeekDenseAdmissionResult admit_deepseek_dense_matrix(
     std::span<const std::byte> weights, std::span<const std::byte> scales,
     std::uint32_t rows, std::uint32_t columns) noexcept;
+
+struct DeepSeekDenseSpec final {
+  std::string name;
+  PayloadRecord record;
+  std::uint32_t rows{};
+  std::uint32_t columns{};
+};
+
+class DeepSeekDenseSet final {
+ public:
+  DeepSeekDenseSet() = default;
+  DeepSeekDenseSet(const DeepSeekDenseSet&) = delete;
+  DeepSeekDenseSet& operator=(const DeepSeekDenseSet&) = delete;
+  DeepSeekDenseSet(DeepSeekDenseSet&&) noexcept = default;
+  DeepSeekDenseSet& operator=(DeepSeekDenseSet&&) noexcept = default;
+
+  [[nodiscard]] static Status load(IAsyncStorage& storage,
+                                   FixedBufferPool& buffers,
+                                   std::span<const DeepSeekDenseSpec> specs,
+                                   DeepSeekDenseSet& destination);
+  [[nodiscard]] const DeepSeekDenseMatrix* find(
+      std::string_view name) const noexcept;
+  [[nodiscard]] std::size_t size() const noexcept { return entries_.size(); }
+  [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+  void clear() noexcept;
+
+ private:
+  struct Entry final {
+    std::string name;
+    std::shared_ptr<DeepSeekDenseMatrix> matrix;
+  };
+  std::vector<Entry> entries_;
+  std::uint64_t bytes_{};
+};
 
 }  // namespace expert::runtime::cuda

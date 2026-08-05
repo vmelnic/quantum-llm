@@ -85,6 +85,11 @@ NaNs, derives a row-INT8 matrix, and exposes the existing `Int8Matrix` GEMV ABI.
 Source and device byte claims remain explicit; dense allocations are model
 state rather than router-evictable cache entries.
 
+`DeepSeekDenseSet` validates the complete name/shape/byte plan, loads matrices
+serially through one maximum-sized pinned slot, and publishes the collection
+only after all matrices succeed. Hot paths bind matrix pointers once during
+model construction; string lookup is not part of token execution.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution

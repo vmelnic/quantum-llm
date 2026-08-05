@@ -62,6 +62,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_sources(expert_runtime PRIVATE
     src/cuda/deepseek_admission.cu
     src/cuda/deepseek_dense.cu
+    src/cuda/deepseek_dense_set.cpp
     src/cuda/expert_directory.cu
     src/cuda/expert_uploader.cu
     src/cuda/moe_kernels.cu
@@ -100,6 +101,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
       tools/deepseek_dense_smoke.cpp)
     target_compile_features(expert-deepseek-dense-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-dense-smoke PRIVATE
+      expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-dense-residency
+      tools/deepseek_dense_residency.cpp)
+    target_compile_features(expert-deepseek-dense-residency PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-dense-residency PRIVATE
       expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-shared-residency
       tools/deepseek_shared_residency.cpp)

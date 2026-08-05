@@ -616,3 +616,83 @@ def export_deepseek_shared_set(
         return result
     except Exception:
         raise
+
+
+def export_deepseek_dense_set(
+    checkpoint: SafeTensorCheckpoint, *, output: Path
+) -> dict[str, object]:
+    """Atomically describe all main-model FP8 dense matrices."""
+
+    validate_deepseek_v4_source(checkpoint)
+    bases = sorted(
+        name.removesuffix(".weight")
+        for name, info in checkpoint.tensors.items()
+        if name.startswith("layers.")
+        and name.endswith(".weight")
+        and info.dtype == "F8_E4M3"
+        and ".shared_experts." not in name
+    )
+    if len(bases) != 236:
+        raise AdapterError(f"expected 236 main-model FP8 matrices, got {len(bases)}")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"dense set output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    entries: list[dict[str, object]] = []
+    total_source = 0
+    total_device = 0
+    maximum_source = 0
+    try:
+        for index, base in enumerate(bases):
+            relative = Path(f"matrix-{index:03d}")
+            manifest = _export_deepseek_extents(
+                checkpoint, names=(base + ".weight", base + ".scale"),
+                output=partial / relative, layer=-1, expert=base,
+                format_name="deepseek-fp8-matrix-extents-v1",
+                source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+            )
+            rows, columns = checkpoint.tensors[base + ".weight"].shape
+            source_bytes = int(manifest["bytes"])
+            device_bytes = rows * columns + rows * 4
+            entry = {
+                "name": base,
+                "rows": rows,
+                "columns": columns,
+                "descriptor": str(relative / "extents.tsv"),
+                "source_bytes": source_bytes,
+                "device_bytes": device_bytes,
+                "sha256": manifest["combined"]["sha256"],
+            }
+            entries.append(entry)
+            total_source += source_bytes
+            total_device += device_bytes
+            maximum_source = max(maximum_source, source_bytes)
+        with (partial / "dense-set.tsv").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as index_file:
+            index_file.write("deepseek-dense-residency-v1\n")
+            for entry in entries:
+                index_file.write(
+                    f"{entry['name']}\t{entry['rows']}\t{entry['columns']}\t"
+                    f"{entry['source_bytes']}\t{entry['device_bytes']}\t"
+                    f"{entry['sha256']}\t{entry['descriptor']}\n"
+                )
+            index_file.flush()
+            os.fsync(index_file.fileno())
+        result = {
+            "format": "deepseek-dense-residency-v1",
+            "source_abi": "deepseek-fp8-e4m3-ue8m0-block128-v1",
+            "target_abi": "deepseek-sm86-int8-per-row-matrix-v1",
+            "matrix_count": len(entries),
+            "source_bytes": total_source,
+            "device_bytes": total_device,
+            "maximum_source_bytes": maximum_source,
+            "matrices": entries,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise

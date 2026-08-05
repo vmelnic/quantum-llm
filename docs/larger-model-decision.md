@@ -122,5 +122,7 @@ independently proven.
   at teardown; measured startup was 3.59 seconds.
 - Complete: a generic FP8 dense-matrix source/admission/GEMV ABI passes on the
   real layer-0 query projection with an exact candidate hash.
-- Next: load all 236 main-model FP8 matrices as resident state, then implement
-  typed HCA and CSA/attention execution.
+- Complete: all 236 main-model FP8 matrices load atomically as 4.78 GB of
+  resident, named device state through one 33.6 MB staging slot.
+- Next: implement typed HCA and CSA/attention execution, then compose dense and
+  shared ownership in the first model-layer runtime.

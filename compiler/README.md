@@ -66,6 +66,10 @@ no-copy path for any validated dense FP8 matrix. The candidate ABI is generic
 INT8-per-row and feeds the normal dense GEMV kernels rather than the expert
 directory.
 
+`export-deepseek-dense-set` atomically emits descriptors for all 236
+main-model FP8 matrices. The descriptor set is metadata only; the authoritative
+4.78 GB of weights remains in the original shards.
+
 ## Install
 
 From the repository root:
