@@ -63,8 +63,8 @@ std::vector<er::PayloadExtent> extents(const std::filesystem::path& descriptor,
     result.push_back({source / relative(item[3]), std::stoull(item[2]),
                       std::stoull(item[0]), std::stoull(item[1])});
   }
-  require(input.eof() && result.size() == 5U,
-          "CSA slice requires wkv, wgate, ape, norm and sink extents");
+  require(input.eof() && (result.size() == 5U || result.size() == 10U),
+          "CSA slice requires five base extents and optional indexer extents");
   return result;
 }
 std::string hex(const er::Sha256Digest& digest) {
@@ -91,8 +91,13 @@ int main(int argc, char** argv) {
         static_cast<std::size_t>(width) * kHidden * sizeof(std::uint16_t);
     const auto ape_bytes = static_cast<std::size_t>(ratio) * width * sizeof(float);
     constexpr std::size_t sink_bytes = 64U * sizeof(float);
+    constexpr std::size_t index_weight_bytes = 64U * kHidden * sizeof(std::uint16_t);
+    constexpr std::size_t index_extra_bytes = index_weight_bytes +
+        2U * 256U * kHidden * sizeof(std::uint16_t) +
+        4U * 256U * sizeof(float) + 128U * sizeof(std::uint16_t);
     const auto source_bytes =
-        2U * matrix_bytes + ape_bytes + kNormBytes + sink_bytes;
+        2U * matrix_bytes + ape_bytes + kNormBytes + sink_bytes +
+        (ratio == 4U ? index_extra_bytes : 0U);
     auto pool = std::make_shared<er::FixedBufferPool>(
         1U, source_bytes, 4096U, std::make_shared<er::CudaPinnedAllocator>());
     auto lease = pool->try_acquire(source_bytes);
@@ -151,6 +156,20 @@ int main(int argc, char** argv) {
     const auto sparse_cache = read_fixture("sparse-cache.bf16", 6U * kNormBytes);
     const auto sparse_indices = read_fixture("sparse-indices.i32", 4U * sizeof(std::int32_t));
     const auto sparse_expected = read_fixture("sparse-output.bf16", 64U * kNormBytes);
+    std::vector<std::byte> index_q_input, index_cache_input;
+    std::vector<std::byte> index_q_expected, index_cache_expected;
+    std::vector<std::byte> index_scores_expected, index_topk_expected;
+    std::vector<std::byte> index_compressor_expected;
+    if (ratio == 4U) {
+      index_compressor_expected = read_fixture(
+          "index-compressor-output.f32", 128U * sizeof(float));
+      index_q_input = read_fixture("index-q-input.f32", 64U * 128U * sizeof(float));
+      index_cache_input = read_fixture("index-cache-input.f32", 6U * 128U * sizeof(float));
+      index_q_expected = read_fixture("index-q.bf16", 64U * 128U * sizeof(std::uint16_t));
+      index_cache_expected = read_fixture("index-cache.bf16", 6U * 128U * sizeof(std::uint16_t));
+      index_scores_expected = read_fixture("index-scores.f32", 6U * sizeof(float));
+      index_topk_expected = read_fixture("index-topk.i32", 3U * sizeof(std::int32_t));
+    }
 
     std::uint16_t *wkv = nullptr, *wgate = nullptr, *norm = nullptr;
     float *ape = nullptr, *input = nullptr, *projected_values = nullptr;
@@ -161,6 +180,16 @@ int main(int argc, char** argv) {
     std::uint16_t *device_sparse_q = nullptr, *device_sparse_cache = nullptr;
     std::uint16_t* device_sparse_output = nullptr;
     std::int32_t* device_sparse_indices = nullptr;
+    std::uint16_t* index_weight = nullptr;
+    std::uint16_t *index_wkv = nullptr, *index_wgate = nullptr;
+    std::uint16_t* index_norm = nullptr;
+    float* index_ape = nullptr;
+    float *index_projected_values = nullptr, *index_projected_scores = nullptr;
+    float *index_pooled = nullptr, *index_compressor_output = nullptr;
+    float *device_index_q_input = nullptr, *device_index_cache_input = nullptr;
+    std::uint16_t *device_index_q = nullptr, *device_index_cache = nullptr;
+    float *device_index_head_weights = nullptr, *device_index_scores = nullptr;
+    std::int32_t* device_index_topk = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&wkv), matrix_bytes), "allocate CSA wkv");
     check(cudaMalloc(reinterpret_cast<void**>(&wgate), matrix_bytes), "allocate CSA wgate");
     check(cudaMalloc(reinterpret_cast<void**>(&ape), ape_bytes), "allocate CSA ape");
@@ -191,6 +220,48 @@ int main(int argc, char** argv) {
           "allocate sparse indices");
     check(cudaMalloc(reinterpret_cast<void**>(&device_sparse_output), sparse_expected.size()),
           "allocate sparse output");
+    if (ratio == 4U) {
+      check(cudaMalloc(reinterpret_cast<void**>(&index_weight), index_weight_bytes),
+            "allocate index weights");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_q_input), index_q_input.size()),
+            "allocate index query input");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_cache_input), index_cache_input.size()),
+            "allocate index cache input");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_q), index_q_expected.size()),
+            "allocate index query");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_cache), index_cache_expected.size()),
+            "allocate index cache");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_head_weights), 64U * sizeof(float)),
+            "allocate index head weights");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_scores), index_scores_expected.size()),
+            "allocate index scores");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_index_topk), index_topk_expected.size()),
+            "allocate index top-k");
+      constexpr std::size_t index_matrix_bytes =
+          256U * kHidden * sizeof(std::uint16_t);
+      check(cudaMalloc(reinterpret_cast<void**>(&index_wkv), index_matrix_bytes),
+            "allocate index compressor wkv");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_wgate), index_matrix_bytes),
+            "allocate index compressor wgate");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_ape),
+                       4U * 256U * sizeof(float)),
+            "allocate index compressor ape");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_norm),
+                       128U * sizeof(std::uint16_t)),
+            "allocate index compressor norm");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_projected_values),
+                       256U * sizeof(float)),
+            "allocate index projected values");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_projected_scores),
+                       256U * sizeof(float)),
+            "allocate index projected scores");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_pooled),
+                       128U * sizeof(float)),
+            "allocate index pooled output");
+      check(cudaMalloc(reinterpret_cast<void**>(&index_compressor_output),
+                       128U * sizeof(float)),
+            "allocate index compressor output");
+    }
     check(cudaMemcpy(wkv, source.data(), matrix_bytes, cudaMemcpyHostToDevice),
           "copy CSA wkv");
     check(cudaMemcpy(wgate, source.data() + matrix_bytes, matrix_bytes,
@@ -202,6 +273,30 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(sink,
                      source.data() + 2U * matrix_bytes + ape_bytes + kNormBytes,
                      sink_bytes, cudaMemcpyHostToDevice), "copy CSA sink");
+    if (ratio == 4U) {
+      const auto index_offset = 2U * matrix_bytes + ape_bytes + kNormBytes + sink_bytes;
+      check(cudaMemcpy(index_weight, source.data() + index_offset,
+                       index_weight_bytes, cudaMemcpyHostToDevice),
+            "copy index weights");
+      constexpr std::size_t index_matrix_bytes =
+          256U * kHidden * sizeof(std::uint16_t);
+      auto offset = index_offset + index_weight_bytes;
+      check(cudaMemcpy(index_wkv, source.data() + offset, index_matrix_bytes,
+                       cudaMemcpyHostToDevice),
+            "copy index compressor wkv");
+      offset += index_matrix_bytes;
+      check(cudaMemcpy(index_wgate, source.data() + offset, index_matrix_bytes,
+                       cudaMemcpyHostToDevice),
+            "copy index compressor wgate");
+      offset += index_matrix_bytes;
+      check(cudaMemcpy(index_ape, source.data() + offset,
+                       4U * 256U * sizeof(float), cudaMemcpyHostToDevice),
+            "copy index compressor ape");
+      offset += 4U * 256U * sizeof(float);
+      check(cudaMemcpy(index_norm, source.data() + offset,
+                       128U * sizeof(std::uint16_t), cudaMemcpyHostToDevice),
+            "copy index compressor norm");
+    }
     const auto control_offset = static_cast<std::size_t>(ratio) * kHidden + kHeadDim;
     check(cudaMemcpy(cosine, oracle.data() + control_offset, 32U * sizeof(float),
                      cudaMemcpyHostToDevice), "copy CSA cosine");
@@ -293,6 +388,108 @@ int main(int argc, char** argv) {
     }
     require(sparse_maximum < 2e-3F,
             "sparse attention output exceeds BF16 oracle tolerance");
+    std::size_t index_prepare_mismatches = 0U;
+    float index_score_maximum = 0.0F;
+    float index_compressor_maximum = 0.0F;
+    bool index_topk_equal = true;
+    float index_ms = 0.0F;
+    if (ratio == 4U) {
+      check(cudaMemcpy(device_index_q_input, index_q_input.data(), index_q_input.size(),
+                       cudaMemcpyHostToDevice), "copy index query input");
+      check(cudaMemcpy(device_index_cache_input, index_cache_input.data(),
+                       index_cache_input.size(), cudaMemcpyHostToDevice),
+            "copy index cache input");
+      auto index_state = er::cuda::create_deepseek_compressor_state(4U, 128U);
+      require(index_state.status.ok() && index_state.state,
+              std::string(index_state.status.message()));
+      for (std::uint32_t position = 0; position < 4U; ++position) {
+        check(cudaMemcpy(input,
+                         oracle.data() + static_cast<std::size_t>(position) * kHidden,
+                         kHidden * sizeof(float), cudaMemcpyHostToDevice),
+              "copy index compressor input");
+        auto status = er::cuda::gemv_bf16(
+            index_wkv, 256U, kHidden, input, index_projected_values, nullptr);
+        require(status.ok(), std::string(status.message()));
+        status = er::cuda::gemv_bf16(
+            index_wgate, 256U, kHidden, input, index_projected_scores, nullptr);
+        require(status.ok(), std::string(status.message()));
+        status = er::cuda::deepseek_compressor_decode(
+            *index_state.state, index_projected_values, index_projected_scores,
+            index_ape, index_norm, index_pooled, index_compressor_output,
+            position, 1e-6F, nullptr);
+        require(status.ok(), std::string(status.message()));
+      }
+      check(cudaMemcpy(device_index_cache_input, index_compressor_output,
+                       128U * sizeof(float), cudaMemcpyDeviceToDevice),
+            "publish index compressor output");
+      auto status = er::cuda::deepseek_index_prepare(
+          device_index_q_input, cosine, sine, device_index_q, 64U, nullptr);
+      require(status.ok(), std::string(status.message()));
+      status = er::cuda::deepseek_index_prepare(
+          device_index_cache_input, cosine, sine, device_index_cache, 6U, nullptr);
+      require(status.ok(), std::string(status.message()));
+      status = er::cuda::gemv_bf16(index_weight, 64U, kHidden, input,
+                                   device_index_head_weights, nullptr);
+      require(status.ok(), std::string(status.message()));
+      cudaEvent_t index_start{}, index_stop{};
+      check(cudaEventCreate(&index_start), "create index start event");
+      check(cudaEventCreate(&index_stop), "create index stop event");
+      check(cudaEventRecord(index_start), "record index start");
+      status = er::cuda::deepseek_index_topk(
+          device_index_q, device_index_cache, device_index_head_weights, 6U,
+          3U, device_index_scores, device_index_topk, nullptr);
+      require(status.ok(), std::string(status.message()));
+      check(cudaEventRecord(index_stop), "record index stop");
+      check(cudaEventSynchronize(index_stop), "synchronize index selection");
+      check(cudaEventElapsedTime(&index_ms, index_start, index_stop),
+            "measure index selection");
+      std::vector<std::byte> actual_q(index_q_expected.size());
+      std::vector<std::byte> actual_index_cache(index_cache_expected.size());
+      check(cudaMemcpy(actual_q.data(), device_index_q, actual_q.size(),
+                       cudaMemcpyDeviceToHost), "copy index query");
+      check(cudaMemcpy(actual_index_cache.data(), device_index_cache,
+                       actual_index_cache.size(), cudaMemcpyDeviceToHost),
+            "copy index cache");
+      std::vector<float> actual_index_compressor(128U);
+      check(cudaMemcpy(actual_index_compressor.data(), index_compressor_output,
+                       128U * sizeof(float), cudaMemcpyDeviceToHost),
+            "copy index compressor output");
+      const auto* expected_index_compressor =
+          reinterpret_cast<const float*>(index_compressor_expected.data());
+      for (std::size_t index = 0; index < 128U; ++index)
+        index_compressor_maximum = std::max(
+            index_compressor_maximum,
+            std::abs(actual_index_compressor[index] -
+                     expected_index_compressor[index]));
+      for (std::size_t index = 0; index < actual_q.size(); ++index)
+        index_prepare_mismatches += actual_q[index] != index_q_expected[index];
+      for (std::size_t index = 0; index < actual_index_cache.size(); ++index)
+        index_prepare_mismatches +=
+            actual_index_cache[index] != index_cache_expected[index];
+      std::vector<float> actual_scores(6U);
+      std::vector<std::int32_t> actual_topk(3U);
+      check(cudaMemcpy(actual_scores.data(), device_index_scores,
+                       6U * sizeof(float), cudaMemcpyDeviceToHost),
+            "copy index scores");
+      check(cudaMemcpy(actual_topk.data(), device_index_topk,
+                       3U * sizeof(std::int32_t), cudaMemcpyDeviceToHost),
+            "copy index top-k");
+      const auto* expected_scores =
+          reinterpret_cast<const float*>(index_scores_expected.data());
+      const auto* expected_topk =
+          reinterpret_cast<const std::int32_t*>(index_topk_expected.data());
+      for (std::size_t index = 0; index < 6U; ++index)
+        index_score_maximum = std::max(
+            index_score_maximum, std::abs(actual_scores[index] - expected_scores[index]));
+      for (std::size_t index = 0; index < 3U; ++index)
+        index_topk_equal &= actual_topk[index] == expected_topk[index];
+      require(index_compressor_maximum < 5e-4F,
+              "index compressor differs from F32 oracle");
+      require(index_prepare_mismatches == 0U,
+              "index preparation differs from BF16 oracle");
+      require(index_score_maximum < 1e-5F && index_topk_equal,
+              "index selection differs from oracle");
+    }
     std::cout << "{\"ok\":true,\"layer\":" << layer
               << ",\"compress_ratio\":" << ratio
               << ",\"source_bytes\":" << source_bytes
@@ -303,7 +500,13 @@ int main(int argc, char** argv) {
               << ",\"cache_bf16_mismatches\":" << cache_mismatches
               << ",\"sparse_attention_ms\":" << sparse_ms
               << ",\"sparse_bf16_mismatches\":" << sparse_mismatches
-              << ",\"sparse_max_abs_error\":" << sparse_maximum << "}\n";
+              << ",\"sparse_max_abs_error\":" << sparse_maximum
+              << ",\"index_prepare_mismatches\":" << index_prepare_mismatches
+              << ",\"index_compressor_max_abs_error\":"
+              << index_compressor_maximum
+              << ",\"index_score_max_abs_error\":" << index_score_maximum
+              << ",\"index_topk_equal\":" << (index_topk_equal ? "true" : "false")
+              << ",\"index_ms\":" << index_ms << "}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "expert-deepseek-csa-smoke: " << error.what() << '\n';

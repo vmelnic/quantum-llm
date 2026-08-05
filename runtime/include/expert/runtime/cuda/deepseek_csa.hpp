@@ -21,6 +21,7 @@ class DeepSeekCompressorState final {
   [[nodiscard]] std::uint32_t projected_width() const noexcept {
     return projected_width_;
   }
+  [[nodiscard]] std::uint32_t head_dim() const noexcept { return head_dim_; }
   [[nodiscard]] std::uint64_t bytes() const noexcept;
   [[nodiscard]] Status reset(void* stream) noexcept;
 
@@ -29,6 +30,7 @@ class DeepSeekCompressorState final {
   float* scores_{};
   std::uint32_t ratio_{};
   std::uint32_t projected_width_{};
+  std::uint32_t head_dim_{};
 };
 
 struct DeepSeekCompressorStateResult final {
@@ -37,11 +39,11 @@ struct DeepSeekCompressorStateResult final {
 };
 
 [[nodiscard]] DeepSeekCompressorStateResult create_deepseek_compressor_state(
-    std::uint32_t ratio) noexcept;
+    std::uint32_t ratio, std::uint32_t head_dim = 512U) noexcept;
 
-// Updates persistent decode state and emits a normalized 512-vector exactly
-// when a compression group closes. Ratio four uses the checkpoint's overlap
-// geometry; ratio 128 uses ordinary 128-token gated pooling.
+// Updates persistent decode state and emits a normalized head-dimension vector
+// exactly when a compression group closes. Ratio four uses the checkpoint's
+// overlap geometry; ratio 128 uses ordinary 128-token gated pooling.
 [[nodiscard]] Status deepseek_compressor_decode(
     DeepSeekCompressorState& state, const float* projected_values,
     const float* projected_scores, const float* ape,
@@ -63,5 +65,18 @@ struct DeepSeekCompressorStateResult final {
     const std::int32_t* indices, std::uint32_t selected,
     const float* attention_sink, std::uint16_t* output,
     std::uint32_t heads, void* stream) noexcept;
+
+// Applies RoPE64, scaled Hadamard rotation and block-32 E2M1 quantize/
+// dequantize, then stores BF16 vectors for index scoring.
+[[nodiscard]] Status deepseek_index_prepare(
+    const float* input, const float* cosine, const float* sine,
+    std::uint16_t* output, std::uint32_t rows, void* stream) noexcept;
+
+// Scores compressed positions and selects stable descending top-k indices.
+[[nodiscard]] Status deepseek_index_topk(
+    const std::uint16_t* query, const std::uint16_t* cache,
+    const float* head_weights, std::uint32_t cache_slots,
+    std::uint32_t top_k, float* scores, std::int32_t* indices,
+    void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

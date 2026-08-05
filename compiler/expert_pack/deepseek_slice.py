@@ -522,6 +522,39 @@ def _deepseek_compressed_kv_reference(
     return _f32_to_bf16_words(result)
 
 
+def _deepseek_index_prepare_reference(values: object, cosine: object,
+                                      sine: object) -> object:
+    """Reference RoPE64, Hadamard128 and block-32 E2M1 QAT for the indexer."""
+    values = np.asarray(values, dtype=np.float32)
+    rows = values.reshape(-1, 128)
+    result = np.empty_like(rows)
+    table = np.asarray((0, .5, 1, 1.5, 2, 3, 4, 6,
+                        -0., -.5, -1, -1.5, -2, -3, -4, -6), dtype=np.float32)
+    for row_index, row in enumerate(rows):
+        base_words = _f32_to_bf16_words(row)
+        transformed = _bf16_to_f32(base_words.tobytes(), (128,)).copy()
+        for pair in range(32):
+            left, right = transformed[64 + 2 * pair:66 + 2 * pair]
+            transformed[64 + 2 * pair] = left * cosine[pair] - right * sine[pair]
+            transformed[65 + 2 * pair] = right * cosine[pair] + left * sine[pair]
+        stride = 1
+        while stride < 128:
+            previous = transformed.copy()
+            for index in range(128):
+                other = previous[index ^ stride]
+                transformed[index] = previous[index] + other if not index & stride else other - previous[index]
+            stride *= 2
+        transformed *= np.float32(128.0 ** -0.5)
+        for first in range(0, 128, 32):
+            block = transformed[first:first + 32]
+            maximum = max(float(np.max(np.abs(block))), 6.0 * 2.0**-126)
+            scale = math.ldexp(1.0, math.ceil(math.log2(maximum / 6.0)))
+            distances = np.abs(block[:, None] / scale - table[None, :])
+            transformed[first:first + 32] = table[np.argmin(distances, axis=1)] * scale
+        result[row_index] = transformed
+    return _f32_to_bf16_words(result.reshape(values.shape))
+
+
 def _deepseek_csa_ratio4_reference(
     inputs: object, wkv: object, wgate: object, ape: object, norm: object,
     *, epsilon: float = 1e-6,
@@ -544,11 +577,14 @@ def _deepseek_csa_reference(
     inputs = np.asarray(inputs, dtype=np.float32)
     if ratio not in (4, 128):
         raise SourceFormatError("unsupported DeepSeek CSA ratio")
-    width = 1024 if ratio == 4 else 512
+    head_dim = int(norm.shape[0])
+    if head_dim not in (128, 512):
+        raise SourceFormatError("invalid DeepSeek compressor head dimension")
+    width = 2 * head_dim if ratio == 4 else head_dim
     rows = 8 if ratio == 4 else ratio
     if inputs.shape != (ratio, 4096) or wkv.shape != (width, 4096):
         raise SourceFormatError("invalid DeepSeek CSA geometry")
-    if wgate.shape != wkv.shape or ape.shape != (ratio, width) or norm.shape != (512,):
+    if wgate.shape != wkv.shape or ape.shape != (ratio, width):
         raise SourceFormatError("invalid DeepSeek CSA parameters")
     kv_state = np.zeros((rows, width), dtype=np.float32)
     score_state = np.full((rows, width), -np.inf, dtype=np.float32)
@@ -559,8 +595,12 @@ def _deepseek_csa_reference(
         kv_state[state_row] = kv
         score_state[state_row] = score + ape[position]
     if ratio == 4:
-        candidates = np.concatenate((kv_state[:4, :512], kv_state[4:, 512:]), axis=0)
-        logits = np.concatenate((score_state[:4, :512], score_state[4:, 512:]), axis=0)
+        candidates = np.concatenate(
+            (kv_state[:4, :head_dim], kv_state[4:, head_dim:]), axis=0
+        )
+        logits = np.concatenate(
+            (score_state[:4, :head_dim], score_state[4:, head_dim:]), axis=0
+        )
     else:
         candidates = kv_state
         logits = score_state
@@ -588,26 +628,41 @@ def export_deepseek_csa_slice(
     ratio = ratios[layer]
     width = 1024 if ratio == 4 else 512
     prefix = f"layers.{layer}.attn.compressor"
-    names = (
+    names = [
         prefix + ".wkv.weight",
         prefix + ".wgate.weight",
         prefix + ".ape",
         prefix + ".norm.weight",
         f"layers.{layer}.attn.attn_sink",
-    )
-    expected = (
+    ]
+    expected = [
         ("BF16", (width, 4096)),
         ("BF16", (width, 4096)),
         ("F32", (ratio, width)),
         ("BF16", (512,)),
         ("F32", (64,)),
-    )
+    ]
+    if ratio == 4:
+        names.extend((
+            f"layers.{layer}.attn.indexer.weights_proj.weight",
+            f"layers.{layer}.attn.indexer.compressor.wkv.weight",
+            f"layers.{layer}.attn.indexer.compressor.wgate.weight",
+            f"layers.{layer}.attn.indexer.compressor.ape",
+            f"layers.{layer}.attn.indexer.compressor.norm.weight",
+        ))
+        expected.extend((
+            ("BF16", (64, 4096)),
+            ("BF16", (256, 4096)),
+            ("BF16", (256, 4096)),
+            ("F32", (4, 256)),
+            ("BF16", (128,)),
+        ))
     for name, (dtype, shape) in zip(names, expected):
         info = checkpoint.tensors.get(name)
         if info is None or info.dtype != dtype or info.shape != shape:
             raise SourceFormatError(f"invalid DeepSeek CSA tensor: {name}")
     manifest = _export_deepseek_extents(
-        checkpoint, names=names, output=output, layer=layer,
+        checkpoint, names=tuple(names), output=output, layer=layer,
         expert="attention_compressor", format_name="deepseek-csa-slice-v1",
         source_abi="deepseek-csa-mixed-v1",
         target_abi="deepseek-csa-sm86-f32-state-v1",
@@ -620,7 +675,7 @@ def export_deepseek_csa_slice(
                 if dtype == "BF16"
                 else np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
             )
-    wkv, wgate, ape, norm, attn_sink = arrays
+    wkv, wgate, ape, norm, attn_sink = arrays[:5]
     positions = np.arange(ratio * 4096, dtype=np.float32).reshape(ratio, 4096)
     inputs = (
         np.sin(positions * np.float32(0.005)) * np.float32(0.15)
@@ -661,6 +716,65 @@ def export_deepseek_csa_slice(
         denominator = float(np.sum(weights)) + math.exp(float(attn_sink[head]) - maximum)
         sparse_output[head] = np.matmul(weights, selected, dtype=np.float32) / denominator
     sparse_output_words = _f32_to_bf16_words(sparse_output)
+    sparse_files = {
+        "sparse-q.bf16": query_words,
+        "sparse-cache.bf16": sparse_cache_words,
+        "sparse-indices.i32": sparse_indices,
+        "sparse-output.bf16": sparse_output_words,
+    }
+    index_selection = None
+    if ratio == 4:
+        index_weights = arrays[5]
+        index_compressed = _deepseek_csa_reference(
+            inputs, arrays[6], arrays[7], arrays[8], arrays[9], ratio=4
+        )
+        index_query_input = (
+            np.sin(
+                np.arange(64 * 128, dtype=np.float32).reshape(64, 128)
+                * np.float32(0.009)
+            )
+            * np.float32(0.2)
+        )
+        index_cache_input = np.stack(
+            [
+                np.cos(
+                    np.arange(128, dtype=np.float32)
+                    * np.float32(0.017 + row * 0.002)
+                )
+                * np.float32(0.16)
+                for row in range(6)
+            ]
+        )
+        index_cache_input[0] = index_compressed
+        index_query_words = _deepseek_index_prepare_reference(
+            index_query_input, cosine, sine
+        )
+        index_cache_words = _deepseek_index_prepare_reference(
+            index_cache_input, cosine, sine
+        )
+        index_query = _bf16_to_f32(index_query_words.tobytes(), (64, 128))
+        index_cache = _bf16_to_f32(index_cache_words.tobytes(), (6, 128))
+        index_head_weights = np.matmul(index_weights, inputs[-1], dtype=np.float32)
+        index_scores = np.empty(6, dtype="<f4")
+        index_scale = np.float32(128.0 ** -0.5 * 64.0 ** -0.5)
+        for slot in range(6):
+            dots = np.sum(index_query * index_cache[slot], axis=1, dtype=np.float32)
+            index_scores[slot] = np.sum(
+                np.maximum(dots, 0) * index_head_weights, dtype=np.float32
+            ) * index_scale
+        index_topk = np.argsort(-index_scores, kind="stable")[:3].astype("<i4")
+        sparse_files.update({
+            "index-compressor-output.f32": index_compressed,
+            "index-q-input.f32": np.asarray(index_query_input, dtype="<f4"),
+            "index-cache-input.f32": np.asarray(index_cache_input, dtype="<f4"),
+            "index-q.bf16": index_query_words,
+            "index-cache.bf16": index_cache_words,
+            "index-scores.f32": index_scores,
+            "index-topk.i32": index_topk,
+        })
+        index_selection = {
+            "query_rows": 64, "cache_slots": 6, "top_k": 3, "head_dim": 128,
+        }
     oracle_path = output / "oracle.f32"
     with oracle_path.open("xb") as oracle:
         oracle.write(inputs.tobytes(order="C"))
@@ -674,12 +788,6 @@ def export_deepseek_csa_slice(
         cache_file.write(cache_words.tobytes(order="C"))
         cache_file.flush()
         os.fsync(cache_file.fileno())
-    sparse_files = {
-        "sparse-q.bf16": query_words,
-        "sparse-cache.bf16": sparse_cache_words,
-        "sparse-indices.i32": sparse_indices,
-        "sparse-output.bf16": sparse_output_words,
-    }
     for filename, array in sparse_files.items():
         with (output / filename).open("xb") as sparse_file:
             sparse_file.write(array.tobytes(order="C"))
@@ -709,6 +817,7 @@ def export_deepseek_csa_slice(
             "cache_slots": 6,
             "selected_slots": 4,
         },
+        "index_selection": index_selection,
     }
     atomic_json(output / "oracle.json", qualification)
     manifest["oracle"] = qualification

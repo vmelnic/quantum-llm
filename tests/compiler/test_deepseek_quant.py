@@ -46,6 +46,17 @@ class DeepSeekQuantTests(unittest.TestCase):
         self.assertTrue(np.array_equal(output, np.zeros(512, dtype=np.float32)))
 
     @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_csa_ratio_four_supports_indexer_geometry(self) -> None:
+        inputs = np.zeros((4, 4096), dtype=np.float32)
+        wkv = np.zeros((256, 4096), dtype=np.float32)
+        wgate = np.zeros_like(wkv)
+        ape = np.zeros((4, 256), dtype=np.float32)
+        norm = np.ones(128, dtype=np.float32)
+        output = _deepseek_csa_ratio4_reference(inputs, wkv, wgate, ape, norm)
+        self.assertEqual(output.shape, (128,))
+        self.assertTrue(np.array_equal(output, np.zeros(128, dtype=np.float32)))
+
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_hca_reference_preserves_doubly_stochastic_contract(self) -> None:
         streams = np.arange(32, dtype=np.float32).reshape(4, 8) / 32
         fn = np.zeros((24, 32), dtype=np.float32)

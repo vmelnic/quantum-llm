@@ -267,9 +267,10 @@ for collapsed/expanded streams. This closes the HCA correctness boundary, but
 the measured path is not yet performance-final: its 24-row control GEMV and
 small Sinkhorn kernel can later be fused after the complete layer is correct.
 
-The next dependency is CSA attention and its typed BF16/F32 compressor,
-normalization, index, and cache state. After that, HCA can wrap a real attention
-sublayer instead of the deterministic validation vector.
+HCA and the CSA compressor, cache, sparse-attention, and ratio-four index
+primitives are now independently qualified. The remaining boundary is their
+composition with the resident dense and typed sets into a complete attention
+sublayer, followed by workload-shaped kernel optimization.
 
 ## Typed model state
 
@@ -308,17 +309,17 @@ One implementation covers both configured schedules:
 - ratio 128 stores 128 ordinary 512-wide rows and emits at the group boundary.
 
 The layer-2 ratio-4 compressor passed against an independent NumPy oracle using
-its complete real 16,794,624-byte parameter slice. State occupies 65,536 bytes;
-four projection/update steps took 1.13 ms and maximum output error was
+its complete real parameter slice. State occupies 65,536 bytes; four
+projection/update steps took 1.15 ms and maximum output error was
 `3.81e-6`. The layer-3 ratio-128 compressor passed on 8,651,776 source bytes;
-state occupies 524,288 bytes, the 128-token group took 7.86 ms, and maximum
+state occupies 524,288 bytes, the 128-token group took 7.34 ms, and maximum
 error was `1.43e-6`.
 
 These measurements include both BF16 matrix-vector projections for every
 token, state update, final pooling, and RMSNorm. They do not include compressed
-KV RoPE/QAT simulation, cache publication, the ratio-4 indexer, or sparse
-attention. Those remain the next parts of the same attention backend rather
-than separate benchmark paths.
+KV RoPE/QAT simulation, cache publication, indexing, or sparse-attention time;
+those boundaries are qualified separately below and will be timed together
+only after composition into the complete attention layer.
 
 The emitted vector now also crosses the real cache boundary. The runtime first
 rounds the normalized vector to BF16, applies RoPE to only the final 64
@@ -346,3 +347,31 @@ than a production top-k claim. The configured path may consume a 128-position
 window plus as many as 512 indexed compressed positions, so the scalar
 per-position loop must be tiled/batched after the real indexer and complete
 attention layer establish the final workload.
+
+## Ratio-four index selection
+
+Ratio-four layers now run the checkpoint's second, 128-dimensional overlap
+compressor from its real BF16 `wkv`, `wgate`, and norm tensors plus F32 `ape`.
+The emitted position is rounded to BF16 after RoPE64, a scaled Hadamard-128
+rotation, and the official block-32 E2M1 quantize/dequantize simulation. Query
+rows cross the same preparation boundary.
+
+Selection then computes 64 rectified query-to-position dot products, weights
+them with the real BF16 `weights_proj` output and the checkpoint's two scale
+factors, and returns a stable descending top-k. Lower position IDs win exact
+score ties, so selection is deterministic.
+
+The real layer-2 slice passed the independent oracle with:
+
+- `1.97e-6` maximum error from the 128-wide index compressor;
+- zero BF16-word differences after query/cache preparation;
+- `2.98e-8` maximum score error;
+- exact top-3 ordering.
+
+The measured 0.076 ms selected three of six fixture slots. It establishes the
+math and ABI only; it is not a production top-512 performance claim. The
+current stable selector is intentionally simple and must be replaced by a
+parallel bounded top-k after the complete layer fixes batching, context, and
+cache-placement geometry. The already qualified dense FP8 set owns the query
+projection used before this boundary; the vertical slice supplies its
+deterministic output rather than duplicating that dense-kernel proof.

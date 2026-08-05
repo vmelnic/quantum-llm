@@ -139,5 +139,10 @@ independently proven.
 - Complete: sparse attention consumes the BF16 cache with online softmax,
   sentinel handling, and the learned attention sink; the real layer-2 sink
   passed its independent output oracle.
-- Next: add ratio-4 indexing, then compose dense, typed, HCA, and shared
-  ownership around the first complete attention/model layer.
+- Complete: the ratio-4 index path runs its real 128-wide overlap compressor,
+  RoPE64, scaled Hadamard transform, block-32 E2M1 QAT boundary, learned
+  per-head scoring projection, and stable top-k selection against independent
+  oracles.
+- Next: compose the qualified dense, typed, HCA, CSA, and index primitives
+  around the first complete attention/model layer, then optimize the final
+  production workload rather than the small correctness fixtures.

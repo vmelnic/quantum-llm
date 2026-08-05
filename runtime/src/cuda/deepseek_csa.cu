@@ -41,15 +41,15 @@ __global__ void compressor_store_kernel(
 
 __global__ void compressor_pool_kernel(
     const float* values, const float* scores, float* output,
-    std::uint32_t ratio, std::uint32_t width) {
+    std::uint32_t ratio, std::uint32_t width, std::uint32_t head_dim) {
   const auto dimension = static_cast<std::uint32_t>(blockIdx.x);
-  if (dimension >= kHeadDim || threadIdx.x != 0U) return;
+  if (dimension >= head_dim || threadIdx.x != 0U) return;
   const auto candidates = ratio == 4U ? 8U : ratio;
   float maximum = kNegativeInfinity;
   for (std::uint32_t row = 0; row < candidates; ++row) {
     const auto source_row = row;
     const auto source_column =
-        ratio == 4U && row >= 4U ? kHeadDim + dimension : dimension;
+        ratio == 4U && row >= 4U ? head_dim + dimension : dimension;
     maximum = fmaxf(maximum,
                     scores[static_cast<std::size_t>(source_row) * width +
                            source_column]);
@@ -58,7 +58,7 @@ __global__ void compressor_pool_kernel(
   float result = 0.0F;
   for (std::uint32_t row = 0; row < candidates; ++row) {
     const auto source_column =
-        ratio == 4U && row >= 4U ? kHeadDim + dimension : dimension;
+        ratio == 4U && row >= 4U ? head_dim + dimension : dimension;
     const auto source = static_cast<std::size_t>(row) * width + source_column;
     const float weight = expf(scores[source] - maximum);
     denominator += weight;
@@ -177,13 +177,113 @@ __global__ void sparse_attention_decode_kernel(
       __float2bfloat16_rn(accum1 / denominator);
 }
 
+__device__ float nearest_e2m1(float value) {
+  constexpr float table[16] = {0.0F, 0.5F, 1.0F, 1.5F, 2.0F, 3.0F, 4.0F, 6.0F,
+                               -0.0F, -0.5F, -1.0F, -1.5F, -2.0F, -3.0F,
+                               -4.0F, -6.0F};
+  float best = table[0];
+  float distance = fabsf(value - best);
+  for (unsigned index = 1U; index < 16U; ++index) {
+    const float candidate = fabsf(value - table[index]);
+    if (candidate < distance) {
+      distance = candidate;
+      best = table[index];
+    }
+  }
+  return best;
+}
+
+__global__ void index_prepare_kernel(
+    const float* input, const float* cosine, const float* sine,
+    __nv_bfloat16* output) {
+  __shared__ float values[128];
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto offset = static_cast<std::size_t>(row) * 128U;
+  values[dimension] =
+      __bfloat162float(__float2bfloat16_rn(input[offset + dimension]));
+  __syncthreads();
+  if (dimension >= 64U) {
+    const auto local = dimension - 64U;
+    const auto pair = local / 2U;
+    const auto left_index = 64U + pair * 2U;
+    const float left = values[left_index];
+    const float right = values[left_index + 1U];
+    values[dimension] = local % 2U == 0U
+                            ? left * cosine[pair] - right * sine[pair]
+                            : right * cosine[pair] + left * sine[pair];
+  }
+  __syncthreads();
+  for (unsigned stride = 1U; stride < 128U; stride <<= 1U) {
+    const float own = values[dimension];
+    const float other = values[dimension ^ stride];
+    __syncthreads();
+    values[dimension] = (dimension & stride) == 0U ? own + other : other - own;
+    __syncthreads();
+  }
+  const auto group = dimension / 32U;
+  float maximum = 0.0F;
+  for (unsigned item = group * 32U; item < (group + 1U) * 32U; ++item)
+    maximum = fmaxf(maximum, fabsf(values[item] * 0.08838834764831845F));
+  maximum = fmaxf(maximum, 6.0F * exp2f(-126.0F));
+  const float scale = exp2f(ceilf(log2f(maximum / 6.0F)));
+  const float quantized =
+      nearest_e2m1(values[dimension] * 0.08838834764831845F / scale) * scale;
+  output[offset + dimension] = __float2bfloat16_rn(quantized);
+}
+
+__global__ void index_score_kernel(
+    const __nv_bfloat16* query, const __nv_bfloat16* cache,
+    const float* head_weights, float* scores) {
+  __shared__ float contributions[64];
+  const auto slot = static_cast<std::uint32_t>(blockIdx.x);
+  const auto head = static_cast<std::uint32_t>(threadIdx.x);
+  float dot = 0.0F;
+  const auto cache_base = static_cast<std::size_t>(slot) * 128U;
+  const auto query_base = static_cast<std::size_t>(head) * 128U;
+  for (unsigned dimension = 0; dimension < 128U; ++dimension)
+    dot += __bfloat162float(query[query_base + dimension]) *
+           __bfloat162float(cache[cache_base + dimension]);
+  contributions[head] = fmaxf(dot, 0.0F) * head_weights[head] *
+                        0.011048543456039806F;
+  __syncthreads();
+  for (unsigned stride = 32U; stride; stride >>= 1U) {
+    if (head < stride) contributions[head] += contributions[head + stride];
+    __syncthreads();
+  }
+  if (head == 0U) scores[slot] = contributions[0];
+}
+
+__global__ void index_topk_kernel(const float* scores, std::uint32_t slots,
+                                  std::uint32_t top_k,
+                                  std::int32_t* indices) {
+  if (threadIdx.x != 0U) return;
+  for (std::uint32_t selected = 0; selected < top_k; ++selected) {
+    float best = kNegativeInfinity;
+    std::int32_t best_index = -1;
+    for (std::uint32_t slot = 0; slot < slots; ++slot) {
+      bool used = false;
+      for (std::uint32_t previous = 0; previous < selected; ++previous)
+        used |= indices[previous] == static_cast<std::int32_t>(slot);
+      if (!used && (scores[slot] > best ||
+                    (scores[slot] == best &&
+                     (best_index < 0 || slot < static_cast<std::uint32_t>(best_index))))) {
+        best = scores[slot];
+        best_index = static_cast<std::int32_t>(slot);
+      }
+    }
+    indices[selected] = best_index;
+  }
+}
+
 }  // namespace
 
 DeepSeekCompressorState::DeepSeekCompressorState(
     float* values, float* scores, std::uint32_t ratio,
     std::uint32_t projected_width) noexcept
     : values_(values), scores_(scores), ratio_(ratio),
-      projected_width_(projected_width) {}
+      projected_width_(projected_width),
+      head_dim_(ratio == 4U ? projected_width / 2U : projected_width) {}
 
 DeepSeekCompressorState::~DeepSeekCompressorState() {
   if (values_) static_cast<void>(cudaFree(values_));
@@ -209,10 +309,11 @@ Status DeepSeekCompressorState::reset(void* stream) noexcept {
 }
 
 DeepSeekCompressorStateResult create_deepseek_compressor_state(
-    std::uint32_t ratio) noexcept {
-  if (ratio != 4U && ratio != 128U)
+    std::uint32_t ratio, std::uint32_t head_dim) noexcept {
+  if ((ratio != 4U && ratio != 128U) ||
+      (head_dim != 128U && head_dim != 512U))
     return {{ErrorCode::invalid_argument, "unsupported DeepSeek compressor ratio"}, {}};
-  const auto width = ratio == 4U ? 1024U : 512U;
+  const auto width = ratio == 4U ? 2U * head_dim : head_dim;
   const auto rows = ratio == 4U ? 8U : ratio;
   float* values = nullptr;
   float* scores = nullptr;
@@ -244,8 +345,10 @@ Status deepseek_compressor_decode(
     return {ErrorCode::invalid_argument, "invalid DeepSeek compressor launch"};
   const auto ratio = state.ratio();
   const auto width = state.projected_width();
+  const auto head_dim = state.head_dim();
   if ((ratio != 4U && ratio != 128U) ||
-      width != (ratio == 4U ? 1024U : 512U))
+      width != (ratio == 4U ? 2U * head_dim : head_dim) ||
+      (head_dim != 128U && head_dim != 512U))
     return {ErrorCode::invalid_argument, "invalid DeepSeek compressor state"};
   const auto local = position % ratio;
   const auto state_row = ratio == 4U ? ratio + local : local;
@@ -257,8 +360,9 @@ Status deepseek_compressor_decode(
   auto error = cudaPeekAtLastError();
   if (error != cudaSuccess) return failure(error, "DeepSeek compressor store");
   if ((position + 1U) % ratio != 0U) return Status::success();
-  compressor_pool_kernel<<<kHeadDim, 1, 0, cuda_stream>>>(
-      state.values(), state.scores(), pooled_workspace, ratio, width);
+  compressor_pool_kernel<<<head_dim, 1, 0, cuda_stream>>>(
+      state.values(), state.scores(), pooled_workspace, ratio, width,
+      head_dim);
   error = cudaPeekAtLastError();
   if (error != cudaSuccess) return failure(error, "DeepSeek compressor pool");
   if (ratio == 4U) {
@@ -271,7 +375,7 @@ Status deepseek_compressor_decode(
       return failure(error, "DeepSeek compressor overlap advance");
   }
   return rms_norm_bf16_weight(pooled_workspace, norm_weight,
-                              normalized_output, kHeadDim, epsilon, stream);
+                              normalized_output, head_dim, epsilon, stream);
 }
 
 Status deepseek_compressed_kv_publish(
@@ -305,6 +409,39 @@ Status deepseek_sparse_attention_decode(
   const auto error = cudaPeekAtLastError();
   return error == cudaSuccess ? Status::success()
                               : failure(error, "DeepSeek sparse attention");
+}
+
+Status deepseek_index_prepare(const float* input, const float* cosine,
+                              const float* sine, std::uint16_t* output,
+                              std::uint32_t rows, void* stream) noexcept {
+  if (!input || !cosine || !sine || !output || !rows)
+    return {ErrorCode::invalid_argument, "invalid DeepSeek index prepare launch"};
+  index_prepare_kernel<<<rows, 128U, 0, static_cast<cudaStream_t>(stream)>>>(
+      input, cosine, sine, reinterpret_cast<__nv_bfloat16*>(output));
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek index prepare");
+}
+
+Status deepseek_index_topk(
+    const std::uint16_t* query, const std::uint16_t* cache,
+    const float* head_weights, std::uint32_t cache_slots,
+    std::uint32_t top_k, float* scores, std::int32_t* indices,
+    void* stream) noexcept {
+  if (!query || !cache || !head_weights || !cache_slots || !top_k ||
+      top_k > cache_slots || !scores || !indices)
+    return {ErrorCode::invalid_argument, "invalid DeepSeek index top-k launch"};
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  index_score_kernel<<<cache_slots, 64U, 0, cuda_stream>>>(
+      reinterpret_cast<const __nv_bfloat16*>(query),
+      reinterpret_cast<const __nv_bfloat16*>(cache), head_weights, scores);
+  auto error = cudaPeekAtLastError();
+  if (error != cudaSuccess) return failure(error, "DeepSeek index scoring");
+  index_topk_kernel<<<1, 1, 0, cuda_stream>>>(scores, cache_slots, top_k,
+                                              indices);
+  error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek index top-k");
 }
 
 }  // namespace expert::runtime::cuda
