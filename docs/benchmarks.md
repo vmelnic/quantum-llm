@@ -85,6 +85,17 @@ layer. This is the real single-stream inter-token baseline, not prompt
 throughput. It proves that the 64-slot global cache loses the entire previous
 token's routed working set before traversal returns to the same layer.
 
+The routed down projections were then changed from six serial expert loops per
+output block to six parallel selection outputs followed by deterministic
+routing-order aggregation. A three-token gate retained the exact token IDs
+`[19923, 3, 1730]` and the full-block maximum error remained `4.77e-4`.
+Isolated FFN observations moved from roughly 6.92–7.22 ms to 6.65–6.98 ms.
+The observed two-token decode average improved from 2.53 to 1.51 seconds
+(`0.395` to `0.662 tok/s`), but this is not attributed wholly to the kernel:
+the run still read 19.36 GB and file-cache state affects end-to-end latency.
+Only eight routed misses disappeared. The qualified claim is a modest grouped
+FFN compute improvement with unchanged output, not a solved storage boundary.
+
 The separate uncompressed layer-0 gate exercises the checkpoint's
 `compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
 the full block matched its independent oracle with RMSE `3.55e-5` and maximum

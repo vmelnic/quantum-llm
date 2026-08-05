@@ -47,7 +47,8 @@ class DeepSeekFfnState final {
   float *hca_normalized_{}, *hca_mixes_{}, *collapsed_{}, *ffn_input_{};
   float *pre_{}, *post_{}, *comb_{}, *router_logits_{}, *routing_weights_{};
   std::uint32_t* expert_indices_{};
-  float *routed_intermediate_{}, *routed_output_{};
+  float *routed_intermediate_{}, *routed_selection_outputs_{},
+      *routed_output_{};
   float *shared_intermediate_{}, *shared_output_{};
 };
 

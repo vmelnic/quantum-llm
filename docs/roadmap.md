@@ -40,9 +40,11 @@ This roadmap records direction, not a compatibility promise.
     layers and produces the expected decoded response boundary. Layer-major
     prefill reduced that prompt from 19.91 to 3.74 seconds without changing the
     output. Multi-token autoregressive state is now functional; its first real
-    decode measurement is 0.261 tok/s because all 258 routed selections miss
-    the 64-slot global cache. Add grouped multi-row kernels and the persistent
-    HTTP worker.
+    decode measurement was 0.261 tok/s because all 258 routed selections miss
+    the 64-slot global cache. Parallel routed down-selection plus stable
+    aggregation is complete and preserved a three-token sequence; grouped
+    prefill rows, Tensor Core weight kernels, and the persistent HTTP worker
+    remain.
 11. ~~Publish a resumable compact routed-expert pack.~~ The 147.17 GB artifact
     contains 43 aligned layer shards and preserves all 11,008 authenticated
     FP4 records. It reduced a warm five-token prompt from 3.74 to 3.61 seconds,

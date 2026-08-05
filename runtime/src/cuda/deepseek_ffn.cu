@@ -75,6 +75,7 @@ void DeepSeekFfnState::map(void* raw_base) noexcept {
   routing_weights_ = arena.take<float>(7U);
   expert_indices_ = arena.take<std::uint32_t>(7U);
   routed_intermediate_ = arena.take<float>(kTopK * kIntermediate);
+  routed_selection_outputs_ = arena.take<float>(kTopK * kHidden);
   routed_output_ = arena.take<float>(kHidden);
   shared_intermediate_ = arena.take<float>(kIntermediate);
   shared_output_ = arena.take<float>(kHidden);
@@ -154,12 +155,16 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
   if (!status.ok()) return status;
   auto& state = *launch.state;
   const auto layer = launch.weights->layer;
-  status = launch_moe_single_token({
-      state.ffn_input_, nullptr, nullptr, nullptr, nullptr,
-      state.routing_weights_, state.expert_indices_,
-      state.routed_intermediate_, state.routed_output_, kHidden,
+  status = launch_moe_selection_batch({
+      state.ffn_input_, state.routing_weights_, state.expert_indices_, nullptr,
+      state.routed_intermediate_, state.routed_selection_outputs_, 1U, kHidden,
       kIntermediate, kTopK, launch.experts_per_layer, launch.stream,
       launch.directory_entries, layer, 10.0F, true});
+  if (!status.ok()) return status;
+  status = launch_moe_aggregate({
+      state.routed_selection_outputs_, nullptr, nullptr, nullptr,
+      state.routing_weights_, state.routed_output_, 0U, 1U, kHidden, kTopK,
+      launch.stream});
   if (!status.ok()) return status;
   status = launch_moe_single_token({
       state.ffn_input_, nullptr, nullptr, nullptr, nullptr,

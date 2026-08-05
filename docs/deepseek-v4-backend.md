@@ -635,3 +635,10 @@ reports TTFT separately from decode latency. In the first two-token run, the
 second token took 3.83 seconds and triggered 258 new routed acquisitions,
 exactly six per layer. This establishes that global LRU/LFU turnover, rather
 than request-state reconstruction, dominates current single-stream decode.
+
+Routed down projections now materialize six selection outputs in parallel and
+aggregate them in stable routing order. This reuses the runtime's qualified
+selection-batch kernels, preserves the three-token greedy sequence, and keeps
+the block maximum error below `5e-4`. It adds about 98 KiB per layer of FFN
+request workspace. The change removes serialization across top-k down GEMVs;
+it does not remove expert reads or implement Tensor Core weight kernels.
