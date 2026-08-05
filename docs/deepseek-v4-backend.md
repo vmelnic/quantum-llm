@@ -63,6 +63,25 @@ extents is a recovery/qualification path, not the production storage layout.
 The source checkpoint is retained so packs can be rebuilt after corruption or
 format changes.
 
+## Hybrid routed execution
+
+`deepseek_ffn_execute_hybrid` is the execution boundary shared by placement and
+the model backend. A six-entry device mask launches resident selections through
+the packed CUDA kernel while selected compact RAM records run on the persistent
+CPU pool. CPU results occupy dense compact slots; the existing CUDA aggregate
+restores stable top-k order before the shared expert and HCA post-transform.
+
+One reusable workspace per active request owns 98,816 device bytes and 114,688
+bytes of pinned host memory. It is not duplicated across the 43 layer states
+and the hot call performs no weight expansion. The first real gate assigned
+one of six routed experts to CPU and five to CUDA; the final 4×4096 block was
+bit-identical to the all-CUDA result.
+
+This is a mechanism, not a fixed placement rule. On the current host the forced
+single-stream split took 10.54 ms versus 4.40 ms all-CUDA, so a resident hot
+route stays on GPU. CPU becomes eligible when measured queueing, storage/H2D,
+or concurrent-request pressure makes it the shorter critical path.
+
 ## Numeric source decoding
 
 The dependency-free source decoder implements the published E2M1 finite table,

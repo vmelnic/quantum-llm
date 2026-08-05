@@ -386,6 +386,13 @@ GPU path. The placement policy should assign a compact RAM expert to CPU only
 when that shortens the measured critical path versus storage plus H2D, and
 should overlap that work with resident CUDA selections.
 
+The subsequent hybrid vertical slice moved one real selection to CPU and left
+five on CUDA. A reusable per-request workspace used 98,816 device bytes and
+114,688 pinned host bytes. Stable aggregation reproduced the all-CUDA block
+bit-for-bit (`RMSE=0`, maximum error `0`). The forced split took 10.54 ms versus
+4.40 ms all-CUDA, which rejects CPU use for this single-stream hot route while
+qualifying the mechanism for cold or GPU-saturated placement decisions.
+
 ## Benchmark rules
 
 Any published result must include:

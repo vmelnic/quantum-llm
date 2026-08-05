@@ -755,6 +755,45 @@ int main(int argc, char** argv) {
     const auto cpu_metrics = cpu_executor.telemetry();
     require(cpu_metrics.workers_used_last == cpu_metrics.maximum_threads,
             "real DeepSeek CPU expert did not engage every logical worker");
+    float* device_hybrid_output = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&device_hybrid_output),
+                     token_stream_values * sizeof(float)),
+          "allocate DeepSeek hybrid block output");
+    const er::cpu::DeepSeekPackedWorkGroup hybrid_cpu_group{
+        cpu_leases[0].bytes(), cpu_leases[0].compact_sections(),
+        4096U, 2048U, {0U}, {0U}};
+    auto hybrid_workspace = er::cuda::create_deepseek_ffn_hybrid_workspace();
+    require(hybrid_workspace.status.ok() && hybrid_workspace.workspace,
+            std::string(hybrid_workspace.status.message()));
+    const auto hybrid_started = std::chrono::steady_clock::now();
+    const auto hybrid_status = er::cuda::deepseek_ffn_execute_hybrid({
+        &oracle_ffn, ffn_state.state.get(), expert_directory->device_entries(),
+        device_output + 3U * token_stream_values, device_hybrid_output,
+        hybrid_workspace.workspace.get(), &cpu_executor,
+        std::span(&hybrid_cpu_group, 1U), 257U, nullptr});
+    require(hybrid_status.ok(), std::string(hybrid_status.message()));
+    check(cudaDeviceSynchronize(), "synchronize DeepSeek hybrid FFN");
+    const auto hybrid_stopped = std::chrono::steady_clock::now();
+    std::vector<float> hybrid_block_output(token_stream_values),
+        hybrid_reference_block(token_stream_values);
+    check(cudaMemcpy(hybrid_block_output.data(), device_hybrid_output,
+                     hybrid_block_output.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy DeepSeek hybrid block output");
+    check(cudaMemcpy(hybrid_reference_block.data(), device_block_output,
+                     hybrid_reference_block.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy DeepSeek GPU block reference");
+    float hybrid_block_maximum = 0.0F;
+    double hybrid_block_squared = 0.0;
+    for (std::size_t index = 0U; index < hybrid_block_output.size(); ++index) {
+      const auto error = std::abs(hybrid_block_output[index] -
+                                  hybrid_reference_block[index]);
+      hybrid_block_maximum = std::max(hybrid_block_maximum, error);
+      hybrid_block_squared += static_cast<double>(error) * error;
+    }
+    require(hybrid_block_maximum == 0.0F,
+            "hybrid CPU/CUDA FFN changed the full block output");
     auto release = expert_directory->release_pins(
         concurrent_directory_plan.pin_id, nullptr);
     require(release.ok(), std::string(release.message()));
@@ -1207,6 +1246,19 @@ int main(int argc, char** argv) {
               << ",\"cpu_expert_max_abs_error\":" << cpu_expert_maximum
               << ",\"cpu_expert_max_relative_error\":"
               << cpu_expert_relative_maximum
+              << ",\"hybrid_cpu_experts\":1"
+              << ",\"hybrid_device_workspace_bytes\":"
+              << hybrid_workspace.workspace->device_bytes()
+              << ",\"hybrid_pinned_workspace_bytes\":"
+              << hybrid_workspace.workspace->pinned_host_bytes()
+              << ",\"hybrid_ffn_ms\":"
+              << std::chrono::duration<double, std::milli>(
+                     hybrid_stopped - hybrid_started).count()
+              << ",\"hybrid_block_rmse\":"
+              << std::sqrt(hybrid_block_squared /
+                           hybrid_block_output.size())
+              << ",\"hybrid_block_max_abs_error\":"
+              << hybrid_block_maximum
               << ",\"block_rmse\":"
               << std::sqrt(block_squared / token_stream_values)
               << ",\"block_max_abs_error\":" << block_maximum

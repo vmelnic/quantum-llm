@@ -80,8 +80,12 @@ This roadmap records direction, not a compatibility promise.
     passing the independent block tolerance. The compact CPU executor now uses
     a persistent 12-worker pool, consumes the same RAM record without an INT8
     mirror, and matched all six real CUDA expert outputs exactly in 48.16 ms.
-    Next connect CPU RAM hits and resident CUDA selections to one overlapped
-    layer execution, then feed measured lane costs back into placement.
+    CPU RAM selections and resident CUDA selections now share one masked,
+    overlapped execution boundary and stable aggregate. A forced one-CPU/five-
+    GPU layer remained bit-identical but took 10.54 versus 4.40 ms, so the
+    single-stream hot policy correctly remains GPU. Next move selection into
+    the scheduler state machine and feed measured queue/storage/lane costs back
+    into placement instead of forcing a static split.
 
 ## Phase 1 — long-context and cold-path production work
 

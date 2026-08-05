@@ -2,13 +2,16 @@
 
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
+#include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 
 #include <cstdint>
 #include <memory>
+#include <span>
 
 namespace expert::runtime::cuda {
 
 struct DeepSeekFfnStateResult;
+struct DeepSeekFfnHybridWorkspaceResult;
 
 class DeepSeekFfnState final {
  public:
@@ -43,6 +46,8 @@ class DeepSeekFfnState final {
   friend Status deepseek_ffn_route(const struct DeepSeekFfnRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute(
       const struct DeepSeekFfnExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_hybrid(
+      const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
   DeepSeekFfnState(void* allocation, std::uint64_t bytes,
                    std::uint32_t layer) noexcept;
   void map(void* base) noexcept;
@@ -99,5 +104,67 @@ struct DeepSeekFfnExecuteLaunch final {
 // Executes routed top-6 plus shared expert, then applies FFN HCA post.
 [[nodiscard]] Status deepseek_ffn_execute(
     const DeepSeekFfnExecuteLaunch& launch) noexcept;
+
+class DeepSeekFfnHybridWorkspace final {
+ public:
+  ~DeepSeekFfnHybridWorkspace();
+  DeepSeekFfnHybridWorkspace(const DeepSeekFfnHybridWorkspace&) = delete;
+  DeepSeekFfnHybridWorkspace& operator=(
+      const DeepSeekFfnHybridWorkspace&) = delete;
+  [[nodiscard]] std::uint64_t device_bytes() const noexcept {
+    return device_bytes_;
+  }
+  [[nodiscard]] std::uint64_t pinned_host_bytes() const noexcept {
+    return host_bytes_;
+  }
+
+ private:
+  friend DeepSeekFfnHybridWorkspaceResult
+  create_deepseek_ffn_hybrid_workspace() noexcept;
+  friend Status deepseek_ffn_execute_hybrid(
+      const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
+  DeepSeekFfnHybridWorkspace(void* device_allocation,
+                             std::uint64_t device_bytes,
+                             void* host_allocation,
+                             std::uint64_t host_bytes) noexcept;
+  void map() noexcept;
+
+  void* device_allocation_{};
+  void* host_allocation_{};
+  std::uint64_t device_bytes_{};
+  std::uint64_t host_bytes_{};
+  std::uint8_t* selection_mask_{};
+  std::uint32_t* alternate_slot_by_selection_{};
+  float* alternate_outputs_{};
+  float* host_input_{};
+  float* host_outputs_{};
+};
+
+struct DeepSeekFfnHybridWorkspaceResult final {
+  Status status;
+  std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace;
+};
+
+[[nodiscard]] DeepSeekFfnHybridWorkspaceResult
+create_deepseek_ffn_hybrid_workspace() noexcept;
+
+struct DeepSeekFfnHybridExecuteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  DeepSeekFfnState* state{};
+  const DeviceExpertEntry* directory_entries{};
+  const float* streams{};
+  float* updated_streams{};
+  DeepSeekFfnHybridWorkspace* workspace{};
+  cpu::DeepSeekPackedExecutor* cpu_executor{};
+  std::span<const cpu::DeepSeekPackedWorkGroup> cpu_groups;
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+};
+
+// Executes the unmasked selections on CUDA while the designated compact RAM
+// selections run on the persistent CPU pool. CPU outputs return as a compact
+// array and are merged in stable top-k order before the shared expert/HCA post.
+[[nodiscard]] Status deepseek_ffn_execute_hybrid(
+    const DeepSeekFfnHybridExecuteLaunch& launch) noexcept;
 
 }  // namespace expert::runtime::cuda
