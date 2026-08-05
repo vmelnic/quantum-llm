@@ -871,6 +871,11 @@ int main(int argc, char** argv) {
         prompt ? *prompt : std::vector<std::uint32_t>{42U};
     require(full_inputs.size() <= 4096U,
             "DeepSeek prompt exceeds request context");
+    using RouteSet = std::array<std::uint32_t, 6U>;
+    std::vector<std::array<RouteSet, 43U>> full_route_trace(
+        full_inputs.size() + max_new_tokens - 1U);
+    std::vector<std::array<bool, 43U>> full_route_seen(
+        full_route_trace.size());
     float* prefill_streams = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&prefill_streams),
                      full_inputs.size() * token_stream_values * sizeof(float)),
@@ -918,6 +923,11 @@ int main(int argc, char** argv) {
                          token_stream_values * sizeof(float),
                          cudaMemcpyDeviceToDevice),
               "commit DeepSeek prefill layer output");
+        const auto trace = full_controller.controller->route_trace();
+        require(trace.size() == 1U && trace.front().layer == layer,
+                "layer-major DeepSeek route trace is incomplete");
+        full_route_trace[position][layer] = trace.front().routed_experts;
+        full_route_seen[position][layer] = true;
         full_status = full_scheduler.retire(request_id);
         require(full_status.ok(), std::string(full_status.message()));
       }
@@ -964,6 +974,15 @@ int main(int argc, char** argv) {
                 "DeepSeek generation timed out");
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
+      const auto trace = full_controller.controller->route_trace();
+      require(trace.size() == 43U,
+              "generated DeepSeek route trace is incomplete");
+      for (const auto& item : trace) {
+        require(item.layer < 43U,
+                "generated DeepSeek route trace layer is invalid");
+        full_route_trace[position][item.layer] = item.routed_experts;
+        full_route_seen[position][item.layer] = true;
+      }
       full_status = full_scheduler.retire(request_id);
       require(full_status.ok(), std::string(full_status.message()));
       full_status = full_request.state->project_logits();
@@ -982,6 +1001,34 @@ int main(int argc, char** argv) {
     const auto full_scheduler_state = full_scheduler.snapshot();
     const auto full_cache_state = full_cache.telemetry();
     const auto full_upload_state = full_uploader->telemetry();
+    const auto first_decode_route = full_inputs.size() - 1U;
+    const auto decode_route_steps = generated_tokens.size();
+    std::uint64_t route_overlap_experts = 0U;
+    std::uint64_t route_overlap_possible = 0U;
+    std::uint64_t route_identical_layers = 0U;
+    for (std::size_t step = 0U; step < decode_route_steps; ++step) {
+      for (std::size_t layer = 0U; layer < 43U; ++layer) {
+        require(full_route_seen[first_decode_route + step][layer],
+                "DeepSeek decode route trace has a gap");
+      }
+      if (step == 0U) continue;
+      for (std::size_t layer = 0U; layer < 43U; ++layer) {
+        const auto& previous =
+            full_route_trace[first_decode_route + step - 1U][layer];
+        const auto& current =
+            full_route_trace[first_decode_route + step][layer];
+        std::uint32_t overlap = 0U;
+        for (const auto expert : current) {
+          if (std::find(previous.begin(), previous.end(), expert) !=
+              previous.end()) {
+            ++overlap;
+          }
+        }
+        route_overlap_experts += overlap;
+        route_overlap_possible += current.size();
+        if (overlap == current.size()) ++route_identical_layers;
+      }
+    }
     require(full_scheduler_state.completed_requests ==
                 43U * full_inputs.size() + max_new_tokens - 1U &&
                 full_scheduler_state.layer_advances >=
@@ -1077,12 +1124,41 @@ int main(int argc, char** argv) {
               << (generated_tokens.size() > 1U && decode_ms > 0.0
                       ? 1000.0 * (generated_tokens.size() - 1U) / decode_ms
                       : 0.0)
+              << ",\"decode_route_overlap_experts\":"
+              << route_overlap_experts
+              << ",\"decode_route_overlap_possible\":"
+              << route_overlap_possible
+              << ",\"decode_route_overlap_ratio\":"
+              << (route_overlap_possible != 0U
+                      ? static_cast<double>(route_overlap_experts) /
+                            static_cast<double>(route_overlap_possible)
+                      : 0.0)
+              << ",\"decode_route_identical_layers\":"
+              << route_identical_layers
               << ",\"generated_token_ids\":[";
     for (std::size_t index = 0U; index < generated_tokens.size(); ++index) {
       if (index != 0U) std::cout << ',';
       std::cout << generated_tokens[index];
     }
     std::cout << "]"
+              << ",\"decode_route_expert_ids\":[";
+    for (std::size_t step = 0U; step < decode_route_steps; ++step) {
+      if (step != 0U) std::cout << ',';
+      std::cout << '[';
+      for (std::size_t layer = 0U; layer < 43U; ++layer) {
+        if (layer != 0U) std::cout << ',';
+        std::cout << '[';
+        const auto& route =
+            full_route_trace[first_decode_route + step][layer];
+        for (std::size_t rank = 0U; rank < route.size(); ++rank) {
+          if (rank != 0U) std::cout << ',';
+          std::cout << route[rank];
+        }
+        std::cout << ']';
+      }
+      std::cout << ']';
+    }
+    std::cout << ']'
               << ",\"prompt_tokens\":" << full_inputs.size()
               << ",\"prompt_token_ids\":[";
     for (std::size_t index = 0U; index < full_inputs.size(); ++index) {

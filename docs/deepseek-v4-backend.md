@@ -178,6 +178,32 @@ an undersized admission remains absent instead of loading data it cannot
 publish. Qwen retains its legacy equal-size behavior through a zero/default
 device-size claim.
 
+## Autoregressive route locality
+
+The full-model runner now records the exact six routed expert IDs for every
+layer and output-producing model step. The trace is bounded by the 43-layer
+decode range, excludes the invariant shared expert, preserves router rank, and
+is copied as part of the directory plan's existing host synchronization.
+
+An eight-step real generation showed that the former 64-slot global INT8 cache
+was a cyclic-scan policy failure, not evidence that every route was novel.
+Consecutive routes reused 840 of 1,806 selections (46.5%), but only one of 301
+layer transitions retained the complete six-expert set. Retaining more INT8
+history cannot solve the capacity problem:
+
+| Prior per-layer routes | Route hit ratio | Maximum routed slots | INT8 bytes |
+|---:|---:|---:|---:|
+| 1 | 46.5% | 258 | 6.50 GB |
+| 3 | 57.8% | 526 | 13.25 GB |
+| 7 | 75.2% | 905 | 22.80 GB |
+
+The seven-route case no longer fits beside 7.77 GB of dense state and 1.08 GB
+of shared experts. The production direction is therefore a tiered compact
+cache: pageable compact FP4 in RAM, compact FP4 in VRAM, and only the current
+six selections expanded into transient SM86 INT8 compute slots. Route traces
+remain evidence for admission and prefetch; they are not a hard-coded routing
+oracle.
+
 The checkpoint remains authoritative: the qualification bundle now contains
 only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
 expert payload is retained. Extents must cover the compact destination exactly

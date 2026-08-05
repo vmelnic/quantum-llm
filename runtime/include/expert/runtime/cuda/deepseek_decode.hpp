@@ -3,8 +3,10 @@
 #include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 namespace expert::runtime::cuda {
@@ -44,6 +46,12 @@ struct DeepSeekDecodeAdvanceResult final {
   std::vector<std::uint32_t> missing_experts;
 };
 
+struct DeepSeekRouteTraceEntry final {
+  std::uint32_t layer{};
+  // The shared expert is invariant and intentionally excluded.
+  std::array<std::uint32_t, 6U> routed_experts{};
+};
+
 struct DeepSeekDecodeControllerResult;
 
 // Executes one layer per advance() call. A cache miss returns control without
@@ -67,6 +75,10 @@ class DeepSeekDecodeController final {
   [[nodiscard]] std::uint32_t current_layer() const noexcept {
     return current_layer_;
   }
+  [[nodiscard]] std::span<const DeepSeekRouteTraceEntry> route_trace()
+      const noexcept {
+    return route_trace_;
+  }
 
  private:
   friend DeepSeekDecodeControllerResult create_deepseek_decode_controller(
@@ -87,6 +99,7 @@ class DeepSeekDecodeController final {
   std::uint32_t current_layer_{};
   std::uint32_t layer_limit_{};
   std::uint64_t pin_id_{};
+  std::vector<DeepSeekRouteTraceEntry> route_trace_;
   bool active_{};
   bool waiting_for_experts_{};
   bool complete_{};

@@ -40,11 +40,14 @@ This roadmap records direction, not a compatibility promise.
     layers and produces the expected decoded response boundary. Layer-major
     prefill reduced that prompt from 19.91 to 3.74 seconds without changing the
     output. Multi-token autoregressive state is now functional; its first real
-    decode measurement was 0.261 tok/s because all 258 routed selections miss
-    the 64-slot global cache. Parallel routed down-selection plus stable
-    aggregation is complete and preserved a three-token sequence; grouped
-    prefill rows, Tensor Core weight kernels, and the persistent HTTP worker
-    remain.
+    decode measurement exposed a cyclic-scan failure in the 64-slot global
+    cache. Exact eight-step traces found 46.5% consecutive route reuse, while a
+    seven-route INT8 history reached only 75.2% and would require 22.80 GB
+    before dense/shared state. Parallel routed down-selection plus stable
+    aggregation is complete and preserved the generated sequence. Next use a
+    bounded compact FP4 RAM/VRAM hierarchy with transient INT8 compute slots;
+    grouped prefill rows, Tensor Core weight kernels, and the persistent HTTP
+    worker remain.
 11. ~~Publish a resumable compact routed-expert pack.~~ The 147.17 GB artifact
     contains 43 aligned layer shards and preserves all 11,008 authenticated
     FP4 records. It reduced a warm five-token prompt from 3.74 to 3.61 seconds,
@@ -52,8 +55,9 @@ This roadmap records direction, not a compatibility promise.
     transient allocation with persistent device slots, retain a learned active
     set across decode tokens, and use grouped/Tensor Core execution. Bounded
     persistent device slots are complete (795 reuses from 107 allocations in
-    the real prompt); active-set placement and grouped compute remain. Compact
-    storage is not itself the compute-ready representation.
+    the real prompt). Exact route tracing rejected a larger history-only INT8
+    active set; compact RAM L2, compact VRAM L1, and transient compute-ready
+    slots replace that direction.
 
 ## Phase 1 — long-context and cold-path production work
 

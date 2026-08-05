@@ -2,6 +2,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -52,6 +53,8 @@ Status DeepSeekDecodeController::begin(
   token_id_ = launch.token_id;
   current_layer_ = launch.first_layer;
   layer_limit_ = launch.layer_limit;
+  route_trace_.clear();
+  route_trace_.reserve(layer_limit_ - current_layer_);
   waiting_for_experts_ = false;
   complete_ = false;
   active_ = true;
@@ -79,6 +82,18 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
       current_layer_, view.ffn_state->expert_indices(),
       view.ffn_state->selection_count(), stream_, true);
   if (!plan.status.ok()) return fail(std::move(plan.status));
+  if (plan.selected_experts.size() != 7U ||
+      plan.selected_experts.back() != 256U) {
+    return fail({ErrorCode::internal,
+                 "DeepSeek directory returned an invalid routed selection"});
+  }
+  if (route_trace_.empty() || route_trace_.back().layer != current_layer_) {
+    DeepSeekRouteTraceEntry trace;
+    trace.layer = current_layer_;
+    std::copy_n(plan.selected_experts.begin(), trace.routed_experts.size(),
+                trace.routed_experts.begin());
+    route_trace_.push_back(trace);
+  }
   pin_id_ = plan.pin_id;
   if (!plan.missing_experts.empty()) {
     waiting_for_experts_ = true;

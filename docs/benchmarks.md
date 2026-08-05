@@ -309,6 +309,20 @@ heated the expert cache, total usage reached approximately 17.4 GiB. Stopping
 the full process tree returned the GPU to approximately 421 MiB used by the
 Windows desktop.
 
+## DeepSeek-V4-Flash route trace
+
+An eight-token single-stream diagnostic measured the placement problem rather
+than claiming a throughput gate. With the 64-slot global routed cache it ran at
+0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route
+IDs showed 46.5% consecutive reuse, rising to only 75.2% when the previous
+seven routes were considered. That seven-route INT8 working set would consume
+22.80 GB before dense, shared, request, or CUDA memory.
+
+This rejects a larger history-only INT8 cache on a 24 GB GPU. The trace justifies
+the compact RAM/VRAM hierarchy described in the DeepSeek backend document; it
+does not justify comparing the diagnostic rate with the qualified Qwen hot
+batch results above.
+
 ## Benchmark rules
 
 Any published result must include:

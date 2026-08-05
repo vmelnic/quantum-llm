@@ -31,6 +31,10 @@ struct alignas(16) DeviceExpertEntry final {
 struct DirectoryPlanResult final {
   Status status;
   std::vector<std::uint32_t> missing_experts;
+  // Exact selection order copied from the router output. Unlike the hash-table
+  // views below, this preserves duplicates and routing rank, making it suitable
+  // for bounded route tracing and deterministic working-set placement.
+  std::vector<std::uint32_t> selected_experts;
   // Populated only on the cold path. The control plane may lease these ready
   // entries while it resolves misses, preventing capacity churn before retry.
   std::vector<std::uint32_t> ready_experts;

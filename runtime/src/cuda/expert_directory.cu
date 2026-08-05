@@ -292,7 +292,7 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
     std::uint32_t selection_count, void* raw_stream,
     bool keep_ready_pins_on_miss) {
   std::lock_guard lock(impl_->mutex);
-  DirectoryPlanResult result{Status::success(), {}, {}, 0, 0};
+  DirectoryPlanResult result{Status::success(), {}, {}, {}, 0, 0};
   if (layer >= impl_->layers || device_expert_indices == nullptr || selection_count == 0 ||
       selection_count > impl_->maximum_selections) {
     result.status = Status(ErrorCode::invalid_argument,
@@ -332,6 +332,7 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
   std::uint32_t missing_count = 0;
   std::uint32_t plan_error = 0;
   std::vector<std::uint32_t> route_keys(impl_->hash_slots);
+  result.selected_experts.resize(selection_count);
   error = cudaMemcpyAsync(&missing_count, impl_->missing_count,
                           sizeof(missing_count), cudaMemcpyDeviceToHost,
                           stream);
@@ -345,6 +346,11 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
   if (error == cudaSuccess)
     error = cudaMemcpyAsync(route_keys.data(), impl_->hash_keys,
                             impl_->hash_slots * sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(result.selected_experts.data(),
+                            device_expert_indices,
+                            selection_count * sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost, stream);
   if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess || plan_error != 0) {
