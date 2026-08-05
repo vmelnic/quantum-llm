@@ -219,8 +219,10 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             kv_page_bytes=1024, kv_page_capacity=8192,
             placement_profile="capacity", ram_cache_bytes=48 << 30,
             vram_cache_bytes=18 << 30, placement_prefetch_enabled=False,
+            placement_prefetch_state="disabled",
             placement_minimum_observations=2,
-            stats=lambda: {"allocated_pages": 0, "reserved_pages": 0},
+            stats=lambda: {"allocated_pages": 0, "reserved_pages": 0,
+                           "cache_vram_hits": 7},
         )
         app.active = 0
         app.active_lock = threading.Lock()
@@ -230,6 +232,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(info["worker_placement"], {
             "profile": "capacity", "ram_cache_bytes": 48 << 30,
             "vram_cache_bytes": 18 << 30, "prefetch_enabled": False,
+            "prefetch_state": "disabled",
             "minimum_recent_observations": 2,
         })
         self.assertEqual(info["runtime_config"]["placement_profile"],
@@ -239,6 +242,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         })
         self.assertEqual(info["worker_kv"]["dtype"], "bf16")
         self.assertEqual(info["worker_kv"]["allocation"], "preallocated")
+        self.assertEqual(info["worker_runtime"]["cache_vram_hits"], 7)
 
     def test_concurrent_rows_share_one_worker_step(self) -> None:
         worker = FakeWorker()

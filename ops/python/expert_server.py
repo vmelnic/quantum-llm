@@ -176,10 +176,12 @@ class CudaWorker:
         self.placement_prefetch_enabled = bool(
             response.get("placement_prefetch_enabled", False)
         )
+        self.placement_prefetch_state = str(
+            response.get("placement_prefetch_state", "disabled")
+        )
         self.placement_minimum_observations = int(
             response.get("placement_minimum_observations", 0)
         )
-        expected_prefetch = placement_profile != "capacity"
         expected_observations = 1 if placement_profile == "latency" else 2
         if (self.protocol < 4 or self.capacity != requested_capacity or
                 self.prefill_mode not in {"causal_chunked", "causal_sequential"} or
@@ -191,7 +193,10 @@ class CudaWorker:
                 self.placement_profile != placement_profile or
                 self.ram_cache_bytes != ram_cache_gib << 30 or
                 self.vram_cache_bytes != vram_cache_gib << 30 or
-                self.placement_prefetch_enabled != expected_prefetch or
+                self.placement_prefetch_enabled or
+                self.placement_prefetch_state not in {"disabled", "observing"} or
+                (placement_profile == "capacity" and
+                 self.placement_prefetch_state != "disabled") or
                 self.placement_minimum_observations != expected_observations):
             self.process.kill()
             raise WorkerError(
@@ -284,10 +289,15 @@ class CudaWorker:
         response = self._command("STATS")
         if response.get("type") != "stats":
             raise WorkerError("unexpected STATS response")
-        return {
+        result = {
+            key: int(value) for key, value in response.items()
+            if key != "type" and isinstance(value, (int, bool))
+        }
+        result.update({
             "allocated_pages": int(response["kv_allocated_pages"]),
             "reserved_pages": int(response["kv_reserved_pages"]),
-        }
+        })
+        return result
 
     def close(self) -> None:
         if self.process.poll() is not None:
@@ -507,6 +517,13 @@ class Application:
             ))
         lines.extend(("# TYPE expert_service_ready gauge",
                       f"expert_service_ready {int(self.worker.healthy() and not self.draining.is_set())}"))
+        try:
+            worker_stats = self.worker.stats()
+        except WorkerError:
+            worker_stats = {}
+        for name, value in worker_stats.items():
+            metric = f"expert_worker_{name}"
+            lines.extend((f"# TYPE {metric} gauge", f"{metric} {value}"))
         return "\n".join(lines) + "\n"
 
     def _chat_prompt_ids(self, messages: list[dict[str, Any]]) -> list[int]:
@@ -735,6 +752,11 @@ class Application:
         with self.active_lock:
             active = self.active
         kv_stats = self.worker.stats()
+        runtime_stats = {
+            key: value for key, value in kv_stats.items()
+            if key not in {"allocated_pages", "reserved_pages",
+                           "kv_allocated_pages", "kv_reserved_pages"}
+        }
         return {
             "model": self.args.model,
             "build_id": self.args.build_id,
@@ -755,6 +777,7 @@ class Application:
                 "ram_cache_bytes": self.worker.ram_cache_bytes,
                 "vram_cache_bytes": self.worker.vram_cache_bytes,
                 "prefetch_enabled": self.worker.placement_prefetch_enabled,
+                "prefetch_state": self.worker.placement_prefetch_state,
                 "minimum_recent_observations": (
                     self.worker.placement_minimum_observations
                 ),
@@ -769,8 +792,10 @@ class Application:
                 "page_tokens": self.worker.kv_page_tokens,
                 "page_bytes": self.worker.kv_page_bytes,
                 "page_capacity": self.worker.kv_page_capacity,
-                **kv_stats,
+                "allocated_pages": kv_stats["allocated_pages"],
+                "reserved_pages": kv_stats["reserved_pages"],
             },
+            "worker_runtime": runtime_stats,
             "runtime_config": {
                 "host": self.args.host,
                 "port": self.args.port,

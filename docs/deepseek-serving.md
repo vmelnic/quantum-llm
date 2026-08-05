@@ -67,6 +67,9 @@ python -m venv work\venv\server
 
 The wrapper defaults to a 40 GiB host expert cache, a 12 GiB device expert
 cache, two request slots, 4096 context tokens, and a balanced placement policy.
+`placement_prefetch_state=observing` means the worker is collecting route
+evidence only. It does not report prefetch as enabled until a bounded warm-load
+or lookahead consumer is actually active.
 Startup performs hard RAM, VRAM, request-state, and logical KV-credit
 preflights before the ready message. These defaults fit the qualified 64 GiB
 RAM / 24 GiB VRAM class, but operators must lower them when other processes

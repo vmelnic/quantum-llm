@@ -33,7 +33,7 @@ one subsystem.
   metrics/model-info surface.
 - [ ] Add a reset or delta-snapshot boundary so one request can be attributed
   without restarting the worker.
-- [ ] Stop advertising placement prefetch merely because a placement profile
+- [x] Stop advertising placement prefetch merely because a placement profile
   enables it. Report `observing`, `warming`, `ready`, or `disabled` from actual
   runtime state.
 - [ ] Make protocol timing name the token being computed and the token being

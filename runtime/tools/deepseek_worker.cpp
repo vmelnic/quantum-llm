@@ -427,6 +427,21 @@ class Model final {
     return scheduler_->snapshot();
   }
   er::RouteCensusSnapshot census_snapshot() const { return census_->snapshot(); }
+  er::TelemetrySnapshot cache_snapshot() const { return cache_->telemetry(); }
+  er::cuda::CudaExpertUploaderTelemetry uploader_snapshot() const {
+    return uploader_->telemetry();
+  }
+  er::cpu::DeepSeekPackedExecutorTelemetry cpu_snapshot() const {
+    return cpu_->telemetry();
+  }
+  er::HybridDispatchTelemetry planner_snapshot() const {
+    return planner_->telemetry();
+  }
+  const char* prefetch_state() const noexcept {
+    // A census is persisted, but no warm-load or lookahead consumer is wired
+    // yet. Policy intent is not active data movement.
+    return placement_ == "capacity" ? "disabled" : "observing";
+  }
 
  private:
   Bundle bundle_;
@@ -482,8 +497,9 @@ int worker_loop(Model& model) {
             << ",\"placement_profile\":\"" << model.placement()
             << "\",\"ram_cache_bytes\":" << model.ram_bytes()
             << ",\"vram_cache_bytes\":" << model.vram_bytes()
-            << ",\"placement_prefetch_enabled\":"
-            << (model.placement() == "capacity" ? "false" : "true")
+            << ",\"placement_prefetch_enabled\":false"
+            << ",\"placement_prefetch_state\":\""
+            << model.prefetch_state() << '\"'
             << ",\"placement_minimum_observations\":"
             << (model.placement() == "latency" ? 1 : 2) << "}\n"
             << std::flush;
@@ -498,6 +514,10 @@ int worker_loop(Model& model) {
         require(fields.size() == 1U, "invalid STATS");
         const auto scheduler = model.scheduler_snapshot();
         const auto census = model.census_snapshot();
+        const auto cache = model.cache_snapshot();
+        const auto uploader = model.uploader_snapshot();
+        const auto cpu = model.cpu_snapshot();
+        const auto planner = model.planner_snapshot();
         std::uint64_t reserved_pages = 0U;
         for (const auto& [id, item] : active) {
           static_cast<void>(id);
@@ -512,6 +532,63 @@ int worker_loop(Model& model) {
                   << ",\"route_observations\":"
                   << scheduler.route_observations
                   << ",\"census_routes\":" << census.completed_routes
+                  << ",\"cache_vram_hits\":" << cache.acquire_vram_hits
+                  << ",\"cache_ram_hits\":" << cache.acquire_ram_hits
+                  << ",\"cache_ssd_misses\":" << cache.acquire_ssd_misses
+                  << ",\"cache_loads_started\":" << cache.load_started
+                  << ",\"cache_loads_completed\":" << cache.load_completed
+                  << ",\"cache_uploads_started\":" << cache.upload_started
+                  << ",\"cache_uploads_completed\":" << cache.upload_completed
+                  << ",\"cache_read_bytes\":" << cache.read_bytes
+                  << ",\"cache_uploaded_bytes\":" << cache.uploaded_bytes
+                  << ",\"cache_ram_bytes\":" << cache.ram_bytes
+                  << ",\"cache_ram_high_water\":" << cache.ram_high_water
+                  << ",\"cache_vram_bytes\":" << cache.vram_bytes
+                  << ",\"cache_vram_high_water\":" << cache.vram_high_water
+                  << ",\"cache_evictions\":" << cache.eviction_count
+                  << ",\"cache_stalled_by_budget\":"
+                  << cache.stalled_by_budget
+                  << ",\"cache_io_errors\":" << cache.io_errors
+                  << ",\"cache_upload_errors\":" << cache.upload_errors
+                  << ",\"uploader_device_allocations\":"
+                  << uploader.device_allocations
+                  << ",\"uploader_recycled_acquires\":"
+                  << uploader.recycled_acquires
+                  << ",\"uploader_staging_allocations\":"
+                  << uploader.staging_allocations
+                  << ",\"uploader_compact_h2d_bytes\":"
+                  << uploader.compact_h2d_bytes
+                  << ",\"uploader_compact_cache_hits\":"
+                  << uploader.compact_cache_hits
+                  << ",\"uploader_compact_cache_misses\":"
+                  << uploader.compact_cache_misses
+                  << ",\"scheduler_layer_advances\":"
+                  << scheduler.layer_advances
+                  << ",\"scheduler_expert_suspensions\":"
+                  << scheduler.expert_suspensions
+                  << ",\"scheduler_acquires_started\":"
+                  << scheduler.acquires_started
+                  << ",\"scheduler_acquires_completed\":"
+                  << scheduler.acquires_completed
+                  << ",\"scheduler_host_resolves\":"
+                  << scheduler.host_resolves
+                  << ",\"scheduler_cpu_placements\":"
+                  << scheduler.cpu_placements
+                  << ",\"scheduler_hybrid_layers\":"
+                  << scheduler.hybrid_layers
+                  << ",\"cpu_workers_used_last\":"
+                  << cpu.workers_used_last
+                  << ",\"cpu_execute_calls\":" << cpu.execute_calls
+                  << ",\"cpu_selections\":" << cpu.selections
+                  << ",\"cpu_source_weight_bytes\":"
+                  << cpu.source_weight_bytes
+                  << ",\"cpu_compute_ns\":" << cpu.compute_ns
+                  << ",\"planner_plans\":" << planner.plans
+                  << ",\"planner_candidates\":" << planner.candidates
+                  << ",\"planner_cpu_cost_wins\":"
+                  << planner.cpu_cost_wins
+                  << ",\"planner_gpu_cost_wins\":"
+                  << planner.gpu_cost_wins
                   << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
         require(fields.size() == 4U, "invalid BEGIN");
