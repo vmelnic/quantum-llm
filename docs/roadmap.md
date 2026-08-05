@@ -63,6 +63,11 @@ This roadmap records direction, not a compatibility promise.
     step must place the cold compact tier in higher-bandwidth RAM/NVMe or move
     expert compute to a memory-owning worker; more local INT8 history cannot
     meet the single-stream target.
+12. Replace per-expert hot-path operations with an explicit placement store.
+    The first slice is complete: the scheduler resolves a bounded layer union
+    through `IExpertStore`, preserves request order, cancels the unresolved
+    remainder on failure, and accounts backpressure per expert. Packed GPU,
+    all-core CPU, SSD, and remote ownership now share one scheduler boundary.
 
 ## Phase 1 — long-context and cold-path production work
 

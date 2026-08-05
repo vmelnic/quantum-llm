@@ -242,6 +242,14 @@ round-robin; the cache still deduplicates identical expert loads across
 requests. Acquired leases live through FFN resume, while cancellation and every
 terminal failure unwind pending waiters, leases, and controller pins.
 
+The scheduler submits a bounded union of `(layer, expert)` records to
+`IExpertStore`, rather than exposing individual cache futures as its placement
+contract. It receives either the complete ordered lease set or one explicit
+failure. The local store still deduplicates immutable records through
+`ExpertCache`; compact-GPU, CPU-local, and remote-owner stores can implement the
+same batch boundary without changing request state. Global credits count
+experts, not batch objects, so batching cannot bypass I/O or memory bounds.
+
 The same request owns the model edges: BF16 embedding gather expands directly
 into its four input streams; after layer 42, HC-head collapse, final RMSNorm,
 the untied BF16 vocabulary projection, and greedy argmax write into a fixed

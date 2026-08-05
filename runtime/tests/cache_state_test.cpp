@@ -1,6 +1,7 @@
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/expert_store.hpp"
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
@@ -423,6 +424,42 @@ struct Harness final {
     return result;
   }
 };
+
+void test_expert_store_resolves_complete_ordered_union() {
+  Harness harness(16'384, 2, 16'384);
+  const auto first = make_record(31, 0);
+  const auto second = make_record(32, er::kExpertPackAlignment);
+  er::LocalExpertStore store(harness.cache);
+  const std::array requests = {
+      er::ExpertResolveRequest{second.key, second.record},
+      er::ExpertResolveRequest{first.key, first.record},
+  };
+  auto batch = store.resolve(requests);
+  require(batch.valid() && batch.size() == 2U && !batch.poll(),
+          "expert store did not retain a pending union");
+
+  harness.storage->complete_success(second.bytes);
+  harness.uploader->complete_success();
+  require(!batch.poll(), "expert store published a partial union");
+  harness.storage->complete_success(first.bytes);
+  harness.uploader->complete_success();
+  auto resolved = batch.poll();
+  require(resolved && resolved->status.ok() &&
+              resolved->experts.size() == 2U &&
+              resolved->experts[0].key == second.key &&
+              resolved->experts[1].key == first.key &&
+              resolved->experts[0].lease && resolved->experts[1].lease,
+          "expert store changed order or omitted a union member");
+  require(!batch.valid() && !batch.poll(),
+          "terminal expert store handle was reusable");
+
+  const std::array duplicate = {
+      er::ExpertResolveRequest{first.key, first.record},
+      er::ExpertResolveRequest{first.key, first.record},
+  };
+  require(!store.resolve(duplicate).valid(),
+          "expert store accepted duplicate immutable keys");
+}
 
 void test_state_machine_and_sha256() {
   require(er::cache_state_name(er::CacheState::vram_ready) == "VRAM_READY",
@@ -1073,6 +1110,7 @@ int main() {
     test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();
+    test_expert_store_resolves_complete_ordered_union();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();

@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/deepseek_scheduler.hpp"
 
 #include "expert/runtime/expert_record.hpp"
+#include "expert/runtime/expert_store.hpp"
 
 #include <algorithm>
 #include <array>
@@ -28,9 +29,9 @@ Status copied_status(const Status& status) {
   return {status.code(), std::string(status.message())};
 }
 
-struct PendingAcquire final {
-  std::uint32_t expert{};
-  AcquireHandle handle;
+struct PendingResolve final {
+  std::vector<std::uint32_t> experts;
+  ExpertResolveHandle handle;
 };
 
 struct HeldLease final {
@@ -53,7 +54,7 @@ struct ScheduledRequest final {
   Status status;
   std::uint32_t layer{};
   std::deque<std::uint32_t> queued_experts;
-  std::vector<PendingAcquire> inflight;
+  std::vector<PendingResolve> inflight;
   std::vector<HeldLease> leases;
   bool runnable_queued{};
   bool acquire_queued{};
@@ -64,10 +65,12 @@ struct ScheduledRequest final {
 struct DeepSeekDecodeScheduler::Core final {
   Core(DeepSeekDecodeSchedulerConfig value, ExpertCache& expert_cache,
        const DeepSeekExpertCatalog& expert_catalog)
-      : config(value), cache(expert_cache), catalog(expert_catalog) {}
+      : config(value), cache(expert_cache), store(expert_cache),
+        catalog(expert_catalog) {}
 
   DeepSeekDecodeSchedulerConfig config;
   ExpertCache& cache;
+  LocalExpertStore store;
   const DeepSeekExpertCatalog& catalog;
   std::map<std::uint64_t, std::unique_ptr<ScheduledRequest>> requests;
   std::map<DeepSeekDecodeController*, ControllerWorkingSet> working_sets;
@@ -98,9 +101,13 @@ struct DeepSeekDecodeScheduler::Core final {
   }
 
   void abandon_acquisitions(ScheduledRequest& request) noexcept {
-    for (auto& pending : request.inflight) pending.handle.cancel();
-    if (request.inflight.size() <= inflight_acquires)
-      inflight_acquires -= request.inflight.size();
+    std::size_t cancelled = 0U;
+    for (auto& pending : request.inflight) {
+      cancelled += pending.experts.size();
+      pending.handle.cancel();
+    }
+    if (cancelled <= inflight_acquires)
+      inflight_acquires -= cancelled;
     else
       inflight_acquires = 0U;
     request.inflight.clear();
@@ -310,20 +317,38 @@ struct DeepSeekDecodeScheduler::Core final {
       if (request.state != DeepSeekScheduledState::waiting_for_experts ||
           request.queued_experts.empty())
         continue;
-      const auto expert = request.queued_experts.front();
-      request.queued_experts.pop_front();
-      const auto* record = catalog.find(request.layer, expert);
-      if (!record) {
-        fail(request, {ErrorCode::invalid_argument,
-                       "DeepSeek routed expert catalog lookup failed"});
+      const auto available =
+          config.maximum_inflight_acquires - inflight_acquires;
+      const auto count = std::min(available, request.queued_experts.size());
+      std::vector<std::uint32_t> experts;
+      std::vector<ExpertResolveRequest> resolves;
+      experts.reserve(count);
+      resolves.reserve(count);
+      for (std::size_t index = 0; index < count; ++index) {
+        const auto expert = request.queued_experts.front();
+        request.queued_experts.pop_front();
+        const auto* record = catalog.find(request.layer, expert);
+        if (!record) {
+          fail(request, {ErrorCode::invalid_argument,
+                         "DeepSeek routed expert catalog lookup failed"});
+          break;
+        }
+        experts.push_back(expert);
+        resolves.push_back({ExpertKey{config.model_id, request.layer, expert,
+                                     kExpertQuantAbiDeepSeekSm86},
+                            *record});
+      }
+      if (request.state != DeepSeekScheduledState::waiting_for_experts)
+        continue;
+      auto handle = store.resolve(resolves);
+      if (!handle.valid()) {
+        fail(request, {ErrorCode::internal,
+                       "DeepSeek batch expert resolve was rejected"});
         continue;
       }
-      ExpertKey key{config.model_id, request.layer, expert,
-                    kExpertQuantAbiDeepSeekSm86};
-      request.inflight.push_back(
-          {expert, cache.acquire(key, *record)});
-      ++inflight_acquires;
-      ++metrics.acquires_started;
+      request.inflight.push_back({std::move(experts), std::move(handle)});
+      inflight_acquires += count;
+      metrics.acquires_started += count;
       started = true;
       enqueue_acquisition(request);
     }
@@ -339,24 +364,29 @@ struct DeepSeekDecodeScheduler::Core final {
         continue;
       for (std::size_t index = 0U; index < request.inflight.size();) {
         auto& pending = request.inflight[index];
-        if (pending.handle.wait_for(0ms) != std::future_status::ready) {
+        auto result = pending.handle.poll();
+        if (!result) {
           ++index;
           continue;
         }
-        auto result = pending.handle.get();
-        const auto expert = pending.expert;
+        const auto count = pending.experts.size();
         request.inflight.erase(request.inflight.begin() + index);
-        if (inflight_acquires > 0U) --inflight_acquires;
-        ++metrics.acquires_completed;
+        inflight_acquires = count <= inflight_acquires
+                                ? inflight_acquires - count
+                                : 0U;
+        metrics.acquires_completed += count;
         completed = true;
-        if (!result.status.ok() || !result.lease) {
-          fail(request, result.status.ok()
+        if (!result->status.ok() || result->experts.size() != count) {
+          fail(request, result->status.ok()
                             ? Status(ErrorCode::internal,
-                                     "DeepSeek cache returned no expert lease")
-                            : copied_status(result.status));
+                                     "DeepSeek store returned incomplete batch")
+                            : copied_status(result->status));
           break;
         }
-        request.leases.push_back({expert, std::move(result.lease)});
+        for (auto& resolved : result->experts) {
+          request.leases.push_back(
+              {resolved.key.expert, std::move(resolved.lease)});
+        }
       }
       if (request.state == DeepSeekScheduledState::waiting_for_experts &&
           request.queued_experts.empty() && request.inflight.empty()) {
