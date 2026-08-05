@@ -27,6 +27,7 @@ remote files.
 | `Start-HuggingFaceModelDownload.ps1` | generic pinned, disk-checked Xet download task |
 | `Get-HuggingFaceModelDownload.ps1` | progress and index/shard completion verification |
 | `Start-DeepSeekV4FlashDownload.ps1` | pinned DeepSeek-V4-Flash Xet download profile |
+| `Invoke-SourceInventory.ps1` | read-only validation and dtype/byte inventory for a cached checkpoint |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
 | `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |
 | `Invoke-P6Conversion.ps1` | pinned Qwen3-Next conversion profile |

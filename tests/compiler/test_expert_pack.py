@@ -12,6 +12,7 @@ from compiler.expert_pack.compile import CompileOptions, compile_checkpoint
 from compiler.expert_pack.constants import EXPERT_HEADER_STRUCT, HEADER_BYTES, PACK_ALIGNMENT
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint
+from compiler.expert_pack.source_inventory import inspect_source
 from compiler.expert_pack.util import load_json, sha256_file
 from compiler.expert_pack.validate import validate_container
 
@@ -220,6 +221,34 @@ def _make_qwen3_next_fixture(root: Path, include_mtp: bool = False) -> None:
 
 
 class ExpertPackTests(unittest.TestCase):
+    def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(
+                json.dumps({
+                    "architectures": ["SyntheticForCausalLM"],
+                    "model_type": "synthetic",
+                }),
+                encoding="utf-8",
+            )
+            _write_safetensors(
+                root / "model.safetensors",
+                {
+                    "weight": ("F8_E4M3", (2, 3), bytes(range(6))),
+                    "scale": ("F8_E8M0", (2,), bytes((127, 128))),
+                },
+            )
+            inventory = inspect_source(SafeTensorCheckpoint(root))
+            self.assertEqual(inventory["tensor_count"], 2)
+            self.assertEqual(inventory["tensor_bytes"], 8)
+            self.assertEqual(
+                inventory["dtypes"],
+                {
+                    "F8_E4M3": {"tensor_count": 1, "bytes": 6},
+                    "F8_E8M0": {"tensor_count": 1, "bytes": 2},
+                },
+            )
+
     def test_qwen3_next_adapter_and_rank3_dense_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

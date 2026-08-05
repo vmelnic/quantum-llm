@@ -13,6 +13,20 @@ Supported strict adapters:
 
 Unknown, missing, or geometrically inconsistent tensors fail conversion.
 
+## Inspect an unfamiliar checkpoint
+
+Before adding an architecture adapter or defining a target ABI, validate every
+SafeTensors header and obtain an architecture-neutral byte inventory:
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler inspect-source `
+  --source C:\path\to\snapshot
+```
+
+The command is read-only. It does not map tensor payloads, convert weights, or
+create output files. Unsupported dtypes, unsafe shard paths, overlapping tensor
+ranges, index/header disagreements, and truncated shards fail closed.
+
 ## Install
 
 From the repository root:

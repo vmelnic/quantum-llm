@@ -8,6 +8,8 @@ from typing import Sequence
 from .compile import CompileOptions, compile_checkpoint
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE
 from .errors import ExpertPackError
+from .safetensors import SafeTensorCheckpoint
+from .source_inventory import inspect_source
 from .validate import validate_container
 
 
@@ -32,6 +34,12 @@ def _parser() -> argparse.ArgumentParser:
 
     validate_parser = commands.add_parser("validate", help="independently validate a completed container")
     validate_parser.add_argument("container", type=Path)
+
+    inspect_parser = commands.add_parser(
+        "inspect-source",
+        help="validate all SafeTensors headers and report a read-only source inventory",
+    )
+    inspect_parser.add_argument("--source", type=Path, required=True)
     return parser
 
 
@@ -53,8 +61,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     reclaim_source_shards=args.reclaim_source_shards,
                 )
             )
-        else:
+        elif args.command == "validate":
             result = validate_container(args.container)
+        else:
+            result = inspect_source(SafeTensorCheckpoint(args.source))
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
         return 2

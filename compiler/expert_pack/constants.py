@@ -64,6 +64,12 @@ DTYPE_BYTES = {
     "I64": 8,
     "U64": 8,
     "BOOL": 1,
+    # SafeTensors stores each supported float8 value in one byte.  Keep these
+    # source dtypes distinct: their bit layouts and scale semantics are not
+    # interchangeable even though their storage widths match.
+    "F8_E4M3": 1,
+    "F8_E5M2": 1,
+    "F8_E8M0": 1,
 }
 
 MODEL_CONFIG_FILES = (
