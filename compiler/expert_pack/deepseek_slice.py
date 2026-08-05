@@ -522,6 +522,172 @@ def _deepseek_compressed_kv_reference(
     return _f32_to_bf16_words(result)
 
 
+def _deepseek_sm86_fp8_matvec(
+    checkpoint: SafeTensorCheckpoint, name: str, vector: object,
+    *, row_first: int = 0, row_last: int | None = None,
+) -> object:
+    """Independently reproduce FP8 admission and the SM86 warp GEMV ABI."""
+    weight_info = checkpoint.tensors[name + ".weight"]
+    scale_info = checkpoint.tensors[name + ".scale"]
+    rows, columns = weight_info.shape
+    row_last = rows if row_last is None else row_last
+    if not 0 <= row_first < row_last <= rows or columns % 32:
+        raise SourceFormatError("invalid DeepSeek reference GEMV rows")
+    vector = np.asarray(vector, dtype=np.float32)
+    if vector.shape != (columns,) or scale_info.shape != (rows // 128, columns // 128):
+        raise SourceFormatError("invalid DeepSeek reference GEMV geometry")
+    table = _fp8_e4m3fn_table()
+    result = np.empty(row_last - row_first, dtype=np.float32)
+    with checkpoint.open_tensor(name + ".weight") as weight_view, \
+            checkpoint.open_tensor(name + ".scale") as scale_view:
+        weights = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(rows, columns)
+        scales = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+            rows // 128, columns // 128
+        )
+        for first in range(row_first, row_last, 128):
+            last = min(first + 128, row_last)
+            codes = weights[first:last]
+            scale_codes = scales[np.arange(first, last) // 128]
+            if bool((scale_codes == 255).any()):
+                raise SourceFormatError("DeepSeek reference GEMV contains NaN scale")
+            decoded = table[codes]
+            decoded *= np.repeat(
+                np.ldexp(np.ones(scale_codes.shape, dtype=np.float32),
+                         scale_codes.astype(np.int16) - 127),
+                128, axis=1,
+            )
+            maxima = np.max(np.abs(decoded), axis=1)
+            row_scales = np.where(maxima > 0, maxima / 127.0, 1.0).astype(np.float32)
+            quantized = np.clip(
+                np.rint(decoded / row_scales[:, None]), -127, 127
+            ).astype(np.int8)
+            # Match one CUDA warp per row: each lane accumulates stride-32
+            # columns, followed by the fixed shuffle-down reduction tree.
+            partial = np.zeros((last - first, 32), dtype=np.float32)
+            for block in range(columns // 32):
+                begin = block * 32
+                partial += quantized[:, begin:begin + 32].astype(np.float32) * \
+                    vector[begin:begin + 32]
+            for offset in (16, 8, 4, 2, 1):
+                partial[:, :offset] += partial[:, offset:2 * offset]
+            destination = first - row_first
+            result[destination:destination + last - first] = \
+                partial[:, 0] * row_scales
+        del weights, scales, codes, scale_codes
+    return result
+
+
+def export_deepseek_attention_oracle(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
+) -> dict[str, object]:
+    """Emit an independent token-zero oracle for one complete attention site."""
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek attention oracle")
+    validate_deepseek_v4_source(checkpoint)
+    if layer != 2:
+        raise AdapterError("the first complete attention oracle targets ratio-4 layer 2")
+    prefix = f"layers.{layer}"
+
+    def tensor(name: str, shape: tuple[int, ...], dtype: str) -> object:
+        info = checkpoint.tensors[name]
+        if info.shape != shape or info.dtype != dtype:
+            raise SourceFormatError(f"invalid attention oracle tensor: {name}")
+        with checkpoint.open_tensor(name) as view:
+            if dtype == "BF16":
+                return _bf16_to_f32(view.raw, shape).copy()
+            return np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
+
+    positions = np.arange(4 * 4096, dtype=np.float32).reshape(4, 4096)
+    streams = np.sin(positions * np.float32(0.0017)) * np.float32(0.08)
+    fn = tensor(prefix + ".hc_attn_fn", (24, 4 * 4096), "F32")
+    base = tensor(prefix + ".hc_attn_base", (24,), "F32")
+    scale = tensor(prefix + ".hc_attn_scale", (3,), "F32")
+    pre, post, comb, collapsed, _ = _deepseek_hca_reference(
+        streams, fn, base, scale
+    )
+
+    def rms(values: object, weight: object) -> object:
+        values = np.asarray(values, dtype=np.float32)
+        inverse = np.float32(
+            1.0 / math.sqrt(float(np.mean(np.square(values, dtype=np.float32))) + 1e-6)
+        )
+        return np.asarray(values * inverse * weight, dtype=np.float32)
+
+    attention_input = rms(
+        collapsed, tensor(prefix + ".attn_norm.weight", (4096,), "BF16")
+    )
+    qr = _deepseek_sm86_fp8_matvec(
+        checkpoint, prefix + ".attn.wq_a", attention_input
+    )
+    qr = rms(qr, tensor(prefix + ".attn.q_norm.weight", (1024,), "BF16"))
+    query = _deepseek_sm86_fp8_matvec(
+        checkpoint, prefix + ".attn.wq_b", qr
+    ).reshape(64, 512)
+    query_inverse = np.asarray(
+        1.0 / np.sqrt(np.mean(np.square(query, dtype=np.float32), axis=1) + 1e-6),
+        dtype=np.float32,
+    )
+    query = query * query_inverse[:, None]
+    query_words = _f32_to_bf16_words(query)
+    query = _bf16_to_f32(query_words.tobytes(), (64, 512))
+
+    kv = _deepseek_sm86_fp8_matvec(
+        checkpoint, prefix + ".attn.wkv", attention_input
+    )
+    kv = rms(kv, tensor(prefix + ".attn.kv_norm.weight", (512,), "BF16"))
+    cosine = np.ones(32, dtype=np.float32)
+    sine = np.zeros(32, dtype=np.float32)
+    cache_words = _deepseek_compressed_kv_reference(kv, cosine, sine)
+    cache = _bf16_to_f32(cache_words.tobytes(), (512,))
+    sink = tensor(prefix + ".attn.attn_sink", (64,), "F32")
+    scores = np.sum(query * cache[None, :], axis=1, dtype=np.float32) * \
+        np.float32(512.0 ** -0.5)
+    weights = 1.0 / (1.0 + np.exp(sink - scores))
+    attention = weights[:, None] * cache[None, :]
+    attention_words = _f32_to_bf16_words(attention)
+    attention = _bf16_to_f32(attention_words.tobytes(), (64, 512))
+
+    grouped = []
+    flattened = attention.reshape(-1)
+    for group in range(8):
+        grouped.append(_deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wo_a",
+            flattened[group * 4096:(group + 1) * 4096],
+            row_first=group * 1024, row_last=(group + 1) * 1024,
+        ))
+    projected = _deepseek_sm86_fp8_matvec(
+        checkpoint, prefix + ".attn.wo_b", np.concatenate(grouped)
+    )
+    updated = post[:, None] * projected[None, :] + np.matmul(comb.T, streams)
+    updated = np.asarray(updated, dtype="<f4")
+
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"attention oracle output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    with (partial / "streams.f32").open("xb") as file:
+        file.write(np.asarray(streams, dtype="<f4").tobytes())
+        file.flush()
+        os.fsync(file.fileno())
+    with (partial / "output.f32").open("xb") as file:
+        file.write(updated.tobytes())
+        file.flush()
+        os.fsync(file.fileno())
+    result = {
+        "format": "deepseek-attention-token0-oracle-v1",
+        "layer": layer,
+        "compress_ratio": 4,
+        "position": 0,
+        "stream_values": int(streams.size),
+        "output_values": int(updated.size),
+    }
+    atomic_json(partial / "manifest.json", result)
+    os.replace(partial, output)
+    return result
+
+
 def _deepseek_index_prepare_reference(values: object, cosine: object,
                                       sine: object) -> object:
     """Reference RoPE64, Hadamard128 and block-32 E2M1 QAT for the indexer."""

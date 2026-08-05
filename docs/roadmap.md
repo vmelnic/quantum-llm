@@ -2,6 +2,23 @@
 
 This roadmap records direction, not a compatibility promise.
 
+## DeepSeek-V4-Flash backend
+
+1. ~~Strict source contract, compact expert ABI, resident dense/typed/shared
+   state, HCA, CSA cache/index primitives.~~ Implemented and independently
+   qualified on the pinned checkpoint.
+2. ~~Transactional model publication and the first complete ratio-four
+   attention decode sublayer.~~ Implemented for token zero with an independent
+   full-graph oracle.
+3. Sequential token-three gate that emits and consumes the first compressed
+   slot through the composed executor.
+4. Optimize the measured layer workload: tiled/vectorized dense GEMV, fused
+   normalization/RoPE/QAT, grouped output kernels, batching, and parallel top-k.
+5. Compose routing, resident shared expert, streamed routed experts, FFN HCA,
+   and attention into the first complete transformer block.
+6. Extend ownership/state across 43 layers, then add embedding, head,
+   tokenizer, sampling, and the HTTP worker boundary.
+
 ## Phase 1 — long-context and cold-path production work
 
 1. ~~Paged, on-demand FP16 KV cache with per-request credits.~~ Implemented in

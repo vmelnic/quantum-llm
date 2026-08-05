@@ -16,6 +16,7 @@ $stamp = [DateTime]::UtcNow.ToString("yyyyMMddTHHmmssfffZ")
 $bundle = Join-Path (Join-Path $script:RepoRoot "work") "deepseek-model-$stamp"
 $dense = Join-Path $bundle "dense"
 $typed = Join-Path $bundle "typed"
+$oracle = Join-Path $bundle "attention-oracle"
 $executable = Join-Path $script:RepoRoot `
     "out\build\windows-msvc-release\runtime\Release\expert-deepseek-model-residency.exe"
 if (-not (Test-Path $executable -PathType Leaf)) {
@@ -30,7 +31,10 @@ try {
     & $python.Source -m compiler export-deepseek-typed-set --source $source `
         --output $typed | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek typed-set export failed" }
-    $nativeRaw = & $executable $dense $typed $source | Out-String
+    & $python.Source -m compiler export-deepseek-attention-oracle --source $source `
+        --output $oracle --layer 2 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "DeepSeek attention oracle export failed" }
+    $nativeRaw = & $executable $dense $typed $source $oracle | Out-String
     if ($LASTEXITCODE -ne 0) {
         Write-Output $nativeRaw
         throw "DeepSeek model residency failed"

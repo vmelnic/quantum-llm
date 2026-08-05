@@ -36,7 +36,7 @@ remote files.
 | `Invoke-DeepSeekSharedResidency.ps1` | atomically pin all 43 shared experts at startup |
 | `Invoke-DeepSeekHcaSlice.ps1` | real F32 HCA pre/Sinkhorn/post CUDA correctness gate |
 | `Invoke-DeepSeekTypedResidency.ps1` | stream all 834 BF16/F32/I64 tensors into typed model state |
-| `Invoke-DeepSeekModelResidency.ps1` | atomically publish dense + typed state and bind real CSA layers |
+| `Invoke-DeepSeekModelResidency.ps1` | publish model state and qualify a complete real attention sublayer |
 | `Invoke-DeepSeekCsaSlice.ps1` | validate real ratio-4/128 CSA compressor decode state on CUDA |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
 | `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |

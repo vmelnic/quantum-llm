@@ -1,4 +1,5 @@
 #include "expert/runtime/buffer_pool.hpp"
+#include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/gather_storage.hpp"
@@ -13,6 +14,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <cmath>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -142,13 +144,27 @@ std::vector<er::cuda::DeepSeekTypedSpec> typed_specs(
   return result;
 }
 
+std::vector<float> floats(const std::filesystem::path& path,
+                          std::size_t expected) {
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  require(static_cast<bool>(input) &&
+              static_cast<std::size_t>(input.tellg()) == expected * sizeof(float),
+          "invalid attention oracle file");
+  input.seekg(0);
+  std::vector<float> result(expected);
+  input.read(reinterpret_cast<char*>(result.data()),
+             static_cast<std::streamsize>(expected * sizeof(float)));
+  require(static_cast<bool>(input), "truncated attention oracle file");
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 4) {
+    if (argc != 5) {
       std::cerr << "usage: expert-deepseek-model-residency "
-                   "<dense-bundle> <typed-bundle> <checkpoint>\n";
+                   "<dense-bundle> <typed-bundle> <checkpoint> <attention-oracle>\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
@@ -183,6 +199,59 @@ int main(int argc, char** argv) {
     require(bind.ok(), std::string(bind.message()));
     bind = model.bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
+    constexpr std::size_t stream_values = 4U * 4096U;
+    const auto host_streams = floats(std::filesystem::path(argv[4]) / "streams.f32",
+                                     stream_values);
+    const auto expected_output = floats(
+        std::filesystem::path(argv[4]) / "output.f32", stream_values);
+    float *device_streams = nullptr, *device_output = nullptr;
+    float *device_cosine = nullptr, *device_sine = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&device_streams),
+                     stream_values * sizeof(float)), "allocate attention streams");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_output),
+                     stream_values * sizeof(float)), "allocate attention output");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_cosine), 32U * sizeof(float)),
+          "allocate attention cosine");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sine), 32U * sizeof(float)),
+          "allocate attention sine");
+    std::vector<float> cosine(32U, 1.0F), sine(32U, 0.0F);
+    check(cudaMemcpy(device_streams, host_streams.data(),
+                     stream_values * sizeof(float), cudaMemcpyHostToDevice),
+          "copy attention streams");
+    check(cudaMemcpy(device_cosine, cosine.data(), 32U * sizeof(float),
+                     cudaMemcpyHostToDevice), "copy attention cosine");
+    check(cudaMemcpy(device_sine, sine.data(), 32U * sizeof(float),
+                     cudaMemcpyHostToDevice), "copy attention sine");
+    auto attention_state = er::cuda::create_deepseek_attention_state(4U, 4096U);
+    require(attention_state.status.ok() && attention_state.state,
+            std::string(attention_state.status.message()));
+    cudaEvent_t attention_start{}, attention_stop{};
+    check(cudaEventCreate(&attention_start), "create attention start event");
+    check(cudaEventCreate(&attention_stop), "create attention stop event");
+    check(cudaEventRecord(attention_start), "record attention start");
+    const auto attention_status = er::cuda::deepseek_attention_decode({
+        &ratio_four, attention_state.state.get(), device_streams, device_output,
+        device_cosine, device_sine, device_cosine, device_sine, 0U, 1e-6F,
+        20U, nullptr});
+    require(attention_status.ok(), std::string(attention_status.message()));
+    check(cudaEventRecord(attention_stop), "record attention stop");
+    check(cudaEventSynchronize(attention_stop), "synchronize attention");
+    float attention_ms = 0.0F;
+    check(cudaEventElapsedTime(&attention_ms, attention_start, attention_stop),
+          "measure attention");
+    std::vector<float> actual_output(stream_values);
+    check(cudaMemcpy(actual_output.data(), device_output,
+                     stream_values * sizeof(float), cudaMemcpyDeviceToHost),
+          "copy attention output");
+    double squared = 0.0;
+    float maximum = 0.0F;
+    for (std::size_t index = 0; index < stream_values; ++index) {
+      require(std::isfinite(actual_output[index]), "attention output is non-finite");
+      const float error = std::abs(actual_output[index] - expected_output[index]);
+      maximum = std::max(maximum, error);
+      squared += static_cast<double>(error) * error;
+    }
+    require(maximum < 2e-4F, "complete attention output exceeds oracle tolerance");
     std::size_t free_resident = 0U;
     check(cudaMemGetInfo(&free_resident, &total),
           "cudaMemGetInfo resident model");
@@ -195,6 +264,11 @@ int main(int argc, char** argv) {
               << ",\"staging_bytes\":" << staging
               << ",\"startup_ms\":" << startup_ms
               << ",\"ratio4_bound\":true,\"ratio128_bound\":true"
+              << ",\"request_state_bytes\":" << attention_state.state->bytes()
+              << ",\"attention_ms\":" << attention_ms
+              << ",\"attention_rmse\":"
+              << std::sqrt(squared / stream_values)
+              << ",\"attention_max_abs_error\":" << maximum
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

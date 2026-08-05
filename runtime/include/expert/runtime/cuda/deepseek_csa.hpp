@@ -77,6 +77,6 @@ struct DeepSeekCompressorStateResult final {
     const std::uint16_t* query, const std::uint16_t* cache,
     const float* head_weights, std::uint32_t cache_slots,
     std::uint32_t top_k, float* scores, std::int32_t* indices,
-    void* stream) noexcept;
+    void* stream, std::uint32_t index_offset = 0U) noexcept;
 
 }  // namespace expert::runtime::cuda

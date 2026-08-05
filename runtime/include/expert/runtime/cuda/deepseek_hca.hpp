@@ -12,6 +12,13 @@ namespace expert::runtime::cuda {
 inline constexpr std::uint32_t kDeepSeekHcaStreams = 4;
 inline constexpr std::uint32_t kDeepSeekHcaMixes = 24;
 
+struct DeepSeekHcaView final {
+  const float* function{};
+  const float* base{};
+  const float* scale{};
+  std::uint32_t hidden{};
+};
+
 class DeepSeekHcaParameters final {
  public:
   DeepSeekHcaParameters(float* function, float* base, float* scale,
@@ -25,6 +32,9 @@ class DeepSeekHcaParameters final {
   [[nodiscard]] const float* scale() const noexcept { return scale_; }
   [[nodiscard]] std::uint32_t hidden() const noexcept { return hidden_; }
   [[nodiscard]] std::uint64_t bytes() const noexcept;
+  [[nodiscard]] DeepSeekHcaView view() const noexcept {
+    return {function_, base_, scale_, hidden_};
+  }
 
  private:
   float* function_{};
@@ -53,6 +63,12 @@ struct DeepSeekHcaWorkspace final {
 // post and comb contain 4, 4 and 16 F32 values respectively.
 [[nodiscard]] Status deepseek_hca_pre(
     const DeepSeekHcaParameters& parameters, const float* streams,
+    float* collapsed, float* pre, float* post, float* comb,
+    const DeepSeekHcaWorkspace& workspace, float epsilon,
+    std::uint32_t sinkhorn_iterations, void* stream) noexcept;
+
+[[nodiscard]] Status deepseek_hca_pre(
+    const DeepSeekHcaView& parameters, const float* streams,
     float* collapsed, float* pre, float* post, float* comb,
     const DeepSeekHcaWorkspace& workspace, float epsilon,
     std::uint32_t sinkhorn_iterations, void* stream) noexcept;

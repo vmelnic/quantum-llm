@@ -86,6 +86,12 @@ decode oracle for its real BF16 compressor weights. Both checkpoint schedules
 are supported: overlap pooling at ratio 4 and ordinary gated pooling at ratio
 128. The bundle is a qualification fixture, not a replacement weight format.
 
+`export-deepseek-attention-oracle` independently composes the SM86 dense ABI,
+real typed weights, HCA, Q/KV transforms, sparse attention, and grouped output
+projection for token zero of layer 2. It emits only input/output fixtures; the
+runtime still loads the authoritative full checkpoint through its normal model
+state path.
+
 ## Install
 
 From the repository root:

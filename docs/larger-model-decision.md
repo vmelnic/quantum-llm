@@ -146,6 +146,10 @@ independently proven.
   RoPE64, scaled Hadamard transform, block-32 E2M1 QAT boundary, learned
   per-head scoring projection, and stable top-k selection against independent
   oracles.
-- Next: compose the qualified dense, typed, HCA, CSA, and index primitives
-  around the first complete attention/model layer, then optimize the final
-  production workload rather than the small correctness fixtures.
+- Complete: the first real attention sublayer composes HCA, resident dense and
+  typed state, Q/window KV, both compressors, index selection, sparse
+  attention, grouped output projection, and HCA post. Token-zero output passed
+  an independent full-graph oracle with `2.69e-5` maximum error.
+- Next: close and consume a compressed group in the sequential layer-2 gate,
+  then optimize the composed kernels and connect attention to routing/shared/
+  streamed experts in the first complete transformer block.

@@ -256,7 +256,8 @@ __global__ void index_score_kernel(
 
 __global__ void index_topk_kernel(const float* scores, std::uint32_t slots,
                                   std::uint32_t top_k,
-                                  std::int32_t* indices) {
+                                  std::int32_t* indices,
+                                  std::uint32_t index_offset) {
   if (threadIdx.x != 0U) return;
   for (std::uint32_t selected = 0; selected < top_k; ++selected) {
     float best = kNegativeInfinity;
@@ -264,7 +265,8 @@ __global__ void index_topk_kernel(const float* scores, std::uint32_t slots,
     for (std::uint32_t slot = 0; slot < slots; ++slot) {
       bool used = false;
       for (std::uint32_t previous = 0; previous < selected; ++previous)
-        used |= indices[previous] == static_cast<std::int32_t>(slot);
+        used |= indices[previous] ==
+                static_cast<std::int32_t>(slot + index_offset);
       if (!used && (scores[slot] > best ||
                     (scores[slot] == best &&
                      (best_index < 0 || slot < static_cast<std::uint32_t>(best_index))))) {
@@ -272,7 +274,8 @@ __global__ void index_topk_kernel(const float* scores, std::uint32_t slots,
         best_index = static_cast<std::int32_t>(slot);
       }
     }
-    indices[selected] = best_index;
+    indices[selected] = best_index < 0
+        ? best_index : best_index + static_cast<std::int32_t>(index_offset);
   }
 }
 
@@ -427,7 +430,7 @@ Status deepseek_index_topk(
     const std::uint16_t* query, const std::uint16_t* cache,
     const float* head_weights, std::uint32_t cache_slots,
     std::uint32_t top_k, float* scores, std::int32_t* indices,
-    void* stream) noexcept {
+    void* stream, std::uint32_t index_offset) noexcept {
   if (!query || !cache || !head_weights || !cache_slots || !top_k ||
       top_k > cache_slots || !scores || !indices)
     return {ErrorCode::invalid_argument, "invalid DeepSeek index top-k launch"};
@@ -438,7 +441,7 @@ Status deepseek_index_topk(
   auto error = cudaPeekAtLastError();
   if (error != cudaSuccess) return failure(error, "DeepSeek index scoring");
   index_topk_kernel<<<1, 1, 0, cuda_stream>>>(scores, cache_slots, top_k,
-                                              indices);
+                                              indices, index_offset);
   error = cudaPeekAtLastError();
   return error == cudaSuccess ? Status::success()
                               : failure(error, "DeepSeek index top-k");

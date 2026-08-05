@@ -190,24 +190,35 @@ Status deepseek_hca_pre(
     float* collapsed, float* pre, float* post, float* comb,
     const DeepSeekHcaWorkspace& workspace, float epsilon,
     std::uint32_t sinkhorn_iterations, void* stream) noexcept {
-  if (!streams || !collapsed || !pre || !post || !comb ||
-      !workspace.normalized || !workspace.mixes || parameters.hidden() == 0U ||
+  return deepseek_hca_pre(parameters.view(), streams, collapsed, pre, post,
+                          comb, workspace, epsilon, sinkhorn_iterations,
+                          stream);
+}
+
+Status deepseek_hca_pre(
+    const DeepSeekHcaView& parameters, const float* streams,
+    float* collapsed, float* pre, float* post, float* comb,
+    const DeepSeekHcaWorkspace& workspace, float epsilon,
+    std::uint32_t sinkhorn_iterations, void* stream) noexcept {
+  if (!parameters.function || !parameters.base || !parameters.scale ||
+      !streams || !collapsed || !pre || !post || !comb ||
+      !workspace.normalized || !workspace.mixes || parameters.hidden == 0U ||
       epsilon <= 0.0F || sinkhorn_iterations == 0U) {
     return {ErrorCode::invalid_argument, "invalid DeepSeek HCA pre launch"};
   }
   auto cuda_stream = static_cast<cudaStream_t>(stream);
-  const auto values = kDeepSeekHcaStreams * parameters.hidden();
+  const auto values = kDeepSeekHcaStreams * parameters.hidden;
   hca_normalize_kernel<<<1, kThreads, 0, cuda_stream>>>(
       streams, workspace.normalized, values, epsilon);
-  auto status = gemv_f32(parameters.function(), kDeepSeekHcaMixes, values,
+  auto status = gemv_f32(parameters.function, kDeepSeekHcaMixes, values,
                          workspace.normalized, workspace.mixes, stream);
   if (!status.ok()) return status;
   hca_split_sinkhorn_kernel<<<1, 32, 0, cuda_stream>>>(
-      workspace.mixes, parameters.base(), parameters.scale(), pre, post, comb,
+      workspace.mixes, parameters.base, parameters.scale, pre, post, comb,
       epsilon, sinkhorn_iterations);
-  hca_collapse_kernel<<<(parameters.hidden() + kThreads - 1U) / kThreads,
+  hca_collapse_kernel<<<(parameters.hidden + kThreads - 1U) / kThreads,
                          kThreads, 0, cuda_stream>>>(
-      streams, pre, collapsed, parameters.hidden());
+      streams, pre, collapsed, parameters.hidden);
   const auto error = cudaGetLastError();
   return error == cudaSuccess ? Status::success()
                               : failure(error, "DeepSeek HCA pre");

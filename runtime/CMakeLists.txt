@@ -61,6 +61,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   find_package(CUDAToolkit 12.1 REQUIRED)
   target_sources(expert_runtime PRIVATE
     src/cuda/deepseek_admission.cu
+    src/cuda/deepseek_attention.cu
     src/cuda/deepseek_csa.cu
     src/cuda/deepseek_dense.cu
     src/cuda/deepseek_dense_set.cpp

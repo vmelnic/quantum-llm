@@ -16,6 +16,7 @@ from .deepseek_slice import (
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
     export_deepseek_csa_slice,
+    export_deepseek_attention_oracle,
     export_deepseek_typed_set,
     export_deepseek_dense_set,
     export_deepseek_shared_expert,
@@ -152,6 +153,13 @@ def _parser() -> argparse.ArgumentParser:
     csa_parser.add_argument("--source", type=Path, required=True)
     csa_parser.add_argument("--output", type=Path, required=True)
     csa_parser.add_argument("--layer", type=int, default=2)
+    attention_parser = commands.add_parser(
+        "export-deepseek-attention-oracle",
+        help="emit an independent complete token-zero attention oracle",
+    )
+    attention_parser.add_argument("--source", type=Path, required=True)
+    attention_parser.add_argument("--output", type=Path, required=True)
+    attention_parser.add_argument("--layer", type=int, default=2)
     return parser
 
 
@@ -239,8 +247,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = export_deepseek_typed_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-csa":
             result = export_deepseek_csa_slice(
+                SafeTensorCheckpoint(args.source), layer=args.layer,
+                output=args.output,
+            )
+        else:
+            result = export_deepseek_attention_oracle(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 output=args.output,
             )

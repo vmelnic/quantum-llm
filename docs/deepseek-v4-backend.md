@@ -396,3 +396,42 @@ parallel bounded top-k after the complete layer fixes batching, context, and
 cache-placement geometry. The already qualified dense FP8 set owns the query
 projection used before this boundary; the vertical slice supplies its
 deterministic output rather than duplicating that dense-kernel proof.
+
+## Complete decode attention sublayer
+
+`DeepSeekAttentionState` is a bounded per-request object. Creation takes a
+compression schedule and admitted maximum context, allocates the BF16 window,
+compressed and optional index caches plus all workspaces once, and initializes
+the persistent compressors. `deepseek_attention_decode` performs no model-name
+lookup, source I/O, admission, or allocation.
+
+The one-token executor now composes:
+
+1. HCA normalization, Sinkhorn controls, and stream collapse;
+2. attention RMSNorm and the resident `wq_a`/`wq_b` query path;
+3. per-head query normalization and RoPE64;
+4. window KV projection, normalization, QAT boundary, and ring-cache update;
+5. the main compressor and, for ratio four, the index compressor/query/top-k;
+6. online sparse attention over window plus compressed positions;
+7. inverse RoPE, eight grouped `wo_a` projections, `wo_b`, and HCA expansion.
+
+An independent compiler oracle reconstructs every FP8 dense matrix through the
+same declared SM86 INT8-per-row ABI, but reproduces admission and warp
+accumulation outside the CUDA executor. On real layer 2 at token zero, the
+16,384-value updated HCA state matched with RMSE `4.34e-6` and maximum error
+`2.69e-5` under a fail-closed `2e-4` limit. A context-4096 request state used
+2,149,120 bytes.
+
+The first composed measurement was 8.15 ms for one layer. This is correctness,
+not the target throughput: multiplying it by 43 already exceeds 350 ms before
+MoE. The current generic one-warp-per-row GEMVs achieve only a small fraction
+of RTX 3090 memory bandwidth. The next optimization boundary is therefore the
+actual composed workload: vectorized/tiled dense GEMV, fused query/norm/RoPE,
+grouped output GEMM, batched requests, and parallel top-k. Component-fixture
+timings will not be optimized in isolation.
+
+Token zero exercises the complete projection/cache/attention/output graph and
+updates both compressor states, but no compressed group has closed yet. The
+existing ratio-four and ratio-128 component gates cover emission and index
+selection independently; the next sequential gate must close a real group at
+token three before the executor is promoted to a multi-layer runner.
