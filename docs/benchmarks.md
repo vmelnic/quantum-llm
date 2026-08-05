@@ -59,6 +59,14 @@ policy was rejected:
 route turnover forced costly allocation and FP8-to-INT8 admission churn and did
 not complete the five-token prompt within five minutes.
 
+The compact layer-shard pack preserved the same token and exposed the cold
+boundary explicitly. Its first run took 29.05 seconds while reading 12.57 GB
+of routed source and publishing 22.73 GB of expanded expert data over 859
+acquisitions. Repeating the request from the Windows file cache took 3.61
+seconds, about 3.5% below the prior 3.74-second warm result. The pack therefore
+improves layout and recovery, but does not turn SATA into a viable per-token
+weight tier. Cold and warm numbers must not be compared as kernel speed.
+
 The separate uncompressed layer-0 gate exercises the checkpoint's
 `compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
 the full block matched its independent oracle with RMSE `3.55e-5` and maximum

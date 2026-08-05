@@ -86,30 +86,37 @@ Status DeepSeekExpertCatalog::load(
   try {
     std::ifstream extent_input(catalog_root / "extents.tsv");
     std::string line;
-    if (!std::getline(extent_input, line) ||
-        line != "deepseek-routed-extents-v1") {
+    if (!std::getline(extent_input, line)) {
       return {ErrorCode::invalid_argument,
               "invalid DeepSeek routed extent header"};
     }
+    const bool packed = line == "deepseek-routed-pack-extents-v1";
+    if (!packed && line != "deepseek-routed-extents-v1")
+      return {ErrorCode::invalid_argument,
+              "invalid DeepSeek routed extent header"};
+    const std::size_t extents_per_expert = packed ? 1U : 6U;
+    const auto payload_root = packed ? catalog_root : source_root;
     std::vector<PayloadExtent> extents;
-    extents.reserve(kExpertCount * 6U);
+    extents.reserve(kExpertCount * extents_per_expert);
     while (std::getline(extent_input, line)) {
       const auto item = fields(line);
       if (item.size() != 4U)
         return {ErrorCode::invalid_argument,
                 "invalid DeepSeek routed extent row"};
-      extents.push_back({source_root / relative_path(item[3]),
+      extents.push_back({payload_root / relative_path(item[3]),
                          unsigned_integer(item[2]), unsigned_integer(item[0]),
                          unsigned_integer(item[1])});
     }
-    if (!extent_input.eof() || extents.size() != kExpertCount * 6U) {
+    if (!extent_input.eof() ||
+        extents.size() != kExpertCount * extents_per_expert) {
       return {ErrorCode::invalid_argument,
               "DeepSeek routed extent catalog is incomplete"};
     }
 
     std::ifstream catalog_input(catalog_root / "catalog.tsv");
     if (!std::getline(catalog_input, line) ||
-        line != "deepseek-routed-catalog-v1") {
+        line != (packed ? "deepseek-routed-pack-catalog-v1"
+                        : "deepseek-routed-catalog-v1")) {
       return {ErrorCode::invalid_argument,
               "invalid DeepSeek routed catalog header"};
     }
@@ -128,8 +135,9 @@ Status DeepSeekExpertCatalog::load(
       const auto count = unsigned_integer(item[5]);
       if (layer != expected_index / kDeepSeekCatalogExperts ||
           expert != expected_index % kDeepSeekCatalogExperts ||
-          stored != kStoredBytes || first != expected_index * 6U ||
-          count != 6U || first + count > extents.size()) {
+          stored != kStoredBytes ||
+          first != expected_index * extents_per_expert ||
+          count != extents_per_expert || first + count > extents.size()) {
         return {ErrorCode::invalid_argument,
                 "DeepSeek routed catalog ordering/geometry mismatch"};
       }

@@ -14,6 +14,7 @@ from .deepseek_v4 import (
 from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_routed_catalog,
+    pack_deepseek_routed_catalog,
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
     export_deepseek_io_oracle,
@@ -114,6 +115,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     routed_catalog_parser.add_argument("--source", type=Path, required=True)
     routed_catalog_parser.add_argument("--output", type=Path, required=True)
+    compact_pack_parser = commands.add_parser(
+        "pack-deepseek-routed",
+        help="repack routed experts into resumable aligned compact layer shards",
+    )
+    compact_pack_parser.add_argument("--catalog", type=Path, required=True)
+    compact_pack_parser.add_argument("--source", type=Path, required=True)
+    compact_pack_parser.add_argument("--output", type=Path, required=True)
+    compact_pack_parser.add_argument("--resume", action="store_true")
     io_oracle_parser = commands.add_parser(
         "export-deepseek-io-oracle",
         help="emit an independent embedding and output-head oracle",
@@ -239,6 +248,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "export-deepseek-routed-catalog":
             result = export_deepseek_routed_catalog(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        elif args.command == "pack-deepseek-routed":
+            result = pack_deepseek_routed_catalog(
+                catalog_root=args.catalog, source_root=args.source,
+                output=args.output, resume=args.resume,
             )
         elif args.command == "export-deepseek-io-oracle":
             result = export_deepseek_io_oracle(

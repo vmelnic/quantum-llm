@@ -41,10 +41,13 @@ This roadmap records direction, not a compatibility promise.
     prefill reduced that prompt from 19.91 to 3.74 seconds without changing the
     output. Add grouped multi-row kernels, multi-token generation, and the
     persistent HTTP worker.
-11. Replace miss-time FP8-to-INT8 conversion/allocation with persistent
-    compute-ready expert packs. The attempted per-layer VRAM cache regressed
-    badly under route turnover and was removed; the bounded global cache is the
-    qualified baseline.
+11. ~~Publish a resumable compact routed-expert pack.~~ The 147.17 GB artifact
+    contains 43 aligned layer shards and preserves all 11,008 authenticated
+    FP4 records. It reduced a warm five-token prompt from 3.74 to 3.61 seconds,
+    but the cold run still read 12.57 GB and took 29.05 seconds. Next replace
+    transient allocation with persistent device slots, retain a learned active
+    set across decode tokens, and use grouped/Tensor Core execution. Compact
+    storage is not itself the compute-ready representation.
 
 ## Phase 1 — long-context and cold-path production work
 

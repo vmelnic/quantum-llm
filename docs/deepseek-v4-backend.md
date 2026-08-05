@@ -611,3 +611,11 @@ expert admission also remains the dominant cost. A 43-partition cache was
 rejected after it caused severe allocation/admission churn on changing routes;
 the bounded global 64-expert window completed the same prompt more than 15×
 faster. Persistent compute-ready expert packs are the next cold-path boundary.
+
+An attempted direct FP4 CUDA prototype retained 13,369,344 bytes per routed
+GPU entry instead of 25,198,592, kept `Hi → Hello` unchanged, and stayed
+within the full-block tolerance (`4.23e-3` maximum error). Scalar on-the-fly
+dequantization nevertheless regressed the FFN block from 6.94 to 38.64 ms and
+the layer-major prompt from 3.74 to 26.75 seconds, so that execution path was
+removed. A future compact path must expand during admission or use grouped
+rows/Tensor Cores; it must not decode every weight inside a scalar GEMV.

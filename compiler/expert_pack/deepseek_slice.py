@@ -6,13 +6,13 @@ import hashlib
 import math
 import os
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 from .deepseek_v4 import validate_deepseek_v4_source
 from .errors import AdapterError, SourceFormatError
 from .safetensors import SafeTensorCheckpoint
-from .util import atomic_json
+from .util import atomic_json, write_all
 
 try:
     import numpy as np
@@ -1565,6 +1565,234 @@ def export_deepseek_routed_catalog(
         return result
     except Exception:
         raise
+
+
+@contextmanager
+def _exclusive_pack_lock(path: Path):
+    """Hold a process-scoped lock without making crash recovery ambiguous."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = path.open("a+b", buffering=0)
+    try:
+        if os.fstat(handle.fileno()).st_size == 0:
+            handle.write(b"\0")
+        handle.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise SourceFormatError(
+                f"another DeepSeek compact pack process owns {path}"
+            ) from error
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def pack_deepseek_routed_catalog(
+    *, catalog_root: Path, source_root: Path, output: Path, resume: bool = False
+) -> dict[str, object]:
+    output = output.resolve()
+    lock = output.with_name(f".{output.name}.lock")
+    with _exclusive_pack_lock(lock):
+        return _pack_deepseek_routed_catalog_locked(
+            catalog_root=catalog_root, source_root=source_root,
+            output=output, resume=resume,
+        )
+
+
+def _pack_deepseek_routed_catalog_locked(
+    *, catalog_root: Path, source_root: Path, output: Path, resume: bool
+) -> dict[str, object]:
+    """Repack routed experts into one aligned compact shard per layer.
+
+    Payload bytes and per-expert SHA-256 remain identical to the authenticated
+    source catalog. Completed layer shards are atomic resume boundaries; the
+    source checkpoint is never modified or reclaimed.
+    """
+
+    stored_bytes = 13_369_344
+    layers = 43
+    experts_per_layer = 256
+    expert_count = layers * experts_per_layer
+    catalog_root = catalog_root.resolve()
+    source_root = source_root.resolve()
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists():
+        raise SourceFormatError(f"DeepSeek compact pack already exists: {output}")
+    if partial.exists() and not resume:
+        raise SourceFormatError(
+            f"DeepSeek compact pack partial exists; pass --resume: {partial}"
+        )
+    partial.mkdir(parents=True, exist_ok=resume)
+
+    catalog_lines = (catalog_root / "catalog.tsv").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    extent_lines = (catalog_root / "extents.tsv").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    if not catalog_lines or catalog_lines[0] != "deepseek-routed-catalog-v1":
+        raise SourceFormatError("compact pack requires routed catalog v1")
+    if not extent_lines or extent_lines[0] != "deepseek-routed-extents-v1":
+        raise SourceFormatError("compact pack requires routed extents v1")
+    rows = [line.split("\t") for line in catalog_lines[1:]]
+    extents = [line.split("\t") for line in extent_lines[1:]]
+    if len(rows) != expert_count or len(extents) != expert_count * 6:
+        raise SourceFormatError("DeepSeek source catalog is incomplete")
+
+    normalized: list[tuple[int, int, str, list[tuple[int, int, Path]]]] = []
+    for index, row in enumerate(rows):
+        if len(row) != 6:
+            raise SourceFormatError("invalid DeepSeek source catalog row")
+        layer, expert, size, digest, first, count = row
+        if (
+            int(layer) != index // experts_per_layer
+            or int(expert) != index % experts_per_layer
+            or int(size) != stored_bytes
+            or int(first) != index * 6
+            or int(count) != 6
+            or len(digest) != 64
+        ):
+            raise SourceFormatError("invalid DeepSeek source catalog geometry")
+        record_extents: list[tuple[int, int, Path]] = []
+        destination = 0
+        for raw in extents[index * 6 : index * 6 + 6]:
+            if len(raw) != 4:
+                raise SourceFormatError("invalid DeepSeek source extent row")
+            target, size_text, offset_text, relative_text = raw
+            relative = Path(relative_text)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise SourceFormatError("DeepSeek source extent escapes root")
+            size_value = int(size_text)
+            if int(target) != destination or size_value <= 0:
+                raise SourceFormatError("DeepSeek source extents are not exact-cover")
+            destination += size_value
+            record_extents.append((int(offset_text), size_value,
+                                   source_root / relative))
+        if destination != stored_bytes:
+            raise SourceFormatError("DeepSeek source expert has wrong byte count")
+        normalized.append((int(layer), int(expert), digest, record_extents))
+
+    def pack_layer(layer: int) -> tuple[str, int]:
+        shard_name = f"experts-{layer:02d}.dsc"
+        shard = partial / shard_name
+        commit = partial / f"{shard_name}.commit.json"
+        layer_bytes = experts_per_layer * stored_bytes
+        if shard.exists() and commit.exists() and shard.stat().st_size == layer_bytes:
+            return "reused", layer_bytes
+        temporary = partial / f"{shard_name}.tmp"
+        if temporary.exists():
+            temporary.unlink()
+        buffer = bytearray(8 * 1024 * 1024)
+        view = memoryview(buffer)
+        layer_digest = hashlib.sha256()
+        with ExitStack() as stack:
+            handles: dict[Path, object] = {}
+            destination = stack.enter_context(temporary.open("xb", buffering=0))
+            for index in range(layer * experts_per_layer,
+                               (layer + 1) * experts_per_layer):
+                _, _, expected_digest, record_extents = normalized[index]
+                expert_digest = hashlib.sha256()
+                for offset, size_value, path in record_extents:
+                    handle = handles.get(path)
+                    if handle is None:
+                        handle = stack.enter_context(path.open("rb", buffering=0))
+                        handles[path] = handle
+                    handle.seek(offset)
+                    remaining = size_value
+                    while remaining:
+                        requested = min(remaining, len(buffer))
+                        count = handle.readinto(view[:requested])
+                        if count is None or count <= 0:
+                            raise SourceFormatError(
+                                f"truncated DeepSeek compact source: {path.name}"
+                            )
+                        write_all(destination, view[:count])
+                        expert_digest.update(view[:count])
+                        layer_digest.update(view[:count])
+                        remaining -= count
+                if expert_digest.hexdigest() != expected_digest:
+                    raise SourceFormatError(
+                        f"DeepSeek compact source hash mismatch at record {index}"
+                    )
+            destination.flush()
+            os.fsync(destination.fileno())
+        if temporary.stat().st_size != layer_bytes:
+            raise SourceFormatError("DeepSeek compact layer has wrong byte count")
+        os.replace(temporary, shard)
+        atomic_json(commit, {
+            "format": "deepseek-compact-layer-commit-v1",
+            "layer": layer,
+            "bytes": layer_bytes,
+            "sha256": layer_digest.hexdigest(),
+        })
+        view.release()
+        return "packed", layer_bytes
+
+    pack_bytes = 0
+    for layer in range(layers):
+        action, layer_bytes = pack_layer(layer)
+        pack_bytes += layer_bytes
+        print(
+            f"{action} DeepSeek compact layer {layer + 1}/{layers}",
+            flush=True,
+        )
+
+    packed_catalog = partial / "catalog.tsv.tmp"
+    packed_extents = partial / "extents.tsv.tmp"
+    for stale in (packed_catalog, packed_extents,
+                  partial / "catalog.tsv", partial / "extents.tsv"):
+        if stale.exists():
+            stale.unlink()
+    with packed_catalog.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write("deepseek-routed-pack-catalog-v1\n")
+        for index, (layer, expert, digest, _) in enumerate(normalized):
+            handle.write(
+                f"{layer}\t{expert}\t{stored_bytes}\t{digest}\t{index}\t1\n"
+            )
+        handle.flush()
+        os.fsync(handle.fileno())
+    with packed_extents.open("x", encoding="utf-8", newline="\n") as handle:
+        handle.write("deepseek-routed-pack-extents-v1\n")
+        for layer in range(layers):
+            shard_name = f"experts-{layer:02d}.dsc"
+            for expert in range(experts_per_layer):
+                handle.write(
+                    f"0\t{stored_bytes}\t{expert * stored_bytes}\t{shard_name}\n"
+                )
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(packed_catalog, partial / "catalog.tsv")
+    os.replace(packed_extents, partial / "extents.tsv")
+    result = {
+        "format": "deepseek-routed-compact-pack-v1",
+        "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
+        "layers": layers,
+        "experts_per_layer": experts_per_layer,
+        "expert_count": expert_count,
+        "stored_bytes_per_expert": stored_bytes,
+        "pack_bytes": pack_bytes,
+        "shards": layers,
+        "alignment": 4096,
+    }
+    atomic_json(partial / "manifest.json", result)
+    os.replace(partial, output)
+    return result
 
 
 def export_deepseek_io_oracle(

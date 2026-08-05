@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import math
+import tempfile
 import unittest
+from pathlib import Path
 
 from compiler.expert_pack.deepseek_quant import (
     decode_fp8_e4m3fn,
@@ -19,6 +21,7 @@ from compiler.expert_pack.deepseek_slice import (
     _f32_to_bf16_words,
     _deepseek_csa_ratio4_reference,
     _deepseek_hca_reference,
+    _exclusive_pack_lock,
 )
 
 try:
@@ -28,6 +31,14 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    def test_compact_pack_lock_rejects_overlapping_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / ".compact.lock"
+            with _exclusive_pack_lock(lock):
+                with self.assertRaisesRegex(SourceFormatError, "another"):
+                    with _exclusive_pack_lock(lock):
+                        self.fail("overlapping compact pack lock was admitted")
+
     @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_bf16_rounding_uses_nearest_even(self) -> None:
         values = np.asarray([1.0, 1.00390625, 1.0078125], dtype=np.float32)
