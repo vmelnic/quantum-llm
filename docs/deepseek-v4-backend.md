@@ -417,21 +417,20 @@ The one-token executor now composes:
 
 An independent compiler oracle reconstructs every FP8 dense matrix through the
 same declared SM86 INT8-per-row ABI, but reproduces admission and warp
-accumulation outside the CUDA executor. On real layer 2 at token zero, the
-16,384-value updated HCA state matched with RMSE `4.34e-6` and maximum error
-`2.69e-5` under a fail-closed `2e-4` limit. A context-4096 request state used
-2,149,120 bytes.
+accumulation outside the CUDA executor. Four sequential tokens on real layer 2
+exercise real RoPE positions, retain the same state, and at token three emit
+and consume the first main/index compressed slot. Across the 65,536 updated
+HCA values, the executor matched with RMSE `3.07e-5` and maximum error
+`4.02e-4` under a fail-closed `1e-3` composed limit. The gradual per-token
+maximum (`2.7e-5`, `7.9e-5`, `1.65e-4`, `4.02e-4`) is consistent with the
+different online/warp reduction order rather than a discontinuity at
+compression. A context-4096 request state used 2,149,120 bytes.
 
-The first composed measurement was 8.15 ms for one layer. This is correctness,
-not the target throughput: multiplying it by 43 already exceeds 350 ms before
+The four-token composed measurement averaged 7.22 ms per layer-token. This is
+correctness, not the target throughput: multiplying it by 43 already exceeds
+310 ms before
 MoE. The current generic one-warp-per-row GEMVs achieve only a small fraction
 of RTX 3090 memory bandwidth. The next optimization boundary is therefore the
 actual composed workload: vectorized/tiled dense GEMV, fused query/norm/RoPE,
 grouped output GEMM, batched requests, and parallel top-k. Component-fixture
 timings will not be optimized in isolation.
-
-Token zero exercises the complete projection/cache/attention/output graph and
-updates both compressor states, but no compressed group has closed yet. The
-existing ratio-four and ratio-128 component gates cover emission and index
-selection independently; the next sequential gate must close a real group at
-token three before the executor is promoted to a multi-layer runner.

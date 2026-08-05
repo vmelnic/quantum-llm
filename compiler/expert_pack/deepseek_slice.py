@@ -580,7 +580,7 @@ def _deepseek_sm86_fp8_matvec(
 def export_deepseek_attention_oracle(
     checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
 ) -> dict[str, object]:
-    """Emit an independent token-zero oracle for one complete attention site."""
+    """Emit an independent four-token oracle for one complete attention site."""
     if np is None:
         raise SourceFormatError("NumPy is required for DeepSeek attention oracle")
     validate_deepseek_v4_source(checkpoint)
@@ -597,14 +597,47 @@ def export_deepseek_attention_oracle(
                 return _bf16_to_f32(view.raw, shape).copy()
             return np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
 
-    positions = np.arange(4 * 4096, dtype=np.float32).reshape(4, 4096)
+    positions = np.arange(4 * 4 * 4096, dtype=np.float32).reshape(4, 4, 4096)
     streams = np.sin(positions * np.float32(0.0017)) * np.float32(0.08)
     fn = tensor(prefix + ".hc_attn_fn", (24, 4 * 4096), "F32")
     base = tensor(prefix + ".hc_attn_base", (24,), "F32")
     scale = tensor(prefix + ".hc_attn_scale", (3,), "F32")
-    pre, post, comb, collapsed, _ = _deepseek_hca_reference(
-        streams, fn, base, scale
+    attention_norm = tensor(prefix + ".attn_norm.weight", (4096,), "BF16")
+    query_norm = tensor(prefix + ".attn.q_norm.weight", (1024,), "BF16")
+    kv_norm = tensor(prefix + ".attn.kv_norm.weight", (512,), "BF16")
+    sink = tensor(prefix + ".attn.attn_sink", (64,), "F32")
+    compressor = prefix + ".attn.compressor"
+    compressor_wkv = tensor(compressor + ".wkv.weight", (1024, 4096), "BF16")
+    compressor_wgate = tensor(compressor + ".wgate.weight", (1024, 4096), "BF16")
+    compressor_ape = tensor(compressor + ".ape", (4, 1024), "F32")
+    compressor_norm = tensor(compressor + ".norm.weight", (512,), "BF16")
+
+    rope = checkpoint.config["rope_scaling"]
+    rope_dim = 64
+    rope_base = float(checkpoint.config["compress_rope_theta"])
+    original = int(rope["original_max_position_embeddings"])
+    factor = float(rope["factor"])
+    beta_fast = float(rope["beta_fast"])
+    beta_slow = float(rope["beta_slow"])
+    frequencies = 1.0 / (
+        rope_base ** (np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim)
     )
+
+    def correction(rotation: float) -> float:
+        return rope_dim * math.log(original / (rotation * 2 * math.pi)) / \
+            (2 * math.log(rope_base))
+
+    low = max(math.floor(correction(beta_fast)), 0)
+    high = min(math.ceil(correction(beta_slow)), rope_dim - 1)
+    ramp = np.clip(
+        (np.arange(rope_dim // 2, dtype=np.float32) - low) /
+        np.float32(high - low if high != low else 0.001), 0, 1,
+    )
+    smooth = 1 - ramp
+    frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
+    angles = np.arange(4, dtype=np.float32)[:, None] * frequencies[None, :]
+    cosines = np.cos(angles).astype(np.float32)
+    sines = np.sin(angles).astype(np.float32)
 
     def rms(values: object, weight: object) -> object:
         values = np.asarray(values, dtype=np.float32)
@@ -613,53 +646,91 @@ def export_deepseek_attention_oracle(
         )
         return np.asarray(values * inverse * weight, dtype=np.float32)
 
-    attention_input = rms(
-        collapsed, tensor(prefix + ".attn_norm.weight", (4096,), "BF16")
-    )
-    qr = _deepseek_sm86_fp8_matvec(
-        checkpoint, prefix + ".attn.wq_a", attention_input
-    )
-    qr = rms(qr, tensor(prefix + ".attn.q_norm.weight", (1024,), "BF16"))
-    query = _deepseek_sm86_fp8_matvec(
-        checkpoint, prefix + ".attn.wq_b", qr
-    ).reshape(64, 512)
-    query_inverse = np.asarray(
-        1.0 / np.sqrt(np.mean(np.square(query, dtype=np.float32), axis=1) + 1e-6),
-        dtype=np.float32,
-    )
-    query = query * query_inverse[:, None]
-    query_words = _f32_to_bf16_words(query)
-    query = _bf16_to_f32(query_words.tobytes(), (64, 512))
+    attention_inputs: list[object] = []
+    window_cache: list[object] = []
+    updated_tokens: list[object] = []
+    for position in range(4):
+        pre, post, comb, collapsed, _ = _deepseek_hca_reference(
+            streams[position], fn, base, scale
+        )
+        attention_input = rms(collapsed, attention_norm)
+        attention_inputs.append(attention_input)
+        qr = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wq_a", attention_input
+        )
+        qr = rms(qr, query_norm)
+        query = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wq_b", qr
+        ).reshape(64, 512)
+        query *= np.asarray(
+            1.0 / np.sqrt(
+                np.mean(np.square(query, dtype=np.float32), axis=1) + 1e-6
+            ), dtype=np.float32,
+        )[:, None]
+        for pair in range(32):
+            left = query[:, 448 + pair * 2].copy()
+            right = query[:, 449 + pair * 2].copy()
+            query[:, 448 + pair * 2] = \
+                left * cosines[position, pair] - right * sines[position, pair]
+            query[:, 449 + pair * 2] = \
+                right * cosines[position, pair] + left * sines[position, pair]
+        query_words = _f32_to_bf16_words(query)
+        query = _bf16_to_f32(query_words.tobytes(), (64, 512))
 
-    kv = _deepseek_sm86_fp8_matvec(
-        checkpoint, prefix + ".attn.wkv", attention_input
-    )
-    kv = rms(kv, tensor(prefix + ".attn.kv_norm.weight", (512,), "BF16"))
-    cosine = np.ones(32, dtype=np.float32)
-    sine = np.zeros(32, dtype=np.float32)
-    cache_words = _deepseek_compressed_kv_reference(kv, cosine, sine)
-    cache = _bf16_to_f32(cache_words.tobytes(), (512,))
-    sink = tensor(prefix + ".attn.attn_sink", (64,), "F32")
-    scores = np.sum(query * cache[None, :], axis=1, dtype=np.float32) * \
-        np.float32(512.0 ** -0.5)
-    weights = 1.0 / (1.0 + np.exp(sink - scores))
-    attention = weights[:, None] * cache[None, :]
-    attention_words = _f32_to_bf16_words(attention)
-    attention = _bf16_to_f32(attention_words.tobytes(), (64, 512))
+        kv = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wkv", attention_input
+        )
+        kv = rms(kv, kv_norm)
+        cache_words = _deepseek_compressed_kv_reference(
+            kv, cosines[position], sines[position]
+        )
+        window_cache.append(_bf16_to_f32(cache_words.tobytes(), (512,)))
+        selected = list(window_cache)
+        if position == 3:
+            compressed = _deepseek_csa_reference(
+                np.asarray(attention_inputs), compressor_wkv,
+                compressor_wgate, compressor_ape, compressor_norm, ratio=4,
+            )
+            compressed_words = _deepseek_compressed_kv_reference(
+                compressed, cosines[0], sines[0]
+            )
+            selected.append(_bf16_to_f32(compressed_words.tobytes(), (512,)))
+        selected_values = np.asarray(selected, dtype=np.float32)
+        scores = np.matmul(query, selected_values.T, dtype=np.float32) * \
+            np.float32(512.0 ** -0.5)
+        maximum = np.maximum(np.max(scores, axis=1), sink)
+        attention_weights = np.exp(scores - maximum[:, None])
+        denominator = np.sum(attention_weights, axis=1, dtype=np.float32) + \
+            np.exp(sink - maximum)
+        attention = np.matmul(
+            attention_weights, selected_values, dtype=np.float32
+        ) / denominator[:, None]
+        attention_words = _f32_to_bf16_words(attention)
+        attention = _bf16_to_f32(attention_words.tobytes(), (64, 512)).copy()
+        for pair in range(32):
+            left = attention[:, 448 + pair * 2].copy()
+            right = attention[:, 449 + pair * 2].copy()
+            attention[:, 448 + pair * 2] = \
+                left * cosines[position, pair] + right * sines[position, pair]
+            attention[:, 449 + pair * 2] = \
+                right * cosines[position, pair] - left * sines[position, pair]
 
-    grouped = []
-    flattened = attention.reshape(-1)
-    for group in range(8):
-        grouped.append(_deepseek_sm86_fp8_matvec(
-            checkpoint, prefix + ".attn.wo_a",
-            flattened[group * 4096:(group + 1) * 4096],
-            row_first=group * 1024, row_last=(group + 1) * 1024,
-        ))
-    projected = _deepseek_sm86_fp8_matvec(
-        checkpoint, prefix + ".attn.wo_b", np.concatenate(grouped)
-    )
-    updated = post[:, None] * projected[None, :] + np.matmul(comb.T, streams)
-    updated = np.asarray(updated, dtype="<f4")
+        grouped = []
+        flattened = attention.reshape(-1)
+        for group in range(8):
+            grouped.append(_deepseek_sm86_fp8_matvec(
+                checkpoint, prefix + ".attn.wo_a",
+                flattened[group * 4096:(group + 1) * 4096],
+                row_first=group * 1024, row_last=(group + 1) * 1024,
+            ))
+        projected = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wo_b", np.concatenate(grouped)
+        )
+        updated_tokens.append(
+            post[:, None] * projected[None, :] +
+            np.matmul(comb.T, streams[position])
+        )
+    updated = np.asarray(updated_tokens, dtype="<f4")
 
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
@@ -675,11 +746,19 @@ def export_deepseek_attention_oracle(
         file.write(updated.tobytes())
         file.flush()
         os.fsync(file.fileno())
+    with (partial / "cosine.f32").open("xb") as file:
+        file.write(np.asarray(cosines, dtype="<f4").tobytes())
+        file.flush()
+        os.fsync(file.fileno())
+    with (partial / "sine.f32").open("xb") as file:
+        file.write(np.asarray(sines, dtype="<f4").tobytes())
+        file.flush()
+        os.fsync(file.fileno())
     result = {
-        "format": "deepseek-attention-token0-oracle-v1",
+        "format": "deepseek-attention-decode4-oracle-v1",
         "layer": layer,
         "compress_ratio": 4,
-        "position": 0,
+        "positions": [0, 3],
         "stream_values": int(streams.size),
         "output_values": int(updated.size),
     }

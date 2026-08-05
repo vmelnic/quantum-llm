@@ -148,8 +148,8 @@ independently proven.
   oracles.
 - Complete: the first real attention sublayer composes HCA, resident dense and
   typed state, Q/window KV, both compressors, index selection, sparse
-  attention, grouped output projection, and HCA post. Token-zero output passed
-  an independent full-graph oracle with `2.69e-5` maximum error.
-- Next: close and consume a compressed group in the sequential layer-2 gate,
-  then optimize the composed kernels and connect attention to routing/shared/
-  streamed experts in the first complete transformer block.
+  attention, grouped output projection, and HCA post. Four sequential tokens
+  passed the independent full-graph oracle; token three emitted and consumed
+  the first compressed/indexed slot with `4.02e-4` maximum composed error.
+- Next: optimize the measured 7.22 ms layer path, then connect attention to
+  routing/shared/streamed experts in the first complete transformer block.

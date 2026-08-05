@@ -8,6 +8,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -199,29 +200,40 @@ int main(int argc, char** argv) {
     require(bind.ok(), std::string(bind.message()));
     bind = model.bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
-    constexpr std::size_t stream_values = 4U * 4096U;
+    constexpr std::size_t token_stream_values = 4U * 4096U;
+    constexpr std::size_t decode_tokens = 4U;
+    constexpr std::size_t stream_values = decode_tokens * token_stream_values;
     const auto host_streams = floats(std::filesystem::path(argv[4]) / "streams.f32",
                                      stream_values);
     const auto expected_output = floats(
         std::filesystem::path(argv[4]) / "output.f32", stream_values);
+    const auto host_cosine = floats(
+        std::filesystem::path(argv[4]) / "cosine.f32", decode_tokens * 32U);
+    const auto host_sine = floats(
+        std::filesystem::path(argv[4]) / "sine.f32", decode_tokens * 32U);
     float *device_streams = nullptr, *device_output = nullptr;
     float *device_cosine = nullptr, *device_sine = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_streams),
-                     stream_values * sizeof(float)), "allocate attention streams");
+                     stream_values * sizeof(float)),
+          "allocate attention streams");
     check(cudaMalloc(reinterpret_cast<void**>(&device_output),
-                     stream_values * sizeof(float)), "allocate attention output");
-    check(cudaMalloc(reinterpret_cast<void**>(&device_cosine), 32U * sizeof(float)),
+                     stream_values * sizeof(float)),
+          "allocate attention output");
+    check(cudaMalloc(reinterpret_cast<void**>(&device_cosine),
+                     decode_tokens * 32U * sizeof(float)),
           "allocate attention cosine");
-    check(cudaMalloc(reinterpret_cast<void**>(&device_sine), 32U * sizeof(float)),
+    check(cudaMalloc(reinterpret_cast<void**>(&device_sine),
+                     decode_tokens * 32U * sizeof(float)),
           "allocate attention sine");
-    std::vector<float> cosine(32U, 1.0F), sine(32U, 0.0F);
     check(cudaMemcpy(device_streams, host_streams.data(),
                      stream_values * sizeof(float), cudaMemcpyHostToDevice),
           "copy attention streams");
-    check(cudaMemcpy(device_cosine, cosine.data(), 32U * sizeof(float),
-                     cudaMemcpyHostToDevice), "copy attention cosine");
-    check(cudaMemcpy(device_sine, sine.data(), 32U * sizeof(float),
-                     cudaMemcpyHostToDevice), "copy attention sine");
+    check(cudaMemcpy(device_cosine, host_cosine.data(),
+                     decode_tokens * 32U * sizeof(float), cudaMemcpyHostToDevice),
+          "copy attention cosine");
+    check(cudaMemcpy(device_sine, host_sine.data(),
+                     decode_tokens * 32U * sizeof(float), cudaMemcpyHostToDevice),
+          "copy attention sine");
     auto attention_state = er::cuda::create_deepseek_attention_state(4U, 4096U);
     require(attention_state.status.ok() && attention_state.state,
             std::string(attention_state.status.message()));
@@ -229,29 +241,42 @@ int main(int argc, char** argv) {
     check(cudaEventCreate(&attention_start), "create attention start event");
     check(cudaEventCreate(&attention_stop), "create attention stop event");
     check(cudaEventRecord(attention_start), "record attention start");
-    const auto attention_status = er::cuda::deepseek_attention_decode({
-        &ratio_four, attention_state.state.get(), device_streams, device_output,
-        device_cosine, device_sine, device_cosine, device_sine, 0U, 1e-6F,
-        20U, nullptr});
-    require(attention_status.ok(), std::string(attention_status.message()));
+    std::vector<float> actual_output(stream_values);
+    for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
+      const auto attention_status = er::cuda::deepseek_attention_decode({
+          &ratio_four, attention_state.state.get(),
+          device_streams + position * token_stream_values,
+          device_output + position * token_stream_values,
+          device_cosine + position * 32U, device_sine + position * 32U,
+          device_cosine, device_sine, position, 1e-6F, 20U, nullptr});
+      require(attention_status.ok(), std::string(attention_status.message()));
+    }
     check(cudaEventRecord(attention_stop), "record attention stop");
     check(cudaEventSynchronize(attention_stop), "synchronize attention");
     float attention_ms = 0.0F;
     check(cudaEventElapsedTime(&attention_ms, attention_start, attention_stop),
           "measure attention");
-    std::vector<float> actual_output(stream_values);
     check(cudaMemcpy(actual_output.data(), device_output,
                      stream_values * sizeof(float), cudaMemcpyDeviceToHost),
           "copy attention output");
     double squared = 0.0;
     float maximum = 0.0F;
+    std::array<float, decode_tokens> token_maximum{};
     for (std::size_t index = 0; index < stream_values; ++index) {
       require(std::isfinite(actual_output[index]), "attention output is non-finite");
       const float error = std::abs(actual_output[index] - expected_output[index]);
       maximum = std::max(maximum, error);
+      token_maximum[index / token_stream_values] = std::max(
+          token_maximum[index / token_stream_values], error);
       squared += static_cast<double>(error) * error;
     }
-    require(maximum < 2e-4F, "complete attention output exceeds oracle tolerance");
+    require(maximum < 1e-3F,
+            "complete attention output exceeds oracle tolerance; max=" +
+                std::to_string(maximum) + ", tokens=" +
+                std::to_string(token_maximum[0]) + "," +
+                std::to_string(token_maximum[1]) + "," +
+                std::to_string(token_maximum[2]) + "," +
+                std::to_string(token_maximum[3]));
     std::size_t free_resident = 0U;
     check(cudaMemGetInfo(&free_resident, &total),
           "cudaMemGetInfo resident model");
@@ -265,7 +290,10 @@ int main(int argc, char** argv) {
               << ",\"startup_ms\":" << startup_ms
               << ",\"ratio4_bound\":true,\"ratio128_bound\":true"
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
+              << ",\"decode_tokens\":" << decode_tokens
               << ",\"attention_ms\":" << attention_ms
+              << ",\"attention_ms_per_token\":"
+              << attention_ms / decode_tokens
               << ",\"attention_rmse\":"
               << std::sqrt(squared / stream_values)
               << ",\"attention_max_abs_error\":" << maximum

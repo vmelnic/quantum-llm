@@ -155,7 +155,7 @@ def _parser() -> argparse.ArgumentParser:
     csa_parser.add_argument("--layer", type=int, default=2)
     attention_parser = commands.add_parser(
         "export-deepseek-attention-oracle",
-        help="emit an independent complete token-zero attention oracle",
+        help="emit an independent complete four-token attention oracle",
     )
     attention_parser.add_argument("--source", type=Path, required=True)
     attention_parser.add_argument("--output", type=Path, required=True)
