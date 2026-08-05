@@ -61,10 +61,11 @@ $snapshot = Join-Path (Join-Path $cacheRoot "snapshots") $Revision
 $initialShardBytes = [int64]((Get-ChildItem $snapshot `
     -Filter "model-*.safetensors" -File -ErrorAction SilentlyContinue |
     Measure-Object Length -Sum).Sum)
-$cachedBytes = if (Test-Path (Join-Path $cacheRoot "blobs")) {
-    [int64]((Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
-        -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
-} else { [int64]0 }
+$cachedBytes = [int64]0
+foreach ($blob in @(Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
+        -ErrorAction SilentlyContinue)) {
+    $cachedBytes += [int64]$blob.Length
+}
 $remainingBytes = [Math]::Max([int64]0, $ExpectedDownloadBytes - $cachedBytes)
 $driveName = ([System.IO.Path]::GetPathRoot($env:USERPROFILE)).Substring(0, 1)
 $freeBytes = [int64](Get-PSDrive -Name $driveName).Free

@@ -19,10 +19,11 @@ $taskRunning = $null -ne $task -and $task.State -eq "Running"
 
 $cacheName = "models--" + ($state.model_id -replace "/", "--")
 $root = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
-$blobBytes = if (Test-Path (Join-Path $root "blobs")) {
-    [int64]((Get-ChildItem (Join-Path $root "blobs") -File `
-        -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum)
-} else { [int64]0 }
+$blobBytes = [int64]0
+foreach ($blob in @(Get-ChildItem (Join-Path $root "blobs") -File `
+        -ErrorAction SilentlyContinue)) {
+    $blobBytes += [int64]$blob.Length
+}
 $incomplete = @(Get-ChildItem (Join-Path $root "blobs") -Filter "*.incomplete" `
     -File -ErrorAction SilentlyContinue)
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
