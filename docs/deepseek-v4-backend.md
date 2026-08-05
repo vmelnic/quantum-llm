@@ -310,9 +310,12 @@ bytes; expansion of dense FP8 matrices accounts for the device/source delta.
 Layer bindings are non-owning views tied to the model state's lifetime. Model
 construction resolves names once and rejects wrong dtype, byte length, matrix
 geometry, layer ID, or compression schedule. Real bindings passed for layer 2
-(ratio 4, including its indexer) and layer 3 (ratio 128). Decode can therefore
-consume direct matrix/tensor pointers without names, source I/O, or admission
-inside the per-token path.
+(ratio 4, including its indexer) and layer 3 (ratio 128). FFN bindings now
+resolve the norm, BF16 router matrix, HCA controls, and exactly one routing
+metadata form: the I64 token-to-expert table for hash layers 0–2 or the F32
+selection bias for learned layers 3–42. Both real layer-2 and layer-3 contracts
+passed. Decode can therefore consume direct pointers without names, source I/O,
+or admission inside the per-token path.
 
 ## CSA decode compressor
 

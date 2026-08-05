@@ -41,6 +41,22 @@ struct DeepSeekAttentionBinding final {
   const std::uint16_t* index_compressor_norm{};
 };
 
+// Non-owning controls for one FFN sublayer. Shared and routed expert weights
+// live in the expert directory; this binding owns only the resident model
+// tensors required before and after expert dispatch.
+struct DeepSeekFfnBinding final {
+  std::uint32_t layer{};
+  bool hash_router{};
+
+  const std::uint16_t* ffn_norm{};
+  const std::uint16_t* router_weight{};
+  const std::int64_t* token_experts{};
+  const float* router_bias{};
+  const float* hca_function{};
+  const float* hca_base{};
+  const float* hca_scale{};
+};
+
 // Publishes the FP8-expanded dense set and dtype-preserving model tensors as
 // one transaction. A failed second phase cannot expose a partial model.
 class DeepSeekResidentModelState final {
@@ -60,6 +76,8 @@ class DeepSeekResidentModelState final {
   [[nodiscard]] Status bind_attention(
       std::uint32_t layer, std::uint32_t compress_ratio,
       DeepSeekAttentionBinding& destination) const noexcept;
+  [[nodiscard]] Status bind_ffn(
+      std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept;
 
   [[nodiscard]] std::uint64_t bytes() const noexcept {
     return dense_.bytes() + typed_.bytes();

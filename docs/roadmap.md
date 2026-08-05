@@ -20,6 +20,7 @@ This roadmap records direction, not a compatibility promise.
    The eight `wo_a` groups now execute in one launch without changing results.
 5. Compose routing, resident shared expert, streamed routed experts, FFN HCA,
    and attention into the first complete transformer block.
+   Resident hash/learned FFN control bindings are complete.
 6. Extend ownership/state across 43 layers, then add embedding, head,
    tokenizer, sampling, and the HTTP worker boundary.
 

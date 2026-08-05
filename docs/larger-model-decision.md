@@ -160,5 +160,7 @@ independently proven.
 - Complete: the eight grouped `wo_a` projections use one launch with unchanged
   composed error; 6.74 versus 6.78 ms was within measurement noise, so no
   throughput gain is claimed.
+- Complete: resident FFN bindings distinguish hash and learned routing and
+  expose norm/router/HCA controls without hot-path name lookup.
 - Next: continue optimizing the composed layer, then connect attention to
   routing/shared/streamed experts in the first complete transformer block.

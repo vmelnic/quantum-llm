@@ -200,6 +200,15 @@ int main(int argc, char** argv) {
     require(bind.ok(), std::string(bind.message()));
     bind = model.bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
+    er::cuda::DeepSeekFfnBinding hash_ffn, learned_ffn;
+    bind = model.bind_ffn(2U, hash_ffn);
+    require(bind.ok() && hash_ffn.hash_router && hash_ffn.token_experts &&
+                !hash_ffn.router_bias,
+            "invalid hash FFN binding");
+    bind = model.bind_ffn(3U, learned_ffn);
+    require(bind.ok() && !learned_ffn.hash_router && learned_ffn.router_bias &&
+                !learned_ffn.token_experts,
+            "invalid learned FFN binding");
     constexpr std::size_t token_stream_values = 4U * 4096U;
     constexpr std::size_t decode_tokens = 4U;
     constexpr std::size_t stream_values = decode_tokens * token_stream_values;
@@ -289,6 +298,7 @@ int main(int argc, char** argv) {
               << ",\"staging_bytes\":" << staging
               << ",\"startup_ms\":" << startup_ms
               << ",\"ratio4_bound\":true,\"ratio128_bound\":true"
+              << ",\"hash_ffn_bound\":true,\"learned_ffn_bound\":true"
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
               << ",\"decode_tokens\":" << decode_tokens
               << ",\"attention_ms\":" << attention_ms

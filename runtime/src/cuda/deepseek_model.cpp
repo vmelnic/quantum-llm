@@ -129,6 +129,42 @@ Status DeepSeekResidentModelState::bind_attention(
   return Status::success();
 }
 
+Status DeepSeekResidentModelState::bind_ffn(
+    std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept {
+  if (layer >= 43U)
+    return {ErrorCode::invalid_argument, "invalid DeepSeek FFN layer"};
+  DeepSeekFfnBinding bound;
+  bound.layer = layer;
+  bound.hash_router = layer < 3U;
+  const auto prefix = "layers." + std::to_string(layer);
+  const auto ffn = prefix + ".ffn";
+  bool valid =
+      bind_tensor(typed_, prefix + ".ffn_norm.weight", DeepSeekDtype::bf16,
+                  4096U, bound.ffn_norm) &&
+      bind_tensor(typed_, ffn + ".gate.weight", DeepSeekDtype::bf16,
+                  256U * 4096U, bound.router_weight) &&
+      bind_tensor(typed_, prefix + ".hc_ffn_fn", DeepSeekDtype::f32,
+                  24U * 4U * 4096U, bound.hca_function) &&
+      bind_tensor(typed_, prefix + ".hc_ffn_base", DeepSeekDtype::f32,
+                  24U, bound.hca_base) &&
+      bind_tensor(typed_, prefix + ".hc_ffn_scale", DeepSeekDtype::f32,
+                  3U, bound.hca_scale);
+  if (bound.hash_router) {
+    valid = valid &&
+        bind_tensor(typed_, ffn + ".gate.tid2eid", DeepSeekDtype::i64,
+                    129280U * 6U, bound.token_experts);
+  } else {
+    valid = valid &&
+        bind_tensor(typed_, ffn + ".gate.bias", DeepSeekDtype::f32,
+                    256U, bound.router_bias);
+  }
+  if (!valid)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek FFN binding is missing or has incompatible model state"};
+  destination = bound;
+  return Status::success();
+}
+
 void DeepSeekResidentModelState::clear() noexcept {
   dense_.clear();
   typed_.clear();
