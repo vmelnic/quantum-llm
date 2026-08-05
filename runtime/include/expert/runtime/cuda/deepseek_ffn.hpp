@@ -49,6 +49,8 @@ class DeepSeekFfnState final {
   std::uint32_t* expert_indices_{};
   float *routed_intermediate_{}, *routed_selection_outputs_{},
       *routed_output_{};
+  std::int8_t *routed_q_input_{}, *routed_q_intermediate_{};
+  float *routed_q_input_scales_{}, *routed_q_intermediate_scales_{};
   float *shared_intermediate_{}, *shared_output_{};
 };
 

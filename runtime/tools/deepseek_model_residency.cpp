@@ -371,6 +371,7 @@ int main(int argc, char** argv) {
         argc == 12 ? static_cast<std::uint64_t>(std::stoull(argv[11])) : 0U;
     require(compact_cache_gib <= 10U,
             "compact-vram-cache-gib must be in [0,10]");
+    static_cast<void>(compact_cache_gib);  // direct FP4 is the compact tier
     er::DeepSeekExpertCatalog routed_catalog;
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
@@ -481,7 +482,8 @@ int main(int argc, char** argv) {
                 ratio_128_layers == 20U,
             "request state has the wrong compression schedule");
     auto expert_storage = std::make_shared<er::ExtentGatherStorage>(iocp);
-    auto expert_uploader = std::make_shared<er::cuda::CudaExpertUploader>();
+    auto expert_uploader = std::make_shared<er::cuda::CudaExpertUploader>(
+        er::cuda::CudaExpertUploaderOptions{0U, false, 0U, true});
     auto expert_buffers = std::make_shared<er::FixedBufferPool>(
         1U, 25'167'360U, er::kExpertPackAlignment,
         std::make_shared<er::CudaPinnedAllocator>());
@@ -501,7 +503,8 @@ int main(int argc, char** argv) {
         expert_cache, ffn, ffn_resident);
     const auto ffn_load_stopped = std::chrono::steady_clock::now();
     require(ffn_load_status.ok() && ffn_resident.size() == 7U &&
-                ffn_resident.bytes() == 7ULL * 25'198'592U,
+                ffn_resident.bytes() ==
+                    6ULL * 13'369'344U + 25'198'592U,
             std::string(ffn_load_status.message()));
     er::cuda::DeepSeekAttentionBinding sliding_window, ratio_four, ratio_128;
     auto bind = model->bind_attention(0U, 0U, sliding_window);
@@ -837,6 +840,7 @@ int main(int argc, char** argv) {
     constexpr std::uint64_t routed_cache_slots = 258U;
     constexpr std::uint64_t routed_cache_bytes =
         routed_cache_slots * 25'198'592U;
+    constexpr std::uint64_t compact_cache_bytes = 0U;
     auto full_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
         17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 64U);
     auto full_buffers = std::make_shared<er::FixedBufferPool>(
@@ -844,7 +848,6 @@ int main(int argc, char** argv) {
         std::make_shared<er::CudaPinnedAllocator>());
     er::ExpertCacheConfig full_config;
     const auto host_cache_bytes = host_cache_gib << 30U;
-    const auto compact_cache_bytes = compact_cache_gib << 30U;
     const auto full_ram_bytes =
         std::max<std::uint64_t>(4ULL * 25'167'360U, host_cache_bytes);
     const auto full_ram_low = host_cache_bytes == 0U
@@ -860,7 +863,7 @@ int main(int argc, char** argv) {
     full_config.trusted_immutable_source = true;
     auto full_uploader = std::make_shared<er::cuda::CudaExpertUploader>(
         er::cuda::CudaExpertUploaderOptions{
-            routed_cache_bytes, true, compact_cache_bytes});
+            routed_cache_bytes, true, 0U, true});
     er::ExpertCache full_cache(full_config, expert_storage, full_uploader,
                                full_buffers, full_directory);
     er::ResidentExpertSet full_shared;
@@ -877,7 +880,7 @@ int main(int argc, char** argv) {
     require(full_controller.status.ok() && full_controller.controller,
             std::string(full_controller.status.message()));
     er::cuda::DeepSeekDecodeScheduler full_scheduler(
-        {17U, 1U, 4U, 1U, true}, full_cache, routed_catalog);
+        {17U, 1U, 6U, 1U, true}, full_cache, routed_catalog);
     float* full_rope = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&full_rope),
                      8U * 32U * sizeof(float)),

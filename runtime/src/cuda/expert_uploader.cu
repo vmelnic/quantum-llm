@@ -40,6 +40,7 @@ struct CudaExpertPool final {
   std::uint64_t recycled_capacity_bytes{};
   std::uint64_t compact_cache_capacity_bytes{};
   bool persistent_staging{};
+  bool direct_compact_execution{};
   std::unordered_map<std::size_t, std::vector<void*>> recycled;
   void* staging{};
   std::size_t staging_bytes{};
@@ -154,6 +155,29 @@ const float* CudaExpertAllocation::gate_up_scales() const noexcept { return gate
 const std::int8_t* CudaExpertAllocation::down() const noexcept { return down_; }
 const float* CudaExpertAllocation::down_scales() const noexcept { return down_scales_; }
 
+CudaCompactExpertAllocation::CudaCompactExpertAllocation(
+    std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
+    DeepSeekCompactSections sections) noexcept
+    : pool_(std::move(pool)), storage_(storage), bytes_(bytes),
+      sections_(sections) {}
+
+CudaCompactExpertAllocation::~CudaCompactExpertAllocation() {
+  if (storage_ != nullptr && pool_) pool_->release(storage_, bytes_);
+}
+
+std::size_t CudaCompactExpertAllocation::bytes() const noexcept {
+  return bytes_;
+}
+
+const std::uint8_t* CudaCompactExpertAllocation::base() const noexcept {
+  return static_cast<const std::uint8_t*>(storage_);
+}
+
+const DeepSeekCompactSections& CudaCompactExpertAllocation::sections()
+    const noexcept {
+  return sections_;
+}
+
 CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
     : pool_(std::make_shared<CudaExpertPool>()) {
   int pools_supported = 0;
@@ -172,6 +196,7 @@ CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
   pool_->compact_cache_capacity_bytes =
       options.compact_cache_capacity_bytes;
   pool_->persistent_staging = options.persistent_staging;
+  pool_->direct_compact_execution = options.direct_compact_execution;
   cudaMemPool_t memory_pool{};
   if (const auto error = cudaDeviceGetDefaultMemPool(&memory_pool, 0);
       error != cudaSuccess) {
@@ -203,8 +228,34 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   const auto total = static_cast<std::size_t>(
       sections.gate_up_q_bytes + sections.gate_up_scale_bytes +
       sections.down_q_bytes + sections.down_scale_bytes);
-  void* raw = nullptr;
   const auto stream = pool_->stream;
+  if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86 &&
+      request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
+      pool_->direct_compact_execution) {
+    const auto compact_bytes = request.complete_record.size();
+    void* compact_raw = nullptr;
+    auto error = pool_->acquire_locked(compact_bytes, &compact_raw);
+    if (error == cudaSuccess) {
+      error = cudaMemcpyAsync(compact_raw, request.complete_record.data(),
+                              compact_bytes, cudaMemcpyHostToDevice, stream);
+    }
+    if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+    if (error != cudaSuccess) {
+      if (compact_raw != nullptr)
+        pool_->release_locked(compact_raw, compact_bytes);
+      stream_lock.unlock();
+      completion({cuda_failure("DeepSeek direct compact upload", error), {},
+                  0U});
+      return operation;
+    }
+    pool_->metrics.compact_h2d_bytes += compact_bytes;
+    auto allocation = std::make_shared<CudaCompactExpertAllocation>(
+        pool_, compact_raw, compact_bytes, request.compact);
+    stream_lock.unlock();
+    completion({Status::success(), std::move(allocation), compact_bytes});
+    return operation;
+  }
+  void* raw = nullptr;
   auto error = pool_->acquire_locked(total, &raw);
   if (error != cudaSuccess) {
     stream_lock.unlock();

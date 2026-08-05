@@ -20,6 +20,9 @@ struct CudaExpertUploaderOptions final {
   // Retain immutable compact DeepSeek FP4 records on device independently of
   // expanded compute slots. Zero disables this L1 tier.
   std::uint64_t compact_cache_capacity_bytes{};
+  // Publish routed DeepSeek FP4 records directly instead of materializing the
+  // derived INT8-per-row allocation. Shared FP8 experts remain expanded.
+  bool direct_compact_execution{};
 };
 
 struct CudaExpertUploaderTelemetry final {
@@ -62,6 +65,27 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   const float* gate_up_scales_{};
   const std::int8_t* down_{};
   const float* down_scales_{};
+};
+
+class CudaCompactExpertAllocation final : public IDeviceAllocation {
+ public:
+  CudaCompactExpertAllocation(std::shared_ptr<CudaExpertPool> pool,
+                              void* storage, std::size_t bytes,
+                              DeepSeekCompactSections sections) noexcept;
+  ~CudaCompactExpertAllocation() override;
+  CudaCompactExpertAllocation(const CudaCompactExpertAllocation&) = delete;
+  CudaCompactExpertAllocation& operator=(
+      const CudaCompactExpertAllocation&) = delete;
+
+  [[nodiscard]] std::size_t bytes() const noexcept override;
+  [[nodiscard]] const std::uint8_t* base() const noexcept;
+  [[nodiscard]] const DeepSeekCompactSections& sections() const noexcept;
+
+ private:
+  std::shared_ptr<CudaExpertPool> pool_;
+  void* storage_{};
+  std::size_t bytes_{};
+  DeepSeekCompactSections sections_{};
 };
 
 class CudaExpertUploader final : public IDeviceUploader {

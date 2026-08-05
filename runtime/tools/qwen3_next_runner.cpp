@@ -1334,8 +1334,9 @@ class Qwen3NextModel final {
               normalized_, routing_scores_, routing_indices_,
               compact_cpu_selection_count ? gpu_selection_mask_ : nullptr,
               moe_intermediate_, moe_selection_output_,
-              rows, hidden_, expert_width_, top_k_, experts_, nullptr,
-              directory_->device_entries(), layer}));
+              nullptr, nullptr, nullptr, nullptr, rows, hidden_, expert_width_,
+              top_k_, experts_, nullptr, directory_->device_entries(), layer,
+              0.0F, false, false}));
         }
         phase_.gpu_expert_selections +=
             selection_count - compact_cpu_selection_count;

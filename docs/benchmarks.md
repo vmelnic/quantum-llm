@@ -344,6 +344,24 @@ Decode measured 0.557 tok/s with identical output. This establishes the current
 hardware lower bound: first-touch storage, not retained-route eviction or GEMV,
 dominates the single stream.
 
+## DeepSeek direct packed-FP4 CUDA gate
+
+The replacement compact kernel keeps routed weights in their 13,369,344-byte
+FP4/UE8M0 representation, quantizes activations to Q8 once, and performs
+coalesced SM86 DP4A dots without a global INT8 expert allocation. On the real
+layer oracle:
+
+| measurement | expanded INT8 | direct packed FP4 |
+| --- | ---: | ---: |
+| seven-expert resident bytes | 176,390,144 | 105,414,656 |
+| FFN execution | ~6.98 ms | 4.39 ms |
+| block maximum error | `4.77e-4` | `6.96e-3` |
+
+The compact result passed the declared `1e-2` block tolerance and retained the
+real `Hi` → `Hello` full-model output. The full prompt used the original
+six-extent checkpoint and rebuilt its working set, so its wall time is not
+compared with the earlier compact-pack steady-state number.
+
 ## Benchmark rules
 
 Any published result must include:

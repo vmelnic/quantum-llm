@@ -247,17 +247,34 @@ Status CudaExpertDirectory::publish(
   }
   const auto* cuda_allocation =
       dynamic_cast<const CudaExpertAllocation*>(allocation.get());
-  if (!cuda_allocation) {
+  const auto* compact_allocation =
+      dynamic_cast<const CudaCompactExpertAllocation*>(allocation.get());
+  if (!cuda_allocation && !compact_allocation) {
     return Status(ErrorCode::invalid_argument,
                   "CUDA directory received a non-CUDA allocation");
   }
   const auto index = static_cast<std::size_t>(key.layer) * impl_->experts +
                      key.expert;
   DeviceExpertEntry entry{};
-  entry.gate_up = cuda_allocation->gate_up();
-  entry.gate_up_scales = cuda_allocation->gate_up_scales();
-  entry.down = cuda_allocation->down();
-  entry.down_scales = cuda_allocation->down_scales();
+  if (cuda_allocation) {
+    entry.gate_up = cuda_allocation->gate_up();
+    entry.gate_up_scales = cuda_allocation->gate_up_scales();
+    entry.down = cuda_allocation->down();
+    entry.down_scales = cuda_allocation->down_scales();
+    entry.format = static_cast<std::uint32_t>(
+        DeviceExpertFormat::int8_per_row);
+  } else {
+    const auto* base = compact_allocation->base();
+    const auto& sections = compact_allocation->sections();
+    entry.w1_fp4 = base + sections.w1_weight_offset;
+    entry.w1_ue8m0 = base + sections.w1_scale_offset;
+    entry.w3_fp4 = base + sections.w3_weight_offset;
+    entry.w3_ue8m0 = base + sections.w3_scale_offset;
+    entry.w2_fp4 = base + sections.w2_weight_offset;
+    entry.w2_ue8m0 = base + sections.w2_scale_offset;
+    entry.format = static_cast<std::uint32_t>(
+        DeviceExpertFormat::deepseek_fp4_block32);
+  }
   entry.generation = ++impl_->generations[index];
   entry.state = static_cast<std::uint32_t>(DeviceExpertState::ready);
   return checked(cudaMemcpy(impl_->entries + index, &entry, sizeof(entry),

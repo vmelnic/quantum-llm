@@ -15,6 +15,11 @@ enum class DeviceExpertState : std::uint32_t {
   retiring = 2,
 };
 
+enum class DeviceExpertFormat : std::uint32_t {
+  int8_per_row = 0,
+  deepseek_fp4_block32 = 1,
+};
+
 // Small compute-ready metadata entry. The full model is never materialized in
 // this table; only addresses of currently resident slots are published.
 struct alignas(16) DeviceExpertEntry final {
@@ -22,10 +27,16 @@ struct alignas(16) DeviceExpertEntry final {
   const float* gate_up_scales{};
   const std::int8_t* down{};
   const float* down_scales{};
+  const std::uint8_t* w1_fp4{};
+  const std::uint8_t* w1_ue8m0{};
+  const std::uint8_t* w3_fp4{};
+  const std::uint8_t* w3_ue8m0{};
+  const std::uint8_t* w2_fp4{};
+  const std::uint8_t* w2_ue8m0{};
+  std::uint32_t format{};
   std::uint32_t generation{};
   std::uint32_t state{};
   std::uint32_t device_references{};
-  std::uint32_t reserved{};
 };
 
 struct DirectoryPlanResult final {

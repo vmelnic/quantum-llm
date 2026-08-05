@@ -233,8 +233,9 @@ int main(int argc, char** argv) {
     cuda_check(cudaDeviceSynchronize(), "MoE synchronize");
     auto split_status = expert::runtime::cuda::launch_moe_selection_batch({
         d_input, d_routing, d_indices, nullptr, d_intermediate,
-        d_selection_output, 1, hidden, width, top_k, top_k, nullptr,
-        directory->device_entries(), 0});
+        d_selection_output, nullptr, nullptr, nullptr, nullptr, 1, hidden,
+        width, top_k, top_k, nullptr, directory->device_entries(), 0, 0.0F,
+        false, false});
     if (!split_status.ok())
       throw std::runtime_error(std::string(split_status.message()));
     split_status = expert::runtime::cuda::launch_moe_aggregate({

@@ -73,6 +73,12 @@ This roadmap records direction, not a compatibility promise.
     protected live bytes. `ExpertCache` supports independent RAM/VRAM
     `trim_to` targets. The DeepSeek production worker must register dense, KV,
     request, compact-GPU, CPU-host, and staging consumers with this authority.
+14. Execute routed experts without global expansion. The SM86 path now keeps
+    authenticated FP4/UE8M0 records compact, quantizes activations once to Q8,
+    and uses coalesced DP4A dots. The real layer improved from about 6.98 to
+    4.39 ms while reducing seven-expert residency from 176.39 to 105.41 MB and
+    passing the independent block tolerance. Next overlap this path with the
+    all-core CPU lane and batched storage completions.
 
 ## Phase 1 — long-context and cold-path production work
 

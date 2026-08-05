@@ -58,6 +58,10 @@ struct MoeSelectionBatchLaunch final {
   const std::uint8_t* selection_mask{};   // [rows, top_k], null means all
   float* intermediate{};                  // [rows, top_k, intermediate]
   float* selection_outputs{};             // [rows, top_k, hidden]
+  std::int8_t* quantized_input{};          // [rows, hidden]
+  float* quantized_input_scales{};         // [rows]
+  std::int8_t* quantized_intermediate{};   // [rows, top_k, intermediate]
+  float* quantized_intermediate_scales{};  // [rows, top_k]
   std::uint32_t rows{};
   std::uint32_t hidden_size{};
   std::uint32_t intermediate_size{};
@@ -68,6 +72,7 @@ struct MoeSelectionBatchLaunch final {
   std::uint32_t directory_layer{};
   float swiglu_limit{};
   bool bf16_intermediate{};
+  bool enable_packed_fp4{};
 };
 
 struct MoeAggregateLaunch final {

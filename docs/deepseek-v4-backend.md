@@ -680,6 +680,21 @@ the layer-major prompt from 3.74 to 26.75 seconds, so that execution path was
 removed. A future compact path must expand during admission or use grouped
 rows/Tensor Cores; it must not decode every weight inside a scalar GEMV.
 
+That rejected scalar kernel has now been replaced by a block- and warp-oriented
+direct path. It publishes the authenticated 13,369,344-byte FP4 record in the
+CUDA directory, quantizes each activation vector once to Q8, decodes four E2M1
+values into registers, and uses SM86 `DP4A`. Consecutive lanes read a contiguous
+64-byte weight segment; UE8M0 powers of two are constructed directly as
+IEEE-754 values rather than calling `ldexpf` in the inner loop.
+
+On the real seven-expert layer gate, six routed compact experts plus the shared
+expert occupied 105,414,656 bytes instead of 176,390,144 bytes. FFN execution
+fell from approximately 6.98 ms to 4.39 ms. The independent block oracle had
+`0.00149` RMSE and `0.00696` maximum error, below the declared `0.01` gate. The
+complete prompt retained `Hi` → `Hello`, and routed compute-cache high water was
+7.58 GB. Its source was still the six-extent HF checkpoint, so that wall time is
+a storage qualification rather than a packed steady-state SLO.
+
 CUDA expert storage now supports an explicitly bounded recycler. Cache
 eviction retires the directory entry and returns its exact-size allocation to
 the uploader instead of freeing it; later admission overwrites and republishes
