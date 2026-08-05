@@ -77,8 +77,11 @@ This roadmap records direction, not a compatibility promise.
     authenticated FP4/UE8M0 records compact, quantizes activations once to Q8,
     and uses coalesced DP4A dots. The real layer improved from about 6.98 to
     4.39 ms while reducing seven-expert residency from 176.39 to 105.41 MB and
-    passing the independent block tolerance. Next overlap this path with the
-    all-core CPU lane and batched storage completions.
+    passing the independent block tolerance. The compact CPU executor now uses
+    a persistent 12-worker pool, consumes the same RAM record without an INT8
+    mirror, and matched all six real CUDA expert outputs exactly in 48.16 ms.
+    Next connect CPU RAM hits and resident CUDA selections to one overlapped
+    layer execution, then feed measured lane costs back into placement.
 
 ## Phase 1 — long-context and cold-path production work
 

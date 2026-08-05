@@ -11,6 +11,7 @@ add_library(expert_runtime STATIC
   src/adaptive_placement.cpp
   src/buffer_pool.cpp
   src/cache_state.cpp
+  src/cpu/deepseek_packed_executor.cpp
   src/cpu/expert_executor.cpp
   src/deepseek_catalog.cpp
   src/deepseek_expert.cpp
@@ -41,10 +42,14 @@ find_package(Threads REQUIRED)
 target_link_libraries(expert_runtime PUBLIC Threads::Threads)
 
 if(MSVC)
-  set_source_files_properties(src/cpu/expert_executor.cpp
+  set_source_files_properties(
+    src/cpu/deepseek_packed_executor.cpp
+    src/cpu/expert_executor.cpp
     PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
-  set_source_files_properties(src/cpu/expert_executor.cpp
+  set_source_files_properties(
+    src/cpu/deepseek_packed_executor.cpp
+    src/cpu/expert_executor.cpp
     PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 

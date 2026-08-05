@@ -26,6 +26,12 @@ class DeepSeekFfnState final {
   [[nodiscard]] const float* routing_weights() const noexcept {
     return routing_weights_;
   }
+  [[nodiscard]] const float* normalized_input() const noexcept {
+    return ffn_input_;
+  }
+  [[nodiscard]] const float* routed_selection_outputs() const noexcept {
+    return routed_selection_outputs_;
+  }
   [[nodiscard]] static constexpr std::uint32_t selection_count() noexcept {
     return 7U;
   }

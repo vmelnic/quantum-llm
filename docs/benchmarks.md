@@ -362,6 +362,30 @@ real `Hi` → `Hello` full-model output. The full prompt used the original
 six-extent checkpoint and rebuilt its working set, so its wall time is not
 compared with the earlier compact-pack steady-state number.
 
+## DeepSeek all-core packed-FP4 CPU gate
+
+The CPU lane consumes the same retained 13,369,344-byte records directly. It
+uses a persistent pool pinned across the 12 logical processors on the target
+Windows host, Q8-quantizes each activation once, and does not allocate a full
+INT8 copy. A varied-weight deterministic fixture first caught and rejected an
+incorrect SIMD nibble permutation that a uniform fixture had hidden.
+
+The real layer gate then executed all six routed experts on CPU and compared
+every one of the 24,576 output values with the direct packed-FP4 CUDA path:
+
+| measurement | result |
+| --- | ---: |
+| logical CPU workers engaged | 12 / 12 |
+| six-expert CPU execution | 48.162 ms |
+| six-expert CUDA execution | 4.387 ms |
+| CPU versus CUDA RMSE | 0 |
+| CPU versus CUDA maximum error | 0 |
+
+This qualifies correctness and resource use, not a CPU replacement for the hot
+GPU path. The placement policy should assign a compact RAM expert to CPU only
+when that shortens the measured critical path versus storage plus H2D, and
+should overlap that work with resident CUDA selections.
+
 ## Benchmark rules
 
 Any published result must include:

@@ -869,7 +869,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     const auto iterator = entries.find(key);
     if (iterator == entries.end()) return std::nullopt;
     auto& entry = *iterator->second;
-    if (record.source_abi != kExpertSourceAbiExpertPackV1 ||
+    if ((record.source_abi != kExpertSourceAbiExpertPackV1 &&
+         record.source_abi != kExpertSourceAbiDeepSeekCompactV1) ||
         !same_record(entry.record, record) || !entry.host_copy ||
         !entry.validated_sections ||
         (entry.state != CacheState::ram_ready &&
@@ -881,7 +882,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     Telemetry::add(metrics.acquire_ram_hits_);
     auto weak = weak_from_this();
     return HostExpertLease(
-        entry.host_copy, *entry.validated_sections,
+        entry.host_copy, *entry.validated_sections, entry.validated_compact,
+        record.source_abi,
         [weak, key]() noexcept {
           if (auto core = weak.lock()) core->release_reference(key);
         });
@@ -1093,12 +1095,15 @@ void ExpertLease::reset() noexcept {
 
 HostExpertLease::HostExpertLease(
     std::shared_ptr<const std::vector<std::byte>> bytes,
-    ExpertSections sections, std::function<void()> release) noexcept
-    : bytes_(std::move(bytes)), sections_(sections),
+    ExpertSections sections, DeepSeekCompactSections compact,
+    std::uint32_t source_abi, std::function<void()> release) noexcept
+    : bytes_(std::move(bytes)), sections_(sections), compact_(compact),
+      source_abi_(source_abi),
       release_(std::move(release)) {}
 
 HostExpertLease::HostExpertLease(HostExpertLease&& other) noexcept
     : bytes_(std::move(other.bytes_)), sections_(other.sections_),
+      compact_(other.compact_), source_abi_(other.source_abi_),
       release_(std::move(other.release_)) {}
 
 HostExpertLease& HostExpertLease::operator=(HostExpertLease&& other) noexcept {
@@ -1106,6 +1111,8 @@ HostExpertLease& HostExpertLease::operator=(HostExpertLease&& other) noexcept {
     reset();
     bytes_ = std::move(other.bytes_);
     sections_ = other.sections_;
+    compact_ = other.compact_;
+    source_abi_ = other.source_abi_;
     release_ = std::move(other.release_);
   }
   return *this;
@@ -1122,6 +1129,15 @@ std::span<const std::byte> HostExpertLease::bytes() const noexcept {
 
 const ExpertSections& HostExpertLease::sections() const noexcept {
   return sections_;
+}
+
+const DeepSeekCompactSections& HostExpertLease::compact_sections()
+    const noexcept {
+  return compact_;
+}
+
+std::uint32_t HostExpertLease::source_abi() const noexcept {
+  return source_abi_;
 }
 
 void HostExpertLease::reset() noexcept {

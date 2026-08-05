@@ -128,9 +128,13 @@ class HostExpertLease final {
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] std::span<const std::byte> bytes() const noexcept;
   [[nodiscard]] const ExpertSections& sections() const noexcept;
+  [[nodiscard]] const DeepSeekCompactSections& compact_sections()
+      const noexcept;
+  [[nodiscard]] std::uint32_t source_abi() const noexcept;
 
   HostExpertLease(std::shared_ptr<const std::vector<std::byte>> bytes,
-                  ExpertSections sections,
+                  ExpertSections sections, DeepSeekCompactSections compact,
+                  std::uint32_t source_abi,
                   std::function<void()> release) noexcept;
 
  private:
@@ -138,6 +142,8 @@ class HostExpertLease final {
 
   std::shared_ptr<const std::vector<std::byte>> bytes_;
   ExpertSections sections_{};
+  DeepSeekCompactSections compact_{};
+  std::uint32_t source_abi_{};
   std::function<void()> release_;
 };
 

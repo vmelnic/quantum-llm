@@ -5,6 +5,7 @@
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/resource_governor.hpp"
+#include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
@@ -868,6 +869,122 @@ void test_cpu_executor_writes_compact_selection_outputs() {
           "CPU executor accepted duplicate compact output slots");
 }
 
+void test_deepseek_packed_executor_engages_every_worker() {
+  constexpr std::uint32_t hidden = 32U;
+  constexpr std::uint32_t intermediate = 32U;
+  constexpr std::size_t matrix_bytes = hidden * intermediate / 2U;
+  constexpr std::size_t scale_bytes = hidden * intermediate / 32U;
+  constexpr std::size_t record_bytes = 3U * (matrix_bytes + scale_bytes);
+  std::vector<std::byte> record(record_bytes);
+  const auto fill_matrix = [&](std::size_t weight_offset,
+                               std::size_t scale_offset) {
+    for (std::size_t index = 0U; index < matrix_bytes; ++index) {
+      record[weight_offset + index] = static_cast<std::byte>(
+          (index * 37U + weight_offset / 17U + 11U) & 0xffU);
+    }
+    std::fill_n(record.begin() + scale_offset, scale_bytes,
+                std::byte{127});
+  };
+  const std::size_t w1_weight = 0U;
+  const std::size_t w1_scale = w1_weight + matrix_bytes;
+  const std::size_t w3_weight = w1_scale + scale_bytes;
+  const std::size_t w3_scale = w3_weight + matrix_bytes;
+  const std::size_t w2_weight = w3_scale + scale_bytes;
+  const std::size_t w2_scale = w2_weight + matrix_bytes;
+  fill_matrix(w1_weight, w1_scale);
+  fill_matrix(w3_weight, w3_scale);
+  fill_matrix(w2_weight, w2_scale);
+  const er::DeepSeekCompactSections sections{
+      w1_weight, matrix_bytes, w1_scale, scale_bytes,
+      w3_weight, matrix_bytes, w3_scale, scale_bytes,
+      w2_weight, matrix_bytes, w2_scale, scale_bytes};
+  const expert::runtime::cpu::DeepSeekPackedWorkGroup group{
+      record, sections, hidden, intermediate, {0U, 3U}, {1U, 0U}};
+  expert::runtime::cpu::DeepSeekPackedExecutor executor(
+      {4U, 8U, 8U, 0.0F, false, false});
+  std::vector<float> inputs(2U * hidden);
+  for (std::size_t column = 0U; column < hidden; ++column) {
+    const auto value = static_cast<float>(
+        static_cast<int>(column % 11U) - 5) * 0.125F;
+    inputs[column] = value;
+    inputs[hidden + column] = value;
+  }
+  std::vector<float> outputs(2U * hidden, -123.0F);
+  const auto status = executor.execute(std::span(&group, 1U), inputs, 2U, 2U,
+                                       outputs);
+  require(status.ok(), "packed DeepSeek CPU executor rejected valid fixture");
+  const auto decode = [](std::uint8_t code) {
+    const auto index = code & 7U;
+    const auto magnitude = index <= 4U ? static_cast<int>(index)
+                           : index == 5U ? 6
+                           : index == 6U ? 8
+                                         : 12;
+    return 0.5F * static_cast<float>((code & 8U) ? -magnitude : magnitude);
+  };
+  std::array<std::int8_t, hidden> q_input{};
+  float input_maximum = 0.0F;
+  for (std::size_t column = 0U; column < hidden; ++column)
+    input_maximum = std::max(input_maximum, std::abs(inputs[column]));
+  const auto input_scale = input_maximum / 127.0F;
+  for (std::size_t column = 0U; column < hidden; ++column) {
+    q_input[column] = static_cast<std::int8_t>(std::clamp(
+        static_cast<int>(std::nearbyint(inputs[column] / input_scale)),
+        -127, 127));
+  }
+  const auto projection = [&](std::size_t offset, std::uint32_t row,
+                              const auto& activation, float scale) {
+    float sum = 0.0F;
+    for (std::size_t column = 0U; column < activation.size(); ++column) {
+      const auto packed = std::to_integer<std::uint8_t>(
+          record[offset + static_cast<std::size_t>(row) *
+                              activation.size() / 2U +
+                 column / 2U]);
+      const auto code = (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U;
+      sum += decode(code) * static_cast<float>(activation[column]) * scale;
+    }
+    return sum;
+  };
+  std::array<float, intermediate> reference_intermediate{};
+  for (std::uint32_t row = 0U; row < intermediate; ++row) {
+    const auto gate = projection(w1_weight, row, q_input, input_scale);
+    const auto up = projection(w3_weight, row, q_input, input_scale);
+    reference_intermediate[row] =
+        (gate / (1.0F + std::exp(-gate))) * up;
+  }
+  float intermediate_maximum = 0.0F;
+  for (const auto value : reference_intermediate)
+    intermediate_maximum = std::max(intermediate_maximum, std::abs(value));
+  const auto intermediate_scale = intermediate_maximum > 0.0F
+                                      ? intermediate_maximum / 127.0F
+                                      : 1.0F;
+  std::array<std::int8_t, intermediate> q_intermediate{};
+  for (std::size_t column = 0U; column < intermediate; ++column) {
+    q_intermediate[column] = static_cast<std::int8_t>(std::clamp(
+        static_cast<int>(std::nearbyint(reference_intermediate[column] /
+                                        intermediate_scale)),
+        -127, 127));
+  }
+  for (std::size_t column = 0U; column < hidden; ++column) {
+    const auto expected = projection(w2_weight,
+                                     static_cast<std::uint32_t>(column),
+                                     q_intermediate, intermediate_scale);
+    require(std::isfinite(outputs[column]) &&
+                std::abs(outputs[column] - outputs[hidden + column]) < 1e-3F &&
+                std::abs(outputs[column] - expected) < 1e-3F,
+            "packed DeepSeek CPU decode or output mapping is incorrect: actual=" +
+                std::to_string(outputs[column]) + ", expected=" +
+                std::to_string(expected) + ", column=" +
+                std::to_string(column));
+  }
+  const auto metrics = executor.telemetry();
+  require(metrics.maximum_threads == 4U && metrics.workers_used_last == 4U &&
+              metrics.worker_mask_last == 0x0fU &&
+              metrics.execute_calls == 1U && metrics.selections == 2U &&
+              metrics.source_weight_bytes == record_bytes &&
+              metrics.compute_ns > 0U,
+          "packed DeepSeek CPU executor did not use every configured worker");
+}
+
 void test_layer_partitioned_eviction_protects_other_layers() {
   Harness harness(16384, 2, 6144, {2, 1, 0, 0});
   const auto layer0_old = make_record(30, 0, 0);
@@ -1178,6 +1295,7 @@ int main() {
     test_ram_hit_reuploads_after_vram_eviction();
     test_host_lease_protects_validated_ram_copy();
     test_cpu_executor_writes_compact_selection_outputs();
+    test_deepseek_packed_executor_engages_every_worker();
     test_layer_partitioned_eviction_protects_other_layers();
     test_frequency_admission_protects_reused_expert();
     test_routing_score_temperature_breaks_frequency_ties();

@@ -43,16 +43,25 @@ receive a separate, versioned representation because expanding all compact FP4
 experts to INT8 would increase storage and I/O without benefiting every compute
 tier.
 
-The planned SM86 placement model is:
+The implemented SM86 placement model is:
 
 1. keep the cold expert directory in compact FP4 plus scales on SSD/RAM;
-2. decode only admitted hot experts into a compute-ready RTX 3090 cache;
+2. upload admitted experts without expanding them and execute packed FP4/Q8
+   dots directly on the RTX 3090;
 3. keep dense/attention state under a separate SM86 ABI;
-4. preserve the compact source representation for future CPU and distributed
-   expert workers.
+4. expose validated compact RAM leases to an all-core CPU executor and future
+   distributed expert workers.
 
-No full conversion starts until the FP4/UE8M0 decoder, a real expert slice,
-numeric comparison, and output-space estimate pass independently.
+The FP4/UE8M0 decoder, real expert slice, direct CUDA path, and all-core CPU
+path have passed independently. A full INT8 conversion is no longer part of
+the default runtime path.
+
+Storage packing and compute packing are separate contracts. Durable Expert
+Packs make each authenticated expert contiguous for predictable I/O; the
+record inside remains native FP4/UE8M0. A catalog over original Hugging Face
+extents is a recovery/qualification path, not the production storage layout.
+The source checkpoint is retained so packs can be rebuilt after corruption or
+format changes.
 
 ## Numeric source decoding
 
@@ -62,8 +71,9 @@ values, and row/block streaming. All 16 FP4 codes and all 255 finite UE8M0 codes
 are tested; the UE8M0 NaN code, invalid geometry, and non-finite output fail
 closed.
 
-This decoder establishes source semantics only. It does not select the final
-GPU-cache representation and is not wired into Expert Pack v1.
+This decoder establishes source semantics. The runtime consumes the same byte
+order directly in CUDA and CPU kernels; Expert Pack framing changes placement
+and I/O, not the numeric representation.
 
 ## Representation estimate
 
@@ -86,8 +96,7 @@ candidate INT8 compute cache. Six selected experts for one layer require
 holds 42 such experts, before allocator/workspace overhead.
 
 Therefore eager expansion is rejected as the default direction. Compact cold
-storage plus bounded, eviction-aware compute admission remains the working ABI
-decision; the real expert slice must still validate quality and decode cost.
+storage plus bounded, eviction-aware admission is the working ABI decision.
 
 ## Real expert vertical slice
 

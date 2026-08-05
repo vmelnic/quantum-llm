@@ -7,6 +7,7 @@
 #include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
+#include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_record.hpp"
@@ -490,10 +491,10 @@ int main(int argc, char** argv) {
     auto expert_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
         17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 8U);
     er::ExpertCacheConfig expert_config;
-    expert_config.ram = {50'334'720U, 50'334'720U, 25'167'360U};
+    expert_config.ram = {128ULL << 20U, 128ULL << 20U, 64ULL << 20U};
     expert_config.vram = {7ULL * 25'198'592U, 7ULL * 25'198'592U,
                           25'198'592U};
-    expert_config.retain_host_copy = false;
+    expert_config.retain_host_copy = true;
     er::ExpertCache expert_cache(expert_config, expert_storage,
                                  expert_uploader, expert_buffers,
                                  expert_directory);
@@ -680,6 +681,80 @@ int main(int argc, char** argv) {
     check(cudaEventSynchronize(ffn_stop), "synchronize FFN");
     float ffn_ms = 0.0F;
     check(cudaEventElapsedTime(&ffn_ms, ffn_start, ffn_stop), "measure FFN");
+    std::array<std::uint32_t, 6U> cpu_route{};
+    check(cudaMemcpy(cpu_route.data(), ffn_state.state->expert_indices(),
+                     cpu_route.size() * sizeof(std::uint32_t),
+                     cudaMemcpyDeviceToHost),
+          "copy routed experts for CPU oracle");
+    std::vector<er::HostExpertLease> cpu_leases;
+    cpu_leases.reserve(cpu_route.size());
+    for (const auto expert : cpu_route) {
+      const auto spec = std::find_if(
+          ffn.begin(), ffn.begin() + 6U, [&](const auto& value) {
+            return value.key.expert == expert;
+          });
+      require(spec != ffn.begin() + 6U,
+              "CPU oracle expert is absent from the resident route");
+      auto lease = expert_cache.try_acquire_host(spec->key, spec->record,
+                                                 false);
+      require(lease.has_value(),
+              "CPU oracle expert has no retained compact RAM payload");
+      cpu_leases.push_back(std::move(*lease));
+    }
+    std::vector<float> cpu_input(4096U),
+        gpu_selection_output(6U * 4096U);
+    check(cudaMemcpy(cpu_input.data(), ffn_state.state->normalized_input(),
+                     cpu_input.size() * sizeof(float), cudaMemcpyDeviceToHost),
+          "copy FFN input for CPU oracle");
+    check(cudaMemcpy(gpu_selection_output.data(),
+                     ffn_state.state->routed_selection_outputs(),
+                     gpu_selection_output.size() * sizeof(float),
+                     cudaMemcpyDeviceToHost),
+          "copy GPU expert output for CPU oracle");
+    er::cpu::DeepSeekPackedExecutor cpu_executor({
+        std::max(1U, std::thread::hardware_concurrency()),
+        8U, 8U, 10.0F, true, true});
+    std::vector<er::cpu::DeepSeekPackedWorkGroup> cpu_groups;
+    cpu_groups.reserve(cpu_route.size());
+    for (std::uint32_t slot = 0U; slot < cpu_route.size(); ++slot) {
+      cpu_groups.push_back({cpu_leases[slot].bytes(),
+                            cpu_leases[slot].compact_sections(),
+                            4096U, 2048U, {slot}, {slot}});
+    }
+    std::vector<float> cpu_selection_output(6U * 4096U);
+    const auto cpu_started = std::chrono::steady_clock::now();
+    const auto cpu_status = cpu_executor.execute(
+        cpu_groups, cpu_input, 1U, 6U,
+        cpu_selection_output);
+    const auto cpu_stopped = std::chrono::steady_clock::now();
+    require(cpu_status.ok(), std::string(cpu_status.message()));
+    float cpu_expert_maximum = 0.0F;
+    float cpu_expert_reference_maximum = 0.0F;
+    double cpu_expert_squared = 0.0;
+    for (std::size_t index = 0U; index < cpu_selection_output.size(); ++index) {
+      const auto error = std::abs(cpu_selection_output[index] -
+                                  gpu_selection_output[index]);
+      cpu_expert_maximum = std::max(cpu_expert_maximum, error);
+      cpu_expert_reference_maximum = std::max(
+          cpu_expert_reference_maximum, std::abs(gpu_selection_output[index]));
+      cpu_expert_squared += static_cast<double>(error) * error;
+    }
+    const auto cpu_expert_rmse =
+        std::sqrt(cpu_expert_squared / cpu_selection_output.size());
+    const auto cpu_expert_relative_maximum =
+        cpu_expert_reference_maximum > 0.0F
+            ? cpu_expert_maximum / cpu_expert_reference_maximum
+            : cpu_expert_maximum;
+    require(cpu_expert_relative_maximum < 1e-3F,
+            "all-core CPU expert exceeds direct-FP4 CUDA tolerance; max=" +
+                std::to_string(cpu_expert_maximum) + ", rmse=" +
+                std::to_string(cpu_expert_rmse) + ", reference_max=" +
+                std::to_string(cpu_expert_reference_maximum) +
+                ", relative_max=" +
+                std::to_string(cpu_expert_relative_maximum));
+    const auto cpu_metrics = cpu_executor.telemetry();
+    require(cpu_metrics.workers_used_last == cpu_metrics.maximum_threads,
+            "real DeepSeek CPU expert did not engage every logical worker");
     auto release = expert_directory->release_pins(
         concurrent_directory_plan.pin_id, nullptr);
     require(release.ok(), std::string(release.message()));
@@ -1121,6 +1196,17 @@ int main(int argc, char** argv) {
               << std::chrono::duration<double, std::milli>(
                      ffn_load_stopped - ffn_load_started).count()
               << ",\"ffn_execute_ms\":" << ffn_ms
+              << ",\"cpu_expert_count\":" << cpu_route.size()
+              << ",\"cpu_expert_threads\":"
+              << cpu_metrics.workers_used_last
+              << ",\"cpu_expert_ms\":"
+              << std::chrono::duration<double, std::milli>(
+                     cpu_stopped - cpu_started).count()
+              << ",\"cpu_expert_rmse\":"
+              << cpu_expert_rmse
+              << ",\"cpu_expert_max_abs_error\":" << cpu_expert_maximum
+              << ",\"cpu_expert_max_relative_error\":"
+              << cpu_expert_relative_maximum
               << ",\"block_rmse\":"
               << std::sqrt(block_squared / token_stream_values)
               << ",\"block_max_abs_error\":" << block_maximum
