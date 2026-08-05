@@ -77,6 +77,18 @@ For a non-loopback bind, set `EXPERT_API_KEY`; the common server refuses an
 unauthenticated public bind. See [OpenAI-compatible API](openai-api.md) for
 request formats and supported compatibility behavior.
 
+After the service is ready, run one model-specific integration gate:
+
+```powershell
+./ops/windows/Invoke-DeepSeekServiceSmoke.ps1 `
+  -ExpectedBuildId (git rev-parse --short HEAD)
+```
+
+The production gate rejects a source-extent routed catalog. During backend
+development only, `-AllowSourceExtents` permits that storage mode. The gate
+checks model and bundle hashes, backend-specific prefill/KV metadata, one real
+two-token completion, metrics, and complete request/KV cleanup.
+
 ## Verified vertical slice
 
 The first service gate used the source-extent catalog while the durable pack
