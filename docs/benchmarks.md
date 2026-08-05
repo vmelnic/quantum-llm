@@ -22,6 +22,13 @@ well below the throughput target. This result establishes the complete
 attention/router/cache/MoE/HCA execution contract and locates the next compute
 boundary. It is not a full-model tokens/s claim.
 
+The separate uncompressed layer-0 gate exercises the checkpoint's
+`compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
+the full block matched its independent oracle with RMSE `3.55e-5` and maximum
+error `2.20e-4`. Its attention request state is 685,568 bytes because it owns no
+compressed/index cache. This closes a functional prerequisite for owning all
+43 layers; it is not presented as an optimization comparison with layer 2.
+
 ## Tested configuration
 
 - model: `Qwen/Qwen3-Next-80B-A3B-Instruct`;

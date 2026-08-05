@@ -152,27 +152,33 @@ std::vector<er::cuda::DeepSeekTypedSpec> typed_specs(
 
 std::vector<er::ResidentExpertSpec> ffn_specs(
     const std::filesystem::path& oracle_root,
-    const std::filesystem::path& source_root, std::uint64_t& source_bytes) {
+    const std::filesystem::path& source_root, std::uint64_t& source_bytes,
+    std::uint32_t& layer) {
   std::ifstream input(oracle_root / "ffn" / "ffn-set.tsv");
   std::string line;
   require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-ffn-route-set-v1",
+              line == "deepseek-ffn-route-set-v2",
           "invalid FFN route-set header");
   std::vector<er::ResidentExpertSpec> result;
+  layer = 43U;
   while (std::getline(input, line)) {
     const auto item = fields(line);
-    require(item.size() == 5U, "invalid FFN route-set row");
-    const auto expert = static_cast<std::uint32_t>(std::stoul(item[0]));
-    const bool shared = item[1] == "shared";
+    require(item.size() == 6U, "invalid FFN route-set row");
+    const auto item_layer = static_cast<std::uint32_t>(std::stoul(item[0]));
+    require(item_layer < 43U && (layer == 43U || layer == item_layer),
+            "FFN route set spans incompatible layers");
+    layer = item_layer;
+    const auto expert = static_cast<std::uint32_t>(std::stoul(item[1]));
+    const bool shared = item[2] == "shared";
     require((shared && expert == 256U) ||
-                (!shared && item[1] == "routed" && expert < 256U),
+                (!shared && item[2] == "routed" && expert < 256U),
             "invalid FFN route-set expert kind");
-    const auto bytes = std::stoull(item[2]);
+    const auto bytes = std::stoull(item[3]);
     require(bytes == (shared ? 25'167'360ULL : 13'369'344ULL),
             "invalid FFN source byte geometry");
     er::PayloadRecord record;
     record.extents = extents(
-        oracle_root / relative(item[4]), source_root, 6U);
+        oracle_root / relative(item[5]), source_root, 6U);
     record.stored_bytes = bytes;
     record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
     record.device_bytes = 25'198'592ULL;
@@ -181,8 +187,8 @@ std::vector<er::ResidentExpertSpec> ffn_specs(
         : er::kExpertSourceAbiDeepSeekCompactV1;
     record.alignment = er::kExpertPackAlignment;
     record.header_bytes = 0U;
-    record.payload_sha256 = digest(item[3]);
-    result.push_back({{17U, 2U, expert, er::kExpertQuantAbiDeepSeekSm86},
+    record.payload_sha256 = digest(item[4]);
+    result.push_back({{17U, layer, expert, er::kExpertQuantAbiDeepSeekSm86},
                       std::move(record)});
     source_bytes += bytes;
   }
@@ -221,6 +227,11 @@ std::vector<std::uint32_t> integers(const std::filesystem::path& path,
   return result;
 }
 
+std::uint32_t compression_ratio(std::uint32_t layer) {
+  if (layer == 0U || layer == 1U || layer == 42U) return 0U;
+  return layer % 2U == 0U ? 4U : 128U;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -237,7 +248,9 @@ int main(int argc, char** argv) {
                                    maximum_dense);
     const auto typed = typed_specs(argv[2], source, typed_source);
     std::uint64_t ffn_source = 0U;
-    const auto ffn = ffn_specs(argv[4], source, ffn_source);
+    std::uint32_t oracle_layer = 43U;
+    const auto ffn = ffn_specs(argv[4], source, ffn_source, oracle_layer);
+    const auto oracle_ratio = compression_ratio(oracle_layer);
     constexpr std::uint64_t typed_staging = 64ULL * 1024U * 1024U;
     const auto staging = std::max(maximum_dense, typed_staging);
     const auto resident_bytes = dense_device + typed_source;
@@ -282,8 +295,10 @@ int main(int argc, char** argv) {
     require(ffn_load_status.ok() && ffn_resident.size() == 7U &&
                 ffn_resident.bytes() == 7ULL * 25'198'592U,
             std::string(ffn_load_status.message()));
-    er::cuda::DeepSeekAttentionBinding ratio_four, ratio_128;
-    auto bind = model.bind_attention(2U, 4U, ratio_four);
+    er::cuda::DeepSeekAttentionBinding sliding_window, ratio_four, ratio_128;
+    auto bind = model.bind_attention(0U, 0U, sliding_window);
+    require(bind.ok(), std::string(bind.message()));
+    bind = model.bind_attention(2U, 4U, ratio_four);
     require(bind.ok(), std::string(bind.message()));
     bind = model.bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
@@ -296,6 +311,13 @@ int main(int argc, char** argv) {
     require(bind.ok() && !learned_ffn.hash_router && learned_ffn.router_bias &&
                 !learned_ffn.token_experts,
             "invalid learned FFN binding");
+    er::cuda::DeepSeekAttentionBinding oracle_attention;
+    bind = model.bind_attention(oracle_layer, oracle_ratio, oracle_attention);
+    require(bind.ok(), std::string(bind.message()));
+    er::cuda::DeepSeekFfnBinding oracle_ffn;
+    bind = model.bind_ffn(oracle_layer, oracle_ffn);
+    require(bind.ok() && oracle_ffn.hash_router,
+            "attention oracle requires a hash-routed FFN layer");
     constexpr std::size_t token_stream_values = 4U * 4096U;
     constexpr std::size_t decode_tokens = 4U;
     constexpr std::size_t stream_values = decode_tokens * token_stream_values;
@@ -338,7 +360,8 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(device_sine, host_sine.data(),
                      decode_tokens * 32U * sizeof(float), cudaMemcpyHostToDevice),
           "copy attention sine");
-    auto attention_state = er::cuda::create_deepseek_attention_state(4U, 4096U);
+    auto attention_state = er::cuda::create_deepseek_attention_state(
+        oracle_ratio, 4096U);
     require(attention_state.status.ok() && attention_state.state,
             std::string(attention_state.status.message()));
     cudaEvent_t attention_start{}, attention_stop{};
@@ -348,7 +371,7 @@ int main(int argc, char** argv) {
     std::vector<float> actual_output(stream_values);
     for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
       const auto attention_status = er::cuda::deepseek_attention_decode({
-          &ratio_four, attention_state.state.get(),
+          &oracle_attention, attention_state.state.get(),
           device_streams + position * token_stream_values,
           device_output + position * token_stream_values,
           device_cosine + position * 32U, device_sine + position * 32U,
@@ -363,7 +386,7 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(actual_output.data(), device_output,
                      stream_values * sizeof(float), cudaMemcpyDeviceToHost),
           "copy attention output");
-    auto ffn_state = er::cuda::create_deepseek_ffn_state(2U);
+    auto ffn_state = er::cuda::create_deepseek_ffn_state(oracle_layer);
     require(ffn_state.status.ok() && ffn_state.state,
             std::string(ffn_state.status.message()));
     cudaEvent_t router_start{}, router_stop{};
@@ -372,7 +395,7 @@ int main(int argc, char** argv) {
     check(cudaEventRecord(router_start), "record router start");
     for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
       const auto route_status = er::cuda::deepseek_ffn_route({
-          &hash_ffn, ffn_state.state.get(),
+          &oracle_ffn, ffn_state.state.get(),
           device_output + position * token_stream_values, position,
           1e-6F, 20U, nullptr});
       require(route_status.ok(), std::string(route_status.message()));
@@ -386,7 +409,7 @@ int main(int argc, char** argv) {
     std::vector<std::uint32_t> actual_router_indices(router_values);
     for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
       const auto route_status = er::cuda::deepseek_ffn_route({
-          &hash_ffn, ffn_state.state.get(),
+          &oracle_ffn, ffn_state.state.get(),
           device_output + position * token_stream_values, position,
           1e-6F, 20U, nullptr});
       require(route_status.ok(), std::string(route_status.message()));
@@ -411,11 +434,11 @@ int main(int argc, char** argv) {
     require(router_maximum < 1e-3F,
             "hash router weights exceed oracle tolerance");
     const auto final_route = er::cuda::deepseek_ffn_route({
-        &hash_ffn, ffn_state.state.get(),
+        &oracle_ffn, ffn_state.state.get(),
         device_output + 3U * token_stream_values, 3U, 1e-6F, 20U, nullptr});
     require(final_route.ok(), std::string(final_route.message()));
     const auto directory_plan = expert_directory->pin_or_collect_misses(
-        2U, ffn_state.state->expert_indices(),
+        oracle_layer, ffn_state.state->expert_indices(),
         ffn_state.state->selection_count(), nullptr);
     require(directory_plan.status.ok() &&
                 directory_plan.missing_experts.empty() &&
@@ -430,7 +453,7 @@ int main(int argc, char** argv) {
     check(cudaEventCreate(&ffn_stop), "create FFN stop event");
     check(cudaEventRecord(ffn_start), "record FFN start");
     const auto ffn_status = er::cuda::deepseek_ffn_execute({
-        &hash_ffn, ffn_state.state.get(), expert_directory->device_entries(),
+        &oracle_ffn, ffn_state.state.get(), expert_directory->device_entries(),
         device_output + 3U * token_stream_values, device_block_output,
         257U, nullptr});
     require(ffn_status.ok(), std::string(ffn_status.message()));
@@ -486,7 +509,10 @@ int main(int argc, char** argv) {
               << ",\"resident_bytes\":" << model.bytes()
               << ",\"staging_bytes\":" << staging
               << ",\"startup_ms\":" << startup_ms
-              << ",\"ratio4_bound\":true,\"ratio128_bound\":true"
+              << ",\"oracle_layer\":" << oracle_layer
+              << ",\"compress_ratio\":" << oracle_ratio
+              << ",\"ratio0_bound\":true,\"ratio4_bound\":true"
+              << ",\"ratio128_bound\":true"
               << ",\"hash_ffn_bound\":true,\"learned_ffn_bound\":true"
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
               << ",\"decode_tokens\":" << decode_tokens

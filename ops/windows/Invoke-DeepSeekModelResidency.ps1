@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
-    [string]$Snapshot
+    [string]$Snapshot,
+    [ValidateSet(0, 2)][int]$OracleLayer = 2
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -32,7 +33,7 @@ try {
         --output $typed | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek typed-set export failed" }
     & $python.Source -m compiler export-deepseek-attention-oracle --source $source `
-        --output $oracle --layer 2 | Out-Null
+        --output $oracle --layer $OracleLayer | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek attention oracle export failed" }
     $nativeRaw = & $executable $dense $typed $source $oracle | Out-String
     if ($LASTEXITCODE -ne 0) {

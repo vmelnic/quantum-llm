@@ -584,9 +584,13 @@ def export_deepseek_attention_oracle(
     if np is None:
         raise SourceFormatError("NumPy is required for DeepSeek attention oracle")
     validate_deepseek_v4_source(checkpoint)
-    if layer != 2:
-        raise AdapterError("the first complete attention oracle targets ratio-4 layer 2")
+    if layer not in (0, 2):
+        raise AdapterError(
+            "the complete attention oracle targets sliding-window layer 0 "
+            "or ratio-4 layer 2"
+        )
     prefix = f"layers.{layer}"
+    ratio = int(checkpoint.config["compress_ratios"][layer])
 
     def tensor(name: str, shape: tuple[int, ...], dtype: str) -> object:
         info = checkpoint.tensors[name]
@@ -606,35 +610,49 @@ def export_deepseek_attention_oracle(
     query_norm = tensor(prefix + ".attn.q_norm.weight", (1024,), "BF16")
     kv_norm = tensor(prefix + ".attn.kv_norm.weight", (512,), "BF16")
     sink = tensor(prefix + ".attn.attn_sink", (64,), "F32")
-    compressor = prefix + ".attn.compressor"
-    compressor_wkv = tensor(compressor + ".wkv.weight", (1024, 4096), "BF16")
-    compressor_wgate = tensor(compressor + ".wgate.weight", (1024, 4096), "BF16")
-    compressor_ape = tensor(compressor + ".ape", (4, 1024), "F32")
-    compressor_norm = tensor(compressor + ".norm.weight", (512,), "BF16")
+    compressor_wkv = compressor_wgate = compressor_ape = compressor_norm = None
+    if ratio:
+        compressor = prefix + ".attn.compressor"
+        width = 1024 if ratio == 4 else 512
+        compressor_wkv = tensor(
+            compressor + ".wkv.weight", (width, 4096), "BF16"
+        )
+        compressor_wgate = tensor(
+            compressor + ".wgate.weight", (width, 4096), "BF16"
+        )
+        compressor_ape = tensor(
+            compressor + ".ape", (ratio, width), "F32"
+        )
+        compressor_norm = tensor(compressor + ".norm.weight", (512,), "BF16")
 
     rope = checkpoint.config["rope_scaling"]
     rope_dim = 64
-    rope_base = float(checkpoint.config["compress_rope_theta"])
-    original = int(rope["original_max_position_embeddings"])
-    factor = float(rope["factor"])
-    beta_fast = float(rope["beta_fast"])
-    beta_slow = float(rope["beta_slow"])
+    rope_base = float(
+        checkpoint.config["compress_rope_theta"] if ratio
+        else checkpoint.config["rope_theta"]
+    )
     frequencies = 1.0 / (
         rope_base ** (np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim)
     )
 
-    def correction(rotation: float) -> float:
-        return rope_dim * math.log(original / (rotation * 2 * math.pi)) / \
-            (2 * math.log(rope_base))
+    if ratio:
+        original = int(rope["original_max_position_embeddings"])
+        factor = float(rope["factor"])
+        beta_fast = float(rope["beta_fast"])
+        beta_slow = float(rope["beta_slow"])
 
-    low = max(math.floor(correction(beta_fast)), 0)
-    high = min(math.ceil(correction(beta_slow)), rope_dim - 1)
-    ramp = np.clip(
-        (np.arange(rope_dim // 2, dtype=np.float32) - low) /
-        np.float32(high - low if high != low else 0.001), 0, 1,
-    )
-    smooth = 1 - ramp
-    frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
+        def correction(rotation: float) -> float:
+            return rope_dim * math.log(original / (rotation * 2 * math.pi)) / \
+                (2 * math.log(rope_base))
+
+        low = max(math.floor(correction(beta_fast)), 0)
+        high = min(math.ceil(correction(beta_slow)), rope_dim - 1)
+        ramp = np.clip(
+            (np.arange(rope_dim // 2, dtype=np.float32) - low) /
+            np.float32(high - low if high != low else 0.001), 0, 1,
+        )
+        smooth = 1 - ramp
+        frequencies = frequencies / factor * (1 - smooth) + frequencies * smooth
     angles = np.arange(4, dtype=np.float32)[:, None] * frequencies[None, :]
     cosines = np.cos(angles).astype(np.float32)
     sines = np.sin(angles).astype(np.float32)
@@ -686,13 +704,14 @@ def export_deepseek_attention_oracle(
         )
         window_cache.append(_bf16_to_f32(cache_words.tobytes(), (512,)))
         selected = list(window_cache)
-        if position == 3:
+        if ratio and (position + 1) % ratio == 0:
             compressed = _deepseek_csa_reference(
                 np.asarray(attention_inputs), compressor_wkv,
-                compressor_wgate, compressor_ape, compressor_norm, ratio=4,
+                compressor_wgate, compressor_ape, compressor_norm, ratio=ratio,
             )
             compressed_words = _deepseek_compressed_kv_reference(
-                compressed, cosines[0], sines[0]
+                compressed, cosines[position + 1 - ratio],
+                sines[position + 1 - ratio]
             )
             selected.append(_bf16_to_f32(compressed_words.tobytes(), (512,)))
         selected_values = np.asarray(selected, dtype=np.float32)
@@ -902,10 +921,10 @@ def export_deepseek_attention_oracle(
         "descriptor": str(relative / "extents.tsv"),
     })
     with (ffn_root / "ffn-set.tsv").open("x", encoding="utf-8", newline="\n") as index:
-        index.write("deepseek-ffn-route-set-v1\n")
+        index.write("deepseek-ffn-route-set-v2\n")
         for entry in ffn_entries:
             index.write(
-                f"{entry['expert']}\t{entry['kind']}\t{entry['bytes']}\t"
+                f"{layer}\t{entry['expert']}\t{entry['kind']}\t{entry['bytes']}\t"
                 f"{entry['sha256']}\t{entry['descriptor']}\n"
             )
         index.flush()
@@ -941,7 +960,7 @@ def export_deepseek_attention_oracle(
     result = {
         "format": "deepseek-attention-decode4-oracle-v1",
         "layer": layer,
-        "compress_ratio": 4,
+        "compress_ratio": ratio,
         "positions": [0, 3],
         "stream_values": int(streams.size),
         "output_values": int(updated.size),

@@ -168,5 +168,8 @@ independently proven.
 - Complete: the first real layer-2 block composes compressed attention,
   routing, directory pinning, six routed experts, shared expert and FFN HCA;
   maximum full-block error is `4.76e-4`.
+- Complete: ratio-zero layers execute the checkpoint's pure 128-token
+  sliding-window path without synthetic compressor state; a real layer-0 block
+  matched its independent oracle within `2.20e-4` maximum error.
 - Next: extend the block owner across 43 layers and move the dominant dense/MoE
   paths to batch/tensor-core execution with overlapped expert readiness.

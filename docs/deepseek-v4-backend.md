@@ -501,3 +501,17 @@ This is architectural correctness, not the throughput target: if every one of
 per generated token. The next phase must extend ownership across all layers
 while replacing per-token GEMV-style work with batch/tensor-core execution and
 overlapping expert readiness across requests.
+
+### Pure sliding-window layers
+
+Layers 0, 1, and 42 have `compress_ratio=0` in the pinned source contract. They
+do not instantiate a compressor or indexer and use only the 128-token circular
+window with base RoPE. The runtime now treats zero as a first-class attention
+mode: its state allocates no compressed/index cache, its binding requires no
+compressor tensors, and decode never performs compressor work or divides by a
+ratio.
+
+A real layer-0 four-token block passed the independent checkpoint oracle with
+attention RMSE `1.18e-5`, maximum attention error `1.41e-4`, full-block RMSE
+`3.55e-5`, and maximum full-block error `2.20e-4`. This validates the missing
+schedule endpoint required before a 43-layer request owner can be constructed.

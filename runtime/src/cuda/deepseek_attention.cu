@@ -53,7 +53,8 @@ void DeepSeekAttentionState::map(void* raw_base) noexcept {
   Arena arena{base};
   const auto compressed = max_compressed_;
   const auto ratio = ratio_;
-  const auto compressor_width = ratio == 4U ? 1024U : 512U;
+  const auto compressor_width = ratio == 4U ? 1024U :
+                                ratio == 128U ? 512U : 0U;
   const auto selected = kWindow +
       (ratio == 4U ? std::min(kIndexTopK, compressed) : compressed);
   kv_cache_ = arena.take<std::uint16_t>(
@@ -81,10 +82,10 @@ void DeepSeekAttentionState::map(void* raw_base) noexcept {
   attention_output_ = arena.take<float>(kHeads * kHeadDim);
   group_output_ = arena.take<float>(8192U);
   sublayer_ = arena.take<float>(kHidden);
-  compress_values_ = arena.take<float>(compressor_width);
-  compress_scores_ = arena.take<float>(compressor_width);
-  compress_pooled_ = arena.take<float>(kHeadDim);
-  compress_output_ = arena.take<float>(kHeadDim);
+  compress_values_ = ratio != 0U ? arena.take<float>(compressor_width) : nullptr;
+  compress_scores_ = ratio != 0U ? arena.take<float>(compressor_width) : nullptr;
+  compress_pooled_ = ratio != 0U ? arena.take<float>(kHeadDim) : nullptr;
+  compress_output_ = ratio != 0U ? arena.take<float>(kHeadDim) : nullptr;
   if (ratio == 4U) {
     index_query_ = arena.take<float>(kHeads * 128U);
     index_head_weights_ = arena.take<float>(kHeads);
@@ -179,10 +180,13 @@ Status check_binding(const DeepSeekAttentionBinding& weights,
       !weights.wo_a.weights || !weights.wo_b.weights ||
       !weights.attention_norm || !weights.query_norm || !weights.kv_norm ||
       !weights.attention_sink || !weights.hca_function || !weights.hca_base ||
-      !weights.hca_scale || !weights.compressor_wkv ||
-      !weights.compressor_wgate || !weights.compressor_ape ||
-      !weights.compressor_norm)
+      !weights.hca_scale)
     return {ErrorCode::invalid_argument, "incomplete DeepSeek attention binding"};
+  if (state.compress_ratio() != 0U &&
+      (!weights.compressor_wkv || !weights.compressor_wgate ||
+       !weights.compressor_ape || !weights.compressor_norm))
+    return {ErrorCode::invalid_argument,
+            "incomplete DeepSeek compressed attention binding"};
   if (state.compress_ratio() == 4U &&
       (!weights.index_wq_b.weights || !weights.index_weights ||
        !weights.index_compressor_wkv || !weights.index_compressor_wgate ||
@@ -210,11 +214,11 @@ std::uint64_t DeepSeekAttentionState::bytes() const noexcept {
 
 DeepSeekAttentionStateResult create_deepseek_attention_state(
     std::uint32_t ratio, std::uint32_t max_context) noexcept {
-  if ((ratio != 4U && ratio != 128U) || max_context == 0U ||
+  if ((ratio != 0U && ratio != 4U && ratio != 128U) || max_context == 0U ||
       max_context > 1'048'576U)
     return {{ErrorCode::invalid_argument,
              "unsupported DeepSeek attention state geometry"}, {}};
-  const auto compressed = max_context / ratio;
+  const auto compressed = ratio == 0U ? 0U : max_context / ratio;
   DeepSeekAttentionState sizing(nullptr, 0U, ratio, max_context, compressed);
   sizing.map(nullptr);
   void* allocation = nullptr;
@@ -228,9 +232,11 @@ DeepSeekAttentionStateResult create_deepseek_attention_state(
   error = cudaMemset(allocation, 0, state->allocation_bytes_);
   if (error != cudaSuccess)
     return {failure(error, "DeepSeek attention state reset"), {}};
-  auto compressor = create_deepseek_compressor_state(ratio, 512U);
-  if (!compressor.status.ok()) return {compressor.status, {}};
-  state->compressor_ = std::move(compressor.state);
+  if (ratio != 0U) {
+    auto compressor = create_deepseek_compressor_state(ratio, 512U);
+    if (!compressor.status.ok()) return {compressor.status, {}};
+    state->compressor_ = std::move(compressor.state);
+  }
   if (ratio == 4U) {
     auto index = create_deepseek_compressor_state(4U, 128U);
     if (!index.status.ok()) return {index.status, {}};
@@ -249,7 +255,8 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
   if (!status.ok()) return status;
   auto& state = *launch.state;
   const auto& weights = *launch.weights;
-  const bool emits = (launch.position + 1U) % state.ratio_ == 0U;
+  const bool emits = state.ratio_ != 0U &&
+                     (launch.position + 1U) % state.ratio_ == 0U;
   if (emits && (!launch.compressed_cosine || !launch.compressed_sine))
     return {ErrorCode::invalid_argument, "missing compressed-position RoPE"};
   auto raw_stream = static_cast<cudaStream_t>(launch.stream);
@@ -287,27 +294,31 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
       launch.position % kWindow, launch.stream);
   if (!status.ok()) return status;
 
-  const auto width = state.ratio_ == 4U ? 1024U : 512U;
-  status = gemv_bf16(weights.compressor_wkv, width, kHidden,
-                     state.attention_input_, state.compress_values_,
-                     launch.stream);
-  if (!status.ok()) return status;
-  status = gemv_bf16(weights.compressor_wgate, width, kHidden,
-                     state.attention_input_, state.compress_scores_,
-                     launch.stream);
-  if (!status.ok()) return status;
-  status = deepseek_compressor_decode(
-      *state.compressor_, state.compress_values_, state.compress_scores_,
-      weights.compressor_ape, weights.compressor_norm, state.compress_pooled_,
-      state.compress_output_, launch.position, launch.epsilon, launch.stream);
-  if (!status.ok()) return status;
-  const auto compressed_count = (launch.position + 1U) / state.ratio_;
-  if (emits) {
-    status = deepseek_compressed_kv_publish(
-        state.compress_output_, launch.compressed_cosine,
-        launch.compressed_sine, state.kv_cache_,
-        kWindow + compressed_count - 1U, launch.stream);
+  std::uint32_t compressed_count = 0U;
+  if (state.ratio_ != 0U) {
+    const auto width = state.ratio_ == 4U ? 1024U : 512U;
+    status = gemv_bf16(weights.compressor_wkv, width, kHidden,
+                       state.attention_input_, state.compress_values_,
+                       launch.stream);
     if (!status.ok()) return status;
+    status = gemv_bf16(weights.compressor_wgate, width, kHidden,
+                       state.attention_input_, state.compress_scores_,
+                       launch.stream);
+    if (!status.ok()) return status;
+    status = deepseek_compressor_decode(
+        *state.compressor_, state.compress_values_, state.compress_scores_,
+        weights.compressor_ape, weights.compressor_norm,
+        state.compress_pooled_, state.compress_output_, launch.position,
+        launch.epsilon, launch.stream);
+    if (!status.ok()) return status;
+    compressed_count = (launch.position + 1U) / state.ratio_;
+    if (emits) {
+      status = deepseek_compressed_kv_publish(
+          state.compress_output_, launch.compressed_cosine,
+          launch.compressed_sine, state.kv_cache_,
+          kWindow + compressed_count - 1U, launch.stream);
+      if (!status.ok()) return status;
+    }
   }
 
   const auto window_count = std::min(launch.position + 1U, kWindow);

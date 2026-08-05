@@ -22,7 +22,9 @@ This roadmap records direction, not a compatibility promise.
    and attention into the first complete transformer block.~~ Qualified on the
    real layer-2 compressed token with an independent full-block oracle.
 6. Extend ownership/state across 43 layers, then add embedding, head,
-   tokenizer, sampling, and the HTTP worker boundary.
+   tokenizer, sampling, and the HTTP worker boundary. The ratio-zero pure
+   sliding-window path used by layers 0, 1, and 42 is complete and independently
+   qualified; the transactional 43-layer owner is next.
 
 ## Phase 1 — long-context and cold-path production work
 

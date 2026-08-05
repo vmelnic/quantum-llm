@@ -61,7 +61,8 @@ struct DeepSeekAttentionStateResult final {
   std::shared_ptr<DeepSeekAttentionState> state;
 };
 
-// Allocates all per-request CSA cache/workspace up front. No allocation occurs
+// Allocates all per-request sliding-window/CSA cache and workspace up front.
+// Ratio zero is the checkpoint's pure sliding-window mode. No allocation occurs
 // in deepseek_attention_decode.
 [[nodiscard]] DeepSeekAttentionStateResult create_deepseek_attention_state(
     std::uint32_t compress_ratio, std::uint32_t max_context_tokens) noexcept;
