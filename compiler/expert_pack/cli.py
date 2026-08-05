@@ -11,6 +11,7 @@ from .deepseek_v4 import (
     estimate_deepseek_v4_representations,
     validate_deepseek_v4_source,
 )
+from .deepseek_slice import qualify_deepseek_expert
 from .errors import ExpertPackError
 from .safetensors import SafeTensorCheckpoint
 from .source_inventory import inspect_source
@@ -59,6 +60,16 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="derive DeepSeek compact/eager/hot-cache payload sizes without conversion",
     )
+
+    slice_parser = commands.add_parser(
+        "qualify-deepseek-expert",
+        help="decode one complete real expert and compare candidate INT8 with PyTorch",
+    )
+    slice_parser.add_argument("--source", type=Path, required=True)
+    slice_parser.add_argument("--layer", type=int, default=0)
+    slice_parser.add_argument("--expert", type=int, default=0)
+    slice_parser.add_argument("--row-chunk", type=int, default=128)
+    slice_parser.add_argument("--no-torch-reference", action="store_true")
     return parser
 
 
@@ -82,7 +93,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "validate":
             result = validate_container(args.container)
-        else:
+        elif args.command == "inspect-source":
             checkpoint = SafeTensorCheckpoint(args.source)
             result = inspect_source(
                 checkpoint,
@@ -96,6 +107,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 result["representation_estimates"] = (
                     estimate_deepseek_v4_representations(checkpoint)
                 )
+        else:
+            result = qualify_deepseek_expert(
+                SafeTensorCheckpoint(args.source),
+                layer=args.layer,
+                expert=args.expert,
+                row_chunk=args.row_chunk,
+                torch_reference=not args.no_torch_reference,
+            )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
         return 2

@@ -41,6 +41,12 @@ eager FP8, eager INT8-per-row, and one-expert hot-cache payload sizes. The
 estimate reads metadata only and explicitly excludes container/runtime
 overhead.
 
+`qualify-deepseek-expert` is the bounded payload gate. It decodes one complete
+real routed expert, checks every result bit against PyTorch's UE8M0 semantics,
+and reports deterministic candidate INT8 hashes/error metrics without retaining
+converted weights. NumPy and a PyTorch build with `float8_e8m0fnu` are required
+on the qualification host.
+
 ## Install
 
 From the repository root:

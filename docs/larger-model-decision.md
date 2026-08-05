@@ -98,5 +98,7 @@ independently proven.
 - Complete: pinned download and independent index/shard verification.
 - Complete: read-only dtype inventory and exhaustive source metadata contract.
 - Complete: FP4 E2M1 and UE8M0 numerical decoding with exhaustive value tests.
-- Next: one real routed expert slice, trusted-reference comparison, and
-  representation/space measurements before any full conversion.
+- Complete: one real routed expert slice, bitwise PyTorch reference comparison,
+  INT8 error metrics, and metadata-derived representation/space measurements.
+- Next: freeze the compact-source/hot-cache ABI and implement an SM86 expert
+  admission plus GEMM vertical slice before any full conversion.

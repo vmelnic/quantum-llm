@@ -12,9 +12,30 @@ from compiler.expert_pack.deepseek_quant import (
     iter_scaled_fp4_e2m1_blocks,
 )
 from compiler.expert_pack.errors import SourceFormatError
+from compiler.expert_pack.deepseek_slice import _decode_numpy
+
+try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_numpy_slice_decoder_matches_dependency_free_decoder(self) -> None:
+        packed = bytes((0x21,)) * 16 + bytes((0x76,)) * 16
+        expected = decode_scaled_fp4_e2m1_row(packed, bytes((127, 128)))
+        actual = _decode_numpy(
+            np.frombuffer(packed, dtype=np.uint8).reshape(1, 32),
+            np.frombuffer(bytes((127, 128)), dtype=np.uint8).reshape(1, 2),
+        )
+        self.assertEqual(tuple(float(value) for value in actual[0]), expected)
+        with self.assertRaisesRegex(SourceFormatError, "NaN"):
+            _decode_numpy(
+                np.frombuffer(bytes(16), dtype=np.uint8).reshape(1, 16),
+                np.frombuffer(bytes((255,)), dtype=np.uint8).reshape(1, 1),
+            )
+
     def test_all_e2m1_codes_and_packed_order(self) -> None:
         packed = bytes((high << 4) | low for low, high in zip(range(8), range(8, 16)))
         expected = tuple(

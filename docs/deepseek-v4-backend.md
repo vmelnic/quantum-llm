@@ -88,3 +88,27 @@ holds 42 such experts, before allocator/workspace overhead.
 Therefore eager expansion is rejected as the default direction. Compact cold
 storage plus bounded, eviction-aware compute admission remains the working ABI
 decision; the real expert slice must still validate quality and decode cost.
+
+## Real expert vertical slice
+
+`qualify-deepseek-expert` reads all three projections of one routed expert,
+decodes them in bounded row chunks, compares every decoded FP32 bit with an
+independent PyTorch `float8_e8m0fnu` reference, and incrementally hashes a
+candidate INT8-per-row representation. It retains no converted weight file.
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler qualify-deepseek-expert `
+  --source C:\path\to\snapshot --layer 0 --expert 0 --row-chunk 128
+```
+
+The first complete slice (layer 0, expert 0) processed 25,165,824 logical
+values from 13,369,344 source bytes. Reference equality was bitwise exact. The
+25,198,592-byte INT8 candidate measured RMSE 0.0002269152 and maximum absolute
+error 0.0007381886. End-to-end qualification, including the PyTorch comparison,
+took about two seconds on the target host. Row chunks of 64 and 256 produced
+the same candidate SHA-256, proving that chunking does not alter the candidate
+byte stream.
+
+This passes source decode correctness for one complete expert. It does not yet
+prove model-level quality, CUDA kernel throughput, cache admission latency, or
+the final on-disk/cache ABI.
