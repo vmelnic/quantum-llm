@@ -14,7 +14,7 @@ from compiler.expert_pack.deepseek_quant import (
     iter_scaled_fp4_e2m1_blocks,
 )
 from compiler.expert_pack.errors import SourceFormatError
-from compiler.expert_pack.deepseek_slice import _decode_numpy
+from compiler.expert_pack.deepseek_slice import _decode_numpy, _deepseek_hca_reference
 
 try:
     import numpy as np
@@ -23,6 +23,22 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_hca_reference_preserves_doubly_stochastic_contract(self) -> None:
+        streams = np.arange(32, dtype=np.float32).reshape(4, 8) / 32
+        fn = np.zeros((24, 32), dtype=np.float32)
+        base = np.zeros(24, dtype=np.float32)
+        scale = np.ones(3, dtype=np.float32)
+        pre, post, comb, collapsed, updated = _deepseek_hca_reference(
+            streams, fn, base, scale
+        )
+        self.assertTrue(np.allclose(pre, 0.500001))
+        self.assertTrue(np.allclose(post, 1.0))
+        self.assertTrue(np.allclose(comb.sum(axis=0), 1.0, atol=2e-6))
+        self.assertTrue(np.allclose(comb.sum(axis=1), 1.0, atol=2e-6))
+        self.assertEqual(collapsed.shape, (8,))
+        self.assertEqual(updated.shape, (4, 8))
+
     def test_e4m3fn_finite_table_and_nan_codes(self) -> None:
         self.assertEqual(decode_fp8_e4m3fn(0x00), 0.0)
         self.assertEqual(decode_fp8_e4m3fn(0x01), 2.0**-9)

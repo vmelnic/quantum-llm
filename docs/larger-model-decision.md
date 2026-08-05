@@ -124,5 +124,8 @@ independently proven.
   real layer-0 query projection with an exact candidate hash.
 - Complete: all 236 main-model FP8 matrices load atomically as 4.78 GB of
   resident, named device state through one 33.6 MB staging slot.
-- Next: implement typed HCA and CSA/attention execution, then compose dense and
+- Complete: the real layer-0 attention HCA site runs its exact F32
+  RMS-rescale, 24-way projection, sigmoid controls, 20-step Sinkhorn stream
+  mixer, collapse, and expansion on CUDA against an independent oracle.
+- Next: implement typed CSA/attention execution, then compose dense, HCA, and
   shared ownership in the first model-layer runtime.

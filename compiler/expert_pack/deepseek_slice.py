@@ -423,6 +423,139 @@ def qualify_deepseek_fp8_matrix(
     }
 
 
+def _deepseek_hca_reference(
+    streams: object,
+    fn: object,
+    base: object,
+    scale: object,
+    *,
+    epsilon: float = 1e-6,
+    sinkhorn_iterations: int = 20,
+) -> tuple[object, object, object, object, object]:
+    """Reference the official DeepSeek-V4 mHC pre/post equations in FP32."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek HCA qualification")
+    streams = np.asarray(streams, dtype=np.float32)
+    fn = np.asarray(fn, dtype=np.float32)
+    base = np.asarray(base, dtype=np.float32)
+    scale = np.asarray(scale, dtype=np.float32)
+    if streams.ndim != 2 or fn.shape != (24, streams.size) or base.shape != (24,):
+        raise SourceFormatError("invalid DeepSeek HCA reference geometry")
+    if streams.shape[0] != 4 or scale.shape != (3,) or sinkhorn_iterations <= 0:
+        raise SourceFormatError("invalid DeepSeek HCA reference configuration")
+    flat = streams.reshape(-1)
+    inverse_rms = np.float32(
+        1.0 / math.sqrt(float(np.mean(np.square(flat, dtype=np.float32))) + epsilon)
+    )
+    mixes = np.matmul(fn, flat, dtype=np.float32) * inverse_rms
+    pre_logits, post_logits, comb_logits = np.split(mixes, (4, 8))
+    pre = 1.0 / (1.0 + np.exp(-(pre_logits * scale[0] + base[:4]))) + epsilon
+    post = 2.0 / (1.0 + np.exp(-(post_logits * scale[1] + base[4:8])))
+    comb_logits = comb_logits.reshape(4, 4) * scale[2] + base[8:].reshape(4, 4)
+    shifted = comb_logits - np.max(comb_logits, axis=-1, keepdims=True)
+    comb = np.exp(shifted)
+    comb /= np.sum(comb, axis=-1, keepdims=True)
+    comb += epsilon
+    comb /= np.sum(comb, axis=-2, keepdims=True) + epsilon
+    for _ in range(sinkhorn_iterations - 1):
+        comb /= np.sum(comb, axis=-1, keepdims=True) + epsilon
+        comb /= np.sum(comb, axis=-2, keepdims=True) + epsilon
+    collapsed = np.sum(pre[:, None] * streams, axis=0, dtype=np.float32)
+
+    # Exercise hc_post independently of attention/MLP with a stable sublayer
+    # vector. The complete layer will later substitute the real sublayer output.
+    dimension = streams.shape[1]
+    positions = np.arange(dimension, dtype=np.float32)
+    sublayer = np.sin(positions * np.float32(0.013)) * np.float32(0.125)
+    updated = post[:, None] * sublayer[None, :] + np.matmul(comb.T, streams)
+    return tuple(
+        np.asarray(value, dtype="<f4")
+        for value in (pre, post, comb, collapsed, updated)
+    )
+
+
+def export_deepseek_hca_slice(
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    layer: int,
+    site: str,
+    output: Path,
+) -> dict[str, object]:
+    """Describe one real HCA site and emit a small deterministic FP32 oracle."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek HCA qualification")
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= layer < 43 or site not in ("attn", "ffn"):
+        raise AdapterError("DeepSeek HCA key is outside configured bounds")
+    prefix = f"layers.{layer}.hc_{site}"
+    names = (f"{prefix}_fn", f"{prefix}_base", f"{prefix}_scale")
+    expected = ((24, 16384), (24,), (3,))
+    for name, shape in zip(names, expected):
+        info = checkpoint.tensors.get(name)
+        if info is None or info.dtype != "F32" or info.shape != shape:
+            raise SourceFormatError(f"invalid DeepSeek HCA tensor: {name}")
+
+    manifest = _export_deepseek_extents(
+        checkpoint,
+        names=names,
+        output=output,
+        layer=layer,
+        expert=f"hc_{site}",
+        format_name="deepseek-hca-slice-v1",
+        source_abi="deepseek-hca-f32-v1",
+        target_abi="deepseek-hca-sm86-f32-v1",
+    )
+    arrays: list[object] = []
+    for name, shape in zip(names, expected):
+        with checkpoint.open_tensor(name) as view:
+            arrays.append(np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy())
+    fn, base, scale = arrays
+    positions = np.arange(16384, dtype=np.float32)
+    streams = (
+        np.sin(positions * np.float32(0.007)) * np.float32(0.2)
+        + np.cos(positions * np.float32(0.003)) * np.float32(0.05)
+    ).reshape(4, 4096).astype("<f4")
+    pre, post, comb, collapsed, updated = _deepseek_hca_reference(
+        streams, fn, base, scale
+    )
+    sublayer = (
+        np.sin(np.arange(4096, dtype=np.float32) * np.float32(0.013))
+        * np.float32(0.125)
+    ).astype("<f4")
+    oracle_arrays = (streams, sublayer, pre, post, comb, collapsed, updated)
+    oracle_path = output / "oracle.f32"
+    with oracle_path.open("xb") as oracle:
+        for array in oracle_arrays:
+            oracle.write(array.tobytes(order="C"))
+        oracle.flush()
+        os.fsync(oracle.fileno())
+    oracle_bytes = oracle_path.stat().st_size
+    oracle_sha256 = hashlib.sha256(oracle_path.read_bytes()).hexdigest()
+    qualification = {
+        "format": "deepseek-hca-oracle-v1",
+        "layer": layer,
+        "site": site,
+        "hidden_size": 4096,
+        "hc_mult": 4,
+        "sinkhorn_iterations": 20,
+        "epsilon": 1e-6,
+        "oracle": oracle_path.name,
+        "oracle_f32_values": sum(int(array.size) for array in oracle_arrays),
+        "oracle_bytes": oracle_bytes,
+        "oracle_sha256": oracle_sha256,
+        "pre_sum": float(np.sum(pre)),
+        "post_sum": float(np.sum(post)),
+        "comb_row_sums": [float(value) for value in np.sum(comb, axis=1)],
+        "comb_column_sums": [float(value) for value in np.sum(comb, axis=0)],
+    }
+    atomic_json(output / "oracle.json", qualification)
+    manifest["oracle"] = qualification
+    atomic_json(output / "manifest.json", manifest)
+    return manifest
+
+
 def _export_deepseek_extents(
     checkpoint: SafeTensorCheckpoint,
     *,
@@ -432,6 +565,7 @@ def _export_deepseek_extents(
     expert: int | str,
     format_name: str,
     source_abi: str,
+    target_abi: str = "deepseek-sm86-int8-per-row-v1",
 ) -> dict[str, object]:
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
@@ -473,7 +607,7 @@ def _export_deepseek_extents(
         manifest = {
             "format": format_name,
             "source_abi": source_abi,
-            "target_abi": "deepseek-sm86-int8-per-row-v1",
+            "target_abi": target_abi,
             "layer": layer,
             "expert": expert,
             "bytes": total_bytes,

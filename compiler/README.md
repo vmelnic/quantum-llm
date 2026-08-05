@@ -70,6 +70,12 @@ directory.
 main-model FP8 matrices. The descriptor set is metadata only; the authoritative
 4.78 GB of weights remains in the original shards.
 
+`export-deepseek-hca` describes one attention or FFN hyper-connection site and
+emits a small deterministic FP32 oracle. It does not copy the model tensors;
+the runtime still gathers `fn`, `base`, and `scale` from their original
+SafeTensors extents. The oracle covers stream collapse, the doubly-stochastic
+Sinkhorn matrix, and stream expansion after a deterministic sublayer output.
+
 ## Install
 
 From the repository root:

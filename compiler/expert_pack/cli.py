@@ -14,6 +14,7 @@ from .deepseek_v4 import (
 from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_fp8_matrix,
+    export_deepseek_hca_slice,
     export_deepseek_dense_set,
     export_deepseek_shared_expert,
     export_deepseek_shared_set,
@@ -128,6 +129,14 @@ def _parser() -> argparse.ArgumentParser:
     )
     dense_set_parser.add_argument("--source", type=Path, required=True)
     dense_set_parser.add_argument("--output", type=Path, required=True)
+    hca_parser = commands.add_parser(
+        "export-deepseek-hca",
+        help="describe one real HCA site and emit its deterministic FP32 oracle",
+    )
+    hca_parser.add_argument("--source", type=Path, required=True)
+    hca_parser.add_argument("--output", type=Path, required=True)
+    hca_parser.add_argument("--layer", type=int, default=0)
+    hca_parser.add_argument("--site", choices=("attn", "ffn"), default="attn")
     return parser
 
 
@@ -202,9 +211,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SafeTensorCheckpoint(args.source), name=args.name,
                 output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-dense-set":
             result = export_deepseek_dense_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        else:
+            result = export_deepseek_hca_slice(
+                SafeTensorCheckpoint(args.source), layer=args.layer,
+                site=args.site, output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

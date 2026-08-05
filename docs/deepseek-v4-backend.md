@@ -243,3 +243,30 @@ The dense set is transactional: duplicate names or inconsistent geometry fail
 before I/O, and any later checksum/admission failure destroys every matrix in
 the partial candidate. This set will be composed with shared residency in the
 model owner; neither allocation class competes with routed-cache eviction.
+
+## Manifold-constrained hyper-connections
+
+The HCA implementation follows the checkpoint author's
+[reference inference code](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py)
+and the independent
+[Transformers DeepSeek-V4 implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/deepseek_v4/modeling_deepseek_v4.py).
+Four residual streams are flattened and RMS-rescaled, then projected by the
+site's F32 `fn` matrix into 24 mixing values. `pre` collapses the streams,
+`post` places the sublayer result back into them, and the 4×4 `comb` matrix is
+projected with the checkpoint's 20-step Sinkhorn normalization order.
+
+The runtime retains `fn`, `base`, and `scale` in F32 and exposes reusable CUDA
+`deepseek_hca_pre` and `deepseek_hca_post` primitives. It does not collapse the
+four streams permanently or substitute an ordinary residual connection.
+
+A real `layers.0.hc_attn_*` slice passed against a NumPy FP32 oracle generated
+from the official equations. The 1,572,972 source bytes remain the same size on
+device. Admission measured 0.48 ms; the initial unfused pre + post path measured
+1.96 ms. Maximum absolute error was `3.87e-7` for `pre/post/comb` and `1.04e-7`
+for collapsed/expanded streams. This closes the HCA correctness boundary, but
+the measured path is not yet performance-final: its 24-row control GEMV and
+small Sinkhorn kernel can later be fused after the complete layer is correct.
+
+The next dependency is CSA attention and its typed BF16/F32 compressor,
+normalization, index, and cache state. After that, HCA can wrap a real attention
+sublayer instead of the deterministic validation vector.
