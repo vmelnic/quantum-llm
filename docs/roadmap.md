@@ -46,7 +46,9 @@ This roadmap records direction, not a compatibility promise.
     FP4 records. It reduced a warm five-token prompt from 3.74 to 3.61 seconds,
     but the cold run still read 12.57 GB and took 29.05 seconds. Next replace
     transient allocation with persistent device slots, retain a learned active
-    set across decode tokens, and use grouped/Tensor Core execution. Compact
+    set across decode tokens, and use grouped/Tensor Core execution. Bounded
+    persistent device slots are complete (795 reuses from 107 allocations in
+    the real prompt); active-set placement and grouped compute remain. Compact
     storage is not itself the compute-ready representation.
 
 ## Phase 1 — long-context and cold-path production work

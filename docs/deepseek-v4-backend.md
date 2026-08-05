@@ -619,3 +619,13 @@ dequantization nevertheless regressed the FFN block from 6.94 to 38.64 ms and
 the layer-major prompt from 3.74 to 26.75 seconds, so that execution path was
 removed. A future compact path must expand during admission or use grouped
 rows/Tensor Cores; it must not decode every weight inside a scalar GEMV.
+
+CUDA expert storage now supports an explicitly bounded recycler. Cache
+eviction retires the directory entry and returns its exact-size allocation to
+the uploader instead of freeing it; later admission overwrites and republishes
+the slot. Compact-source staging is also reusable because uploader execution is
+serialized. The five-token gate reduced 902 logical publications to 107 device
+allocations plus 795 slot reuses without changing output or materially changing
+latency. The recycler capacity is supplied by placement policy rather than
+being inferred from total model size, so metadata and storage remain bounded
+for substantially larger models.

@@ -836,7 +836,9 @@ int main(int argc, char** argv) {
     // The complete catalog was SHA-256 authenticated when it was generated
     // from this content-addressed checkpoint snapshot.
     full_config.trusted_immutable_source = true;
-    er::ExpertCache full_cache(full_config, expert_storage, expert_uploader,
+    auto full_uploader = std::make_shared<er::cuda::CudaExpertUploader>(
+        er::cuda::CudaExpertUploaderOptions{routed_cache_bytes, true});
+    er::ExpertCache full_cache(full_config, expert_storage, full_uploader,
                                full_buffers, full_directory);
     er::ResidentExpertSet full_shared;
     auto full_status = er::ResidentExpertSet::load(
@@ -923,6 +925,7 @@ int main(int argc, char** argv) {
             "full DeepSeek token is outside vocabulary");
     const auto full_scheduler_state = full_scheduler.snapshot();
     const auto full_cache_state = full_cache.telemetry();
+    const auto full_upload_state = full_uploader->telemetry();
     require(full_scheduler_state.completed_requests ==
                 43U * full_inputs.size() &&
                 full_scheduler_state.layer_advances >= 43U * full_inputs.size(),
@@ -1025,6 +1028,18 @@ int main(int argc, char** argv) {
               << full_cache_state.uploaded_bytes
               << ",\"full_cache_vram_high_water\":"
               << full_cache_state.vram_high_water
+              << ",\"full_upload_device_allocations\":"
+              << full_upload_state.device_allocations
+              << ",\"full_upload_recycled_acquires\":"
+              << full_upload_state.recycled_acquires
+              << ",\"full_upload_recycled_releases\":"
+              << full_upload_state.recycled_releases
+              << ",\"full_upload_recycled_bytes\":"
+              << full_upload_state.recycled_bytes
+              << ",\"full_upload_device_bytes_high_water\":"
+              << full_upload_state.device_bytes_high_water
+              << ",\"full_upload_staging_allocations\":"
+              << full_upload_state.staging_allocations
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

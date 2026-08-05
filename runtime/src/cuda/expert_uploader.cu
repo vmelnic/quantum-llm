@@ -4,13 +4,16 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace expert::runtime::cuda {
 namespace {
@@ -24,10 +27,89 @@ Status cuda_failure(const char* operation, cudaError_t error) {
 
 struct CudaExpertPool final {
   cudaStream_t stream{};
-  std::mutex mutex;
+  mutable std::mutex mutex;
+  std::uint64_t recycled_capacity_bytes{};
+  bool persistent_staging{};
+  std::unordered_map<std::size_t, std::vector<void*>> recycled;
+  void* staging{};
+  std::size_t staging_bytes{};
+  std::uint64_t device_slot_bytes{};
+  CudaExpertUploaderTelemetry metrics;
+
+  cudaError_t acquire_locked(std::size_t bytes, void** output) {
+    auto iterator = recycled.find(bytes);
+    if (iterator != recycled.end() && !iterator->second.empty()) {
+      *output = iterator->second.back();
+      iterator->second.pop_back();
+      metrics.recycled_bytes -= bytes;
+      ++metrics.recycled_acquires;
+      return cudaSuccess;
+    }
+    const auto error = cudaMallocAsync(output, bytes, stream);
+    if (error == cudaSuccess) {
+      ++metrics.device_allocations;
+      device_slot_bytes += bytes;
+      metrics.device_bytes_high_water = std::max(
+          metrics.device_bytes_high_water,
+          device_slot_bytes + static_cast<std::uint64_t>(staging_bytes));
+    }
+    return error;
+  }
+
+  void release_locked(void* storage, std::size_t bytes) noexcept {
+    if (storage == nullptr) return;
+    if (metrics.recycled_bytes + bytes <= recycled_capacity_bytes) {
+      recycled[bytes].push_back(storage);
+      metrics.recycled_bytes += bytes;
+      ++metrics.recycled_releases;
+      return;
+    }
+    if (cudaFreeAsync(storage, stream) == cudaSuccess) {
+      device_slot_bytes -= bytes;
+      ++metrics.device_releases;
+      return;
+    }
+    // Keep ownership if CUDA cannot enqueue the release; the pool destructor
+    // will retry instead of silently losing the pointer.
+    recycled[bytes].push_back(storage);
+    metrics.recycled_bytes += bytes;
+  }
+
+  void release(void* storage, std::size_t bytes) noexcept {
+    std::lock_guard lock(mutex);
+    release_locked(storage, bytes);
+  }
+
+  cudaError_t staging_locked(std::size_t bytes, void** output) {
+    if (!persistent_staging) return cudaMallocAsync(output, bytes, stream);
+    if (staging != nullptr && staging_bytes >= bytes) {
+      *output = staging;
+      return cudaSuccess;
+    }
+    if (staging != nullptr) {
+      const auto error = cudaFreeAsync(staging, stream);
+      if (error != cudaSuccess) return error;
+      staging = nullptr;
+      staging_bytes = 0U;
+    }
+    const auto error = cudaMallocAsync(&staging, bytes, stream);
+    if (error == cudaSuccess) {
+      staging_bytes = bytes;
+      ++metrics.staging_allocations;
+      metrics.device_bytes_high_water = std::max(
+          metrics.device_bytes_high_water,
+          device_slot_bytes + static_cast<std::uint64_t>(staging_bytes));
+      *output = staging;
+    }
+    return error;
+  }
 
   ~CudaExpertPool() {
     if (stream != nullptr) {
+      for (const auto& [_, slots] : recycled) {
+        for (auto* slot : slots) static_cast<void>(cudaFreeAsync(slot, stream));
+      }
+      if (staging != nullptr) static_cast<void>(cudaFreeAsync(staging, stream));
       static_cast<void>(cudaStreamSynchronize(stream));
       static_cast<void>(cudaStreamDestroy(stream));
     }
@@ -44,8 +126,7 @@ CudaExpertAllocation::CudaExpertAllocation(
 
 CudaExpertAllocation::~CudaExpertAllocation() {
   if (storage_ != nullptr && pool_) {
-    std::lock_guard lock(pool_->mutex);
-    static_cast<void>(cudaFreeAsync(storage_, pool_->stream));
+    pool_->release(storage_, bytes_);
   }
 }
 
@@ -55,7 +136,8 @@ const float* CudaExpertAllocation::gate_up_scales() const noexcept { return gate
 const std::int8_t* CudaExpertAllocation::down() const noexcept { return down_; }
 const float* CudaExpertAllocation::down_scales() const noexcept { return down_scales_; }
 
-CudaExpertUploader::CudaExpertUploader() : pool_(std::make_shared<CudaExpertPool>()) {
+CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
+    : pool_(std::make_shared<CudaExpertPool>()) {
   int pools_supported = 0;
   if (const auto error = cudaDeviceGetAttribute(
           &pools_supported, cudaDevAttrMemoryPoolsSupported, 0);
@@ -68,6 +150,8 @@ CudaExpertUploader::CudaExpertUploader() : pool_(std::make_shared<CudaExpertPool
     throw std::runtime_error(std::string("cudaStreamCreate: ") + cudaGetErrorString(error));
   }
   pool_->stream = stream;
+  pool_->recycled_capacity_bytes = options.recycled_capacity_bytes;
+  pool_->persistent_staging = options.persistent_staging;
   cudaMemPool_t memory_pool{};
   if (const auto error = cudaDeviceGetDefaultMemPool(&memory_pool, 0);
       error != cudaSuccess) {
@@ -85,6 +169,11 @@ CudaExpertUploader::CudaExpertUploader() : pool_(std::make_shared<CudaExpertPool
 
 CudaExpertUploader::~CudaExpertUploader() = default;
 
+CudaExpertUploaderTelemetry CudaExpertUploader::telemetry() const noexcept {
+  std::lock_guard lock(pool_->mutex);
+  return pool_->metrics;
+}
+
 OperationId CudaExpertUploader::upload(UploadRequest request,
                                        UploadCompletion completion) {
   const auto operation = next_operation_++;
@@ -96,7 +185,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       sections.down_q_bytes + sections.down_scale_bytes);
   void* raw = nullptr;
   const auto stream = pool_->stream;
-  auto error = cudaMallocAsync(&raw, total, stream);
+  auto error = pool_->acquire_locked(total, &raw);
   if (error != cudaSuccess) {
     stream_lock.unlock();
     completion({cuda_failure("cudaMallocAsync expert", error), {}, 0});
@@ -113,7 +202,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   const auto source = request.complete_record.data();
   if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86) {
     void* compact_raw = nullptr;
-    error = cudaMallocAsync(&compact_raw, request.complete_record.size(), stream);
+    error = pool_->staging_locked(request.complete_record.size(), &compact_raw);
     if (error == cudaSuccess) {
       error = cudaMemcpyAsync(compact_raw, source, request.complete_record.size(),
                               cudaMemcpyHostToDevice, stream);
@@ -150,9 +239,11 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
              down, down_scales, 4096U, 2048U);
     }
     if (compact_raw != nullptr) {
-      const auto free_error = cudaFreeAsync(compact_raw, stream);
-      if (admission.ok() && free_error != cudaSuccess) {
-        admission = cuda_failure("DeepSeek compact release", free_error);
+      if (!pool_->persistent_staging) {
+        const auto free_error = cudaFreeAsync(compact_raw, stream);
+        if (admission.ok() && free_error != cudaSuccess) {
+          admission = cuda_failure("DeepSeek compact release", free_error);
+        }
       }
       const auto synchronize_error = cudaStreamSynchronize(stream);
       if (admission.ok() && synchronize_error != cudaSuccess) {
@@ -160,8 +251,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       }
     }
     if (!admission.ok()) {
-      static_cast<void>(cudaFreeAsync(raw, stream));
-      static_cast<void>(cudaStreamSynchronize(stream));
+      pool_->release_locked(raw, total);
       stream_lock.unlock();
       completion({admission, {}, 0});
       return operation;
@@ -189,8 +279,8 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
                  sections.down_scale_bytes);
   if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess) {
-    static_cast<void>(cudaFreeAsync(raw, stream));
     static_cast<void>(cudaStreamSynchronize(stream));
+    pool_->release_locked(raw, total);
     stream_lock.unlock();
     completion({cuda_failure("expert H2D", error), {}, 0});
     return operation;

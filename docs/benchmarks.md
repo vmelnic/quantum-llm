@@ -67,6 +67,14 @@ seconds, about 3.5% below the prior 3.74-second warm result. The pack therefore
 improves layout and recovery, but does not turn SATA into a viable per-token
 weight tier. Cold and warm numbers must not be compared as kernel speed.
 
+A bounded persistent CUDA slot pool then replaced allocation on every expert
+turnover. The same request performed 902 logical expert publications using 107
+physical device allocations, 795 exact-size slot reuses, and one persistent
+compact staging allocation. It completed in 3.63 seconds versus the 3.61-second
+warm run, so the change is throughput-neutral at this cache size. Its value is
+bounded allocator behavior and enabling a larger active set without repeating
+the allocation storm; it is not reported as a tokens/s gain.
+
 The separate uncompressed layer-0 gate exercises the checkpoint's
 `compress_ratio=0` sliding-window mode. Attention measured 5.42 ms/token and
 the full block matched its independent oracle with RMSE `3.55e-5` and maximum

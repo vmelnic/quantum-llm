@@ -11,6 +11,24 @@ namespace expert::runtime::cuda {
 
 struct CudaExpertPool;
 
+struct CudaExpertUploaderOptions final {
+  // Maximum bytes retained in idle, exactly-sized device slots. Live bytes
+  // remain bounded by ExpertCache; zero preserves release-on-eviction.
+  std::uint64_t recycled_capacity_bytes{};
+  // Reuse one serialized compact-source staging allocation across admissions.
+  bool persistent_staging{};
+};
+
+struct CudaExpertUploaderTelemetry final {
+  std::uint64_t device_allocations{};
+  std::uint64_t recycled_acquires{};
+  std::uint64_t recycled_releases{};
+  std::uint64_t device_releases{};
+  std::uint64_t recycled_bytes{};
+  std::uint64_t device_bytes_high_water{};
+  std::uint64_t staging_allocations{};
+};
+
 class CudaExpertAllocation final : public IDeviceAllocation {
  public:
   CudaExpertAllocation(std::shared_ptr<CudaExpertPool> pool, void* storage,
@@ -39,13 +57,14 @@ class CudaExpertAllocation final : public IDeviceAllocation {
 
 class CudaExpertUploader final : public IDeviceUploader {
  public:
-  CudaExpertUploader();
+  explicit CudaExpertUploader(CudaExpertUploaderOptions options = {});
   ~CudaExpertUploader() override;
   CudaExpertUploader(const CudaExpertUploader&) = delete;
   CudaExpertUploader& operator=(const CudaExpertUploader&) = delete;
 
   OperationId upload(UploadRequest request, UploadCompletion completion) override;
   void cancel(OperationId operation) noexcept override;
+  [[nodiscard]] CudaExpertUploaderTelemetry telemetry() const noexcept;
 
  private:
   std::shared_ptr<CudaExpertPool> pool_;
