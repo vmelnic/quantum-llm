@@ -16,6 +16,7 @@ This roadmap records direction, not a compatibility promise.
 4. Optimize the measured layer workload: tiled/vectorized dense GEMV, fused
    normalization/RoPE/QAT, grouped output kernels, batching, and parallel top-k.
    Aligned INT8 vector loads are complete; the end-to-end layer improved 6.6%.
+   Standalone activation-INT8 DP4A was measured, regressed, and removed.
 5. Compose routing, resident shared expert, streamed routed experts, FFN HCA,
    and attention into the first complete transformer block.
 6. Extend ownership/state across 43 layers, then add embedding, head,

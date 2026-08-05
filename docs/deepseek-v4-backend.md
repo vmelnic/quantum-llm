@@ -432,10 +432,19 @@ the same qualified path to 6.74 ms, a 6.6% improvement with no semantic change.
 Vectorizing BF16 compressor loads and copying activations into shared memory
 both regressed the complete layer and were removed.
 
+A symmetric activation-INT8 DP4A path was also qualified and removed. It
+quantized each reused activation once and applied DP4A to every dense attention
+projection. The composed layer regressed to 7.45 ms per token, while the added
+activation representation changed the prior output by RMSE `5.97e-3` and
+maximum absolute error `5.34e-2`. This rules out the implemented per-vector
+quantize-then-DP4A design on SM86; it does not rule out a fused or tensor-core
+ABI that avoids standalone quantization and launch costs.
+
 This remains far from target throughput: multiplying 6.74 ms by 43 already
 exceeds 289 ms before MoE. The generic one-warp-per-row GEMV still achieves
 only a small fraction of RTX 3090 memory bandwidth. The next optimization
 boundary remains the actual composed workload: DP4A/tensor-core-capable
-activation quantization with an explicit accuracy gate, fused query/norm/RoPE,
-grouped output GEMM, batched requests, and parallel top-k. Component-fixture
-timings will not be optimized in isolation.
+weight/activation layouts with an explicit accuracy gate, fused
+query/norm/RoPE, grouped output GEMM, batched requests, and parallel top-k.
+The rejected standalone activation-INT8 DP4A path must not be repeated.
+Component-fixture timings will not be optimized in isolation.

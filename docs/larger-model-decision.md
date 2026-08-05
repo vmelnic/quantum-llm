@@ -154,5 +154,8 @@ independently proven.
 - Complete: vectorized aligned INT8 GEMV lowered the same qualified attention
   path from 7.22 to 6.74 ms per layer-token; two measured regressions were
   removed rather than retained.
+- Rejected: standalone symmetric activation quantization plus DP4A regressed
+  the composed path to 7.45 ms and introduced `5.34e-2` maximum drift versus
+  the prior activation ABI; the implementation was removed.
 - Next: continue optimizing the composed layer, then connect attention to
   routing/shared/streamed experts in the first complete transformer block.
