@@ -1,7 +1,8 @@
 param(
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
-    [string]$Snapshot
+    [string]$Snapshot,
+    [switch]$TensorGroups
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -15,7 +16,9 @@ $python = Get-PythonCommand
 
 Push-Location $script:RepoRoot
 try {
-    & $python.Source -m compiler inspect-source --source $source
+    $arguments = @("-m", "compiler", "inspect-source", "--source", $source)
+    if ($TensorGroups) { $arguments += "--tensor-groups" }
+    & $python.Source @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Source inventory exited with code $LASTEXITCODE"
     }

@@ -40,6 +40,11 @@ def _parser() -> argparse.ArgumentParser:
         help="validate all SafeTensors headers and report a read-only source inventory",
     )
     inspect_parser.add_argument("--source", type=Path, required=True)
+    inspect_parser.add_argument(
+        "--tensor-groups",
+        action="store_true",
+        help="include metadata grouped by tensor name pattern, dtype, and shape",
+    )
     return parser
 
 
@@ -64,7 +69,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "validate":
             result = validate_container(args.container)
         else:
-            result = inspect_source(SafeTensorCheckpoint(args.source))
+            result = inspect_source(
+                SafeTensorCheckpoint(args.source),
+                include_tensor_groups=args.tensor_groups,
+            )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))
         return 2

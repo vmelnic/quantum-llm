@@ -12,7 +12,7 @@ from compiler.expert_pack.compile import CompileOptions, compile_checkpoint
 from compiler.expert_pack.constants import EXPERT_HEADER_STRUCT, HEADER_BYTES, PACK_ALIGNMENT
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint
-from compiler.expert_pack.source_inventory import inspect_source
+from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
 from compiler.expert_pack.util import load_json, sha256_file
 from compiler.expert_pack.validate import validate_container
 
@@ -247,6 +247,31 @@ class ExpertPackTests(unittest.TestCase):
                     "F8_E4M3": {"tensor_count": 1, "bytes": 6},
                     "F8_E8M0": {"tensor_count": 1, "bytes": 2},
                 },
+            )
+            groups = group_source_tensors(SafeTensorCheckpoint(root))
+            self.assertEqual([group["pattern"] for group in groups], ["scale", "weight"])
+
+    def test_source_inventory_groups_numeric_tensor_ids(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text(
+                json.dumps({"model_type": "synthetic"}), encoding="utf-8"
+            )
+            _write_safetensors(
+                root / "model.safetensors",
+                {
+                    "layers.0.experts.17.w1.weight": ("I8", (2, 4), bytes(8)),
+                    "layers.1.experts.2.w1.weight": ("I8", (2, 4), bytes(8)),
+                    "layers.1.ffn.gate.tid0eid": ("I64", (2,), bytes(16)),
+                },
+            )
+            groups = group_source_tensors(SafeTensorCheckpoint(root))
+            by_pattern = {group["pattern"]: group for group in groups}
+            experts = by_pattern["layers.{n}.experts.{n}.w1.weight"]
+            self.assertEqual(experts["tensor_count"], 2)
+            self.assertEqual(experts["bytes"], 16)
+            self.assertEqual(
+                by_pattern["layers.{n}.ffn.gate.tid{n}eid"]["tensor_count"], 1
             )
 
     def test_qwen3_next_adapter_and_rank3_dense_record(self) -> None:

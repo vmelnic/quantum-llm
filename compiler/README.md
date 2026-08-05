@@ -27,6 +27,10 @@ The command is read-only. It does not map tensor payloads, convert weights, or
 create output files. Unsupported dtypes, unsafe shard paths, overlapping tensor
 ranges, index/header disagreements, and truncated shards fail closed.
 
+Use `--tensor-groups` during adapter development to group numeric layer/expert
+IDs while retaining each observed dtype and shape variant. This is still a
+metadata-only operation; it can produce a long JSON report.
+
 ## Install
 
 From the repository root:
