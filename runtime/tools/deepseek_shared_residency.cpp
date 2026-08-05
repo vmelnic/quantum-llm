@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
       require(plan.status.ok() && plan.missing_experts.empty() &&
                   plan.unique_experts == 1U,
               "resident shared expert is absent from CUDA directory");
-      const auto release = directory->release_pins(nullptr);
+      const auto release = directory->release_pins(plan.pin_id, nullptr);
       require(release.ok(), std::string(release.message()));
     }
     check(cudaFree(selected), "cudaFree shared selection");

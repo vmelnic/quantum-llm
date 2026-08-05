@@ -477,6 +477,14 @@ int main(int argc, char** argv) {
                 directory_plan.missing_experts.empty() &&
                 directory_plan.unique_experts == 7U,
             "FFN route dependencies are not resident");
+    const auto concurrent_directory_plan =
+        expert_directory->pin_or_collect_misses(
+            oracle_layer, ffn_state.state->expert_indices(),
+            ffn_state.state->selection_count(), nullptr);
+    require(concurrent_directory_plan.status.ok() &&
+                concurrent_directory_plan.missing_experts.empty() &&
+                concurrent_directory_plan.pin_id != directory_plan.pin_id,
+            "CUDA directory did not retain concurrent request pins");
     float* device_block_output = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_block_output),
                      token_stream_values * sizeof(float)),
@@ -494,7 +502,10 @@ int main(int argc, char** argv) {
     check(cudaEventSynchronize(ffn_stop), "synchronize FFN");
     float ffn_ms = 0.0F;
     check(cudaEventElapsedTime(&ffn_ms, ffn_start, ffn_stop), "measure FFN");
-    const auto release = expert_directory->release_pins(nullptr);
+    auto release = expert_directory->release_pins(
+        concurrent_directory_plan.pin_id, nullptr);
+    require(release.ok(), std::string(release.message()));
+    release = expert_directory->release_pins(directory_plan.pin_id, nullptr);
     require(release.ok(), std::string(release.message()));
     std::vector<float> actual_block_output(token_stream_values);
     check(cudaMemcpy(actual_block_output.data(), device_block_output,

@@ -535,3 +535,10 @@ The real model gate confirmed all 43 bindings and rejected a budget one byte
 below the estimate before allocation. This owns state, not yet execution order:
 the next component must drive attention → route → asynchronous expert readiness
 → execute for each layer while preserving directory pin lifetimes.
+
+Directory pin lifetimes are now identified by independent bounded tokens. Two
+requests can retain the same or different ready experts concurrently, and a
+miss route may retain its ready subset while the remaining experts load. The
+real seven-expert DeepSeek route held two simultaneous tokens, executed the
+block, and released both independently. This removes the former single-global-
+pin serialization point required before request-level overlap can be added.

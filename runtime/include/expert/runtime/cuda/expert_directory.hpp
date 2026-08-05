@@ -35,6 +35,9 @@ struct DirectoryPlanResult final {
   // entries while it resolves misses, preventing capacity churn before retry.
   std::vector<std::uint32_t> ready_experts;
   std::uint32_t unique_experts{};
+  // Nonzero while this route owns device references. Independent tokens allow
+  // multiple requests to keep disjoint or overlapping routes pinned.
+  std::uint64_t pin_id{};
 };
 
 // One instance belongs to one immutable model/ABI. The hash table used to
@@ -44,7 +47,8 @@ class CudaExpertDirectory final : public IDeviceResidencyDirectory {
  public:
   CudaExpertDirectory(std::uint64_t model_id, std::uint32_t quant_abi,
                       std::uint32_t layers, std::uint32_t experts_per_layer,
-                      std::uint32_t maximum_selections);
+                      std::uint32_t maximum_selections,
+                      std::uint32_t maximum_active_pins = 64U);
   ~CudaExpertDirectory() override;
   CudaExpertDirectory(const CudaExpertDirectory&) = delete;
   CudaExpertDirectory& operator=(const CudaExpertDirectory&) = delete;
@@ -54,13 +58,14 @@ class CudaExpertDirectory final : public IDeviceResidencyDirectory {
       std::shared_ptr<IDeviceAllocation> allocation) override;
   void retire(const ExpertKey& key) noexcept override;
 
-  // A successful empty miss list holds one device reference for every unique
-  // selected expert. release_pins() is mandatory after the MoE kernels finish.
+  // A returned pin_id holds one device reference for every ready unique expert.
+  // release_pins(pin_id) is mandatory after the dependent kernels finish.
   [[nodiscard]] DirectoryPlanResult pin_or_collect_misses(
       std::uint32_t layer, const std::uint32_t* device_expert_indices,
       std::uint32_t selection_count, void* stream,
       bool keep_ready_pins_on_miss = false);
-  [[nodiscard]] Status release_pins(void* stream) noexcept;
+  [[nodiscard]] Status release_pins(std::uint64_t pin_id,
+                                    void* stream) noexcept;
 
   [[nodiscard]] const DeviceExpertEntry* device_entries() const noexcept;
   [[nodiscard]] std::uint32_t experts_per_layer() const noexcept;

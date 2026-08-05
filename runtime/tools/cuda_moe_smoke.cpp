@@ -218,6 +218,12 @@ int main(int argc, char** argv) {
         0, d_indices, top_k, nullptr);
     if (!plan.status.ok() || !plan.missing_experts.empty())
       throw std::runtime_error("CUDA directory did not publish acquired experts");
+    const auto concurrent_plan = directory->pin_or_collect_misses(
+        0, d_indices, top_k, nullptr);
+    if (!concurrent_plan.status.ok() ||
+        !concurrent_plan.missing_experts.empty() ||
+        concurrent_plan.pin_id == plan.pin_id)
+      throw std::runtime_error("CUDA directory rejected concurrent route pins");
     expert::runtime::cuda::MoeLaunch launch{
         d_input, nullptr, nullptr, nullptr, nullptr, d_routing, d_indices,
         d_intermediate, d_output, hidden, width, top_k, top_k, nullptr,
@@ -273,7 +279,11 @@ int main(int argc, char** argv) {
       norm_b += static_cast<double>(reference[i]) * reference[i];
     }
     const double cosine = dot / std::sqrt(norm_a * norm_b);
-    const auto release_status = directory->release_pins(nullptr);
+    auto release_status = directory->release_pins(concurrent_plan.pin_id,
+                                                  nullptr);
+    if (!release_status.ok())
+      throw std::runtime_error(std::string(release_status.message()));
+    release_status = directory->release_pins(plan.pin_id, nullptr);
     if (!release_status.ok())
       throw std::runtime_error(std::string(release_status.message()));
     const auto cache_metrics = cache.telemetry();

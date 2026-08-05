@@ -62,6 +62,13 @@ One in-flight load/upload exists per key. Leases and CUDA events prevent reuse
 or eviction while data is referenced. RAM, pinned staging, VRAM resident, VRAM
 transient, KV, and workspace budgets are independent.
 
+Device-directory protection is request-scoped rather than global. Each route
+receives a bounded pin token covering its ready unique experts; overlapping
+requests may hold independent tokens, including overlapping expert sets. A
+token is released exactly once after its dependent CUDA work completes. The
+directory serializes only the small planning/release control operation, not the
+lifetimes of active request routes.
+
 ### Scheduler and placement
 
 The router is backend-exact. Qwen uses its declared softmax/top-k behavior;

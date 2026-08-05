@@ -1072,21 +1072,22 @@ class Qwen3NextModel final {
     std::vector<expert::runtime::cpu::ExpertWorkGroup> cpu_groups;
     std::vector<std::uint32_t> cpu_experts;
     if (!placement_->frozen()) placement_->poll();
-    bool route_pinned = false;
+    std::uint64_t route_pin_id = 0U;
     struct PinGuard final {
       expert::runtime::cuda::CudaExpertDirectory* directory{};
-      bool* active{};
+      std::uint64_t* pin_id{};
       ~PinGuard() {
-        if (directory != nullptr && active != nullptr && *active) {
-          static_cast<void>(directory->release_pins(nullptr));
+        if (directory != nullptr && pin_id != nullptr && *pin_id != 0U) {
+          static_cast<void>(directory->release_pins(*pin_id, nullptr));
         }
       }
-    } pin_guard{directory_.get(), &route_pinned};
+    } pin_guard{directory_.get(), &route_pin_id};
     bool split_execution = false;
     std::uint32_t compact_cpu_selection_count = 0;
     auto plan = directory_->pin_or_collect_misses(
         layer, routing_indices_, rows * top_k_, nullptr, true);
     status_check(plan.status);
+    route_pin_id = plan.pin_id;
     routed_expert_keys_.clear();
     missing_expert_keys_.clear();
     for (const auto expert : plan.ready_experts)
@@ -1143,10 +1144,12 @@ class Qwen3NextModel final {
     }
     if (plan.missing_experts.empty()) {
       directory_vram_hits_ += plan.unique_experts;
-      route_pinned = true;
+      if (route_pin_id == 0U)
+        throw std::runtime_error("directory returned no route pin");
     } else {
       split_execution = true;
-      route_pinned = true;
+      if (route_pin_id == 0U)
+        throw std::runtime_error("directory returned no miss-route pin");
       const auto acquire_device = [&](std::span<const std::uint32_t> experts) {
         std::vector<expert::runtime::AcquireHandle> handles;
         handles.reserve(experts.size());
@@ -1326,7 +1329,7 @@ class Qwen3NextModel final {
         cuda_check(cudaEventRecord(expert_done_events_[layer]),
                    "record expert lane done");
       } else {
-        if (route_pinned) {
+        if (route_pin_id != 0U) {
           status_check(expert::runtime::cuda::launch_moe_selection_batch({
               normalized_, routing_scores_, routing_indices_,
               compact_cpu_selection_count ? gpu_selection_mask_ : nullptr,
@@ -1386,9 +1389,9 @@ class Qwen3NextModel final {
           moe_output_, shared_output_, rows * hidden_, nullptr));
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, moe_output_, rows * hidden_, nullptr));
-      if (route_pinned) {
-        status_check(directory_->release_pins(nullptr));
-        route_pinned = false;
+      if (route_pin_id != 0U) {
+        status_check(directory_->release_pins(route_pin_id, nullptr));
+        route_pin_id = 0U;
       } else {
         cuda_check(cudaStreamSynchronize(nullptr),
                    "complete CPU-only expert layer");

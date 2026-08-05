@@ -253,7 +253,7 @@ int main(int argc, char** argv) {
     require(plan.status.ok() && plan.missing_experts.empty() &&
                 plan.unique_experts == 1U,
             "published expert was not visible in CUDA directory");
-    const auto release_status = directory->release_pins(nullptr);
+    const auto release_status = directory->release_pins(plan.pin_id, nullptr);
     require(release_status.ok(), std::string(release_status.message()));
 
     std::vector<std::byte> result(layout.slot_bytes);

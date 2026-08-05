@@ -49,6 +49,8 @@ Rules:
 - RAM publishes only after complete read and checksum;
 - VRAM publishes only after copy completion event;
 - leases, scheduler reservations and incomplete CUDA events prevent eviction;
+- each active device route owns an independent bounded pin token, so one
+  request waiting on expert readiness does not invalidate or serialize another;
 - credits are acquired before allocation and returned exactly once;
 - cancellation removes a waiter, not data still required by another request;
 - short read, checksum or CUDA error fails all dependent requests;

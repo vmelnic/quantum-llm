@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 namespace expert::runtime::cuda {
 namespace {
@@ -105,6 +106,16 @@ __global__ void release_directory_pins(DeviceExpertEntry* directory,
   }
 }
 
+__global__ void release_selected_pins(DeviceExpertEntry* directory,
+                                      std::uint32_t layer_offset,
+                                      const std::uint32_t* experts,
+                                      std::uint32_t count) {
+  const auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                threadIdx.x);
+  if (index < count)
+    atomicSub(&directory[layer_offset + experts[index]].device_references, 1U);
+}
+
 __global__ void try_retire_entry(DeviceExpertEntry* entry,
                                  std::uint32_t* retired) {
   if (threadIdx.x != 0 || blockIdx.x != 0) return;
@@ -144,6 +155,7 @@ struct CudaExpertDirectory::Impl final {
   std::uint32_t layers{};
   std::uint32_t experts{};
   std::uint32_t maximum_selections{};
+  std::uint32_t maximum_active_pins{};
   std::uint32_t hash_slots{};
   DeviceExpertEntry* entries{};
   std::uint32_t* hash_keys{};
@@ -154,9 +166,13 @@ struct CudaExpertDirectory::Impl final {
   std::uint32_t* error{};
   std::uint32_t* retired{};
   std::vector<std::uint32_t> generations;
+  struct ActivePin final {
+    std::uint32_t layer{};
+    std::vector<std::uint32_t> experts;
+  };
+  std::unordered_map<std::uint64_t, ActivePin> active_pins;
+  std::uint64_t next_pin_id{1U};
   std::mutex mutex;
-  bool pins_active{};
-  std::uint32_t pinned_layer{};
 
   ~Impl() {
     static_cast<void>(cudaFree(retired));
@@ -172,9 +188,11 @@ struct CudaExpertDirectory::Impl final {
 
 CudaExpertDirectory::CudaExpertDirectory(
     std::uint64_t model_id, std::uint32_t quant_abi, std::uint32_t layers,
-    std::uint32_t experts_per_layer, std::uint32_t maximum_selections)
+    std::uint32_t experts_per_layer, std::uint32_t maximum_selections,
+    std::uint32_t maximum_active_pins)
     : impl_(std::make_unique<Impl>()) {
-  if (layers == 0 || experts_per_layer == 0 || maximum_selections == 0) {
+  if (layers == 0 || experts_per_layer == 0 || maximum_selections == 0 ||
+      maximum_active_pins == 0) {
     throw std::invalid_argument("invalid CUDA expert directory geometry");
   }
   impl_->model_id = model_id;
@@ -182,6 +200,7 @@ CudaExpertDirectory::CudaExpertDirectory(
   impl_->layers = layers;
   impl_->experts = experts_per_layer;
   impl_->maximum_selections = maximum_selections;
+  impl_->maximum_active_pins = maximum_active_pins;
   impl_->hash_slots = hash_capacity(maximum_selections);
   const auto entry_count = static_cast<std::size_t>(layers) * experts_per_layer;
   impl_->generations.resize(entry_count);
@@ -273,12 +292,11 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
     std::uint32_t selection_count, void* raw_stream,
     bool keep_ready_pins_on_miss) {
   std::lock_guard lock(impl_->mutex);
-  DirectoryPlanResult result{Status::success(), {}, {}, 0};
-  if (impl_->pins_active || layer >= impl_->layers ||
-      device_expert_indices == nullptr || selection_count == 0 ||
+  DirectoryPlanResult result{Status::success(), {}, {}, 0, 0};
+  if (layer >= impl_->layers || device_expert_indices == nullptr || selection_count == 0 ||
       selection_count > impl_->maximum_selections) {
     result.status = Status(ErrorCode::invalid_argument,
-                           "invalid or overlapping directory plan");
+                           "invalid CUDA directory plan");
     return result;
   }
   const auto stream = static_cast<cudaStream_t>(raw_stream);
@@ -313,6 +331,7 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
       impl_->unique_count);
   std::uint32_t missing_count = 0;
   std::uint32_t plan_error = 0;
+  std::vector<std::uint32_t> route_keys(impl_->hash_slots);
   error = cudaMemcpyAsync(&missing_count, impl_->missing_count,
                           sizeof(missing_count), cudaMemcpyDeviceToHost,
                           stream);
@@ -323,13 +342,15 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
   if (error == cudaSuccess)
     error = cudaMemcpyAsync(&plan_error, impl_->error, sizeof(plan_error),
                             cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(route_keys.data(), impl_->hash_keys,
+                            impl_->hash_slots * sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
   if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess || plan_error != 0) {
-    if (!keep_ready_pins_on_miss) {
-      release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
-          impl_->entries, layer * impl_->experts, impl_->hash_keys,
-          impl_->pinned, impl_->hash_slots);
-    }
+    release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+        impl_->entries, layer * impl_->experts, impl_->hash_keys,
+        impl_->pinned, impl_->hash_slots);
     static_cast<void>(cudaStreamSynchronize(stream));
     result.status = error != cudaSuccess
                         ? checked(error, "complete directory plan")
@@ -339,25 +360,15 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
   }
   if (missing_count != 0) {
     result.missing_experts.resize(missing_count);
-    std::vector<std::uint32_t> route_keys(impl_->hash_slots);
     error = cudaMemcpyAsync(result.missing_experts.data(), impl_->missing,
                             missing_count * sizeof(std::uint32_t),
                             cudaMemcpyDeviceToHost, stream);
-    if (error == cudaSuccess)
-      error = cudaMemcpyAsync(route_keys.data(), impl_->hash_keys,
-                              impl_->hash_slots * sizeof(std::uint32_t),
-                              cudaMemcpyDeviceToHost, stream);
-    release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
-        impl_->entries, layer * impl_->experts, impl_->hash_keys,
-        impl_->pinned, impl_->hash_slots);
     if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
     if (error != cudaSuccess) {
-      if (keep_ready_pins_on_miss) {
-        release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
-            impl_->entries, layer * impl_->experts, impl_->hash_keys,
-            impl_->pinned, impl_->hash_slots);
-        static_cast<void>(cudaStreamSynchronize(stream));
-      }
+      release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+          impl_->entries, layer * impl_->experts, impl_->hash_keys,
+          impl_->pinned, impl_->hash_slots);
+      static_cast<void>(cudaStreamSynchronize(stream));
       result.status = checked(error, "copy directory misses");
     } else {
       result.ready_experts.reserve(result.unique_experts - missing_count);
@@ -370,36 +381,75 @@ DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(
         }
         result.ready_experts.push_back(expert);
       }
-      if (keep_ready_pins_on_miss) {
-        impl_->pins_active = true;
-        impl_->pinned_layer = layer;
+      if (!keep_ready_pins_on_miss) {
+        release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+            impl_->entries, layer * impl_->experts, impl_->hash_keys,
+            impl_->pinned, impl_->hash_slots);
+        const auto release_error = cudaStreamSynchronize(stream);
+        if (release_error != cudaSuccess)
+          result.status = checked(release_error,
+                                  "release ready directory misses");
       }
     }
+  }
+
+  const bool retain = missing_count == 0U || keep_ready_pins_on_miss;
+  if (!result.status.ok() || !retain) return result;
+  if (impl_->active_pins.size() >= impl_->maximum_active_pins) {
+    release_directory_pins<<<hash_blocks, kThreads, 0, stream>>>(
+        impl_->entries, layer * impl_->experts, impl_->hash_keys,
+        impl_->pinned, impl_->hash_slots);
+    static_cast<void>(cudaStreamSynchronize(stream));
+    result.status = Status(ErrorCode::backpressure,
+                           "CUDA directory active pin capacity exhausted");
     return result;
   }
-  impl_->pins_active = true;
-  impl_->pinned_layer = layer;
+  std::vector<std::uint32_t> pinned_experts;
+  pinned_experts.reserve(result.ready_experts.size());
+  for (const auto expert : route_keys) {
+    if (expert == kEmptyKey ||
+        std::find(result.missing_experts.begin(),
+                  result.missing_experts.end(), expert) !=
+            result.missing_experts.end())
+      continue;
+    pinned_experts.push_back(expert);
+  }
+  auto pin_id = impl_->next_pin_id++;
+  while (pin_id == 0U || impl_->active_pins.contains(pin_id))
+    pin_id = impl_->next_pin_id++;
+  impl_->active_pins.emplace(
+      pin_id, Impl::ActivePin{layer, std::move(pinned_experts)});
+  result.pin_id = pin_id;
   return result;
 }
 
-Status CudaExpertDirectory::release_pins(void* raw_stream) noexcept {
+Status CudaExpertDirectory::release_pins(std::uint64_t pin_id,
+                                         void* raw_stream) noexcept {
   std::lock_guard lock(impl_->mutex);
-  if (!impl_->pins_active) {
+  const auto active = impl_->active_pins.find(pin_id);
+  if (pin_id == 0U || active == impl_->active_pins.end()) {
     return Status(ErrorCode::invalid_argument,
-                  "CUDA directory has no active route pins");
+                  "CUDA directory pin token is not active");
   }
   const auto stream = static_cast<cudaStream_t>(raw_stream);
-  const auto blocks =
-      std::min(128U, (impl_->hash_slots + kThreads - 1U) / kThreads);
-  release_directory_pins<<<blocks, kThreads, 0, stream>>>(
-      impl_->entries, impl_->pinned_layer * impl_->experts, impl_->hash_keys,
-      impl_->pinned, impl_->hash_slots);
-  auto status = checked(cudaPeekAtLastError(), "release directory pins");
-  if (status.ok()) {
-    status = checked(cudaStreamSynchronize(stream),
-                     "complete directory pin release");
+  auto status = Status::success();
+  if (!active->second.experts.empty()) {
+    auto error = cudaMemcpyAsync(
+        impl_->missing, active->second.experts.data(),
+        active->second.experts.size() * sizeof(std::uint32_t),
+        cudaMemcpyHostToDevice, stream);
+    if (error == cudaSuccess) {
+      const auto count = static_cast<std::uint32_t>(active->second.experts.size());
+      release_selected_pins<<<(count + kThreads - 1U) / kThreads, kThreads, 0,
+                              stream>>>(
+          impl_->entries, active->second.layer * impl_->experts,
+          impl_->missing, count);
+      error = cudaPeekAtLastError();
+    }
+    if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+    status = checked(error, "release directory pin token");
   }
-  impl_->pins_active = false;
+  if (status.ok()) impl_->active_pins.erase(active);
   return status;
 }
 
