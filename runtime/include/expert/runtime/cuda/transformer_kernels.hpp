@@ -17,6 +17,11 @@ struct Int8Matrix final {
                                float* output, void* stream) noexcept;
 [[nodiscard]] Status gemv(const Int8Matrix& matrix, const float* input,
                           float* output, void* stream) noexcept;
+// Rows are split evenly across groups. Each row consumes the corresponding
+// group activation from row-major [groups, columns] input in one launch.
+[[nodiscard]] Status gemv_grouped_inputs(
+    const Int8Matrix& matrix, const float* input, float* output,
+    std::uint32_t groups, void* stream) noexcept;
 // Inputs and outputs are row-major [batch, columns] and [batch, rows]. Blocks
 // for the same matrix row are adjacent so concurrent requests reuse weights.
 [[nodiscard]] Status gemv_batch(const Int8Matrix& matrix, const float* input,

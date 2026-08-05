@@ -374,15 +374,9 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
   attention_output_kernel<<<kHeads, kHeadDim, 0, raw_stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(state.attention_bf16_),
       launch.cosine, launch.sine, state.attention_output_);
-  for (std::uint32_t group = 0U; group < 8U; ++group) {
-    Int8Matrix matrix{
-        weights.wo_a.weights + static_cast<std::size_t>(group) * 1024U * 4096U,
-        weights.wo_a.scales + static_cast<std::size_t>(group) * 1024U,
-        1024U, 4096U};
-    status = gemv(matrix, state.attention_output_ + group * 4096U,
-                  state.group_output_ + group * 1024U, launch.stream);
-    if (!status.ok()) return status;
-  }
+  status = gemv_grouped_inputs(weights.wo_a, state.attention_output_,
+                               state.group_output_, 8U, launch.stream);
+  if (!status.ok()) return status;
   status = gemv(weights.wo_b, state.group_output_, state.sublayer_,
                 launch.stream);
   if (!status.ok()) return status;

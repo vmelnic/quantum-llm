@@ -157,5 +157,8 @@ independently proven.
 - Rejected: standalone symmetric activation quantization plus DP4A regressed
   the composed path to 7.45 ms and introduced `5.34e-2` maximum drift versus
   the prior activation ABI; the implementation was removed.
+- Complete: the eight grouped `wo_a` projections use one launch with unchanged
+  composed error; 6.74 versus 6.78 ms was within measurement noise, so no
+  throughput gain is claimed.
 - Next: continue optimizing the composed layer, then connect attention to
   routing/shared/streamed experts in the first complete transformer block.

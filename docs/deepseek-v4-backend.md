@@ -440,11 +440,18 @@ maximum absolute error `5.34e-2`. This rules out the implemented per-vector
 quantize-then-DP4A design on SM86; it does not rule out a fused or tensor-core
 ABI that avoids standalone quantization and launch costs.
 
+The eight `wo_a` group projections now share one grouped-input GEMV launch.
+This preserves the original per-row accumulation and output bit behavior while
+removing seven launches from each layer-token. The qualified path measured
+6.74 ms per token versus 6.78 ms in the immediately preceding baseline run;
+that difference is within run-to-run noise and is not counted as a throughput
+gain.
+
 This remains far from target throughput: multiplying 6.74 ms by 43 already
 exceeds 289 ms before MoE. The generic one-warp-per-row GEMV still achieves
 only a small fraction of RTX 3090 memory bandwidth. The next optimization
 boundary remains the actual composed workload: DP4A/tensor-core-capable
 weight/activation layouts with an explicit accuracy gate, fused
-query/norm/RoPE, grouped output GEMM, batched requests, and parallel top-k.
+query/norm/RoPE, batched requests, and parallel top-k.
 The rejected standalone activation-INT8 DP4A path must not be repeated.
 Component-fixture timings will not be optimized in isolation.

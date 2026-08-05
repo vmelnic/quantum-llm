@@ -85,6 +85,33 @@ __global__ void int8_gemv_vector_kernel(
   if (lane == 0) output[row] = partial * scales[row];
 }
 
+__global__ void int8_gemv_grouped_inputs_vector_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t rows_per_group) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(
+      blockIdx.x * kWarpsPerBlock + warp);
+  if (row >= rows) return;
+  const auto group = row / rows_per_group;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  const auto* activation = input + static_cast<std::size_t>(group) * columns;
+  float partial = 0.0F;
+  for (std::uint32_t column = lane * 4U; column < columns;
+       column += kWarpSize * 4U) {
+    const auto packed = *reinterpret_cast<const char4*>(weight + column);
+    const auto values =
+        *reinterpret_cast<const float4*>(activation + column);
+    partial += static_cast<float>(packed.x) * values.x;
+    partial += static_cast<float>(packed.y) * values.y;
+    partial += static_cast<float>(packed.z) * values.z;
+    partial += static_cast<float>(packed.w) * values.w;
+  }
+  partial = warp_sum(partial);
+  if (lane == 0) output[row] = partial * scales[row];
+}
+
 __global__ void int8_gemv_batch_kernel(
     const std::int8_t* weights, const float* scales, const float* input,
     float* output, std::uint32_t rows, std::uint32_t columns,
@@ -843,6 +870,21 @@ Status gemv(const Int8Matrix& m, const float* input, float* output, void* raw) n
         m.weights, m.scales, input, output, m.rows, m.columns);
   }
   return checked(cudaPeekAtLastError(), "int8 gemv");
+}
+Status gemv_grouped_inputs(const Int8Matrix& m, const float* input,
+                           float* output, std::uint32_t groups,
+                           void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !groups || m.rows % groups != 0U ||
+      m.columns % 4U != 0U)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid grouped-input gemv");
+  const auto blocks = (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  int8_gemv_grouped_inputs_vector_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, input, output, m.rows, m.columns,
+      m.rows / groups);
+  return checked(cudaPeekAtLastError(), "grouped-input int8 gemv");
 }
 Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
                   std::uint32_t batch, void* raw) noexcept {
