@@ -1,5 +1,6 @@
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/deepseek_attention.hpp"
+#include "expert/runtime/cuda/deepseek_decode.hpp"
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_request.hpp"
@@ -524,6 +525,112 @@ int main(int argc, char** argv) {
     require(block_maximum < 1e-2F,
             "transformer block output exceeds oracle tolerance; max=" +
                 std::to_string(block_maximum));
+
+    const auto request_layer = request.state->layer(oracle_layer);
+    for (std::uint32_t position = 0U; position + 1U < decode_tokens;
+         ++position) {
+      const auto attention_status = er::cuda::deepseek_attention_decode({
+          request_layer.attention_weights, request_layer.attention_state,
+          device_streams + position * token_stream_values,
+          device_output + position * token_stream_values,
+          device_cosine + position * 32U, device_sine + position * 32U,
+          nullptr, nullptr, position, 1e-6F, 20U, nullptr});
+      require(attention_status.ok(), std::string(attention_status.message()));
+    }
+    auto controller = er::cuda::create_deepseek_decode_controller(
+        request.state, expert_directory, nullptr);
+    require(controller.status.ok() && controller.controller,
+            std::string(controller.status.message()));
+    const auto begin = controller.controller->begin({
+        device_streams + 3U * token_stream_values,
+        {device_cosine + 3U * 32U, device_sine + 3U * 32U,
+         device_cosine + 3U * 32U, device_sine + 3U * 32U,
+         device_cosine, device_sine, device_cosine, device_sine},
+        3U, 3U, oracle_layer, oracle_layer + 1U});
+    require(begin.ok(), std::string(begin.message()));
+    const auto advanced = controller.controller->advance();
+    require(advanced.status.ok() &&
+                advanced.progress ==
+                    er::cuda::DeepSeekDecodeProgress::token_complete &&
+                advanced.missing_experts.empty(),
+            std::string(advanced.status.message()));
+    std::vector<float> controller_output(token_stream_values);
+    check(cudaMemcpy(controller_output.data(),
+                     controller.controller->output_streams(),
+                     token_stream_values * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy controller output");
+    float controller_maximum = 0.0F;
+    for (std::size_t index = 0U; index < token_stream_values; ++index) {
+      controller_maximum = std::max(
+          controller_maximum,
+          std::abs(controller_output[index] - expected_block_output[index]));
+    }
+    require(controller_maximum < 1e-2F,
+            "decode controller exceeds block oracle tolerance");
+
+    auto resumed_request = er::cuda::create_deepseek_request_state(
+        model, {4096U, request_size.total_bytes});
+    require(resumed_request.status.ok() && resumed_request.state,
+            std::string(resumed_request.status.message()));
+    const auto resumed_layer = resumed_request.state->layer(oracle_layer);
+    for (std::uint32_t position = 0U; position + 1U < decode_tokens;
+         ++position) {
+      const auto attention_status = er::cuda::deepseek_attention_decode({
+          resumed_layer.attention_weights, resumed_layer.attention_state,
+          device_streams + position * token_stream_values,
+          device_output + position * token_stream_values,
+          device_cosine + position * 32U, device_sine + position * 32U,
+          nullptr, nullptr, position, 1e-6F, 20U, nullptr});
+      require(attention_status.ok(), std::string(attention_status.message()));
+    }
+    auto resumed_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
+        17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 8U);
+    auto resumed_buffers = std::make_shared<er::FixedBufferPool>(
+        1U, 25'167'360U, er::kExpertPackAlignment,
+        std::make_shared<er::CudaPinnedAllocator>());
+    er::ExpertCache resumed_cache(
+        expert_config, expert_storage, expert_uploader, resumed_buffers,
+        resumed_directory);
+    auto resumed_controller = er::cuda::create_deepseek_decode_controller(
+        resumed_request.state, resumed_directory, nullptr);
+    require(resumed_controller.status.ok() && resumed_controller.controller,
+            std::string(resumed_controller.status.message()));
+    const auto resumed_begin = resumed_controller.controller->begin({
+        device_streams + 3U * token_stream_values,
+        {device_cosine + 3U * 32U, device_sine + 3U * 32U,
+         device_cosine + 3U * 32U, device_sine + 3U * 32U,
+         device_cosine, device_sine, device_cosine, device_sine},
+        3U, 3U, oracle_layer, oracle_layer + 1U});
+    require(resumed_begin.ok(), std::string(resumed_begin.message()));
+    auto resumed_advance = resumed_controller.controller->advance();
+    require(resumed_advance.status.ok() &&
+                resumed_advance.progress ==
+                    er::cuda::DeepSeekDecodeProgress::needs_experts &&
+                resumed_advance.missing_experts.size() == 7U,
+            "decode controller did not suspend on the cold route");
+    er::ResidentExpertSet resumed_resident;
+    const auto resumed_load = er::ResidentExpertSet::load(
+        resumed_cache, ffn, resumed_resident);
+    require(resumed_load.ok() && resumed_resident.size() == 7U,
+            std::string(resumed_load.message()));
+    resumed_advance = resumed_controller.controller->advance();
+    require(resumed_advance.status.ok() &&
+                resumed_advance.progress ==
+                    er::cuda::DeepSeekDecodeProgress::token_complete,
+            std::string(resumed_advance.status.message()));
+    std::vector<float> resumed_output(token_stream_values);
+    check(cudaMemcpy(resumed_output.data(),
+                     resumed_controller.controller->output_streams(),
+                     token_stream_values * sizeof(float),
+                     cudaMemcpyDeviceToHost), "copy resumed controller output");
+    float resumed_maximum = 0.0F;
+    for (std::size_t index = 0U; index < token_stream_values; ++index) {
+      resumed_maximum = std::max(
+          resumed_maximum,
+          std::abs(resumed_output[index] - expected_block_output[index]));
+    }
+    require(resumed_maximum < 1e-2F,
+            "resumed decode controller exceeds block oracle tolerance");
     double squared = 0.0;
     float maximum = 0.0F;
     std::array<float, decode_tokens> token_maximum{};
@@ -563,6 +670,7 @@ int main(int argc, char** argv) {
               << ",\"request_attention_bytes\":"
               << request_size.attention_bytes
               << ",\"request_ffn_bytes\":" << request_size.ffn_bytes
+              << ",\"request_stream_bytes\":" << request_size.stream_bytes
               << ",\"request_state_bytes\":" << attention_state.state->bytes()
               << ",\"decode_tokens\":" << decode_tokens
               << ",\"attention_ms\":" << attention_ms
@@ -586,6 +694,9 @@ int main(int argc, char** argv) {
               << ",\"block_rmse\":"
               << std::sqrt(block_squared / token_stream_values)
               << ",\"block_max_abs_error\":" << block_maximum
+              << ",\"controller_max_abs_error\":" << controller_maximum
+              << ",\"controller_cold_misses\":7"
+              << ",\"controller_resume_max_abs_error\":" << resumed_maximum
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

@@ -173,6 +173,10 @@ independently proven.
   matched its independent oracle within `2.20e-4` maximum error.
 - Complete: a budget-preflighted request owner transactionally retains all 43
   attention/FFN states and their immutable model bindings; the 4,096-token
-  footprint is 78,272,512 bytes.
-- Next: add the 43-layer execution/control loop and move the dominant dense/MoE
-  paths to batch/tensor-core execution with overlapped expert readiness.
+  footprint including ping-pong streams is 78,403,584 bytes.
+- Complete: the layer controller suspends on exact cold misses and resumes the
+  same routed/shared FFN after normal cache publication without recomputing
+  attention or weakening top-k.
+- Next: publish the complete routed-expert catalog, connect asynchronous cache
+  leases to multiple controllers, and move dominant dense/MoE paths to
+  batch/tensor-core execution.

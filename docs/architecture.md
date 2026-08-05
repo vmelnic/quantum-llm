@@ -218,3 +218,10 @@ per-request budget, binds every layer, and only then publishes a fully built
 request. Partial allocation or a missing layer never becomes schedulable. The
 compression schedule is explicit: three pure sliding-window layers, twenty
 ratio-four layers, and twenty ratio-128 layers.
+
+`DeepSeekDecodeController` advances one layer at a time. It composes attention,
+exact routing, directory planning, routed/shared execution, and pin release. A
+cold route returns its exact missing expert IDs while preserving the computed
+attention/router state. The scheduler can run other requests while the cache
+publishes those experts, then call `advance()` again to replan and resume the
+same FFN. Cancellation and every failure path release any active pin token.

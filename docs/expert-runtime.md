@@ -118,6 +118,12 @@ or aggregation order.
 Planner decisions use measured queue, transfer and compute costs. A missing
 expert is never treated as zero and a timeout never reduces top-k.
 
+DeepSeek layer execution exposes cache misses as a resumable state-machine
+boundary. Attention/router results remain in bounded request state while the
+outer scheduler acquires the exact missing experts. Resume replans the complete
+top-k, executes only when every dependency is available, and releases the
+request's directory pin after the FFN stream completes.
+
 `HybridDispatchPlanner` receives one unique candidate per routed expert. It
 keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
 balances flexible RAM misses by projected critical path. Current synchronous

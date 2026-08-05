@@ -23,9 +23,10 @@ This roadmap records direction, not a compatibility promise.
    real layer-2 compressed token with an independent full-block oracle.
 6. ~~Extend ownership/state across 43 layers.~~ A preflight-budgeted request
    transaction now retains the immutable model plus all 43 attention/FFN
-   states. Concurrent directory pin tokens are also complete. Next add the
-   layer execution/control loop, then embedding, head, tokenizer, sampling, and
-   the HTTP worker boundary.
+   states. Concurrent directory pin tokens and the suspend/resume layer control
+   loop are complete. Next add the complete expert catalog and outer async
+   scheduler, then embedding, head, tokenizer, sampling, and the HTTP worker
+   boundary.
 
 ## Phase 1 — long-context and cold-path production work
 

@@ -529,8 +529,9 @@ owner. Construction is transactional and budgeted:
 4. allocate all layer states into a private candidate;
 5. publish only after all 43 layers are complete.
 
-At a 4,096-token context the complete state is 78,272,512 bytes: 70,060,544
-bytes of attention/cache/workspace state plus 8,211,968 bytes of FFN workspace.
+At a 4,096-token context the complete state is 78,403,584 bytes: 70,060,544
+bytes of attention/cache/workspace state, 8,211,968 bytes of FFN workspace, and
+131,072 bytes for the two four-stream ping-pong buffers.
 The real model gate confirmed all 43 bindings and rejected a budget one byte
 below the estimate before allocation. This owns state, not yet execution order:
 the next component must drive attention → route → asynchronous expert readiness
@@ -542,3 +543,18 @@ miss route may retain its ready subset while the remaining experts load. The
 real seven-expert DeepSeek route held two simultaneous tokens, executed the
 block, and released both independently. This removes the former single-global-
 pin serialization point required before request-level overlap can be added.
+
+The layer control loop is now suspendable. It executes attention and routing
+once, returns the exact misses to the outer scheduler, retains no hidden
+unbounded work, and resumes the same FFN after publication. On the real layer-2
+route it suspended with seven cold misses, loaded those experts through the
+normal extent-gather/cache/admission path, resumed, and reproduced the full
+block oracle with `4.76e-4` maximum error. The all-resident path produced the
+same bound. A full request can use range `[0, 43)`; strict subranges remain
+available for qualification and future pipeline placement.
+
+The remaining full-model blocker is no longer layer execution semantics. It is
+the production expert catalog and outer scheduler: all `(layer, expert)` source
+descriptors must be addressable without generating per-route files, and the
+scheduler must own asynchronous acquire handles/leases across suspended
+controllers.

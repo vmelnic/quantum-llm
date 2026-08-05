@@ -22,6 +22,7 @@ struct DeepSeekRequestStateSize final {
   Status status;
   std::uint64_t attention_bytes{};
   std::uint64_t ffn_bytes{};
+  std::uint64_t stream_bytes{};
   std::uint64_t total_bytes{};
 };
 
@@ -43,6 +44,7 @@ struct DeepSeekRequestStateResult;
 // for the complete request lifetime.
 class DeepSeekRequestState final {
  public:
+  ~DeepSeekRequestState();
   DeepSeekRequestState(const DeepSeekRequestState&) = delete;
   DeepSeekRequestState& operator=(const DeepSeekRequestState&) = delete;
 
@@ -60,6 +62,7 @@ class DeepSeekRequestState final {
   friend DeepSeekRequestStateResult create_deepseek_request_state(
       std::shared_ptr<const DeepSeekResidentModelState>,
       const DeepSeekRequestConfig&) noexcept;
+  friend class DeepSeekDecodeController;
   DeepSeekRequestState() = default;
 
   std::shared_ptr<const DeepSeekResidentModelState> model_;
@@ -70,6 +73,9 @@ class DeepSeekRequestState final {
   std::array<std::shared_ptr<DeepSeekFfnState>, kDeepSeekLayers> ffn_states_{};
   std::uint32_t max_context_tokens_{};
   std::uint64_t bytes_{};
+  float* stream_allocation_{};
+  float* streams_a_{};
+  float* streams_b_{};
 };
 
 struct DeepSeekRequestStateResult final {
