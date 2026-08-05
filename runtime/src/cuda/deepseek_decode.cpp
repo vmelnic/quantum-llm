@@ -23,9 +23,11 @@ Status cuda_status(cudaError_t error, const char* operation) {
 
 DeepSeekDecodeController::DeepSeekDecodeController(
     std::shared_ptr<DeepSeekRequestState> request,
-    std::shared_ptr<CudaExpertDirectory> directory, void* stream) noexcept
+    std::shared_ptr<CudaExpertDirectory> directory,
+    std::shared_ptr<CudaDirectoryPlanWorkspace> workspace,
+    void* stream) noexcept
     : request_(std::move(request)), directory_(std::move(directory)),
-      stream_(stream) {}
+      directory_workspace_(std::move(workspace)), stream_(stream) {}
 
 DeepSeekDecodeController::~DeepSeekDecodeController() {
   static_cast<void>(cancel());
@@ -90,6 +92,7 @@ Status DeepSeekDecodeController::begin(
   route_trace_.clear();
   route_trace_.reserve(layer_limit_ - current_layer_);
   waiting_for_experts_ = false;
+  planning_ = false;
   complete_ = false;
   active_ = true;
   return Status::success();
@@ -97,6 +100,11 @@ Status DeepSeekDecodeController::begin(
 
 DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
     Status status) noexcept {
+  if (planning_) {
+    const auto cancelled = directory_->cancel_plan_async(*directory_workspace_);
+    planning_ = false;
+    if (status.ok() && !cancelled.ok()) status = cancelled;
+  }
   if (pin_id_ != 0U) {
     const auto release = directory_->release_pins(pin_id_, stream_);
     pin_id_ = 0U;
@@ -111,17 +119,39 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
 }
 
 DeepSeekDecodeAdvanceResult
-DeepSeekDecodeController::plan_and_execute() noexcept {
+DeepSeekDecodeController::start_plan() noexcept {
   const auto view = request_->layer(current_layer_);
-  const auto plan_started = std::chrono::steady_clock::now();
-  auto plan = directory_->pin_or_collect_misses(
-      current_layer_, view.ffn_state->expert_indices(),
-      view.ffn_state->selection_count(), stream_, true);
+  plan_started_ = std::chrono::steady_clock::now();
+  const auto status = directory_->begin_plan_async(
+      *directory_workspace_, current_layer_,
+      view.ffn_state->expert_indices(), view.ffn_state->selection_count(),
+      stream_, true);
+  if (!status.ok()) return fail(status);
+  planning_ = true;
+  return {Status::success(), DeepSeekDecodeProgress::pending_cuda,
+          current_layer_, {}, {}, {}};
+}
+
+DeepSeekDecodeAdvanceResult
+DeepSeekDecodeController::poll_plan() noexcept {
+  auto polled = directory_->poll_plan_async(*directory_workspace_);
+  if (!polled.status.ok()) return fail(std::move(polled.status));
+  if (!polled.complete) {
+    return {Status::success(), DeepSeekDecodeProgress::pending_cuda,
+            current_layer_, {}, {}, {}};
+  }
+  planning_ = false;
   telemetry_.directory_plan_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - plan_started)
+          std::chrono::steady_clock::now() - plan_started_)
           .count());
-  if (!plan.status.ok()) return fail(std::move(plan.status));
+  if (!polled.plan.status.ok()) return fail(std::move(polled.plan.status));
+  return execute_plan(std::move(polled.plan));
+}
+
+DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
+    DirectoryPlanResult plan) noexcept {
+  const auto view = request_->layer(current_layer_);
   if (plan.selected_experts.size() != 7U ||
       plan.selected_experts.back() != 256U) {
     return fail({ErrorCode::internal,
@@ -215,11 +245,16 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
             DeepSeekDecodeProgress::layer_complete, current_layer_, {}, {}, {}};
   }
   if (waiting_for_experts_) {
-    const auto release = directory_->release_pins(pin_id_, stream_);
+    const auto release = directory_->release_pins_async(pin_id_, stream_);
     pin_id_ = 0U;
     if (!release.ok()) return fail(release);
-    return plan_and_execute();
+    // The replacement plan is now the sole in-flight state. Keep any staged
+    // CPU placements, but do not re-enter this release branch while its CUDA
+    // event is pending.
+    waiting_for_experts_ = false;
+    return start_plan();
   }
+  if (planning_) return poll_plan();
 
   const auto view = request_->layer(current_layer_);
   const bool compressed = view.compress_ratio != 0U;
@@ -254,13 +289,25 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - attention_route_started)
           .count());
-  return plan_and_execute();
+  return start_plan();
+}
+
+Status DeepSeekDecodeController::wait_for_cuda() noexcept {
+  if (!active_ || !planning_)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek decode has no pending CUDA plan"};
+  return directory_->wait_plan_async(*directory_workspace_);
 }
 
 Status DeepSeekDecodeController::cancel() noexcept {
   auto status = Status::success();
+  if (planning_) {
+    status = directory_->cancel_plan_async(*directory_workspace_);
+    planning_ = false;
+  }
   if (pin_id_ != 0U) {
-    status = directory_->release_pins(pin_id_, stream_);
+    const auto released = directory_->release_pins(pin_id_, stream_);
+    if (status.ok()) status = released;
     pin_id_ = 0U;
   }
   active_ = false;
@@ -277,9 +324,16 @@ DeepSeekDecodeControllerResult create_deepseek_decode_controller(
     return {{ErrorCode::invalid_argument,
              "invalid DeepSeek decode controller dependencies"}, {}};
   }
+  auto workspace = directory->create_plan_workspace();
+  if (!workspace.status.ok() || !workspace.workspace)
+    return {workspace.status.ok()
+                ? Status(ErrorCode::internal,
+                         "CUDA directory returned no planning workspace")
+                : std::move(workspace.status),
+            {}};
   return {Status::success(), std::shared_ptr<DeepSeekDecodeController>(
       new DeepSeekDecodeController(std::move(request), std::move(directory),
-                                   stream))};
+                                   std::move(workspace.workspace), stream))};
 }
 
 }  // namespace expert::runtime::cuda

@@ -79,9 +79,12 @@ router output or generated tokens.
   4. on a miss, expose exact missing and selected IDs, acquire them through the
      bounded cache pipeline, and resume FFN without recomputing attention;
   5. retain eviction protection until the last consuming kernel completes.
-- [ ] Give every request a persistent CUDA event set and private directory
+- [x] Give every request a persistent directory completion event and private
   scratch (hash keys, pin flags, counters, miss IDs, selected IDs). No request
-  may overwrite another request's in-flight planning or release metadata.
+  can overwrite another request's in-flight planning metadata.
+- [ ] Extend the request event set across upload and compute dependencies; the
+  current service loop explicitly parks on one completed plan event after it
+  has submitted all runnable request streams.
 - [x] Precompute bounded RoPE tables or generate RoPE on device; remove the
   synchronous per-step host upload.
 - [ ] Keep directory hit planning on device. Return only compact miss metadata

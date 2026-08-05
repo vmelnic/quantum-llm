@@ -200,6 +200,53 @@ struct CudaExpertDirectory::Impl final {
   }
 };
 
+struct CudaDirectoryPlanWorkspace::Impl final {
+  const void* owner{};
+  std::uint32_t maximum_selections{};
+  std::uint32_t hash_slots{};
+  std::uint32_t layer{};
+  std::uint32_t selection_count{};
+  std::uint32_t* hash_keys{};
+  std::uint8_t* pinned{};
+  std::uint32_t* missing{};
+  std::uint32_t* missing_count{};
+  std::uint32_t* unique_count{};
+  std::uint32_t* error{};
+  std::uint32_t* host_counts{};  // missing, unique, error
+  std::uint32_t* host_hash_keys{};
+  std::uint32_t* host_selected{};
+  std::uint32_t* host_missing{};
+  std::uint32_t* host_pin_experts{};
+  cudaEvent_t completion{};
+  cudaStream_t stream{};
+  bool active{};
+  bool cleanup_pending{};
+  bool keep_ready_pins_on_miss{};
+
+  ~Impl() {
+    if ((active || cleanup_pending) && completion)
+      static_cast<void>(cudaEventSynchronize(completion));
+    if (completion) static_cast<void>(cudaEventDestroy(completion));
+    static_cast<void>(cudaFreeHost(host_pin_experts));
+    static_cast<void>(cudaFreeHost(host_missing));
+    static_cast<void>(cudaFreeHost(host_selected));
+    static_cast<void>(cudaFreeHost(host_hash_keys));
+    static_cast<void>(cudaFreeHost(host_counts));
+    static_cast<void>(cudaFree(error));
+    static_cast<void>(cudaFree(unique_count));
+    static_cast<void>(cudaFree(missing_count));
+    static_cast<void>(cudaFree(missing));
+    static_cast<void>(cudaFree(pinned));
+    static_cast<void>(cudaFree(hash_keys));
+  }
+};
+
+CudaDirectoryPlanWorkspace::CudaDirectoryPlanWorkspace(
+    std::unique_ptr<Impl> impl) noexcept
+    : impl_(std::move(impl)) {}
+
+CudaDirectoryPlanWorkspace::~CudaDirectoryPlanWorkspace() = default;
+
 CudaExpertDirectory::CudaExpertDirectory(
     std::uint64_t model_id, std::uint32_t quant_abi, std::uint32_t layers,
     std::uint32_t experts_per_layer, std::uint32_t maximum_selections,
@@ -262,6 +309,326 @@ CudaExpertDirectory::CudaExpertDirectory(
 }
 
 CudaExpertDirectory::~CudaExpertDirectory() = default;
+
+DirectoryPlanWorkspaceResult
+CudaExpertDirectory::create_plan_workspace() noexcept {
+  try {
+    auto workspace = std::make_unique<CudaDirectoryPlanWorkspace::Impl>();
+    workspace->owner = impl_.get();
+    workspace->maximum_selections = impl_->maximum_selections;
+    workspace->hash_slots = impl_->hash_slots;
+    const auto device_allocate = [](auto** pointer, std::size_t bytes,
+                                    const char* operation) {
+      const auto error =
+          cudaMalloc(reinterpret_cast<void**>(pointer), bytes);
+      if (error != cudaSuccess)
+        throw std::runtime_error(std::string(operation) + ": " +
+                                 cudaGetErrorString(error));
+    };
+    const auto host_allocate = [](auto** pointer, std::size_t bytes,
+                                  const char* operation) {
+      const auto error = cudaHostAlloc(reinterpret_cast<void**>(pointer),
+                                       bytes, cudaHostAllocPortable);
+      if (error != cudaSuccess)
+        throw std::runtime_error(std::string(operation) + ": " +
+                                 cudaGetErrorString(error));
+    };
+    device_allocate(&workspace->hash_keys,
+                    workspace->hash_slots * sizeof(std::uint32_t),
+                    "cudaMalloc async route hash");
+    device_allocate(&workspace->pinned,
+                    workspace->hash_slots * sizeof(std::uint8_t),
+                    "cudaMalloc async route pins");
+    device_allocate(&workspace->missing,
+                    workspace->maximum_selections * sizeof(std::uint32_t),
+                    "cudaMalloc async route misses");
+    device_allocate(&workspace->missing_count, sizeof(std::uint32_t),
+                    "cudaMalloc async route miss count");
+    device_allocate(&workspace->unique_count, sizeof(std::uint32_t),
+                    "cudaMalloc async route unique count");
+    device_allocate(&workspace->error, sizeof(std::uint32_t),
+                    "cudaMalloc async route error");
+    host_allocate(&workspace->host_counts, 3U * sizeof(std::uint32_t),
+                  "cudaHostAlloc async route counts");
+    host_allocate(&workspace->host_hash_keys,
+                  workspace->hash_slots * sizeof(std::uint32_t),
+                  "cudaHostAlloc async route hash");
+    host_allocate(&workspace->host_selected,
+                  workspace->maximum_selections * sizeof(std::uint32_t),
+                  "cudaHostAlloc async route selections");
+    host_allocate(&workspace->host_missing,
+                  workspace->maximum_selections * sizeof(std::uint32_t),
+                  "cudaHostAlloc async route misses");
+    host_allocate(&workspace->host_pin_experts,
+                  workspace->maximum_selections * sizeof(std::uint32_t),
+                  "cudaHostAlloc async pin experts");
+    const auto event_error = cudaEventCreateWithFlags(
+        &workspace->completion, cudaEventDisableTiming);
+    if (event_error != cudaSuccess)
+      throw std::runtime_error(std::string("cudaEventCreate async route: ") +
+                               cudaGetErrorString(event_error));
+    return {Status::success(), std::shared_ptr<CudaDirectoryPlanWorkspace>(
+                                   new CudaDirectoryPlanWorkspace(
+                                       std::move(workspace)))};
+  } catch (const std::exception& error) {
+    return {Status(ErrorCode::upload_failed, error.what()), {}};
+  }
+}
+
+Status CudaExpertDirectory::begin_plan_async(
+    CudaDirectoryPlanWorkspace& public_workspace, std::uint32_t layer,
+    const std::uint32_t* device_expert_indices,
+    std::uint32_t selection_count, void* raw_stream,
+    bool keep_ready_pins_on_miss) noexcept {
+  auto& workspace = *public_workspace.impl_;
+  if (workspace.owner != impl_.get() || workspace.active ||
+      layer >= impl_->layers || device_expert_indices == nullptr ||
+      selection_count == 0U ||
+      selection_count > workspace.maximum_selections) {
+    return Status(ErrorCode::invalid_argument,
+                  "invalid asynchronous CUDA directory plan");
+  }
+  const auto stream = static_cast<cudaStream_t>(raw_stream);
+  if (workspace.cleanup_pending) {
+    const auto wait = cudaStreamWaitEvent(stream, workspace.completion, 0U);
+    if (wait != cudaSuccess)
+      return checked(wait, "wait for asynchronous directory cleanup");
+    workspace.cleanup_pending = false;
+  }
+  auto error = cudaMemsetAsync(workspace.hash_keys, 0xff,
+                               workspace.hash_slots * sizeof(std::uint32_t),
+                               stream);
+  if (error == cudaSuccess)
+    error = cudaMemsetAsync(workspace.pinned, 0,
+                            workspace.hash_slots * sizeof(std::uint8_t),
+                            stream);
+  if (error == cudaSuccess)
+    error = cudaMemsetAsync(workspace.missing_count, 0,
+                            sizeof(std::uint32_t), stream);
+  if (error == cudaSuccess)
+    error = cudaMemsetAsync(workspace.unique_count, 0,
+                            sizeof(std::uint32_t), stream);
+  if (error == cudaSuccess)
+    error = cudaMemsetAsync(workspace.error, 0, sizeof(std::uint32_t), stream);
+  if (error != cudaSuccess)
+    return checked(error, "initialize asynchronous directory plan");
+  const auto blocks = std::min(
+      128U, (selection_count + kThreads - 1U) / kThreads);
+  insert_route_keys<<<blocks, kThreads, 0, stream>>>(
+      device_expert_indices, selection_count, impl_->experts,
+      workspace.hash_keys, workspace.hash_slots, workspace.error);
+  const auto hash_blocks = std::min(
+      128U, (workspace.hash_slots + kThreads - 1U) / kThreads);
+  pin_directory_entries<<<hash_blocks, kThreads, 0, stream>>>(
+      impl_->entries, layer * impl_->experts, workspace.hash_keys,
+      workspace.pinned, workspace.hash_slots, workspace.missing,
+      workspace.missing_count, workspace.unique_count);
+  error = cudaPeekAtLastError();
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_counts, workspace.missing_count,
+                            sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                            stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_counts + 1U,
+                            workspace.unique_count, sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_counts + 2U, workspace.error,
+                            sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                            stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_hash_keys, workspace.hash_keys,
+                            workspace.hash_slots * sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_selected, device_expert_indices,
+                            selection_count * sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(workspace.host_missing, workspace.missing,
+                            selection_count * sizeof(std::uint32_t),
+                            cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess)
+    error = cudaEventRecord(workspace.completion, stream);
+  if (error != cudaSuccess)
+    return checked(error, "enqueue asynchronous directory plan");
+  workspace.layer = layer;
+  workspace.selection_count = selection_count;
+  workspace.stream = stream;
+  workspace.keep_ready_pins_on_miss = keep_ready_pins_on_miss;
+  workspace.active = true;
+  return Status::success();
+}
+
+DirectoryPlanPollResult CudaExpertDirectory::poll_plan_async(
+    CudaDirectoryPlanWorkspace& public_workspace) noexcept {
+  DirectoryPlanPollResult polled{Status::success(), false, {}};
+  polled.plan.status = Status::success();
+  auto& workspace = *public_workspace.impl_;
+  if (workspace.owner != impl_.get() || !workspace.active) {
+    polled.status = Status(ErrorCode::invalid_argument,
+                           "asynchronous CUDA directory plan is not active");
+    return polled;
+  }
+  const auto query = cudaEventQuery(workspace.completion);
+  if (query == cudaErrorNotReady) return polled;
+  polled.complete = true;
+  if (query != cudaSuccess) {
+    workspace.active = false;
+    polled.status = checked(query, "poll asynchronous directory plan");
+    return polled;
+  }
+  const auto missing_count = workspace.host_counts[0];
+  const auto unique_count = workspace.host_counts[1];
+  const auto plan_error = workspace.host_counts[2];
+  auto enqueue_cleanup = [&]() -> Status {
+    const auto hash_blocks = std::min(
+        128U, (workspace.hash_slots + kThreads - 1U) / kThreads);
+    release_directory_pins<<<hash_blocks, kThreads, 0, workspace.stream>>>(
+        impl_->entries, workspace.layer * impl_->experts,
+        workspace.hash_keys, workspace.pinned, workspace.hash_slots);
+    auto error = cudaPeekAtLastError();
+    if (error == cudaSuccess)
+      error = cudaEventRecord(workspace.completion, workspace.stream);
+    if (error == cudaSuccess) workspace.cleanup_pending = true;
+    return checked(error, "enqueue asynchronous directory cleanup");
+  };
+  if (plan_error != 0U || missing_count > workspace.selection_count ||
+      unique_count > workspace.selection_count ||
+      missing_count > unique_count) {
+    workspace.active = false;
+    const auto cleanup = enqueue_cleanup();
+    polled.status = cleanup.ok()
+        ? Status(ErrorCode::invalid_argument,
+                 "route hash rejected expert indices")
+        : cleanup;
+    return polled;
+  }
+  auto& plan = polled.plan;
+  plan.unique_experts = unique_count;
+  plan.selected_experts.assign(
+      workspace.host_selected,
+      workspace.host_selected + workspace.selection_count);
+  plan.missing_experts.assign(workspace.host_missing,
+                              workspace.host_missing + missing_count);
+  plan.ready_experts.reserve(unique_count - missing_count);
+  std::uint32_t pin_count = 0U;
+  for (std::uint32_t index = 0U; index < workspace.hash_slots; ++index) {
+    const auto expert = workspace.host_hash_keys[index];
+    if (expert == kEmptyKey ||
+        std::find(plan.missing_experts.begin(), plan.missing_experts.end(),
+                  expert) != plan.missing_experts.end())
+      continue;
+    plan.ready_experts.push_back(expert);
+    workspace.host_pin_experts[pin_count++] = expert;
+  }
+  const bool retain = missing_count == 0U ||
+                      workspace.keep_ready_pins_on_miss;
+  workspace.active = false;
+  if (!retain) {
+    const auto cleanup = enqueue_cleanup();
+    if (!cleanup.ok()) polled.status = cleanup;
+    return polled;
+  }
+
+  std::lock_guard lock(impl_->mutex);
+  if (impl_->active_pins.size() >= impl_->maximum_active_pins) {
+    const auto cleanup = enqueue_cleanup();
+    polled.status = cleanup.ok()
+        ? Status(ErrorCode::backpressure,
+                 "CUDA directory active pin capacity exhausted")
+        : cleanup;
+    return polled;
+  }
+  std::size_t pin_slot = impl_->pin_slots.size();
+  for (std::size_t index = 0U; index < impl_->pin_slots.size(); ++index) {
+    auto& slot = impl_->pin_slots[index];
+    if (slot.release_pending) {
+      const auto slot_query = cudaEventQuery(slot.completion);
+      if (slot_query == cudaSuccess) {
+        slot.release_pending = false;
+        slot.in_use = false;
+      } else if (slot_query != cudaErrorNotReady) {
+        const auto cleanup = enqueue_cleanup();
+        polled.status = cleanup.ok()
+            ? checked(slot_query, "query asynchronous directory pin slot")
+            : cleanup;
+        return polled;
+      }
+    }
+    if (!slot.in_use) {
+      pin_slot = index;
+      break;
+    }
+  }
+  if (pin_slot == impl_->pin_slots.size()) {
+    const auto cleanup = enqueue_cleanup();
+    polled.status = cleanup.ok()
+        ? Status(ErrorCode::backpressure,
+                 "CUDA directory pin slots exhausted")
+        : cleanup;
+    return polled;
+  }
+  auto& slot = impl_->pin_slots[pin_slot];
+  if (pin_count != 0U) {
+    const auto copy_error = cudaMemcpyAsync(
+        slot.device_experts, workspace.host_pin_experts,
+        pin_count * sizeof(std::uint32_t), cudaMemcpyHostToDevice,
+        workspace.stream);
+    if (copy_error != cudaSuccess) {
+      const auto cleanup = enqueue_cleanup();
+      polled.status = cleanup.ok()
+          ? checked(copy_error, "stage asynchronous directory pin slot")
+          : cleanup;
+      return polled;
+    }
+  }
+  slot.in_use = true;
+  auto pin_id = impl_->next_pin_id++;
+  while (pin_id == 0U || impl_->active_pins.contains(pin_id))
+    pin_id = impl_->next_pin_id++;
+  impl_->active_pins.emplace(
+      pin_id, Impl::ActivePin{
+                  workspace.layer,
+                  std::vector<std::uint32_t>(workspace.host_pin_experts,
+                                             workspace.host_pin_experts +
+                                                 pin_count),
+                  pin_slot});
+  plan.pin_id = pin_id;
+  return polled;
+}
+
+Status CudaExpertDirectory::cancel_plan_async(
+    CudaDirectoryPlanWorkspace& public_workspace) noexcept {
+  auto& workspace = *public_workspace.impl_;
+  if (workspace.owner != impl_.get())
+    return Status(ErrorCode::invalid_argument,
+                  "asynchronous CUDA directory workspace owner mismatch");
+  if (!workspace.active) return Status::success();
+  auto error = cudaEventSynchronize(workspace.completion);
+  if (error == cudaSuccess) {
+    const auto hash_blocks = std::min(
+        128U, (workspace.hash_slots + kThreads - 1U) / kThreads);
+    release_directory_pins<<<hash_blocks, kThreads, 0, workspace.stream>>>(
+        impl_->entries, workspace.layer * impl_->experts,
+        workspace.hash_keys, workspace.pinned, workspace.hash_slots);
+    error = cudaPeekAtLastError();
+  }
+  if (error == cudaSuccess) error = cudaStreamSynchronize(workspace.stream);
+  workspace.active = false;
+  workspace.cleanup_pending = false;
+  return checked(error, "cancel asynchronous directory plan");
+}
+
+Status CudaExpertDirectory::wait_plan_async(
+    CudaDirectoryPlanWorkspace& public_workspace) noexcept {
+  auto& workspace = *public_workspace.impl_;
+  if (workspace.owner != impl_.get() || !workspace.active)
+    return Status(ErrorCode::invalid_argument,
+                  "asynchronous CUDA directory plan is not active");
+  return checked(cudaEventSynchronize(workspace.completion),
+                 "wait for asynchronous directory plan");
+}
 
 Status CudaExpertDirectory::publish(
     const ExpertKey& key, std::shared_ptr<IDeviceAllocation> allocation) {
@@ -525,7 +892,9 @@ Status CudaExpertDirectory::release_pins(std::uint64_t pin_id,
   const auto active = impl_->active_pins.find(pin_id);
   if (pin_id == 0U || active == impl_->active_pins.end()) {
     return Status(ErrorCode::invalid_argument,
-                  "CUDA directory pin token is not active");
+                  "CUDA directory pin token " + std::to_string(pin_id) +
+                      " is not active; active=" +
+                      std::to_string(impl_->active_pins.size()));
   }
   const auto stream = static_cast<cudaStream_t>(raw_stream);
   auto status = Status::success();
@@ -554,7 +923,9 @@ Status CudaExpertDirectory::release_pins_async(std::uint64_t pin_id,
   const auto active = impl_->active_pins.find(pin_id);
   if (pin_id == 0U || active == impl_->active_pins.end()) {
     return Status(ErrorCode::invalid_argument,
-                  "CUDA directory pin token is not active");
+                  "CUDA directory pin token " + std::to_string(pin_id) +
+                      " is not active; active=" +
+                      std::to_string(impl_->active_pins.size()));
   }
   auto& slot = impl_->pin_slots[active->second.slot];
   const auto stream = static_cast<cudaStream_t>(raw_stream);

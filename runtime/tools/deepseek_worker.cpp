@@ -430,7 +430,12 @@ class Model final {
         if (state->state == er::cuda::DeepSeekScheduledState::complete)
           ++completed;
       }
-      if (completed != operations.size()) std::this_thread::yield();
+      if (completed != operations.size()) {
+        const auto waited = scheduler_->wait_for_cuda_progress();
+        require(waited.ok(), waited.message());
+        if (scheduler_->snapshot().cuda_pending_requests == 0U)
+          std::this_thread::yield();
+      }
     }
     telemetry_.scheduler_poll_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -723,6 +728,11 @@ int worker_loop(Model& model) {
                   << uploader.compact_cache_misses
                   << ",\"scheduler_layer_advances\":"
                   << scheduler.layer_advances
+                  << ",\"scheduler_cuda_pending_polls\":"
+                  << scheduler.cuda_pending_polls
+                  << ",\"scheduler_cuda_waits\":" << scheduler.cuda_waits
+                  << ",\"scheduler_cuda_wait_ns\":"
+                  << scheduler.cuda_wait_ns
                   << ",\"scheduler_expert_suspensions\":"
                   << scheduler.expert_suspensions
                   << ",\"scheduler_acquires_started\":"

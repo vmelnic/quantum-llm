@@ -66,6 +66,7 @@ struct ScheduledRequest final {
   std::chrono::steady_clock::time_point expert_wait_started{};
   bool runnable_queued{};
   bool acquire_queued{};
+  bool cuda_pending{};
 };
 
 }  // namespace
@@ -133,6 +134,7 @@ struct DeepSeekDecodeScheduler::Core final {
     abandon_acquisitions(request);
     static_cast<void>(request.controller->cancel());
     request.runnable_queued = false;
+    request.cuda_pending = false;
     request.state = DeepSeekScheduledState::failed;
     request.status = std::move(status);
     ++metrics.failed_requests;
@@ -616,6 +618,7 @@ Status DeepSeekDecodeScheduler::poll() {
   const auto poll_started = std::chrono::steady_clock::now();
   core_->service_acquisitions();
   std::size_t advances = 0U;
+  std::vector<std::uint64_t> deferred_cuda;
   while (advances < core_->config.maximum_layer_advances_per_poll &&
          !core_->runnable.empty()) {
     const auto id = core_->runnable.front();
@@ -632,20 +635,30 @@ Status DeepSeekDecodeScheduler::poll() {
             std::chrono::steady_clock::now() - advance_started)
             .count());
     ++advances;
-    ++core_->metrics.layer_advances;
     request.layer = result.layer;
     if (!result.status.ok()) {
+      request.cuda_pending = false;
       core_->fail(request, copied_status(result.status));
       continue;
     }
     switch (result.progress) {
+      case DeepSeekDecodeProgress::pending_cuda: {
+        request.cuda_pending = true;
+        ++core_->metrics.cuda_pending_polls;
+        deferred_cuda.push_back(request.id);
+        break;
+      }
       case DeepSeekDecodeProgress::needs_experts: {
+        request.cuda_pending = false;
+        ++core_->metrics.layer_advances;
         ++core_->metrics.expert_suspensions;
         const auto status = core_->wait_for_experts(request, result);
         if (!status.ok()) core_->fail(request, copied_status(status));
         break;
       }
       case DeepSeekDecodeProgress::layer_complete: {
+        request.cuda_pending = false;
+        ++core_->metrics.layer_advances;
         const auto retained = core_->retain_completed_route(request, result);
         if (!retained.ok()) {
           core_->fail(request, copied_status(retained));
@@ -655,6 +668,8 @@ Status DeepSeekDecodeScheduler::poll() {
         break;
       }
       case DeepSeekDecodeProgress::token_complete: {
+        request.cuda_pending = false;
+        ++core_->metrics.layer_advances;
         const auto retained = core_->retain_completed_route(request, result);
         if (!retained.ok()) {
           core_->fail(request, copied_status(retained));
@@ -666,11 +681,32 @@ Status DeepSeekDecodeScheduler::poll() {
       }
     }
   }
+  for (const auto id : deferred_cuda) {
+    const auto iterator = core_->requests.find(id);
+    if (iterator != core_->requests.end())
+      core_->enqueue_runnable(*iterator->second);
+  }
   core_->service_acquisitions();
   core_->metrics.poll_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - poll_started)
           .count());
+  return Status::success();
+}
+
+Status DeepSeekDecodeScheduler::wait_for_cuda_progress() {
+  for (auto& [id, request] : core_->requests) {
+    (void)id;
+    if (!request->cuda_pending || terminal(request->state)) continue;
+    const auto started = std::chrono::steady_clock::now();
+    const auto status = request->controller->wait_for_cuda();
+    core_->metrics.cuda_wait_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+    ++core_->metrics.cuda_waits;
+    return copied_status(status);
+  }
   return Status::success();
 }
 
@@ -685,6 +721,7 @@ Status DeepSeekDecodeScheduler::cancel(std::uint64_t request_id) noexcept {
   core_->abandon_acquisitions(request);
   const auto cancelled = request.controller->cancel();
   request.runnable_queued = false;
+  request.cuda_pending = false;
   request.state = DeepSeekScheduledState::cancelled;
   request.status = cancelled.ok()
                        ? Status(ErrorCode::cancelled,
@@ -722,6 +759,7 @@ DeepSeekDecodeSchedulerSnapshot DeepSeekDecodeScheduler::snapshot() const
   result.inflight_acquires = core_->inflight_acquires;
   result.runnable_requests = 0U;
   result.waiting_requests = 0U;
+  result.cuda_pending_requests = 0U;
   result.retained_working_set_experts = 0U;
   for (const auto& [id, request] : core_->requests) {
     (void)id;
@@ -729,6 +767,7 @@ DeepSeekDecodeSchedulerSnapshot DeepSeekDecodeScheduler::snapshot() const
       ++result.runnable_requests;
     if (request->state == DeepSeekScheduledState::waiting_for_experts)
       ++result.waiting_requests;
+    if (request->cuda_pending) ++result.cuda_pending_requests;
   }
   for (const auto& [controller, working_set] : core_->working_sets) {
     (void)controller;

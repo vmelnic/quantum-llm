@@ -372,6 +372,25 @@ is claimed. The change is retained because it removes one host barrier per
 layer and makes inter-request overlap possible; private asynchronous planning
 is still required to realize that concurrency.
 
+Request-private hash/pin/miss scratch and a persistent plan event then replaced
+the remaining in-controller stream synchronization. An initial implementation
+was rejected because it busy-polled the event 835,494 times for 215 layers. The
+service loop now submits every runnable request stream, parks on one pending
+event only when no other runnable work remains, and resumes through an explicit
+`pending_cuda` scheduler state. The qualified single route emitted token
+`19923` with exactly 215 pending polls and 215 waits. Five model steps took
+342.421 ms, or 68.484 ms/model step (14.60 model steps/s), effectively matching
+the previous 14.67 best sample while freeing the control core from spin.
+
+A two-request lifecycle gate then exercised independent request streams and
+scratch through warm planning, concurrent execution, cold miss suspension,
+bounded acquisition, and resume. Both requests emitted the same two tokens
+(`19923`, then `3`); 76 suspensions and 188 acquisitions completed without a
+duplicate release, corrupted route, or leaked active request. This qualifies
+concurrent lifecycle correctness, not aggregate throughput: the setup still
+prefilled the two prompts sequentially and the extra route exceeded the learned
+warm set.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

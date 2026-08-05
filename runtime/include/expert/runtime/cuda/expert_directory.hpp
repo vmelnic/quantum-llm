@@ -55,6 +55,35 @@ struct DirectoryPlanResult final {
   std::uint64_t pin_id{};
 };
 
+class CudaDirectoryPlanWorkspace;
+
+struct DirectoryPlanWorkspaceResult final {
+  Status status;
+  std::shared_ptr<CudaDirectoryPlanWorkspace> workspace;
+};
+
+struct DirectoryPlanPollResult final {
+  Status status;
+  bool complete{};
+  DirectoryPlanResult plan;
+};
+
+// Request-private planning metadata. Device and pinned-host scratch remains
+// stable while an asynchronous route plan is in flight.
+class CudaDirectoryPlanWorkspace final {
+ public:
+  ~CudaDirectoryPlanWorkspace();
+  CudaDirectoryPlanWorkspace(const CudaDirectoryPlanWorkspace&) = delete;
+  CudaDirectoryPlanWorkspace& operator=(const CudaDirectoryPlanWorkspace&) =
+      delete;
+
+ private:
+  friend class CudaExpertDirectory;
+  struct Impl;
+  explicit CudaDirectoryPlanWorkspace(std::unique_ptr<Impl> impl) noexcept;
+  std::unique_ptr<Impl> impl_;
+};
+
 // One instance belongs to one immutable model/ABI. The hash table used to
 // deduplicate a route is sized by maximum_selections rather than by the total
 // expert count, keeping planning bounded for very large sparse models.
@@ -79,6 +108,18 @@ class CudaExpertDirectory final : public IDeviceResidencyDirectory {
       std::uint32_t layer, const std::uint32_t* device_expert_indices,
       std::uint32_t selection_count, void* stream,
       bool keep_ready_pins_on_miss = false);
+  [[nodiscard]] DirectoryPlanWorkspaceResult create_plan_workspace() noexcept;
+  [[nodiscard]] Status begin_plan_async(
+      CudaDirectoryPlanWorkspace& workspace, std::uint32_t layer,
+      const std::uint32_t* device_expert_indices,
+      std::uint32_t selection_count, void* stream,
+      bool keep_ready_pins_on_miss = false) noexcept;
+  [[nodiscard]] DirectoryPlanPollResult poll_plan_async(
+      CudaDirectoryPlanWorkspace& workspace) noexcept;
+  [[nodiscard]] Status cancel_plan_async(
+      CudaDirectoryPlanWorkspace& workspace) noexcept;
+  [[nodiscard]] Status wait_plan_async(
+      CudaDirectoryPlanWorkspace& workspace) noexcept;
   [[nodiscard]] Status release_pins(std::uint64_t pin_id,
                                     void* stream) noexcept;
   // Enqueues reference release after all prior work in stream and returns

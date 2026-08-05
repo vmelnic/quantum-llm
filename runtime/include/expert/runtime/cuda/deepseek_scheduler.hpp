@@ -45,11 +45,15 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::size_t requests{};
   std::size_t runnable_requests{};
   std::size_t waiting_requests{};
+  std::size_t cuda_pending_requests{};
   std::size_t inflight_acquires{};
   std::size_t retained_working_set_experts{};
   std::uint64_t submitted_requests{};
   std::uint64_t rejected_requests{};
   std::uint64_t layer_advances{};
+  std::uint64_t cuda_pending_polls{};
+  std::uint64_t cuda_waits{};
+  std::uint64_t cuda_wait_ns{};
   std::uint64_t expert_suspensions{};
   std::uint64_t acquires_started{};
   std::uint64_t acquires_completed{};
@@ -90,6 +94,10 @@ class DeepSeekDecodeScheduler final {
       std::shared_ptr<DeepSeekDecodeController> controller,
       const DeepSeekDecodeBegin& begin);
   [[nodiscard]] Status poll();
+  // Called by a blocking service loop only after poll() has submitted all
+  // currently runnable work. Waits for one request-private CUDA event so the
+  // control thread does not busy-spin while other request streams remain free.
+  [[nodiscard]] Status wait_for_cuda_progress();
   [[nodiscard]] Status cancel(std::uint64_t request_id) noexcept;
   [[nodiscard]] Status retire(std::uint64_t request_id);
   [[nodiscard]] std::optional<DeepSeekScheduledRequestSnapshot> inspect(

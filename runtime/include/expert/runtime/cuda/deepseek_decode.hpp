@@ -4,6 +4,7 @@
 #include "expert/runtime/cuda/expert_directory.hpp"
 
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <span>
@@ -34,6 +35,7 @@ struct DeepSeekDecodeBegin final {
 };
 
 enum class DeepSeekDecodeProgress : std::uint8_t {
+  pending_cuda,
   layer_complete,
   needs_experts,
   token_complete,
@@ -85,6 +87,7 @@ class DeepSeekDecodeController final {
 
   [[nodiscard]] Status begin(const DeepSeekDecodeBegin& launch) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult advance() noexcept;
+  [[nodiscard]] Status wait_for_cuda() noexcept;
   [[nodiscard]] Status cancel() noexcept;
   // Configured once before begin(); the workspace is private to this request.
   [[nodiscard]] Status configure_hybrid(
@@ -119,13 +122,18 @@ class DeepSeekDecodeController final {
       std::shared_ptr<CudaExpertDirectory>, void*) noexcept;
   DeepSeekDecodeController(std::shared_ptr<DeepSeekRequestState> request,
                            std::shared_ptr<CudaExpertDirectory> directory,
+                           std::shared_ptr<CudaDirectoryPlanWorkspace> workspace,
                            void* stream) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult fail(Status status) noexcept;
-  [[nodiscard]] DeepSeekDecodeAdvanceResult plan_and_execute() noexcept;
+  [[nodiscard]] DeepSeekDecodeAdvanceResult start_plan() noexcept;
+  [[nodiscard]] DeepSeekDecodeAdvanceResult poll_plan() noexcept;
+  [[nodiscard]] DeepSeekDecodeAdvanceResult execute_plan(
+      DirectoryPlanResult plan) noexcept;
   void clear_cpu_placements() noexcept;
 
   std::shared_ptr<DeepSeekRequestState> request_;
   std::shared_ptr<CudaExpertDirectory> directory_;
+  std::shared_ptr<CudaDirectoryPlanWorkspace> directory_workspace_;
   void* stream_{};
   DeepSeekDecodeRope rope_{};
   std::uint32_t position_{};
@@ -138,7 +146,9 @@ class DeepSeekDecodeController final {
   std::shared_ptr<DeepSeekFfnHybridWorkspace> hybrid_workspace_;
   std::vector<DeepSeekCpuExpertPlacement> cpu_placements_;
   DeepSeekDecodeTelemetry telemetry_;
+  std::chrono::steady_clock::time_point plan_started_{};
   bool active_{};
+  bool planning_{};
   bool waiting_for_experts_{};
   bool complete_{};
 };
