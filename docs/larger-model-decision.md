@@ -120,4 +120,7 @@ independently proven.
 - Complete: all 43 shared slots are atomically described, loaded through one
   bounded staging slot, pinned as model state, directory-verified, and released
   at teardown; measured startup was 3.59 seconds.
-- Next: implement dense FP8, HCA, and CSA/attention execution.
+- Complete: a generic FP8 dense-matrix source/admission/GEMV ABI passes on the
+  real layer-0 query projection with an exact candidate hash.
+- Next: load all 236 main-model FP8 matrices as resident state, then implement
+  typed HCA and CSA/attention execution.

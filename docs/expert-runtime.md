@@ -79,6 +79,12 @@ design: one pinned source slot bounds host memory while VRAM accumulates only
 the declared final allocations. Duplicate keys fail before I/O. A load failure
 releases the partial set and trims its now-unreferenced cache entries.
 
+Dense block-scaled FP8 matrices use `DeepSeekDenseMatrix`, not a synthetic
+expert key. Admission validates 128×128 source geometry, rejects E4M3FN/UE8M0
+NaNs, derives a row-INT8 matrix, and exposes the existing `Int8Matrix` GEMV ABI.
+Source and device byte claims remain explicit; dense allocations are model
+state rather than router-evictable cache entries.
+
 The key is `(model_content_hash, layer, expert, quant_abi)`.
 
 ## Heterogeneous execution

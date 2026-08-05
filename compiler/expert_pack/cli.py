@@ -13,9 +13,11 @@ from .deepseek_v4 import (
 )
 from .deepseek_slice import (
     export_deepseek_compact_expert,
+    export_deepseek_fp8_matrix,
     export_deepseek_shared_expert,
     export_deepseek_shared_set,
     qualify_deepseek_expert,
+    qualify_deepseek_fp8_matrix,
     qualify_deepseek_shared_expert,
 )
 from .errors import ExpertPackError
@@ -83,6 +85,13 @@ def _parser() -> argparse.ArgumentParser:
     shared_slice_parser.add_argument("--source", type=Path, required=True)
     shared_slice_parser.add_argument("--layer", type=int, default=0)
     shared_slice_parser.add_argument("--row-chunk", type=int, default=128)
+    dense_slice_parser = commands.add_parser(
+        "qualify-deepseek-fp8-matrix",
+        help="qualify one block-scaled FP8 dense matrix",
+    )
+    dense_slice_parser.add_argument("--source", type=Path, required=True)
+    dense_slice_parser.add_argument("--name", required=True)
+    dense_slice_parser.add_argument("--row-chunk", type=int, default=128)
 
     export_parser = commands.add_parser(
         "export-deepseek-expert",
@@ -105,6 +114,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     shared_set_parser.add_argument("--source", type=Path, required=True)
     shared_set_parser.add_argument("--output", type=Path, required=True)
+    dense_parser = commands.add_parser(
+        "export-deepseek-fp8-matrix",
+        help="describe one block-scaled FP8 matrix as SafeTensors extents",
+    )
+    dense_parser.add_argument("--source", type=Path, required=True)
+    dense_parser.add_argument("--output", type=Path, required=True)
+    dense_parser.add_argument("--name", required=True)
     return parser
 
 
@@ -155,6 +171,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 row_chunk=args.row_chunk,
             )
+        elif args.command == "qualify-deepseek-fp8-matrix":
+            result = qualify_deepseek_fp8_matrix(
+                SafeTensorCheckpoint(args.source), name=args.name,
+                row_chunk=args.row_chunk,
+            )
         elif args.command == "export-deepseek-expert":
             result = export_deepseek_compact_expert(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
@@ -165,9 +186,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-shared-set":
             result = export_deepseek_shared_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        else:
+            result = export_deepseek_fp8_matrix(
+                SafeTensorCheckpoint(args.source), name=args.name,
+                output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

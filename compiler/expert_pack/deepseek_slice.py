@@ -325,6 +325,104 @@ def qualify_deepseek_shared_expert(
     }
 
 
+def qualify_deepseek_fp8_matrix(
+    checkpoint: SafeTensorCheckpoint, *, name: str, row_chunk: int = 128
+) -> dict[str, object]:
+    """Qualify one block-scaled FP8 matrix for the generic SM86 dense ABI."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek dense qualification")
+    validate_deepseek_v4_source(checkpoint)
+    weight_name = name + ".weight"
+    scale_name = name + ".scale"
+    if weight_name not in checkpoint.tensors or scale_name not in checkpoint.tensors:
+        raise AdapterError(f"DeepSeek FP8 matrix does not exist: {name}")
+    weight_info = checkpoint.tensors[weight_name]
+    scale_info = checkpoint.tensors[scale_name]
+    if weight_info.dtype != "F8_E4M3" or scale_info.dtype != "F8_E8M0":
+        raise AdapterError(f"DeepSeek matrix is not block-scaled FP8: {name}")
+    rows, columns = weight_info.shape
+    if rows % 128 or columns % 128 or scale_info.shape != (rows // 128, columns // 128):
+        raise SourceFormatError("DeepSeek FP8 matrix has invalid 128x128 geometry")
+    if row_chunk <= 0:
+        raise ValueError("row_chunk must be positive")
+
+    started = time.perf_counter()
+    table = _fp8_e4m3fn_table()
+    quantized_payload = bytearray()
+    row_scale_payload = bytearray()
+    reference_equal = True
+    squared_error = 0.0
+    maximum_error = 0.0
+    with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
+        scale_name
+    ) as scale_view:
+        weights = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(rows, columns)
+        scales = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+            rows // 128, columns // 128
+        )
+        for first in range(0, rows, row_chunk):
+            last = min(rows, first + row_chunk)
+            weight_codes = weights[first:last]
+            scale_codes = scales[np.arange(first, last) // 128]
+            if bool((scale_codes == 255).any()):
+                raise SourceFormatError("dense FP8 matrix contains a UE8M0 NaN scale")
+            decoded = table[weight_codes]
+            decoded *= np.repeat(
+                np.ldexp(
+                    np.ones(scale_codes.shape, dtype=np.float32),
+                    scale_codes.astype(np.int16) - 127,
+                ),
+                128,
+                axis=1,
+            )
+            if not bool(np.isfinite(decoded).all()):
+                raise SourceFormatError("dense FP8 matrix decoded non-finite values")
+            try:
+                import torch
+            except ImportError as error:  # pragma: no cover
+                raise SourceFormatError("PyTorch is required for FP8 reference") from error
+            reference = (
+                torch.from_numpy(weight_codes.copy()).view(torch.float8_e4m3fn).float()
+                * torch.from_numpy(scale_codes.copy()).view(torch.float8_e8m0fnu)
+                .float().repeat_interleave(128, dim=1)
+            ).numpy()
+            reference_equal &= bool(
+                np.array_equal(decoded.view(np.uint32), reference.view(np.uint32))
+            )
+            maxima = np.max(np.abs(decoded), axis=1)
+            row_scales = np.where(maxima > 0, maxima / 127.0, 1.0).astype("<f4")
+            quantized = np.clip(
+                np.rint(decoded / row_scales[:, None]), -127, 127
+            ).astype(np.int8)
+            reconstructed = quantized.astype(np.float32) * row_scales[:, None]
+            difference = decoded.astype(np.float64) - reconstructed.astype(np.float64)
+            squared_error += float(np.square(difference).sum())
+            maximum_error = max(
+                maximum_error, float(np.max(np.abs(decoded - reconstructed)))
+            )
+            quantized_payload.extend(quantized.tobytes(order="C"))
+            row_scale_payload.extend(row_scales.tobytes(order="C"))
+        del weights, scales, weight_codes, scale_codes, decoded, reference
+    digest = hashlib.sha256(quantized_payload)
+    digest.update(row_scale_payload)
+    values = rows * columns
+    elapsed = time.perf_counter() - started
+    return {
+        "format": "deepseek-v4-fp8-matrix-qualification-v1",
+        "name": name,
+        "shape": [rows, columns],
+        "reference_bitwise_equal": reference_equal,
+        "source_bytes": weight_info.nbytes + scale_info.nbytes,
+        "candidate_int8_bytes": len(quantized_payload) + len(row_scale_payload),
+        "candidate_abi": "deepseek-sm86-int8-per-row-matrix-v1",
+        "candidate_sha256": digest.hexdigest(),
+        "root_mean_squared_error": math.sqrt(squared_error / values),
+        "maximum_absolute_error": maximum_error,
+        "elapsed_seconds": elapsed,
+    }
+
+
 def _export_deepseek_extents(
     checkpoint: SafeTensorCheckpoint,
     *,
@@ -432,6 +530,27 @@ def export_deepseek_shared_expert(
     return _export_deepseek_extents(
         checkpoint, names=names, output=output, layer=layer, expert="shared",
         format_name="deepseek-fp8-shared-expert-extents-v1",
+        source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+    )
+
+
+def export_deepseek_fp8_matrix(
+    checkpoint: SafeTensorCheckpoint, *, name: str, output: Path
+) -> dict[str, object]:
+    """Describe one block-scaled FP8 dense matrix without copying weights."""
+
+    validate_deepseek_v4_source(checkpoint)
+    weight_name = name + ".weight"
+    scale_name = name + ".scale"
+    if weight_name not in checkpoint.tensors or scale_name not in checkpoint.tensors:
+        raise AdapterError(f"DeepSeek FP8 matrix does not exist: {name}")
+    weight = checkpoint.tensors[weight_name]
+    scale = checkpoint.tensors[scale_name]
+    if weight.dtype != "F8_E4M3" or scale.dtype != "F8_E8M0":
+        raise AdapterError(f"DeepSeek matrix is not block-scaled FP8: {name}")
+    return _export_deepseek_extents(
+        checkpoint, names=(weight_name, scale_name), output=output, layer=-1,
+        expert=name, format_name="deepseek-fp8-matrix-extents-v1",
         source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
     )
 

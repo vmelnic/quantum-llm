@@ -30,6 +30,7 @@ remote files.
 | `Invoke-SourceInventory.ps1` | read-only validation and dtype/byte inventory for a cached checkpoint |
 | `Invoke-DeepSeekExpertSlice.ps1` | full real-expert decode/reference/INT8 qualification |
 | `Invoke-DeepSeekCudaAdmission.ps1` | compact H2D + SM86 admission hash gate |
+| `Invoke-DeepSeekDenseAdmission.ps1` | block-scaled FP8 dense matrix → SM86 GEMV gate |
 | `Invoke-DeepSeekSharedAdmission.ps1` | FP8 shared expert → SM86 cache/compute gate |
 | `Invoke-DeepSeekSharedResidency.ps1` | atomically pin all 43 shared experts at startup |
 | `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |

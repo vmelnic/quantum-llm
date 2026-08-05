@@ -11,6 +11,8 @@ inline constexpr std::string_view kDeepSeekFp8Block128Abi =
     "deepseek-fp8-e4m3-ue8m0-block128-v1";
 inline constexpr std::string_view kDeepSeekSm86HotAbi =
     "deepseek-sm86-int8-per-row-v1";
+inline constexpr std::string_view kDeepSeekSm86DenseAbi =
+    "deepseek-sm86-int8-per-row-matrix-v1";
 
 enum class DeepSeekProjection : std::uint8_t { w1_gate, w3_up, w2_down };
 

@@ -61,6 +61,11 @@ is accepted.
 the 43 small extent descriptors used for startup residency. It hashes about
 1.08 GB of authoritative source payload but copies none of it.
 
+`qualify-deepseek-fp8-matrix` and `export-deepseek-fp8-matrix` expose the same
+no-copy path for any validated dense FP8 matrix. The candidate ABI is generic
+INT8-per-row and feeds the normal dense GEMV kernels rather than the expert
+directory.
+
 ## Install
 
 From the repository root:

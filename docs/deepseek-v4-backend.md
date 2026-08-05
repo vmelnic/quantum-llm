@@ -212,3 +212,22 @@ Startup residency now loads and pins all 43 shared experts through one fixed
 visible in the CUDA directory, and teardown released the complete logical
 allocation. VRAM headroom is checked before the first read; partial startup
 failure releases every lease acquired by that startup transaction.
+
+## Dense FP8 matrices
+
+The main model contains 236 block-scaled FP8 matrices: 4,775,215,104 weight
+bytes and 291,456 UE8M0 scale bytes. Another 2,988,256,348 bytes are dense
+BF16/F32/I64 state and require their own typed loaders. The FP8 mass is small
+enough to remain resident on a 24 GB GPU after the 1.01 GiB shared set, while
+still leaving the routed-expert cache bounded separately.
+
+`deepseek-sm86-int8-per-row-matrix-v1` is the generic dense compute ABI. The
+first real projection, `layers.0.attn.wq_a` (1024×4096), was gathered directly
+from SafeTensors and decoded bit-for-bit identically to PyTorch. Its
+4,194,560-byte source became 4,198,400 device bytes; the candidate hash matched
+exactly. Admission took 5.74 ms and the existing dense GEMV took 0.674 ms, with
+maximum output difference `1.79e-7` against the CPU calculation.
+
+This proves one reusable dense matrix boundary, not the complete attention
+layer. Next the same loader must own all 236 FP8 matrices, while BF16/F32 HCA,
+normalization, compressor and router tensors retain their declared types.
