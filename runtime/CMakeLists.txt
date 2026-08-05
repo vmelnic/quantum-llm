@@ -65,6 +65,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     src/cuda/deepseek_dense.cu
     src/cuda/deepseek_dense_set.cpp
     src/cuda/deepseek_hca.cu
+    src/cuda/deepseek_model.cpp
     src/cuda/deepseek_typed.cu
     src/cuda/deepseek_typed_set.cpp
     src/cuda/expert_directory.cu
@@ -125,6 +126,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
       tools/deepseek_typed_residency.cpp)
     target_compile_features(expert-deepseek-typed-residency PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-typed-residency PRIVATE
+      expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-model-residency
+      tools/deepseek_model_residency.cpp)
+    target_compile_features(expert-deepseek-model-residency PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-model-residency PRIVATE
       expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-csa-smoke tools/deepseek_csa_smoke.cpp)
     target_compile_features(expert-deepseek-csa-smoke PRIVATE cxx_std_20)

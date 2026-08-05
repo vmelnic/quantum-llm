@@ -293,6 +293,27 @@ resident. This is the typed storage boundary required by HCA, normalization,
 CSA compressors/indexers, routing, embedding, and the output head; individual
 kernels still have to enforce each tensor's dtype and shape contract.
 
+## Transactional resident model
+
+`DeepSeekResidentModelState` combines the complete 236-matrix expanded dense
+set and all 834 dtype-preserving tensors behind one publication boundary. The
+dense phase may complete internally, but a failure while streaming typed state
+destroys the candidate and leaves the destination empty. This prevents a
+runner from observing a partially ready model.
+
+On the real checkpoint the combined state published 1,070 named objects and
+occupied 7,772,173,404 device bytes. It loaded through one 64 MiB pinned
+staging slot in 28.0 seconds and left 16,665,018,368 CUDA bytes free on the
+24 GiB qualification GPU. The source representation covered 7,763,762,908
+bytes; expansion of dense FP8 matrices accounts for the device/source delta.
+
+Layer bindings are non-owning views tied to the model state's lifetime. Model
+construction resolves names once and rejects wrong dtype, byte length, matrix
+geometry, layer ID, or compression schedule. Real bindings passed for layer 2
+(ratio 4, including its indexer) and layer 3 (ratio 128). Decode can therefore
+consume direct matrix/tensor pointers without names, source I/O, or admission
+inside the per-token path.
+
 ## CSA decode compressor
 
 The first CSA primitive now consumes the checkpoint's BF16 `wkv` and `wgate`

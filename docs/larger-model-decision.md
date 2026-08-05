@@ -130,6 +130,9 @@ independently proven.
 - Complete: all 834 main-model BF16/F32/I64 tensors stream transactionally
   into dtype-preserving device state through one fixed 64 MiB staging slot;
   tensors larger than the slot are hashed and uploaded incrementally.
+- Complete: dense and typed sets publish as one 7,772,173,404-byte model
+  transaction; fail-closed pointer bindings cover real ratio-4 and ratio-128
+  attention layers without hot-path name lookup or reupload.
 - Complete: the real CSA decode compressor passes for both checkpoint
   schedules—overlap ratio 4 and ordinary ratio 128—including BF16 projections,
   persistent state, gated pooling, and normalization.

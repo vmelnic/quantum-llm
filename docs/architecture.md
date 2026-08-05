@@ -197,3 +197,7 @@ not pretend that remote RAM is local memory.
 DeepSeek's compact-source and derived SM86-cache boundary is specified in
 [DeepSeek-V4-Flash backend](deepseek-v4-backend.md). It deliberately does not
 reinterpret the Expert Pack v1 ABI used by the current Qwen/OLMoE backend.
+Its resident dense and dtype-preserving tensors are published as one model
+transaction. Layer construction resolves and geometry-checks names once, then
+execution consumes stable pointer bindings rather than performing string
+lookups or per-layer uploads in the hot path.
