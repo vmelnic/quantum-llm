@@ -732,6 +732,39 @@ def export_deepseek_attention_oracle(
         )
     updated = np.asarray(updated_tokens, dtype="<f4")
 
+    ffn_fn = tensor(prefix + ".hc_ffn_fn", (24, 4 * 4096), "F32")
+    ffn_base = tensor(prefix + ".hc_ffn_base", (24,), "F32")
+    ffn_scale = tensor(prefix + ".hc_ffn_scale", (3,), "F32")
+    ffn_norm = tensor(prefix + ".ffn_norm.weight", (4096,), "BF16")
+    router = tensor(prefix + ".ffn.gate.weight", (256, 4096), "BF16")
+    token_expert_info = checkpoint.tensors[prefix + ".ffn.gate.tid2eid"]
+    if token_expert_info.shape != (129280, 6) or token_expert_info.dtype != "I64":
+        raise SourceFormatError("invalid hash router token table")
+    with checkpoint.open_tensor(prefix + ".ffn.gate.tid2eid") as view:
+        token_experts = np.frombuffer(view.raw, dtype="<i8").reshape(129280, 6)
+        route_indices = token_experts[:4].astype("<i4").copy()
+        del token_experts
+    if bool((route_indices < 0).any()) or bool((route_indices >= 256).any()):
+        raise SourceFormatError("hash router selected an invalid expert")
+
+    route_weights = np.empty((4, 6), dtype=np.float32)
+    for position in range(4):
+        _, _, _, ffn_collapsed, _ = _deepseek_hca_reference(
+            updated[position], ffn_fn, ffn_base, ffn_scale
+        )
+        ffn_input = rms(ffn_collapsed, ffn_norm)
+        partial = np.zeros((256, 32), dtype=np.float32)
+        for block in range(4096 // 32):
+            begin = block * 32
+            partial += router[:, begin:begin + 32] * ffn_input[begin:begin + 32]
+        for offset in (16, 8, 4, 2, 1):
+            partial[:, :offset] += partial[:, offset:2 * offset]
+        logits = partial[:, 0]
+        scores = np.sqrt(np.logaddexp(np.float32(0.0), logits)).astype(np.float32)
+        selected = scores[route_indices[position]]
+        route_weights[position] = selected / np.sum(selected, dtype=np.float32) * \
+            np.float32(1.5)
+
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
     if output.exists() or partial.exists():
@@ -754,6 +787,14 @@ def export_deepseek_attention_oracle(
         file.write(np.asarray(sines, dtype="<f4").tobytes())
         file.flush()
         os.fsync(file.fileno())
+    with (partial / "router-scores.f32").open("xb") as file:
+        file.write(np.asarray(route_weights, dtype="<f4").tobytes())
+        file.flush()
+        os.fsync(file.fileno())
+    with (partial / "router-indices.i32").open("xb") as file:
+        file.write(np.asarray(route_indices, dtype="<i4").tobytes())
+        file.flush()
+        os.fsync(file.fileno())
     result = {
         "format": "deepseek-attention-decode4-oracle-v1",
         "layer": layer,
@@ -761,6 +802,8 @@ def export_deepseek_attention_oracle(
         "positions": [0, 3],
         "stream_values": int(streams.size),
         "output_values": int(updated.size),
+        "router_tokens": 4,
+        "router_top_k": 6,
     }
     atomic_json(partial / "manifest.json", result)
     os.replace(partial, output)

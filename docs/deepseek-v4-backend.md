@@ -458,3 +458,25 @@ weight/activation layouts with an explicit accuracy gate, fused
 query/norm/RoPE, batched requests, and parallel top-k.
 The rejected standalone activation-INT8 DP4A path must not be repeated.
 Component-fixture timings will not be optimized in isolation.
+
+## FFN route and dispatch boundary
+
+FFN decode is split at the necessary control-plane boundary. `route` applies
+FFN HCA pre, BF16 RMSNorm, the BF16 router projection, and checkpoint-exact
+`sqrt(softplus)` scoring. Layers 0–2 select six experts through the immutable
+I64 token table. Later layers select by unbiased score plus F32 correction
+bias, but derive routing weights from the unbiased scores. Selected weights
+are normalized and multiplied by the checkpoint route scale `1.5`.
+
+The device route contains seven IDs: six routed experts followed by shared
+expert 256. The control plane can therefore pin/load the complete dependency
+set through one directory operation. Only after that succeeds does `execute`
+run routed and shared SwiGLU, add their outputs, and apply FFN HCA post. Both
+expert paths enforce the checkpoint's gate/up clamp of `10.0`; no expert
+pointer is dereferenced before the directory pin boundary.
+
+On the four real layer-2 attention outputs, hash IDs matched the independent
+checkpoint oracle exactly. Routing weights matched with RMSE `7.94e-6` and
+maximum absolute error `2.39e-5`. HCA pre, FFN norm, router projection and
+selection together measured 0.79 ms per token. The bounded FFN request state
+uses 190,976 bytes. Full routed/shared execution is the next composed gate.

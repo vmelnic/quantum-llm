@@ -25,6 +25,7 @@ struct MoeLaunch final {
   void* stream{};         // cudaStream_t without leaking CUDA headers.
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
+  float swiglu_limit{};
 };
 
 struct MoeBatchLaunch final {
@@ -45,6 +46,7 @@ struct MoeBatchLaunch final {
   void* stream{};
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
+  float swiglu_limit{};
 };
 
 struct MoeSelectionBatchLaunch final {
@@ -62,6 +64,7 @@ struct MoeSelectionBatchLaunch final {
   void* stream{};
   const DeviceExpertEntry* directory_entries{};
   std::uint32_t directory_layer{};
+  float swiglu_limit{};
 };
 
 struct MoeAggregateLaunch final {

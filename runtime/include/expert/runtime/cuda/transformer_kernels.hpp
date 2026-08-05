@@ -93,6 +93,19 @@ struct Int8Matrix final {
     float* logits, float* topk_scores, std::uint32_t* topk_indices,
     void* stream) noexcept;
 
+// DeepSeek-V4 sqrt(softplus) routing. Hash layers select through the immutable
+// token table; learned layers select by score+bias while weighting by the
+// unbiased score. Both normalize the selected weights before route scaling.
+[[nodiscard]] Status deepseek_router_hash(
+    const float* input, const std::uint16_t* router_weights,
+    const std::int64_t* token_experts, std::uint32_t token_id,
+    float* logits, float* topk_scores, std::uint32_t* topk_indices,
+    float route_scale, void* stream) noexcept;
+[[nodiscard]] Status deepseek_router_learned(
+    const float* input, const std::uint16_t* router_weights,
+    const float* selection_bias, float* logits, float* topk_scores,
+    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
+
 // Qwen3-Next full attention. q_and_gate is laid out per query head as
 // [query(head_dim), output_gate(head_dim)]. K/V caches retain only KV heads.
 [[nodiscard]] Status qwen3_next_qkv_rope_cache(

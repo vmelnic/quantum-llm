@@ -452,6 +452,86 @@ __global__ void router_select_batch_kernel(
   }
 }
 
+__device__ float deepseek_route_score(float logit) {
+  const float softplus = logit > 20.0F ? logit : log1pf(expf(logit));
+  return sqrtf(softplus);
+}
+
+__global__ void deepseek_hash_router_kernel(
+    const float* logits, const std::int64_t* token_experts,
+    std::uint32_t token_id, float route_scale, float* scores,
+    std::uint32_t* indices) {
+  const auto slot = static_cast<std::uint32_t>(threadIdx.x);
+  __shared__ float selected[6];
+  if (slot < 6U) {
+    const auto expert = token_experts[
+        static_cast<std::size_t>(token_id) * 6U + slot];
+    if (expert < 0 || expert >= 256) {
+      indices[slot] = 0xffffffffU;
+      selected[slot] = 0.0F;
+    } else {
+      indices[slot] = static_cast<std::uint32_t>(expert);
+      selected[slot] = deepseek_route_score(logits[expert]);
+    }
+  }
+  __syncthreads();
+  if (slot == 0U) {
+    float total = 0.0F;
+    for (std::uint32_t index = 0U; index < 6U; ++index)
+      total += selected[index];
+    const float multiplier = total > 0.0F ? route_scale / total : 0.0F;
+    for (std::uint32_t index = 0U; index < 6U; ++index)
+      scores[index] = selected[index] * multiplier;
+  }
+}
+
+__global__ void deepseek_learned_router_kernel(
+    const float* logits, const float* bias, float route_scale,
+    float* scores, std::uint32_t* indices) {
+  __shared__ float candidates[kThreads];
+  __shared__ std::uint32_t candidate_indices[kThreads];
+  __shared__ float selected_scores[6];
+  __shared__ std::uint32_t selected_indices[6];
+  const auto expert = static_cast<std::uint32_t>(threadIdx.x);
+  const float unbiased = deepseek_route_score(logits[expert]);
+  for (std::uint32_t slot = 0U; slot < 6U; ++slot) {
+    bool used = false;
+    for (std::uint32_t previous = 0U; previous < slot; ++previous)
+      used |= selected_indices[previous] == expert;
+    candidates[expert] = used ? kNegativeInfinity : unbiased + bias[expert];
+    candidate_indices[expert] = expert;
+    __syncthreads();
+    for (unsigned stride = kThreads / 2U; stride; stride >>= 1U) {
+      if (expert < stride) {
+        const auto other_value = candidates[expert + stride];
+        const auto other_index = candidate_indices[expert + stride];
+        if (other_value > candidates[expert] ||
+            (other_value == candidates[expert] &&
+             other_index < candidate_indices[expert])) {
+          candidates[expert] = other_value;
+          candidate_indices[expert] = other_index;
+        }
+      }
+      __syncthreads();
+    }
+    if (expert == 0U) {
+      selected_indices[slot] = candidate_indices[0];
+      selected_scores[slot] =
+          deepseek_route_score(logits[selected_indices[slot]]);
+    }
+    __syncthreads();
+  }
+  if (expert == 0U) {
+    float total = 0.0F;
+    for (const float value : selected_scores) total += value;
+    const float multiplier = total > 0.0F ? route_scale / total : 0.0F;
+    for (std::uint32_t slot = 0U; slot < 6U; ++slot) {
+      indices[slot] = selected_indices[slot];
+      scores[slot] = selected_scores[slot] * multiplier;
+    }
+  }
+}
+
 __global__ void qwen_qkv_rope_kernel(
     float* q_and_gate, float* key, const float* value,
     const float* q_weight, const float* k_weight, float* key_cache,
@@ -1053,6 +1133,37 @@ Status router_topk_normalized_batch(
   router_select_batch_kernel<<<rows, kThreads, 0, stream>>>(
       logits, experts, top_k, scores, indices);
   return checked(cudaPeekAtLastError(), "normalized batched router select");
+}
+Status deepseek_router_hash(
+    const float* input, const std::uint16_t* weights,
+    const std::int64_t* token_experts, std::uint32_t token_id,
+    float* logits, float* scores, std::uint32_t* indices,
+    float route_scale, void* raw) noexcept {
+  if (!input || !weights || !token_experts || !logits || !scores ||
+      !indices || token_id >= 129280U || !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek hash router");
+  auto status = gemv_bf16(weights, 256U, 4096U, input, logits, raw);
+  if (!status.ok()) return status;
+  deepseek_hash_router_kernel<<<1, 32, 0,
+                                static_cast<cudaStream_t>(raw)>>>(
+      logits, token_experts, token_id, route_scale, scores, indices);
+  return checked(cudaPeekAtLastError(), "DeepSeek hash router select");
+}
+Status deepseek_router_learned(
+    const float* input, const std::uint16_t* weights,
+    const float* selection_bias, float* logits, float* scores,
+    std::uint32_t* indices, float route_scale, void* raw) noexcept {
+  if (!input || !weights || !selection_bias || !logits || !scores ||
+      !indices || !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek learned router");
+  auto status = gemv_bf16(weights, 256U, 4096U, input, logits, raw);
+  if (!status.ok()) return status;
+  deepseek_learned_router_kernel<<<1, kThreads, 0,
+                                   static_cast<cudaStream_t>(raw)>>>(
+      logits, selection_bias, route_scale, scores, indices);
+  return checked(cudaPeekAtLastError(), "DeepSeek learned router select");
 }
 Status qwen3_next_qkv_rope_cache(
     float* q_and_gate, float* key, const float* value,

@@ -1,5 +1,6 @@
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/deepseek_attention.hpp"
+#include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/gather_storage.hpp"
@@ -159,6 +160,21 @@ std::vector<float> floats(const std::filesystem::path& path,
   return result;
 }
 
+std::vector<std::uint32_t> integers(const std::filesystem::path& path,
+                                    std::size_t expected) {
+  std::ifstream input(path, std::ios::binary | std::ios::ate);
+  require(static_cast<bool>(input) &&
+              static_cast<std::size_t>(input.tellg()) ==
+                  expected * sizeof(std::uint32_t),
+          "invalid attention oracle integer file");
+  input.seekg(0);
+  std::vector<std::uint32_t> result(expected);
+  input.read(reinterpret_cast<char*>(result.data()),
+             static_cast<std::streamsize>(expected * sizeof(std::uint32_t)));
+  require(static_cast<bool>(input), "truncated attention oracle integer file");
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -220,6 +236,11 @@ int main(int argc, char** argv) {
         std::filesystem::path(argv[4]) / "cosine.f32", decode_tokens * 32U);
     const auto host_sine = floats(
         std::filesystem::path(argv[4]) / "sine.f32", decode_tokens * 32U);
+    constexpr std::size_t router_values = decode_tokens * 6U;
+    const auto expected_router_scores = floats(
+        std::filesystem::path(argv[4]) / "router-scores.f32", router_values);
+    const auto expected_router_indices = integers(
+        std::filesystem::path(argv[4]) / "router-indices.i32", router_values);
     float *device_streams = nullptr, *device_output = nullptr;
     float *device_cosine = nullptr, *device_sine = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_streams),
@@ -268,6 +289,53 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(actual_output.data(), device_output,
                      stream_values * sizeof(float), cudaMemcpyDeviceToHost),
           "copy attention output");
+    auto ffn_state = er::cuda::create_deepseek_ffn_state(2U);
+    require(ffn_state.status.ok() && ffn_state.state,
+            std::string(ffn_state.status.message()));
+    cudaEvent_t router_start{}, router_stop{};
+    check(cudaEventCreate(&router_start), "create router start event");
+    check(cudaEventCreate(&router_stop), "create router stop event");
+    check(cudaEventRecord(router_start), "record router start");
+    for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
+      const auto route_status = er::cuda::deepseek_ffn_route({
+          &hash_ffn, ffn_state.state.get(),
+          device_output + position * token_stream_values, position,
+          1e-6F, 20U, nullptr});
+      require(route_status.ok(), std::string(route_status.message()));
+    }
+    check(cudaEventRecord(router_stop), "record router stop");
+    check(cudaEventSynchronize(router_stop), "synchronize router");
+    float router_ms = 0.0F;
+    check(cudaEventElapsedTime(&router_ms, router_start, router_stop),
+          "measure router");
+    std::vector<float> actual_router_scores(router_values);
+    std::vector<std::uint32_t> actual_router_indices(router_values);
+    for (std::uint32_t position = 0U; position < decode_tokens; ++position) {
+      const auto route_status = er::cuda::deepseek_ffn_route({
+          &hash_ffn, ffn_state.state.get(),
+          device_output + position * token_stream_values, position,
+          1e-6F, 20U, nullptr});
+      require(route_status.ok(), std::string(route_status.message()));
+      check(cudaMemcpy(actual_router_scores.data() + position * 6U,
+                       ffn_state.state->routing_weights(), 6U * sizeof(float),
+                       cudaMemcpyDeviceToHost), "copy router scores");
+      check(cudaMemcpy(actual_router_indices.data() + position * 6U,
+                       ffn_state.state->expert_indices(),
+                       6U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost),
+            "copy router indices");
+    }
+    float router_maximum = 0.0F;
+    double router_squared = 0.0;
+    for (std::size_t index = 0U; index < router_values; ++index) {
+      require(actual_router_indices[index] == expected_router_indices[index],
+              "hash router selected the wrong expert");
+      const auto error = std::abs(
+          actual_router_scores[index] - expected_router_scores[index]);
+      router_maximum = std::max(router_maximum, error);
+      router_squared += static_cast<double>(error) * error;
+    }
+    require(router_maximum < 1e-3F,
+            "hash router weights exceed oracle tolerance");
     double squared = 0.0;
     float maximum = 0.0F;
     std::array<float, decode_tokens> token_maximum{};
@@ -307,6 +375,11 @@ int main(int argc, char** argv) {
               << ",\"attention_rmse\":"
               << std::sqrt(squared / stream_values)
               << ",\"attention_max_abs_error\":" << maximum
+              << ",\"ffn_state_bytes\":" << ffn_state.state->bytes()
+              << ",\"router_ms_per_token\":" << router_ms / decode_tokens
+              << ",\"router_rmse\":"
+              << std::sqrt(router_squared / router_values)
+              << ",\"router_max_abs_error\":" << router_maximum
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";
     return 0;

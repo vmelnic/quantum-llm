@@ -89,9 +89,10 @@ are supported: overlap pooling at ratio 4 and ordinary gated pooling at ratio
 `export-deepseek-attention-oracle` independently composes the SM86 dense ABI,
 real typed weights, HCA, Q/KV transforms, sparse attention, and grouped output
 projection for four sequential layer-2 tokens. The fourth token closes and
-consumes the first compressed group. It emits only input/output/RoPE fixtures;
-the runtime still loads the authoritative full checkpoint through its normal
-model-state path.
+consumes the first compressed group. The same oracle then applies the real FFN
+HCA/norm and hash router, emitting expected top-6 IDs and weights for the four
+attention outputs. The runtime still loads the authoritative full checkpoint
+through its normal model-state path.
 
 ## Install
 

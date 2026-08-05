@@ -162,5 +162,8 @@ independently proven.
   throughput gain is claimed.
 - Complete: resident FFN bindings distinguish hash and learned routing and
   expose norm/router/HCA controls without hot-path name lookup.
+- Complete: the layer-2 FFN route phase composes HCA/norm and exact hash
+  routing, exposes six routed IDs plus shared expert 256 for one directory
+  plan, and matches independent IDs/weights.
 - Next: continue optimizing the composed layer, then connect attention to
   routing/shared/streamed experts in the first complete transformer block.

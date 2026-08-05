@@ -64,9 +64,11 @@ transient, KV, and workspace budgets are independent.
 
 ### Scheduler and placement
 
-The router is exact: it performs global softmax, top-k selection, and selected
-weight renormalization. Work is grouped by `(layer, expert, quant ABI)` across
-the active microbatch. Ready GPU work proceeds while cache misses are loaded or
+The router is backend-exact. Qwen uses its declared softmax/top-k behavior;
+DeepSeek uses `sqrt(softplus)`, token-table selection on hash layers or
+score-plus-bias selection on learned layers, then normalizes the unbiased
+selected weights. Work is grouped by `(layer, expert, quant ABI)` across the
+active microbatch. Ready GPU work proceeds while cache misses are loaded or
 executed on CPU. Weighted aggregation uses a stable order.
 
 CPU expert results return in a compact selection buffer rather than a dense
