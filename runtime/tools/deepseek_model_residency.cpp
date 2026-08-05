@@ -859,35 +859,58 @@ int main(int argc, char** argv) {
           "allocate full-model RoPE");
     const std::vector<std::uint32_t> full_inputs =
         prompt ? *prompt : std::vector<std::uint32_t>{42U};
+    require(full_inputs.size() <= 4096U,
+            "DeepSeek prompt exceeds request context");
+    float* prefill_streams = nullptr;
+    check(cudaMalloc(reinterpret_cast<void**>(&prefill_streams),
+                     full_inputs.size() * token_stream_values * sizeof(float)),
+          "allocate layer-major prefill streams");
     const auto full_started = std::chrono::steady_clock::now();
     const auto full_deadline = full_started + std::chrono::minutes(5);
     for (std::uint32_t position = 0U; position < full_inputs.size(); ++position) {
-      const auto token = full_inputs[position];
-      full_status = full_request.state->embed(token);
+      full_status = full_request.state->embed(full_inputs[position]);
       require(full_status.ok(), std::string(full_status.message()));
-      const auto request_id = 2U + position;
-      full_status = full_scheduler.submit(
-          request_id, full_controller.controller,
-          {full_request.state->current_streams(), upload_rope(position, full_rope),
-           position, token, 0U, 43U});
-      require(full_status.ok(), std::string(full_status.message()));
-      for (;;) {
-        full_status = full_scheduler.poll();
+      check(cudaMemcpy(prefill_streams + position * token_stream_values,
+                       full_request.state->current_streams(),
+                       token_stream_values * sizeof(float),
+                       cudaMemcpyDeviceToDevice),
+            "stage DeepSeek prefill embedding");
+    }
+    for (std::uint32_t layer = 0U; layer < 43U; ++layer) {
+      for (std::uint32_t position = 0U; position < full_inputs.size();
+           ++position) {
+        const auto request_id =
+            2U + static_cast<std::uint64_t>(layer) * full_inputs.size() +
+            position;
+        full_status = full_scheduler.submit(
+            request_id, full_controller.controller,
+            {prefill_streams + position * token_stream_values,
+             upload_rope(position, full_rope), position, full_inputs[position],
+             layer, layer + 1U});
         require(full_status.ok(), std::string(full_status.message()));
-        const auto scheduled = full_scheduler.inspect(request_id);
-        require(scheduled.has_value(), "full DeepSeek request disappeared");
-        if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
-          break;
-        require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
-                    scheduled->state !=
-                        er::cuda::DeepSeekScheduledState::cancelled,
-                std::string(scheduled->status.message()));
-        require(std::chrono::steady_clock::now() < full_deadline,
-                "full DeepSeek prompt timed out");
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        for (;;) {
+          full_status = full_scheduler.poll();
+          require(full_status.ok(), std::string(full_status.message()));
+          const auto scheduled = full_scheduler.inspect(request_id);
+          require(scheduled.has_value(), "full DeepSeek request disappeared");
+          if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
+            break;
+          require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
+                      scheduled->state !=
+                          er::cuda::DeepSeekScheduledState::cancelled,
+                  std::string(scheduled->status.message()));
+          require(std::chrono::steady_clock::now() < full_deadline,
+                  "full DeepSeek prompt timed out");
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        check(cudaMemcpy(prefill_streams + position * token_stream_values,
+                         full_controller.controller->output_streams(),
+                         token_stream_values * sizeof(float),
+                         cudaMemcpyDeviceToDevice),
+              "commit DeepSeek prefill layer output");
+        full_status = full_scheduler.retire(request_id);
+        require(full_status.ok(), std::string(full_status.message()));
       }
-      full_status = full_scheduler.retire(request_id);
-      require(full_status.ok(), std::string(full_status.message()));
     }
     full_status = full_request.state->project_logits();
     require(full_status.ok(), std::string(full_status.message()));
@@ -899,7 +922,8 @@ int main(int argc, char** argv) {
     require(full_sampled_token < 129280U,
             "full DeepSeek token is outside vocabulary");
     const auto full_scheduler_state = full_scheduler.snapshot();
-    require(full_scheduler_state.completed_requests == full_inputs.size() &&
+    require(full_scheduler_state.completed_requests ==
+                43U * full_inputs.size() &&
                 full_scheduler_state.layer_advances >= 43U * full_inputs.size(),
             "full DeepSeek scheduler did not complete every layer");
     const auto full_token_ms = std::chrono::duration<double, std::milli>(

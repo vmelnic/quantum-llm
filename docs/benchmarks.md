@@ -44,16 +44,18 @@ layers at every position, then projected 129,280 logits. The result was:
 | Measurement | Result |
 |---|---:|
 | prompt tokens | 5 |
-| layer advances | 430 (suspend + resume) |
-| routed acquisitions | 1,286 |
-| prompt decode | 19.91 s |
-| average prompt decode | 3.98 s/token |
+| layer advances | 420 |
+| routed acquisitions | 859 |
+| prompt decode | 3.74 s |
+| average prompt decode | 0.75 s/token |
 | greedy token | 19,923 (`Hello`) |
 
 This proves end-to-end checkpoint execution and tokenizer compatibility; it
-does not meet the throughput SLO. The 64-entry global routed cache used about
-10.7 GB total VRAM during execution and released back to the normal driver
-baseline after exit. A larger seven-routed-slots-per-layer policy was rejected:
+does not yet meet the throughput SLO. Layer-major traversal is 5.32x faster
+than the original 19.91-second token-major baseline. The 64-entry global routed
+cache used about 10.7 GB total VRAM during execution and released back to the
+normal driver baseline after exit. A larger seven-routed-slots-per-layer
+policy was rejected:
 route turnover forced costly allocation and FP8-to-INT8 admission churn and did
 not complete the five-token prompt within five minutes.
 

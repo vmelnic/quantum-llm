@@ -596,8 +596,14 @@ group-start coordinates.
 The first real chat prompt, `Hi`, encoded to the official five-token sequence
 `[0, 128803, 23166, 128804, 128822]`. The runtime consumed all five positions,
 executed 43 layers per position, projected the complete vocabulary, and
-greedily produced token `19923`, which decodes to `Hello`. The complete prompt
-decode took 19.91 seconds on the qualification host.
+greedily produced token `19923`, which decodes to `Hello`.
+
+Prefill now traverses layer-major: bounded device buffers retain every prompt
+row while one layer processes positions in causal order. The exact same prompt
+fell from 19.91 to 3.74 seconds (5.32x), and routed acquisitions fell from 1,286
+to 859 because expert residency is reused across prompt rows before advancing
+to the next layer. Grouped multi-row expert kernels remain a separate
+optimization.
 
 The serving boundary is still incomplete: this runner currently exposes one
 generated token as a qualification path, not a persistent HTTP worker. Cold

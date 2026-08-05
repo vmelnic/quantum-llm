@@ -37,8 +37,10 @@ This roadmap records direction, not a compatibility promise.
    and matches an independent full-vocabulary oracle.
 10. ~~Add official tokenizer integration and a token-level `[0,43)`
     controller.~~ A five-token real chat prompt now preserves state across all
-    layers and produces the expected decoded response boundary. Extend it to
-    multi-token generation and connect the persistent HTTP worker.
+    layers and produces the expected decoded response boundary. Layer-major
+    prefill reduced that prompt from 19.91 to 3.74 seconds without changing the
+    output. Add grouped multi-row kernels, multi-token generation, and the
+    persistent HTTP worker.
 11. Replace miss-time FP8-to-INT8 conversion/allocation with persistent
     compute-ready expert packs. The attempted per-layer VRAM cache regressed
     badly under route turnover and was removed; the bounded global cache is the
