@@ -393,6 +393,13 @@ bit-for-bit (`RMSE=0`, maximum error `0`). The forced split took 10.54 ms versus
 4.40 ms all-CUDA, which rejects CPU use for this single-stream hot route while
 qualifying the mechanism for cold or GPU-saturated placement decisions.
 
+The same forced split now passes through the production decode scheduler. The
+real-layer gate observed five cold device acquisitions, one typed host resolve,
+one peak host lease, and one completed hybrid layer. CPU/GPU output again
+matched exactly. This proves the scheduler lifecycle and placement boundary;
+the synthetic planner costs used to force the branch are intentionally excluded
+from performance claims.
+
 ## Benchmark rules
 
 Any published result must include:

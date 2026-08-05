@@ -39,6 +39,11 @@ struct HeldLease final {
   ExpertLease lease;
 };
 
+struct HeldHostLease final {
+  std::uint32_t expert{};
+  HostExpertLease lease;
+};
+
 using LayerWorkingSet =
     std::array<std::vector<HeldLease>, kDeepSeekLayers>;
 
@@ -56,6 +61,8 @@ struct ScheduledRequest final {
   std::deque<std::uint32_t> queued_experts;
   std::vector<PendingResolve> inflight;
   std::vector<HeldLease> leases;
+  std::vector<HeldHostLease> host_leases;
+  std::vector<std::uint32_t> cpu_experts;
   bool runnable_queued{};
   bool acquire_queued{};
 };
@@ -64,14 +71,16 @@ struct ScheduledRequest final {
 
 struct DeepSeekDecodeScheduler::Core final {
   Core(DeepSeekDecodeSchedulerConfig value, ExpertCache& expert_cache,
-       const DeepSeekExpertCatalog& expert_catalog)
+       const DeepSeekExpertCatalog& expert_catalog,
+       DeepSeekHybridSchedulerDependencies hybrid_dependencies)
       : config(value), cache(expert_cache), store(expert_cache),
-        catalog(expert_catalog) {}
+        catalog(expert_catalog), hybrid(std::move(hybrid_dependencies)) {}
 
   DeepSeekDecodeSchedulerConfig config;
   ExpertCache& cache;
   LocalExpertStore store;
   const DeepSeekExpertCatalog& catalog;
+  DeepSeekHybridSchedulerDependencies hybrid;
   std::map<std::uint64_t, std::unique_ptr<ScheduledRequest>> requests;
   std::map<DeepSeekDecodeController*, ControllerWorkingSet> working_sets;
   std::deque<std::uint64_t> runnable;
@@ -113,6 +122,8 @@ struct DeepSeekDecodeScheduler::Core final {
     request.inflight.clear();
     request.queued_experts.clear();
     request.leases.clear();
+    request.host_leases.clear();
+    request.cpu_experts.clear();
     request.acquire_queued = false;
   }
 
@@ -132,6 +143,12 @@ struct DeepSeekDecodeScheduler::Core final {
     return std::find(result.routed_experts.begin(),
                      result.routed_experts.end(), expert) !=
            result.routed_experts.end();
+  }
+
+  [[nodiscard]] bool cpu_contains(const ScheduledRequest& request,
+                                  std::uint32_t expert) const noexcept {
+    return std::find(request.cpu_experts.begin(), request.cpu_experts.end(),
+                     expert) != request.cpu_experts.end();
   }
 
   [[nodiscard]] std::vector<HeldLease>* layer_working_set(
@@ -192,7 +209,8 @@ struct DeepSeekDecodeScheduler::Core final {
     }
     if (auto* retained = layer_working_set(request, result.layer)) {
       std::erase_if(*retained, [&](const HeldLease& value) {
-        return !route_contains(result, value.expert);
+        return !route_contains(result, value.expert) ||
+               cpu_contains(request, value.expert);
       });
     }
     return Status::success();
@@ -202,7 +220,10 @@ struct DeepSeekDecodeScheduler::Core final {
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
     if (!config.retain_previous_route) {
+      if (!request.cpu_experts.empty()) ++metrics.hybrid_layers;
       request.leases.clear();
+      request.host_leases.clear();
+      request.cpu_experts.clear();
       return Status::success();
     }
     auto status = reconcile_working_set(request, result);
@@ -219,6 +240,7 @@ struct DeepSeekDecodeScheduler::Core final {
     }
     request.leases.clear();
     for (const auto expert : result.routed_experts) {
+      if (cpu_contains(request, expert)) continue;
       const bool held = std::any_of(
           retained->begin(), retained->end(), [expert](const HeldLease& value) {
             return value.expert == expert;
@@ -231,10 +253,83 @@ struct DeepSeekDecodeScheduler::Core final {
            std::move(request.leases.back().lease)});
       request.leases.pop_back();
     }
-    if (retained->size() != result.routed_experts.size()) {
+    const auto expected = result.routed_experts.size() -
+                          request.cpu_experts.size();
+    if (retained->size() != expected) {
       return {ErrorCode::internal,
               "DeepSeek retained route has the wrong cardinality"};
     }
+    if (!request.cpu_experts.empty()) ++metrics.hybrid_layers;
+    request.host_leases.clear();
+    request.cpu_experts.clear();
+    return Status::success();
+  }
+
+  Status plan_host_placements(
+      ScheduledRequest& request,
+      const DeepSeekDecodeAdvanceResult& result,
+      std::set<std::uint32_t>& cpu_selected) {
+    if (!hybrid.cpu_executor || !hybrid.planner ||
+        !request.cpu_experts.empty())
+      return Status::success();
+    std::vector<HybridDispatchCandidate> candidates;
+    candidates.reserve(result.routed_experts.size());
+    for (const auto expert : result.routed_experts) {
+      const auto* record = catalog.find(result.layer, expert);
+      if (!record)
+        return {ErrorCode::invalid_argument,
+                "DeepSeek hybrid candidate is absent from catalog"};
+      const auto ready = std::find(result.ready_experts.begin(),
+                                   result.ready_experts.end(), expert) !=
+                         result.ready_experts.end();
+      const ExpertKey key{config.model_id, result.layer, expert,
+                          kExpertQuantAbiDeepSeekSm86};
+      const auto snapshot = cache.inspect(key);
+      const auto host_ready = snapshot && snapshot->has_host_copy;
+      candidates.push_back({expert, 1U, record->stored_bytes, ready,
+                            host_ready, true});
+    }
+    const auto placement = hybrid.planner->plan(candidates);
+    if (!placement.status.ok()) return copied_status(placement.status);
+    std::vector<ExpertResolveRequest> host_requests;
+    for (const auto& decision : placement.decisions) {
+      if (decision.executor != HybridExecutor::cpu_local) continue;
+      const auto* record = catalog.find(result.layer, decision.expert);
+      host_requests.push_back(
+          {ExpertKey{config.model_id, result.layer, decision.expert,
+                     kExpertQuantAbiDeepSeekSm86},
+           *record, ExpertResolveTarget::host_ready});
+    }
+    if (host_requests.empty()) return Status::success();
+    auto handle = store.resolve(host_requests);
+    auto resolved = handle.poll();
+    if (!resolved || !resolved->status.ok() ||
+        resolved->experts.size() != host_requests.size()) {
+      // RAM placement is opportunistic. An eviction between inspect and lease
+      // acquisition falls back to the ordinary device path.
+      return Status::success();
+    }
+    std::vector<DeepSeekCpuExpertPlacement> staged;
+    staged.reserve(resolved->experts.size());
+    for (auto& expert : resolved->experts) {
+      if (expert.placement != ExpertPlacementKind::host ||
+          !expert.host_lease)
+        return {ErrorCode::internal,
+                "DeepSeek host resolve returned device placement"};
+      cpu_selected.insert(expert.key.expert);
+      request.cpu_experts.push_back(expert.key.expert);
+      request.host_leases.push_back(
+          {expert.key.expert, std::move(expert.host_lease)});
+    }
+    for (const auto& held : request.host_leases) {
+      if (!cpu_selected.contains(held.expert)) continue;
+      staged.push_back({held.expert, held.lease.bytes(),
+                        held.lease.compact_sections()});
+    }
+    const auto staged_status = request.controller->stage_cpu_placements(staged);
+    if (!staged_status.ok()) return copied_status(staged_status);
+    metrics.host_resolves += staged.size();
+    metrics.cpu_placements += staged.size();
     return Status::success();
   }
 
@@ -270,6 +365,9 @@ struct DeepSeekDecodeScheduler::Core final {
       }
     }
     std::set<std::uint32_t> unique;
+    std::set<std::uint32_t> cpu_selected;
+    status = plan_host_placements(request, result, cpu_selected);
+    if (!status.ok()) return status;
     for (const auto expert : result.missing_experts) {
       if (expert >= kDeepSeekCatalogExperts) {
         return {ErrorCode::internal,
@@ -279,6 +377,7 @@ struct DeepSeekDecodeScheduler::Core final {
         return {ErrorCode::internal,
                 "DeepSeek controller returned a duplicate missing expert"};
       }
+      if (cpu_selected.contains(expert)) continue;
       const auto held = std::any_of(
           request.leases.begin(), request.leases.end(),
           [expert](const HeldLease& value) { return value.expert == expert; }) ||
@@ -298,8 +397,10 @@ struct DeepSeekDecodeScheduler::Core final {
     }
     request.state = DeepSeekScheduledState::waiting_for_experts;
     request.layer = result.layer;
-    for (const auto expert : result.missing_experts)
-      request.queued_experts.push_back(expert);
+    for (const auto expert : result.missing_experts) {
+      if (!cpu_selected.contains(expert))
+        request.queued_experts.push_back(expert);
+    }
     enqueue_acquisition(request);
     return Status::success();
   }
@@ -414,11 +515,15 @@ struct DeepSeekDecodeScheduler::Core final {
 
 DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
     DeepSeekDecodeSchedulerConfig config, ExpertCache& cache,
-    const DeepSeekExpertCatalog& catalog)
-    : core_(std::make_unique<Core>(config, cache, catalog)) {
+    const DeepSeekExpertCatalog& catalog,
+    DeepSeekHybridSchedulerDependencies hybrid)
+    : core_(std::make_unique<Core>(config, cache, catalog,
+                                   std::move(hybrid))) {
   if (config.model_id == 0U || config.maximum_requests == 0U ||
       config.maximum_inflight_acquires == 0U ||
       config.maximum_layer_advances_per_poll == 0U ||
+      static_cast<bool>(core_->hybrid.cpu_executor) !=
+          static_cast<bool>(core_->hybrid.planner) ||
       catalog.size() != static_cast<std::size_t>(kDeepSeekCatalogLayers) *
                             kDeepSeekCatalogExperts) {
     throw std::invalid_argument("invalid DeepSeek decode scheduler contract");
@@ -448,6 +553,22 @@ Status DeepSeekDecodeScheduler::submit(
     ++core_->metrics.rejected_requests;
     return {ErrorCode::backpressure,
             "DeepSeek scheduled request capacity exhausted"};
+  }
+  if (core_->hybrid.cpu_executor) {
+    auto workspace = create_deepseek_ffn_hybrid_workspace();
+    if (!workspace.status.ok() || !workspace.workspace) {
+      ++core_->metrics.rejected_requests;
+      return workspace.status.ok()
+                 ? Status(ErrorCode::internal,
+                          "DeepSeek hybrid workspace returned no ownership")
+                 : copied_status(workspace.status);
+    }
+    const auto configured = controller->configure_hybrid(
+        core_->hybrid.cpu_executor, std::move(workspace.workspace));
+    if (!configured.ok()) {
+      ++core_->metrics.rejected_requests;
+      return copied_status(configured);
+    }
   }
   const auto started = controller->begin(begin);
   if (!started.ok()) {
@@ -555,7 +676,7 @@ DeepSeekDecodeScheduler::inspect(std::uint64_t request_id) const {
   return DeepSeekScheduledRequestSnapshot{
       request.state, copied_status(request.status), request.layer,
       request.queued_experts.size(), request.inflight.size(),
-      request.leases.size()};
+      request.leases.size(), request.host_leases.size()};
 }
 
 DeepSeekDecodeSchedulerSnapshot DeepSeekDecodeScheduler::snapshot() const

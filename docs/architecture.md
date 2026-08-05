@@ -120,6 +120,23 @@ bounded software prefetches. A first-real-batch calibration chooses active
 workers and gate/down tiles under a time limit, then publishes the selected
 configuration and effective weight traversal rate.
 
+DeepSeek placement now crosses the real decode scheduler boundary. For every
+suspended layer, the scheduler gives the bounded hybrid planner the exact
+routed union and the current host/device residency. A CPU decision is resolved
+as a typed host lease; all remaining selections are resolved as typed device
+leases. Both lease classes stay alive until the layer finishes, so the
+controller receives stable compact-record spans and the CUDA directory cannot
+evict an in-flight selection. If a host copy is evicted between inspection and
+lease acquisition, that selection safely falls back to the device path.
+
+The controller owns one reusable hybrid FFN workspace per active request. It
+only executes the placement supplied by the scheduler and aggregates CPU and
+GPU selections in stable route order; it does not infer placement from pointer
+location or silently promote a host record. The current qualification uses
+forced planner costs to exercise one CPU plus five GPU experts exactly. Real
+serving policy must instead be seeded and updated by measured CPU, GPU, H2D,
+storage, and queue costs.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

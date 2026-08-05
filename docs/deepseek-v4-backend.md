@@ -745,3 +745,21 @@ selection-batch kernels, preserves the three-token greedy sequence, and keeps
 the block maximum error below `5e-4`. It adds about 98 KiB per layer of FFN
 request workspace. The change removes serialization across top-k down GEMVs;
 it does not remove expert reads or implement Tensor Core weight kernels.
+
+The hybrid primitive is now owned by the asynchronous decode scheduler rather
+than invoked only by a standalone gate. A suspended routed layer is planned as
+an explicit union of host and device placements. Host selections hold
+`HostExpertLease` ownership over the native FP4 record; device selections hold
+ordinary directory/cache leases. The scheduler stages host placements once,
+the controller resumes the same already-computed attention/router state, and
+the two lanes aggregate in deterministic route order. Host eviction races are
+handled by falling back to device resolution, never by using an unowned span.
+
+The real scheduler gate deliberately biases its planner so that one of six
+routed experts executes on all CPU cores while five execute on the RTX 3090.
+It is a correctness, lifetime, and accounting gate: output remains exact with
+the direct hybrid oracle, five device acquisitions replace six, one host lease
+is visible at peak, and one hybrid layer is recorded. These forced costs are
+not a production placement profile. On this hot layer the all-GPU path remains
+faster; measured hardware/queue/storage observations must drive production
+placement.

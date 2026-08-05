@@ -3,6 +3,7 @@
 #include "expert/runtime/cuda/deepseek_decode.hpp"
 #include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/hybrid_dispatch.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,7 @@ struct DeepSeekScheduledRequestSnapshot final {
   std::size_t queued_experts{};
   std::size_t inflight_acquires{};
   std::size_t held_leases{};
+  std::size_t held_host_leases{};
 };
 
 struct DeepSeekDecodeSchedulerSnapshot final {
@@ -50,9 +52,17 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::uint64_t expert_suspensions{};
   std::uint64_t acquires_started{};
   std::uint64_t acquires_completed{};
+  std::uint64_t host_resolves{};
+  std::uint64_t cpu_placements{};
+  std::uint64_t hybrid_layers{};
   std::uint64_t completed_requests{};
   std::uint64_t failed_requests{};
   std::uint64_t cancelled_requests{};
+};
+
+struct DeepSeekHybridSchedulerDependencies final {
+  std::shared_ptr<cpu::DeepSeekPackedExecutor> cpu_executor;
+  std::shared_ptr<HybridDispatchPlanner> planner;
 };
 
 // Single-owner, non-blocking outer loop for DeepSeek decode controllers.
@@ -63,7 +73,8 @@ class DeepSeekDecodeScheduler final {
  public:
   DeepSeekDecodeScheduler(DeepSeekDecodeSchedulerConfig config,
                           ExpertCache& cache,
-                          const DeepSeekExpertCatalog& catalog);
+                          const DeepSeekExpertCatalog& catalog,
+                          DeepSeekHybridSchedulerDependencies hybrid = {});
   ~DeepSeekDecodeScheduler();
   DeepSeekDecodeScheduler(const DeepSeekDecodeScheduler&) = delete;
   DeepSeekDecodeScheduler& operator=(const DeepSeekDecodeScheduler&) = delete;

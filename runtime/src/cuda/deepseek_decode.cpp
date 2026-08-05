@@ -3,6 +3,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -27,6 +28,38 @@ DeepSeekDecodeController::DeepSeekDecodeController(
 
 DeepSeekDecodeController::~DeepSeekDecodeController() {
   static_cast<void>(cancel());
+}
+
+Status DeepSeekDecodeController::configure_hybrid(
+    std::shared_ptr<cpu::DeepSeekPackedExecutor> executor,
+    std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept {
+  if (active_ || !executor || !workspace)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek hybrid controller configuration"};
+  cpu_executor_ = std::move(executor);
+  hybrid_workspace_ = std::move(workspace);
+  return Status::success();
+}
+
+Status DeepSeekDecodeController::stage_cpu_placements(
+    std::span<const DeepSeekCpuExpertPlacement> placements) noexcept {
+  if (!active_ || !waiting_for_experts_ || !cpu_executor_ ||
+      !hybrid_workspace_ || placements.empty() || placements.size() > 6U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek CPU placement staging"};
+  std::set<std::uint32_t> unique;
+  for (const auto& placement : placements) {
+    if (placement.expert >= 256U || placement.record_bytes.empty() ||
+        !unique.insert(placement.expert).second)
+      return {ErrorCode::invalid_argument,
+              "invalid or duplicate DeepSeek CPU placement"};
+  }
+  cpu_placements_.assign(placements.begin(), placements.end());
+  return Status::success();
+}
+
+void DeepSeekDecodeController::clear_cpu_placements() noexcept {
+  cpu_placements_.clear();
 }
 
 Status DeepSeekDecodeController::begin(
@@ -71,6 +104,7 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
   active_ = false;
   waiting_for_experts_ = false;
   complete_ = false;
+  clear_cpu_placements();
   return {std::move(status), DeepSeekDecodeProgress::layer_complete,
           current_layer_, {}, {}, {}};
 }
@@ -97,20 +131,49 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
   std::vector<std::uint32_t> routed_experts(
       plan.selected_experts.begin(), plan.selected_experts.begin() + 6U);
   pin_id_ = plan.pin_id;
-  if (!plan.missing_experts.empty()) {
+  std::vector<std::uint32_t> uncovered_missing;
+  std::vector<cpu::DeepSeekPackedWorkGroup> cpu_groups;
+  uncovered_missing.reserve(plan.missing_experts.size());
+  cpu_groups.reserve(cpu_placements_.size());
+  for (const auto missing : plan.missing_experts) {
+    const auto placement = std::find_if(
+        cpu_placements_.begin(), cpu_placements_.end(),
+        [missing](const auto& value) { return value.expert == missing; });
+    if (placement == cpu_placements_.end()) {
+      uncovered_missing.push_back(missing);
+      continue;
+    }
+    const auto selection = std::find(routed_experts.begin(),
+                                     routed_experts.end(), missing);
+    if (selection == routed_experts.end())
+      return fail({ErrorCode::internal,
+                   "staged CPU expert is absent from the routed selection"});
+    const auto slot = static_cast<std::uint32_t>(
+        std::distance(routed_experts.begin(), selection));
+    cpu_groups.push_back({placement->record_bytes, placement->sections,
+                          4096U, 2048U, {slot},
+                          {static_cast<std::uint32_t>(cpu_groups.size())}});
+  }
+  if (!uncovered_missing.empty()) {
     waiting_for_experts_ = true;
     return {Status::success(), DeepSeekDecodeProgress::needs_experts,
-            current_layer_, std::move(plan.missing_experts),
+            current_layer_, std::move(uncovered_missing),
             std::move(plan.ready_experts), std::move(routed_experts)};
   }
   if (pin_id_ == 0U)
     return fail({ErrorCode::internal,
                  "DeepSeek directory returned no execution pin"});
 
-  const auto execute = deepseek_ffn_execute(
-      {view.ffn_weights, view.ffn_state, directory_->device_entries(),
-       request_->streams_b_, request_->streams_a_,
-       directory_->experts_per_layer(), stream_});
+  const auto execute = cpu_groups.empty()
+      ? deepseek_ffn_execute(
+            {view.ffn_weights, view.ffn_state, directory_->device_entries(),
+             request_->streams_b_, request_->streams_a_,
+             directory_->experts_per_layer(), stream_})
+      : deepseek_ffn_execute_hybrid(
+            {view.ffn_weights, view.ffn_state, directory_->device_entries(),
+             request_->streams_b_, request_->streams_a_,
+             hybrid_workspace_.get(), cpu_executor_.get(), cpu_groups,
+             directory_->experts_per_layer(), stream_});
   if (!execute.ok()) return fail(execute);
   const auto release = directory_->release_pins(pin_id_, stream_);
   pin_id_ = 0U;
@@ -118,6 +181,7 @@ DeepSeekDecodeController::plan_and_execute() noexcept {
 
   const auto completed_layer = current_layer_++;
   waiting_for_experts_ = false;
+  clear_cpu_placements();
   if (current_layer_ == layer_limit_) {
     active_ = false;
     complete_ = true;
@@ -181,6 +245,7 @@ Status DeepSeekDecodeController::cancel() noexcept {
   active_ = false;
   waiting_for_experts_ = false;
   complete_ = false;
+  clear_cpu_placements();
   return status;
 }
 

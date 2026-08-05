@@ -85,9 +85,13 @@ This roadmap records direction, not a compatibility promise.
     CPU RAM selections and resident CUDA selections now share one masked,
     overlapped execution boundary and stable aggregate. A forced one-CPU/five-
     GPU layer remained bit-identical but took 10.54 versus 4.40 ms, so the
-    single-stream hot policy correctly remains GPU. Next move selection into
-    the scheduler state machine and feed measured queue/storage/lane costs back
-    into placement instead of forcing a static split.
+    single-stream hot policy correctly remains GPU. Selection now crosses the
+    actual scheduler state machine as typed host/device leases, with safe
+    host-eviction fallback and per-request reusable workspace. A forced
+    one-CPU/five-GPU scheduler gate is exact and accounts five device acquires,
+    one host resolve, and one hybrid layer. Next persist bounded route evidence
+    and feed measured queue/storage/lane costs into placement instead of using
+    forced qualification costs.
 
 ## Phase 1 — long-context and cold-path production work
 

@@ -58,6 +58,12 @@ struct DeepSeekRouteTraceEntry final {
   std::array<std::uint32_t, 6U> routed_experts{};
 };
 
+struct DeepSeekCpuExpertPlacement final {
+  std::uint32_t expert{};
+  std::span<const std::byte> record_bytes;
+  DeepSeekCompactSections sections;
+};
+
 struct DeepSeekDecodeControllerResult;
 
 // Executes one layer per advance() call. A cache miss returns control without
@@ -73,6 +79,14 @@ class DeepSeekDecodeController final {
   [[nodiscard]] Status begin(const DeepSeekDecodeBegin& launch) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult advance() noexcept;
   [[nodiscard]] Status cancel() noexcept;
+  // Configured once before begin(); the workspace is private to this request.
+  [[nodiscard]] Status configure_hybrid(
+      std::shared_ptr<cpu::DeepSeekPackedExecutor> executor,
+      std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept;
+  // Called only after needs_experts. Spans remain owned by scheduler host
+  // leases until the suspended layer completes or is cancelled.
+  [[nodiscard]] Status stage_cpu_placements(
+      std::span<const DeepSeekCpuExpertPlacement> placements) noexcept;
 
   [[nodiscard]] const float* output_streams() const noexcept {
     return complete_ ? request_->streams_a_ : nullptr;
@@ -95,6 +109,7 @@ class DeepSeekDecodeController final {
                            void* stream) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult fail(Status status) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult plan_and_execute() noexcept;
+  void clear_cpu_placements() noexcept;
 
   std::shared_ptr<DeepSeekRequestState> request_;
   std::shared_ptr<CudaExpertDirectory> directory_;
@@ -106,6 +121,9 @@ class DeepSeekDecodeController final {
   std::uint32_t layer_limit_{};
   std::uint64_t pin_id_{};
   std::vector<DeepSeekRouteTraceEntry> route_trace_;
+  std::shared_ptr<cpu::DeepSeekPackedExecutor> cpu_executor_;
+  std::shared_ptr<DeepSeekFfnHybridWorkspace> hybrid_workspace_;
+  std::vector<DeepSeekCpuExpertPlacement> cpu_placements_;
   bool active_{};
   bool waiting_for_experts_{};
   bool complete_{};

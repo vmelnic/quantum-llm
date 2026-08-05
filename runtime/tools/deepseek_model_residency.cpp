@@ -882,6 +882,21 @@ int main(int argc, char** argv) {
     er::ExpertCache resumed_cache(
         expert_config, expert_storage, expert_uploader, resumed_buffers,
         resumed_directory);
+    {
+      er::ResidentExpertSet cpu_seed;
+      const auto seeded = er::ResidentExpertSet::load(
+          resumed_cache,
+          std::span<const er::ResidentExpertSpec>(ffn.data(), 1U), cpu_seed);
+      require(seeded.ok() && cpu_seed.size() == 1U,
+              std::string(seeded.message()));
+    }
+    const auto trimmed_seed = resumed_cache.trim_to(
+        128ULL << 20U, 0U);
+    const auto seeded_snapshot = resumed_cache.inspect(ffn.front().key);
+    require(seeded_snapshot && seeded_snapshot->has_host_copy &&
+                !seeded_snapshot->has_device_copy &&
+                trimmed_seed.vram_bytes == 0U,
+            "DeepSeek CPU seed did not remain host-only after device trim");
     auto resumed_controller = er::cuda::create_deepseek_decode_controller(
         resumed_request.state, resumed_directory, nullptr);
     require(resumed_controller.status.ok() && resumed_controller.controller,
@@ -893,8 +908,15 @@ int main(int argc, char** argv) {
         resumed_shared);
     require(resumed_load.ok() && resumed_shared.size() == 1U,
             std::string(resumed_load.message()));
+    auto scheduler_cpu = std::make_shared<er::cpu::DeepSeekPackedExecutor>(
+        er::cpu::DeepSeekPackedExecutorConfig{
+            std::max(1U, std::thread::hardware_concurrency()),
+            8U, 8U, 10.0F, true, true});
+    auto scheduler_planner = std::make_shared<er::HybridDispatchPlanner>(
+        er::HybridDispatchConfig{1.0, 1.0, 1.0, 0.125, 6U, 32U});
     er::cuda::DeepSeekDecodeScheduler decode_scheduler(
-        {17U, 2U, 2U, 1U}, resumed_cache, routed_catalog);
+        {17U, 2U, 2U, 1U}, resumed_cache, routed_catalog,
+        {scheduler_cpu, scheduler_planner});
     const auto submitted = decode_scheduler.submit(
         1U, resumed_controller.controller,
         {device_streams + 3U * token_stream_values,
@@ -905,6 +927,7 @@ int main(int argc, char** argv) {
     require(submitted.ok(), std::string(submitted.message()));
     std::size_t scheduler_peak_acquires = 0U;
     std::size_t scheduler_peak_leases = 0U;
+    std::size_t scheduler_peak_host_leases = 0U;
     const auto scheduler_deadline =
         std::chrono::steady_clock::now() + std::chrono::seconds(60);
     for (;;) {
@@ -917,6 +940,8 @@ int main(int argc, char** argv) {
           scheduler_peak_acquires, scheduler_state.inflight_acquires);
       scheduler_peak_leases = std::max(
           scheduler_peak_leases, scheduled->held_leases);
+      scheduler_peak_host_leases = std::max(
+          scheduler_peak_host_leases, scheduled->held_host_leases);
       if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
         break;
       require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
@@ -930,11 +955,15 @@ int main(int argc, char** argv) {
     const auto scheduler_state = decode_scheduler.snapshot();
     require(scheduler_state.completed_requests == 1U &&
                 scheduler_state.expert_suspensions == 1U &&
-                scheduler_state.acquires_started == 6U &&
-                scheduler_state.acquires_completed == 6U &&
+                scheduler_state.acquires_started == 5U &&
+                scheduler_state.acquires_completed == 5U &&
+                scheduler_state.host_resolves == 1U &&
+                scheduler_state.cpu_placements == 1U &&
+                scheduler_state.hybrid_layers == 1U &&
                 scheduler_peak_acquires == 2U &&
                 scheduler_peak_leases > 0U &&
-                scheduler_peak_leases <= 6U,
+                scheduler_peak_leases <= 5U &&
+                scheduler_peak_host_leases == 1U,
             "DeepSeek async scheduler accounting is inconsistent");
     std::vector<float> resumed_output(token_stream_values);
     check(cudaMemcpy(resumed_output.data(),
@@ -1268,6 +1297,12 @@ int main(int argc, char** argv) {
               << ",\"scheduler_peak_acquires\":"
               << scheduler_peak_acquires
               << ",\"scheduler_peak_leases\":" << scheduler_peak_leases
+              << ",\"scheduler_peak_host_leases\":"
+              << scheduler_peak_host_leases
+              << ",\"scheduler_cpu_placements\":"
+              << scheduler_state.cpu_placements
+              << ",\"scheduler_hybrid_layers\":"
+              << scheduler_state.hybrid_layers
               << ",\"controller_resume_max_abs_error\":" << resumed_maximum
               << ",\"full_token_input\":" << full_inputs.front()
               << ",\"full_token_output\":" << full_sampled_token
