@@ -53,3 +53,14 @@ The planned SM86 placement model is:
 
 No full conversion starts until the FP4/UE8M0 decoder, a real expert slice,
 numeric comparison, and output-space estimate pass independently.
+
+## Numeric source decoding
+
+The dependency-free source decoder implements the published E2M1 finite table,
+low-nibble-then-high-nibble packing order, one UE8M0 scale per 32 logical expert
+values, and row/block streaming. All 16 FP4 codes and all 255 finite UE8M0 codes
+are tested; the UE8M0 NaN code, invalid geometry, and non-finite output fail
+closed.
+
+This decoder establishes source semantics only. It does not select the final
+GPU-cache representation and is not wired into Expert Pack v1.

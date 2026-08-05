@@ -97,6 +97,6 @@ independently proven.
 
 - Complete: pinned download and independent index/shard verification.
 - Complete: read-only dtype inventory and exhaustive source metadata contract.
-- Next: FP4 E2M1 and UE8M0 numerical decoding with exhaustive value tests.
-- Then: one real routed expert slice, trusted-reference comparison, and
+- Complete: FP4 E2M1 and UE8M0 numerical decoding with exhaustive value tests.
+- Next: one real routed expert slice, trusted-reference comparison, and
   representation/space measurements before any full conversion.
