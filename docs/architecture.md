@@ -153,6 +153,12 @@ headroom from operator-approved host/device envelopes and returns whole compact
 expert slots plus the matching memory-governor configuration. Required minima
 are never silently reduced.
 
+DeepSeek dense, typed, and always-resident shared descriptors are parsed by one
+runtime loader used by both qualification and the production worker. It binds
+every payload to its declared SHA-256, canonical extent count, dtype, geometry,
+and checkpoint root before any model allocation begins. This prevents the
+worker and benchmark tools from developing separate metadata interpretations.
+
 ### Qwen3-Next backend
 
 The current production candidate implements Qwen3-Next's alternating full

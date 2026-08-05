@@ -13,6 +13,7 @@
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
+#include "expert/runtime/deepseek_artifacts.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_record.hpp"
@@ -102,69 +103,6 @@ std::vector<er::PayloadExtent> extents(
           "model tensor has the wrong extent count");
   return result;
 }
-er::cuda::DeepSeekDtype dtype(const std::string& text) {
-  if (text == "BF16") return er::cuda::DeepSeekDtype::bf16;
-  if (text == "F32") return er::cuda::DeepSeekDtype::f32;
-  if (text == "I64") return er::cuda::DeepSeekDtype::i64;
-  throw std::runtime_error("unsupported model tensor dtype");
-}
-
-std::vector<er::cuda::DeepSeekDenseSpec> dense_specs(
-    const std::filesystem::path& root,
-    const std::filesystem::path& source_root, std::uint64_t& source_bytes,
-    std::uint64_t& device_bytes, std::uint64_t& maximum_source) {
-  std::ifstream input(root / "dense-set.tsv");
-  std::string line;
-  require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-dense-residency-v1",
-          "invalid dense model header");
-  std::vector<er::cuda::DeepSeekDenseSpec> result;
-  while (std::getline(input, line)) {
-    const auto item = fields(line);
-    require(item.size() == 7U, "invalid dense model row");
-    er::PayloadRecord record;
-    record.extents = extents(root / relative(item[6]), source_root, 2U);
-    record.stored_bytes = std::stoull(item[3]);
-    record.device_bytes = std::stoull(item[4]);
-    record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
-    record.alignment = er::kExpertPackAlignment;
-    record.payload_sha256 = digest(item[5]);
-    const auto rows = static_cast<std::uint32_t>(std::stoul(item[1]));
-    const auto columns = static_cast<std::uint32_t>(std::stoul(item[2]));
-    result.push_back({item[0], std::move(record), rows, columns});
-    source_bytes += std::stoull(item[3]);
-    device_bytes += std::stoull(item[4]);
-    maximum_source = std::max(maximum_source, std::stoull(item[3]));
-  }
-  require(input.eof() && result.size() == 236U,
-          "model dense set is incomplete");
-  return result;
-}
-
-std::vector<er::cuda::DeepSeekTypedSpec> typed_specs(
-    const std::filesystem::path& root,
-    const std::filesystem::path& source_root, std::uint64_t& source_bytes) {
-  std::ifstream input(root / "typed-set.tsv");
-  std::string line;
-  require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-typed-residency-v1",
-          "invalid typed model header");
-  std::vector<er::cuda::DeepSeekTypedSpec> result;
-  while (std::getline(input, line)) {
-    const auto item = fields(line);
-    require(item.size() == 6U, "invalid typed model row");
-    er::PayloadRecord record;
-    record.extents = extents(root / relative(item[5]), source_root, 1U);
-    record.stored_bytes = std::stoull(item[3]);
-    record.payload_sha256 = digest(item[4]);
-    result.push_back({item[0], std::move(record), dtype(item[1])});
-    source_bytes += std::stoull(item[3]);
-  }
-  require(input.eof() && result.size() == 834U,
-          "model typed set is incomplete");
-  return result;
-}
-
 std::vector<er::ResidentExpertSpec> ffn_specs(
     const std::filesystem::path& oracle_root,
     const std::filesystem::path& source_root, std::uint64_t& source_bytes,
@@ -210,40 +148,6 @@ std::vector<er::ResidentExpertSpec> ffn_specs(
   require(input.eof() && result.size() == 7U &&
               result.back().key.expert == 256U,
           "FFN route set must contain six routed and one shared expert");
-  return result;
-}
-
-std::vector<er::ResidentExpertSpec> shared_specs(
-    const std::filesystem::path& root,
-    const std::filesystem::path& source_root) {
-  std::ifstream input(root / "shared-set.tsv");
-  std::string line;
-  require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-shared-residency-v1",
-          "invalid shared residency header");
-  std::vector<er::ResidentExpertSpec> result;
-  while (std::getline(input, line)) {
-    const auto item = fields(line);
-    require(item.size() == 4U, "invalid shared residency row");
-    const auto layer = static_cast<std::uint32_t>(std::stoul(item[0]));
-    const auto bytes = std::stoull(item[1]);
-    require(layer == result.size() && layer < 43U && bytes == 25'167'360ULL,
-            "shared residency geometry is not canonical");
-    er::PayloadRecord record;
-    record.extents = extents(root / relative(item[3]), source_root, 6U);
-    record.stored_bytes = bytes;
-    record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
-    record.device_bytes = 25'198'592ULL;
-    record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
-    record.alignment = er::kExpertPackAlignment;
-    record.header_bytes = 0U;
-    record.payload_sha256 = digest(item[2]);
-    result.push_back({{17U, layer, 256U,
-                       er::kExpertQuantAbiDeepSeekSm86},
-                      std::move(record)});
-  }
-  require(input.eof() && result.size() == 43U,
-          "shared residency set is incomplete");
   return result;
 }
 
@@ -384,12 +288,18 @@ int main(int argc, char** argv) {
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         argv[5], source, routed_catalog);
     require(catalog_status.ok(), std::string(catalog_status.message()));
-    const auto all_shared = shared_specs(argv[7], source);
-    std::uint64_t dense_source = 0U, dense_device = 0U, maximum_dense = 0U;
-    std::uint64_t typed_source = 0U;
-    const auto dense = dense_specs(argv[1], source, dense_source, dense_device,
-                                   maximum_dense);
-    const auto typed = typed_specs(argv[2], source, typed_source);
+    auto loaded_artifacts = er::load_deepseek_model_artifacts(
+        argv[1], argv[2], argv[7], source);
+    require(loaded_artifacts.status.ok(),
+            std::string(loaded_artifacts.status.message()));
+    auto artifacts = std::move(loaded_artifacts.artifacts);
+    const auto dense_source = artifacts.dense_source_bytes;
+    const auto dense_device = artifacts.dense_device_bytes;
+    const auto maximum_dense = artifacts.maximum_source_record_bytes;
+    const auto typed_source = artifacts.typed_source_bytes;
+    auto dense = std::move(artifacts.dense);
+    auto typed = std::move(artifacts.typed);
+    auto all_shared = std::move(artifacts.shared);
     std::uint64_t ffn_source = 0U;
     std::uint32_t oracle_layer = 43U;
     const auto ffn = ffn_specs(argv[4], source, ffn_source, oracle_layer);

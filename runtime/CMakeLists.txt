@@ -14,6 +14,7 @@ add_library(expert_runtime STATIC
   src/cpu/deepseek_packed_executor.cpp
   src/cpu/expert_executor.cpp
   src/deepseek_catalog.cpp
+  src/deepseek_artifacts.cpp
   src/deepseek_expert.cpp
   src/expert_cache.cpp
   src/expert_record.cpp
