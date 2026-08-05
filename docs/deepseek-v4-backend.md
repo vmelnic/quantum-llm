@@ -291,3 +291,31 @@ RTX 3090 reported 21,452,816,384 free CUDA bytes while this set alone was
 resident. This is the typed storage boundary required by HCA, normalization,
 CSA compressors/indexers, routing, embedding, and the output head; individual
 kernels still have to enforce each tensor's dtype and shape contract.
+
+## CSA decode compressor
+
+The first CSA primitive now consumes the checkpoint's BF16 `wkv` and `wgate`
+projections directly, adds the F32 per-position `ape`, maintains persistent
+decode state, performs dimension-wise gated softmax pooling, and applies the
+BF16 RMSNorm weight. Its behavior follows the checkpoint author's
+[Compressor reference](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/inference/model.py).
+
+One implementation covers both configured schedules:
+
+- ratio 4 stores eight projected rows and combines the previous group's first
+  512 dimensions with the current group's second 512 dimensions. After emit,
+  the current four full-width rows become the next overlap history;
+- ratio 128 stores 128 ordinary 512-wide rows and emits at the group boundary.
+
+The layer-2 ratio-4 compressor passed against an independent NumPy oracle using
+its complete real 16,794,624-byte parameter slice. State occupies 65,536 bytes;
+four projection/update steps took 1.13 ms and maximum output error was
+`3.81e-6`. The layer-3 ratio-128 compressor passed on 8,651,776 source bytes;
+state occupies 524,288 bytes, the 128-token group took 7.86 ms, and maximum
+error was `1.43e-6`.
+
+These measurements include both BF16 matrix-vector projections for every
+token, state update, final pooling, and RMSNorm. They do not include compressed
+KV RoPE/QAT simulation, cache publication, the ratio-4 indexer, or sparse
+attention. Those remain the next parts of the same attention backend rather
+than separate benchmark paths.

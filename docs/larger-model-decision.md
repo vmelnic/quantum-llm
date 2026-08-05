@@ -130,5 +130,8 @@ independently proven.
 - Complete: all 834 main-model BF16/F32/I64 tensors stream transactionally
   into dtype-preserving device state through one fixed 64 MiB staging slot;
   tensors larger than the slot are hashed and uploaded incrementally.
-- Next: implement typed CSA/attention execution, then compose dense, HCA, and
-  shared ownership in the first model-layer runtime.
+- Complete: the real CSA decode compressor passes for both checkpoint
+  schedules—overlap ratio 4 and ordinary ratio 128—including BF16 projections,
+  persistent state, gated pooling, and normalization.
+- Next: add compressed-KV RoPE/QAT/cache publication, ratio-4 indexing, and
+  sparse attention, then compose dense, typed, HCA, and shared ownership.

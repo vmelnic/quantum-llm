@@ -14,7 +14,11 @@ from compiler.expert_pack.deepseek_quant import (
     iter_scaled_fp4_e2m1_blocks,
 )
 from compiler.expert_pack.errors import SourceFormatError
-from compiler.expert_pack.deepseek_slice import _decode_numpy, _deepseek_hca_reference
+from compiler.expert_pack.deepseek_slice import (
+    _decode_numpy,
+    _deepseek_csa_ratio4_reference,
+    _deepseek_hca_reference,
+)
 
 try:
     import numpy as np
@@ -23,6 +27,17 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_csa_ratio_four_uses_overlap_half_geometry(self) -> None:
+        inputs = np.zeros((4, 4096), dtype=np.float32)
+        wkv = np.zeros((1024, 4096), dtype=np.float32)
+        wgate = np.zeros_like(wkv)
+        ape = np.zeros((4, 1024), dtype=np.float32)
+        norm = np.ones(512, dtype=np.float32)
+        output = _deepseek_csa_ratio4_reference(inputs, wkv, wgate, ape, norm)
+        self.assertEqual(output.shape, (512,))
+        self.assertTrue(np.array_equal(output, np.zeros(512, dtype=np.float32)))
+
     @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_hca_reference_preserves_doubly_stochastic_contract(self) -> None:
         streams = np.arange(32, dtype=np.float32).reshape(4, 8) / 32

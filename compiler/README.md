@@ -81,6 +81,11 @@ main-model BF16/F32/I64 tensors. The runtime preserves their source dtype and
 streams tensors larger than its fixed staging slot while calculating one
 incremental SHA-256 over the original byte order.
 
+`export-deepseek-csa` describes one compressed-attention layer and emits a
+decode oracle for its real BF16 compressor weights. Both checkpoint schedules
+are supported: overlap pooling at ratio 4 and ordinary gated pooling at ratio
+128. The bundle is a qualification fixture, not a replacement weight format.
+
 ## Install
 
 From the repository root:

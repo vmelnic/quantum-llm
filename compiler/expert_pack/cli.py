@@ -15,6 +15,7 @@ from .deepseek_slice import (
     export_deepseek_compact_expert,
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
+    export_deepseek_csa_slice,
     export_deepseek_typed_set,
     export_deepseek_dense_set,
     export_deepseek_shared_expert,
@@ -144,6 +145,13 @@ def _parser() -> argparse.ArgumentParser:
     )
     typed_set_parser.add_argument("--source", type=Path, required=True)
     typed_set_parser.add_argument("--output", type=Path, required=True)
+    csa_parser = commands.add_parser(
+        "export-deepseek-csa",
+        help="describe one ratio-four CSA compressor and emit its decode oracle",
+    )
+    csa_parser.add_argument("--source", type=Path, required=True)
+    csa_parser.add_argument("--output", type=Path, required=True)
+    csa_parser.add_argument("--layer", type=int, default=2)
     return parser
 
 
@@ -227,9 +235,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 site=args.site, output=args.output,
             )
-        else:
+        elif args.command == "export-deepseek-typed-set":
             result = export_deepseek_typed_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        else:
+            result = export_deepseek_csa_slice(
+                SafeTensorCheckpoint(args.source), layer=args.layer,
+                output=args.output,
             )
     except (ExpertPackError, OSError, ValueError) as error:
         print(json.dumps({"ok": False, "error": str(error)}, sort_keys=True))

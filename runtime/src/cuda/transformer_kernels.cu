@@ -143,6 +143,22 @@ __global__ void f32_gemv_batch_kernel(
     output[static_cast<std::size_t>(request) * rows + row] = partial;
 }
 
+__global__ void bf16_gemv_kernel(const std::uint16_t* weights,
+                                  const float* input, float* output,
+                                  std::uint32_t rows,
+                                  std::uint32_t columns) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(blockIdx.x * kWarpsPerBlock + warp);
+  if (row >= rows) return;
+  float partial = 0.0F;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  for (std::uint32_t i = lane; i < columns; i += kWarpSize)
+    partial += __uint_as_float(static_cast<unsigned>(weight[i]) << 16U) * input[i];
+  partial = warp_sum(partial);
+  if (lane == 0) output[row] = partial;
+}
+
 __global__ void rms_kernel(const float* input, const float* weight,
                            float* output, std::uint32_t count, float epsilon) {
   float square = 0.0F;
@@ -150,6 +166,22 @@ __global__ void rms_kernel(const float* input, const float* weight,
   square = reduce_sum(square);
   const float inverse = rsqrtf(square / static_cast<float>(count) + epsilon);
   for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) output[i] = input[i] * inverse * weight[i];
+}
+
+__global__ void rms_bf16_weight_kernel(const float* input,
+                                        const std::uint16_t* weight,
+                                        float* output, std::uint32_t count,
+                                        float epsilon) {
+  float square = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    square += input[i] * input[i];
+  square = reduce_sum(square);
+  const float inverse = rsqrtf(square / static_cast<float>(count) + epsilon);
+  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+    const float scale =
+        __uint_as_float(static_cast<unsigned>(weight[i]) << 16U);
+    output[i] = input[i] * inverse * scale;
+  }
 }
 
 __global__ void qwen_rms_kernel(const float* input, const float* weight,
@@ -830,10 +862,31 @@ Status gemv_f32_batch(const float* matrix, std::uint32_t rows,
       matrix, input, output, rows, columns, batch);
   return checked(cudaPeekAtLastError(), "f32 batched gemv");
 }
+Status gemv_bf16(const std::uint16_t* matrix, std::uint32_t rows,
+                  std::uint32_t columns, const float* input, float* output,
+                  void* raw) noexcept {
+  if (!matrix || !input || !output || !rows || !columns)
+    return Status(ErrorCode::invalid_argument, "invalid bf16 gemv");
+  const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  bf16_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      matrix, input, output, rows, columns);
+  return checked(cudaPeekAtLastError(), "bf16 gemv");
+}
 Status rms_norm(const float* input, const float* weight, float* output, std::uint32_t elements, float epsilon, void* raw) noexcept {
   if (!input || !weight || !output || !elements || epsilon <= 0) return Status(ErrorCode::invalid_argument, "invalid rms norm");
   rms_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "rms norm");
+}
+Status rms_norm_bf16_weight(const float* input, const std::uint16_t* weight,
+                            float* output, std::uint32_t elements,
+                            float epsilon, void* raw) noexcept {
+  if (!input || !weight || !output || !elements || epsilon <= 0)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid bf16-weight rms norm");
+  rms_bf16_weight_kernel<<<1, kThreads, 0,
+                           static_cast<cudaStream_t>(raw)>>>(
+      input, weight, output, elements, epsilon);
+  return checked(cudaPeekAtLastError(), "bf16-weight rms norm");
 }
 Status qwen3_next_rms_norm(const float* input, const float* weight,
                            float* output, std::uint32_t elements,

@@ -475,6 +475,142 @@ def _deepseek_hca_reference(
     )
 
 
+def _bf16_to_f32(raw: object, shape: tuple[int, ...]) -> object:
+    if np is None:
+        raise SourceFormatError("NumPy is required for BF16 decoding")
+    words = np.frombuffer(raw, dtype="<u2").reshape(shape)
+    return (words.astype(np.uint32) << 16).view(np.float32)
+
+
+def _deepseek_csa_ratio4_reference(
+    inputs: object, wkv: object, wgate: object, ape: object, norm: object,
+    *, epsilon: float = 1e-6,
+) -> object:
+    """Reference the official decode-phase overlap compressor for ratio four."""
+
+    return _deepseek_csa_reference(
+        inputs, wkv, wgate, ape, norm, ratio=4, epsilon=epsilon
+    )
+
+
+def _deepseek_csa_reference(
+    inputs: object, wkv: object, wgate: object, ape: object, norm: object,
+    *, ratio: int, epsilon: float = 1e-6,
+) -> object:
+    """Reference the official decode compressor for ratio four or 128."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek CSA qualification")
+    inputs = np.asarray(inputs, dtype=np.float32)
+    if ratio not in (4, 128):
+        raise SourceFormatError("unsupported DeepSeek CSA ratio")
+    width = 1024 if ratio == 4 else 512
+    rows = 8 if ratio == 4 else ratio
+    if inputs.shape != (ratio, 4096) or wkv.shape != (width, 4096):
+        raise SourceFormatError("invalid DeepSeek CSA geometry")
+    if wgate.shape != wkv.shape or ape.shape != (ratio, width) or norm.shape != (512,):
+        raise SourceFormatError("invalid DeepSeek CSA parameters")
+    kv_state = np.zeros((rows, width), dtype=np.float32)
+    score_state = np.full((rows, width), -np.inf, dtype=np.float32)
+    for position in range(ratio):
+        kv = np.matmul(wkv, inputs[position], dtype=np.float32)
+        score = np.matmul(wgate, inputs[position], dtype=np.float32)
+        state_row = ratio + position if ratio == 4 else position
+        kv_state[state_row] = kv
+        score_state[state_row] = score + ape[position]
+    if ratio == 4:
+        candidates = np.concatenate((kv_state[:4, :512], kv_state[4:, 512:]), axis=0)
+        logits = np.concatenate((score_state[:4, :512], score_state[4:, 512:]), axis=0)
+    else:
+        candidates = kv_state
+        logits = score_state
+    shifted = logits - np.max(logits, axis=0, keepdims=True)
+    weights = np.exp(shifted)
+    weights /= np.sum(weights, axis=0, keepdims=True)
+    pooled = np.sum(candidates * weights, axis=0, dtype=np.float32)
+    inverse = np.float32(
+        1.0 / math.sqrt(float(np.mean(np.square(pooled, dtype=np.float32))) + epsilon)
+    )
+    return np.asarray(pooled * inverse * norm, dtype="<f4")
+
+
+def export_deepseek_csa_slice(
+    checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
+) -> dict[str, object]:
+    """Describe one ratio-four CSA compressor and emit a decode oracle."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for DeepSeek CSA qualification")
+    validate_deepseek_v4_source(checkpoint)
+    ratios = checkpoint.config["compress_ratios"]
+    if not 0 <= layer < 43 or ratios[layer] not in (4, 128):
+        raise AdapterError("DeepSeek CSA slice requires a compressed-attention layer")
+    ratio = ratios[layer]
+    width = 1024 if ratio == 4 else 512
+    prefix = f"layers.{layer}.attn.compressor"
+    names = (
+        prefix + ".wkv.weight",
+        prefix + ".wgate.weight",
+        prefix + ".ape",
+        prefix + ".norm.weight",
+    )
+    expected = (
+        ("BF16", (width, 4096)),
+        ("BF16", (width, 4096)),
+        ("F32", (ratio, width)),
+        ("BF16", (512,)),
+    )
+    for name, (dtype, shape) in zip(names, expected):
+        info = checkpoint.tensors.get(name)
+        if info is None or info.dtype != dtype or info.shape != shape:
+            raise SourceFormatError(f"invalid DeepSeek CSA tensor: {name}")
+    manifest = _export_deepseek_extents(
+        checkpoint, names=names, output=output, layer=layer,
+        expert="attention_compressor", format_name="deepseek-csa-slice-v1",
+        source_abi="deepseek-csa-mixed-v1",
+        target_abi="deepseek-csa-sm86-f32-state-v1",
+    )
+    arrays: list[object] = []
+    for name, (dtype, shape) in zip(names, expected):
+        with checkpoint.open_tensor(name) as view:
+            arrays.append(
+                _bf16_to_f32(view.raw, shape)
+                if dtype == "BF16"
+                else np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
+            )
+    wkv, wgate, ape, norm = arrays
+    positions = np.arange(ratio * 4096, dtype=np.float32).reshape(ratio, 4096)
+    inputs = (
+        np.sin(positions * np.float32(0.005)) * np.float32(0.15)
+        + np.cos(positions * np.float32(0.002)) * np.float32(0.025)
+    ).astype("<f4")
+    output_value = _deepseek_csa_reference(
+        inputs, wkv, wgate, ape, norm, ratio=ratio
+    )
+    oracle_path = output / "oracle.f32"
+    with oracle_path.open("xb") as oracle:
+        oracle.write(inputs.tobytes(order="C"))
+        oracle.write(output_value.tobytes(order="C"))
+        oracle.flush()
+        os.fsync(oracle.fileno())
+    qualification = {
+        "format": "deepseek-csa-decode-oracle-v1",
+        "layer": layer,
+        "compress_ratio": ratio,
+        "overlap": ratio == 4,
+        "hidden_size": 4096,
+        "head_dim": 512,
+        "oracle": oracle_path.name,
+        "oracle_bytes": oracle_path.stat().st_size,
+        "oracle_sha256": hashlib.sha256(oracle_path.read_bytes()).hexdigest(),
+        "output_l2": float(np.linalg.norm(output_value)),
+    }
+    atomic_json(output / "oracle.json", qualification)
+    manifest["oracle"] = qualification
+    atomic_json(output / "manifest.json", manifest)
+    return manifest
+
+
 def export_deepseek_hca_slice(
     checkpoint: SafeTensorCheckpoint,
     *,

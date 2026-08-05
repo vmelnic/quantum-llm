@@ -35,9 +35,16 @@ struct Int8Matrix final {
     const float* matrix, std::uint32_t rows, std::uint32_t columns,
     const float* input, float* output, std::uint32_t batch,
     void* stream) noexcept;
+[[nodiscard]] Status gemv_bf16(const std::uint16_t* matrix,
+                               std::uint32_t rows, std::uint32_t columns,
+                               const float* input, float* output,
+                               void* stream) noexcept;
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;
+[[nodiscard]] Status rms_norm_bf16_weight(
+    const float* input, const std::uint16_t* weight, float* output,
+    std::uint32_t elements, float epsilon, void* stream) noexcept;
 // Qwen3-Next stores zero-centered RMSNorm weights and applies (1 + weight).
 [[nodiscard]] Status qwen3_next_rms_norm(
     const float* input, const float* weight, float* output,
