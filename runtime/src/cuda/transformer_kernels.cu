@@ -61,6 +61,30 @@ __global__ void int8_gemv_kernel(const std::int8_t* weights,
   if (lane == 0) output[row] = partial * scales[row];
 }
 
+__global__ void int8_gemv_vector_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(
+      blockIdx.x * kWarpsPerBlock + warp);
+  if (row >= rows) return;
+  float partial = 0.0F;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  for (std::uint32_t column = lane * 4U; column < columns;
+       column += kWarpSize * 4U) {
+    const auto packed = *reinterpret_cast<const char4*>(weight + column);
+    const auto activation =
+        *reinterpret_cast<const float4*>(input + column);
+    partial += static_cast<float>(packed.x) * activation.x;
+    partial += static_cast<float>(packed.y) * activation.y;
+    partial += static_cast<float>(packed.z) * activation.z;
+    partial += static_cast<float>(packed.w) * activation.w;
+  }
+  partial = warp_sum(partial);
+  if (lane == 0) output[row] = partial * scales[row];
+}
+
 __global__ void int8_gemv_batch_kernel(
     const std::int8_t* weights, const float* scales, const float* input,
     float* output, std::uint32_t rows, std::uint32_t columns,
@@ -810,7 +834,14 @@ Status embedding(const Int8Matrix& m, std::uint32_t token, float* output, void* 
 Status gemv(const Int8Matrix& m, const float* input, float* output, void* raw) noexcept {
   if (!m.weights || !m.scales || !input || !output || !m.rows || !m.columns) return Status(ErrorCode::invalid_argument, "invalid gemv");
   const auto blocks = (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  int8_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(m.weights, m.scales, input, output, m.rows, m.columns);
+  if (m.columns % 4U == 0U) {
+    int8_gemv_vector_kernel<<<blocks, kThreads, 0,
+                              static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales, input, output, m.rows, m.columns);
+  } else {
+    int8_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales, input, output, m.rows, m.columns);
+  }
   return checked(cudaPeekAtLastError(), "int8 gemv");
 }
 Status gemv_batch(const Int8Matrix& m, const float* input, float* output,

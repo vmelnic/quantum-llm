@@ -151,5 +151,8 @@ independently proven.
   attention, grouped output projection, and HCA post. Four sequential tokens
   passed the independent full-graph oracle; token three emitted and consumed
   the first compressed/indexed slot with `4.02e-4` maximum composed error.
-- Next: optimize the measured 7.22 ms layer path, then connect attention to
+- Complete: vectorized aligned INT8 GEMV lowered the same qualified attention
+  path from 7.22 to 6.74 ms per layer-token; two measured regressions were
+  removed rather than retained.
+- Next: continue optimizing the composed layer, then connect attention to
   routing/shared/streamed experts in the first complete transformer block.

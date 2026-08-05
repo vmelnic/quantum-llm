@@ -426,11 +426,16 @@ maximum (`2.7e-5`, `7.9e-5`, `1.65e-4`, `4.02e-4`) is consistent with the
 different online/warp reduction order rather than a discontinuity at
 compression. A context-4096 request state used 2,149,120 bytes.
 
-The four-token composed measurement averaged 7.22 ms per layer-token. This is
-correctness, not the target throughput: multiplying it by 43 already exceeds
-310 ms before
-MoE. The current generic one-warp-per-row GEMVs achieve only a small fraction
-of RTX 3090 memory bandwidth. The next optimization boundary is therefore the
-actual composed workload: vectorized/tiled dense GEMV, fused query/norm/RoPE,
+The initial four-token composed measurement averaged 7.22 ms per layer-token.
+Vectorizing aligned INT8 GEMV loads to four weights/activations per lane reduced
+the same qualified path to 6.74 ms, a 6.6% improvement with no semantic change.
+Vectorizing BF16 compressor loads and copying activations into shared memory
+both regressed the complete layer and were removed.
+
+This remains far from target throughput: multiplying 6.74 ms by 43 already
+exceeds 289 ms before MoE. The generic one-warp-per-row GEMV still achieves
+only a small fraction of RTX 3090 memory bandwidth. The next optimization
+boundary remains the actual composed workload: DP4A/tensor-core-capable
+activation quantization with an explicit accuracy gate, fused query/norm/RoPE,
 grouped output GEMM, batched requests, and parallel top-k. Component-fixture
 timings will not be optimized in isolation.
