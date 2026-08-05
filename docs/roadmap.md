@@ -2,6 +2,12 @@
 
 This roadmap records direction, not a compatibility promise.
 
+The ordered implementation backlog for the current performance work is
+[DeepSeek performance tasks](deepseek-performance-tasks.md). It separates
+measurement, residency, asynchronous execution, batching, kernels, placement,
+and useful-token acceleration so local patches cannot be mistaken for the
+30 tok/s objective.
+
 ## DeepSeek-V4-Flash backend
 
 1. ~~Strict source contract, compact expert ABI, resident dense/typed/shared

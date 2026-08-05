@@ -18,6 +18,7 @@
 | [DeepSeek-V4-Flash serving](deepseek-serving.md) | Worker bundle, persistent CUDA process, API startup, and service gate |
 | [Route census](route-census.md) | Bounded, authenticated route evidence and deterministic warm-set ranking |
 | [Measured placement profile](placement-profile.md) | Hardware cost calibration and fail-closed RAM/VRAM budget solver |
+| [DeepSeek performance tasks](deepseek-performance-tasks.md) | Ordered work and acceptance gates for the GPU-driven performance path |
 
 The JSON schemas under `schemas/` and the compiler validator are normative for
 Expert Pack. Documentation never overrides executable validation.
