@@ -16,6 +16,7 @@ from compiler.expert_pack.deepseek_quant import (
 from compiler.expert_pack.errors import SourceFormatError
 from compiler.expert_pack.deepseek_slice import (
     _decode_numpy,
+    _f32_to_bf16_words,
     _deepseek_csa_ratio4_reference,
     _deepseek_hca_reference,
 )
@@ -27,6 +28,12 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_bf16_rounding_uses_nearest_even(self) -> None:
+        values = np.asarray([1.0, 1.00390625, 1.0078125], dtype=np.float32)
+        words = _f32_to_bf16_words(values)
+        self.assertEqual(tuple(int(value) for value in words), (0x3F80, 0x3F80, 0x3F81))
+
     @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_csa_ratio_four_uses_overlap_half_geometry(self) -> None:
         inputs = np.zeros((4, 4096), dtype=np.float32)

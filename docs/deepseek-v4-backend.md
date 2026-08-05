@@ -319,3 +319,16 @@ token, state update, final pooling, and RMSNorm. They do not include compressed
 KV RoPE/QAT simulation, cache publication, the ratio-4 indexer, or sparse
 attention. Those remain the next parts of the same attention backend rather
 than separate benchmark paths.
+
+The emitted vector now also crosses the real cache boundary. The runtime first
+rounds the normalized vector to BF16, applies RoPE to only the final 64
+dimensions, and runs the checkpoint's in-place MXFP8 E4M3 quantize/dequantize
+simulation over seven 64-value blocks in the first 448 dimensions. Power-of-two
+scales use the same ceiling rule and `1e-4` minimum as the official QAT kernel.
+The result is stored as 512 BF16 values (1,024 bytes per compressed slot), not
+as an F32 cache.
+
+Both the ratio-4 and ratio-128 real slices matched independent PyTorch/NumPy
+cache oracles with zero BF16-word differences. Keeping this cache typed halves
+its VRAM footprint relative to F32 and freezes the producer ABI that the sparse
+attention consumer will read next.

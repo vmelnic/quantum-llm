@@ -115,17 +115,28 @@ int main(int argc, char** argv) {
     require(static_cast<bool>(oracle_file), "missing CSA oracle");
     const auto oracle_bytes = static_cast<std::size_t>(oracle_file.tellg());
     require(oracle_bytes ==
-                (static_cast<std::size_t>(ratio) * kHidden + kHeadDim) * sizeof(float),
+                (static_cast<std::size_t>(ratio) * kHidden + kHeadDim + 64U) * sizeof(float),
             "invalid CSA oracle geometry");
     oracle_file.seekg(0);
     std::vector<float> oracle(oracle_bytes / sizeof(float));
     oracle_file.read(reinterpret_cast<char*>(oracle.data()),
                      static_cast<std::streamsize>(oracle_bytes));
     require(static_cast<bool>(oracle_file), "truncated CSA oracle");
+    std::ifstream cache_file(std::filesystem::path(argv[1]) / "cache.bf16",
+                             std::ios::binary | std::ios::ate);
+    require(static_cast<bool>(cache_file) &&
+                static_cast<std::size_t>(cache_file.tellg()) == kNormBytes,
+            "invalid CSA cache oracle");
+    cache_file.seekg(0);
+    std::vector<std::uint16_t> expected_cache(kHeadDim);
+    cache_file.read(reinterpret_cast<char*>(expected_cache.data()), kNormBytes);
+    require(static_cast<bool>(cache_file), "truncated CSA cache oracle");
 
     std::uint16_t *wkv = nullptr, *wgate = nullptr, *norm = nullptr;
     float *ape = nullptr, *input = nullptr, *projected_values = nullptr;
     float *projected_scores = nullptr, *pooled = nullptr, *output = nullptr;
+    float *cosine = nullptr, *sine = nullptr;
+    std::uint16_t* cache = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&wkv), matrix_bytes), "allocate CSA wkv");
     check(cudaMalloc(reinterpret_cast<void**>(&wgate), matrix_bytes), "allocate CSA wgate");
     check(cudaMalloc(reinterpret_cast<void**>(&ape), ape_bytes), "allocate CSA ape");
@@ -140,6 +151,12 @@ int main(int argc, char** argv) {
           "allocate CSA pooled");
     check(cudaMalloc(reinterpret_cast<void**>(&output), kHeadDim * sizeof(float)),
           "allocate CSA output");
+    check(cudaMalloc(reinterpret_cast<void**>(&cosine), 32U * sizeof(float)),
+          "allocate CSA cosine");
+    check(cudaMalloc(reinterpret_cast<void**>(&sine), 32U * sizeof(float)),
+          "allocate CSA sine");
+    check(cudaMalloc(reinterpret_cast<void**>(&cache), kNormBytes),
+          "allocate CSA cache");
     check(cudaMemcpy(wkv, source.data(), matrix_bytes, cudaMemcpyHostToDevice),
           "copy CSA wkv");
     check(cudaMemcpy(wgate, source.data() + matrix_bytes, matrix_bytes,
@@ -148,6 +165,11 @@ int main(int argc, char** argv) {
                      cudaMemcpyHostToDevice), "copy CSA ape");
     check(cudaMemcpy(norm, source.data() + 2U * matrix_bytes + ape_bytes,
                      kNormBytes, cudaMemcpyHostToDevice), "copy CSA norm");
+    const auto control_offset = static_cast<std::size_t>(ratio) * kHidden + kHeadDim;
+    check(cudaMemcpy(cosine, oracle.data() + control_offset, 32U * sizeof(float),
+                     cudaMemcpyHostToDevice), "copy CSA cosine");
+    check(cudaMemcpy(sine, oracle.data() + control_offset + 32U,
+                     32U * sizeof(float), cudaMemcpyHostToDevice), "copy CSA sine");
     auto state = er::cuda::create_deepseek_compressor_state(ratio);
     require(state.status.ok() && state.state, std::string(state.status.message()));
     cudaEvent_t start{}, stop{};
@@ -168,6 +190,9 @@ int main(int argc, char** argv) {
           output, position, 1e-6F, nullptr);
       require(status.ok(), std::string(status.message()));
     }
+    auto publish_status = er::cuda::deepseek_compressed_kv_publish(
+        output, cosine, sine, cache, 0U, nullptr);
+    require(publish_status.ok(), std::string(publish_status.message()));
     check(cudaEventRecord(stop), "record CSA stop");
     check(cudaEventSynchronize(stop), "synchronize CSA");
     float execution_ms = 0.0F;
@@ -184,13 +209,21 @@ int main(int argc, char** argv) {
       squared += static_cast<double>(error) * error;
     }
     require(maximum < 5e-4F, "CSA output exceeds FP32 oracle tolerance");
+    std::vector<std::uint16_t> actual_cache(kHeadDim);
+    check(cudaMemcpy(actual_cache.data(), cache, kNormBytes, cudaMemcpyDeviceToHost),
+          "copy CSA cache");
+    std::size_t cache_mismatches = 0U;
+    for (std::size_t index = 0; index < actual_cache.size(); ++index)
+      cache_mismatches += actual_cache[index] != expected_cache[index];
+    require(cache_mismatches == 0U, "CSA BF16 cache differs from oracle");
     std::cout << "{\"ok\":true,\"layer\":" << layer
               << ",\"compress_ratio\":" << ratio
               << ",\"source_bytes\":" << source_bytes
               << ",\"state_bytes\":" << state.state->bytes()
               << ",\"group_ms\":" << execution_ms
               << ",\"output_rmse\":" << std::sqrt(squared / actual.size())
-              << ",\"output_max_abs_error\":" << maximum << "}\n";
+              << ",\"output_max_abs_error\":" << maximum
+              << ",\"cache_bf16_mismatches\":" << cache_mismatches << "}\n";
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "expert-deepseek-csa-smoke: " << error.what() << '\n';

@@ -133,5 +133,8 @@ independently proven.
 - Complete: the real CSA decode compressor passes for both checkpoint
   schedules—overlap ratio 4 and ordinary ratio 128—including BF16 projections,
   persistent state, gated pooling, and normalization.
-- Next: add compressed-KV RoPE/QAT/cache publication, ratio-4 indexing, and
-  sparse attention, then compose dense, typed, HCA, and shared ownership.
+- Complete: compressed KV publication applies RoPE64 and the block-64 MXFP8
+  QAT boundary, then stores a 1,024-byte BF16 cache slot; both schedules matched
+  their independent cache oracle bit-for-bit.
+- Next: add ratio-4 indexing and sparse attention, then compose dense, typed,
+  HCA, and shared ownership.

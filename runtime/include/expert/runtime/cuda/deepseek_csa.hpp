@@ -49,4 +49,11 @@ struct DeepSeekCompressorStateResult final {
     float* normalized_output, std::uint32_t position, float epsilon,
     void* stream) noexcept;
 
+// Publishes one normalized compressed KV vector in the checkpoint's BF16 cache
+// ABI. RoPE applies to the last 64 dimensions; the first 448 receive the
+// block-64 power-of-two FP8 quantize/dequantize simulation used during QAT.
+[[nodiscard]] Status deepseek_compressed_kv_publish(
+    const float* normalized, const float* cosine, const float* sine,
+    std::uint16_t* cache, std::uint32_t slot, void* stream) noexcept;
+
 }  // namespace expert::runtime::cuda

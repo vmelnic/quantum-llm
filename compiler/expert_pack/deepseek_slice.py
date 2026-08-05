@@ -482,6 +482,46 @@ def _bf16_to_f32(raw: object, shape: tuple[int, ...]) -> object:
     return (words.astype(np.uint32) << 16).view(np.float32)
 
 
+def _f32_to_bf16_words(values: object) -> object:
+    """Round FP32 to BF16 with round-to-nearest-even and return little-endian words."""
+    values = np.asarray(values, dtype=np.float32)
+    bits = values.view(np.uint32)
+    rounded = bits + np.uint32(0x7FFF) + ((bits >> 16) & np.uint32(1))
+    return (rounded >> 16).astype("<u2")
+
+
+def _deepseek_compressed_kv_reference(
+    normalized: object, cosine: object, sine: object
+) -> object:
+    """Apply the checkpoint's BF16, RoPE64 and in-place MXFP8 QAT boundary."""
+    if np is None:
+        raise SourceFormatError("NumPy is required for compressed KV qualification")
+    base_words = _f32_to_bf16_words(normalized)
+    base = _bf16_to_f32(base_words.tobytes(), (512,)).copy()
+    result = base.copy()
+    try:
+        import torch
+    except ImportError as error:  # pragma: no cover
+        raise SourceFormatError("PyTorch is required for compressed KV reference") from error
+    for first in range(0, 448, 64):
+        block = base[first:first + 64]
+        maximum = max(float(np.max(np.abs(block))), 1e-4)
+        scale = math.ldexp(1.0, math.ceil(math.log2(maximum / 448.0)))
+        quantized = (
+            torch.from_numpy((block / scale).copy())
+            .to(torch.float8_e4m3fn).float().numpy() * scale
+        )
+        result[first:first + 64] = quantized
+    cosine = np.asarray(cosine, dtype=np.float32)
+    sine = np.asarray(sine, dtype=np.float32)
+    for pair in range(32):
+        left = base[448 + pair * 2]
+        right = base[449 + pair * 2]
+        result[448 + pair * 2] = left * cosine[pair] - right * sine[pair]
+        result[449 + pair * 2] = right * cosine[pair] + left * sine[pair]
+    return _f32_to_bf16_words(result)
+
+
 def _deepseek_csa_ratio4_reference(
     inputs: object, wkv: object, wgate: object, ape: object, norm: object,
     *, epsilon: float = 1e-6,
@@ -587,12 +627,23 @@ def export_deepseek_csa_slice(
     output_value = _deepseek_csa_reference(
         inputs, wkv, wgate, ape, norm, ratio=ratio
     )
+    angles = np.arange(32, dtype=np.float32) * np.float32(0.03125)
+    cosine = np.cos(angles).astype("<f4")
+    sine = np.sin(angles).astype("<f4")
+    cache_words = _deepseek_compressed_kv_reference(output_value, cosine, sine)
     oracle_path = output / "oracle.f32"
     with oracle_path.open("xb") as oracle:
         oracle.write(inputs.tobytes(order="C"))
         oracle.write(output_value.tobytes(order="C"))
+        oracle.write(cosine.tobytes(order="C"))
+        oracle.write(sine.tobytes(order="C"))
         oracle.flush()
         os.fsync(oracle.fileno())
+    cache_path = output / "cache.bf16"
+    with cache_path.open("xb") as cache_file:
+        cache_file.write(cache_words.tobytes(order="C"))
+        cache_file.flush()
+        os.fsync(cache_file.fileno())
     qualification = {
         "format": "deepseek-csa-decode-oracle-v1",
         "layer": layer,
@@ -603,6 +654,9 @@ def export_deepseek_csa_slice(
         "oracle": oracle_path.name,
         "oracle_bytes": oracle_path.stat().st_size,
         "oracle_sha256": hashlib.sha256(oracle_path.read_bytes()).hexdigest(),
+        "cache": cache_path.name,
+        "cache_bytes": cache_path.stat().st_size,
+        "cache_sha256": hashlib.sha256(cache_path.read_bytes()).hexdigest(),
         "output_l2": float(np.linalg.norm(output_value)),
     }
     atomic_json(output / "oracle.json", qualification)

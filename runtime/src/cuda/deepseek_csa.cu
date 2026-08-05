@@ -3,6 +3,8 @@
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 
 #include <cuda_runtime.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <string>
 
@@ -73,6 +75,39 @@ __global__ void compressor_overlap_advance_kernel(float* values, float* scores,
   if (index >= count) return;
   values[index] = values[count + index];
   scores[index] = scores[count + index];
+}
+
+__global__ void compressed_kv_publish_kernel(
+    const float* normalized, const float* cosine, const float* sine,
+    __nv_bfloat16* cache, std::uint32_t slot) {
+  __shared__ float base[kHeadDim];
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (dimension < kHeadDim)
+    base[dimension] = __bfloat162float(__float2bfloat16_rn(normalized[dimension]));
+  __syncthreads();
+  if (dimension < 448U) {
+    const auto group = dimension / 64U;
+    float maximum = 0.0F;
+    for (std::uint32_t item = group * 64U; item < (group + 1U) * 64U; ++item)
+      maximum = fmaxf(maximum, fabsf(base[item]));
+    maximum = fmaxf(maximum, 1.0e-4F);
+    const float scale = exp2f(ceilf(log2f(maximum / 448.0F)));
+    const __nv_fp8_e4m3 quantized(base[dimension] / scale);
+    const float restored = static_cast<float>(quantized) * scale;
+    cache[static_cast<std::size_t>(slot) * kHeadDim + dimension] =
+        __float2bfloat16_rn(restored);
+  } else if (dimension < kHeadDim) {
+    const auto local = dimension - 448U;
+    const auto pair = local / 2U;
+    const auto left_index = 448U + pair * 2U;
+    const float left = base[left_index];
+    const float right = base[left_index + 1U];
+    const float rotated = local % 2U == 0U
+                              ? left * cosine[pair] - right * sine[pair]
+                              : right * cosine[pair] + left * sine[pair];
+    cache[static_cast<std::size_t>(slot) * kHeadDim + dimension] =
+        __float2bfloat16_rn(rotated);
+  }
 }
 
 }  // namespace
@@ -170,6 +205,20 @@ Status deepseek_compressor_decode(
   }
   return rms_norm_bf16_weight(pooled_workspace, norm_weight,
                               normalized_output, kHeadDim, epsilon, stream);
+}
+
+Status deepseek_compressed_kv_publish(
+    const float* normalized, const float* cosine, const float* sine,
+    std::uint16_t* cache, std::uint32_t slot, void* stream) noexcept {
+  if (!normalized || !cosine || !sine || !cache)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek compressed KV publication"};
+  compressed_kv_publish_kernel<<<1, kHeadDim, 0,
+                                 static_cast<cudaStream_t>(stream)>>>(
+      normalized, cosine, sine, reinterpret_cast<__nv_bfloat16*>(cache), slot);
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek compressed KV publication");
 }
 
 }  // namespace expert::runtime::cuda
