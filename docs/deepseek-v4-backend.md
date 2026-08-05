@@ -533,9 +533,9 @@ At a 4,096-token context the complete state is 78,403,584 bytes: 70,060,544
 bytes of attention/cache/workspace state, 8,211,968 bytes of FFN workspace, and
 131,072 bytes for the two four-stream ping-pong buffers.
 The real model gate confirmed all 43 bindings and rejected a budget one byte
-below the estimate before allocation. This owns state, not yet execution order:
-the next component must drive attention → route → asynchronous expert readiness
-→ execute for each layer while preserving directory pin lifetimes.
+below the estimate before allocation. Execution order is owned separately by
+the decode controller and its non-blocking outer scheduler, so request-state
+allocation does not also become queue policy.
 
 Directory pin lifetimes are now identified by independent bounded tokens. Two
 requests can retain the same or different ready experts concurrently, and a
@@ -562,7 +562,18 @@ closed. A real boundary smoke loads `(0, 0)` and `(42, 255)` through IOCP,
 extent gather, SHA-256 verification, compact FP4 admission, cache publication,
 CUDA directory pinning, and independent release.
 
-The remaining full-model blocker is the outer asynchronous scheduler. It must
-own acquire handles and leases across suspended controllers, bound concurrent
-cold admissions, wake a request only when its exact route is ready, and keep
-other runnable requests progressing while I/O and admission execute.
+`DeepSeekDecodeScheduler` now owns the outer asynchronous boundary. It advances
+runnable controllers in round-robin order, limits both request count and global
+in-flight cache acquisitions, and never waits inside `poll()`. Cache acquisition
+remains deduplicated by immutable expert key. A suspended request retains every
+successful lease until the same layer replans and executes; failure or
+cancellation releases acquire handles, leases, and directory pins explicitly.
+The shared expert is a startup-resident invariant, so the cold scheduler accepts
+only routed IDs 0–255 and fails closed if expert 256 disappears.
+
+The real layer-2 gate kept the shared expert resident, admitted six routed
+experts from the complete catalog with a two-acquire global limit, and resumed
+without rerunning attention or routing. It observed six completed acquisitions,
+a peak of two in flight, and reproduced the block oracle with `4.76122e-4`
+maximum error. The remaining full-model boundary is embedding, output head,
+tokenizer/sampling, and connection to the HTTP worker—not expert orchestration.

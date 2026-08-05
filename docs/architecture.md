@@ -232,3 +232,11 @@ extents and the exact source/device ABI geometry. The catalog contains metadata
 and hashes only; the original checkpoint remains authoritative and recoverable.
 This keeps startup metadata bounded while allowing future placement planners to
 point the same logical expert at local SSD, RAM, VRAM, or a remote worker.
+
+`DeepSeekDecodeScheduler` is a single-owner event-loop component above the
+controllers. Each `poll()` first consumes already-completed cache futures, then
+advances a bounded number of runnable layers, and finally fills a bounded global
+acquisition window. It never blocks on I/O. Request and acquisition queues are
+round-robin; the cache still deduplicates identical expert loads across
+requests. Acquired leases live through FFN resume, while cancellation and every
+terminal failure unwind pending waiters, leases, and controller pins.

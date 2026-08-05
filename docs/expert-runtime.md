@@ -131,6 +131,14 @@ expanded SM86 bytes. Lookup does not parse files, allocate, or hash in the hot
 path. Catalog generation hashes the authoritative source once; normal cache
 admission verifies the selected expert again before publication.
 
+The DeepSeek outer scheduler converts controller misses into catalog-backed
+`ExpertCache::acquire` handles. Its independent credits bound active requests,
+cache waiters, and layer advances per event-loop poll. Completed acquisitions
+become request-owned leases; a request becomes runnable only when its entire
+exact top-6 route is present. Other runnable requests continue while a route is
+on SSD/I/O/H2D. Shared expert 256 is not silently loaded from the routed catalog:
+it must be held by the resident model set, otherwise the request fails closed.
+
 `HybridDispatchPlanner` receives one unique candidate per routed expert. It
 keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
 balances flexible RAM misses by projected critical path. Current synchronous

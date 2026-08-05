@@ -1,12 +1,14 @@
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_decode.hpp"
+#include "expert/runtime/cuda/deepseek_scheduler.hpp"
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/resident_expert_set.hpp"
@@ -26,6 +28,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace er = expert::runtime;
@@ -238,12 +241,17 @@ std::uint32_t compression_ratio(std::uint32_t layer) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 5) {
+    if (argc != 6) {
       std::cerr << "usage: expert-deepseek-model-residency "
-                   "<dense-bundle> <typed-bundle> <checkpoint> <attention-oracle>\n";
+                   "<dense-bundle> <typed-bundle> <checkpoint> "
+                   "<attention-oracle> <routed-catalog>\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
+    er::DeepSeekExpertCatalog routed_catalog;
+    const auto catalog_status = er::DeepSeekExpertCatalog::load(
+        argv[5], source, routed_catalog);
+    require(catalog_status.ok(), std::string(catalog_status.message()));
     std::uint64_t dense_source = 0U, dense_device = 0U, maximum_dense = 0U;
     std::uint64_t typed_source = 0U;
     const auto dense = dense_specs(argv[1], source, dense_source, dense_device,
@@ -595,29 +603,56 @@ int main(int argc, char** argv) {
         resumed_request.state, resumed_directory, nullptr);
     require(resumed_controller.status.ok() && resumed_controller.controller,
             std::string(resumed_controller.status.message()));
-    const auto resumed_begin = resumed_controller.controller->begin({
-        device_streams + 3U * token_stream_values,
-        {device_cosine + 3U * 32U, device_sine + 3U * 32U,
-         device_cosine + 3U * 32U, device_sine + 3U * 32U,
-         device_cosine, device_sine, device_cosine, device_sine},
-        3U, 3U, oracle_layer, oracle_layer + 1U});
-    require(resumed_begin.ok(), std::string(resumed_begin.message()));
-    auto resumed_advance = resumed_controller.controller->advance();
-    require(resumed_advance.status.ok() &&
-                resumed_advance.progress ==
-                    er::cuda::DeepSeekDecodeProgress::needs_experts &&
-                resumed_advance.missing_experts.size() == 7U,
-            "decode controller did not suspend on the cold route");
-    er::ResidentExpertSet resumed_resident;
+    er::ResidentExpertSet resumed_shared;
     const auto resumed_load = er::ResidentExpertSet::load(
-        resumed_cache, ffn, resumed_resident);
-    require(resumed_load.ok() && resumed_resident.size() == 7U,
+        resumed_cache,
+        std::span<const er::ResidentExpertSpec>(ffn.data() + 6U, 1U),
+        resumed_shared);
+    require(resumed_load.ok() && resumed_shared.size() == 1U,
             std::string(resumed_load.message()));
-    resumed_advance = resumed_controller.controller->advance();
-    require(resumed_advance.status.ok() &&
-                resumed_advance.progress ==
-                    er::cuda::DeepSeekDecodeProgress::token_complete,
-            std::string(resumed_advance.status.message()));
+    er::cuda::DeepSeekDecodeScheduler decode_scheduler(
+        {17U, 2U, 2U, 1U}, resumed_cache, routed_catalog);
+    const auto submitted = decode_scheduler.submit(
+        1U, resumed_controller.controller,
+        {device_streams + 3U * token_stream_values,
+         {device_cosine + 3U * 32U, device_sine + 3U * 32U,
+          device_cosine + 3U * 32U, device_sine + 3U * 32U,
+          device_cosine, device_sine, device_cosine, device_sine},
+         3U, 3U, oracle_layer, oracle_layer + 1U});
+    require(submitted.ok(), std::string(submitted.message()));
+    std::size_t scheduler_peak_acquires = 0U;
+    std::size_t scheduler_peak_leases = 0U;
+    const auto scheduler_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    for (;;) {
+      const auto polled = decode_scheduler.poll();
+      require(polled.ok(), std::string(polled.message()));
+      const auto scheduled = decode_scheduler.inspect(1U);
+      require(scheduled.has_value(), "scheduled DeepSeek request disappeared");
+      const auto scheduler_state = decode_scheduler.snapshot();
+      scheduler_peak_acquires = std::max(
+          scheduler_peak_acquires, scheduler_state.inflight_acquires);
+      scheduler_peak_leases = std::max(
+          scheduler_peak_leases, scheduled->held_leases);
+      if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
+        break;
+      require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
+                  scheduled->state !=
+                      er::cuda::DeepSeekScheduledState::cancelled,
+              std::string(scheduled->status.message()));
+      require(std::chrono::steady_clock::now() < scheduler_deadline,
+              "DeepSeek async scheduler timed out");
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const auto scheduler_state = decode_scheduler.snapshot();
+    require(scheduler_state.completed_requests == 1U &&
+                scheduler_state.expert_suspensions == 1U &&
+                scheduler_state.acquires_started == 6U &&
+                scheduler_state.acquires_completed == 6U &&
+                scheduler_peak_acquires == 2U &&
+                scheduler_peak_leases > 0U &&
+                scheduler_peak_leases <= 6U,
+            "DeepSeek async scheduler accounting is inconsistent");
     std::vector<float> resumed_output(token_stream_values);
     check(cudaMemcpy(resumed_output.data(),
                      resumed_controller.controller->output_streams(),
@@ -695,7 +730,11 @@ int main(int argc, char** argv) {
               << std::sqrt(block_squared / token_stream_values)
               << ",\"block_max_abs_error\":" << block_maximum
               << ",\"controller_max_abs_error\":" << controller_maximum
-              << ",\"controller_cold_misses\":7"
+              << ",\"scheduler_cold_misses\":"
+              << scheduler_state.acquires_started
+              << ",\"scheduler_peak_acquires\":"
+              << scheduler_peak_acquires
+              << ",\"scheduler_peak_leases\":" << scheduler_peak_leases
               << ",\"controller_resume_max_abs_error\":" << resumed_maximum
               << ",\"cuda_free_before\":" << free_before
               << ",\"cuda_free_resident\":" << free_resident << "}\n";

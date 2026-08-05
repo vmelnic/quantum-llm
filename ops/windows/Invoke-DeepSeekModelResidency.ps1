@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Snapshot,
+    [string]$RoutedCatalog,
     [ValidateSet(0, 2)][int]$OracleLayer = 2
 )
 
@@ -18,6 +19,14 @@ $bundle = Join-Path (Join-Path $script:RepoRoot "work") "deepseek-model-$stamp"
 $dense = Join-Path $bundle "dense"
 $typed = Join-Path $bundle "typed"
 $oracle = Join-Path $bundle "attention-oracle"
+$catalog = if ($RoutedCatalog) {
+    [System.IO.Path]::GetFullPath($RoutedCatalog)
+} else {
+    Join-Path (Join-Path $script:RepoRoot "work") "deepseek-routed-catalog"
+}
+if (-not (Test-Path (Join-Path $catalog "catalog.tsv") -PathType Leaf)) {
+    throw "Generate the complete routed catalog before model residency"
+}
 $executable = Join-Path $script:RepoRoot `
     "out\build\windows-msvc-release\runtime\Release\expert-deepseek-model-residency.exe"
 if (-not (Test-Path $executable -PathType Leaf)) {
@@ -35,7 +44,7 @@ try {
     & $python.Source -m compiler export-deepseek-attention-oracle --source $source `
         --output $oracle --layer $OracleLayer | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek attention oracle export failed" }
-    $nativeRaw = & $executable $dense $typed $source $oracle | Out-String
+    $nativeRaw = & $executable $dense $typed $source $oracle $catalog | Out-String
     if ($LASTEXITCODE -ne 0) {
         Write-Output $nativeRaw
         throw "DeepSeek model residency failed"

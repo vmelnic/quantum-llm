@@ -28,8 +28,12 @@ This roadmap records direction, not a compatibility promise.
 7. ~~Index every main-model routed expert without copying the checkpoint.~~ The
    atomic catalog contains 11,008 records and 66,048 source extents; the runtime
    parser and real first/last-expert cache/CUDA boundary are complete.
-8. Add the outer async scheduler, then embedding, head, tokenizer, sampling,
-   and the HTTP worker boundary.
+8. ~~Add the outer async scheduler.~~ The non-blocking round-robin loop bounds
+   concurrent requests, layer advances, and cache acquisitions; it retains
+   leases across suspended layers and was qualified with six catalog-backed
+   cold routed experts under a two-acquire limit.
+9. Add embedding, output head, tokenizer, sampling, and the HTTP worker
+   boundary for DeepSeek.
 
 ## Phase 1 — long-context and cold-path production work
 

@@ -67,6 +67,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     src/cuda/deepseek_dense.cu
     src/cuda/deepseek_dense_set.cpp
     src/cuda/deepseek_decode.cpp
+    src/cuda/deepseek_scheduler.cpp
     src/cuda/deepseek_ffn.cu
     src/cuda/deepseek_hca.cu
     src/cuda/deepseek_model.cpp

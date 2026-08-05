@@ -16,6 +16,13 @@ routed experts plus the always-active shared expert.
 | cold gather/admission/publication for seven experts | 410 ms |
 | full-block RMSE / maximum error | `1.04e-4` / `4.76e-4` |
 
+The production cold-path gate keeps the shared expert resident and lets the
+outer scheduler acquire the six routed experts from the complete catalog. With
+the global acquire credit set to two, the observed peak was exactly two; all
+six completed and the resumed block retained the same `4.76e-4` maximum error.
+This is a bounded orchestration result, not a claim that parallel cache waiters
+make one physical staging slot perform parallel I/O.
+
 The cold 410 ms is outside the hot compute interval. Conversely, 14.77 ms is
 one layer, not one generated token; extrapolating it across 43 layers would be
 well below the throughput target. This result establishes the complete
