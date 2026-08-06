@@ -955,10 +955,29 @@ class Model final {
   void warm_from_census() {
     if (placement_ == "capacity") return;
     const auto usage = cache_->usage();
-    if (usage.ram_bytes >= ram_bytes_) return;
-    constexpr std::uint64_t routed_record_bytes = 13'369'344U;
+    const auto* representative = catalog_.find(0U, 0U);
+    require(representative != nullptr,
+            "DeepSeek warm start has no representative routed record");
+    const auto device_record_bytes = representative->device_bytes == 0U
+                                         ? representative->stored_bytes
+                                         : representative->device_bytes;
+    require(representative->stored_bytes != 0U && device_record_bytes != 0U,
+            "DeepSeek warm start record geometry is empty");
+    const auto warm_ram_limit = ram_bytes_ - mtp_cache_bytes_;
+    const auto warm_vram_limit = vram_bytes_ - mtp_cache_bytes_;
+    if (usage.ram_bytes >= warm_ram_limit ||
+        usage.vram_bytes >= warm_vram_limit)
+      return;
+    // acquire() resolves all the way to a device lease. Bounding only by RAM
+    // can leave the final waiter permanently queued once every VRAM entry is
+    // hotter than the next census candidate. Until a host-only load primitive
+    // exists, the safe warm set must fit both cache tiers.
+    const auto ram_entries =
+        (warm_ram_limit - usage.ram_bytes) / representative->stored_bytes;
+    const auto vram_entries =
+        (warm_vram_limit - usage.vram_bytes) / device_record_bytes;
     const auto maximum_entries = static_cast<std::size_t>(
-        (ram_bytes_ - usage.ram_bytes) / routed_record_bytes);
+        std::min(ram_entries, vram_entries));
     if (maximum_entries == 0U) return;
     const auto maximum_per_layer =
         (maximum_entries + er::kDeepSeekCatalogLayers - 1U) /

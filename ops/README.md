@@ -16,6 +16,12 @@ The sync includes only Git-visible, non-ignored files. It therefore excludes
 `.git`, models, work, logs, artifacts, and build output. It does not delete
 remote files.
 
+Interactive streaming chat can own its SSH tunnel and clean it up on exit:
+
+```bash
+./ops/chat.sh --ssh user@gpu-host
+```
+
 ## Windows scripts
 
 | Script | Purpose |

@@ -54,6 +54,18 @@ required.
 The normal OpenAI `base_url` override works; any non-empty placeholder key is
 enough for the loopback deployment.
 
+For an interactive terminal chat, including an owned SSH tunnel and streaming
+output, run from a POSIX control host:
+
+```bash
+./ops/chat.sh --ssh user@gpu-host
+```
+
+Use `--max-tokens`, `--local-port`, and `--remote-port` to override the safe
+defaults. The client retains conversation history. Enter `quit` or `exit`, or
+press Ctrl+C, to close both the client and the tunnel it created. Without
+`--ssh`, it connects to `--base-url` (default `http://127.0.0.1:8080`).
+
 DeepSeek-V4-Flash does not publish a Transformers `chat_template`. For that
 model the service loads the pinned checkpoint's official
 `encoding/encoding_dsv4.py` and uses its `encode_messages(...,

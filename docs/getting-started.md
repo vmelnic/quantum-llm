@@ -24,7 +24,10 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements\server.txt
 ```
 
-No model repository code is executed by the server.
+The Qwen server does not execute model repository code. DeepSeek-V4-Flash lacks
+a Transformers chat template, so its server executes only the pinned
+checkpoint's official `encoding/encoding_dsv4.py` for prompt formatting; model
+layers still run exclusively through the native runtime.
 
 ## Build and test
 
