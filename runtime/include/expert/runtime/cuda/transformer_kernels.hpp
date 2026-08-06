@@ -50,6 +50,12 @@ struct Int8Matrix final {
 [[nodiscard]] Status rms_norm_bf16_weight(
     const float* input, const std::uint16_t* weight, float* output,
     std::uint32_t elements, float epsilon, void* stream) noexcept;
+// Input/output are row-major [rows, elements]. Every row has an independent
+// RMS statistic and shares the same BF16 norm weight.
+[[nodiscard]] Status rms_norm_bf16_weight_batch(
+    const float* input, const std::uint16_t* weight, float* output,
+    std::uint32_t rows, std::uint32_t elements, float epsilon,
+    void* stream) noexcept;
 // Qwen3-Next stores zero-centered RMSNorm weights and applies (1 + weight).
 [[nodiscard]] Status qwen3_next_rms_norm(
     const float* input, const float* weight, float* output,

@@ -492,6 +492,17 @@ route-time acquisitions and no CPU expert execution. This proves resource
 availability is isolated from base-model semantics; it is not an MTP speed or
 acceptance result.
 
+The first production-facing MTP state now qualifies both sides of the decoder
+block using real token `19923` at position 2. Its two admitted 4096x4096
+projections occupy 33,587,200 device bytes and its reusable glue workspace is
+779,300 bytes. The input mix matched its independent source-checkpoint oracle
+with `3.05e-8` RMSE and `2.39e-7` maximum error; hyper-head collapse/final norm
+matched with `2.12e-10` RMSE and `1.68e-8` maximum error. Across 100 warm
+iterations on the RTX 3090, the projection mix took 0.135 ms and collapse took
+0.073 ms. Thus the two V4-specific boundaries are not a material part of the
+current 68.3 ms target step; the still-unimplemented MTP attention and MoE are
+the cost that must be fused/reused with verification.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

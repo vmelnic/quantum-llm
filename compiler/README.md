@@ -80,8 +80,18 @@ so a native comparison can be exact for the representation actually served.
 ```powershell
 ops\windows\Export-DeepSeekMtpGlueOracle.ps1 `
   -Snapshot C:\path\to\checkpoint `
-  -Output C:\path\to\mtp-glue-oracle-v1 `
+  -Output C:\path\to\mtp-glue-oracle-v2 `
   -Token 42 -Position 1
+```
+
+The v2 oracle also publishes fixed-order source extents for its two FP8
+projections and six typed tensors. Run the native qualification after building
+the CUDA runtime:
+
+```powershell
+ops\windows\Invoke-DeepSeekMtpGlueSmoke.ps1 `
+  -Oracle C:\path\to\mtp-glue-oracle-v2 `
+  -Snapshot C:\path\to\checkpoint
 ```
 
 ```powershell

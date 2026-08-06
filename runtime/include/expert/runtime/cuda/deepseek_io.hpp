@@ -32,6 +32,9 @@ class DeepSeekIoState final {
   [[nodiscard]] const std::uint32_t* sampled_token() const noexcept {
     return sampled_token_;
   }
+  [[nodiscard]] const float* head_gates() const noexcept { return head_pre_; }
+  [[nodiscard]] const float* collapsed() const noexcept { return collapsed_; }
+  [[nodiscard]] const float* normalized() const noexcept { return normalized_; }
 
  private:
   friend DeepSeekIoStateResult create_deepseek_io_state() noexcept;
@@ -39,6 +42,8 @@ class DeepSeekIoState final {
                                float*, void*) noexcept;
   friend Status deepseek_head(const DeepSeekIoBinding&, const float*,
                               DeepSeekIoState&, float, void*) noexcept;
+  friend Status deepseek_hc_head(const DeepSeekIoBinding&, const float*,
+                                 DeepSeekIoState&, float, void*) noexcept;
   DeepSeekIoState(void* allocation, std::uint64_t bytes) noexcept;
   void map(void* allocation) noexcept;
 
@@ -69,6 +74,12 @@ struct DeepSeekIoStateResult final {
 // Applies the checkpoint HC head, final RMSNorm and untied BF16 output head,
 // then writes both complete logits and greedy argmax into request-owned state.
 [[nodiscard]] Status deepseek_head(
+    const DeepSeekIoBinding& weights, const float* streams,
+    DeepSeekIoState& state, float epsilon, void* stream) noexcept;
+
+// Applies only the hyper-head collapse and final RMSNorm. MTP reuses this
+// boundary before the shared vocabulary head, avoiding a duplicate kernel ABI.
+[[nodiscard]] Status deepseek_hc_head(
     const DeepSeekIoBinding& weights, const float* streams,
     DeepSeekIoState& state, float epsilon, void* stream) noexcept;
 

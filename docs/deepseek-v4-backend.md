@@ -75,10 +75,14 @@ implementations. The contract follows the production DeepSeek V4 MTP path in
 
 `export-deepseek-mtp-glue-oracle` now independently qualifies both boundaries
 against the source checkpoint and the SM86 admitted projection ABI. A real
-token-19923, position-2 export produced seven authenticated FP32 artifacts;
-the mixed four-stream result is 64 KiB. This is intentionally not called a
-draft-token qualification: the MTP attention, FFN and cache state still have
-to execute between those two validated boundaries.
+token-19923, position-2 export produced nine authenticated FP32 artifacts plus
+source extents; the mixed four-stream result is 64 KiB. The native runtime uses
+one four-row RMSNorm launch, batched `h_proj`, one `e_proj`, and the existing
+hyper-head implementation. It matched the input oracle with `3.05e-8` RMSE
+and `2.39e-7` maximum error, and the output oracle with `2.12e-10` RMSE and
+`1.68e-8` maximum error. This is intentionally not called a draft-token
+qualification: the MTP attention, FFN and cache state still have to execute
+between those two validated boundaries.
 
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the

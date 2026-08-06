@@ -156,10 +156,28 @@ Status deepseek_embed(const DeepSeekIoBinding& weights, std::uint32_t token,
 Status deepseek_head(const DeepSeekIoBinding& weights, const float* streams,
                      DeepSeekIoState& state, float epsilon,
                      void* raw_stream) noexcept {
-  if (!weights.final_norm || !weights.head || !weights.head_function ||
-      !weights.head_base || !weights.head_scale || !streams ||
-      epsilon <= 0.0F)
+  if (!weights.head)
     return {ErrorCode::invalid_argument, "invalid DeepSeek head launch"};
+  auto status = deepseek_hc_head(weights, streams, state, epsilon, raw_stream);
+  if (!status.ok()) return status;
+  status = gemv_bf16(weights.head, kDeepSeekVocab, kDeepSeekHidden,
+                     state.normalized_, state.logits_, raw_stream);
+  if (!status.ok()) return status;
+  status = argmax(state.logits_, kDeepSeekVocab, state.sampled_token_,
+                  raw_stream);
+  if (!status.ok()) return status;
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek output head");
+}
+
+Status deepseek_hc_head(const DeepSeekIoBinding& weights, const float* streams,
+                        DeepSeekIoState& state, float epsilon,
+                        void* raw_stream) noexcept {
+  if (!weights.final_norm || !weights.head_function || !weights.head_base ||
+      !weights.head_scale || !streams || epsilon <= 0.0F)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek hyper-head launch"};
   const auto stream = static_cast<cudaStream_t>(raw_stream);
   normalize_head_streams_kernel<<<1, kThreads, 0, stream>>>(
       streams, state.normalized_streams_, epsilon);
@@ -179,15 +197,9 @@ Status deepseek_head(const DeepSeekIoBinding& weights, const float* streams,
   if (!status.ok()) return status;
   round_bf16_kernel<<<(kDeepSeekHidden + kThreads - 1U) / kThreads, kThreads,
                        0, stream>>>(state.normalized_, kDeepSeekHidden);
-  status = gemv_bf16(weights.head, kDeepSeekVocab, kDeepSeekHidden,
-                     state.normalized_, state.logits_, raw_stream);
-  if (!status.ok()) return status;
-  status = argmax(state.logits_, kDeepSeekVocab, state.sampled_token_,
-                  raw_stream);
-  if (!status.ok()) return status;
   const auto error = cudaPeekAtLastError();
   return error == cudaSuccess ? Status::success()
-                              : failure(error, "DeepSeek output head");
+                              : failure(error, "DeepSeek hyper-head");
 }
 
 }  // namespace expert::runtime::cuda

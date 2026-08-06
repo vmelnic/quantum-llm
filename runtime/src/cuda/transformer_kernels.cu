@@ -235,6 +235,24 @@ __global__ void rms_bf16_weight_kernel(const float* input,
   }
 }
 
+__global__ void rms_bf16_weight_batch_kernel(
+    const float* input, const std::uint16_t* weight, float* output,
+    std::uint32_t count, float epsilon) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  input += static_cast<std::size_t>(row) * count;
+  output += static_cast<std::size_t>(row) * count;
+  float square = 0.0F;
+  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x)
+    square += input[i] * input[i];
+  square = reduce_sum(square);
+  const float inverse = rsqrtf(square / static_cast<float>(count) + epsilon);
+  for (std::uint32_t i = threadIdx.x; i < count; i += blockDim.x) {
+    const float scale =
+        __uint_as_float(static_cast<unsigned>(weight[i]) << 16U);
+    output[i] = input[i] * inverse * scale;
+  }
+}
+
 __global__ void qwen_rms_kernel(const float* input, const float* weight,
                                 float* output, std::uint32_t count,
                                 float epsilon) {
@@ -1040,6 +1058,18 @@ Status rms_norm_bf16_weight(const float* input, const std::uint16_t* weight,
                            static_cast<cudaStream_t>(raw)>>>(
       input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "bf16-weight rms norm");
+}
+Status rms_norm_bf16_weight_batch(
+    const float* input, const std::uint16_t* weight, float* output,
+    std::uint32_t rows, std::uint32_t elements, float epsilon,
+    void* raw) noexcept {
+  if (!input || !weight || !output || !rows || !elements || epsilon <= 0)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid batched bf16-weight rms norm");
+  rms_bf16_weight_batch_kernel<<<rows, kThreads, 0,
+                                 static_cast<cudaStream_t>(raw)>>>(
+      input, weight, output, elements, epsilon);
+  return checked(cudaPeekAtLastError(), "batched bf16-weight rms norm");
 }
 Status qwen3_next_rms_norm(const float* input, const float* weight,
                            float* output, std::uint32_t elements,

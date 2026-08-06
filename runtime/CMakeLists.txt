@@ -82,6 +82,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     src/cuda/deepseek_hca.cu
     src/cuda/deepseek_io.cu
     src/cuda/deepseek_model.cpp
+    src/cuda/deepseek_mtp.cu
     src/cuda/deepseek_request.cpp
     src/cuda/deepseek_typed.cu
     src/cuda/deepseek_typed_set.cpp
@@ -138,6 +139,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
       tools/deepseek_hca_smoke.cpp)
     target_compile_features(expert-deepseek-hca-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-hca-smoke PRIVATE
+      expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-mtp-glue-smoke
+      tools/deepseek_mtp_glue_smoke.cpp)
+    target_compile_features(expert-deepseek-mtp-glue-smoke PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-mtp-glue-smoke PRIVATE
       expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-typed-residency
       tools/deepseek_typed_residency.cpp)

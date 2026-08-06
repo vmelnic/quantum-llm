@@ -12,7 +12,7 @@ from pathlib import Path
 from .deepseek_v4 import validate_deepseek_v4_source
 from .errors import AdapterError, SourceFormatError
 from .safetensors import SafeTensorCheckpoint
-from .util import atomic_json, write_all
+from .util import atomic_json, publish_directory, write_all
 
 try:
     import numpy as np
@@ -1780,7 +1780,7 @@ def export_deepseek_routed_catalog(
             "device_bytes_per_expert": 25_198_592,
         }
         atomic_json(partial / "manifest.json", result)
-        os.replace(partial, output)
+        publish_directory(partial, output)
         return result
     except Exception:
         raise
@@ -2264,10 +2264,48 @@ def export_deepseek_mtp_glue_oracle(
                 ),
             )
 
+        resources = partial / "resources"
+        resources.mkdir()
+        typed_names = (
+            "mtp.0.enorm.weight",
+            "mtp.0.hnorm.weight",
+            "mtp.0.hc_head_fn",
+            "mtp.0.hc_head_base",
+            "mtp.0.hc_head_scale",
+            "mtp.0.norm.weight",
+        )
+        typed_resource = _export_deepseek_extents(
+            checkpoint, names=typed_names, output=resources / "typed",
+            layer=-1, expert="mtp.0.glue.typed",
+            format_name="deepseek-mtp-glue-typed-extents-v1",
+            source_abi="deepseek-mtp-glue-source-dtypes-v1",
+            target_abi="deepseek-mtp-glue-sm86-v1",
+        )
+        projection_resources: dict[str, object] = {}
+        for projection in ("e_proj", "h_proj"):
+            base_name = f"mtp.0.{projection}"
+            manifest = _export_deepseek_extents(
+                checkpoint,
+                names=(base_name + ".weight", base_name + ".scale"),
+                output=resources / projection, layer=-1,
+                expert=base_name,
+                format_name="deepseek-mtp-glue-fp8-extents-v1",
+                source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+                target_abi="deepseek-sm86-int8-per-row-matrix-v1",
+            )
+            projection_resources[projection] = {
+                "descriptor": f"resources/{projection}/extents.tsv",
+                "sha256": manifest["combined"]["sha256"],
+                "source_bytes": manifest["bytes"],
+            }
+
         function = tensor("mtp.0.hc_head_fn", (4, 16384), "F32")
         base = tensor("mtp.0.hc_head_base", (4,), "F32")
         scale = tensor("mtp.0.hc_head_scale", (1,), "F32")
-        flat = mixed.reshape(-1)
+        head_input = _bf16_to_f32(
+            _f32_to_bf16_words(mixed).tobytes(), (4, 4096)
+        ).copy()
+        flat = head_input.reshape(-1)
         inverse = np.float32(
             1.0 / math.sqrt(float(np.mean(np.square(flat, dtype=np.float32))) + 1e-6)
         )
@@ -2275,7 +2313,9 @@ def export_deepseek_mtp_glue_oracle(
             1.0 + np.exp(-(np.matmul(function, flat * inverse, dtype=np.float32)
                            * scale[0] + base))
         ) + 1e-6
-        collapsed = np.sum(gates[:, None] * mixed, axis=0, dtype=np.float32)
+        collapsed = np.sum(
+            gates[:, None] * head_input, axis=0, dtype=np.float32
+        )
         collapsed = _bf16_to_f32(
             _f32_to_bf16_words(collapsed).tobytes(), (4096,)
         ).copy()
@@ -2292,9 +2332,11 @@ def export_deepseek_mtp_glue_oracle(
 
         arrays = {
             "previous-streams.f32": previous,
+            "embedding.f32": embedding,
             "normalized-token.f32": normalized_token,
             "normalized-streams.f32": normalized_streams,
             "mixed-streams.f32": mixed,
+            "hc-head-input.f32": head_input,
             "hc-head-gates.f32": np.asarray(gates, dtype="<f4"),
             "collapsed.f32": collapsed,
             "normalized-output.f32": normalized_output,
@@ -2308,7 +2350,7 @@ def export_deepseek_mtp_glue_oracle(
                 "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
             }
         result = {
-            "format": "deepseek-mtp-glue-oracle-v1",
+            "format": "deepseek-mtp-glue-oracle-v2",
             "namespace": 0,
             "token": token,
             "position": position,
@@ -2316,10 +2358,18 @@ def export_deepseek_mtp_glue_oracle(
             "hc_mult": 4,
             "previous_streams": previous_source,
             "projection_abi": "deepseek-sm86-int8-per-row-matrix-v1",
+            "resources": {
+                "typed": {
+                    "descriptor": "resources/typed/extents.tsv",
+                    "sha256": typed_resource["combined"]["sha256"],
+                    "source_bytes": typed_resource["bytes"],
+                },
+                **projection_resources,
+            },
             "files": files,
         }
         atomic_json(partial / "manifest.json", result)
-        os.replace(partial, output)
+        publish_directory(partial, output)
         return result
     except Exception:
         raise

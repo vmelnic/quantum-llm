@@ -242,7 +242,10 @@ latency or aggregate throughput without changing model semantics.
   - [x] Freeze the V4-specific input/output glue contract and export a real
     source-checkpoint oracle for `hnorm`/`enorm`, separate `h_proj`/`e_proj`,
     stream broadcast, MTP hyper-head collapse, and MTP final norm.
-  - [ ] Qualify those boundary artifacts with the native SM86 kernels.
+  - [x] Qualify those boundary artifacts with the native SM86 kernels. The
+    production-facing state uses one four-row RMSNorm launch, batched `h_proj`,
+    one `e_proj`, and the shared hyper-head implementation; both boundaries
+    passed with maximum absolute error below `2.39e-7`.
   - [ ] Execute the MTP attention, routed/shared FFN, mHC state and shared
     vocabulary head between the qualified boundaries; only then compare a
     one-token draft prediction.

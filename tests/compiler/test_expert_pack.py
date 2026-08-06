@@ -24,6 +24,7 @@ from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
 from compiler.expert_pack.util import load_json, sha256_file
+from compiler.expert_pack.util import publish_directory
 from compiler.expert_pack.validate import validate_container
 
 
@@ -288,6 +289,20 @@ def _deepseek_metadata_checkpoint() -> SimpleNamespace:
 
 
 class ExpertPackTests(unittest.TestCase):
+    def test_publish_directory_preserves_completed_tree(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            partial = root / "artifact.partial"
+            destination = root / "artifact"
+            partial.mkdir()
+            (partial / "manifest.json").write_text("{}\n", encoding="utf-8")
+            publish_directory(partial, destination)
+            self.assertFalse(partial.exists())
+            self.assertEqual(
+                (destination / "manifest.json").read_text(encoding="utf-8"),
+                "{}\n",
+            )
+
     def test_deepseek_v4_contract_is_byte_exact_and_fail_closed(self) -> None:
         checkpoint = _deepseek_metadata_checkpoint()
         result = validate_deepseek_v4_source(checkpoint)

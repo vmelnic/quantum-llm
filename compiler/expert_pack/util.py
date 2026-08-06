@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any, BinaryIO
 
@@ -86,3 +87,24 @@ def fsync_directory(path: Path) -> None:
     finally:
         os.close(descriptor)
 
+
+def publish_directory(partial: Path, destination: Path) -> None:
+    """Atomically publish a completed directory with bounded Windows retry.
+
+    Virus scanners and indexers can briefly hold a newly populated directory
+    on Windows. Retry only that transient permission failure, never overwrite
+    an existing destination, and preserve the partial tree on final failure.
+    """
+
+    if destination.exists():
+        raise FileExistsError(f"publish destination exists: {destination}")
+    attempts = 6 if os.name == "nt" else 1
+    for attempt in range(attempts):
+        try:
+            os.replace(partial, destination)
+            fsync_directory(destination.parent)
+            return
+        except PermissionError:
+            if attempt + 1 == attempts or destination.exists():
+                raise
+            time.sleep(0.05 * (2 ** attempt))
