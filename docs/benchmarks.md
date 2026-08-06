@@ -439,6 +439,17 @@ original kernel. The variant was removed before commit and the pre-profile
 census was restored. Future dense work must gate routing stability as well as
 final-token equality and speed.
 
+A second dense experiment kept the original one-warp reduction and per-lane
+FP32 accumulation order, but loaded two coalesced `char4`/`float4` segments
+before their FMAs to expose more independent memory work. The optimized run
+took 347.028 ms for five steps. Rebuilding the original kernel and running it
+against exactly the same accumulated census produced zero misses, the same
+token `19923`, and 334.189 ms. Thus routing stayed stable, but the extra live
+values made the end-to-end path about 3.8% slower. The variant was removed and
+the pre-experiment census restored. The measured scoreboard stalls therefore
+cannot be converted into a win by local unrolling alone; the next dense change
+must alter the representation or use an architecture-suited dot-product path.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

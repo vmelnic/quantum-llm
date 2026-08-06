@@ -138,6 +138,11 @@ single-request latency and aggregate throughput.
   zero-miss five-step route took 346.860 ms versus the accepted
   340.886–342.421 ms baseline, and the changed FP32 reduction order changed
   later routed expert IDs. The code was removed before commit.
+- [x] Evaluate a two-segment load/FMA pipeline while preserving the original
+  per-lane FP32 accumulation order. Reject it: on one shared zero-miss census
+  the pipelined kernel took 347.028 ms and the original took 334.189 ms. Both
+  emitted token `19923`, proving route stability but no speedup. The code was
+  removed before commit.
 - [ ] Profile representative BF16, F32, grouped-INT8, and routed-FP4 launches
   with Nsight Compute, then choose the first kernel by attainable end-to-end
   reduction rather than by one launch's percentage.
