@@ -83,6 +83,7 @@ Switch models or release all GPU memory with the same command:
 - [OpenAI-compatible API](docs/openai-api.md)
 - [Operations](docs/operations.md)
 - [Benchmarks and evidence](docs/benchmarks.md)
+- [Performance architecture review](docs/performance-architecture-review.md)
 - [Engineering history](docs/history.md)
 - [Production readiness](docs/production-readiness.md)
 - [Roadmap](docs/roadmap.md)

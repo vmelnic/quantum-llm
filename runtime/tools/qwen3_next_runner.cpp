@@ -94,6 +94,199 @@ struct DevicePack final {
   std::uint64_t bytes{};
 };
 
+std::string digest_hex(const expert::runtime::Sha256Digest& digest) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result(digest.size() * 2U, '0');
+  for (std::size_t index = 0; index < digest.size(); ++index) {
+    const auto value = std::to_integer<unsigned>(digest[index]);
+    result[2U * index] = digits[value >> 4U];
+    result[2U * index + 1U] = digits[value & 0x0fU];
+  }
+  return result;
+}
+
+class MoeTraceWriter final {
+ public:
+  MoeTraceWriter(std::filesystem::path root,
+                 std::vector<std::uint32_t> layers,
+                 std::uint32_t hidden, std::uint32_t top_k,
+                 std::uint64_t maximum_records)
+      : root_(std::move(root)), layers_(std::move(layers)), hidden_(hidden),
+        top_k_(top_k), maximum_records_(maximum_records) {
+    if (layers_.empty() || !hidden_ || !top_k_)
+      throw std::runtime_error("invalid MoE trace geometry");
+    std::sort(layers_.begin(), layers_.end());
+    if (std::adjacent_find(layers_.begin(), layers_.end()) != layers_.end())
+      throw std::runtime_error("duplicate MoE trace layer");
+    selected_layers_.insert(layers_.begin(), layers_.end());
+    std::filesystem::create_directories(root_);
+    open(input_, "input.f32");
+    open(output_, "output.f32");
+    open(layer_, "layer.u32");
+    open(sequence_, "sequence.u32");
+    open(position_, "position.u32");
+    open(route_indices_, "route-indices.u32");
+    open(route_scores_, "route-scores.f32");
+  }
+
+  bool selected(std::uint32_t layer) const noexcept {
+    return selected_layers_.contains(layer) && !full();
+  }
+  bool full() const noexcept {
+    return maximum_records_ && records_ >= maximum_records_;
+  }
+  std::uint64_t records() const noexcept { return records_; }
+
+  void append(std::uint32_t layer, const float* device_input,
+              const float* device_output,
+              const std::uint32_t* device_route_indices,
+              const float* device_route_scores,
+              std::span<const std::uint32_t> positions,
+              std::span<const std::uint32_t> state_slots,
+              std::span<const std::uint32_t> sequence_ids) {
+    if (!selected(layer)) return;
+    if (positions.size() != state_slots.size())
+      throw std::runtime_error("MoE trace row metadata mismatch");
+    auto rows = positions.size();
+    if (maximum_records_)
+      rows = std::min<std::size_t>(
+          rows, static_cast<std::size_t>(maximum_records_ - records_));
+    if (!rows) return;
+
+    const auto vector_values = rows * hidden_;
+    const auto route_values = rows * top_k_;
+    host_input_.resize(vector_values);
+    host_output_.resize(vector_values);
+    host_route_indices_.resize(route_values);
+    host_route_scores_.resize(route_values);
+    host_layers_.assign(rows, layer);
+    host_sequences_.resize(rows);
+    host_positions_.assign(positions.begin(), positions.begin() + rows);
+    for (std::size_t row = 0; row < rows; ++row) {
+      if (state_slots[row] >= sequence_ids.size())
+        throw std::runtime_error("MoE trace state slot outside sequence map");
+      host_sequences_[row] = sequence_ids[state_slots[row]];
+    }
+
+    cuda_check(cudaMemcpy(host_input_.data(), device_input,
+                          vector_values * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "copy MoE trace input");
+    cuda_check(cudaMemcpy(host_output_.data(), device_output,
+                          vector_values * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "copy MoE trace output");
+    cuda_check(cudaMemcpy(host_route_indices_.data(), device_route_indices,
+                          route_values * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost),
+               "copy MoE trace route indices");
+    cuda_check(cudaMemcpy(host_route_scores_.data(), device_route_scores,
+                          route_values * sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "copy MoE trace route scores");
+
+    write(input_, host_input_);
+    write(output_, host_output_);
+    write(layer_, host_layers_);
+    write(sequence_, host_sequences_);
+    write(position_, host_positions_);
+    write(route_indices_, host_route_indices_);
+    write(route_scores_, host_route_scores_);
+    records_ += rows;
+  }
+
+  void finalize() {
+    if (finalized_) return;
+    finalized_ = true;
+    close(input_);
+    close(output_);
+    close(layer_);
+    close(sequence_);
+    close(position_);
+    close(route_indices_);
+    close(route_scores_);
+    std::ofstream manifest(root_ / "manifest.json", std::ios::binary);
+    if (!manifest) throw std::runtime_error("cannot create MoE trace manifest");
+    manifest << "{\n  \"format\": \"quantum-llm-moe-trace-v1\",\n"
+             << "  \"record_count\": " << records_ << ",\n"
+             << "  \"hidden_size\": " << hidden_ << ",\n"
+             << "  \"top_k\": " << top_k_ << ",\n"
+             << "  \"maximum_records\": " << maximum_records_ << ",\n"
+             << "  \"layers\": [";
+    for (std::size_t index = 0; index < layers_.size(); ++index) {
+      if (index) manifest << ", ";
+      manifest << layers_[index];
+    }
+    manifest << "],\n  \"files\": {\n";
+    write_manifest_file(manifest, input_, true);
+    write_manifest_file(manifest, output_, true);
+    write_manifest_file(manifest, layer_, true);
+    write_manifest_file(manifest, sequence_, true);
+    write_manifest_file(manifest, position_, true);
+    write_manifest_file(manifest, route_indices_, true);
+    write_manifest_file(manifest, route_scores_, false);
+    manifest << "  }\n}\n";
+    if (!manifest) throw std::runtime_error("failed to write MoE trace manifest");
+  }
+
+ private:
+  struct File final {
+    std::string name;
+    std::ofstream stream;
+    expert::runtime::Sha256 hash;
+    expert::runtime::Sha256Digest digest{};
+    std::uint64_t bytes{};
+  };
+
+  void open(File& file, std::string name) {
+    file.name = std::move(name);
+    const auto path = root_ / file.name;
+    if (std::filesystem::exists(path))
+      throw std::runtime_error("MoE trace output already exists: " +
+                               path.string());
+    file.stream.open(path, std::ios::binary);
+    if (!file.stream)
+      throw std::runtime_error("cannot create MoE trace file: " + path.string());
+  }
+
+  template <typename T>
+  void write(File& file, const std::vector<T>& values) {
+    const auto bytes = std::as_bytes(std::span(values));
+    file.stream.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+    if (!file.stream)
+      throw std::runtime_error("failed writing MoE trace file: " + file.name);
+    file.hash.update(bytes);
+    file.bytes += bytes.size();
+  }
+
+  void close(File& file) {
+    file.stream.close();
+    if (!file.stream)
+      throw std::runtime_error("failed closing MoE trace file: " + file.name);
+    file.digest = file.hash.finalize();
+  }
+
+  static void write_manifest_file(std::ostream& output, const File& file,
+                                  bool comma) {
+    output << "    \"" << file.name << "\": {\"bytes\": " << file.bytes
+           << ", \"sha256\": \"" << digest_hex(file.digest) << "\"}"
+           << (comma ? "," : "") << "\n";
+  }
+
+  std::filesystem::path root_;
+  std::vector<std::uint32_t> layers_;
+  std::unordered_set<std::uint32_t> selected_layers_;
+  std::uint32_t hidden_{}, top_k_{};
+  std::uint64_t maximum_records_{}, records_{};
+  bool finalized_{};
+  File input_, output_, layer_, sequence_, position_, route_indices_,
+      route_scores_;
+  std::vector<float> host_input_, host_output_, host_route_scores_;
+  std::vector<std::uint32_t> host_route_indices_, host_layers_, host_sequences_,
+      host_positions_;
+};
+
 DevicePack upload_dense_pack(const std::filesystem::path& path,
                              std::uint64_t expected_bytes,
                              std::string_view expected_sha) {
@@ -571,7 +764,7 @@ class Qwen3NextModel final {
             epsilon_, nullptr));
       cuda_check(cudaEventRecord(attention_done_event_),
                  "record attention done");
-      run_moe(prefix, layer, rows);
+      run_moe(prefix, layer, positions, state_slots, rows);
     }
     const auto final_head_started = std::chrono::steady_clock::now();
     for (std::uint32_t row = 0; row < rows; ++row)
@@ -693,6 +886,32 @@ class Qwen3NextModel final {
     return kv_reserved_pages_;
   }
   std::uint32_t kv_page_tokens() const noexcept { return kv_page_tokens_; }
+
+  void enable_moe_trace(const std::filesystem::path& root,
+                        std::vector<std::uint32_t> layers,
+                        std::uint64_t maximum_records = 0) {
+    if (moe_trace_)
+      throw std::runtime_error("MoE tracing is already enabled");
+    for (const auto layer : layers)
+      if (layer >= layers_)
+        throw std::runtime_error("MoE trace layer outside model");
+    moe_trace_ = std::make_unique<MoeTraceWriter>(
+        root, std::move(layers), hidden_, top_k_, maximum_records);
+  }
+  void set_trace_sequence_id(std::uint32_t slot, std::uint32_t sequence_id) {
+    if (slot >= capacity_)
+      throw std::runtime_error("trace sequence slot outside capacity");
+    trace_sequence_ids_[slot] = sequence_id;
+  }
+  std::uint64_t moe_trace_records() const noexcept {
+    return moe_trace_ ? moe_trace_->records() : 0U;
+  }
+  bool moe_trace_full() const noexcept {
+    return moe_trace_ && moe_trace_->full();
+  }
+  void finalize_moe_trace() {
+    if (moe_trace_) moe_trace_->finalize();
+  }
 
   void reserve_slot(std::uint32_t slot, std::uint32_t context_tokens) {
     if (slot >= capacity_ || !context_tokens || context_tokens > max_context_)
@@ -917,6 +1136,7 @@ class Qwen3NextModel final {
                "zero KV page table");
     slot_kv_pages_.resize(capacity_);
     slot_context_limits_.resize(capacity_);
+    trace_sequence_ids_.resize(capacity_);
     const auto conv_elements = conv_size * conv_kernel_;
     const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
                                     key_head_dim_ * value_head_dim_;
@@ -1040,6 +1260,8 @@ class Qwen3NextModel final {
   }
 
   void run_moe(const std::string& prefix, std::uint32_t layer,
+               std::span<const std::uint32_t> positions,
+               std::span<const std::uint32_t> state_slots,
                std::uint32_t rows) {
     status_check(expert::runtime::cuda::gemv_batch(
         matrix(prefix + "mlp.shared_expert.gate_proj.weight"), normalized_,
@@ -1388,6 +1610,10 @@ class Qwen3NextModel final {
     }
       status_check(expert::runtime::cuda::add_in_place(
           moe_output_, shared_output_, rows * hidden_, nullptr));
+      if (moe_trace_ && moe_trace_->selected(layer))
+        moe_trace_->append(layer, normalized_, moe_output_, routing_indices_,
+                           routing_scores_, positions, state_slots,
+                           trace_sequence_ids_);
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, moe_output_, rows * hidden_, nullptr));
       if (route_pin_id != 0U) {
@@ -1459,12 +1685,13 @@ class Qwen3NextModel final {
   void** device_kv_page_table_{};
   std::vector<std::vector<void*>> slot_kv_pages_;
   std::vector<void*> free_kv_pages_;
-  std::vector<std::uint32_t> slot_context_limits_;
+  std::vector<std::uint32_t> slot_context_limits_, trace_sequence_ids_;
   std::vector<float*> conv_state_, recurrent_state_;
   std::vector<std::uint32_t> gpu_selections_by_layer_;
   std::vector<cudaEvent_t> expert_start_events_, expert_done_events_;
   cudaEvent_t layer_start_event_{}, attention_done_event_{},
       shared_done_event_{}, router_done_event_{};
+  std::unique_ptr<MoeTraceWriter> moe_trace_;
 };
 
 std::vector<std::uint32_t> parse_tokens(std::string_view text) {
@@ -1492,6 +1719,29 @@ std::vector<std::vector<std::uint32_t>> parse_prompt_batch(
     text.remove_prefix(separator + 1U);
   }
   return result;
+}
+
+std::vector<std::vector<std::uint32_t>> read_prompt_file(
+    const std::filesystem::path& path) {
+  std::ifstream input(path);
+  if (!input) throw std::runtime_error("cannot open prompt file " + path.string());
+  std::vector<std::vector<std::uint32_t>> prompts;
+  std::string line;
+  while (std::getline(input, line)) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (line.empty() || line.front() == '#') continue;
+    prompts.push_back(parse_tokens(line));
+  }
+  if (prompts.empty()) throw std::runtime_error("prompt file contains no prompts");
+  return prompts;
+}
+
+std::vector<std::uint32_t> parse_layers(std::string_view text) {
+  auto layers = parse_tokens(text);
+  std::sort(layers.begin(), layers.end());
+  if (std::adjacent_find(layers.begin(), layers.end()) != layers.end())
+    throw std::runtime_error("duplicate trace layer");
+  return layers;
 }
 
 double percentile_ms(std::vector<double> values, double fraction) {
@@ -1702,6 +1952,54 @@ int worker_loop(Qwen3NextModel& model) {
 
 int main(int argc, char** argv) {
   try {
+    if (argc >= 3 && std::string_view(argv[2]) == "--trace-moe") {
+      if (argc < 5 || argc > 10)
+        throw std::runtime_error(
+            "trace usage: <container> --trace-moe <prompt-file> <output-dir> "
+            "[layers-csv] [ram-gib] [vram-gib] [chunk-tokens] "
+            "[maximum-records]");
+      const auto prompts = read_prompt_file(argv[3]);
+      const auto layers = parse_layers(argc >= 6 ? argv[5] : "20,21,22,23");
+      const auto ram_gib = argc >= 7 ? std::stoull(argv[6]) : 48ULL;
+      const auto vram_gib = argc >= 8 ? std::stoull(argv[7]) : 14ULL;
+      const auto chunk_tokens = argc >= 9
+          ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 16U;
+      const auto maximum_records = argc >= 10 ? std::stoull(argv[9]) : 0ULL;
+      if (!ram_gib || !vram_gib || !chunk_tokens)
+        throw std::runtime_error("zero MoE trace runtime setting");
+      const auto longest_prompt = std::max_element(
+          prompts.begin(), prompts.end(),
+          [](const auto& left, const auto& right) {
+            return left.size() < right.size();
+          })->size();
+      if (longest_prompt > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("trace prompt exceeds u32 context");
+      const auto started = std::chrono::steady_clock::now();
+      Qwen3NextModel model(
+          argv[1], static_cast<std::uint32_t>(longest_prompt), ram_gib << 30U,
+          vram_gib << 30U, chunk_tokens);
+      model.enable_moe_trace(argv[4], layers, maximum_records);
+      std::uint64_t input_tokens = 0;
+      std::uint32_t processed_sequences = 0;
+      for (std::uint32_t sequence = 0; sequence < prompts.size(); ++sequence) {
+        if (model.moe_trace_full()) break;
+        const auto& prompt = prompts[sequence];
+        model.reserve_slot(0, static_cast<std::uint32_t>(prompt.size()));
+        model.set_trace_sequence_id(0, sequence);
+        static_cast<void>(model.prefill(0, prompt));
+        model.release_slot(0);
+        input_tokens += prompt.size();
+        ++processed_sequences;
+      }
+      model.finalize_moe_trace();
+      const auto seconds = std::chrono::duration<double>(
+          std::chrono::steady_clock::now() - started).count();
+      std::cout << "{\"type\":\"moe_trace\",\"records\":"
+                << model.moe_trace_records() << ",\"input_tokens\":"
+                << input_tokens << ",\"sequences\":" << processed_sequences
+                << ",\"seconds\":" << seconds << "}\n";
+      return 0;
+    }
     if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
       if (argc < 4 || argc > 12)
         throw std::runtime_error(

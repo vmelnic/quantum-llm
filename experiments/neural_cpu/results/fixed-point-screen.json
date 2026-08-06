@@ -1,0 +1,131 @@
+{
+  "baseline": {
+    "fp32_persistent_bytes": 1622272,
+    "parameter_ratio_cpu_to_static": 0.7071169323023513,
+    "parameters": 405568
+  },
+  "data": {
+    "samples": 512,
+    "seed": 20260806,
+    "test": 64,
+    "train": 384,
+    "validation": 64
+  },
+  "decision": "kill",
+  "decision_checks": [
+    "time_improves_4_to_32=false",
+    "time_still_improves_16_to_32=false",
+    "beats_static_by_10_percent=false",
+    "instruction_order_matters=false"
+  ],
+  "interpretation": "GO only green-lights the time-for-space mechanism for a single expert; KILL rejects this hard ISA/cell, not every possible Neural CPU.",
+  "machine": {
+    "fp32_persistent_bytes": 1147184,
+    "parameters": 286784,
+    "program": [
+      "MIX_A",
+      "MIX_B",
+      "GLU",
+      "GATE",
+      "ADD",
+      "NORM"
+    ],
+    "program_bytes": 48,
+    "register_width": 64,
+    "ticks": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ]
+  },
+  "neural_cpu_batch1_microseconds_32_ticks_eager": 15381.134999915957,
+  "schema": "neural-cpu-screen-v1",
+  "scope": "one real Qwen routed expert on deterministic RMS-normalized synthetic activations",
+  "teacher": {
+    "expert": 0,
+    "hidden": 2048,
+    "intermediate": 512,
+    "layer": 20,
+    "record_bytes": 3162112
+  },
+  "test": {
+    "shuffled_program": {
+      "cosine": 0.08245927095413208,
+      "normalized_mse": 1.0065805912017822
+    },
+    "static": {
+      "cosine": 0.04511238634586334,
+      "normalized_mse": 1.054863452911377
+    },
+    "tick_sweep": {
+      "1": {
+        "cosine": 0.032042842358350754,
+        "normalized_mse": 1.2814064025878906
+      },
+      "16": {
+        "cosine": 0.08245860040187836,
+        "normalized_mse": 1.0065789222717285
+      },
+      "2": {
+        "cosine": 0.07282843440771103,
+        "normalized_mse": 1.0216928720474243
+      },
+      "32": {
+        "cosine": 0.08245927095413208,
+        "normalized_mse": 1.0065805912017822
+      },
+      "4": {
+        "cosine": 0.08524046838283539,
+        "normalized_mse": 1.0036845207214355
+      },
+      "8": {
+        "cosine": 0.08287844806909561,
+        "normalized_mse": 1.0060923099517822
+      }
+    }
+  },
+  "training": {
+    "neural_cpu_seconds": 8.513520900000003,
+    "static_seconds": 0.37929260000237264,
+    "steps_per_model": 120
+  },
+  "validation": {
+    "shuffled_program": {
+      "cosine": 0.06228608638048172,
+      "normalized_mse": 1.0180147886276245
+    },
+    "static": {
+      "cosine": 0.047743864357471466,
+      "normalized_mse": 1.0625321865081787
+    },
+    "tick_sweep": {
+      "1": {
+        "cosine": 0.02250024303793907,
+        "normalized_mse": 1.2989933490753174
+      },
+      "16": {
+        "cosine": 0.06228591874241829,
+        "normalized_mse": 1.0180113315582275
+      },
+      "2": {
+        "cosine": 0.05668297037482262,
+        "normalized_mse": 1.0304664373397827
+      },
+      "32": {
+        "cosine": 0.06228608638048172,
+        "normalized_mse": 1.0180147886276245
+      },
+      "4": {
+        "cosine": 0.06522680073976517,
+        "normalized_mse": 1.0136727094650269
+      },
+      "8": {
+        "cosine": 0.06251632422208786,
+        "normalized_mse": 1.0174006223678589
+      }
+    }
+  }
+}
