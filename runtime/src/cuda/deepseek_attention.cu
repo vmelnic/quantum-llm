@@ -227,6 +227,64 @@ std::uint64_t DeepSeekAttentionState::bytes() const noexcept {
          (index_compressor_ ? index_compressor_->bytes() : 0U);
 }
 
+std::uint64_t DeepSeekAttentionState::speculative_checkpoint_bytes()
+    const noexcept {
+  if (ratio_ != 4U || !compressor_ || !index_compressor_) return 0U;
+  return compressor_->bytes() + index_compressor_->bytes();
+}
+
+Status DeepSeekAttentionState::checkpoint_speculative_state(
+    void* destination, void* stream) const noexcept {
+  const auto bytes = speculative_checkpoint_bytes();
+  if (bytes == 0U) return Status::success();
+  if (!destination)
+    return {ErrorCode::invalid_argument,
+            "missing DeepSeek speculative checkpoint destination"};
+  auto* cursor = static_cast<std::byte*>(destination);
+  const auto copy = [&](const DeepSeekCompressorState& state) -> Status {
+    const auto half = state.bytes() / 2U;
+    auto error = cudaMemcpyAsync(cursor, state.values(), half,
+                                 cudaMemcpyDeviceToDevice,
+                                 static_cast<cudaStream_t>(stream));
+    if (error == cudaSuccess)
+      error = cudaMemcpyAsync(cursor + half, state.scores(), half,
+                              cudaMemcpyDeviceToDevice,
+                              static_cast<cudaStream_t>(stream));
+    if (error != cudaSuccess)
+      return failure(error, "checkpoint DeepSeek compressor state");
+    cursor += state.bytes();
+    return Status::success();
+  };
+  auto status = copy(*compressor_);
+  return status.ok() ? copy(*index_compressor_) : status;
+}
+
+Status DeepSeekAttentionState::restore_speculative_state(
+    const void* source, void* stream) noexcept {
+  const auto bytes = speculative_checkpoint_bytes();
+  if (bytes == 0U) return Status::success();
+  if (!source)
+    return {ErrorCode::invalid_argument,
+            "missing DeepSeek speculative checkpoint source"};
+  auto* cursor = static_cast<const std::byte*>(source);
+  const auto copy = [&](DeepSeekCompressorState& state) -> Status {
+    const auto half = state.bytes() / 2U;
+    auto error = cudaMemcpyAsync(state.values(), cursor, half,
+                                 cudaMemcpyDeviceToDevice,
+                                 static_cast<cudaStream_t>(stream));
+    if (error == cudaSuccess)
+      error = cudaMemcpyAsync(state.scores(), cursor + half, half,
+                              cudaMemcpyDeviceToDevice,
+                              static_cast<cudaStream_t>(stream));
+    if (error != cudaSuccess)
+      return failure(error, "restore DeepSeek compressor state");
+    cursor += state.bytes();
+    return Status::success();
+  };
+  auto status = copy(*compressor_);
+  return status.ok() ? copy(*index_compressor_) : status;
+}
+
 DeepSeekAttentionStateResult create_deepseek_attention_state(
     std::uint32_t ratio, std::uint32_t max_context) noexcept {
   const auto size = deepseek_attention_state_size(ratio, max_context);
@@ -270,6 +328,13 @@ DeepSeekAttentionStateSize deepseek_attention_state_size(
   const auto compressor_bytes = compressor_state_bytes(ratio, kHeadDim) +
       (ratio == 4U ? compressor_state_bytes(4U, 128U) : 0U);
   return {Status::success(), sizing.allocation_bytes_ + compressor_bytes};
+}
+
+std::uint64_t deepseek_attention_speculative_checkpoint_size(
+    std::uint32_t ratio) noexcept {
+  if (ratio != 4U) return 0U;
+  return compressor_state_bytes(4U, 512U) +
+         compressor_state_bytes(4U, 128U);
 }
 
 Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept {

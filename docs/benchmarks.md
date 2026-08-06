@@ -789,6 +789,32 @@ model-18 cache/directory were resident. The worker reported resource available
 and runtime ready while keeping MTP disabled; it then shut down cleanly. This
 is a production startup boundary, not target-verification throughput.
 
+## DeepSeek two-row target verification gate
+
+The production worker was then run with MTP explicitly enabled. Prompt token
+`42` produced the following target-greedy sequence:
+
+```text
+14, 552, 438, 223, 25
+```
+
+The speculative path produced the same sequence with three target pair
+transactions: one rejection followed by two acceptances. Protocol v5 therefore
+returned `1 + 2 + 2 = 5` useful tokens from three verifier calls. Running the
+ordinary target worker from the same prompt produced the five IDs separately
+and exactly matched. No draft was visible before the row-zero target head
+accepted it.
+
+On the repeated-census run, cumulative worker time was 3.59 seconds for one
+prefill target row plus three two-row verifier operations. It observed 1,123
+routed acquisitions and 172 suspended target layers. This is a semantic and
+orchestration success, but only about 1--2 useful tok/s for this route state,
+not the 30 tok/s SLO. The limiting boundary is routed working-set turnover:
+each pair can name up to 12 routed experts per layer, while adjacent hash routes
+have insufficient overlap to keep I/O/upload off the critical path. The next
+optimization is batched dense attention projection plus a placement/profile
+decision that prevents cold expert movement; MTP cannot manufacture bandwidth.
+
 ## Benchmark rules
 
 Any published result must include:

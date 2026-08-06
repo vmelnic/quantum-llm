@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <iostream>
 #include <limits>
@@ -234,15 +235,21 @@ std::array<std::array<float, 32U>, 8U> rope_row(std::uint32_t position) {
 struct Request final {
   std::shared_ptr<er::cuda::DeepSeekRequestState> state;
   std::shared_ptr<er::cuda::DeepSeekDecodeController> controller;
+  std::shared_ptr<er::cuda::DeepSeekVerifyState> verify;
   std::shared_ptr<er::cuda::DeepSeekMtpRequestState> mtp;
   cudaStream_t stream{};
   er::cuda::DeepSeekDecodeTelemetry controller_telemetry;
   std::uint32_t predicted{};
+  std::uint32_t draft{};
   std::uint32_t next_position{};
   std::uint32_t context_limit{};
   std::uint32_t slot{};
+  bool draft_ready{};
+  bool speculation_suppressed{};
   ~Request() {
     controller.reset();
+    verify.reset();
+    mtp.reset();
     state.reset();
     if (stream) static_cast<void>(cudaStreamDestroy(stream));
   }
@@ -280,6 +287,12 @@ struct WorkerTelemetry final {
   std::uint64_t warm_start_loaded{};
   std::uint64_t warm_start_bytes{};
   std::uint64_t warm_start_ns{};
+  std::uint64_t mtp_drafts{};
+  std::uint64_t mtp_accepted{};
+  std::uint64_t mtp_rejected{};
+  std::uint64_t verify_pairs{};
+  std::uint64_t useful_tokens{};
+  std::uint64_t mtp_suppressions{};
 };
 
 class Model final {
@@ -288,11 +301,12 @@ class Model final {
         std::uint64_t ram_bytes, std::uint64_t vram_bytes,
         std::uint32_t capacity, std::uint64_t kv_cache_bytes,
         std::uint32_t kv_page_tokens, std::string placement,
-        bool gpu_phase_timing)
+        bool gpu_phase_timing, bool enable_mtp)
       : bundle_(load_bundle(root)), max_context_(max_context),
         capacity_(capacity), ram_bytes_(ram_bytes), vram_bytes_(vram_bytes),
         kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens),
-        placement_(std::move(placement)), gpu_phase_timing_(gpu_phase_timing) {
+        placement_(std::move(placement)), gpu_phase_timing_(gpu_phase_timing),
+        mtp_enabled_(enable_mtp) {
     require(max_context_ >= 2U && capacity_ != 0U && ram_bytes_ != 0U &&
                 vram_bytes_ != 0U && kv_cache_bytes_ != 0U &&
                 kv_page_tokens_ != 0U,
@@ -324,9 +338,16 @@ class Model final {
       mtp_request_bytes_ = mtp_request_size.total_bytes;
       mtp_cache_bytes_ = 512ULL << 20U;
     }
+    require(!mtp_enabled_ || bundle_.mtp_runtime_ready,
+            "MTP execution requires worker bundle v3 resources");
     const auto request_size = er::cuda::deepseek_request_state_size(max_context_);
     require(request_size.status.ok(), request_size.status.message());
     request_bytes_ = request_size.total_bytes;
+    if (mtp_enabled_) {
+      const auto verify_size = er::cuda::deepseek_verify_state_size();
+      require(verify_size.status.ok(), verify_size.status.message());
+      verify_request_bytes_ = verify_size.total_bytes;
+    }
     const auto attention_per_token =
         (request_size.attention_bytes + max_context_ - 1U) / max_context_;
     require(attention_per_token <=
@@ -351,7 +372,8 @@ class Model final {
                        request_bytes_ * capacity_ + rope_table_bytes() +
                        mtp_artifacts_.dense_device_bytes +
                        mtp_artifacts_.typed_source_bytes +
-                       mtp_request_bytes_ * capacity_;
+                       mtp_request_bytes_ * capacity_ +
+                       verify_request_bytes_ * capacity_;
     require(fixed + vram_bytes_ + (1ULL << 30U) <= free,
             "DeepSeek worker VRAM preflight failed");
 
@@ -488,6 +510,17 @@ class Model final {
     require(controller.status.ok() && controller.controller,
             controller.status.message());
     request->controller = std::move(controller.controller);
+    if (mtp_enabled_) {
+      auto verify = er::cuda::create_deepseek_verify_state(
+          request->state, verify_request_bytes_);
+      require(verify.status.ok() && verify.state,
+              verify.status.ok() ? "verify state returned no ownership"
+                                 : verify.status.message());
+      request->verify = std::move(verify.state);
+      const auto configured =
+          request->controller->configure_verify(request->verify);
+      require(configured.ok(), configured.message());
+    }
     auto workspace = er::cuda::create_deepseek_ffn_hybrid_workspace();
     require(workspace.status.ok() && workspace.workspace,
             workspace.status.ok() ? "hybrid workspace returned no ownership"
@@ -651,7 +684,182 @@ class Model final {
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - model_step_started)
             .count());
+    const auto elapsed_ns = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - model_step_started)
+            .count());
+    update_moving_average(ordinary_ns_per_token_, ordinary_samples_,
+                          elapsed_ns / requests.size());
     return result;
+  }
+
+  void advance_mtp(Request& request, std::uint32_t next_token,
+                   const float* target_streams, std::uint32_t position,
+                   bool produce_draft) {
+    require(mtp_enabled_ && request.mtp && mtp_cache_ && mtp_directory_,
+            "MTP advance requires an enabled request runtime");
+    const auto rope = rope_at(position);
+    auto status = request.mtp->prepare(
+        next_token, target_streams, position, rope.base_cosine,
+        rope.base_sine, request.stream);
+    require(status.ok(), status.message());
+    if (!produce_draft) {
+      status = request.mtp->abandon_draft();
+      require(status.ok(), status.message());
+      request.draft_ready = false;
+      return;
+    }
+
+    std::vector<er::ExpertLease> leases;
+    for (;;) {
+      auto plan = mtp_directory_->pin_or_collect_misses(
+          0U, request.mtp->expert_indices(),
+          request.mtp->selection_count(), request.stream, true);
+      require(plan.status.ok(), plan.status.message());
+      if (plan.missing_experts.empty()) {
+        require(plan.pin_id != 0U,
+                "MTP directory returned no execution pin");
+        status = request.mtp->complete(mtp_directory_->device_entries(), 257U,
+                                       request.stream);
+        require(status.ok(), status.message());
+        cuda_check(cudaMemcpyAsync(&request.draft,
+                                   request.mtp->draft_token(),
+                                   sizeof(request.draft),
+                                   cudaMemcpyDeviceToHost, request.stream),
+                   "copy MTP draft token");
+        status = mtp_directory_->release_pins_async(plan.pin_id,
+                                                    request.stream);
+        require(status.ok(), status.message());
+        cuda_check(cudaStreamSynchronize(request.stream),
+                   "complete MTP draft");
+        break;
+      }
+      if (plan.pin_id != 0U) {
+        status = mtp_directory_->release_pins(plan.pin_id, request.stream);
+        require(status.ok(), status.message());
+      }
+      for (const auto expert : plan.missing_experts) {
+        require(expert < 256U,
+                "always-resident MTP shared expert is unavailable");
+        const auto* record = mtp_catalog_.find(0U, expert);
+        require(record != nullptr,
+                "MTP route references an absent catalog expert");
+        auto pending = mtp_cache_->acquire(
+            {18U, 0U, expert, er::kExpertQuantAbiDeepSeekSm86}, *record);
+        while (pending.wait_for(std::chrono::milliseconds(1)) !=
+               std::future_status::ready)
+          std::this_thread::yield();
+        auto acquired = pending.get();
+        require(acquired.status.ok() && acquired.lease,
+                acquired.status.ok() ? "MTP cache returned no device lease"
+                                     : acquired.status.message());
+        leases.push_back(std::move(acquired.lease));
+      }
+    }
+    request.draft_ready = true;
+    ++telemetry_.mtp_drafts;
+  }
+
+  std::vector<std::uint32_t> verify_draft(Request& request) {
+    require(mtp_enabled_ && request.verify && request.draft_ready &&
+                request.next_position + 1U < request.context_limit,
+            "invalid DeepSeek speculative verification request");
+    const auto started = std::chrono::steady_clock::now();
+    const auto guaranteed = request.predicted;
+    const auto draft = request.draft;
+    const auto position = request.next_position;
+    auto status = request.state->embed(guaranteed, request.stream);
+    require(status.ok(), status.message());
+    status = request.verify->embed_speculative(draft, request.stream);
+    require(status.ok(), status.message());
+    const auto operation = next_operation_++;
+    status = scheduler_->submit_verify(
+        operation, request.controller,
+        {{rope_at(position), rope_at(position + 1U)},
+         {position, position + 1U}, {guaranteed, draft}, 0U, 43U});
+    require(status.ok(), status.message());
+    for (;;) {
+      status = scheduler_->poll();
+      require(status.ok(), status.message());
+      const auto scheduled = scheduler_->inspect(operation);
+      require(scheduled.has_value(),
+              "DeepSeek verify operation disappeared");
+      require(scheduled->state != er::cuda::DeepSeekScheduledState::failed &&
+                  scheduled->state !=
+                      er::cuda::DeepSeekScheduledState::cancelled,
+              scheduled->status.message());
+      if (scheduled->state == er::cuda::DeepSeekScheduledState::complete)
+        break;
+      if (scheduler_->snapshot().cuda_pending_requests != 0U) {
+        status = scheduler_->wait_for_cuda_progress();
+        require(status.ok(), status.message());
+      } else {
+        std::this_thread::yield();
+      }
+    }
+    status = request.verify->project_pair_logits(request.stream);
+    require(status.ok(), status.message());
+    std::array<std::uint32_t, 2U> sampled{};
+    cuda_check(cudaMemcpyAsync(
+                   sampled.data(), request.verify->primary_sampled_token(),
+                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                   request.stream),
+               "copy DeepSeek verifier token");
+    cuda_check(cudaMemcpyAsync(
+                   sampled.data() + 1U,
+                   request.verify->bonus_sampled_token(),
+                   sizeof(std::uint32_t), cudaMemcpyDeviceToHost,
+                   request.stream),
+               "copy DeepSeek verifier bonus token");
+    cuda_check(cudaStreamSynchronize(request.stream),
+               "complete DeepSeek pair vocabulary heads");
+
+    const bool accepted = sampled[0] == draft;
+    if (accepted) {
+      // Bring the MTP causal cache through H_A/B before H_B/C becomes the next
+      // draft boundary. The first result is intentionally abandoned because
+      // the target verifier already produced the bonus token C.
+      advance_mtp(request, draft, request.state->current_streams(), position,
+                  false);
+      status = request.verify->finish_transaction(true, request.stream);
+      require(status.ok(), status.message());
+      advance_mtp(request, sampled[1], request.state->current_streams(),
+                  position + 1U, true);
+      request.predicted = sampled[1];
+      request.next_position += 2U;
+      ++telemetry_.mtp_accepted;
+    } else {
+      status = request.verify->finish_transaction(false, request.stream);
+      require(status.ok(), status.message());
+      advance_mtp(request, sampled[0], request.state->current_streams(),
+                  position, true);
+      request.predicted = sampled[0];
+      ++request.next_position;
+      ++telemetry_.mtp_rejected;
+    }
+    status = scheduler_->retire(operation);
+    require(status.ok(), status.message());
+    ++telemetry_.model_steps;
+    telemetry_.model_rows += 2U;
+    ++telemetry_.verify_pairs;
+    telemetry_.model_step_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+    const auto elapsed_ns = static_cast<double>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - started)
+            .count());
+    update_moving_average(speculative_ns_per_useful_, speculative_samples_,
+                          elapsed_ns / (accepted ? 2.0 : 1.0));
+    if (speculative_samples_ >= 2U && ordinary_samples_ != 0U &&
+        speculative_ns_per_useful_ > ordinary_ns_per_token_ * 1.05) {
+      request.speculation_suppressed = true;
+      request.draft_ready = false;
+      ++telemetry_.mtp_suppressions;
+    }
+    return accepted ? std::vector<std::uint32_t>{guaranteed, draft}
+                    : std::vector<std::uint32_t>{guaranteed};
   }
 
   std::uint32_t capacity() const noexcept { return capacity_; }
@@ -695,8 +903,23 @@ class Model final {
     return bundle_.mtp_runtime_ready && mtp_model_ && mtp_cache_ &&
            mtp_directory_ && mtp_shared_.size() == 1U;
   }
+  bool mtp_enabled() const noexcept { return mtp_enabled_; }
+  void record_useful_tokens(std::size_t count) noexcept {
+    telemetry_.useful_tokens += count;
+  }
+  bool speculation_active(const Request& request) const noexcept {
+    return mtp_enabled_ && request.draft_ready &&
+           !request.speculation_suppressed;
+  }
 
  private:
+  static void update_moving_average(double& value, std::uint64_t& samples,
+                                    double observation) noexcept {
+    constexpr double alpha = 0.25;
+    value = samples == 0U ? observation
+                          : alpha * observation + (1.0 - alpha) * value;
+    ++samples;
+  }
   static constexpr std::uint64_t rope_row_values = 8ULL * 32U;
   std::uint64_t rope_table_bytes() const noexcept {
     return static_cast<std::uint64_t>(max_context_) * rope_row_values *
@@ -774,11 +997,16 @@ class Model final {
   Bundle bundle_;
   std::uint32_t max_context_{}, capacity_{};
   std::uint64_t ram_bytes_{}, vram_bytes_{}, request_bytes_{}, next_operation_{1U};
-  std::uint64_t mtp_request_bytes_{}, mtp_cache_bytes_{};
+  std::uint64_t mtp_request_bytes_{}, mtp_cache_bytes_{},
+      verify_request_bytes_{};
   std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{};
   std::uint32_t kv_page_tokens_{};
   std::string placement_;
   bool gpu_phase_timing_{};
+  bool mtp_enabled_{};
+  double ordinary_ns_per_token_{};
+  double speculative_ns_per_useful_{};
+  std::uint64_t ordinary_samples_{}, speculative_samples_{};
   er::DeepSeekModelArtifacts artifacts_;
   er::DeepSeekTensorArtifacts mtp_artifacts_;
   std::vector<er::ResidentExpertSpec> mtp_shared_specs_;
@@ -824,7 +1052,7 @@ std::uint32_t free_slot(const std::unordered_map<std::uint64_t, Active>& active,
 
 int worker_loop(Model& model) {
   std::unordered_map<std::uint64_t, Active> active;
-  std::cout << "{\"type\":\"ready\",\"protocol\":4,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":5,\"capacity\":"
             << model.capacity()
             << ",\"prefill_mode\":\"causal_sequential\""
             << ",\"prefill_chunk_tokens\":1"
@@ -850,7 +1078,8 @@ int worker_loop(Model& model) {
             << (model.mtp_available() ? "true" : "false")
             << ",\"mtp_runtime_ready\":"
             << (model.mtp_runtime_ready() ? "true" : "false")
-            << ",\"mtp_enabled\":false}\n"
+            << ",\"mtp_enabled\":"
+            << (model.mtp_enabled() ? "true" : "false") << "}\n"
             << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
@@ -1012,6 +1241,13 @@ int worker_loop(Model& model) {
                   << worker.warm_start_bytes
                   << ",\"worker_warm_start_ns\":"
                   << worker.warm_start_ns
+                  << ",\"worker_mtp_drafts\":" << worker.mtp_drafts
+                  << ",\"worker_mtp_accepted\":" << worker.mtp_accepted
+                  << ",\"worker_mtp_rejected\":" << worker.mtp_rejected
+                  << ",\"worker_verify_pairs\":" << worker.verify_pairs
+                  << ",\"worker_useful_tokens\":" << worker.useful_tokens
+                  << ",\"worker_mtp_suppressions\":"
+                  << worker.mtp_suppressions
                   << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
         require(fields.size() == 4U, "invalid BEGIN");
@@ -1032,6 +1268,14 @@ int worker_loop(Model& model) {
               std::span<Request* const>(&pointer, 1U),
               std::span<const std::uint32_t>(&prompt[position], 1U),
               std::span<const std::uint32_t>(&position, 1U)).front();
+          if (model.mtp_enabled()) {
+            const bool final_prompt = position + 1U == prompt.size();
+            const auto next_token = final_prompt
+                ? request->predicted : prompt[position + 1U];
+            model.advance_mtp(*request, next_token,
+                              request->state->current_streams(), position,
+                              final_prompt);
+          }
         }
         request->next_position = static_cast<std::uint32_t>(prompt.size());
         const auto slot = request->slot;
@@ -1061,43 +1305,77 @@ int worker_loop(Model& model) {
           for (std::size_t index = 1U; index < fields.size(); ++index)
             add(fields[index]);
         }
-        std::vector<std::uint32_t> emitted;
-        emitted.reserve(steps.size());
-        for (const auto& [id, final] : steps) {
-          static_cast<void>(final);
-          emitted.push_back(active.at(id).request->predicted);
-        }
-        std::vector<Request*> advancing;
-        std::vector<std::uint32_t> tokens, positions;
-        for (const auto& [id, final] : steps) {
-          if (final) continue;
-          auto& request = *active.at(id).request;
-          advancing.push_back(&request);
-          tokens.push_back(request.predicted);
-          positions.push_back(request.next_position);
-        }
-        if (!advancing.empty()) {
-          const auto predicted = model.forward(advancing, tokens, positions);
-          std::size_t index = 0U;
-          for (const auto& [id, final] : steps) {
+        std::vector<std::vector<std::uint32_t>> emitted(steps.size());
+        if (model.mtp_enabled()) {
+          for (std::size_t index = 0U; index < steps.size(); ++index) {
+            const auto [id, final] = steps[index];
+            auto& request = *active.at(id).request;
+            if (final) {
+              emitted[index] = {request.predicted};
+              continue;
+            }
+            if (model.speculation_active(request)) {
+              emitted[index] = model.verify_draft(request);
+            } else {
+              emitted[index] = {request.predicted};
+              Request* pointer = &request;
+              const auto token = request.predicted;
+              const auto position = request.next_position;
+              request.predicted = model.forward(
+                  std::span<Request* const>(&pointer, 1U),
+                  std::span<const std::uint32_t>(&token, 1U),
+                  std::span<const std::uint32_t>(&position, 1U)).front();
+              ++request.next_position;
+            }
+          }
+        } else {
+          std::vector<Request*> advancing;
+          std::vector<std::uint32_t> tokens, positions;
+          for (std::size_t index = 0U; index < steps.size(); ++index) {
+            const auto [id, final] = steps[index];
+            auto& request = *active.at(id).request;
+            emitted[index] = {request.predicted};
             if (final) continue;
-            active.at(id).request->predicted = predicted[index++];
-            ++active.at(id).request->next_position;
+            advancing.push_back(&request);
+            tokens.push_back(request.predicted);
+            positions.push_back(request.next_position);
+          }
+          if (!advancing.empty()) {
+            const auto predicted = model.forward(advancing, tokens, positions);
+            std::size_t predicted_index = 0U;
+            for (const auto& [id, final] : steps) {
+              if (final) continue;
+              active.at(id).request->predicted =
+                  predicted[predicted_index++];
+              ++active.at(id).request->next_position;
+            }
           }
         }
         if (fields[0] == "NEXT") {
           std::cout << "{\"type\":\"token\",\"id\":" << steps[0].first
-                    << ",\"token\":" << emitted[0] << "}\n";
+                    << ",\"tokens\":[";
+          for (std::size_t token = 0U; token < emitted[0].size(); ++token) {
+            if (token) std::cout << ',';
+            std::cout << emitted[0][token];
+          }
+          std::cout << "]}\n";
         } else {
           std::cout << "{\"type\":\"batch\",\"items\":[";
           for (std::size_t index = 0U; index < steps.size(); ++index) {
             if (index) std::cout << ',';
             const auto id = steps[index].first;
-            std::cout << "{\"id\":" << id << ",\"token\":"
-                      << emitted[index] << '}';
+            std::cout << "{\"id\":" << id << ",\"tokens\":[";
+            for (std::size_t token = 0U; token < emitted[index].size();
+                 ++token) {
+              if (token) std::cout << ',';
+              std::cout << emitted[index][token];
+            }
+            std::cout << "]}";
           }
           std::cout << "]}\n";
         }
+        for (const auto& tokens : emitted)
+          model.record_useful_tokens(tokens.size());
         std::cout << std::flush;
         for (const auto& [id, final] : steps)
           if (final) active.erase(id);
@@ -1127,14 +1405,27 @@ int worker_loop(Model& model) {
 
 int main(int argc, char** argv) {
   try {
-    if ((argc != 10 && argc != 11) ||
-        std::string_view(argv[2]) != "--worker" ||
-        (argc == 11 && std::string_view(argv[10]) != "--profile-gpu-phases")) {
+    if (argc < 10 || argc > 12 ||
+        std::string_view(argv[2]) != "--worker") {
       std::cerr << "usage: expert-deepseek-worker <bundle> --worker "
                    "<max-context> <ram-gib> <vram-gib> <capacity> "
                    "<kv-cache-mib> <kv-page-tokens> <placement-profile> "
-                   "[--profile-gpu-phases]\n";
+                   "[--profile-gpu-phases] [--enable-mtp]\n";
       return 64;
+    }
+    bool profile_gpu_phases = false;
+    bool enable_mtp = false;
+    for (int index = 10; index < argc; ++index) {
+      const std::string_view flag = argv[index];
+      require(flag == "--profile-gpu-phases" || flag == "--enable-mtp",
+              "unknown DeepSeek worker option");
+      if (flag == "--profile-gpu-phases") {
+        require(!profile_gpu_phases, "duplicate GPU profiling option");
+        profile_gpu_phases = true;
+      } else {
+        require(!enable_mtp, "duplicate MTP option");
+        enable_mtp = true;
+      }
     }
     const auto max_context = static_cast<std::uint32_t>(std::stoul(argv[3]));
     const auto ram_gib = std::stoull(argv[4]);
@@ -1149,7 +1440,7 @@ int main(int argc, char** argv) {
             "invalid placement profile");
     Model model(argv[1], max_context, ram_gib << 30U, vram_gib << 30U,
                 capacity, kv_cache_mib << 20U, kv_page_tokens, placement,
-                argc == 11);
+                profile_gpu_phases, enable_mtp);
     return worker_loop(model);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

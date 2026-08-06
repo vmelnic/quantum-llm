@@ -39,6 +39,7 @@ struct DeepSeekLayerStateView final {
 };
 
 struct DeepSeekRequestStateResult;
+struct DeepSeekVerifyStateResult;
 
 // Owns all mutable CUDA state for one request across the 43-layer schedule.
 // It also retains the immutable resident model, so every binding remains valid
@@ -76,6 +77,7 @@ class DeepSeekRequestState final {
       std::shared_ptr<const DeepSeekResidentModelState>,
       const DeepSeekRequestConfig&) noexcept;
   friend class DeepSeekDecodeController;
+  friend class DeepSeekVerifyState;
   DeepSeekRequestState() = default;
 
   std::shared_ptr<const DeepSeekResidentModelState> model_;

@@ -268,17 +268,22 @@ latency or aggregate throughput without changing model semantics.
     dependency and load the tensor state, one shared expert, routed catalog,
     cache and CUDA directory transactionally at worker startup. Readiness was
     observed with `mtp_runtime_ready=true` and `mtp_enabled=false`.
-- [ ] Add transactional two-row target verification. Row zero is guaranteed;
+- [x] Add transactional two-row target verification. Row zero is guaranteed;
   row one is speculative. On rejection, commit row zero and logically roll
   back row one by retaining the external position and overwriting that explicit
   KV/CSA slot on replay. Never expose a draft before target acceptance.
 - [ ] Batch the union of experts and dense projections needed by target
   verification; use measured multi-row kernels instead of running two ordinary
   model steps serially.
-- [ ] Publish acceptance rate, rollback/replay cost, target model steps, and
-  useful output tokens separately.
-- [ ] Disable speculation automatically when its moving critical-path cost is
-  higher than ordinary decode.
+  - [x] Pin the exact union once and run routed plus shared experts with
+    `rows=2`; duplicates across rows keep stable routing order.
+  - [ ] Batch compatible attention and router dense projections while
+    preserving row-zero-before-row-one causal cache publication.
+- [x] Publish acceptance, rejection, target rows/steps, useful output tokens,
+  and adaptive-suppression counters. Ratio-four checkpoint/restore bytes and
+  replay attribution remain part of the next measurement pass.
+- [x] Disable speculation per request when its moving critical-path cost per
+  useful token exceeds ordinary decode by more than 5% after two samples.
 
 The current ~68.3 ms warm model-step result is about 14.6 model steps/s. One
 MTP layer can propose at most one additional token, so even perfect acceptance

@@ -176,8 +176,10 @@ tokens per chunk.
 an active speculative path. `mtp_resource_available` means descriptors exist;
 `mtp_runtime_ready` means the worker also loaded the tensor state, compact pack,
 shared expert, cache and directory. Either may be true while `mtp_enabled`
-remains false; clients must never infer speculative generation from bundle
-contents or startup residency alone.
+remains false unless the operator explicitly enables it; clients must never
+infer speculative generation from bundle contents or startup residency alone.
+When enabled, the internal protocol may return a verified bonus token, but the
+HTTP streaming contracts remain one ordered text delta at a time.
 
 `/model-info.worker_placement` is the authoritative effective placement
 contract. It returns the selected `profile`, exact RAM/VRAM cache bytes,

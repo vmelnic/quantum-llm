@@ -85,6 +85,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     src/cuda/deepseek_mtp.cu
     src/cuda/deepseek_mtp_request.cpp
     src/cuda/deepseek_request.cpp
+    src/cuda/deepseek_verify.cpp
     src/cuda/deepseek_typed.cu
     src/cuda/deepseek_typed_set.cpp
     src/cuda/expert_directory.cu

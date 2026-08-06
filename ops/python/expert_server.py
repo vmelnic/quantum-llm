@@ -130,7 +130,8 @@ class CudaWorker:
                  startup_timeout: float, requested_capacity: int,
                  ram_cache_gib: int, vram_cache_gib: int,
                  kv_cache_mib: int, kv_page_tokens: int,
-                 placement_profile: str, profile_gpu_phases: bool) -> None:
+                 placement_profile: str, profile_gpu_phases: bool,
+                 enable_mtp: bool) -> None:
         command = [
             str(executable), str(container), "--worker", str(max_context),
             str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
@@ -138,6 +139,8 @@ class CudaWorker:
         ]
         if profile_gpu_phases:
             command.append("--profile-gpu-phases")
+        if enable_mtp:
+            command.append("--enable-mtp")
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -179,9 +182,9 @@ class CudaWorker:
         if self.mtp_runtime_ready and not self.mtp_resource_available:
             self.process.kill()
             raise WorkerError("MTP runtime cannot be ready without resources")
-        if self.mtp_enabled:
+        if self.mtp_enabled != enable_mtp:
             self.process.kill()
-            raise WorkerError("unqualified MTP execution was enabled")
+            raise WorkerError("CUDA worker MTP mode does not match the request")
         self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
@@ -263,15 +266,18 @@ class CudaWorker:
             raise WorkerError("unexpected BEGIN response")
         self.active_ids.add(request_id)
 
-    def next(self, request_id: int, final: bool) -> int:
+    def next(self, request_id: int, final: bool) -> list[int]:
         response = self._command(f"NEXT\t{request_id}\t{1 if final else 0}")
         if response.get("type") != "token" or response.get("id") != request_id:
             raise WorkerError("unexpected NEXT response")
         if final:
             self.active_ids.discard(request_id)
-        return int(response["token"])
+        tokens = response.get("tokens")
+        if not isinstance(tokens, list) or not tokens:
+            raise WorkerError("NEXT response has no tokens")
+        return [int(token) for token in tokens]
 
-    def step(self, items: list[tuple[int, bool]]) -> dict[int, int]:
+    def step(self, items: list[tuple[int, bool]]) -> dict[int, list[int]]:
         if not items or len(items) > self.capacity:
             raise WorkerError("invalid decode batch")
         if self.protocol < 2:
@@ -284,8 +290,12 @@ class CudaWorker:
         ))
         if response.get("type") != "batch" or not isinstance(response.get("items"), list):
             raise WorkerError("unexpected STEP response")
-        result = {int(item["id"]): int(item["token"])
-                  for item in response["items"]}
+        result: dict[int, list[int]] = {}
+        for item in response["items"]:
+            tokens = item.get("tokens")
+            if not isinstance(tokens, list) or not tokens:
+                raise WorkerError("STEP response item has no tokens")
+            result[int(item["id"])] = [int(token) for token in tokens]
         expected = {request_id for request_id, _final in items}
         if set(result) != expected:
             raise WorkerError("STEP response request mismatch")
@@ -347,10 +357,22 @@ class ContinuousDecodeBatcher:
         self.window_seconds = window_ms / 1000.0
         self.on_batch = on_batch
         self.pending: queue.Queue[DecodeWaiter | None] = queue.Queue()
+        self.buffer_lock = threading.Lock()
+        self.buffered: dict[int, list[int]] = {}
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def step(self, request_id: int, final: bool) -> int:
+        with self.buffer_lock:
+            buffered = self.buffered.get(request_id)
+            if buffered:
+                token = buffered.pop(0)
+                if not buffered:
+                    self.buffered.pop(request_id, None)
+                if final:
+                    self.buffered.pop(request_id, None)
+                    self.worker.cancel(request_id)
+                return token
         waiter = DecodeWaiter(request_id, final)
         self.pending.put(waiter)
         waiter.event.wait()
@@ -385,7 +407,12 @@ class ContinuousDecodeBatcher:
                 ])
                 self.on_batch(len(batch))
                 for item in batch:
-                    item.token = tokens[item.request_id]
+                    raw = tokens[item.request_id]
+                    produced = raw if isinstance(raw, list) else [int(raw)]
+                    item.token = produced[0]
+                    if not item.final and len(produced) > 1:
+                        with self.buffer_lock:
+                            self.buffered[item.request_id] = produced[1:]
             except Exception as error:
                 for item in batch:
                     item.error = error
@@ -396,6 +423,10 @@ class ContinuousDecodeBatcher:
     def close(self) -> None:
         self.pending.put(None)
         self.thread.join(timeout=10)
+
+    def discard(self, request_id: int) -> None:
+        with self.buffer_lock:
+            self.buffered.pop(request_id, None)
 
 
 class Application:
@@ -419,7 +450,8 @@ class Application:
                                  args.worker_kv_cache_mib,
                                  args.worker_kv_page_tokens,
                                  args.placement_profile,
-                                 args.profile_gpu_phases)
+                                 args.profile_gpu_phases,
+                                 args.enable_mtp)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
@@ -766,6 +798,9 @@ class Application:
                 if token in self.eos_token_ids:
                     break
         finally:
+            discard = getattr(self.decode_batcher, "discard", None)
+            if discard is not None:
+                discard(request_id)
             if request_id in self.worker.active_ids:
                 self.worker.cancel(request_id)
 
@@ -1269,6 +1304,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
     parser.add_argument("--profile-gpu-phases", action="store_true")
+    parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)

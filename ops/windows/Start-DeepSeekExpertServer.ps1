@@ -16,6 +16,7 @@ param(
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
     [bool]$ProfileGpuPhases = $false,
+    [bool]$EnableMtp = $false,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -60,6 +61,7 @@ $arguments = @{
     WorkerKvCacheMiB = $WorkerKvCacheMiB
     WorkerKvPageTokens = $WorkerKvPageTokens
     ProfileGpuPhases = $ProfileGpuPhases
+    EnableMtp = $EnableMtp
     MicrobatchWindowMs = $MicrobatchWindowMs
     LatencyWindow = $LatencyWindow
     QueueTimeoutSeconds = $QueueTimeoutSeconds

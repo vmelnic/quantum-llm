@@ -17,6 +17,7 @@ param(
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
     [bool]$ProfileGpuPhases = $false,
+    [bool]$EnableMtp = $false,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -73,6 +74,7 @@ if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $work
 if (-not (Test-Path $containerPath -PathType Container)) { throw "Container missing: $containerPath" }
 if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer missing: $tokenizerPath" }
 $profileArguments = if ($ProfileGpuPhases) { @("--profile-gpu-phases") } else { @() }
+$mtpArguments = if ($EnableMtp) { @("--enable-mtp") } else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -91,6 +93,7 @@ $profileArguments = if ($ProfileGpuPhases) { @("--profile-gpu-phases") } else { 
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
     @profileArguments `
+    @mtpArguments `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `

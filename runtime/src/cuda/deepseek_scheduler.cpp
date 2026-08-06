@@ -199,16 +199,17 @@ struct DeepSeekDecodeScheduler::Core final {
   Status reconcile_working_set(
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
-    if (result.routed_experts.size() != 6U) {
+    if ((result.route_rows != 1U && result.route_rows != 2U) ||
+        result.routed_experts.size() != 6U * result.route_rows) {
       return {ErrorCode::internal,
               "DeepSeek scheduler received an invalid routed set"};
     }
-    std::set<std::uint32_t> unique(result.routed_experts.begin(),
-                                   result.routed_experts.end());
-    if (unique.size() != result.routed_experts.size() ||
-        *unique.rbegin() >= kDeepSeekCatalogExperts) {
-      return {ErrorCode::internal,
-              "DeepSeek scheduler received invalid routed experts"};
+    for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
+      const auto first = result.routed_experts.begin() + row * 6U;
+      std::set<std::uint32_t> unique(first, first + 6U);
+      if (unique.size() != 6U || *unique.rbegin() >= kDeepSeekCatalogExperts)
+        return {ErrorCode::internal,
+                "DeepSeek scheduler received invalid routed experts"};
     }
     if (auto* retained = layer_working_set(request, result.layer)) {
       std::erase_if(*retained, [&](const HeldLease& value) {
@@ -223,10 +224,16 @@ struct DeepSeekDecodeScheduler::Core final {
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
     if (hybrid.route_census) {
-      const auto observed = hybrid.route_census->observe(
-          result.layer, result.routed_experts, request.cpu_experts);
-      if (!observed.ok()) return copied_status(observed);
-      ++metrics.route_observations;
+      for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
+        const auto first = result.routed_experts.begin() + row * 6U;
+        const auto observed = hybrid.route_census->observe(
+            result.layer, std::span<const std::uint32_t>(first, first + 6U),
+            result.route_rows == 1U
+                ? std::span<const std::uint32_t>(request.cpu_experts)
+                : std::span<const std::uint32_t>());
+        if (!observed.ok()) return copied_status(observed);
+        ++metrics.route_observations;
+      }
     }
     if (!config.retain_previous_route) {
       if (!request.cpu_experts.empty()) ++metrics.hybrid_layers;
@@ -238,17 +245,28 @@ struct DeepSeekDecodeScheduler::Core final {
     auto status = reconcile_working_set(request, result);
     if (!status.ok()) return status;
     auto* retained = layer_working_set(request, result.layer);
+    const auto retained_first = result.routed_experts.end() - 6U;
+    const auto retained_contains = [&](std::uint32_t expert) {
+      return std::find(retained_first, result.routed_experts.end(), expert) !=
+             result.routed_experts.end();
+    };
+    std::erase_if(*retained, [&](const HeldLease& value) {
+      return !retained_contains(value.expert) ||
+             cpu_contains(request, value.expert);
+    });
     for (auto& held : request.leases) {
       const bool duplicate = std::any_of(
           retained->begin(), retained->end(), [&](const HeldLease& value) {
             return value.expert == held.expert;
           });
-      if (route_contains(result, held.expert) && !duplicate) {
+      if (retained_contains(held.expert) && !duplicate) {
         retained->push_back({held.expert, std::move(held.lease)});
       }
     }
     request.leases.clear();
-    for (const auto expert : result.routed_experts) {
+    for (auto iterator = retained_first;
+         iterator != result.routed_experts.end(); ++iterator) {
+      const auto expert = *iterator;
       if (cpu_contains(request, expert)) continue;
       const bool held = std::any_of(
           retained->begin(), retained->end(), [expert](const HeldLease& value) {
@@ -262,8 +280,11 @@ struct DeepSeekDecodeScheduler::Core final {
            std::move(request.leases.back().lease)});
       request.leases.pop_back();
     }
-    const auto expected = result.routed_experts.size() -
-                          request.cpu_experts.size();
+    std::set<std::uint32_t> expected_experts(retained_first,
+                                             result.routed_experts.end());
+    for (const auto expert : request.cpu_experts)
+      expected_experts.erase(expert);
+    const auto expected = expected_experts.size();
     if (retained->size() != expected) {
       return {ErrorCode::internal,
               "DeepSeek retained route has the wrong cardinality"};
@@ -278,7 +299,7 @@ struct DeepSeekDecodeScheduler::Core final {
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result,
       std::set<std::uint32_t>& cpu_selected) {
-    if (!hybrid.cpu_executor || !hybrid.planner ||
+    if (result.route_rows != 1U || !hybrid.cpu_executor || !hybrid.planner ||
         !request.cpu_experts.empty())
       return Status::success();
     std::vector<HybridDispatchCandidate> candidates;
@@ -599,6 +620,37 @@ Status DeepSeekDecodeScheduler::submit(
     }
   }
   const auto started = controller->begin(begin);
+  if (!started.ok()) {
+    ++core_->metrics.rejected_requests;
+    return copied_status(started);
+  }
+  auto request = std::make_unique<ScheduledRequest>();
+  request->id = request_id;
+  request->controller = std::move(controller);
+  request->layer = begin.first_layer;
+  auto* published = request.get();
+  core_->requests.emplace(request_id, std::move(request));
+  core_->enqueue_runnable(*published);
+  ++core_->metrics.submitted_requests;
+  return Status::success();
+}
+
+Status DeepSeekDecodeScheduler::submit_verify(
+    std::uint64_t request_id,
+    std::shared_ptr<DeepSeekDecodeController> controller,
+    const DeepSeekVerifyBegin& begin) {
+  core_->prune_working_sets();
+  if (request_id == 0U || !controller || core_->requests.contains(request_id)) {
+    ++core_->metrics.rejected_requests;
+    return {ErrorCode::invalid_argument,
+            "invalid or duplicate DeepSeek verify request"};
+  }
+  if (core_->requests.size() >= core_->config.maximum_requests) {
+    ++core_->metrics.rejected_requests;
+    return {ErrorCode::backpressure,
+            "DeepSeek scheduled request capacity exhausted"};
+  }
+  const auto started = controller->begin_verify_pair(begin);
   if (!started.ok()) {
     ++core_->metrics.rejected_requests;
     return copied_status(started);

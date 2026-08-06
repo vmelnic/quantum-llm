@@ -83,8 +83,9 @@ one four-row RMSNorm launch, batched `h_proj`, one `e_proj`, and the existing
 hyper-head implementation. It matched the input oracle with `3.05e-8` RMSE
 and `2.39e-7` maximum error, and the output oracle with `2.12e-10` RMSE and
 `1.68e-8` maximum error. This is intentionally not called a draft-token
-qualification: the MTP attention, FFN and cache state still have to execute
-between those two validated boundaries.
+qualification by itself. The complete attention/FFN/cache/head block is
+qualified separately below so a boundary-only result cannot be mistaken for a
+draft-token result.
 
 Residency is namespace-driven rather than model-role-driven. An authenticated
 `DeepSeekResidentTensorState` owns an arbitrary dense/typed namespace and
@@ -145,13 +146,26 @@ shared experts. The state occupies 1,918,500 bytes for the four-position gate.
 An unused draft can be abandoned without discarding the valid causal attention
 write, which is required for prefill and adaptive speculation.
 
-For the checkpoint's one-draft configuration, rollback is position-logical,
-not a 43-layer memory copy. KV, sliding-window and compressor writes are indexed
-by the explicit position supplied to each layer. A rejected speculative second
-row is excluded from the committed request position and that same slot is
-overwritten before it can be read on replay. The upcoming verifier must still
-enforce this transaction at every layer and keep client emission behind target
-acceptance; deeper draft trees would require a more general checkpoint policy.
+For the checkpoint's one-draft configuration, most rollback is
+position-logical, not a 43-layer memory copy. KV and sliding-window writes are
+indexed by the explicit position supplied to each layer. A rejected
+speculative second row is excluded from the committed request position and
+that same slot is overwritten before it can be read on replay. Ratio-128
+compressor rows follow the same rule. Ratio-four is the important exception:
+closing a four-token group advances an overlapping recurrent window. The
+verifier therefore checkpoints only the ratio-four value/score rings before a
+speculative boundary row and restores them on rejection. This is about 1.56
+MiB for all 20 affected target layers, rather than copying the complete KV/CSA
+state.
+
+`DeepSeekVerifyState` and the ordinary decode controller now implement the
+complete two-row transaction. Row zero is guaranteed, row one remains private,
+and both routes share one 14-selection directory pin. Routed and shared expert
+execution uses a true two-row CUDA launch; HCA post remains row-local. On
+accept, the row-one streams become the ordinary request state. On rejection,
+row zero remains committed and the minimal ratio-four checkpoint is restored.
+The target head decides acceptance before protocol v5 exposes a second token.
+Deeper draft trees would still require a general checkpoint policy.
 
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the

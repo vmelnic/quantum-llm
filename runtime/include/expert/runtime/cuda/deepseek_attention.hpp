@@ -22,6 +22,16 @@ class DeepSeekAttentionState final {
     return max_context_;
   }
   [[nodiscard]] std::uint64_t bytes() const noexcept;
+  // Ratio-four compression advances an overlapping recurrent window whenever
+  // a group closes. A speculative row that closes such a group cannot be
+  // rolled back by overwriting only its explicit KV slot. These helpers expose
+  // the minimal device checkpoint required for that boundary; other ratios
+  // return zero and remain position-logical.
+  [[nodiscard]] std::uint64_t speculative_checkpoint_bytes() const noexcept;
+  [[nodiscard]] Status checkpoint_speculative_state(
+      void* destination, void* stream) const noexcept;
+  [[nodiscard]] Status restore_speculative_state(
+      const void* source, void* stream) noexcept;
 
  private:
   friend DeepSeekAttentionStateResult create_deepseek_attention_state(
@@ -73,6 +83,12 @@ struct DeepSeekAttentionStateSize final {
 [[nodiscard]] DeepSeekAttentionStateSize deepseek_attention_state_size(
     std::uint32_t compress_ratio,
     std::uint32_t max_context_tokens) noexcept;
+
+// Minimal rollback storage for a speculative row at this compression ratio.
+// Only ratio four has recurrent overlap state that cannot be recovered by
+// replaying the same explicit position.
+[[nodiscard]] std::uint64_t deepseek_attention_speculative_checkpoint_size(
+    std::uint32_t compress_ratio) noexcept;
 
 // Allocates all per-request sliding-window/CSA cache and workspace up front.
 // Ratio zero is the checkpoint's pure sliding-window mode. No allocation occurs

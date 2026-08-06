@@ -284,6 +284,31 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(observed, [4])
         self.assertEqual(results, {1: 10, 2: 20, 3: 30, 4: 41})
 
+    def test_speculative_bonus_is_buffered_without_an_extra_worker_step(self) -> None:
+        class Worker:
+            capacity = 1
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.active_ids = {7}
+
+            def step(self, items: list[tuple[int, bool]]) -> dict[int, list[int]]:
+                self.calls += 1
+                return {items[0][0]: [101, 102]}
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+        worker = Worker()
+        batcher = ContinuousDecodeBatcher(worker, 0.0, lambda _rows: None)
+        try:
+            self.assertEqual(batcher.step(7, False), 101)
+            self.assertEqual(batcher.step(7, True), 102)
+            self.assertEqual(worker.calls, 1)
+            self.assertEqual(worker.active_ids, set())
+        finally:
+            batcher.close()
+
     def test_generation_stops_and_cancels_after_eos(self) -> None:
         class Worker:
             def __init__(self) -> None:

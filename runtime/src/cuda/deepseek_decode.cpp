@@ -85,6 +85,15 @@ Status DeepSeekDecodeController::configure_hybrid(
   return Status::success();
 }
 
+Status DeepSeekDecodeController::configure_verify(
+    std::shared_ptr<DeepSeekVerifyState> verify) noexcept {
+  if (active_ || !verify || verify->primary_request().get() != request_.get())
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek verify controller configuration"};
+  verify_ = std::move(verify);
+  return Status::success();
+}
+
 Status DeepSeekDecodeController::stage_cpu_placements(
     std::span<const DeepSeekCpuExpertPlacement> placements) noexcept {
   if (!active_ || !waiting_for_experts_ || !cpu_executor_ ||
@@ -135,6 +144,39 @@ Status DeepSeekDecodeController::begin(
   waiting_for_experts_ = false;
   planning_ = false;
   complete_ = false;
+  pair_mode_ = false;
+  active_ = true;
+  return Status::success();
+}
+
+Status DeepSeekDecodeController::begin_verify_pair(
+    const DeepSeekVerifyBegin& launch) noexcept {
+  if (active_ || !verify_ || launch.positions[1] != launch.positions[0] + 1U ||
+      launch.positions[1] >= request_->max_context_tokens() ||
+      launch.first_layer >= launch.layer_limit ||
+      launch.layer_limit > kDeepSeekLayers) {
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek pair verification begin"};
+  }
+  for (const auto& rope : launch.rope) {
+    if (!rope.base_cosine || !rope.base_sine || !rope.compressed_cosine ||
+        !rope.compressed_sine)
+      return {ErrorCode::invalid_argument,
+              "DeepSeek pair verification is missing RoPE"};
+  }
+  auto status = verify_->begin_transaction(launch.positions[1]);
+  if (!status.ok()) return status;
+  pair_rope_ = launch.rope;
+  pair_positions_ = launch.positions;
+  pair_token_ids_ = launch.token_ids;
+  current_layer_ = launch.first_layer;
+  layer_limit_ = launch.layer_limit;
+  route_trace_.clear();
+  route_trace_.reserve(2U * (layer_limit_ - current_layer_));
+  waiting_for_experts_ = false;
+  planning_ = false;
+  complete_ = false;
+  pair_mode_ = true;
   active_ = true;
   return Status::success();
 }
@@ -155,6 +197,11 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
   waiting_for_experts_ = false;
   complete_ = false;
   clear_cpu_placements();
+  if (pair_mode_ && verify_) {
+    const auto aborted = verify_->abort_transaction(stream_);
+    if (status.ok() && !aborted.ok()) status = aborted;
+  }
+  pair_mode_ = false;
   return {std::move(status), DeepSeekDecodeProgress::layer_complete,
           current_layer_, {}, {}, {}};
 }
@@ -165,7 +212,10 @@ DeepSeekDecodeController::start_plan() noexcept {
   plan_started_ = std::chrono::steady_clock::now();
   const auto status = directory_->begin_plan_async(
       *directory_workspace_, current_layer_,
-      view.ffn_state->expert_indices(), view.ffn_state->selection_count(),
+      pair_mode_ ? verify_->ffn_workspace()->expert_indices()
+                 : view.ffn_state->expert_indices(),
+      pair_mode_ ? verify_->ffn_workspace()->selection_count()
+                 : view.ffn_state->selection_count(),
       stream_, true);
   if (!status.ok()) return fail(status);
   planning_ = true;
@@ -256,6 +306,72 @@ DeepSeekDecodeController::poll_plan() noexcept {
 DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     DirectoryPlanResult plan) noexcept {
   const auto view = request_->layer(current_layer_);
+  if (pair_mode_) {
+    if (plan.selected_experts.size() != 14U ||
+        plan.selected_experts[6U] != 256U ||
+        plan.selected_experts[13U] != 256U)
+      return fail({ErrorCode::internal,
+                   "DeepSeek directory returned an invalid pair selection"});
+    if (route_trace_.empty() || route_trace_.back().layer != current_layer_) {
+      for (const auto offset : {0U, 7U}) {
+        DeepSeekRouteTraceEntry trace;
+        trace.layer = current_layer_;
+        std::copy_n(plan.selected_experts.begin() + offset,
+                    trace.routed_experts.size(),
+                    trace.routed_experts.begin());
+        route_trace_.push_back(trace);
+      }
+    }
+    std::vector<std::uint32_t> routed_experts;
+    routed_experts.reserve(12U);
+    routed_experts.insert(routed_experts.end(),
+                          plan.selected_experts.begin(),
+                          plan.selected_experts.begin() + 6U);
+    routed_experts.insert(routed_experts.end(),
+                          plan.selected_experts.begin() + 7U,
+                          plan.selected_experts.begin() + 13U);
+    pin_id_ = plan.pin_id;
+    if (!plan.missing_experts.empty()) {
+      waiting_for_experts_ = true;
+      return {Status::success(), DeepSeekDecodeProgress::needs_experts,
+              current_layer_, std::move(plan.missing_experts),
+              std::move(plan.ready_experts), std::move(routed_experts), 2U};
+    }
+    if (pin_id_ == 0U)
+      return fail({ErrorCode::internal,
+                   "DeepSeek pair directory returned no execution pin"});
+    const auto pair_view = verify_->layer(current_layer_);
+    const auto ffn_started = std::chrono::steady_clock::now();
+    const auto execute = deepseek_ffn_execute_pair({
+        pair_view.ffn_weights, pair_view.ffn_states,
+        verify_->ffn_workspace(), directory_->device_entries(),
+        {request_->streams_b_, verify_->speculative_streams_b_},
+        {request_->streams_a_, verify_->speculative_streams_a_},
+        directory_->experts_per_layer(), stream_});
+    telemetry_.ffn_submit_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - ffn_started)
+            .count());
+    if (!execute.ok()) return fail(execute);
+    const auto release_started = std::chrono::steady_clock::now();
+    const auto release = directory_->release_pins_async(pin_id_, stream_);
+    telemetry_.directory_release_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - release_started)
+            .count());
+    pin_id_ = 0U;
+    if (!release.ok()) return fail(release);
+    const auto completed_layer = current_layer_++;
+    waiting_for_experts_ = false;
+    if (current_layer_ == layer_limit_) {
+      active_ = false;
+      complete_ = true;
+      return {Status::success(), DeepSeekDecodeProgress::token_complete,
+              completed_layer, {}, {}, std::move(routed_experts), 2U};
+    }
+    return {Status::success(), DeepSeekDecodeProgress::layer_complete,
+            completed_layer, {}, {}, std::move(routed_experts), 2U};
+  }
   if (plan.selected_experts.size() != 7U ||
       plan.selected_experts.back() != 256U) {
     return fail({ErrorCode::internal,
@@ -433,6 +549,75 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
   }
   if (planning_) return poll_plan();
 
+  if (pair_mode_) {
+    const auto view = verify_->layer(current_layer_);
+    const auto group_rope = [&](std::uint32_t row,
+                                const float*& cosine,
+                                const float*& sine) -> Status {
+      cosine = nullptr;
+      sine = nullptr;
+      const bool emits = view.compress_ratio != 0U &&
+          (pair_positions_[row] + 1U) % view.compress_ratio == 0U;
+      if (!emits) return Status::success();
+      if (view.compress_ratio == 4U) {
+        cosine = pair_rope_[row].ratio_four_group_cosine;
+        sine = pair_rope_[row].ratio_four_group_sine;
+      } else {
+        cosine = pair_rope_[row].ratio_128_group_cosine;
+        sine = pair_rope_[row].ratio_128_group_sine;
+      }
+      return cosine && sine
+          ? Status::success()
+          : Status(ErrorCode::invalid_argument,
+                   "DeepSeek pair verification is missing group RoPE");
+    };
+    const auto attention_route_started = std::chrono::steady_clock::now();
+    const float *group_cosine{}, *group_sine{};
+    auto status = group_rope(0U, group_cosine, group_sine);
+    if (!status.ok()) return fail(status);
+    status = deepseek_attention_decode({
+        view.attention_weights, view.attention_state, request_->streams_a_,
+        request_->streams_b_,
+        view.compress_ratio ? pair_rope_[0].compressed_cosine
+                            : pair_rope_[0].base_cosine,
+        view.compress_ratio ? pair_rope_[0].compressed_sine
+                            : pair_rope_[0].base_sine,
+        group_cosine, group_sine, pair_positions_[0], 1e-6F, 20U, stream_});
+    if (!status.ok()) return fail(status);
+    status = deepseek_ffn_route({
+        view.ffn_weights, view.ffn_states[0], request_->streams_b_,
+        pair_token_ids_[0], 1e-6F, 20U, stream_});
+    if (!status.ok()) return fail(status);
+
+    status = verify_->checkpoint_layer(current_layer_, stream_);
+    if (!status.ok()) return fail(status);
+    status = group_rope(1U, group_cosine, group_sine);
+    if (!status.ok()) return fail(status);
+    status = deepseek_attention_decode({
+        view.attention_weights, view.attention_state,
+        verify_->speculative_streams_a_, verify_->speculative_streams_b_,
+        view.compress_ratio ? pair_rope_[1].compressed_cosine
+                            : pair_rope_[1].base_cosine,
+        view.compress_ratio ? pair_rope_[1].compressed_sine
+                            : pair_rope_[1].base_sine,
+        group_cosine, group_sine, pair_positions_[1], 1e-6F, 20U, stream_});
+    if (!status.ok()) return fail(status);
+    status = deepseek_ffn_route({
+        view.ffn_weights, view.ffn_states[1],
+        verify_->speculative_streams_b_, pair_token_ids_[1], 1e-6F, 20U,
+        stream_});
+    if (!status.ok()) return fail(status);
+    status = deepseek_ffn_gather_pair_routes(
+        {{view.ffn_states[0], view.ffn_states[1]},
+         verify_->ffn_workspace(), stream_});
+    if (!status.ok()) return fail(status);
+    telemetry_.attention_route_submit_ns += static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - attention_route_started)
+            .count());
+    return start_plan();
+  }
+
   const auto view = request_->layer(current_layer_);
   const bool compressed = view.compress_ratio != 0U;
   const bool emits = compressed &&
@@ -516,6 +701,11 @@ Status DeepSeekDecodeController::cancel() noexcept {
   waiting_for_experts_ = false;
   complete_ = false;
   clear_cpu_placements();
+  if (pair_mode_ && verify_) {
+    const auto aborted = verify_->abort_transaction(stream_);
+    if (status.ok()) status = aborted;
+  }
+  pair_mode_ = false;
   return status;
 }
 
@@ -536,6 +726,28 @@ DeepSeekDecodeControllerResult create_deepseek_decode_controller(
   return {Status::success(), std::shared_ptr<DeepSeekDecodeController>(
       new DeepSeekDecodeController(std::move(request), std::move(directory),
                                    std::move(workspace.workspace), stream))};
+}
+
+DeepSeekDecodeControllerResult create_deepseek_verify_controller(
+    std::shared_ptr<DeepSeekVerifyState> verify,
+    std::shared_ptr<CudaExpertDirectory> directory, void* stream) noexcept {
+  if (!verify || !verify->primary_request() || !directory ||
+      directory->experts_per_layer() != 257U)
+    return {{ErrorCode::invalid_argument,
+             "invalid DeepSeek verify controller dependencies"}, {}};
+  auto workspace = directory->create_plan_workspace();
+  if (!workspace.status.ok() || !workspace.workspace)
+    return {workspace.status.ok()
+                ? Status(ErrorCode::internal,
+                         "CUDA directory returned no pair planning workspace")
+                : std::move(workspace.status),
+            {}};
+  auto controller = std::shared_ptr<DeepSeekDecodeController>(
+      new DeepSeekDecodeController(verify->primary_request(),
+                                   std::move(directory),
+                                   std::move(workspace.workspace), stream));
+  controller->verify_ = std::move(verify);
+  return {Status::success(), std::move(controller)};
 }
 
 }  // namespace expert::runtime::cuda

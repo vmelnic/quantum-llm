@@ -93,6 +93,10 @@ class DeepSeekDecodeScheduler final {
       std::uint64_t request_id,
       std::shared_ptr<DeepSeekDecodeController> controller,
       const DeepSeekDecodeBegin& begin);
+  [[nodiscard]] Status submit_verify(
+      std::uint64_t request_id,
+      std::shared_ptr<DeepSeekDecodeController> controller,
+      const DeepSeekVerifyBegin& begin);
   [[nodiscard]] Status poll();
   // Called by a blocking service loop only after poll() has submitted all
   // currently runnable work. Waits for one request-private CUDA event so the

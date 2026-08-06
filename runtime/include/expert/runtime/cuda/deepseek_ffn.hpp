@@ -5,6 +5,7 @@
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <span>
 
@@ -12,6 +13,7 @@ namespace expert::runtime::cuda {
 
 struct DeepSeekFfnStateResult;
 struct DeepSeekFfnHybridWorkspaceResult;
+struct DeepSeekFfnPairWorkspaceResult;
 
 class DeepSeekFfnState final {
  public:
@@ -48,6 +50,10 @@ class DeepSeekFfnState final {
       const struct DeepSeekFfnExecuteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_hybrid(
       const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_gather_pair_routes(
+      const struct DeepSeekFfnPairRouteGather&) noexcept;
+  friend Status deepseek_ffn_execute_pair(
+      const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
   DeepSeekFfnState(void* allocation, std::uint64_t bytes,
                    std::uint32_t layer) noexcept;
   void map(void* base) noexcept;
@@ -116,6 +122,82 @@ struct DeepSeekFfnExecuteLaunch final {
 // Executes routed top-6 plus shared expert, then applies FFN HCA post.
 [[nodiscard]] Status deepseek_ffn_execute(
     const DeepSeekFfnExecuteLaunch& launch) noexcept;
+
+// Request-private two-row workspace. Route state remains independently owned
+// by each causal row, while the compute-ready arrays are gathered here so the
+// expert kernels can read each resident weight set for both verifier rows in a
+// single multi-row launch.
+class DeepSeekFfnPairWorkspace final {
+ public:
+  ~DeepSeekFfnPairWorkspace();
+  DeepSeekFfnPairWorkspace(const DeepSeekFfnPairWorkspace&) = delete;
+  DeepSeekFfnPairWorkspace& operator=(const DeepSeekFfnPairWorkspace&) = delete;
+  [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+  [[nodiscard]] const std::uint32_t* expert_indices() const noexcept {
+    return expert_indices_;
+  }
+  [[nodiscard]] static constexpr std::uint32_t selection_count() noexcept {
+    return 14U;
+  }
+
+ private:
+  friend DeepSeekFfnPairWorkspaceResult
+  create_deepseek_ffn_pair_workspace() noexcept;
+  friend std::uint64_t deepseek_ffn_pair_workspace_size() noexcept;
+  friend Status deepseek_ffn_gather_pair_routes(
+      const struct DeepSeekFfnPairRouteGather&) noexcept;
+  friend Status deepseek_ffn_execute_pair(
+      const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
+  DeepSeekFfnPairWorkspace(void* allocation, std::uint64_t bytes) noexcept;
+  void map(void* base) noexcept;
+
+  void* allocation_{};
+  std::uint64_t bytes_{};
+  float *ffn_input_{}, *routing_weights_{}, *routed_intermediate_{},
+      *routed_selection_outputs_{}, *routed_output_{},
+      *shared_intermediate_{}, *shared_output_{};
+  std::uint32_t *expert_indices_{}, *routed_indices_{}, *shared_indices_{};
+  float* shared_weights_{};
+  std::int8_t *routed_q_input_{}, *routed_q_intermediate_{};
+  float *routed_q_input_scales_{}, *routed_q_intermediate_scales_{};
+};
+
+struct DeepSeekFfnPairWorkspaceResult final {
+  Status status;
+  std::shared_ptr<DeepSeekFfnPairWorkspace> workspace;
+};
+
+[[nodiscard]] std::uint64_t deepseek_ffn_pair_workspace_size() noexcept;
+[[nodiscard]] DeepSeekFfnPairWorkspaceResult
+create_deepseek_ffn_pair_workspace() noexcept;
+
+struct DeepSeekFfnPairRouteGather final {
+  std::array<const DeepSeekFfnState*, 2U> states{};
+  DeepSeekFfnPairWorkspace* workspace{};
+  void* stream{};
+};
+
+// Gathers both exact route selections into one stable device span suitable for
+// a single directory pin transaction. It does not synchronize the stream.
+[[nodiscard]] Status deepseek_ffn_gather_pair_routes(
+    const DeepSeekFfnPairRouteGather& launch) noexcept;
+
+struct DeepSeekFfnPairExecuteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  std::array<DeepSeekFfnState*, 2U> states{};
+  DeepSeekFfnPairWorkspace* workspace{};
+  const DeviceExpertEntry* directory_entries{};
+  std::array<const float*, 2U> streams{};
+  std::array<float*, 2U> updated_streams{};
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+};
+
+// Requires one active directory pin covering workspace.expert_indices()[0..14).
+// Routed and shared experts execute as two-row batches; HCA post remains
+// causal-row local because its mutable stream state is request-owned.
+[[nodiscard]] Status deepseek_ffn_execute_pair(
+    const DeepSeekFfnPairExecuteLaunch& launch) noexcept;
 
 class DeepSeekFfnHybridWorkspace final {
  public:

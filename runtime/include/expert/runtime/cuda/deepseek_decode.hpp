@@ -1,6 +1,7 @@
 #pragma once
 
 #include "expert/runtime/cuda/deepseek_request.hpp"
+#include "expert/runtime/cuda/deepseek_verify.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 
 #include <array>
@@ -34,6 +35,14 @@ struct DeepSeekDecodeBegin final {
   std::uint32_t layer_limit{kDeepSeekLayers};
 };
 
+struct DeepSeekVerifyBegin final {
+  std::array<DeepSeekDecodeRope, 2U> rope;
+  std::array<std::uint32_t, 2U> positions{};
+  std::array<std::uint32_t, 2U> token_ids{};
+  std::uint32_t first_layer{};
+  std::uint32_t layer_limit{kDeepSeekLayers};
+};
+
 enum class DeepSeekDecodeProgress : std::uint8_t {
   pending_cuda,
   layer_complete,
@@ -52,6 +61,10 @@ struct DeepSeekDecodeAdvanceResult final {
   std::vector<std::uint32_t> ready_experts;
   // Exact routed selection excluding the invariant shared expert.
   std::vector<std::uint32_t> routed_experts;
+  // Ordinary decode publishes one exact top-6 row. Pair verification publishes
+  // two consecutive top-6 rows; duplicates across rows are valid and share one
+  // directory pin transaction.
+  std::uint32_t route_rows{1U};
 };
 
 struct DeepSeekRouteTraceEntry final {
@@ -103,6 +116,8 @@ class DeepSeekDecodeController final {
   DeepSeekDecodeController& operator=(const DeepSeekDecodeController&) = delete;
 
   [[nodiscard]] Status begin(const DeepSeekDecodeBegin& launch) noexcept;
+  [[nodiscard]] Status begin_verify_pair(
+      const DeepSeekVerifyBegin& launch) noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult advance() noexcept;
   [[nodiscard]] Status wait_for_cuda() noexcept;
   [[nodiscard]] Status cancel() noexcept;
@@ -110,6 +125,8 @@ class DeepSeekDecodeController final {
   [[nodiscard]] Status configure_hybrid(
       std::shared_ptr<cpu::DeepSeekPackedExecutor> executor,
       std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept;
+  [[nodiscard]] Status configure_verify(
+      std::shared_ptr<DeepSeekVerifyState> verify) noexcept;
   // Profiling mode records and synchronizes CUDA events at the two existing
   // per-layer dependency boundaries. It is opt-in because the extra events
   // intentionally perturb production scheduling.
@@ -141,6 +158,9 @@ class DeepSeekDecodeController final {
   friend DeepSeekDecodeControllerResult create_deepseek_decode_controller(
       std::shared_ptr<DeepSeekRequestState>,
       std::shared_ptr<CudaExpertDirectory>, void*) noexcept;
+  friend DeepSeekDecodeControllerResult create_deepseek_verify_controller(
+      std::shared_ptr<DeepSeekVerifyState>,
+      std::shared_ptr<CudaExpertDirectory>, void*) noexcept;
   DeepSeekDecodeController(std::shared_ptr<DeepSeekRequestState> request,
                            std::shared_ptr<CudaExpertDirectory> directory,
                            std::shared_ptr<CudaDirectoryPlanWorkspace> workspace,
@@ -153,10 +173,14 @@ class DeepSeekDecodeController final {
   void clear_cpu_placements() noexcept;
 
   std::shared_ptr<DeepSeekRequestState> request_;
+  std::shared_ptr<DeepSeekVerifyState> verify_;
   std::shared_ptr<CudaExpertDirectory> directory_;
   std::shared_ptr<CudaDirectoryPlanWorkspace> directory_workspace_;
   void* stream_{};
   DeepSeekDecodeRope rope_{};
+  std::array<DeepSeekDecodeRope, 2U> pair_rope_{};
+  std::array<std::uint32_t, 2U> pair_positions_{};
+  std::array<std::uint32_t, 2U> pair_token_ids_{};
   std::uint32_t position_{};
   std::uint32_t token_id_{};
   std::uint32_t current_layer_{};
@@ -187,6 +211,7 @@ class DeepSeekDecodeController final {
   bool planning_{};
   bool waiting_for_experts_{};
   bool complete_{};
+  bool pair_mode_{};
 };
 
 struct DeepSeekDecodeControllerResult final {
@@ -196,6 +221,11 @@ struct DeepSeekDecodeControllerResult final {
 
 [[nodiscard]] DeepSeekDecodeControllerResult create_deepseek_decode_controller(
     std::shared_ptr<DeepSeekRequestState> request,
+    std::shared_ptr<CudaExpertDirectory> directory,
+    void* stream = nullptr) noexcept;
+
+[[nodiscard]] DeepSeekDecodeControllerResult create_deepseek_verify_controller(
+    std::shared_ptr<DeepSeekVerifyState> verify,
     std::shared_ptr<CudaExpertDirectory> directory,
     void* stream = nullptr) noexcept;
 

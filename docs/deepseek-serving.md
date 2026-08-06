@@ -33,8 +33,8 @@ Bundle v1 remains accepted for base greedy serving. Bundle v2 records the MTP
 descriptor only. Bundle v3 additionally binds the external one-shard MTP
 compact pack and transactionally loads the complete MTP tensor/shared/cache/
 directory state. It reports `mtp_runtime_ready=true` only after that startup
-completes, but keeps `mtp_enabled=false` until target verification is qualified.
-Availability/readiness are not execution and cannot change generated tokens.
+completes. Execution remains opt-in with `-EnableMtp $true`; availability and
+readiness alone never change generated tokens.
 
 For development, the routed catalog may point directly at authenticated
 SafeTensors extents. For deployment, publish only after the 43-shard compact
@@ -71,6 +71,7 @@ python -m venv work\venv\server
 
 ./ops/windows/Start-DeepSeekExpertServer.ps1 `
   -Bundle D:\models\deepseek-v4-flash\worker-bundle-v3 `
+  -EnableMtp $true `
   -HostAddress 127.0.0.1 `
   -Port 8080
 ```
@@ -88,6 +89,13 @@ uses a per-layer cap so one layer cannot consume the complete tier.
 The first production qualification loaded 864 routed records (11.55 GB) in
 6.27 seconds. A repeated five-step route then used no scheduler suspension and
 took 340.886 ms of worker model-step time while preserving token `19923`.
+
+With MTP enabled, worker protocol v5 returns one guaranteed token and, only on
+target acceptance, an optional verified bonus token. The HTTP front-end buffers
+that bonus and serves it on the next generation iteration without another
+worker step. Stop/EOS/cancellation discards buffered tokens and closes the
+worker request. A request automatically falls back to ordinary decode when the
+moving speculative cost per useful token is worse than its ordinary path.
 
 `STATS`, `/model-info`, and `/metrics` expose cumulative worker attribution.
 The timing counters deliberately describe their measured boundary:
