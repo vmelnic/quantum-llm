@@ -237,7 +237,7 @@ latency or aggregate throughput without changing model semantics.
   unchanged when the resource is absent or disabled. The real export covers
   3,593,787,756 source bytes without copying them. Bundle v2 reports the
   resource available, remains disabled, and preserved `Hi` -> token `19923`.
-- [ ] Implement the MTP draft state and qualify one-token predictions against
+- [x] Implement the MTP draft state and qualify one-token predictions against
   an independent source-checkpoint oracle before enabling verification.
   - [x] Freeze the V4-specific input/output glue contract and export a real
     source-checkpoint oracle for `hnorm`/`enorm`, separate `h_proj`/`e_proj`,
@@ -260,9 +260,14 @@ latency or aggregate throughput without changing model semantics.
     checkpoint oracle and the native ratio-zero CUDA block selected the same
     learned route and draft token `70663`; the shared vocabulary head is now a
     common target/MTP primitive rather than duplicated code.
-- [ ] Add transactional target verification with causal KV/CSA state commit on
-  acceptance and exact rollback/replay on rejection. Never expose a draft
-  token before target acceptance.
+  - [x] Move the qualified block into a bounded per-request production state.
+    Its two-stage `prepare`/`complete` lifecycle exposes only a route to the
+    control plane, owns 1,918,500 device bytes at context four, and can abandon
+    an unused draft while retaining the valid causal MTP attention write.
+- [ ] Add transactional two-row target verification. Row zero is guaranteed;
+  row one is speculative. On rejection, commit row zero and logically roll
+  back row one by retaining the external position and overwriting that explicit
+  KV/CSA slot on replay. Never expose a draft before target acceptance.
 - [ ] Batch the union of experts and dense projections needed by target
   verification; use measured multi-row kernels instead of running two ordinary
   model steps serially.

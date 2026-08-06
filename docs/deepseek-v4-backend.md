@@ -136,6 +136,23 @@ four times the observed logit RMSE. This proves one complete draft computation;
 it does not yet permit emission. Target verification and KV-state transaction
 semantics remain the next boundary.
 
+The qualified path is no longer owned by the smoke executable. A bounded
+`DeepSeekMtpRequestState` retains its ratio-zero attention cache, glue/FFN/head
+workspace, and immutable target/MTP model ownership. `prepare()` embeds the
+next token, advances MTP attention and publishes the learned route;
+`complete()` runs only after the generic directory has pinned routed plus
+shared experts. The state occupies 1,918,500 bytes for the four-position gate.
+An unused draft can be abandoned without discarding the valid causal attention
+write, which is required for prefill and adaptive speculation.
+
+For the checkpoint's one-draft configuration, rollback is position-logical,
+not a 43-layer memory copy. KV, sliding-window and compressor writes are indexed
+by the explicit position supplied to each layer. A rejected speculative second
+row is excluded from the committed request position and that same slot is
+overwritten before it can be read on replay. The upcoming verifier must still
+enforce this transaction at every layer and keep client emission behind target
+acceptance; deeper draft trees would require a more general checkpoint policy.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face

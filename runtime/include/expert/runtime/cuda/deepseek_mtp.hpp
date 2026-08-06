@@ -70,6 +70,7 @@ struct DeepSeekMtpGlueStateResult final {
 
 [[nodiscard]] DeepSeekMtpGlueStateResult
 create_deepseek_mtp_glue_state() noexcept;
+[[nodiscard]] std::uint64_t deepseek_mtp_glue_state_size() noexcept;
 
 // Produces h_proj(hnorm(previous_streams)) + e_proj(enorm(embedding)).
 [[nodiscard]] Status deepseek_mtp_mix(

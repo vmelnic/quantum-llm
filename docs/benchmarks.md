@@ -775,6 +775,13 @@ and a draft margin above four times logit RMSE are separate mandatory gates.
 This qualifies draft computation only; no token is client-visible before
 target verification is implemented.
 
+The same gate was then rerun through the reusable per-request MTP state rather
+than direct smoke-only kernel calls. Its complete bounded allocation was
+1,918,500 bytes and all intermediate errors, route IDs, draft token and margins
+were unchanged. Expert cache/directory ownership remains outside the state,
+allowing the normal placement control plane to suspend between route
+preparation and draft completion.
+
 ## Benchmark rules
 
 Any published result must include:

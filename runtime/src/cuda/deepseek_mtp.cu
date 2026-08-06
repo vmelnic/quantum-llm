@@ -74,6 +74,10 @@ DeepSeekMtpGlueStateResult create_deepseek_mtp_glue_state() noexcept {
                                      std::move(head.state)))};
 }
 
+std::uint64_t deepseek_mtp_glue_state_size() noexcept {
+  return kAllocationBytes + deepseek_io_state_size();
+}
+
 Status deepseek_mtp_mix(const DeepSeekMtpGlueBinding& weights,
                         const float* embedding,
                         const float* previous_streams,

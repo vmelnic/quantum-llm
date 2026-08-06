@@ -3,6 +3,7 @@
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_mtp.hpp"
+#include "expert/runtime/cuda/deepseek_mtp_request.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/deepseek_artifacts.hpp"
@@ -138,26 +139,11 @@ int main(int argc, char** argv) {
         *storage, *buffers, target_artifacts.artifacts.dense,
         target_artifacts.artifacts.typed, *target);
     require(status.ok(), std::string(status.message()));
-    er::cuda::DeepSeekResidentTensorState mtp;
+    auto mtp = std::make_shared<er::cuda::DeepSeekResidentTensorState>();
     status = er::cuda::DeepSeekResidentTensorState::load(
         *storage, *buffers, mtp_artifacts.artifacts.dense,
-        mtp_artifacts.artifacts.typed, mtp);
+        mtp_artifacts.artifacts.typed, *mtp);
     require(status.ok(), std::string(status.message()));
-
-    er::cuda::DeepSeekIoBinding target_io;
-    status = target->bind_io(target_io);
-    require(status.ok(), std::string(status.message()));
-    er::cuda::DeepSeekMtpGlueBinding glue;
-    status = mtp.bind_mtp_glue("mtp.0", glue);
-    require(status.ok(), std::string(status.message()));
-    er::cuda::DeepSeekAttentionBinding attention;
-    status = mtp.bind_attention("mtp.0", 0U, 0U, attention);
-    require(status.ok(), std::string(status.message()));
-    er::cuda::DeepSeekFfnBinding ffn;
-    status = mtp.bind_ffn("mtp.0", 0U,
-                          er::cuda::DeepSeekRouterKind::learned, ffn);
-    require(status.ok() && !ffn.hash_router,
-            "invalid complete MTP FFN binding");
 
     auto directory = std::make_shared<er::cuda::CudaExpertDirectory>(
         kMtpModelId, er::kExpertQuantAbiDeepSeekSm86, 1U, 257U, 16U);
@@ -175,8 +161,8 @@ int main(int argc, char** argv) {
 
     const auto previous = read_array<float>(
         oracle / "previous-streams.f32", kPositions * kStreamValues);
-    const auto embeddings = read_array<float>(
-        oracle / "embeddings.f32", kPositions * kHidden);
+    const auto tokens = read_array<std::uint32_t>(
+        oracle / "tokens.u32", kPositions);
     const auto expected_mixed = read_array<float>(
         oracle / "mixed-streams.f32", kPositions * kStreamValues);
     const auto expected_attention = read_array<float>(
@@ -198,15 +184,12 @@ int main(int argc, char** argv) {
     const auto expected_sample = read_array<std::uint32_t>(
         oracle / "sampled.u32", 1U).front();
 
-    float *device_previous = nullptr, *device_embeddings = nullptr;
+    float* device_previous = nullptr;
     float *device_attention = nullptr, *device_cosines = nullptr;
     float* device_sines = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&device_previous),
                      previous.size() * sizeof(float)),
           "allocate MTP previous streams");
-    check(cudaMalloc(reinterpret_cast<void**>(&device_embeddings),
-                     embeddings.size() * sizeof(float)),
-          "allocate MTP embeddings");
     check(cudaMalloc(reinterpret_cast<void**>(&device_attention),
                      expected_attention.size() * sizeof(float)),
           "allocate MTP attention outputs");
@@ -219,9 +202,6 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(device_previous, previous.data(),
                      previous.size() * sizeof(float), cudaMemcpyHostToDevice),
           "upload MTP previous streams");
-    check(cudaMemcpy(device_embeddings, embeddings.data(),
-                     embeddings.size() * sizeof(float), cudaMemcpyHostToDevice),
-          "upload MTP embeddings");
     check(cudaMemcpy(device_cosines, cosines.data(),
                      cosines.size() * sizeof(float), cudaMemcpyHostToDevice),
           "upload MTP cosines");
@@ -229,49 +209,43 @@ int main(int argc, char** argv) {
                      sines.size() * sizeof(float), cudaMemcpyHostToDevice),
           "upload MTP sines");
 
-    auto glue_state = er::cuda::create_deepseek_mtp_glue_state();
-    require(glue_state.status.ok() && glue_state.state,
-            std::string(glue_state.status.message()));
-    auto attention_state = er::cuda::create_deepseek_attention_state(0U, 4U);
-    require(attention_state.status.ok() && attention_state.state,
-            std::string(attention_state.status.message()));
-    auto ffn_state = er::cuda::create_deepseek_ffn_state(0U);
-    require(ffn_state.status.ok() && ffn_state.state,
-            std::string(ffn_state.status.message()));
+    const auto request_size = er::cuda::deepseek_mtp_request_state_size(4U);
+    require(request_size.status.ok(),
+            std::string(request_size.status.message()));
+    auto request = er::cuda::create_deepseek_mtp_request_state(
+        target, mtp, {4U, request_size.total_bytes});
+    require(request.status.ok() && request.state,
+            std::string(request.status.message()));
 
     std::vector<float> actual_mixed(expected_mixed.size());
     std::vector<std::uint32_t> actual_indices(expected_indices.size());
     std::vector<float> actual_scores(expected_scores.size());
     for (std::uint32_t position = 0U; position < kPositions; ++position) {
-      status = er::cuda::deepseek_mtp_mix(
-          glue, device_embeddings + position * kHidden,
-          device_previous + position * kStreamValues, *glue_state.state,
-          1e-6F, nullptr);
+      status = request.state->prepare(
+          tokens[position], device_previous + position * kStreamValues,
+          position, device_cosines + position * 32U,
+          device_sines + position * 32U, nullptr);
       require(status.ok(), std::string(status.message()));
       check(cudaMemcpy(actual_mixed.data() + position * kStreamValues,
-                       glue_state.state->mixed_streams(),
+                       request.state->mixed_streams(),
                        kStreamValues * sizeof(float), cudaMemcpyDeviceToHost),
             "copy MTP mixed streams");
-      status = er::cuda::deepseek_attention_decode({
-          &attention, attention_state.state.get(),
-          glue_state.state->mixed_streams(),
-          device_attention + position * kStreamValues,
-          device_cosines + position * 32U, device_sines + position * 32U,
-          device_cosines, device_sines, position, 1e-6F, 20U, nullptr});
-      require(status.ok(), std::string(status.message()));
-      status = er::cuda::deepseek_ffn_route({
-          &ffn, ffn_state.state.get(),
-          device_attention + position * kStreamValues, 0U,
-          1e-6F, 20U, nullptr});
-      require(status.ok(), std::string(status.message()));
+      check(cudaMemcpy(device_attention + position * kStreamValues,
+                       request.state->attention_streams(),
+                       kStreamValues * sizeof(float), cudaMemcpyDeviceToDevice),
+            "retain MTP attention output");
       check(cudaMemcpy(actual_indices.data() + position * 6U,
-                       ffn_state.state->expert_indices(),
+                       request.state->expert_indices(),
                        6U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost),
             "copy MTP router indices");
       check(cudaMemcpy(actual_scores.data() + position * 6U,
-                       ffn_state.state->routing_weights(),
+                       request.state->routing_weights(),
                        6U * sizeof(float), cudaMemcpyDeviceToHost),
             "copy MTP router scores");
+      if (position + 1U != kPositions) {
+        status = request.state->abandon_draft();
+        require(status.ok(), std::string(status.message()));
+      }
     }
 
     std::vector<er::ExpertLease> routed_leases;
@@ -288,24 +262,12 @@ int main(int argc, char** argv) {
       routed_leases.push_back(std::move(acquired.lease));
     }
     const auto pin = directory->pin_or_collect_misses(
-        0U, ffn_state.state->expert_indices(),
-        ffn_state.state->selection_count(), nullptr);
+        0U, request.state->expert_indices(),
+        request.state->selection_count(), nullptr);
     require(pin.status.ok() && pin.missing_experts.empty() && pin.pin_id != 0U,
             "MTP FFN dependencies are not resident");
-    float* device_block = nullptr;
-    check(cudaMalloc(reinterpret_cast<void**>(&device_block),
-                     kStreamValues * sizeof(float)),
-          "allocate MTP block output");
-    status = er::cuda::deepseek_ffn_execute({
-        &ffn, ffn_state.state.get(), directory->device_entries(),
-        device_attention + 3U * kStreamValues, device_block,
-        257U, nullptr, nullptr});
-    require(status.ok(), std::string(status.message()));
-    status = er::cuda::deepseek_mtp_collapse(
-        glue, device_block, *glue_state.state, 1e-6F, nullptr);
-    require(status.ok(), std::string(status.message()));
-    status = er::cuda::deepseek_mtp_vocab_head(
-        target_io.head, *glue_state.state, nullptr);
+    status = request.state->complete(directory->device_entries(), 257U,
+                                     nullptr);
     require(status.ok(), std::string(status.message()));
     check(cudaDeviceSynchronize(), "synchronize complete MTP block");
 
@@ -318,22 +280,22 @@ int main(int argc, char** argv) {
                      actual_attention.size() * sizeof(float),
                      cudaMemcpyDeviceToHost),
           "copy MTP attention outputs");
-    check(cudaMemcpy(actual_block.data(), device_block,
+    check(cudaMemcpy(actual_block.data(), request.state->block_streams(),
                      actual_block.size() * sizeof(float),
                      cudaMemcpyDeviceToHost),
           "copy MTP block output");
     check(cudaMemcpy(actual_normalized.data(),
-                     glue_state.state->head_state().normalized(),
+                     request.state->normalized_output(),
                      actual_normalized.size() * sizeof(float),
                      cudaMemcpyDeviceToHost),
           "copy MTP normalized output");
     check(cudaMemcpy(actual_logits.data(),
-                     glue_state.state->head_state().logits(),
+                     request.state->logits(),
                      actual_logits.size() * sizeof(float),
                      cudaMemcpyDeviceToHost),
           "copy MTP logits");
     check(cudaMemcpy(&actual_sample,
-                     glue_state.state->head_state().sampled_token(),
+                     request.state->draft_token(),
                      sizeof(actual_sample), cudaMemcpyDeviceToHost),
           "copy MTP sampled token");
 
@@ -403,8 +365,9 @@ int main(int argc, char** argv) {
               << ",\"logits_max_abs_error\":" << logits_stats.maximum
               << ",\"actual_draft_margin\":" << actual_margin
               << ",\"expected_draft_margin\":" << expected_margin
-              << ",\"resident_mtp_tensor_bytes\":" << mtp.bytes()
+              << ",\"resident_mtp_tensor_bytes\":" << mtp->bytes()
               << ",\"resident_mtp_shared_bytes\":" << shared.bytes()
+              << ",\"mtp_request_bytes\":" << request.state->bytes()
               << "}\n";
     return 0;
   } catch (const std::exception& error) {
