@@ -75,9 +75,12 @@ must not imply that a policy is active when it is only collecting evidence.
   warm tier ready; allow readiness to distinguish service-ready from warm-ready.
 - [ ] Seed a model-family hot list when no census exists, and replace it with
   measured evidence after a completed workload.
+- [x] Add a bounded next-token, same-layer transition predictor. It promotes at
+  most one record already present in RAM, never starts an SSD read, and yields
+  to exact current-layer demand.
 - [ ] Implement bounded one-layer-ahead expert prefetch. Predicted records must
   be lower priority than exact current-layer demand and trivially cancellable.
-- [ ] Record useful, late, incorrect, cancelled, and evicted-before-use prefetch
+- [x] Record useful, late, incorrect, cancelled, and evicted-before-use prefetch
   outcomes so lookahead remains an evidence-driven policy.
 
 Acceptance: startup state and cache contents match the authenticated census and

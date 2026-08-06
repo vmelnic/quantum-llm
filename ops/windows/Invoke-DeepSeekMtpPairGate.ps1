@@ -69,6 +69,13 @@ function Invoke-WorkerSequence {
         verify_pairs = [uint64]$stats[0].worker_verify_pairs
         mtp_accepted = [uint64]$stats[0].worker_mtp_accepted
         mtp_rejected = [uint64]$stats[0].worker_mtp_rejected
+        prefetch_predictions = [uint64]$stats[0].scheduler_prefetch_predictions
+        prefetch_scheduled = [uint64]$stats[0].scheduler_prefetch_scheduled
+        prefetch_completed = [uint64]$stats[0].scheduler_prefetch_completed
+        prefetch_useful = [uint64]$stats[0].scheduler_prefetch_useful
+        prefetch_late = [uint64]$stats[0].scheduler_prefetch_late
+        prefetch_incorrect = [uint64]$stats[0].scheduler_prefetch_incorrect
+        prefetch_cancelled = [uint64]$stats[0].scheduler_prefetch_cancelled
         wall_seconds = $started.Elapsed.TotalSeconds
     }
 }

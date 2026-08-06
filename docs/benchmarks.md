@@ -838,6 +838,16 @@ than the preceding attention-only pair gate. The result closes duplicated
 dense verification work; it does not alter the conclusion that arbitrary-route
 expert residency/movement must improve by an order of magnitude for 30 tok/s.
 
+A subsequent bounded transition predictor retained that exact sequence and
+accept/reject transcript. It made 108 predictions, scheduled three RAM-to-VRAM
+promotions, completed two, and classified five predictions as useful; the
+useful count includes experts that were already resident when predicted. The
+same five-token speculative target work measured 3.572 seconds versus the prior
+3.656 seconds. That roughly 2% movement is too small to separate from run noise
+and is not claimed as a throughput gain. The result qualifies the safety bound:
+one prediction per layer, one promotion globally, no speculative SSD read, and
+exact demand priority.
+
 ## Benchmark rules
 
 Any published result must include:

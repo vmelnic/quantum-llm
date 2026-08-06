@@ -476,7 +476,7 @@ class Model final {
     scheduler_ = std::make_unique<er::cuda::DeepSeekDecodeScheduler>(
         er::cuda::DeepSeekDecodeSchedulerConfig{
             17U, capacity_, std::max<std::uint32_t>(6U, capacity_ * 2U),
-            capacity_, true},
+            capacity_, 1U, 1U, true},
         *cache_, catalog_,
         er::cuda::DeepSeekHybridSchedulerDependencies{cpu_, planner_, census_});
   }
@@ -1111,6 +1111,22 @@ int worker_loop(Model& model) {
                   << ",\"kv_reserved_pages\":" << reserved_pages
                   << ",\"route_observations\":"
                   << scheduler.route_observations
+                  << ",\"scheduler_prefetch_predictions\":"
+                  << scheduler.prefetch_predictions
+                  << ",\"scheduler_prefetch_scheduled\":"
+                  << scheduler.prefetch_scheduled
+                  << ",\"scheduler_prefetch_completed\":"
+                  << scheduler.prefetch_completed
+                  << ",\"scheduler_prefetch_useful\":"
+                  << scheduler.prefetch_useful
+                  << ",\"scheduler_prefetch_late\":"
+                  << scheduler.prefetch_late
+                  << ",\"scheduler_prefetch_incorrect\":"
+                  << scheduler.prefetch_incorrect
+                  << ",\"scheduler_prefetch_cancelled\":"
+                  << scheduler.prefetch_cancelled
+                  << ",\"scheduler_prefetch_evicted_before_use\":"
+                  << scheduler.prefetch_evicted_before_use
                   << ",\"census_routes\":" << census.completed_routes
                   << ",\"cache_vram_hits\":" << cache.acquire_vram_hits
                   << ",\"cache_ram_hits\":" << cache.acquire_ram_hits

@@ -15,7 +15,8 @@ namespace {
 constexpr std::array<std::byte, 8> kMagic{
     std::byte{'Q'}, std::byte{'R'}, std::byte{'T'}, std::byte{'C'},
     std::byte{'E'}, std::byte{'N'}, std::byte{'S'}, std::byte{'1'}};
-constexpr std::uint32_t kVersion = 1U;
+constexpr std::uint32_t kVersion = 2U;
+constexpr std::uint32_t kLegacyVersion = 1U;
 constexpr std::uint64_t kHeatUnitQ20 = 1ULL << 20U;
 constexpr std::size_t kDigestBytes = 32U;
 constexpr std::size_t kFixedHeaderBytes = 124U;
@@ -28,11 +29,13 @@ constexpr std::size_t kFixedHeaderBytes = 124U;
 [[nodiscard]] bool valid_config(const RouteCensusConfig& config) noexcept {
   const auto cells = static_cast<std::uint64_t>(config.layer_count) *
                      config.experts_per_layer;
+  const auto transitions = cells * config.experts_per_layer;
   return config.model_id != 0U && nonzero_digest(config.model_content_hash) &&
          config.quant_abi != 0U && config.layer_count != 0U &&
          config.experts_per_layer != 0U && config.route_width != 0U &&
          config.route_width <= config.experts_per_layer &&
-         config.decay_interval_observations != 0U && cells <= 1'000'000U;
+         config.decay_interval_observations != 0U && cells <= 1'000'000U &&
+         transitions <= 8'000'000U;
 }
 
 [[nodiscard]] std::uint64_t saturated_add(std::uint64_t left,
@@ -96,9 +99,12 @@ RouteCensusLoadResult RouteCensus::decode_file(
   const auto file_bytes = std::filesystem::file_size(path, error);
   const auto expected_cells = static_cast<std::uint64_t>(expected.layer_count) *
                               expected.experts_per_layer;
-  const auto upper_bound = 256ULL + expected_cells * 48ULL +
+  const auto expected_transitions =
+      expected_cells * expected.experts_per_layer;
+  const auto upper_bound = 264ULL + expected_cells * 48ULL +
                            static_cast<std::uint64_t>(expected.layer_count) *
-                               (16ULL + 4ULL * expected.route_width);
+                               (16ULL + 4ULL * expected.route_width) +
+                           expected_transitions * sizeof(std::uint32_t);
   if (error || file_bytes < 128U || file_bytes > upper_bound) {
     return {{ErrorCode::io_failed, "invalid route census file size"}, {}};
   }
@@ -149,7 +155,9 @@ RouteCensusLoadResult RouteCensus::decode_file(
       !reader.take_u64(consecutive_reuse) || !reader.take_u64(cell_count)) {
     return {{ErrorCode::io_failed, "route census header is truncated"}, {}};
   }
-  if (magic != kMagic || version != kVersion || generation == 0U ||
+  if (magic != kMagic ||
+      (version != kVersion && version != kLegacyVersion) ||
+      generation == 0U ||
       model_id != expected.model_id ||
       quant_abi != expected.quant_abi || layer_count != expected.layer_count ||
       experts_per_layer != expected.experts_per_layer ||
@@ -199,6 +207,18 @@ RouteCensusLoadResult RouteCensus::decode_file(
     observed_sum = saturated_add(observed_sum, layer.observations);
     reuse_sum = saturated_add(reuse_sum, layer.consecutive_reuse);
   }
+  if (version == kVersion) {
+    std::uint64_t transition_count{};
+    if (!reader.take_u64(transition_count) ||
+        transition_count != census->transitions_.size())
+      return {{ErrorCode::io_failed,
+               "route census transition header is invalid"}, {}};
+    for (auto& count : census->transitions_) {
+      if (!reader.take_u32(count))
+        return {{ErrorCode::io_failed,
+                 "route census transition table is truncated"}, {}};
+    }
+  }
   for (const auto& cell : census->cells_)
     selection_sum = saturated_add(selection_sum, cell.total);
   if (reader.cursor != authenticated.size() || observation != completed_routes ||
@@ -218,6 +238,9 @@ RouteCensus::RouteCensus(RouteCensusConfig config) : config_(config) {
   layers_.resize(config_.layer_count);
   for (auto& layer : layers_)
     layer.previous_route.resize(config_.route_width);
+  transitions_.resize(static_cast<std::size_t>(config_.layer_count) *
+                      config_.experts_per_layer *
+                      config_.experts_per_layer);
 }
 
 std::uint64_t RouteCensus::effective_heat(const Cell& cell) const noexcept {
@@ -265,6 +288,17 @@ Status RouteCensus::observe(
   total_selections_ = saturated_add(total_selections_, routed_experts.size());
   auto& layer_state = layers_[layer];
   if (layer_state.observations != 0U) {
+    const auto layer_base = static_cast<std::size_t>(layer) *
+        config_.experts_per_layer * config_.experts_per_layer;
+    for (const auto previous : layer_state.previous_route) {
+      for (const auto expert : routed_experts) {
+        auto& transition = transitions_[
+            layer_base + static_cast<std::size_t>(previous) *
+                             config_.experts_per_layer + expert];
+        if (transition != std::numeric_limits<std::uint32_t>::max())
+          ++transition;
+      }
+    }
     for (const auto expert : routed_experts) {
       if (std::find(layer_state.previous_route.begin(),
                     layer_state.previous_route.end(), expert) !=
@@ -338,6 +372,46 @@ std::vector<RouteCensusWarmEntry> RouteCensus::stable_warm_set(
   return result;
 }
 
+std::vector<RouteCensusPrediction> RouteCensus::predict_next(
+    std::uint32_t layer, std::span<const std::uint32_t> current_route,
+    std::size_t maximum_entries) const {
+  std::lock_guard lock(mutex_);
+  if (layer >= config_.layer_count ||
+      current_route.size() != config_.route_width || maximum_entries == 0U)
+    return {};
+  for (const auto expert : current_route)
+    if (expert >= config_.experts_per_layer) return {};
+  const auto layer_base = static_cast<std::size_t>(layer) *
+      config_.experts_per_layer * config_.experts_per_layer;
+  std::vector<RouteCensusPrediction> candidates;
+  candidates.reserve(config_.experts_per_layer);
+  for (std::uint32_t candidate = 0U;
+       candidate < config_.experts_per_layer; ++candidate) {
+    if (std::find(current_route.begin(), current_route.end(), candidate) !=
+        current_route.end())
+      continue;
+    std::uint64_t score = 0U;
+    for (const auto previous : current_route)
+      score = saturated_add(
+          score, transitions_[layer_base +
+              static_cast<std::size_t>(previous) *
+                  config_.experts_per_layer + candidate]);
+    if (score != 0U)
+      candidates.push_back(
+          {ExpertKey{config_.model_id, layer, candidate, config_.quant_abi},
+           score});
+  }
+  std::sort(candidates.begin(), candidates.end(),
+            [](const auto& left, const auto& right) {
+              return left.transition_score != right.transition_score
+                  ? left.transition_score > right.transition_score
+                  : left.key < right.key;
+            });
+  if (candidates.size() > maximum_entries)
+    candidates.resize(maximum_entries);
+  return candidates;
+}
+
 RouteCensusSnapshot RouteCensus::snapshot() const noexcept {
   std::lock_guard lock(mutex_);
   const auto observed = static_cast<std::size_t>(std::count_if(
@@ -345,6 +419,7 @@ RouteCensusSnapshot RouteCensus::snapshot() const noexcept {
       [](const Cell& cell) { return cell.total != 0U; }));
   const auto serialized = kFixedHeaderBytes + cells_.size() * 48U +
       layers_.size() * (16U + config_.route_width * sizeof(std::uint32_t)) +
+      sizeof(std::uint64_t) + transitions_.size() * sizeof(std::uint32_t) +
       kDigestBytes;
   return {generation_, completed_routes_, total_selections_,
           consecutive_reuse_selections_, observed, serialized};
@@ -356,6 +431,8 @@ std::vector<std::byte> RouteCensus::serialize(
   output.reserve(kFixedHeaderBytes + cells_.size() * 48U +
                  layers_.size() *
                      (16U + config_.route_width * sizeof(std::uint32_t)) +
+                 sizeof(std::uint64_t) +
+                 transitions_.size() * sizeof(std::uint32_t) +
                  kDigestBytes);
   output.insert(output.end(), kMagic.begin(), kMagic.end());
   append_u32(output, kVersion);
@@ -386,6 +463,8 @@ std::vector<std::byte> RouteCensus::serialize(
     append_u64(output, layer.consecutive_reuse);
     for (const auto expert : layer.previous_route) append_u32(output, expert);
   }
+  append_u64(output, transitions_.size());
+  for (const auto count : transitions_) append_u32(output, count);
   const auto digest = sha256(output);
   output.insert(output.end(), digest.begin(), digest.end());
   return output;

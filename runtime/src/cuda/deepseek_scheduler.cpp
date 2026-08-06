@@ -44,6 +44,19 @@ struct HeldHostLease final {
   HostExpertLease lease;
 };
 
+enum class PredictionState : std::uint8_t {
+  unavailable,
+  queued,
+  pending,
+  ready,
+  resident,
+};
+
+struct PendingPrefetch final {
+  ExpertKey key;
+  AcquireHandle handle;
+};
+
 using LayerWorkingSet =
     std::array<std::vector<HeldLease>, kDeepSeekLayers>;
 
@@ -88,6 +101,10 @@ struct DeepSeekDecodeScheduler::Core final {
   std::deque<std::uint64_t> runnable;
   std::deque<std::uint64_t> acquisition_round_robin;
   std::size_t inflight_acquires{};
+  std::deque<ExpertKey> prefetch_queue;
+  std::vector<PendingPrefetch> pending_prefetch;
+  std::array<std::map<std::uint32_t, PredictionState>, kDeepSeekLayers>
+      predictions;
   DeepSeekDecodeSchedulerSnapshot metrics;
 
   void enqueue_runnable(ScheduledRequest& request) {
@@ -220,12 +237,147 @@ struct DeepSeekDecodeScheduler::Core final {
     return Status::success();
   }
 
+  void collect_prefetch() {
+    for (std::size_t index = 0U; index < pending_prefetch.size();) {
+      auto& pending = pending_prefetch[index];
+      if (pending.handle.wait_for(0ms) != std::future_status::ready) {
+        ++index;
+        continue;
+      }
+      auto result = pending.handle.get();
+      auto& predicted = predictions[pending.key.layer];
+      const auto item = predicted.find(pending.key.expert);
+      if (result.status.ok() && result.lease) {
+        if (item != predicted.end()) item->second = PredictionState::ready;
+        ++metrics.prefetch_completed;
+      } else if (item != predicted.end()) {
+        item->second = PredictionState::unavailable;
+      }
+      pending_prefetch.erase(
+          pending_prefetch.begin() + static_cast<std::ptrdiff_t>(index));
+    }
+  }
+
+  void cancel_prefetch_for_exact_demand(
+      std::uint32_t layer, std::span<const std::uint32_t> missing) {
+    for (std::size_t index = 0U; index < pending_prefetch.size();) {
+      const auto& key = pending_prefetch[index].key;
+      const bool exact = key.layer == layer &&
+          std::find(missing.begin(), missing.end(), key.expert) !=
+              missing.end();
+      if (exact) {
+        ++index;
+        continue;
+      }
+      pending_prefetch[index].handle.cancel();
+      const auto item = predictions[key.layer].find(key.expert);
+      if (item != predictions[key.layer].end() &&
+          item->second == PredictionState::pending)
+        item->second = PredictionState::queued;
+      pending_prefetch.erase(
+          pending_prefetch.begin() + static_cast<std::ptrdiff_t>(index));
+      ++metrics.prefetch_cancelled;
+    }
+  }
+
+  void attribute_predictions(
+      std::uint32_t layer, std::span<const std::uint32_t> route) {
+    collect_prefetch();
+    auto& prior = predictions[layer];
+    for (const auto& [expert, state] : prior) {
+      const bool selected =
+          std::find(route.begin(), route.end(), expert) != route.end();
+      if (!selected) {
+        ++metrics.prefetch_incorrect;
+        continue;
+      }
+      const ExpertKey key{config.model_id, layer, expert,
+                          kExpertQuantAbiDeepSeekSm86};
+      const auto snapshot = cache.inspect(key);
+      if ((state == PredictionState::ready ||
+           state == PredictionState::resident) &&
+          snapshot && snapshot->has_device_copy) {
+        ++metrics.prefetch_useful;
+      } else if (state == PredictionState::ready) {
+        ++metrics.prefetch_evicted_before_use;
+      } else {
+        ++metrics.prefetch_late;
+      }
+    }
+    std::erase_if(prefetch_queue, [layer](const ExpertKey& key) {
+      return key.layer == layer;
+    });
+    for (std::size_t index = 0U; index < pending_prefetch.size();) {
+      if (pending_prefetch[index].key.layer != layer) {
+        ++index;
+        continue;
+      }
+      pending_prefetch[index].handle.cancel();
+      pending_prefetch.erase(
+          pending_prefetch.begin() + static_cast<std::ptrdiff_t>(index));
+      ++metrics.prefetch_cancelled;
+    }
+    prior.clear();
+  }
+
+  void publish_predictions(
+      std::uint32_t layer, std::span<const std::uint32_t> route) {
+    if (!hybrid.route_census ||
+        config.transition_predictions_per_layer == 0U)
+      return;
+    auto& prior = predictions[layer];
+    const auto next = hybrid.route_census->predict_next(
+        layer, route, config.transition_predictions_per_layer);
+    for (const auto& prediction : next) {
+      const auto* record = catalog.find(layer, prediction.key.expert);
+      if (!record) continue;
+      ++metrics.prefetch_predictions;
+      const auto snapshot = cache.inspect(prediction.key);
+      if (snapshot && snapshot->has_device_copy) {
+        prior.emplace(prediction.key.expert, PredictionState::resident);
+      } else if (snapshot && snapshot->has_host_copy &&
+                 cache.vram_admission_would_improve(prediction.key,
+                                                    *record)) {
+        prior.emplace(prediction.key.expert, PredictionState::queued);
+        prefetch_queue.push_back(prediction.key);
+      } else {
+        prior.emplace(prediction.key.expert, PredictionState::unavailable);
+      }
+    }
+  }
+
+  void pump_prefetch() {
+    collect_prefetch();
+    if (inflight_acquires != 0U) return;
+    while (pending_prefetch.size() < config.maximum_inflight_prefetch &&
+           !prefetch_queue.empty()) {
+      const auto key = prefetch_queue.front();
+      prefetch_queue.pop_front();
+      auto item = predictions[key.layer].find(key.expert);
+      if (item == predictions[key.layer].end() ||
+          item->second != PredictionState::queued)
+        continue;
+      const auto* record = catalog.find(key.layer, key.expert);
+      if (!record) {
+        item->second = PredictionState::unavailable;
+        continue;
+      }
+      item->second = PredictionState::pending;
+      pending_prefetch.push_back({key, cache.acquire(key, *record)});
+      ++metrics.prefetch_scheduled;
+    }
+  }
+
   Status retain_completed_route(
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
     if (hybrid.route_census) {
       for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
         const auto first = result.routed_experts.begin() + row * 6U;
+        if (row == 0U)
+          attribute_predictions(
+              result.layer,
+              std::span<const std::uint32_t>(first, first + 6U));
         const auto observed = hybrid.route_census->observe(
             result.layer, std::span<const std::uint32_t>(first, first + 6U),
             result.route_rows == 1U
@@ -233,6 +385,10 @@ struct DeepSeekDecodeScheduler::Core final {
                 : std::span<const std::uint32_t>());
         if (!observed.ok()) return copied_status(observed);
         ++metrics.route_observations;
+        if (row + 1U == result.route_rows)
+          publish_predictions(
+              result.layer,
+              std::span<const std::uint32_t>(first, first + 6U));
       }
     }
     if (!config.retain_previous_route) {
@@ -370,6 +526,8 @@ struct DeepSeekDecodeScheduler::Core final {
       return {ErrorCode::internal,
               "DeepSeek controller suspended without missing experts"};
     }
+    cancel_prefetch_for_exact_demand(result.layer,
+                                     result.missing_experts);
     auto status = reconcile_working_set(request, result);
     if (!status.ok()) return status;
     auto* retained = layer_working_set(request, result.layer);
@@ -550,6 +708,7 @@ struct DeepSeekDecodeScheduler::Core final {
       const bool started = pump_acquisitions();
       if (!completed && !started) break;
     }
+    pump_prefetch();
   }
 };
 
@@ -562,6 +721,8 @@ DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
   if (config.model_id == 0U || config.maximum_requests == 0U ||
       config.maximum_inflight_acquires == 0U ||
       config.maximum_layer_advances_per_poll == 0U ||
+      (config.transition_predictions_per_layer != 0U &&
+       config.maximum_inflight_prefetch == 0U) ||
       static_cast<bool>(core_->hybrid.cpu_executor) !=
           static_cast<bool>(core_->hybrid.planner) ||
       (core_->hybrid.route_census &&
@@ -581,6 +742,7 @@ DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
 
 DeepSeekDecodeScheduler::~DeepSeekDecodeScheduler() {
   if (!core_) return;
+  for (auto& pending : core_->pending_prefetch) pending.handle.cancel();
   for (auto& [id, request] : core_->requests) {
     (void)id;
     core_->abandon_acquisitions(*request);

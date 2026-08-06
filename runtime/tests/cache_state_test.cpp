@@ -1325,6 +1325,10 @@ void test_route_census_is_bounded_ranked_and_recoverable() {
   const std::array duplicate{1U, 1U, 2U};
   require(!census.observe(0U, duplicate).ok(),
           "route census accepted a duplicate route");
+  const auto prediction = census.predict_next(0U, first, 2U);
+  require(prediction.size() == 1U && prediction[0].key.expert == 4U &&
+              prediction[0].transition_score == 3U,
+          "route census transition prediction is not stable");
   const auto warm = census.stable_warm_set(3U, 2U);
   require(warm.size() == 3U && warm[0].key.layer == 0U &&
               (warm[0].key.expert == 1U || warm[0].key.expert == 2U) &&
@@ -1343,7 +1347,8 @@ void test_route_census_is_bounded_ranked_and_recoverable() {
   auto loaded = er::RouteCensus::load(prefix, config);
   require(loaded.status.ok() && loaded.census &&
               loaded.census->snapshot().generation == 2U &&
-              loaded.census->snapshot().completed_routes == 3U,
+              loaded.census->snapshot().completed_routes == 3U &&
+              loaded.census->predict_next(0U, first, 2U).size() == 1U,
           "route census did not load its newest valid generation");
   auto mismatch = config;
   mismatch.model_content_hash[0] ^= std::byte{1};

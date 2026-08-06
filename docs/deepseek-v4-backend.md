@@ -394,6 +394,16 @@ router; the remaining 40 learned routers cannot be resolved before their input
 activation exists. Therefore speculative prefetch alone cannot bridge the
 single-stream bandwidth gap on this host.
 
+The authenticated route census now also persists a bounded first-order
+transition table for every layer. After a completed route, the scheduler may
+predict one expert for the next token in that same layer. Promotion is limited
+to a compact record already resident in RAM, with one global in-flight credit;
+it never creates speculative SSD traffic. Exact misses cancel unrelated work.
+The counters distinguish predictions that were already resident from scheduled
+promotions and record useful, late, incorrect, cancelled, and evicted outcomes.
+Legacy version-1 census files remain readable and acquire transition evidence
+online.
+
 The checkpoint remains authoritative: the qualification bundle now contains
 only a manifest and a six-row extent descriptor, about 3 KiB total. No copied
 expert payload is retained. Extents must cover the compact destination exactly

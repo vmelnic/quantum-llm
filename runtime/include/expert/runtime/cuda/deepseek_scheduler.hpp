@@ -26,6 +26,8 @@ struct DeepSeekDecodeSchedulerConfig final {
   std::size_t maximum_requests{};
   std::size_t maximum_inflight_acquires{};
   std::size_t maximum_layer_advances_per_poll{};
+  std::size_t maximum_inflight_prefetch{1U};
+  std::size_t transition_predictions_per_layer{1U};
   // Retain the most recent six routed experts for every layer and controller.
   // This deterministic working set is bounded by 6 * layer count.
   bool retain_previous_route{};
@@ -61,6 +63,14 @@ struct DeepSeekDecodeSchedulerSnapshot final {
   std::uint64_t cpu_placements{};
   std::uint64_t hybrid_layers{};
   std::uint64_t route_observations{};
+  std::uint64_t prefetch_predictions{};
+  std::uint64_t prefetch_scheduled{};
+  std::uint64_t prefetch_completed{};
+  std::uint64_t prefetch_useful{};
+  std::uint64_t prefetch_late{};
+  std::uint64_t prefetch_incorrect{};
+  std::uint64_t prefetch_cancelled{};
+  std::uint64_t prefetch_evicted_before_use{};
   std::uint64_t controller_advance_ns{};
   std::uint64_t expert_wait_ns{};
   std::uint64_t poll_ns{};

@@ -33,6 +33,11 @@ struct RouteCensusWarmEntry final {
   std::uint64_t gpu_selections{};
 };
 
+struct RouteCensusPrediction final {
+  ExpertKey key;
+  std::uint64_t transition_score{};
+};
+
 struct RouteCensusSnapshot final {
   std::uint64_t generation{};
   std::uint64_t completed_routes{};
@@ -62,6 +67,13 @@ class RouteCensus final {
   [[nodiscard]] std::vector<RouteCensusWarmEntry> stable_warm_set(
       std::size_t maximum_entries,
       std::size_t maximum_per_layer = 0U) const;
+  // Bounded first-order prediction for the next route of the same layer.
+  // Scores aggregate transitions from every expert in current_route. Experts
+  // already present in current_route are omitted because the scheduler keeps
+  // them protected as the deterministic working set.
+  [[nodiscard]] std::vector<RouteCensusPrediction> predict_next(
+      std::uint32_t layer, std::span<const std::uint32_t> current_route,
+      std::size_t maximum_entries) const;
   [[nodiscard]] RouteCensusSnapshot snapshot() const noexcept;
   [[nodiscard]] const RouteCensusConfig& config() const noexcept {
     return config_;
@@ -100,6 +112,7 @@ class RouteCensus final {
   mutable std::mutex mutex_;
   std::vector<Cell> cells_;
   std::vector<LayerState> layers_;
+  std::vector<std::uint32_t> transitions_;
   std::uint64_t generation_{};
   std::uint64_t observation_{};
   std::uint64_t completed_routes_{};
