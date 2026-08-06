@@ -450,6 +450,26 @@ the pre-experiment census restored. The measured scoreboard stalls therefore
 cannot be converted into a win by local unrolling alone; the next dense change
 must alter the representation or use an architecture-suited dot-product path.
 
+Q8 activations plus an SM86 DP4A INT8-weight GEMV were then measured on every
+distinct layer-0 INT8 attention geometry. Each number is the mean of 100 warm
+iterations; the Q8 column includes activation quantization:
+
+| projection geometry | FP32 activation | Q8 + DP4A | result |
+| --- | ---: | ---: | --- |
+| 512 × 4096 | 0.00940 ms | 0.01907 ms | 2.03x slower |
+| 1024 × 4096 | 0.01079 ms | 0.02017 ms | 1.87x slower |
+| 8192 × 4096 | 0.04440 ms | 0.05309 ms | 1.20x slower |
+| 4096 × 8192 | 0.04867 ms | 0.06203 ms | 1.27x slower |
+| 32768 × 1024 | 0.04273 ms | 0.04747 ms | 1.11x slower |
+
+The candidate's Q8-versus-accepted RMSE ranged from `3.63e-4` to `1.00e-3`,
+but accuracy is irrelevant because no geometry won. The accepted kernel already
+streams one-byte weights efficiently; shrinking the activation does not shrink
+the dominant matrix read. The Q8/DP4A experiment was removed before commit.
+Future dense work must first reduce authenticated weight bytes or otherwise
+reuse them across real rows/requests, then qualify the changed representation
+against the independent model oracle.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

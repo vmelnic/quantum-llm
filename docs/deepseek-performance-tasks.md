@@ -143,12 +143,21 @@ single-request latency and aggregate throughput.
   the pipelined kernel took 347.028 ms and the original took 334.189 ms. Both
   emitted token `19923`, proving route stability but no speedup. The code was
   removed before commit.
+- [x] Evaluate Q8 activation quantization plus DP4A against all five layer-0
+  INT8 attention geometries. Reject it as a drop-in dense replacement: with
+  quantization inside the measured path it was slower for every geometry.
+  Activation compression cannot reduce the dominant INT8 weight traffic; the
+  experimental implementation was removed before commit.
 - [ ] Profile representative BF16, F32, grouped-INT8, and routed-FP4 launches
   with Nsight Compute, then choose the first kernel by attainable end-to-end
   reduction rather than by one launch's percentage.
 - [ ] Design the dense replacement around routing stability: either preserve
   the accepted accumulation order or qualify route divergence and output
   quality explicitly. Token equality on one prompt is insufficient.
+- [ ] Qualify a smaller dense weight ABI offline before writing another CUDA
+  executor. Report reconstruction error for every distinct projection shape
+  and reject any representation that cannot pass the existing block/model
+  oracle budget.
 - [ ] Add grouped INT8-MMA/Tensor Core kernels for prefill and multi-row MoE,
   while retaining the faster measured decode path for batch one.
 - [ ] Tile and tune the direct FP4/UE8M0 routed kernel; unpack reusable weight
