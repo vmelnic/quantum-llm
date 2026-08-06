@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][string]$RoutedCatalog,
     [Parameter(Mandatory = $true)][string]$Output,
     [string]$MtpSet = "",
+    [string]$MtpRoutedCatalog = "",
     [string]$StateDirectory = "",
     [ValidateRange(0.001, 1000.0)][double]$CpuMillisecondsPerSelection = 9.342,
     [ValidateRange(0.001, 1000.0)][double]$GpuMillisecondsPerSelection = 0.543,
@@ -27,6 +28,12 @@ $descriptors = [System.IO.Path]::GetFullPath($DescriptorBundle)
 $routed = [System.IO.Path]::GetFullPath($RoutedCatalog)
 $destination = [System.IO.Path]::GetFullPath($Output)
 $mtp = if ($MtpSet) { [System.IO.Path]::GetFullPath($MtpSet) } else { "" }
+$mtpRouted = if ($MtpRoutedCatalog) {
+    [System.IO.Path]::GetFullPath($MtpRoutedCatalog)
+} else { "" }
+if ([bool]$mtp -ne [bool]$mtpRouted) {
+    throw "MtpSet and MtpRoutedCatalog must be published together"
+}
 $state = if ($StateDirectory) {
     [System.IO.Path]::GetFullPath($StateDirectory)
 } else {
@@ -66,6 +73,26 @@ if ($mtp) {
         [int]$mtpManifest.routed_experts -ne 256) {
         throw "Unsupported DeepSeek MTP resource set"
     }
+    foreach ($path in @(
+        (Join-Path $mtpRouted "manifest.json"),
+        (Join-Path $mtpRouted "catalog.tsv"),
+        (Join-Path $mtpRouted "extents.tsv")
+    )) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "DeepSeek MTP routed pack dependency missing: $path"
+        }
+    }
+    $mtpPackManifest = Get-Content -LiteralPath `
+        (Join-Path $mtpRouted "manifest.json") -Raw | ConvertFrom-Json
+    if ($mtpPackManifest.format -ne "deepseek-routed-compact-pack-v1" -or
+        [int]$mtpPackManifest.layers -ne 1 -or
+        [int]$mtpPackManifest.expert_count -ne 256 -or
+        @(Get-ChildItem -LiteralPath $mtpRouted -Filter "experts-*.dsc" `
+            -File).Count -ne 1 -or
+        @(Get-ChildItem -LiteralPath $mtpRouted `
+            -Filter "experts-*.dsc.commit.json" -File).Count -ne 1) {
+        throw "Unsupported or incomplete DeepSeek MTP routed pack"
+    }
 }
 if ((Test-Path -LiteralPath $destination) -or
     (Test-Path -LiteralPath $partial)) {
@@ -102,7 +129,11 @@ $mtpHash = if ($mtp) {
     (Get-FileHash -LiteralPath (Join-Path $mtp "manifest.json") `
         -Algorithm SHA256).Hash.ToLowerInvariant()
 } else { "" }
-$bundleVersion = if ($mtp) { 2 } else { 1 }
+$mtpRoutedHash = if ($mtpRouted) {
+    (Get-FileHash -LiteralPath (Join-Path $mtpRouted "catalog.tsv") `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+} else { "" }
+$bundleVersion = if ($mtp) { 3 } else { 1 }
 
 New-Item -ItemType Directory -Path $partial | Out-Null
 try {
@@ -129,7 +160,10 @@ try {
         "gpu_ns_per_selection`t$([long]($GpuMillisecondsPerSelection * 1000000.0))",
         "h2d_bytes_per_second`t$([long]($H2DGigabytesPerSecond * 1000000000.0))"
     )
-    if ($mtp) { $runtimeLines += "mtp`tmtp" }
+    if ($mtp) {
+        $runtimeLines += "mtp`tmtp"
+        $runtimeLines += "mtp_routed`t$mtpRouted"
+    }
     $runtimeText = ($runtimeLines -join "`n") + "`n"
     Write-Utf8NoBom -Path (Join-Path $partial "runtime.tsv") `
         -Value $runtimeText
@@ -146,6 +180,7 @@ try {
             name = "deepseek-worker-bundle"
             version = $bundleVersion
             routed_storage = if ($packed) { "compact-pack" } else { "source-extents" }
+            mtp_routed_storage = if ($mtpRouted) { "compact-pack" } else { $null }
         }
         quantization = [ordered]@{
             dense = "fp8-e4m3-ue8m0-to-sm86-int8-per-row"
@@ -169,6 +204,7 @@ try {
             dense_sha256 = $denseHash
             experts_sha256 = $expertsHash
             mtp_sha256 = if ($mtp) { $mtpHash } else { $null }
+            mtp_routed_sha256 = if ($mtpRouted) { $mtpRoutedHash } else { $null }
         }
         integrity = [ordered]@{
             content_sha256 = $runtimeHash
@@ -196,6 +232,7 @@ $result = [PSCustomObject]@{
     routed_catalog = $routed
     durable_routed_pack = $packed
     mtp_resource_set = $mtp
+    mtp_routed_catalog = $mtpRouted
     model_sha256 = $modelHash
     status = "published"
 }

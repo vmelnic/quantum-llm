@@ -220,6 +220,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             rope_mode="resident_table",
             gpu_phase_timing=False,
             mtp_resource_available=True,
+            mtp_runtime_ready=True, mtp_enabled=False,
             kv_allocation="preallocated", kv_page_tokens=256,
             kv_page_bytes=1024, kv_page_capacity=8192,
             placement_profile="capacity", ram_cache_bytes=48 << 30,
@@ -250,6 +251,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "rope_mode": "resident_table",
             "gpu_phase_timing": False,
             "mtp_resource_available": True,
+            "mtp_runtime_ready": True,
             "mtp_enabled": False,
         })
         self.assertEqual(info["worker_kv"]["dtype"], "bf16")

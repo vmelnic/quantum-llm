@@ -264,6 +264,10 @@ latency or aggregate throughput without changing model semantics.
     Its two-stage `prepare`/`complete` lifecycle exposes only a route to the
     control plane, owns 1,918,500 device bytes at context four, and can abandon
     an unused draft while retaining the valid causal MTP attention write.
+  - [x] Publish worker bundle v3 with an explicit external MTP compact-pack
+    dependency and load the tensor state, one shared expert, routed catalog,
+    cache and CUDA directory transactionally at worker startup. Readiness was
+    observed with `mtp_runtime_ready=true` and `mtp_enabled=false`.
 - [ ] Add transactional two-row target verification. Row zero is guaranteed;
   row one is speculative. On rejection, commit row zero and logically roll
   back row one by retaining the external position and overwriting that explicit

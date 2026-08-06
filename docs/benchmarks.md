@@ -782,6 +782,13 @@ were unchanged. Expert cache/directory ownership remains outside the state,
 allowing the normal placement control plane to suspend between route
 preparation and draft completion.
 
+Worker bundle v3 then bound that request state to the real MTP compact pack.
+A capacity-one startup with a four-token qualification context reached ready
+only after the MTP tensor namespace, one shared expert and its independent
+model-18 cache/directory were resident. The worker reported resource available
+and runtime ready while keeping MTP disabled; it then shut down cleanly. This
+is a production startup boundary, not target-verification throughput.
+
 ## Benchmark rules
 
 Any published result must include:

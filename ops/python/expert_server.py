@@ -174,6 +174,14 @@ class CudaWorker:
         self.mtp_resource_available = bool(
             response.get("mtp_resource_available", False)
         )
+        self.mtp_runtime_ready = bool(response.get("mtp_runtime_ready", False))
+        self.mtp_enabled = bool(response.get("mtp_enabled", False))
+        if self.mtp_runtime_ready and not self.mtp_resource_available:
+            self.process.kill()
+            raise WorkerError("MTP runtime cannot be ready without resources")
+        if self.mtp_enabled:
+            self.process.kill()
+            raise WorkerError("unqualified MTP execution was enabled")
         self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
@@ -804,7 +812,8 @@ class Application:
                 "rope_mode": self.worker.rope_mode,
                 "gpu_phase_timing": self.worker.gpu_phase_timing,
                 "mtp_resource_available": self.worker.mtp_resource_available,
-                "mtp_enabled": False,
+                "mtp_runtime_ready": self.worker.mtp_runtime_ready,
+                "mtp_enabled": self.worker.mtp_enabled,
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,

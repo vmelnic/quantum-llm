@@ -7,6 +7,7 @@
 #include "expert/runtime/cuda/deepseek_decode.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_request.hpp"
+#include "expert/runtime/cuda/deepseek_mtp_request.hpp"
 #include "expert/runtime/cuda/deepseek_scheduler.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
@@ -107,11 +108,13 @@ struct Bundle final {
   std::filesystem::path routed;
   std::filesystem::path census;
   std::filesystem::path mtp;
+  std::filesystem::path mtp_routed;
   er::Sha256Digest model_hash{};
   double cpu_ns{};
   double gpu_ns{};
   double h2d_bytes_per_second{};
   bool mtp_available{};
+  bool mtp_runtime_ready{};
 };
 
 std::filesystem::path bundle_path(const std::filesystem::path& root,
@@ -128,9 +131,11 @@ Bundle load_bundle(const std::filesystem::path& root) {
   std::string line;
   require(static_cast<bool>(std::getline(input, line)) &&
               (line == "deepseek-worker-bundle-v1" ||
-               line == "deepseek-worker-bundle-v2"),
+               line == "deepseek-worker-bundle-v2" ||
+               line == "deepseek-worker-bundle-v3"),
           "invalid DeepSeek worker bundle header");
-  const bool has_mtp = line == "deepseek-worker-bundle-v2";
+  const bool has_mtp = line != "deepseek-worker-bundle-v1";
+  const bool has_mtp_runtime = line == "deepseek-worker-bundle-v3";
   std::map<std::string, std::string> values;
   while (std::getline(input, line)) {
     const auto fields = split_tabs(line);
@@ -139,7 +144,8 @@ Bundle load_bundle(const std::filesystem::path& root) {
                                std::string(fields[1])).second,
             "invalid or duplicate DeepSeek worker bundle field");
   }
-  require(input.eof() && values.size() == (has_mtp ? 12U : 11U) &&
+  const auto expected_fields = has_mtp_runtime ? 13U : has_mtp ? 12U : 11U;
+  require(input.eof() && values.size() == expected_fields &&
               values.at("model_id") == "17",
           "incomplete DeepSeek worker bundle");
   Bundle result;
@@ -150,11 +156,14 @@ Bundle load_bundle(const std::filesystem::path& root) {
   result.routed = bundle_path(root, values.at("routed"));
   result.census = bundle_path(root, values.at("census"));
   if (has_mtp) result.mtp = bundle_path(root, values.at("mtp"));
+  if (has_mtp_runtime)
+    result.mtp_routed = bundle_path(root, values.at("mtp_routed"));
   result.model_hash = digest(values.at("model_sha256"));
   result.cpu_ns = std::stod(values.at("cpu_ns_per_selection"));
   result.gpu_ns = std::stod(values.at("gpu_ns_per_selection"));
   result.h2d_bytes_per_second = std::stod(values.at("h2d_bytes_per_second"));
   result.mtp_available = has_mtp;
+  result.mtp_runtime_ready = has_mtp_runtime;
   require(std::filesystem::is_directory(result.checkpoint) &&
               std::filesystem::is_directory(result.dense) &&
               std::filesystem::is_directory(result.typed) &&
@@ -165,6 +174,12 @@ Bundle load_bundle(const std::filesystem::path& root) {
                 std::filesystem::is_regular_file(result.mtp / "manifest.json") &&
                 std::filesystem::is_regular_file(
                     result.mtp / "routed" / "catalog.tsv"))) &&
+              (!has_mtp_runtime ||
+               (std::filesystem::is_directory(result.mtp_routed) &&
+                std::filesystem::is_regular_file(
+                    result.mtp_routed / "manifest.json") &&
+                std::filesystem::is_regular_file(
+                    result.mtp_routed / "catalog.tsv"))) &&
               std::isfinite(result.cpu_ns) && result.cpu_ns > 0.0 &&
               std::isfinite(result.gpu_ns) && result.gpu_ns > 0.0 &&
               std::isfinite(result.h2d_bytes_per_second) &&
@@ -219,6 +234,7 @@ std::array<std::array<float, 32U>, 8U> rope_row(std::uint32_t position) {
 struct Request final {
   std::shared_ptr<er::cuda::DeepSeekRequestState> state;
   std::shared_ptr<er::cuda::DeepSeekDecodeController> controller;
+  std::shared_ptr<er::cuda::DeepSeekMtpRequestState> mtp;
   cudaStream_t stream{};
   er::cuda::DeepSeekDecodeTelemetry controller_telemetry;
   std::uint32_t predicted{};
@@ -288,6 +304,26 @@ class Model final {
     const auto catalog_status = er::DeepSeekExpertCatalog::load(
         bundle_.routed, bundle_.checkpoint, catalog_);
     require(catalog_status.ok(), catalog_status.message());
+    if (bundle_.mtp_runtime_ready) {
+      auto mtp_loaded = er::load_deepseek_tensor_artifacts(
+          bundle_.mtp / "dense", bundle_.mtp / "typed-residency",
+          bundle_.checkpoint, 7U, 19U);
+      require(mtp_loaded.status.ok(), mtp_loaded.status.message());
+      mtp_artifacts_ = std::move(mtp_loaded.artifacts);
+      auto mtp_shared = er::load_deepseek_shared_artifacts(
+          bundle_.mtp / "shared", bundle_.checkpoint, 1U, 18U);
+      require(mtp_shared.status.ok(), mtp_shared.status.message());
+      mtp_shared_specs_ = std::move(mtp_shared.shared);
+      const auto mtp_catalog_status =
+          er::DeepSeekExpertCatalog::load_namespace(
+              bundle_.mtp_routed, bundle_.checkpoint, 1U, mtp_catalog_);
+      require(mtp_catalog_status.ok(), mtp_catalog_status.message());
+      const auto mtp_request_size =
+          er::cuda::deepseek_mtp_request_state_size(max_context_);
+      require(mtp_request_size.status.ok(), mtp_request_size.status.message());
+      mtp_request_bytes_ = mtp_request_size.total_bytes;
+      mtp_cache_bytes_ = 512ULL << 20U;
+    }
     const auto request_size = er::cuda::deepseek_request_state_size(max_context_);
     require(request_size.status.ok(), request_size.status.message());
     request_bytes_ = request_size.total_bytes;
@@ -304,20 +340,27 @@ class Model final {
     require(kv_page_capacity_ >= pages_per_request * capacity_,
             "DeepSeek KV cache cannot reserve configured request capacity");
     constexpr std::uint64_t shared_bytes = 43ULL * 25'198'592U;
-    require(vram_bytes_ >= shared_bytes + 7ULL * 13'369'344U,
+    require(vram_bytes_ >= shared_bytes + 7ULL * 13'369'344U +
+                               mtp_cache_bytes_ &&
+                ram_bytes_ > mtp_cache_bytes_,
             "DeepSeek VRAM cache cannot hold shared plus one route");
     std::size_t free{}, total{};
     cuda_check(cudaMemGetInfo(&free, &total), "inspect DeepSeek worker VRAM");
     const auto fixed = artifacts_.dense_device_bytes +
                        artifacts_.typed_source_bytes +
-                       request_bytes_ * capacity_ + rope_table_bytes();
+                       request_bytes_ * capacity_ + rope_table_bytes() +
+                       mtp_artifacts_.dense_device_bytes +
+                       mtp_artifacts_.typed_source_bytes +
+                       mtp_request_bytes_ * capacity_;
     require(fixed + vram_bytes_ + (1ULL << 30U) <= free,
             "DeepSeek worker VRAM preflight failed");
 
     iocp_ = std::make_shared<er::WindowsIocpStorage>(2U);
     storage_ = std::make_shared<er::ExtentGatherStorage>(iocp_);
     const auto staging = std::max<std::uint64_t>(
-        64ULL << 20U, artifacts_.maximum_source_record_bytes);
+        64ULL << 20U,
+        std::max(artifacts_.maximum_source_record_bytes,
+                 mtp_artifacts_.maximum_source_record_bytes));
     MEMORYSTATUSEX memory{sizeof(memory)};
     require(GlobalMemoryStatusEx(&memory) != 0,
             "inspect DeepSeek worker RAM failed");
@@ -334,6 +377,15 @@ class Model final {
     const auto model_status = er::cuda::DeepSeekResidentModelState::load(
         *storage_, *buffers_, artifacts_.dense, artifacts_.typed, *model_);
     require(model_status.ok(), model_status.message());
+    if (bundle_.mtp_runtime_ready) {
+      mtp_model_ =
+          std::make_shared<er::cuda::DeepSeekResidentTensorState>();
+      const auto mtp_model_status =
+          er::cuda::DeepSeekResidentTensorState::load(
+              *storage_, *buffers_, mtp_artifacts_.dense,
+              mtp_artifacts_.typed, *mtp_model_);
+      require(mtp_model_status.ok(), mtp_model_status.message());
+    }
     directory_ = std::make_shared<er::cuda::CudaExpertDirectory>(
         17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U,
         std::max<std::uint32_t>(64U, capacity_ * 8U));
@@ -341,8 +393,12 @@ class Model final {
         er::cuda::CudaExpertUploaderOptions{
             0U, true, 0U, true});
     er::ExpertCacheConfig cache_config;
-    cache_config.ram = {ram_bytes_, ram_bytes_, ram_bytes_ * 7U / 8U};
-    cache_config.vram = {vram_bytes_, vram_bytes_, vram_bytes_ * 7U / 8U};
+    const auto target_ram_bytes = ram_bytes_ - mtp_cache_bytes_;
+    const auto target_vram_bytes = vram_bytes_ - mtp_cache_bytes_;
+    cache_config.ram = {target_ram_bytes, target_ram_bytes,
+                        target_ram_bytes * 7U / 8U};
+    cache_config.vram = {target_vram_bytes, target_vram_bytes,
+                         target_vram_bytes * 7U / 8U};
     cache_config.retain_host_copy = true;
     cache_config.trusted_immutable_source = true;
     cache_ = std::make_unique<er::ExpertCache>(
@@ -350,6 +406,26 @@ class Model final {
     const auto shared_status = er::ResidentExpertSet::load(
         *cache_, artifacts_.shared, shared_);
     require(shared_status.ok(), shared_status.message());
+    if (bundle_.mtp_runtime_ready) {
+      mtp_directory_ = std::make_shared<er::cuda::CudaExpertDirectory>(
+          18U, er::kExpertQuantAbiDeepSeekSm86, 1U, 257U,
+          std::max<std::uint32_t>(16U, capacity_ * 8U));
+      mtp_uploader_ = std::make_shared<er::cuda::CudaExpertUploader>(
+          er::cuda::CudaExpertUploaderOptions{0U, true, 0U, true});
+      er::ExpertCacheConfig mtp_cache_config;
+      mtp_cache_config.ram = {mtp_cache_bytes_, mtp_cache_bytes_,
+                              mtp_cache_bytes_ * 7U / 8U};
+      mtp_cache_config.vram = {mtp_cache_bytes_, mtp_cache_bytes_,
+                               mtp_cache_bytes_ * 7U / 8U};
+      mtp_cache_config.retain_host_copy = true;
+      mtp_cache_config.trusted_immutable_source = true;
+      mtp_cache_ = std::make_unique<er::ExpertCache>(
+          mtp_cache_config, storage_, mtp_uploader_, buffers_,
+          mtp_directory_);
+      const auto mtp_shared_status = er::ResidentExpertSet::load(
+          *mtp_cache_, mtp_shared_specs_, mtp_shared_);
+      require(mtp_shared_status.ok(), mtp_shared_status.message());
+    }
     initialize_rope_table();
     cpu_ = std::make_shared<er::cpu::DeepSeekPackedExecutor>(
         er::cpu::DeepSeekPackedExecutorConfig{
@@ -396,6 +472,14 @@ class Model final {
     require(state.status.ok() && state.state, state.status.message());
     auto request = std::make_unique<Request>();
     request->state = std::move(state.state);
+    if (bundle_.mtp_runtime_ready) {
+      auto mtp_state = er::cuda::create_deepseek_mtp_request_state(
+          model_, mtp_model_, {max_context_, mtp_request_bytes_});
+      require(mtp_state.status.ok() && mtp_state.state,
+              mtp_state.status.ok() ? "MTP request returned no ownership"
+                                    : mtp_state.status.message());
+      request->mtp = std::move(mtp_state.state);
+    }
     cuda_check(cudaStreamCreateWithFlags(&request->stream,
                                          cudaStreamNonBlocking),
                "create DeepSeek request stream");
@@ -607,6 +691,10 @@ class Model final {
   }
   bool gpu_phase_timing() const noexcept { return gpu_phase_timing_; }
   bool mtp_available() const noexcept { return bundle_.mtp_available; }
+  bool mtp_runtime_ready() const noexcept {
+    return bundle_.mtp_runtime_ready && mtp_model_ && mtp_cache_ &&
+           mtp_directory_ && mtp_shared_.size() == 1U;
+  }
 
  private:
   static constexpr std::uint64_t rope_row_values = 8ULL * 32U;
@@ -686,21 +774,30 @@ class Model final {
   Bundle bundle_;
   std::uint32_t max_context_{}, capacity_{};
   std::uint64_t ram_bytes_{}, vram_bytes_{}, request_bytes_{}, next_operation_{1U};
+  std::uint64_t mtp_request_bytes_{}, mtp_cache_bytes_{};
   std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{};
   std::uint32_t kv_page_tokens_{};
   std::string placement_;
   bool gpu_phase_timing_{};
   er::DeepSeekModelArtifacts artifacts_;
+  er::DeepSeekTensorArtifacts mtp_artifacts_;
+  std::vector<er::ResidentExpertSpec> mtp_shared_specs_;
   er::DeepSeekExpertCatalog catalog_;
+  er::DeepSeekExpertCatalog mtp_catalog_;
   std::shared_ptr<er::WindowsIocpStorage> iocp_;
   std::shared_ptr<er::ExtentGatherStorage> storage_;
   std::shared_ptr<er::FixedBufferPool> buffers_;
   std::shared_ptr<er::cuda::DeepSeekResidentModelState> model_;
+  std::shared_ptr<er::cuda::DeepSeekResidentTensorState> mtp_model_;
   float* rope_table_{};
   std::shared_ptr<er::cuda::CudaExpertDirectory> directory_;
   std::shared_ptr<er::cuda::CudaExpertUploader> uploader_;
   std::unique_ptr<er::ExpertCache> cache_;
   er::ResidentExpertSet shared_;
+  std::shared_ptr<er::cuda::CudaExpertDirectory> mtp_directory_;
+  std::shared_ptr<er::cuda::CudaExpertUploader> mtp_uploader_;
+  std::unique_ptr<er::ExpertCache> mtp_cache_;
+  er::ResidentExpertSet mtp_shared_;
   std::shared_ptr<er::cpu::DeepSeekPackedExecutor> cpu_;
   std::shared_ptr<er::HybridDispatchPlanner> planner_;
   std::shared_ptr<er::RouteCensus> census_;
@@ -750,7 +847,10 @@ int worker_loop(Model& model) {
             << ",\"gpu_phase_timing\":"
             << (model.gpu_phase_timing() ? "true" : "false")
             << ",\"mtp_resource_available\":"
-            << (model.mtp_available() ? "true" : "false") << "}\n"
+            << (model.mtp_available() ? "true" : "false")
+            << ",\"mtp_runtime_ready\":"
+            << (model.mtp_runtime_ready() ? "true" : "false")
+            << ",\"mtp_enabled\":false}\n"
             << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {

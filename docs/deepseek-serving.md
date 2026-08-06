@@ -12,7 +12,7 @@ not load checkpoints or create CUDA contexts.
 atomically published runtime bundle:
 
 ```text
-deepseek-worker-bundle-v2/
+deepseek-worker-bundle-v3/
   manifest.json       public service identity and architecture
   runtime.tsv         exact runtime dependencies and measured placement seed
   dense/              authenticated FP8 dense descriptors
@@ -29,10 +29,12 @@ and measured CPU/CUDA/H2D seed. Unknown, duplicate, missing, corrupt, or
 model-mismatched state fails closed. A missing census is the only state-load
 condition that creates a new empty census.
 
-Bundle v1 remains accepted for base greedy serving. Bundle v2 adds the `mtp`
-resource and reports `mtp_resource_available=true`, but the worker keeps
-`mtp_enabled=false` until draft-state and target-verification gates are
-implemented. Availability is not execution and cannot change generated tokens.
+Bundle v1 remains accepted for base greedy serving. Bundle v2 records the MTP
+descriptor only. Bundle v3 additionally binds the external one-shard MTP
+compact pack and transactionally loads the complete MTP tensor/shared/cache/
+directory state. It reports `mtp_runtime_ready=true` only after that startup
+completes, but keeps `mtp_enabled=false` until target verification is qualified.
+Availability/readiness are not execution and cannot change generated tokens.
 
 For development, the routed catalog may point directly at authenticated
 SafeTensors extents. For deployment, publish only after the 43-shard compact
@@ -44,8 +46,9 @@ the manifest so the distinction is visible to operators.
   -Snapshot D:\models\deepseek-v4-flash\snapshot `
   -DescriptorBundle D:\qualification\deepseek-descriptors `
   -RoutedCatalog D:\models\deepseek-v4-flash\compact-pack-v1 `
-  -MtpSet D:\models\deepseek-v4-flash\mtp-set-v1 `
-  -Output D:\models\deepseek-v4-flash\worker-bundle-v2 `
+  -MtpSet D:\models\deepseek-v4-flash\mtp-set-v3 `
+  -MtpRoutedCatalog D:\models\deepseek-v4-flash\mtp-compact-pack-v1 `
+  -Output D:\models\deepseek-v4-flash\worker-bundle-v3 `
   -StateDirectory D:\state\deepseek-v4-flash
 ```
 
@@ -67,7 +70,7 @@ python -m venv work\venv\server
   -r requirements/server.txt
 
 ./ops/windows/Start-DeepSeekExpertServer.ps1 `
-  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v2 `
+  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v3 `
   -HostAddress 127.0.0.1 `
   -Port 8080
 ```
