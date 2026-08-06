@@ -70,6 +70,11 @@ retains conversation history. Enter `quit` or `exit`, or press Ctrl+C, to close
 both the client and the tunnel it created. With an empty `CHAT_SSH`, it connects
 directly to `CHAT_BASE_URL`.
 
+After readiness, the terminal client resolves the single deployed model from
+`/v1/models`. `CHAT_MODEL` remains the default selection used by lifecycle
+commands, but a preceding explicit `model.sh start qwen` does not make chat send
+the stale DeepSeek model ID. A mismatch is reported and corrected explicitly.
+
 With `CHAT_SHOW_STATS=1`, every turn prints prompt/output token counts, TTFT,
 total request time, end-to-end tokens/s, post-first-token rate, and finish
 reason. `/info` displays the deployed build, placement profile, MTP state,

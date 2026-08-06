@@ -11,6 +11,7 @@ artifact paths. The lifecycle wrapper consumes that file:
 
 ```bash
 ./ops/model.sh config             # resolved, non-secret configuration
+./ops/model.sh install            # sync + pinned server Python environment
 ./ops/model.sh start              # CHAT_MODEL from .env; sync + replace + wait
 ./ops/model.sh status
 ./ops/model.sh chat
@@ -23,10 +24,14 @@ artifact paths. The lifecycle wrapper consumes that file:
 ```
 
 Starting a model first stops both known scheduled tasks because they share one
-GPU and one API port. `MODEL_MAX_CONTEXT` and `MODEL_MAX_OUTPUT_TOKENS` become
+GPU and one API port. It checks the installed Python/tokenizer dependencies
+before disrupting the running model. `MODEL_MAX_CONTEXT` and
+`MODEL_MAX_OUTPUT_TOKENS` become
 the advertised API limits and are checked against `/model-info` before `start`
 returns. `CHAT_MAX_TOKENS` is an optional independent per-turn ceiling; the
-reference configuration gives chat the full model output allowance.
+reference configuration gives chat the full model output allowance. Chat uses
+the sole model returned by `/v1/models`, so an explicit model switch does not
+require rewriting `.env` before connecting.
 
 The sync includes only Git-visible, non-ignored files. It therefore excludes
 `.git`, models, work, logs, artifacts, and build output. It does not delete
@@ -76,6 +81,7 @@ cp .env.example .env
 | `Uninstall-ExpertServerTask.ps1` | stop and remove task registration |
 | `Invoke-P6ServiceSmoke.ps1` | identity, API, streaming, batching, cancellation smoke |
 | `Get-ExpertServerStatus.ps1` | task state, readiness, identity and configured-limit verification |
+| `Install-ServerEnvironment.ps1` | create/check the isolated, pinned tokenizer environment |
 
 Generated logs/artifacts/work directories are ignored by Git. Model deletion is
 not part of normal automation. Source shard reclamation exists only behind an

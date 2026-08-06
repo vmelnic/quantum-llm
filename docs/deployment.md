@@ -102,6 +102,18 @@ state:
 ./ops/model.sh config qwen
 ```
 
+Install or reconcile the pinned server environment once after cloning and
+whenever `requirements/server.txt` changes:
+
+```bash
+./ops/model.sh install
+```
+
+This creates or reuses the server virtual environment on the Windows host,
+installs the pinned tokenizer dependencies, and verifies their exact versions.
+In particular, Qwen chat templates require Jinja even though Transformers
+imports it only when a chat request is formatted.
+
 ## 3. Start and verify a model
 
 Start the model selected by `CHAT_MODEL`:
@@ -110,9 +122,12 @@ Start the model selected by `CHAT_MODEL`:
 ./ops/model.sh start
 ```
 
-The command returns only after `/ready` succeeds and `/model-info` matches the
-selected model, context, output ceiling, and generation deadline. Inspect it
-again at any time:
+Before stopping an existing model, `start` verifies that the server Python
+environment is complete. The command then returns only after `/ready` succeeds
+and `/model-info` matches the selected model, context, output ceiling, and
+generation deadline. If the scheduled task exits during startup, the command
+reports its result immediately instead of waiting for the full readiness
+timeout. Inspect it again at any time:
 
 ```bash
 ./ops/model.sh status
@@ -141,7 +156,10 @@ A healthy DeepSeek deployment reports fields like:
 ```
 
 The client creates and owns an SSH tunnel, streams text, and closes the tunnel
-on `quit`, `exit`, or Ctrl+C. Interactive commands are:
+on `quit`, `exit`, or Ctrl+C. It reads `/v1/models` after readiness and uses the
+single model actually deployed. Therefore `start qwen` followed by
+`model.sh chat` works even when `.env` still has DeepSeek as its default start
+selection. Interactive commands are:
 
 | Command | Effect |
 |---|---|
@@ -194,6 +212,7 @@ Other lifecycle operations:
 
 ```bash
 ./ops/model.sh restart             # selected CHAT_MODEL
+./ops/model.sh install             # sync and reconcile pinned Python dependencies
 ./ops/model.sh stop                # selected CHAT_MODEL
 ./ops/model.sh stop all            # release all model processes and VRAM
 ./ops/model.sh sync                # source sync without a restart
@@ -209,6 +228,8 @@ current `.env` values.
 - `model.sh: set QUANTUM_LLM_REMOTE...`: configure the SSH target in `.env`.
 - `Container missing` or `runtime bundle is missing`: correct the immutable
   Qwen/DeepSeek artifact path; synchronization does not copy ignored models.
+- dependency preflight failure: run `./ops/model.sh install`; `start` performs
+  only a read-only version/import check and does not access package indexes.
 - readiness timeout: run `./ops/model.sh status`, then inspect the remote JSONL
   service log and Task Scheduler state.
 - identity/limit mismatch: the start command fails closed; synchronize and
@@ -217,6 +238,9 @@ current `.env` values.
   are currently available; shorten/clear history or lower concurrency.
 - generation timeout: raise `MODEL_GENERATION_TIMEOUT_SECONDS` only after
   considering that one slow DeepSeek request occupies its sole worker slot.
+- `request_preprocessing_failed`: inspect the JSONL log for the tokenizer/chat
+  template error; the API returns structured HTTP 500 instead of dropping the
+  connection.
 - local port already in use: choose another `CHAT_LOCAL_PORT`; the remote
   service continues to use `MODEL_PORT`.
 
