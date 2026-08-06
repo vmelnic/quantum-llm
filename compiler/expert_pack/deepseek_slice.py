@@ -2378,3 +2378,229 @@ def export_deepseek_typed_set(
         return result
     except Exception:
         raise
+
+
+def _deepseek_mtp_partition(
+    checkpoint: SafeTensorCheckpoint,
+) -> tuple[int, tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Return the exact non-routed MTP resource partition.
+
+    Routed experts are represented by their deterministic namespace and expert
+    IDs in ``export_deepseek_mtp_set``. Keeping this partition metadata-only
+    lets the contract gate run without mapping multi-gigabyte payloads.
+    """
+
+    contract = validate_deepseek_v4_source(checkpoint)
+    namespace = int(contract["mtp_namespace"])
+    prefix = f"mtp.{namespace}."
+    typed = tuple(sorted(
+        name for name, info in checkpoint.tensors.items()
+        if name.startswith(prefix) and info.dtype in ("BF16", "F32", "I64")
+    ))
+    dense = tuple(sorted(
+        name.removesuffix(".weight")
+        for name, info in checkpoint.tensors.items()
+        if name.startswith(prefix)
+        and name.endswith(".weight")
+        and info.dtype == "F8_E4M3"
+        and ".ffn.experts." not in name
+        and ".ffn.shared_experts." not in name
+    ))
+    shared_prefix = prefix + "ffn.shared_experts"
+    shared = tuple(
+        f"{shared_prefix}.{projection}.{kind}"
+        for projection in ("w1", "w3", "w2")
+        for kind in ("weight", "scale")
+    )
+    if len(typed) != 19 or len(dense) != 7 or len(shared) != 6:
+        raise AdapterError(
+            "DeepSeek MTP resource partition has unexpected geometry: "
+            f"typed={len(typed)}, dense={len(dense)}, shared={len(shared)}"
+        )
+    return namespace, typed, dense, shared
+
+
+def export_deepseek_mtp_set(
+    checkpoint: SafeTensorCheckpoint, *, output: Path
+) -> dict[str, object]:
+    """Authenticate the native one-layer MTP resources without copying them.
+
+    The result is deliberately separate from main-model residency. Merely
+    publishing this descriptor cannot change greedy decoding; a future MTP
+    runtime must opt into the resource and independently qualify its state and
+    verification semantics.
+    """
+
+    namespace, typed_names, dense_bases, shared_names = \
+        _deepseek_mtp_partition(checkpoint)
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"MTP set output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    source_bytes = 0
+    try:
+        typed_manifest = _export_deepseek_extents(
+            checkpoint, names=typed_names, output=partial / "typed",
+            layer=-1, expert=f"mtp.{namespace}.typed",
+            format_name="deepseek-mtp-typed-extents-v1",
+            source_abi="deepseek-mtp-source-dtypes-v1",
+            target_abi="deepseek-sm86-source-dtypes-v1",
+        )
+        source_bytes += int(typed_manifest["bytes"])
+
+        dense_root = partial / "dense"
+        dense_root.mkdir()
+        dense_entries: list[dict[str, object]] = []
+        for index, base in enumerate(dense_bases):
+            relative = Path(f"matrix-{index:02d}")
+            manifest = _export_deepseek_extents(
+                checkpoint, names=(base + ".weight", base + ".scale"),
+                output=dense_root / relative, layer=-1, expert=base,
+                format_name="deepseek-mtp-fp8-matrix-extents-v1",
+                source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+                target_abi="deepseek-sm86-int8-per-row-matrix-v1",
+            )
+            rows, columns = checkpoint.tensors[base + ".weight"].shape
+            entry_bytes = int(manifest["bytes"])
+            dense_entries.append({
+                "name": base,
+                "rows": rows,
+                "columns": columns,
+                "descriptor": str(relative / "extents.tsv"),
+                "source_bytes": entry_bytes,
+                "device_bytes": rows * columns + rows * 4,
+                "sha256": manifest["combined"]["sha256"],
+            })
+            source_bytes += entry_bytes
+        with (dense_root / "dense-set.tsv").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as index_file:
+            index_file.write("deepseek-mtp-dense-residency-v1\n")
+            for entry in dense_entries:
+                index_file.write(
+                    f"{entry['name']}\t{entry['rows']}\t{entry['columns']}\t"
+                    f"{entry['source_bytes']}\t{entry['device_bytes']}\t"
+                    f"{entry['sha256']}\t{entry['descriptor']}\n"
+                )
+            index_file.flush()
+            os.fsync(index_file.fileno())
+
+        shared_manifest = _export_deepseek_extents(
+            checkpoint, names=shared_names, output=partial / "shared",
+            layer=-1, expert=f"mtp.{namespace}.shared",
+            format_name="deepseek-mtp-fp8-shared-expert-extents-v1",
+            source_abi="deepseek-fp8-e4m3-ue8m0-block128-v1",
+            target_abi="deepseek-sm86-int8-per-row-v1",
+        )
+        source_bytes += int(shared_manifest["bytes"])
+
+        routed_root = partial / "routed"
+        routed_root.mkdir()
+        routed_source_bytes = 0
+        with ExitStack() as stack:
+            catalog = stack.enter_context(
+                (routed_root / "catalog.tsv").open(
+                    "x", encoding="utf-8", newline="\n"
+                )
+            )
+            extents = stack.enter_context(
+                (routed_root / "extents.tsv").open(
+                    "x", encoding="utf-8", newline="\n"
+                )
+            )
+            shard_handles: dict[str, object] = {}
+            for shard in checkpoint.shards:
+                shard_handles[shard] = stack.enter_context(
+                    (checkpoint.root / shard).open("rb", buffering=0)
+                )
+            hash_buffer = bytearray(8 * 1024 * 1024)
+            hash_view = memoryview(hash_buffer)
+            catalog.write("deepseek-mtp-routed-catalog-v1\n")
+            extents.write("deepseek-mtp-routed-extents-v1\n")
+            extent_index = 0
+            for expert in range(256):
+                expert_prefix = f"mtp.{namespace}.ffn.experts.{expert}"
+                names = tuple(
+                    f"{expert_prefix}.{projection}.{kind}"
+                    for projection in ("w1", "w3", "w2")
+                    for kind in ("weight", "scale")
+                )
+                digest = hashlib.sha256()
+                destination = 0
+                first_extent = extent_index
+                for name in names:
+                    info = checkpoint.tensors[name]
+                    if any(character in info.shard for character in "\t\r\n"):
+                        raise SourceFormatError(
+                            "SafeTensors shard name is not descriptor-safe"
+                        )
+                    handle = shard_handles[info.shard]
+                    handle.seek(info.offset)
+                    remaining = info.nbytes
+                    while remaining:
+                        requested = min(remaining, len(hash_buffer))
+                        count = handle.readinto(hash_view[:requested])
+                        if count is None or count <= 0:
+                            raise SourceFormatError(
+                                f"truncated DeepSeek MTP tensor payload: {name}"
+                            )
+                        digest.update(hash_view[:count])
+                        remaining -= count
+                    extents.write(
+                        f"{destination}\t{info.nbytes}\t{info.offset}\t"
+                        f"{info.shard}\n"
+                    )
+                    destination += info.nbytes
+                    extent_index += 1
+                if destination != 13_369_344:
+                    raise SourceFormatError(
+                        "DeepSeek MTP routed expert has invalid compact bytes"
+                    )
+                catalog.write(
+                    f"{expert}\t{destination}\t{digest.hexdigest()}\t"
+                    f"{first_extent}\t6\n"
+                )
+                routed_source_bytes += destination
+            catalog.flush()
+            os.fsync(catalog.fileno())
+            extents.flush()
+            os.fsync(extents.fileno())
+            hash_view.release()
+        if extent_index != 256 * 6:
+            raise SourceFormatError("DeepSeek MTP routed extent count mismatch")
+        routed_manifest = {
+            "format": "deepseek-mtp-routed-catalog-v1",
+            "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
+            "target_abi": "deepseek-sm86-fp4-q8-direct-v1",
+            "namespace": namespace,
+            "experts": 256,
+            "extent_count": extent_index,
+            "source_bytes": routed_source_bytes,
+            "device_bytes_per_expert": 13_369_344,
+        }
+        atomic_json(routed_root / "manifest.json", routed_manifest)
+        source_bytes += routed_source_bytes
+
+        result = {
+            "format": "deepseek-mtp-resource-set-v1",
+            "namespace": namespace,
+            "layers": 1,
+            "typed_tensors": len(typed_names),
+            "dense_matrices": len(dense_entries),
+            "shared_experts": 1,
+            "routed_experts": 256,
+            "source_bytes": source_bytes,
+            "resources": {
+                "typed": "typed/manifest.json",
+                "dense": "dense/dense-set.tsv",
+                "shared": "shared/manifest.json",
+                "routed": "routed/catalog.tsv",
+            },
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise

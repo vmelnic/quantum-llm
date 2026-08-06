@@ -232,9 +232,11 @@ latency or aggregate throughput without changing model semantics.
 
 ## P3 — useful-token acceleration
 
-- [ ] Export and authenticate the checkpoint's one native MTP layer as a
+- [x] Export and authenticate the checkpoint's one native MTP layer as a
   separate bundle resource. Base greedy serving must remain byte-for-byte
-  unchanged when the resource is absent or disabled.
+  unchanged when the resource is absent or disabled. The real export covers
+  3,593,787,756 source bytes without copying them; bundle/runtime opt-in is the
+  next boundary.
 - [ ] Implement the MTP draft state and qualify one-token predictions against
   an independent source-checkpoint oracle before enabling verification.
 - [ ] Add transactional target verification with causal KV/CSA state commit on

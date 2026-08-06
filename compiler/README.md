@@ -61,6 +61,19 @@ SHA-256 hashed in its six-extent ABI order, and the directory is atomically
 published only after all 11,008 records are present. The auxiliary MTP head is
 intentionally outside this main-decode catalog.
 
+`export-deepseek-mtp-set` authenticates that auxiliary layer as a separate,
+atomic resource. It hashes the source extents for 19 typed tensors, 7 FP8
+matrices, one shared expert, and 256 compact routed experts without copying the
+3.59 GB payload. Publishing this descriptor does not enable speculation or
+change base greedy decoding; it establishes the input contract for the future
+MTP runtime.
+
+```powershell
+.\ops\windows\Export-DeepSeekMtpSet.ps1 `
+  -Snapshot C:\path\to\deepseek-v4-flash-snapshot `
+  -Output C:\path\to\deepseek-mtp-set-v1
+```
+
 ```powershell
 .\.venv\Scripts\python.exe -m compiler export-deepseek-routed-catalog `
   --source C:\path\to\deepseek-v4-flash-snapshot `

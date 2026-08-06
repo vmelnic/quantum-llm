@@ -21,6 +21,7 @@ from .deepseek_slice import (
     export_deepseek_csa_slice,
     export_deepseek_attention_oracle,
     export_deepseek_typed_set,
+    export_deepseek_mtp_set,
     export_deepseek_dense_set,
     export_deepseek_shared_expert,
     export_deepseek_shared_set,
@@ -183,6 +184,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     typed_set_parser.add_argument("--source", type=Path, required=True)
     typed_set_parser.add_argument("--output", type=Path, required=True)
+    mtp_set_parser = commands.add_parser(
+        "export-deepseek-mtp-set",
+        help="authenticate the native DeepSeek MTP resource set",
+    )
+    mtp_set_parser.add_argument("--source", type=Path, required=True)
+    mtp_set_parser.add_argument("--output", type=Path, required=True)
     csa_parser = commands.add_parser(
         "export-deepseek-csa",
         help="describe one ratio-four CSA compressor and emit its decode oracle",
@@ -302,6 +309,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "export-deepseek-typed-set":
             result = export_deepseek_typed_set(
+                SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        elif args.command == "export-deepseek-mtp-set":
+            result = export_deepseek_mtp_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
             )
         elif args.command == "export-deepseek-csa":

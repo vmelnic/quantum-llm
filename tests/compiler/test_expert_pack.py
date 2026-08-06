@@ -16,6 +16,7 @@ from compiler.expert_pack.deepseek_v4 import (
     estimate_deepseek_v4_representations,
     validate_deepseek_v4_source,
 )
+from compiler.expert_pack.deepseek_slice import _deepseek_mtp_partition
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
@@ -323,6 +324,18 @@ class ExpertPackTests(unittest.TestCase):
         self.assertEqual(cache["compute_bytes_per_expert"], 25198592)
         self.assertEqual(cache["compute_bytes_for_top_k_one_layer"], 151191552)
         self.assertEqual(cache["experts_per_gib"], 42)
+
+    def test_deepseek_mtp_partition_is_exact_and_metadata_only(self) -> None:
+        checkpoint = _deepseek_metadata_checkpoint()
+        namespace, typed, dense, shared = _deepseek_mtp_partition(checkpoint)
+        self.assertEqual(namespace, 0)
+        self.assertEqual(len(typed), 19)
+        self.assertEqual(len(dense), 7)
+        self.assertEqual(len(shared), 6)
+        self.assertTrue(all(name.startswith("mtp.0.") for name in typed))
+        self.assertTrue(all(name.startswith("mtp.0.") for name in dense))
+        self.assertEqual(len(set(typed)), len(typed))
+        self.assertEqual(len(set(dense)), len(dense))
 
     def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
