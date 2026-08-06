@@ -153,6 +153,15 @@ def _chat(base_url: str, model: str, messages: list[dict[str, str]],
         with urllib.request.urlopen(request, timeout=600) as response:
             print("assistant> ", end="", flush=True)
             for event in _events(response):
+                if event.get("error"):
+                    error = event["error"]
+                    message = (error.get("message") if isinstance(error, dict)
+                               else str(error))
+                    raise RuntimeError(f"generation failed: {message}")
+                if event.get("type") == "error":
+                    raise RuntimeError(
+                        f"generation failed: {event.get('message', 'unknown error')}"
+                    )
                 if event.get("usage"):
                     usage = event["usage"]
                 choices = event.get("choices") or []

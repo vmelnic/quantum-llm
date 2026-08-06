@@ -22,7 +22,7 @@ sys.modules.setdefault(
 import ops.python.expert_server as expert_server
 from ops.python.expert_server import (
     Application, ContinuousDecodeBatcher, CudaWorker, Handler, RequestError, StopFilter,
-    _text_content,
+    _text_content, _worker_response_tokens,
 )
 
 
@@ -41,6 +41,16 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_worker_tokens_accept_legacy_scalar_and_mtp_list(self) -> None:
+        self.assertEqual(
+            _worker_response_tokens({"token": 7}, "missing"), [7]
+        )
+        self.assertEqual(
+            _worker_response_tokens({"tokens": [7, 8]}, "missing"), [7, 8]
+        )
+        with self.assertRaises(expert_server.WorkerError):
+            _worker_response_tokens({"tokens": []}, "missing")
+
     def test_protocol4_worker_infers_legacy_prefetch_state(self) -> None:
         ready = {
             "type": "ready", "protocol": 4, "capacity": 4,

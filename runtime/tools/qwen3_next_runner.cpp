@@ -1605,8 +1605,8 @@ int worker_loop(Qwen3NextModel& model) {
               model.forward_batch(tokens, positions, slots).front();
           ++iterator->second.next_position;
         }
-        std::cout << "{\"type\":\"token\",\"id\":" << id
-                  << ",\"token\":" << token << "}\n" << std::flush;
+          std::cout << "{\"type\":\"token\",\"id\":" << id
+                    << ",\"tokens\":[" << token << "]}\n" << std::flush;
         if (final) {
           model.release_slot(iterator->second.slot);
           used_slots[iterator->second.slot] = false;
@@ -1658,7 +1658,7 @@ int worker_loop(Qwen3NextModel& model) {
         for (std::size_t index = 0; index < steps.size(); ++index) {
           if (index) std::cout << ',';
           std::cout << "{\"id\":" << steps[index].id
-                    << ",\"token\":" << steps[index].token << '}';
+                    << ",\"tokens\":[" << steps[index].token << "]}";
         }
         std::cout << "]}\n" << std::flush;
         for (const auto& step : steps) {

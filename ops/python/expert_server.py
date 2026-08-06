@@ -59,6 +59,18 @@ class WorkerError(RuntimeError):
     pass
 
 
+def _worker_response_tokens(payload: Mapping[str, Any], message: str) -> list[int]:
+    tokens = payload.get("tokens")
+    legacy = payload.get("token")
+    if tokens is None and isinstance(legacy, int) and not isinstance(legacy, bool):
+        tokens = [legacy]
+    if (not isinstance(tokens, list) or not tokens or
+            any(not isinstance(token, int) or isinstance(token, bool)
+                for token in tokens)):
+        raise WorkerError(message)
+    return [int(token) for token in tokens]
+
+
 class RequestError(ValueError):
     def __init__(self, message: str, param: str | None = None,
                  code: str = "invalid_value") -> None:
@@ -295,10 +307,7 @@ class CudaWorker:
             raise WorkerError("unexpected NEXT response")
         if final:
             self.active_ids.discard(request_id)
-        tokens = response.get("tokens")
-        if not isinstance(tokens, list) or not tokens:
-            raise WorkerError("NEXT response has no tokens")
-        return [int(token) for token in tokens]
+        return _worker_response_tokens(response, "NEXT response has no tokens")
 
     def step(self, items: list[tuple[int, bool]]) -> dict[int, list[int]]:
         if not items or len(items) > self.capacity:
@@ -315,10 +324,9 @@ class CudaWorker:
             raise WorkerError("unexpected STEP response")
         result: dict[int, list[int]] = {}
         for item in response["items"]:
-            tokens = item.get("tokens")
-            if not isinstance(tokens, list) or not tokens:
-                raise WorkerError("STEP response item has no tokens")
-            result[int(item["id"])] = [int(token) for token in tokens]
+            result[int(item["id"])] = _worker_response_tokens(
+                item, "STEP response item has no tokens"
+            )
         expected = {request_id for request_id, _final in items}
         if set(result) != expected:
             raise WorkerError("STEP response request mismatch")
@@ -1307,6 +1315,11 @@ class Handler(BaseHTTPRequestHandler):
             elif endpoint == "responses":
                 self._sse({"type": "error", "code": "generation_timeout",
                            "message": str(error), "param": None})
+            else:
+                self._sse({"error": {"message": str(error),
+                           "type": "timeout_error", "param": None,
+                           "code": "generation_timeout"}})
+                self._sse("[DONE]")
         except Exception as error:
             self.app.increment("failed")
             log("request_failed", id=request_uuid, error=repr(error))
@@ -1316,6 +1329,11 @@ class Handler(BaseHTTPRequestHandler):
             elif endpoint == "responses":
                 self._sse({"type": "error", "code": "generation_failed",
                            "message": "generation failed", "param": None})
+            else:
+                self._sse({"error": {"message": "generation failed",
+                           "type": "server_error", "param": None,
+                           "code": "generation_failed"}})
+                self._sse("[DONE]")
         finally:
             self.app.release_context_credits(context_pages)
             self.app.release_worker_slot()
