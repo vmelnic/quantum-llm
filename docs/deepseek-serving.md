@@ -172,8 +172,17 @@ After the service is ready, run one model-specific integration gate:
 
 The production gate rejects a source-extent routed catalog. During backend
 development only, `-AllowSourceExtents` permits that storage mode. The gate
-checks model and bundle hashes, backend-specific prefill/KV metadata, one real
-two-token completion, metrics, and complete request/KV cleanup.
+checks model and bundle hashes, backend-specific prefill/KV metadata, real
+Completions, Chat Completions, and Responses requests, metrics, and complete
+request/KV cleanup. Use `probe_openai_api.py` for a real Chat streaming gate.
+
+The latest persistent pilot was qualified with MTP enabled and the `capacity`
+placement profile. Completions, streaming Chat Completions, and Responses all
+returned real model text, after which active requests and allocated/reserved KV
+pages returned to zero. A `balanced` restart with an authenticated census
+stopped making progress during warm-load and is not the deployed profile until
+that lifecycle bug is resolved; the service does not erase or rewrite census
+state as a workaround.
 
 For a controlled pilot, register a separate restartable task after the gate
 passes. Registration does not start it unless `-Start` is supplied:

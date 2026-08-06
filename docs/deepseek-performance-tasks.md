@@ -68,6 +68,9 @@ must not imply that a policy is active when it is only collecting evidence.
 
 ## P1 — learned residency and warm start
 
+- [ ] Fix the reproducible `balanced`-profile restart stall during authenticated
+  census warm-load. The `capacity` profile is the safe persistent deployment;
+  do not delete learned state or silently downgrade readiness to mask the stall.
 - [x] Consume `RouteCensus::stable_warm_set()` at worker startup.
 - [x] Convert the byte budgets into deterministic per-layer RAM and VRAM warm
   sets while reserving dense, shared, KV, request, staging, and OS headroom.

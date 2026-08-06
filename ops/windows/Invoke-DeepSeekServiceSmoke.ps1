@@ -26,6 +26,13 @@ function Get-MetricsText {
     (Invoke-WebRequest -Uri "$BaseUri/metrics" -Headers $headers `
         -UseBasicParsing -TimeoutSec $TimeoutSeconds).Content
 }
+function Invoke-JsonPost {
+    param([string]$Path, [hashtable]$Payload)
+    Invoke-RestMethod -Uri "$BaseUri$Path" -Method Post -Headers $headers `
+        -ContentType "application/json" `
+        -Body ($Payload | ConvertTo-Json -Depth 8 -Compress) `
+        -TimeoutSec $TimeoutSeconds
+}
 function Get-MetricValue {
     param([string]$Text, [string]$Name)
     $match = [regex]::Match(
@@ -74,17 +81,15 @@ if ($info.worker_placement.profile -ne $ExpectedPlacementProfile -or
 }
 
 $before = Get-MetricsText
-$body = @{
+$completionBody = @{
     model = $ExpectedModel
     prompt = "Hi"
     max_tokens = $NewTokens
     stream = $false
     temperature = 0
-} | ConvertTo-Json -Compress
+}
 $started = [DateTime]::UtcNow
-$response = Invoke-RestMethod -Uri "$BaseUri/v1/completions" `
-    -Method Post -Headers $headers -ContentType "application/json" `
-    -Body $body -TimeoutSec $TimeoutSeconds
+$response = Invoke-JsonPost "/v1/completions" $completionBody
 $elapsed = ([DateTime]::UtcNow - $started).TotalSeconds
 if ($response.object -ne "text_completion" -or
     $response.model -ne $ExpectedModel -or
@@ -94,6 +99,33 @@ if ($response.object -ne "text_completion" -or
     [string]::IsNullOrEmpty([string]$response.choices[0].text)) {
     throw "DeepSeek completion response is invalid"
 }
+$chat = Invoke-JsonPost "/v1/chat/completions" @{
+    model = $ExpectedModel
+    messages = @(@{ role = "user"; content = "Hi" })
+    max_completion_tokens = $NewTokens
+    stream = $false
+    temperature = 0
+}
+if ($chat.object -ne "chat.completion" -or
+    $chat.model -ne $ExpectedModel -or $chat.choices.Count -ne 1 -or
+    [string]::IsNullOrEmpty([string]$chat.choices[0].message.content) -or
+    [int]$chat.usage.completion_tokens -lt 1) {
+    throw "DeepSeek chat completion response is invalid"
+}
+$responses = Invoke-JsonPost "/v1/responses" @{
+    model = $ExpectedModel
+    input = "Hi"
+    max_output_tokens = $NewTokens
+    stream = $false
+    temperature = 0
+}
+if ($responses.object -ne "response" -or
+    $responses.status -ne "completed" -or
+    $responses.model -ne $ExpectedModel -or
+    [string]::IsNullOrEmpty([string]$responses.output[0].content[0].text) -or
+    [int]$responses.usage.output_tokens -lt 1) {
+    throw "DeepSeek Responses API result is invalid"
+}
 
 $after = Get-MetricsText
 $afterInfo = Invoke-JsonGet "/model-info"
@@ -101,8 +133,10 @@ $completed = (Get-MetricValue $after "expert_service_completed_total") -
     (Get-MetricValue $before "expert_service_completed_total")
 $rows = (Get-MetricValue $after "expert_service_decode_rows_total") -
     (Get-MetricValue $before "expert_service_decode_rows_total")
-if ($completed -ne 1 -or
-    $rows -lt [int]$response.usage.completion_tokens -or
+$expectedRows = [int]$response.usage.completion_tokens +
+    [int]$chat.usage.completion_tokens +
+    [int]$responses.usage.output_tokens
+if ($completed -ne 3 -or $rows -lt $expectedRows -or
     [int]$afterInfo.active_requests -ne 0 -or
     [int]$afterInfo.worker_kv.reserved_pages -ne 0 -or
     [int]$afterInfo.worker_kv.allocated_pages -ne 0) {
@@ -127,6 +161,9 @@ $result = [PSCustomObject]@{
     completion_tokens = [int]$response.usage.completion_tokens
     elapsed_seconds = $elapsed
     output_text = [string]$response.choices[0].text
+    chat_output_text = [string]$chat.choices[0].message.content
+    responses_output_text = [string]$responses.output[0].content[0].text
+    endpoint_requests = 3
     completed_delta = $completed
     decode_rows_delta = $rows
     context_released = $true
