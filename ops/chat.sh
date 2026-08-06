@@ -11,12 +11,21 @@ if [[ -f "${env_file}" ]]; then
   set +a
 fi
 
+chat_max_tokens="${CHAT_MAX_TOKENS:-${MODEL_MAX_OUTPUT_TOKENS:-8192}}"
+if [[ -n "${MODEL_MAX_OUTPUT_TOKENS:-}" &&
+      "${chat_max_tokens}" =~ ^[0-9]+$ &&
+      "${MODEL_MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] &&
+   (( chat_max_tokens > MODEL_MAX_OUTPUT_TOKENS )); then
+  echo "CHAT_MAX_TOKENS cannot exceed MODEL_MAX_OUTPUT_TOKENS" >&2
+  exit 2
+fi
+
 chat_args=(
   --base-url "${CHAT_BASE_URL:-http://127.0.0.1:8080}"
   --model "${CHAT_MODEL:-deepseek-v4-flash}"
-  --max-tokens "${CHAT_MAX_TOKENS:-32}"
+  --max-tokens "${chat_max_tokens}"
   --local-port "${CHAT_LOCAL_PORT:-18080}"
-  --remote-port "${CHAT_REMOTE_PORT:-8080}"
+  --remote-port "${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
   --ready-timeout "${CHAT_READY_TIMEOUT:-30}"
 )
 if [[ -n "${CHAT_SSH:-}" ]]; then

@@ -63,9 +63,9 @@ cp .env.example .env
 ./ops/chat.sh
 ```
 
-The `.env` file controls the SSH target, model, token limit, ports, readiness
-timeout, Python executable, base URL, and optional API key; every variable is
-listed in `.env.example`. CLI flags remain optional overrides. The client
+The `.env` file controls the SSH target, model, service context/output limits,
+per-turn chat token limit, ports, readiness timeout, Python executable, base
+URL, and optional API key; every variable is listed in `.env.example`. CLI flags remain optional overrides. The client
 retains conversation history. Enter `quit` or `exit`, or press Ctrl+C, to close
 both the client and the tunnel it created. With an empty `CHAT_SSH`, it connects
 directly to `CHAT_BASE_URL`.
@@ -183,15 +183,18 @@ client cancels the active worker request before another decode step is queued.
 
 ## Limits and operational behavior
 
-Effective limits are returned by `/model-info.runtime_config`; launcher defaults
-are a 4096-token context, at most 512 generated tokens, four active worker
-slots and eight queued requests. Prompt plus requested output must fit the
-context. The request body limit is 1 MiB.
+Effective limits are returned by `/model-info.runtime_config`. Deployments made
+through `ops/model.sh` take them from `MODEL_MAX_CONTEXT` and
+`MODEL_MAX_OUTPUT_TOKENS`; the reference `.env.example` enables a 65,536-token
+context and at most 8,192 generated tokens. Prompt plus requested output must
+fit the context. The request body limit is 1 MiB.
 
-4096 is the only certified context limit. The Qwen checkpoint advertises 262K
-positions. The runtime uses paged FP16 KV, context credits, and bounded causal
-prefill chunks, but has not qualified efficient long-context prefill/decode.
-Model metadata is therefore not exposed as an operational API promise. If
+Those configured ceilings are distinct from qualification and checkpoint
+metadata. Qwen advertises 262K positions and DeepSeek-V4-Flash advertises 1M;
+the only completed long-context correctness gate remains 4,096. The 65,536
+DeepSeek setting fits its capacity-one 2 GiB logical KV budget, but long-prompt
+quality and performance remain unqualified. Model metadata is therefore not
+exposed automatically as an operational API promise. If
 concurrent requests exhaust KV page credits, admission returns HTTP `503` with code
 `context_capacity_exhausted` before streaming starts.
 

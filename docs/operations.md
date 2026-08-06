@@ -13,11 +13,34 @@ The optional POSIX wrappers sync Git-visible source without copying `.git`,
 ignored models, work directories, logs, artifacts, or build output:
 
 ```bash
-export QUANTUM_LLM_REMOTE=user@gpu-host
-export QUANTUM_LLM_REMOTE_ROOT=C:/quantum-llm
-# Run the POSIX sync wrapper from ops/.
-# Then invoke Invoke-BuildExpertRuntime.ps1 through the remote-script wrapper.
+cp .env.example .env
+# Set QUANTUM_LLM_REMOTE and the two model artifact paths, then:
+./ops/model.sh start
+./ops/model.sh status
+./ops/model.sh chat
+./ops/model.sh stop
 ```
+
+`CHAT_MODEL=deepseek-v4-flash` is the default. `./ops/model.sh start qwen`
+switches explicitly without editing `.env`; `start deepseek` switches back.
+Every start optionally synchronizes the Git-visible tree, stops both competing
+tasks, installs the selected task, waits for readiness, and verifies identity,
+context, and output limits. Set `MODEL_SYNC_ON_START=0` only for an already
+synchronized immutable deployment.
+
+The operational limits are local configuration, not source constants:
+
+| Variable | Example | Meaning |
+|---|---:|---|
+| `MODEL_MAX_CONTEXT` | `65536` | prompt, history and requested output combined |
+| `MODEL_MAX_OUTPUT_TOKENS` | `8192` | server ceiling for one response |
+| `CHAT_MAX_TOKENS` | `8192` | output ceiling requested by each terminal-chat turn |
+| `MODEL_GENERATION_TIMEOUT_SECONDS` | `600` | worker deadline for one generation |
+| `MODEL_READY_TIMEOUT` | `600` | how long `model.sh start` waits for readiness |
+
+The DeepSeek 65,536-token deployment fits the current 2 GiB logical KV-page
+budget at capacity one. This is an enabled operational limit, not evidence that
+65,536-token quality, latency, or prefill performance has been qualified.
 
 Sync is non-destructive: obsolete remote source files are not removed. Use a
 fresh deployment directory for a release or clean obsolete tracked files during

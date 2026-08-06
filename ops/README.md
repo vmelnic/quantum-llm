@@ -5,12 +5,27 @@
 
 ## POSIX control-host wrappers
 
+Copy `.env.example` to `.env` and set the remote host and immutable model
+artifact paths. The lifecycle wrapper consumes that file:
+
 ```bash
-export QUANTUM_LLM_REMOTE=user@gpu-host
-export QUANTUM_LLM_REMOTE_ROOT=C:/quantum-llm
-# Run the POSIX sync wrapper, then invoke a script from ops/windows through
-# the remote-script wrapper.
+./ops/model.sh config             # resolved, non-secret configuration
+./ops/model.sh start              # CHAT_MODEL from .env; sync + replace + wait
+./ops/model.sh status
+./ops/model.sh chat
+./ops/model.sh stop
+
+./ops/model.sh start qwen         # explicit one-command model switch
+./ops/model.sh start deepseek
+./ops/model.sh stop all           # release all model processes and VRAM
+./ops/model.sh sync               # sync without changing the running service
 ```
+
+Starting a model first stops both known scheduled tasks because they share one
+GPU and one API port. `MODEL_MAX_CONTEXT` and `MODEL_MAX_OUTPUT_TOKENS` become
+the advertised API limits and are checked against `/model-info` before `start`
+returns. `CHAT_MAX_TOKENS` is an optional independent per-turn ceiling; the
+reference configuration gives chat the full model output allowance.
 
 The sync includes only Git-visible, non-ignored files. It therefore excludes
 `.git`, models, work, logs, artifacts, and build output. It does not delete
@@ -59,6 +74,7 @@ cp .env.example .env
 | `Stop-ExpertServer.ps1` | stop task and full descendant process tree |
 | `Uninstall-ExpertServerTask.ps1` | stop and remove task registration |
 | `Invoke-P6ServiceSmoke.ps1` | identity, API, streaming, batching, cancellation smoke |
+| `Get-ExpertServerStatus.ps1` | task state, readiness, identity and configured-limit verification |
 
 Generated logs/artifacts/work directories are ignored by Git. Model deletion is
 not part of normal automation. Source shard reclamation exists only behind an
