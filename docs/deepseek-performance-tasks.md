@@ -255,9 +255,11 @@ latency or aggregate throughput without changing model semantics.
     one authenticated 3,422,552,064-byte shard; the production cache/directory
     gate loaded and pinned its first and last records. The MTP shared descriptor
     passed the same strict parser used by the 43 target shared experts.
-  - [ ] Execute the MTP attention, routed/shared FFN, mHC state and shared
-    vocabulary head between the qualified boundaries; only then compare a
-    one-token draft prediction.
+  - [x] Execute the MTP attention, routed/shared FFN, mHC state and shared
+    vocabulary head between the qualified boundaries. A four-position
+    checkpoint oracle and the native ratio-zero CUDA block selected the same
+    learned route and draft token `70663`; the shared vocabulary head is now a
+    common target/MTP primitive rather than duplicated code.
 - [ ] Add transactional target verification with causal KV/CSA state commit on
   acceptance and exact rollback/replay on rejection. Never expose a draft
   token before target acceptance.

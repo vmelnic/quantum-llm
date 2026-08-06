@@ -160,15 +160,8 @@ Status deepseek_head(const DeepSeekIoBinding& weights, const float* streams,
     return {ErrorCode::invalid_argument, "invalid DeepSeek head launch"};
   auto status = deepseek_hc_head(weights, streams, state, epsilon, raw_stream);
   if (!status.ok()) return status;
-  status = gemv_bf16(weights.head, kDeepSeekVocab, kDeepSeekHidden,
-                     state.normalized_, state.logits_, raw_stream);
-  if (!status.ok()) return status;
-  status = argmax(state.logits_, kDeepSeekVocab, state.sampled_token_,
-                  raw_stream);
-  if (!status.ok()) return status;
-  const auto error = cudaPeekAtLastError();
-  return error == cudaSuccess ? Status::success()
-                              : failure(error, "DeepSeek output head");
+  return deepseek_vocab_head(weights.head, state.normalized_, state,
+                             raw_stream);
 }
 
 Status deepseek_hc_head(const DeepSeekIoBinding& weights, const float* streams,
@@ -200,6 +193,23 @@ Status deepseek_hc_head(const DeepSeekIoBinding& weights, const float* streams,
   const auto error = cudaPeekAtLastError();
   return error == cudaSuccess ? Status::success()
                               : failure(error, "DeepSeek hyper-head");
+}
+
+Status deepseek_vocab_head(const std::uint16_t* vocabulary_head,
+                           const float* normalized, DeepSeekIoState& state,
+                           void* raw_stream) noexcept {
+  if (!vocabulary_head || !normalized)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek vocabulary-head launch"};
+  auto status = gemv_bf16(vocabulary_head, kDeepSeekVocab, kDeepSeekHidden,
+                          normalized, state.logits_, raw_stream);
+  if (!status.ok()) return status;
+  status = argmax(state.logits_, kDeepSeekVocab, state.sampled_token_,
+                  raw_stream);
+  if (!status.ok()) return status;
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek vocabulary head");
 }
 
 }  // namespace expert::runtime::cuda

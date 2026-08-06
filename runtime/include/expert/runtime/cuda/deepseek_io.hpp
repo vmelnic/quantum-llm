@@ -44,6 +44,8 @@ class DeepSeekIoState final {
                               DeepSeekIoState&, float, void*) noexcept;
   friend Status deepseek_hc_head(const DeepSeekIoBinding&, const float*,
                                  DeepSeekIoState&, float, void*) noexcept;
+  friend Status deepseek_vocab_head(const std::uint16_t*, const float*,
+                                    DeepSeekIoState&, void*) noexcept;
   DeepSeekIoState(void* allocation, std::uint64_t bytes) noexcept;
   void map(void* allocation) noexcept;
 
@@ -82,5 +84,11 @@ struct DeepSeekIoStateResult final {
 [[nodiscard]] Status deepseek_hc_head(
     const DeepSeekIoBinding& weights, const float* streams,
     DeepSeekIoState& state, float epsilon, void* stream) noexcept;
+
+// Projects an already-normalized hidden vector through the shared vocabulary
+// head. Target decode and MTP use the same implementation and output state.
+[[nodiscard]] Status deepseek_vocab_head(
+    const std::uint16_t* vocabulary_head, const float* normalized,
+    DeepSeekIoState& state, void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

@@ -119,4 +119,14 @@ Status deepseek_mtp_collapse(const DeepSeekMtpGlueBinding& weights,
                           raw_stream);
 }
 
+Status deepseek_mtp_vocab_head(const std::uint16_t* vocabulary_head,
+                               DeepSeekMtpGlueState& state,
+                               void* raw_stream) noexcept {
+  if (!state.head_state_)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek MTP vocabulary state"};
+  return deepseek_vocab_head(vocabulary_head, state.head_state_->normalized(),
+                             *state.head_state_, raw_stream);
+}
+
 }  // namespace expert::runtime::cuda

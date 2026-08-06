@@ -145,6 +145,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     target_compile_features(expert-deepseek-mtp-glue-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-mtp-glue-smoke PRIVATE
       expert_runtime CUDA::cudart)
+    add_executable(expert-deepseek-mtp-block-smoke
+      tools/deepseek_mtp_block_smoke.cpp)
+    target_compile_features(expert-deepseek-mtp-block-smoke PRIVATE cxx_std_20)
+    target_link_libraries(expert-deepseek-mtp-block-smoke PRIVATE
+      expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-typed-residency
       tools/deepseek_typed_residency.cpp)
     target_compile_features(expert-deepseek-typed-residency PRIVATE cxx_std_20)

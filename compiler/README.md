@@ -79,11 +79,23 @@ exact 4x4096 little-endian FP32 target-state capture for end-to-end work. The
 oracle uses the same block-FP8-to-row-INT8 admission ABI as the SM86 runtime,
 so a native comparison can be exact for the representation actually served.
 
+`export-deepseek-mtp-block-oracle` extends that boundary through four causal
+positions of ratio-zero attention, learned routing, direct packed-FP4/Q8 plus
+shared-FP8 experts, the MTP head, and the shared target vocabulary head. It
+publishes all intermediate semantic boundaries needed by the native gate; it
+does not enable or expose speculative tokens.
+
 ```powershell
 ops\windows\Export-DeepSeekMtpGlueOracle.ps1 `
   -Snapshot C:\path\to\checkpoint `
   -Output C:\path\to\mtp-glue-oracle-v2 `
   -Token 42 -Position 1
+```
+
+```powershell
+ops\windows\Export-DeepSeekMtpBlockOracle.ps1 `
+  -Snapshot C:\path\to\checkpoint `
+  -Output C:\path\to\mtp-block-oracle
 ```
 
 The v2 oracle also publishes fixed-order source extents for its two FP8

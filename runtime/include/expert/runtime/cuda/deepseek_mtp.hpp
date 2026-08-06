@@ -49,6 +49,8 @@ class DeepSeekMtpGlueState final {
   friend Status deepseek_mtp_collapse(const DeepSeekMtpGlueBinding&,
                                       const float*, DeepSeekMtpGlueState&,
                                       float, void*) noexcept;
+  friend Status deepseek_mtp_vocab_head(const std::uint16_t*,
+                                        DeepSeekMtpGlueState&, void*) noexcept;
   DeepSeekMtpGlueState(void* allocation, std::uint64_t allocation_bytes,
                        std::shared_ptr<DeepSeekIoState> head_state) noexcept;
 
@@ -80,5 +82,11 @@ create_deepseek_mtp_glue_state() noexcept;
 [[nodiscard]] Status deepseek_mtp_collapse(
     const DeepSeekMtpGlueBinding& weights, const float* decoder_streams,
     DeepSeekMtpGlueState& state, float epsilon, void* stream) noexcept;
+
+// Applies the target model's shared vocabulary head to the normalized MTP
+// output. This computes a draft candidate but does not expose it to clients.
+[[nodiscard]] Status deepseek_mtp_vocab_head(
+    const std::uint16_t* vocabulary_head, DeepSeekMtpGlueState& state,
+    void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

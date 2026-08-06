@@ -751,6 +751,30 @@ loader. Re-running the qualified MTP glue against this namespace retained
 This is a storage/ownership gate, not a draft-token or throughput result. It
 removes the separate MTP expert path before the full block is executed.
 
+## DeepSeek complete MTP block gate
+
+One four-position independent checkpoint oracle was executed through the
+native SM86 MTP block using the durable one-layer pack and the target model's
+shared vocabulary head:
+
+| boundary | result |
+| --- | ---: |
+| final learned route | `159, 199, 91, 147, 27, 241` exact |
+| mixed-stream RMSE | `4.20e-8` |
+| attention RMSE / maximum | `1.53e-4` / `0.001623` |
+| router-weight RMSE | `3.28e-5` |
+| full-block RMSE / maximum | `0.00504` / `0.02919` |
+| normalized-output RMSE | `0.00357` |
+| logit RMSE | `0.03966` |
+| independent/native draft token | `70663` / `70663` |
+| independent/native draft margin | `0.2549` / `0.2334` |
+
+The tolerances are representation-aware power-of-two gates for BF16, admitted
+FP8, and direct FP4/Q8 execution. Exact route identity, exact draft identity,
+and a draft margin above four times logit RMSE are separate mandatory gates.
+This qualifies draft computation only; no token is client-visible before
+target verification is implemented.
+
 ## Benchmark rules
 
 Any published result must include:

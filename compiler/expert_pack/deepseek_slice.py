@@ -2184,6 +2184,557 @@ def _deepseek_mtp_mix_reference(
     return normalized_token, normalized_streams, mixed
 
 
+def _deepseek_reference_tensor(
+    checkpoint: SafeTensorCheckpoint, name: str,
+    shape: tuple[int, ...], dtype: str,
+) -> object:
+    """Read one strictly typed tensor for an independent semantic oracle."""
+
+    info = checkpoint.tensors[name]
+    if info.shape != shape or info.dtype != dtype:
+        raise SourceFormatError(f"invalid DeepSeek oracle tensor: {name}")
+    with checkpoint.open_tensor(name) as view:
+        if dtype == "BF16":
+            return _bf16_to_f32(view.raw, shape).copy()
+        if dtype == "F32":
+            return np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
+        raise SourceFormatError(f"unsupported DeepSeek oracle dtype: {dtype}")
+
+
+def _deepseek_rms_reference(values: object, weight: object) -> object:
+    values = np.asarray(values, dtype=np.float32)
+    inverse = np.float32(
+        1.0 / math.sqrt(
+            float(np.mean(np.square(values, dtype=np.float32))) + 1e-6
+        )
+    )
+    return np.asarray(values * inverse * weight, dtype=np.float32)
+
+
+def _deepseek_ratio_zero_attention_reference(
+    checkpoint: SafeTensorCheckpoint, *, prefix: str, streams: object,
+) -> tuple[object, object, object]:
+    """Execute the shared ratio-zero attention contract for any namespace."""
+
+    streams = np.asarray(streams, dtype=np.float32)
+    if streams.ndim != 3 or streams.shape[1:] != (4, 4096):
+        raise SourceFormatError("invalid ratio-zero attention input geometry")
+    positions = streams.shape[0]
+    tensor = lambda name, shape, dtype: _deepseek_reference_tensor(
+        checkpoint, name, shape, dtype
+    )
+    function = tensor(prefix + ".hc_attn_fn", (24, 16384), "F32")
+    base = tensor(prefix + ".hc_attn_base", (24,), "F32")
+    scale = tensor(prefix + ".hc_attn_scale", (3,), "F32")
+    attention_norm = tensor(prefix + ".attn_norm.weight", (4096,), "BF16")
+    query_norm = tensor(prefix + ".attn.q_norm.weight", (1024,), "BF16")
+    kv_norm = tensor(prefix + ".attn.kv_norm.weight", (512,), "BF16")
+    sink = tensor(prefix + ".attn.attn_sink", (64,), "F32")
+
+    rope_dim = 64
+    rope_base = float(checkpoint.config["rope_theta"])
+    frequencies = 1.0 / (
+        rope_base ** (
+            np.arange(0, rope_dim, 2, dtype=np.float32) / rope_dim
+        )
+    )
+    angles = np.arange(positions, dtype=np.float32)[:, None] * \
+        frequencies[None, :]
+    cosines = np.cos(angles).astype(np.float32)
+    sines = np.sin(angles).astype(np.float32)
+
+    kv_cache: list[object] = []
+    updated_tokens: list[object] = []
+    for position in range(positions):
+        _, post, combination, collapsed, _ = _deepseek_hca_reference(
+            streams[position], function, base, scale
+        )
+        attention_input = _deepseek_rms_reference(
+            collapsed, attention_norm
+        )
+        query_rank = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wq_a", attention_input
+        )
+        query_rank = _deepseek_rms_reference(query_rank, query_norm)
+        query = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wq_b", query_rank
+        ).reshape(64, 512)
+        query *= np.asarray(
+            1.0 / np.sqrt(
+                np.mean(np.square(query, dtype=np.float32), axis=1) + 1e-6
+            ), dtype=np.float32,
+        )[:, None]
+        for pair in range(32):
+            left = query[:, 448 + pair * 2].copy()
+            right = query[:, 449 + pair * 2].copy()
+            query[:, 448 + pair * 2] = (
+                left * cosines[position, pair]
+                - right * sines[position, pair]
+            )
+            query[:, 449 + pair * 2] = (
+                right * cosines[position, pair]
+                + left * sines[position, pair]
+            )
+        query = _bf16_to_f32(
+            _f32_to_bf16_words(query).tobytes(), (64, 512)
+        ).copy()
+
+        kv = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wkv", attention_input
+        )
+        kv = _deepseek_rms_reference(kv, kv_norm)
+        cache_words = _deepseek_compressed_kv_reference(
+            kv, cosines[position], sines[position]
+        )
+        kv_cache.append(_bf16_to_f32(cache_words.tobytes(), (512,)))
+        selected = np.asarray(kv_cache, dtype=np.float32)
+        scores = np.matmul(query, selected.T, dtype=np.float32) * \
+            np.float32(512.0 ** -0.5)
+        maximum = np.maximum(np.max(scores, axis=1), sink)
+        weights = np.exp(scores - maximum[:, None])
+        denominator = np.sum(weights, axis=1, dtype=np.float32) + \
+            np.exp(sink - maximum)
+        attention = np.matmul(weights, selected, dtype=np.float32) / \
+            denominator[:, None]
+        attention = _bf16_to_f32(
+            _f32_to_bf16_words(attention).tobytes(), (64, 512)
+        ).copy()
+        for pair in range(32):
+            left = attention[:, 448 + pair * 2].copy()
+            right = attention[:, 449 + pair * 2].copy()
+            attention[:, 448 + pair * 2] = (
+                left * cosines[position, pair]
+                + right * sines[position, pair]
+            )
+            attention[:, 449 + pair * 2] = (
+                right * cosines[position, pair]
+                - left * sines[position, pair]
+            )
+        flattened = attention.reshape(-1)
+        grouped = [
+            _deepseek_sm86_fp8_matvec(
+                checkpoint, prefix + ".attn.wo_a",
+                flattened[group * 4096:(group + 1) * 4096],
+                row_first=group * 1024, row_last=(group + 1) * 1024,
+            )
+            for group in range(8)
+        ]
+        projected = _deepseek_sm86_fp8_matvec(
+            checkpoint, prefix + ".attn.wo_b", np.concatenate(grouped)
+        )
+        updated_tokens.append(
+            post[:, None] * projected[None, :]
+            + np.matmul(combination.T, streams[position])
+        )
+    return (
+        np.asarray(updated_tokens, dtype="<f4"),
+        np.asarray(cosines, dtype="<f4"),
+        np.asarray(sines, dtype="<f4"),
+    )
+
+
+def _deepseek_admitted_expert_matrix(
+    checkpoint: SafeTensorCheckpoint, name: str, *, routed: bool,
+) -> tuple[object, object]:
+    """Reproduce the admitted expert representation independently of CUDA."""
+
+    weight_info = checkpoint.tensors[name + ".weight"]
+    scale_info = checkpoint.tensors[name + ".scale"]
+    with checkpoint.open_tensor(name + ".weight") as weight_view, \
+            checkpoint.open_tensor(name + ".scale") as scale_view:
+        if routed:
+            rows, packed_columns = weight_info.shape
+            packed = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(
+                rows, packed_columns
+            ).copy()
+            scale_codes = np.frombuffer(
+                scale_view.raw, dtype=np.uint8
+            ).reshape(rows, packed_columns // 16).copy()
+            decoded = _decode_numpy(packed, scale_codes)
+        else:
+            rows, columns = weight_info.shape
+            codes = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(
+                rows, columns
+            ).copy()
+            scale_codes = np.frombuffer(
+                scale_view.raw, dtype=np.uint8
+            ).reshape(rows // 128, columns // 128).copy()
+            if bool((scale_codes == 255).any()):
+                raise SourceFormatError("shared expert contains a UE8M0 NaN")
+            decoded = _fp8_e4m3fn_table()[codes]
+            decoded *= np.repeat(
+                np.ldexp(
+                    np.ones((rows, columns // 128), dtype=np.float32),
+                    scale_codes[np.arange(rows) // 128].astype(np.int16) - 127,
+                ), 128, axis=1,
+            )
+    maxima = np.max(np.abs(decoded), axis=1)
+    row_scales = np.where(maxima > 0.0, maxima / 127.0, 1.0).astype(np.float32)
+    quantized = np.clip(
+        np.rint(decoded / row_scales[:, None]), -127, 127
+    ).astype(np.int8)
+    return quantized, row_scales
+
+
+def _deepseek_admitted_expert_matvec(
+    matrix: object, scales: object, vector: object,
+) -> object:
+    rows, columns = matrix.shape
+    partials = np.zeros((rows, 256), dtype=np.float32)
+    vector = np.asarray(vector, dtype=np.float32)
+    for block in range(columns // 256):
+        begin = block * 256
+        partials += matrix[:, begin:begin + 256].astype(np.float32) * \
+            vector[begin:begin + 256]
+    for offset in (128, 64, 32, 16, 8, 4, 2, 1):
+        partials[:, :offset] += partials[:, offset:2 * offset]
+    return partials[:, 0] * scales
+
+
+def _deepseek_packed_fp4_matvec(
+    checkpoint: SafeTensorCheckpoint, name: str, vector: object,
+) -> object:
+    """Reproduce the direct packed-FP4/Q8 SM86 expert dot contract."""
+
+    weight_info = checkpoint.tensors[name + ".weight"]
+    scale_info = checkpoint.tensors[name + ".scale"]
+    rows, packed_columns = weight_info.shape
+    columns = packed_columns * 2
+    if scale_info.shape != (rows, columns // 32):
+        raise SourceFormatError("invalid packed DeepSeek expert geometry")
+    vector = np.asarray(vector, dtype=np.float32)
+    if vector.shape != (columns,):
+        raise SourceFormatError("invalid packed DeepSeek activation geometry")
+    maximum = float(np.max(np.abs(vector)))
+    activation_scale = np.float32(maximum / 127.0 if maximum > 0.0 else 1.0)
+    quantized = np.clip(
+        np.rint(vector / activation_scale), -127, 127
+    ).astype(np.int8)
+    magnitudes = np.asarray((0, 1, 2, 3, 4, 6, 8, 12), dtype=np.int8)
+    total = np.zeros(rows, dtype=np.float32)
+    with checkpoint.open_tensor(name + ".weight") as weight_view, \
+            checkpoint.open_tensor(name + ".scale") as scale_view:
+        packed = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(
+            rows, packed_columns
+        ).copy()
+        scale_codes = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+            rows, columns // 32
+        ).copy()
+        if bool((scale_codes == 255).any()):
+            raise SourceFormatError("packed DeepSeek expert contains a UE8M0 NaN")
+        for block in range(columns // 32):
+            source = packed[:, block * 16:(block + 1) * 16]
+            codes = np.empty((rows, 32), dtype=np.uint8)
+            codes[:, 0::2] = source & np.uint8(0x0f)
+            codes[:, 1::2] = source >> np.uint8(4)
+            decoded = magnitudes[codes & np.uint8(0x07)].astype(np.int16)
+            decoded = np.where(
+                (codes & np.uint8(0x08)) != 0, -decoded, decoded
+            ).astype(np.int16)
+            dot = np.sum(
+                decoded * quantized[block * 32:(block + 1) * 32],
+                axis=1, dtype=np.int32,
+            )
+            weight_scale = np.ldexp(
+                np.ones(rows, dtype=np.float32),
+                scale_codes[:, block].astype(np.int16) - 127,
+            )
+            total = np.asarray(
+                total + dot.astype(np.float32) * weight_scale,
+                dtype=np.float32,
+            )
+    return np.asarray(
+        total * activation_scale * np.float32(0.5), dtype=np.float32
+    )
+
+
+def _deepseek_admitted_expert_output(
+    checkpoint: SafeTensorCheckpoint, prefix: str,
+    expert: int | None, vector: object,
+) -> object:
+    routed = expert is not None
+    base = prefix + ".ffn." + (
+        f"experts.{expert}" if routed else "shared_experts"
+    )
+    if routed:
+        gate = np.minimum(
+            _deepseek_packed_fp4_matvec(
+                checkpoint, base + ".w1", vector
+            ), np.float32(10.0),
+        )
+        up = np.clip(
+            _deepseek_packed_fp4_matvec(
+                checkpoint, base + ".w3", vector
+            ), -10.0, 10.0,
+        ).astype(np.float32)
+        intermediate = gate / (np.float32(1.0) + np.exp(-gate)) * up
+        intermediate = _bf16_to_f32(
+            _f32_to_bf16_words(intermediate).tobytes(), (2048,)
+        )
+        return _deepseek_packed_fp4_matvec(
+            checkpoint, base + ".w2", intermediate
+        )
+    gate_q, gate_scale = _deepseek_admitted_expert_matrix(
+        checkpoint, base + ".w1", routed=routed
+    )
+    up_q, up_scale = _deepseek_admitted_expert_matrix(
+        checkpoint, base + ".w3", routed=routed
+    )
+    gate = np.minimum(
+        _deepseek_admitted_expert_matvec(gate_q, gate_scale, vector),
+        np.float32(10.0),
+    )
+    up = np.clip(
+        _deepseek_admitted_expert_matvec(up_q, up_scale, vector),
+        -10.0, 10.0,
+    ).astype(np.float32)
+    intermediate = gate / (np.float32(1.0) + np.exp(-gate)) * up
+    intermediate = _bf16_to_f32(
+        _f32_to_bf16_words(intermediate).tobytes(), (2048,)
+    )
+    down_q, down_scale = _deepseek_admitted_expert_matrix(
+        checkpoint, base + ".w2", routed=routed
+    )
+    return _deepseek_admitted_expert_matvec(
+        down_q, down_scale, intermediate
+    )
+
+
+def _deepseek_learned_ffn_reference(
+    checkpoint: SafeTensorCheckpoint, *, prefix: str,
+    streams: object,
+) -> tuple[object, object, object, object]:
+    """Route every row and execute the final row's complete learned FFN."""
+
+    streams = np.asarray(streams, dtype=np.float32)
+    tensor = lambda name, shape, dtype: _deepseek_reference_tensor(
+        checkpoint, name, shape, dtype
+    )
+    function = tensor(prefix + ".hc_ffn_fn", (24, 16384), "F32")
+    base = tensor(prefix + ".hc_ffn_base", (24,), "F32")
+    scale = tensor(prefix + ".hc_ffn_scale", (3,), "F32")
+    ffn_norm = tensor(prefix + ".ffn_norm.weight", (4096,), "BF16")
+    router = tensor(prefix + ".ffn.gate.weight", (256, 4096), "BF16")
+    bias = tensor(prefix + ".ffn.gate.bias", (256,), "F32")
+    route_indices = np.empty((streams.shape[0], 6), dtype="<i4")
+    route_weights = np.empty((streams.shape[0], 6), dtype="<f4")
+    ffn_inputs: list[object] = []
+    posts: list[object] = []
+    combinations: list[object] = []
+    expert_ids = np.arange(256, dtype=np.int32)
+    for position, row in enumerate(streams):
+        _, post, combination, collapsed, _ = _deepseek_hca_reference(
+            row, function, base, scale
+        )
+        ffn_input = _deepseek_rms_reference(collapsed, ffn_norm)
+        partial = np.zeros((256, 32), dtype=np.float32)
+        for block in range(4096 // 32):
+            begin = block * 32
+            partial += router[:, begin:begin + 32] * \
+                ffn_input[begin:begin + 32]
+        for offset in (16, 8, 4, 2, 1):
+            partial[:, :offset] += partial[:, offset:2 * offset]
+        logits = partial[:, 0]
+        scores = np.sqrt(
+            np.logaddexp(np.float32(0.0), logits)
+        ).astype(np.float32)
+        selected = np.lexsort((expert_ids, -(scores + bias)))[:6]
+        route_indices[position] = selected
+        selected_scores = scores[selected]
+        route_weights[position] = (
+            selected_scores / np.sum(selected_scores, dtype=np.float32)
+            * np.float32(1.5)
+        )
+        ffn_inputs.append(ffn_input)
+        posts.append(post)
+        combinations.append(combination)
+
+    final = streams.shape[0] - 1
+    routed_output = np.zeros(4096, dtype=np.float32)
+    for slot, expert in enumerate(route_indices[final]):
+        routed_output += route_weights[final, slot] * \
+            _deepseek_admitted_expert_output(
+                checkpoint, prefix, int(expert), ffn_inputs[final]
+            )
+    ffn_output = routed_output + _deepseek_admitted_expert_output(
+        checkpoint, prefix, None, ffn_inputs[final]
+    )
+    block_output = (
+        posts[final][:, None] * ffn_output[None, :]
+        + np.matmul(combinations[final].T, streams[final])
+    ).astype("<f4")
+    return route_indices, route_weights, np.asarray(ffn_inputs), block_output
+
+
+def export_deepseek_mtp_block_oracle(
+    checkpoint: SafeTensorCheckpoint, *, output: Path,
+    tokens: tuple[int, ...] = (0, 128803, 23166, 19923),
+    row_chunk: int = 512,
+) -> dict[str, object]:
+    """Emit the independent four-position oracle for the complete MTP block."""
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for the DeepSeek MTP oracle")
+    validate_deepseek_v4_source(checkpoint)
+    if len(tokens) != 4 or any(not 0 <= token < 129280 for token in tokens):
+        raise AdapterError("MTP block oracle requires four valid token IDs")
+    if row_chunk <= 0:
+        raise AdapterError("invalid MTP vocabulary row chunk")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"DeepSeek MTP block oracle exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+    prefix = "mtp.0"
+    try:
+        embedding_info = checkpoint.tensors["embed.weight"]
+        if embedding_info.shape != (129280, 4096) or \
+                embedding_info.dtype != "BF16":
+            raise SourceFormatError("invalid shared MTP embedding")
+        embeddings = np.empty((4, 4096), dtype=np.float32)
+        with (checkpoint.root / embedding_info.shard).open(
+            "rb", buffering=0
+        ) as source:
+            for position, token in enumerate(tokens):
+                source.seek(embedding_info.offset + token * 4096 * 2)
+                raw = source.read(4096 * 2)
+                if len(raw) != 4096 * 2:
+                    raise SourceFormatError("truncated shared MTP embedding")
+                embeddings[position] = _bf16_to_f32(raw, (4096,))
+        embeddings[0].fill(0.0)
+
+        values = np.arange(4 * 4 * 4096, dtype=np.float32).reshape(4, 4, 4096)
+        previous = (
+            np.sin(values * np.float32(0.0019)) * np.float32(0.09)
+            + np.cos(values * np.float32(0.0041)) * np.float32(0.025)
+        ).astype(np.float32)
+        enorm = _deepseek_reference_tensor(
+            checkpoint, prefix + ".enorm.weight", (4096,), "BF16"
+        )
+        hnorm = _deepseek_reference_tensor(
+            checkpoint, prefix + ".hnorm.weight", (4096,), "BF16"
+        )
+        mixed = np.empty_like(previous)
+        for position in range(4):
+            _, _, mixed[position] = _deepseek_mtp_mix_reference(
+                previous[position], embeddings[position], enorm, hnorm,
+                lambda vector: _deepseek_sm86_fp8_matvec(
+                    checkpoint, prefix + ".e_proj", vector
+                ),
+                lambda vector: _deepseek_sm86_fp8_matvec(
+                    checkpoint, prefix + ".h_proj", vector
+                ),
+            )
+        attention, cosines, sines = _deepseek_ratio_zero_attention_reference(
+            checkpoint, prefix=prefix, streams=mixed
+        )
+        route_indices, route_weights, ffn_inputs, block_output = \
+            _deepseek_learned_ffn_reference(
+                checkpoint, prefix=prefix, streams=attention
+            )
+
+        function = _deepseek_reference_tensor(
+            checkpoint, prefix + ".hc_head_fn", (4, 16384), "F32"
+        )
+        base = _deepseek_reference_tensor(
+            checkpoint, prefix + ".hc_head_base", (4,), "F32"
+        )
+        scale = _deepseek_reference_tensor(
+            checkpoint, prefix + ".hc_head_scale", (1,), "F32"
+        )
+        head_input = _bf16_to_f32(
+            _f32_to_bf16_words(block_output).tobytes(), (4, 4096)
+        ).copy()
+        flat = head_input.reshape(-1)
+        inverse = np.float32(
+            1.0 / math.sqrt(
+                float(np.mean(np.square(flat, dtype=np.float32))) + 1e-6
+            )
+        )
+        gates = 1.0 / (
+            1.0 + np.exp(-(
+                np.matmul(function, flat * inverse, dtype=np.float32)
+                * scale[0] + base
+            ))
+        ) + 1e-6
+        collapsed = np.sum(
+            gates[:, None] * head_input, axis=0, dtype=np.float32
+        )
+        collapsed = _bf16_to_f32(
+            _f32_to_bf16_words(collapsed).tobytes(), (4096,)
+        ).copy()
+        norm = _deepseek_reference_tensor(
+            checkpoint, prefix + ".norm.weight", (4096,), "BF16"
+        )
+        normalized = _deepseek_rms_reference(collapsed, norm)
+        normalized = _bf16_to_f32(
+            _f32_to_bf16_words(normalized).tobytes(), (4096,)
+        ).copy()
+        head_info = checkpoint.tensors["head.weight"]
+        if head_info.shape != (129280, 4096) or head_info.dtype != "BF16":
+            raise SourceFormatError("invalid shared MTP vocabulary head")
+        logits = np.empty(129280, dtype="<f4")
+        row_bytes = 4096 * 2
+        with (checkpoint.root / head_info.shard).open(
+            "rb", buffering=0
+        ) as source:
+            for first in range(0, 129280, row_chunk):
+                count = min(row_chunk, 129280 - first)
+                source.seek(head_info.offset + first * row_bytes)
+                raw = source.read(count * row_bytes)
+                if len(raw) != count * row_bytes:
+                    raise SourceFormatError("truncated shared MTP head")
+                matrix = _bf16_to_f32(raw, (count, 4096))
+                logits[first:first + count] = np.matmul(
+                    matrix, normalized, dtype=np.float32
+                )
+        sampled = int(np.argmax(logits))
+
+        arrays = {
+            "previous-streams.f32": previous,
+            "embeddings.f32": embeddings,
+            "mixed-streams.f32": mixed,
+            "attention-output.f32": attention,
+            "cosine.f32": cosines,
+            "sine.f32": sines,
+            "router-indices.i32": route_indices,
+            "router-scores.f32": route_weights,
+            "ffn-inputs.f32": ffn_inputs,
+            "block-output.f32": block_output,
+            "normalized-output.f32": normalized,
+            "logits.f32": logits,
+        }
+        for name, array in arrays.items():
+            dtype = "<i4" if name.endswith(".i32") else "<f4"
+            (partial / name).write_bytes(
+                np.asarray(array, dtype=dtype).tobytes(order="C")
+            )
+        (partial / "tokens.u32").write_bytes(
+            np.asarray(tokens, dtype="<u4").tobytes()
+        )
+        (partial / "sampled.u32").write_bytes(
+            sampled.to_bytes(4, "little", signed=False)
+        )
+        result = {
+            "format": "deepseek-mtp-block-oracle-v1",
+            "namespace": 0,
+            "positions": 4,
+            "tokens": list(tokens),
+            "router_top_k": 6,
+            "block_position": 3,
+            "selected_experts": [int(value) for value in route_indices[3]],
+            "sampled_token": sampled,
+            "expert_reference_abi": "deepseek-sm86-fp4-q8-direct-v1",
+            "projection_abi": "deepseek-sm86-int8-per-row-matrix-v1",
+        }
+        atomic_json(partial / "manifest.json", result)
+        publish_directory(partial, output)
+        return result
+    except Exception:
+        raise
+
+
 def export_deepseek_mtp_glue_oracle(
     checkpoint: SafeTensorCheckpoint,
     *,

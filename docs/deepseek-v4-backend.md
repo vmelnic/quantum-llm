@@ -120,6 +120,22 @@ and shared-residency descriptor. Its 256 routed records were packed into one
 loaded, published, and pinned both boundary records. No MTP-only storage or
 expert execution path was introduced.
 
+The complete MTP decoder is now qualified across four causal positions. The
+independent checkpoint path performs the V4 mix, ratio-zero attention, learned
+top-6 routing, direct packed-FP4/Q8 routed experts, the shared FP8 expert, FFN
+mHC post, MTP hyper-head/final norm, and the target model's shared vocabulary
+head. The native path uses the same attention, FFN, cache, CUDA directory, and
+vocabulary primitives as target decode. Both selected final route
+`[159, 199, 91, 147, 27, 241]` and draft token `70663`.
+
+The qualification gates reflect the served numeric ABIs rather than claiming
+FP32 identity: the four-position attention maximum error was `0.001623`, block
+RMSE was `0.00504`, normalized-output RMSE was `0.00357`, and logit RMSE was
+`0.03966`. The native/independent draft margins were `0.2334`/`0.2549`, above
+four times the observed logit RMSE. This proves one complete draft computation;
+it does not yet permit emission. Target verification and KV-state transaction
+semantics remain the next boundary.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face
