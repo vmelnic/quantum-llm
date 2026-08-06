@@ -73,8 +73,10 @@ $server = Join-Path $script:RepoRoot "ops\python\expert_server.py"
 if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $worker" }
 if (-not (Test-Path $containerPath -PathType Container)) { throw "Container missing: $containerPath" }
 if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer missing: $tokenizerPath" }
-$profileArguments = if ($ProfileGpuPhases) { @("--profile-gpu-phases") } else { @() }
-$mtpArguments = if ($EnableMtp) { @("--enable-mtp") } else { @() }
+[string[]]$profileArguments = if ($ProfileGpuPhases) {
+    "--profile-gpu-phases"
+} else { @() }
+[string[]]$mtpArguments = if ($EnableMtp) { "--enable-mtp" } else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
