@@ -4,6 +4,7 @@
 |---|---|
 | [Architecture](architecture.md) | System boundaries, data flow, placement, and failure model |
 | [Getting started](getting-started.md) | Requirements, build, model conversion, and first request |
+| [Install, configure, and use](deployment.md) | End-to-end `.env`, model lifecycle, chat, API, and troubleshooting |
 | [Expert Pack v1](expert-pack-v1.md) | On-disk format and quantization ABI |
 | [Compute-ready representations](compute-ready.md) | Source, placement, kernel ABI, and residency distinctions |
 | [Runtime contract](expert-runtime.md) | Cache, scheduler, storage, CUDA, and request invariants |

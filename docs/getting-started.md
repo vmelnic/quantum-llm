@@ -14,6 +14,11 @@
 The portable core/tests build on Linux without CUDA. The complete Qwen runtime
 is currently Windows/CUDA only.
 
+For an existing built runtime and prepared DeepSeek/Qwen artifacts, use the
+[end-to-end deployment guide](deployment.md) instead: it covers `.env`, remote
+synchronization, model switching, interactive chat, and API use through the
+single `ops/model.sh` control command.
+
 ## Clone and Python environment
 
 ```powershell

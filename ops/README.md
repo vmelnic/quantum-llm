@@ -2,6 +2,7 @@
 
 `ops/` contains deployment automation only. Product code lives in `core/`,
 `compiler/`, and `runtime/`; public contracts live in `docs/` and `schemas/`.
+The complete operator walkthrough is [Install, configure, and use](../docs/deployment.md).
 
 ## POSIX control-host wrappers
 
