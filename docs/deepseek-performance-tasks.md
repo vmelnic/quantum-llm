@@ -232,14 +232,29 @@ latency or aggregate throughput without changing model semantics.
 
 ## P3 — useful-token acceleration
 
-- [ ] Implement the checkpoint's native MTP state and verification path only
-  after base model steps are fast and cache-resident enough to make rejection
-  affordable.
-- [ ] Batch the union of experts needed by target verification.
+- [ ] Export and authenticate the checkpoint's one native MTP layer as a
+  separate bundle resource. Base greedy serving must remain byte-for-byte
+  unchanged when the resource is absent or disabled.
+- [ ] Implement the MTP draft state and qualify one-token predictions against
+  an independent source-checkpoint oracle before enabling verification.
+- [ ] Add transactional target verification with causal KV/CSA state commit on
+  acceptance and exact rollback/replay on rejection. Never expose a draft
+  token before target acceptance.
+- [ ] Batch the union of experts and dense projections needed by target
+  verification; use measured multi-row kernels instead of running two ordinary
+  model steps serially.
 - [ ] Publish acceptance rate, rollback/replay cost, target model steps, and
   useful output tokens separately.
 - [ ] Disable speculation automatically when its moving critical-path cost is
   higher than ordinary decode.
+
+The current ~68.3 ms warm model-step result is about 14.6 model steps/s. One
+MTP layer can propose at most one additional token, so even perfect acceptance
+has a pre-overhead ceiling near 29.3 useful tokens/s. MTP alone therefore does
+not satisfy the 30 tok/s objective: verification must reuse weights across its
+rows and the base step still needs a modest compute reduction. Conversely,
+single-stream 30 tok/s cannot be reached merely by batching unrelated HTTP
+requests; that improves aggregate service throughput only.
 
 Acceptance: useful output tokens/s improves on representative multi-turn
 workloads, not only on a synthetic prompt, with identical target-model greedy
