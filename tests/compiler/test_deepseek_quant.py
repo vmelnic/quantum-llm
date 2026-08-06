@@ -22,6 +22,7 @@ from compiler.expert_pack.deepseek_slice import (
     _deepseek_csa_ratio4_reference,
     _deepseek_hca_reference,
     _exclusive_pack_lock,
+    _reconstruct_compact_blocks,
 )
 
 try:
@@ -31,6 +32,28 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_compact_dense_candidate_schemes_are_bounded(self) -> None:
+        values = np.asarray(
+            [[[-6.0, -4.0, -3.0, -2.0, -1.5, -1.0, -0.5, 0.0,
+               0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0]]],
+            dtype=np.float32,
+        )
+        symmetric, symmetric_scales = _reconstruct_compact_blocks(
+            values, scheme="symmetric", bits=4
+        )
+        e2m1, e2m1_scales = _reconstruct_compact_blocks(
+            values, scheme="e2m1", bits=4
+        )
+        self.assertEqual(symmetric.shape, values.shape)
+        self.assertEqual(e2m1.shape, values.shape)
+        self.assertEqual(symmetric_scales.dtype, np.float32)
+        self.assertEqual(e2m1_scales.dtype, np.float32)
+        self.assertLessEqual(float(np.max(np.abs(symmetric))), 6.001)
+        self.assertTrue(np.array_equal(e2m1, values))
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            _reconstruct_compact_blocks(values, scheme="e2m1", bits=5)
+
     def test_compact_pack_lock_rejects_overlapping_writer(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             lock = Path(directory) / ".compact.lock"

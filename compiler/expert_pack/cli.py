@@ -26,6 +26,7 @@ from .deepseek_slice import (
     export_deepseek_shared_set,
     qualify_deepseek_expert,
     qualify_deepseek_fp8_matrix,
+    qualify_deepseek_compact_matrix,
     qualify_deepseek_shared_expert,
 )
 from .errors import ExpertPackError
@@ -100,6 +101,17 @@ def _parser() -> argparse.ArgumentParser:
     dense_slice_parser.add_argument("--source", type=Path, required=True)
     dense_slice_parser.add_argument("--name", required=True)
     dense_slice_parser.add_argument("--row-chunk", type=int, default=128)
+    compact_dense_parser = commands.add_parser(
+        "qualify-deepseek-compact-matrix",
+        help="screen compact symmetric dense candidates without publishing an ABI",
+    )
+    compact_dense_parser.add_argument("--source", type=Path, required=True)
+    compact_dense_parser.add_argument("--name", required=True)
+    compact_dense_parser.add_argument("--bits", type=int, nargs="+", default=(4, 5, 6))
+    compact_dense_parser.add_argument(
+        "--block-sizes", type=int, nargs="+", default=(32, 64, 128)
+    )
+    compact_dense_parser.add_argument("--row-chunk", type=int, default=128)
 
     export_parser = commands.add_parser(
         "export-deepseek-expert",
@@ -238,6 +250,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "qualify-deepseek-fp8-matrix":
             result = qualify_deepseek_fp8_matrix(
                 SafeTensorCheckpoint(args.source), name=args.name,
+                row_chunk=args.row_chunk,
+            )
+        elif args.command == "qualify-deepseek-compact-matrix":
+            result = qualify_deepseek_compact_matrix(
+                SafeTensorCheckpoint(args.source), name=args.name,
+                bits=tuple(args.bits), block_sizes=tuple(args.block_sizes),
                 row_chunk=args.row_chunk,
             )
         elif args.command == "export-deepseek-expert":

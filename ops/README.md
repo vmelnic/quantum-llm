@@ -31,6 +31,7 @@ remote files.
 | `Invoke-DeepSeekExpertSlice.ps1` | full real-expert decode/reference/INT8 qualification |
 | `Invoke-DeepSeekCudaAdmission.ps1` | compact H2D + SM86 admission hash gate |
 | `Invoke-DeepSeekDenseAdmission.ps1` | block-scaled FP8 dense matrix → SM86 GEMV gate |
+| `Invoke-DeepSeekCompactDenseScreen.ps1` | read-only compact dense representation screen across real projection geometries |
 | `Invoke-DeepSeekDenseResidency.ps1` | atomically load all 236 main-model FP8 matrices |
 | `Invoke-DeepSeekSharedAdmission.ps1` | FP8 shared expert → SM86 cache/compute gate |
 | `Invoke-DeepSeekSharedResidency.ps1` | atomically pin all 43 shared experts at startup |

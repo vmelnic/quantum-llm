@@ -81,6 +81,12 @@ no-copy path for any validated dense FP8 matrix. The candidate ABI is generic
 INT8-per-row and feeds the normal dense GEMV kernels rather than the expert
 directory.
 
+`qualify-deepseek-compact-matrix` is a read-only pre-kernel screen for smaller
+dense representations. It compares symmetric 4/5/6-bit and FP4 E2M1 candidates
+with FP16 block scales, reporting both reconstruction error and four
+deterministic projection errors. A screened candidate is not a published ABI;
+it must still pass the independent attention/full-model oracles.
+
 `export-deepseek-dense-set` atomically emits descriptors for all 236
 main-model FP8 matrices. The descriptor set is metadata only; the authoritative
 4.78 GB of weights remains in the original shards.

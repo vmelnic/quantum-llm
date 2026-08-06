@@ -424,6 +424,225 @@ def qualify_deepseek_fp8_matrix(
     }
 
 
+def _reconstruct_compact_blocks(
+    blocked: object, *, scheme: str, bits: int
+) -> tuple[object, object]:
+    """Reconstruct one row-major block tensor using a candidate dense ABI."""
+
+    values = np.asarray(blocked, dtype=np.float32)
+    if values.ndim != 3 or bits < 2 or bits > 8:
+        raise ValueError("invalid compact dense candidate geometry")
+    maxima = np.max(np.abs(values), axis=2)
+    if scheme == "symmetric":
+        qmax = (1 << (bits - 1)) - 1
+        scales = np.where(
+            maxima > 0, maxima / np.float32(qmax), np.float32(1.0)
+        ).astype(np.float16).astype(np.float32)
+        quantized = np.clip(
+            np.rint(values / scales[:, :, None]), -qmax, qmax
+        ).astype(np.int8)
+        return quantized.astype(np.float32) * scales[:, :, None], scales
+    if scheme != "e2m1" or bits != 4:
+        raise ValueError("unsupported compact dense candidate scheme")
+    magnitudes = np.asarray(
+        (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0), dtype=np.float32
+    )
+    thresholds = np.asarray(
+        (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0), dtype=np.float32
+    )
+    scales = np.where(
+        maxima > 0, maxima / np.float32(6.0), np.float32(1.0)
+    ).astype(np.float16).astype(np.float32)
+    codes = np.searchsorted(thresholds, np.abs(values) / scales[:, :, None])
+    return np.copysign(magnitudes[codes], values) * scales[:, :, None], scales
+
+
+def qualify_deepseek_compact_matrix(
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    name: str,
+    bits: tuple[int, ...] = (4, 5, 6),
+    block_sizes: tuple[int, ...] = (32, 64, 128),
+    row_chunk: int = 128,
+) -> dict[str, object]:
+    """Screen smaller symmetric dense ABIs before implementing a GPU kernel.
+
+    This is deliberately a read-only qualification: it reconstructs each
+    candidate from packed-width integers and FP16 block scales, then reports
+    both weight error and four deterministic projection errors. It does not
+    publish a format or mutate the checkpoint.
+    """
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for compact dense screening")
+    validate_deepseek_v4_source(checkpoint)
+    weight_name = name + ".weight"
+    scale_name = name + ".scale"
+    if weight_name not in checkpoint.tensors or scale_name not in checkpoint.tensors:
+        raise AdapterError(f"DeepSeek FP8 matrix does not exist: {name}")
+    weight_info = checkpoint.tensors[weight_name]
+    scale_info = checkpoint.tensors[scale_name]
+    if weight_info.dtype != "F8_E4M3" or scale_info.dtype != "F8_E8M0":
+        raise AdapterError(f"DeepSeek matrix is not block-scaled FP8: {name}")
+    rows, columns = weight_info.shape
+    if rows % 128 or columns % 128 or scale_info.shape != (rows // 128, columns // 128):
+        raise SourceFormatError("DeepSeek FP8 matrix has invalid 128x128 geometry")
+    if row_chunk <= 0:
+        raise ValueError("row_chunk must be positive")
+    if not bits or any(value < 2 or value > 8 for value in bits):
+        raise ValueError("compact dense bits must be in [2, 8]")
+    if not block_sizes or any(
+        value <= 0 or columns % value != 0 for value in block_sizes
+    ):
+        raise ValueError("compact dense block sizes must divide matrix columns")
+
+    variants = tuple(
+        [("symmetric", value_bits, block) for value_bits in bits for block in block_sizes]
+        + [("e2m1", 4, block) for block in block_sizes]
+    )
+    accumulators = {
+        variant: {
+            "weight_squared_error": 0.0,
+            "weight_maximum_error": 0.0,
+            "projection_squared_error": 0.0,
+            "projection_maximum_error": 0.0,
+        }
+        for variant in variants
+    }
+    indices = np.arange(columns, dtype=np.float32)
+    random = np.random.default_rng(0xD335E3).standard_normal(columns).astype(np.float32)
+    probes = np.stack(
+        (
+            np.sin(indices * np.float32(0.017)) * np.float32(0.2),
+            np.cos(indices * np.float32(0.013)) * np.float32(0.15),
+            random * np.float32(0.1),
+            ((indices % np.float32(257.0)) - np.float32(128.0))
+            / np.float32(1024.0),
+        ),
+        axis=1,
+    )
+    reference_projection_squares = 0.0
+    reference_weight_squares = 0.0
+    table = _fp8_e4m3fn_table()
+    started = time.perf_counter()
+    with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
+        scale_name
+    ) as scale_view:
+        weights = np.frombuffer(weight_view.raw, dtype=np.uint8).reshape(rows, columns)
+        scales = np.frombuffer(scale_view.raw, dtype=np.uint8).reshape(
+            rows // 128, columns // 128
+        )
+        for first in range(0, rows, row_chunk):
+            last = min(rows, first + row_chunk)
+            weight_codes = weights[first:last]
+            scale_codes = scales[np.arange(first, last) // 128]
+            if bool((scale_codes == 255).any()):
+                raise SourceFormatError("dense FP8 matrix contains a UE8M0 NaN scale")
+            decoded = table[weight_codes]
+            decoded *= np.repeat(
+                np.ldexp(
+                    np.ones(scale_codes.shape, dtype=np.float32),
+                    scale_codes.astype(np.int16) - 127,
+                ),
+                128,
+                axis=1,
+            )
+            if not bool(np.isfinite(decoded).all()):
+                raise SourceFormatError("dense FP8 matrix decoded non-finite values")
+            reference_projection = decoded @ probes
+            reference_projection_squares += float(
+                np.square(reference_projection.astype(np.float64)).sum()
+            )
+            reference_weight_squares += float(
+                np.square(decoded.astype(np.float64)).sum()
+            )
+            for scheme, value_bits, block in variants:
+                blocked = decoded.reshape(last - first, columns // block, block)
+                reconstructed, candidate_scales = _reconstruct_compact_blocks(
+                    blocked, scheme=scheme, bits=value_bits
+                )
+                reconstructed = reconstructed.reshape(last - first, columns)
+                difference = decoded.astype(np.float64) - reconstructed.astype(np.float64)
+                projection_difference = (
+                    reference_projection - reconstructed @ probes
+                ).astype(np.float64)
+                accumulator = accumulators[(scheme, value_bits, block)]
+                accumulator["weight_squared_error"] += float(np.square(difference).sum())
+                accumulator["weight_maximum_error"] = max(
+                    accumulator["weight_maximum_error"],
+                    float(np.max(np.abs(difference))),
+                )
+                accumulator["projection_squared_error"] += float(
+                    np.square(projection_difference).sum()
+                )
+                accumulator["projection_maximum_error"] = max(
+                    accumulator["projection_maximum_error"],
+                    float(np.max(np.abs(projection_difference))),
+                )
+        del (
+            weights,
+            scales,
+            weight_codes,
+            scale_codes,
+            decoded,
+            reference_projection,
+            blocked,
+            candidate_scales,
+            reconstructed,
+            difference,
+            projection_difference,
+        )
+
+    weight_values = rows * columns
+    projection_values = rows * probes.shape[1]
+    candidates = []
+    for scheme, value_bits, block in variants:
+        accumulator = accumulators[(scheme, value_bits, block)]
+        packed_weight_bytes = (weight_values * value_bits + 7) // 8
+        scale_bytes = rows * (columns // block) * 2
+        candidates.append(
+            {
+                "scheme": scheme,
+                "bits": value_bits,
+                "block_size": block,
+                "scale_dtype": "float16",
+                "candidate_bytes": packed_weight_bytes + scale_bytes,
+                "compression_ratio": (weight_info.nbytes + scale_info.nbytes)
+                / (packed_weight_bytes + scale_bytes),
+                "weight_rmse": math.sqrt(
+                    accumulator["weight_squared_error"] / weight_values
+                ),
+                "weight_relative_rmse": math.sqrt(
+                    accumulator["weight_squared_error"]
+                    / max(reference_weight_squares, float.fromhex("0x1p-1022"))
+                ),
+                "weight_maximum_absolute_error": accumulator[
+                    "weight_maximum_error"
+                ],
+                "projection_rmse": math.sqrt(
+                    accumulator["projection_squared_error"] / projection_values
+                ),
+                "projection_relative_rmse": math.sqrt(
+                    accumulator["projection_squared_error"]
+                    / max(reference_projection_squares, float.fromhex("0x1p-1022"))
+                ),
+                "projection_maximum_absolute_error": accumulator[
+                    "projection_maximum_error"
+                ],
+            }
+        )
+    return {
+        "format": "deepseek-v4-compact-dense-screen-v1",
+        "name": name,
+        "shape": [rows, columns],
+        "source_bytes": weight_info.nbytes + scale_info.nbytes,
+        "probe_count": int(probes.shape[1]),
+        "row_chunk": row_chunk,
+        "candidates": candidates,
+        "elapsed_seconds": time.perf_counter() - started,
+    }
+
+
 def _deepseek_hca_reference(
     streams: object,
     fn: object,
