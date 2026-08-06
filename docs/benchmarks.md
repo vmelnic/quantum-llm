@@ -474,6 +474,14 @@ on the immediately following shared census. Both emitted token `19923`. The
 candidate was removed: source-level instruction-count intuition is not a
 substitute for the compiler's SM86 lowering on this kernel.
 
+Loading the four UE8M0 bytes needed by a warp once and distributing them with
+`__shfl_sync` was also rejected. It took 379.641 ms/5 model steps versus the
+immediately preceding 341.462 ms original run, with the same token and 991-entry
+warm set. The scale footprint is already cache/broadcast friendly; explicit
+warp distribution only added work. This closes the obvious bit-exact scalar
+FP4 micro-tuning branch and moves the next effort to row/request reuse or a
+different qualified execution representation.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

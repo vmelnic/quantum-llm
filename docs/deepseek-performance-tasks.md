@@ -196,6 +196,11 @@ single-request latency and aggregate throughput.
   original took 341.462 ms on the immediately following shared census. Both
   emitted token `19923`; NVCC's original byte-load/select lowering is better
   on this SM86 path. The candidate was removed.
+- [x] Evaluate warp-broadcasting four packed UE8M0 scale bytes instead of one
+  scale load per lane. Reject it: the candidate took 379.641 ms/5 model steps
+  versus the immediately preceding 341.462 ms original run, with the same
+  token and warm-set size. Hardware cache/broadcast already handles this tiny
+  scale footprint better than the added shuffle/extraction instructions.
 - [ ] Fuse compatible RMSNorm, quantization, bias/gating, RoPE, top-k, and
   aggregation operations to reduce launches and global-memory traffic.
 - [ ] Capture stable resident decode segments in CUDA graphs after dynamic
