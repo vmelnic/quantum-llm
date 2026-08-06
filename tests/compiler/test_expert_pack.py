@@ -16,7 +16,10 @@ from compiler.expert_pack.deepseek_v4 import (
     estimate_deepseek_v4_representations,
     validate_deepseek_v4_source,
 )
-from compiler.expert_pack.deepseek_slice import _deepseek_mtp_partition
+from compiler.expert_pack.deepseek_slice import (
+    _deepseek_mtp_mix_reference,
+    _deepseek_mtp_partition,
+)
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
@@ -336,6 +339,38 @@ class ExpertPackTests(unittest.TestCase):
         self.assertTrue(all(name.startswith("mtp.0.") for name in dense))
         self.assertEqual(len(set(typed)), len(typed))
         self.assertEqual(len(set(dense)), len(dense))
+
+    def test_deepseek_mtp_mix_normalizes_last_dimension_and_broadcasts(self) -> None:
+        try:
+            import numpy as np
+        except ImportError:
+            self.skipTest("NumPy is required")
+        previous = np.asarray(
+            [[1.0, 2.0], [2.0, 1.0], [-1.0, 2.0], [3.0, -2.0]],
+            dtype=np.float32,
+        )
+        embedding = np.asarray([2.0, -1.0], dtype=np.float32)
+        enorm = np.asarray([1.5, 0.5], dtype=np.float32)
+        hnorm = np.asarray([0.25, 2.0], dtype=np.float32)
+        matrix_e = np.asarray([[2.0, 0.0], [0.0, -1.0]], dtype=np.float32)
+        matrix_h = np.asarray([[1.0, 0.5], [-0.25, 2.0]], dtype=np.float32)
+        normalized_token, normalized_streams, mixed = \
+            _deepseek_mtp_mix_reference(
+                previous, embedding, enorm, hnorm,
+                lambda value: matrix_e @ value,
+                lambda value: matrix_h @ value,
+            )
+        token_inverse = 1.0 / np.sqrt(np.mean(embedding * embedding) + 1e-6)
+        expected_token = embedding * token_inverse * enorm
+        stream_inverse = 1.0 / np.sqrt(
+            np.mean(previous * previous, axis=1) + 1e-6
+        )
+        expected_streams = previous * stream_inverse[:, None] * hnorm[None, :]
+        expected_mixed = expected_streams @ matrix_h.T + \
+            (matrix_e @ expected_token)[None, :]
+        np.testing.assert_allclose(normalized_token, expected_token, rtol=1e-6)
+        np.testing.assert_allclose(normalized_streams, expected_streams, rtol=1e-6)
+        np.testing.assert_allclose(mixed, expected_mixed, rtol=1e-6)
 
     def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

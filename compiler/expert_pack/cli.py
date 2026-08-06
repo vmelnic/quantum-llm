@@ -18,6 +18,7 @@ from .deepseek_slice import (
     export_deepseek_fp8_matrix,
     export_deepseek_hca_slice,
     export_deepseek_io_oracle,
+    export_deepseek_mtp_glue_oracle,
     export_deepseek_csa_slice,
     export_deepseek_attention_oracle,
     export_deepseek_typed_set,
@@ -190,6 +191,15 @@ def _parser() -> argparse.ArgumentParser:
     )
     mtp_set_parser.add_argument("--source", type=Path, required=True)
     mtp_set_parser.add_argument("--output", type=Path, required=True)
+    mtp_oracle_parser = commands.add_parser(
+        "export-deepseek-mtp-glue-oracle",
+        help="emit independent DeepSeek MTP input/output boundary oracles",
+    )
+    mtp_oracle_parser.add_argument("--source", type=Path, required=True)
+    mtp_oracle_parser.add_argument("--output", type=Path, required=True)
+    mtp_oracle_parser.add_argument("--token", type=int, default=42)
+    mtp_oracle_parser.add_argument("--position", type=int, default=1)
+    mtp_oracle_parser.add_argument("--previous-streams", type=Path)
     csa_parser = commands.add_parser(
         "export-deepseek-csa",
         help="describe one ratio-four CSA compressor and emit its decode oracle",
@@ -314,6 +324,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "export-deepseek-mtp-set":
             result = export_deepseek_mtp_set(
                 SafeTensorCheckpoint(args.source), output=args.output,
+            )
+        elif args.command == "export-deepseek-mtp-glue-oracle":
+            result = export_deepseek_mtp_glue_oracle(
+                SafeTensorCheckpoint(args.source), output=args.output,
+                token=args.token, position=args.position,
+                previous_streams=args.previous_streams,
             )
         elif args.command == "export-deepseek-csa":
             result = export_deepseek_csa_slice(

@@ -2121,6 +2121,210 @@ def export_deepseek_io_oracle(
         raise
 
 
+def _deepseek_mtp_mix_reference(
+    previous_streams: object,
+    embedding: object,
+    enorm_weight: object,
+    hnorm_weight: object,
+    e_project: object,
+    h_project: object,
+    *,
+    epsilon: float = 1e-6,
+) -> tuple[object, object, object]:
+    """Reference the DeepSeek-V4 MTP input boundary in FP32.
+
+    RMSNorm is applied independently on the hidden dimension of each target
+    stream.  The token projection is then broadcast across the four projected
+    streams, matching the training-time ``[token, hc_mult, hidden]`` layout.
+    Projection callables keep this equation independent from the checkpoint's
+    block-FP8 storage and from the runtime admission representation.
+    """
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for the DeepSeek MTP oracle")
+    previous = np.asarray(previous_streams, dtype=np.float32)
+    token = np.asarray(embedding, dtype=np.float32)
+    enorm = np.asarray(enorm_weight, dtype=np.float32)
+    hnorm = np.asarray(hnorm_weight, dtype=np.float32)
+    if previous.ndim != 2 or previous.shape[0] != 4:
+        raise SourceFormatError("invalid DeepSeek MTP previous-stream geometry")
+    hidden = previous.shape[1]
+    if token.shape != (hidden,) or enorm.shape != (hidden,) or \
+            hnorm.shape != (hidden,) or epsilon <= 0:
+        raise SourceFormatError("invalid DeepSeek MTP input-boundary geometry")
+
+    token_inverse = np.float32(
+        1.0 / math.sqrt(float(np.mean(np.square(token, dtype=np.float32))) + epsilon)
+    )
+    normalized_token = np.asarray(token * token_inverse * enorm, dtype=np.float32)
+    stream_inverse = np.asarray(
+        1.0 / np.sqrt(
+            np.mean(np.square(previous, dtype=np.float32), axis=1) + epsilon
+        ),
+        dtype=np.float32,
+    )
+    normalized_streams = np.asarray(
+        previous * stream_inverse[:, None] * hnorm[None, :], dtype=np.float32
+    )
+    token_projection = np.asarray(e_project(normalized_token), dtype=np.float32)
+    if token_projection.shape != (hidden,):
+        raise SourceFormatError("invalid DeepSeek MTP token projection geometry")
+    stream_projections = np.asarray(
+        [h_project(stream) for stream in normalized_streams], dtype=np.float32
+    )
+    if stream_projections.shape != previous.shape:
+        raise SourceFormatError("invalid DeepSeek MTP stream projection geometry")
+    mixed = np.asarray(
+        stream_projections + token_projection[None, :], dtype="<f4"
+    )
+    return normalized_token, normalized_streams, mixed
+
+
+def export_deepseek_mtp_glue_oracle(
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    output: Path,
+    token: int = 42,
+    position: int = 1,
+    previous_streams: Path | None = None,
+) -> dict[str, object]:
+    """Emit an independent oracle for both boundaries of the V4 MTP block.
+
+    This deliberately stops at the block boundary: it qualifies the exact
+    h/e projection mix consumed by the MTP decoder and the MTP-specific
+    hyper-head collapse produced after it.  Attention, FFN, cache state and
+    target verification remain separate gates.
+    """
+
+    if np is None:
+        raise SourceFormatError("NumPy is required for the DeepSeek MTP oracle")
+    validate_deepseek_v4_source(checkpoint)
+    if not 0 <= token < 129_280 or position < 0:
+        raise AdapterError("invalid DeepSeek MTP oracle token or position")
+    output = output.resolve()
+    partial = output.with_name(output.name + ".partial")
+    if output.exists() or partial.exists():
+        raise SourceFormatError(f"DeepSeek MTP oracle output exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    partial.mkdir()
+
+    def tensor(name: str, shape: tuple[int, ...], dtype: str) -> object:
+        info = checkpoint.tensors[name]
+        if info.shape != shape or info.dtype != dtype:
+            raise SourceFormatError(f"invalid DeepSeek MTP oracle tensor: {name}")
+        with checkpoint.open_tensor(name) as view:
+            if dtype == "BF16":
+                return _bf16_to_f32(view.raw, shape).copy()
+            return np.frombuffer(view.raw, dtype="<f4").reshape(shape).copy()
+
+    try:
+        embedding_info = checkpoint.tensors["embed.weight"]
+        if embedding_info.shape != (129_280, 4096) or \
+                embedding_info.dtype != "BF16":
+            raise SourceFormatError("invalid DeepSeek MTP shared embedding")
+        with (checkpoint.root / embedding_info.shard).open(
+            "rb", buffering=0
+        ) as source:
+            source.seek(embedding_info.offset + token * 4096 * 2)
+            raw = source.read(4096 * 2)
+        if len(raw) != 4096 * 2:
+            raise SourceFormatError("truncated DeepSeek MTP embedding row")
+        embedding = _bf16_to_f32(raw, (4096,)).copy()
+        if position == 0:
+            embedding.fill(0.0)
+
+        if previous_streams is None:
+            values = np.arange(4 * 4096, dtype=np.float32)
+            previous = (
+                np.sin(values * np.float32(0.0019)) * np.float32(0.09)
+                + np.cos(values * np.float32(0.0041)) * np.float32(0.025)
+            ).reshape(4, 4096).astype(np.float32)
+            previous_source = "deterministic"
+        else:
+            raw_previous = previous_streams.read_bytes()
+            if len(raw_previous) != 4 * 4096 * 4:
+                raise SourceFormatError(
+                    "DeepSeek MTP previous-stream file must contain 4x4096 FP32"
+                )
+            previous = np.frombuffer(raw_previous, dtype="<f4").reshape(
+                4, 4096
+            ).copy()
+            previous_source = str(previous_streams.resolve())
+
+        enorm = tensor("mtp.0.enorm.weight", (4096,), "BF16")
+        hnorm = tensor("mtp.0.hnorm.weight", (4096,), "BF16")
+        normalized_token, normalized_streams, mixed = \
+            _deepseek_mtp_mix_reference(
+                previous, embedding, enorm, hnorm,
+                lambda vector: _deepseek_sm86_fp8_matvec(
+                    checkpoint, "mtp.0.e_proj", vector
+                ),
+                lambda vector: _deepseek_sm86_fp8_matvec(
+                    checkpoint, "mtp.0.h_proj", vector
+                ),
+            )
+
+        function = tensor("mtp.0.hc_head_fn", (4, 16384), "F32")
+        base = tensor("mtp.0.hc_head_base", (4,), "F32")
+        scale = tensor("mtp.0.hc_head_scale", (1,), "F32")
+        flat = mixed.reshape(-1)
+        inverse = np.float32(
+            1.0 / math.sqrt(float(np.mean(np.square(flat, dtype=np.float32))) + 1e-6)
+        )
+        gates = 1.0 / (
+            1.0 + np.exp(-(np.matmul(function, flat * inverse, dtype=np.float32)
+                           * scale[0] + base))
+        ) + 1e-6
+        collapsed = np.sum(gates[:, None] * mixed, axis=0, dtype=np.float32)
+        collapsed = _bf16_to_f32(
+            _f32_to_bf16_words(collapsed).tobytes(), (4096,)
+        ).copy()
+        norm = tensor("mtp.0.norm.weight", (4096,), "BF16")
+        inverse = np.float32(
+            1.0 / math.sqrt(
+                float(np.mean(np.square(collapsed, dtype=np.float32))) + 1e-6
+            )
+        )
+        normalized_output = np.asarray(collapsed * inverse * norm, dtype=np.float32)
+        normalized_output = _bf16_to_f32(
+            _f32_to_bf16_words(normalized_output).tobytes(), (4096,)
+        ).copy()
+
+        arrays = {
+            "previous-streams.f32": previous,
+            "normalized-token.f32": normalized_token,
+            "normalized-streams.f32": normalized_streams,
+            "mixed-streams.f32": mixed,
+            "hc-head-gates.f32": np.asarray(gates, dtype="<f4"),
+            "collapsed.f32": collapsed,
+            "normalized-output.f32": normalized_output,
+        }
+        files: dict[str, object] = {}
+        for name, values in arrays.items():
+            path = partial / name
+            path.write_bytes(np.asarray(values, dtype="<f4").tobytes(order="C"))
+            files[name] = {
+                "bytes": path.stat().st_size,
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }
+        result = {
+            "format": "deepseek-mtp-glue-oracle-v1",
+            "namespace": 0,
+            "token": token,
+            "position": position,
+            "hidden": 4096,
+            "hc_mult": 4,
+            "previous_streams": previous_source,
+            "projection_abi": "deepseek-sm86-int8-per-row-matrix-v1",
+            "files": files,
+        }
+        atomic_json(partial / "manifest.json", result)
+        os.replace(partial, output)
+        return result
+    except Exception:
+        raise
+
+
 def export_deepseek_shared_expert(
     checkpoint: SafeTensorCheckpoint, *, layer: int, output: Path
 ) -> dict[str, object]:

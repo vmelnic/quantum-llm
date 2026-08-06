@@ -239,6 +239,13 @@ latency or aggregate throughput without changing model semantics.
   resource available, remains disabled, and preserved `Hi` -> token `19923`.
 - [ ] Implement the MTP draft state and qualify one-token predictions against
   an independent source-checkpoint oracle before enabling verification.
+  - [x] Freeze the V4-specific input/output glue contract and export a real
+    source-checkpoint oracle for `hnorm`/`enorm`, separate `h_proj`/`e_proj`,
+    stream broadcast, MTP hyper-head collapse, and MTP final norm.
+  - [ ] Qualify those boundary artifacts with the native SM86 kernels.
+  - [ ] Execute the MTP attention, routed/shared FFN, mHC state and shared
+    vocabulary head between the qualified boundaries; only then compare a
+    one-token draft prediction.
 - [ ] Add transactional target verification with causal KV/CSA state commit on
   acceptance and exact rollback/replay on rejection. Never expose a draft
   token before target acceptance.

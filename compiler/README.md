@@ -68,6 +68,22 @@ matrices, one shared expert, and 256 compact routed experts without copying the
 change base greedy decoding; it establishes the input contract for the future
 MTP runtime.
 
+`export-deepseek-mtp-glue-oracle` qualifies the two MTP block boundaries
+without pretending that the decoder itself is complete. It reproduces the
+V4-specific `h_proj(hnorm(target_streams)) + e_proj(enorm(token_embedding))`
+input mix and the MTP-specific hyper-head collapse plus final norm. The
+default target streams are deterministic; `--previous-streams` accepts an
+exact 4x4096 little-endian FP32 target-state capture for end-to-end work. The
+oracle uses the same block-FP8-to-row-INT8 admission ABI as the SM86 runtime,
+so a native comparison can be exact for the representation actually served.
+
+```powershell
+ops\windows\Export-DeepSeekMtpGlueOracle.ps1 `
+  -Snapshot C:\path\to\checkpoint `
+  -Output C:\path\to\mtp-glue-oracle-v1 `
+  -Token 42 -Position 1
+```
+
 ```powershell
 .\ops\windows\Export-DeepSeekMtpSet.ps1 `
   -Snapshot C:\path\to\deepseek-v4-flash-snapshot `

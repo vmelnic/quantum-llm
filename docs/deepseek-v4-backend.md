@@ -64,6 +64,22 @@ resource and the worker reports its availability, but it is not yet a resident
 MTP state and remains disabled, so base greedy generation is unchanged. Bundle
 v1 remains supported without the resource.
 
+The MTP execution contract is not inferred from the tensor names. DeepSeek V4
+normalizes the four target residual streams independently, projects them with
+`h_proj`, broadcasts `e_proj(enorm(next-token embedding))`, and adds the two
+before the MTP mHC decoder. After that decoder, its own hyper-head collapses
+four streams to one vector and its own norm feeds the shared vocabulary head.
+This differs from the fused input projection used by older DeepSeek MTP
+implementations. The contract follows the production DeepSeek V4 MTP path in
+[vLLM](https://github.com/vllm-project/vllm/blob/v0.21.0/vllm/model_executor/models/deepseek_v4_mtp.py).
+
+`export-deepseek-mtp-glue-oracle` now independently qualifies both boundaries
+against the source checkpoint and the SM86 admitted projection ABI. A real
+token-19923, position-2 export produced seven authenticated FP32 artifacts;
+the mixed four-stream result is 64 KiB. This is intentionally not called a
+draft-token qualification: the MTP attention, FFN and cache state still have
+to execute between those two validated boundaries.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face
