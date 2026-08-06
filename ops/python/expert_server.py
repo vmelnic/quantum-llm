@@ -133,6 +133,25 @@ class StopFilter:
         return result
 
 
+class IncrementalTextDecoder:
+    """Emit only tokenizer text prefixes that cannot be rewritten later."""
+
+    def __init__(self) -> None:
+        self.emitted = ""
+
+    def push(self, current: str, final: bool = False) -> str:
+        if not current.startswith(self.emitted):
+            raise WorkerError("tokenizer changed an already streamed text prefix")
+        stable_end = len(current)
+        if not final:
+            replacement = current.find("\ufffd", len(self.emitted))
+            if replacement >= 0:
+                stable_end = replacement
+        delta = current[len(self.emitted):stable_end]
+        self.emitted = current[:stable_end]
+        return delta
+
+
 def _text_content(content: Any, param: str) -> str:
     if isinstance(content, str):
         return content
@@ -809,7 +828,7 @@ class Application:
     def generate(self, prompt_ids: list[int], maximum: int) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
-        decoded = ""
+        decoder = IncrementalTextDecoder()
         started = time.monotonic()
         previous_token_at: float | None = None
         self.worker.begin(request_id, prompt_ids, len(prompt_ids) + maximum)
@@ -834,8 +853,8 @@ class Application:
                     generated, skip_special_tokens=True,
                     clean_up_tokenization_spaces=False,
                 )
-                delta = current[len(decoded):] if current.startswith(decoded) else current
-                decoded = current
+                final_text = token in self.eos_token_ids or index + 1 == maximum
+                delta = decoder.push(current, final=final_text)
                 yield token, delta
                 if token in self.eos_token_ids:
                     break

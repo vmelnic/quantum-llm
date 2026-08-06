@@ -21,7 +21,8 @@ sys.modules.setdefault(
 
 import ops.python.expert_server as expert_server
 from ops.python.expert_server import (
-    Application, ContinuousDecodeBatcher, CudaWorker, Handler, RequestError, StopFilter,
+    Application, ContinuousDecodeBatcher, CudaWorker, Handler,
+    IncrementalTextDecoder, RequestError, StopFilter,
     _text_content, _worker_response_tokens,
 )
 
@@ -41,6 +42,24 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_incremental_decoder_holds_incomplete_unicode_without_replay(self) -> None:
+        decoder = IncrementalTextDecoder()
+        self.assertEqual(decoder.push("Hello! \ufffd"), "Hello! ")
+        self.assertEqual(decoder.push("Hello! 😊"), "😊")
+        self.assertEqual(decoder.push("Hello! 😊 Next"), " Next")
+        self.assertEqual(decoder.emitted, "Hello! 😊 Next")
+
+    def test_incremental_decoder_flushes_replacement_only_at_final_boundary(self) -> None:
+        decoder = IncrementalTextDecoder()
+        self.assertEqual(decoder.push("value \ufffd"), "value ")
+        self.assertEqual(decoder.push("value \ufffd", final=True), "\ufffd")
+
+    def test_incremental_decoder_refuses_to_duplicate_changed_prefix(self) -> None:
+        decoder = IncrementalTextDecoder()
+        self.assertEqual(decoder.push("stable"), "stable")
+        with self.assertRaises(expert_server.WorkerError):
+            decoder.push("different")
+
     def test_worker_tokens_accept_legacy_scalar_and_mtp_list(self) -> None:
         self.assertEqual(
             _worker_response_tokens({"token": 7}, "missing"), [7]
