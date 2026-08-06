@@ -605,18 +605,10 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
     if (!status.ok()) return fail(status);
     status = verify_->mark_layer_checkpointed(current_layer_);
     if (!status.ok()) return fail(status);
-    status = deepseek_ffn_route({
-        view.ffn_weights, view.ffn_states[0], request_->streams_b_,
-        pair_token_ids_[0], 1e-6F, 20U, stream_});
-    if (!status.ok()) return fail(status);
-    status = deepseek_ffn_route({
-        view.ffn_weights, view.ffn_states[1],
-        verify_->speculative_streams_b_, pair_token_ids_[1], 1e-6F, 20U,
-        stream_});
-    if (!status.ok()) return fail(status);
-    status = deepseek_ffn_gather_pair_routes(
-        {{view.ffn_states[0], view.ffn_states[1]},
-         verify_->ffn_workspace(), stream_});
+    status = deepseek_ffn_route_pair({
+        view.ffn_weights, view.ffn_states, verify_->ffn_workspace(),
+        {request_->streams_b_, verify_->speculative_streams_b_},
+        pair_token_ids_, 1e-6F, 20U, stream_});
     if (!status.ok()) return fail(status);
     telemetry_.attention_route_submit_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(

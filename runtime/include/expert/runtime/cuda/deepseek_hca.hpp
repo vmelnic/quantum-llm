@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <span>
 
@@ -64,6 +65,15 @@ struct DeepSeekHcaWorkspace final {
 [[nodiscard]] Status deepseek_hca_pre(
     const DeepSeekHcaParameters& parameters, const float* streams,
     float* collapsed, float* pre, float* post, float* comb,
+    const DeepSeekHcaWorkspace& workspace, float epsilon,
+    std::uint32_t sinkhorn_iterations, void* stream) noexcept;
+
+// Two independent rows share one read of the HCA control matrix. collapsed,
+// pre/post/comb and the workspace are contiguous row-major pairs.
+[[nodiscard]] Status deepseek_hca_pre_pair(
+    const DeepSeekHcaView& parameters,
+    const std::array<const float*, 2U>& streams, float* collapsed,
+    float* pre, float* post, float* comb,
     const DeepSeekHcaWorkspace& workspace, float epsilon,
     std::uint32_t sinkhorn_iterations, void* stream) noexcept;
 

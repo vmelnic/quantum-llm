@@ -43,6 +43,10 @@ struct Int8Matrix final {
     const float* matrix, std::uint32_t rows, std::uint32_t columns,
     const float* input, float* output, std::uint32_t batch,
     void* stream) noexcept;
+[[nodiscard]] Status gemv_f32_batch_weight_reuse(
+    const float* matrix, std::uint32_t rows, std::uint32_t columns,
+    const float* input, float* output, std::uint32_t batch,
+    void* stream) noexcept;
 [[nodiscard]] Status gemv_bf16(const std::uint16_t* matrix,
                                std::uint32_t rows, std::uint32_t columns,
                                const float* input, float* output,
@@ -115,6 +119,15 @@ struct Int8Matrix final {
     float* logits, float* topk_scores, std::uint32_t* topk_indices,
     float route_scale, void* stream) noexcept;
 [[nodiscard]] Status deepseek_router_learned(
+    const float* input, const std::uint16_t* router_weights,
+    const float* selection_bias, float* logits, float* topk_scores,
+    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
+[[nodiscard]] Status deepseek_router_hash_batch(
+    const float* input, const std::uint16_t* router_weights,
+    const std::int64_t* token_experts, std::uint32_t token_zero,
+    std::uint32_t token_one, float* logits, float* topk_scores,
+    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
+[[nodiscard]] Status deepseek_router_learned_batch(
     const float* input, const std::uint16_t* router_weights,
     const float* selection_bias, float* logits, float* topk_scores,
     std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;

@@ -229,6 +229,30 @@ __global__ void f32_gemv_batch_kernel(
     output[static_cast<std::size_t>(request) * rows + row] = partial;
 }
 
+__global__ void f32_gemv_batch_reuse_kernel(
+    const float* weights, const float* input, float* output,
+    std::uint32_t rows, std::uint32_t columns, std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  float partial[kMaximumWeightReuseBatch]{};
+  for (std::uint32_t column = lane; column < columns;
+       column += kWarpSize) {
+    const auto value = weight[column];
+    for (std::uint32_t request = 0U; request < batch; ++request)
+      partial[request] += value *
+          input[static_cast<std::size_t>(request) * columns + column];
+  }
+  for (std::uint32_t request = 0U; request < batch; ++request) {
+    const auto sum = warp_sum(partial[request]);
+    if (lane == 0U)
+      output[static_cast<std::size_t>(request) * rows + row] = sum;
+  }
+}
+
 __global__ void bf16_gemv_kernel(const std::uint16_t* weights,
                                   const float* input, float* output,
                                   std::uint32_t rows,
@@ -571,6 +595,90 @@ __global__ void deepseek_learned_router_kernel(
   __shared__ float selected_scores[6];
   __shared__ std::uint32_t selected_indices[6];
   const auto expert = static_cast<std::uint32_t>(threadIdx.x);
+  const float unbiased = deepseek_route_score(logits[expert]);
+  for (std::uint32_t slot = 0U; slot < 6U; ++slot) {
+    bool used = false;
+    for (std::uint32_t previous = 0U; previous < slot; ++previous)
+      used |= selected_indices[previous] == expert;
+    candidates[expert] = used ? kNegativeInfinity : unbiased + bias[expert];
+    candidate_indices[expert] = expert;
+    __syncthreads();
+    for (unsigned stride = kThreads / 2U; stride; stride >>= 1U) {
+      if (expert < stride) {
+        const auto other_value = candidates[expert + stride];
+        const auto other_index = candidate_indices[expert + stride];
+        if (other_value > candidates[expert] ||
+            (other_value == candidates[expert] &&
+             other_index < candidate_indices[expert])) {
+          candidates[expert] = other_value;
+          candidate_indices[expert] = other_index;
+        }
+      }
+      __syncthreads();
+    }
+    if (expert == 0U) {
+      selected_indices[slot] = candidate_indices[0];
+      selected_scores[slot] =
+          deepseek_route_score(logits[selected_indices[slot]]);
+    }
+    __syncthreads();
+  }
+  if (expert == 0U) {
+    float total = 0.0F;
+    for (const float value : selected_scores) total += value;
+    const float multiplier = total > 0.0F ? route_scale / total : 0.0F;
+    for (std::uint32_t slot = 0U; slot < 6U; ++slot) {
+      indices[slot] = selected_indices[slot];
+      scores[slot] = selected_scores[slot] * multiplier;
+    }
+  }
+}
+
+__global__ void deepseek_hash_router_batch_kernel(
+    const float* logits, const std::int64_t* token_experts,
+    std::uint32_t token_zero, std::uint32_t token_one, float route_scale,
+    float* scores, std::uint32_t* indices) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto slot = static_cast<std::uint32_t>(threadIdx.x);
+  const auto token_id = row == 0U ? token_zero : token_one;
+  logits += static_cast<std::size_t>(row) * 256U;
+  scores += static_cast<std::size_t>(row) * 6U;
+  indices += static_cast<std::size_t>(row) * 6U;
+  __shared__ float selected[6];
+  if (slot < 6U) {
+    const auto expert = token_experts[
+        static_cast<std::size_t>(token_id) * 6U + slot];
+    if (expert < 0 || expert >= 256) {
+      indices[slot] = 0xffffffffU;
+      selected[slot] = 0.0F;
+    } else {
+      indices[slot] = static_cast<std::uint32_t>(expert);
+      selected[slot] = deepseek_route_score(logits[expert]);
+    }
+  }
+  __syncthreads();
+  if (slot == 0U) {
+    float total = 0.0F;
+    for (std::uint32_t index = 0U; index < 6U; ++index)
+      total += selected[index];
+    const float multiplier = total > 0.0F ? route_scale / total : 0.0F;
+    for (std::uint32_t index = 0U; index < 6U; ++index)
+      scores[index] = selected[index] * multiplier;
+  }
+}
+
+__global__ void deepseek_learned_router_batch_kernel(
+    const float* logits, const float* bias, float route_scale,
+    float* scores, std::uint32_t* indices) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto expert = static_cast<std::uint32_t>(threadIdx.x);
+  logits += static_cast<std::size_t>(row) * 256U;
+  scores += static_cast<std::size_t>(row) * 6U;
+  indices += static_cast<std::size_t>(row) * 6U;
+  __shared__ float candidates[kThreads];
+  __shared__ std::uint32_t candidate_indices[kThreads];
+  __shared__ float selected_scores[6];
+  __shared__ std::uint32_t selected_indices[6];
   const float unbiased = deepseek_route_score(logits[expert]);
   for (std::uint32_t slot = 0U; slot < 6U; ++slot) {
     bool used = false;
@@ -1109,6 +1217,21 @@ Status gemv_f32_batch(const float* matrix, std::uint32_t rows,
       matrix, input, output, rows, columns, batch);
   return checked(cudaPeekAtLastError(), "f32 batched gemv");
 }
+Status gemv_f32_batch_weight_reuse(
+    const float* matrix, std::uint32_t rows, std::uint32_t columns,
+    const float* input, float* output, std::uint32_t batch,
+    void* raw) noexcept {
+  if (!matrix || !input || !output || !rows || !columns || !batch ||
+      batch > kMaximumWeightReuseBatch)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid weight-reuse batched f32 gemv");
+  const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  f32_gemv_batch_reuse_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      matrix, input, output, rows, columns, batch);
+  return checked(cudaPeekAtLastError(),
+                 "weight-reuse f32 batched gemv");
+}
 Status gemv_bf16(const std::uint16_t* matrix, std::uint32_t rows,
                   std::uint32_t columns, const float* input, float* output,
                   void* raw) noexcept {
@@ -1284,6 +1407,41 @@ Status deepseek_router_learned(
                                    static_cast<cudaStream_t>(raw)>>>(
       logits, selection_bias, route_scale, scores, indices);
   return checked(cudaPeekAtLastError(), "DeepSeek learned router select");
+}
+Status deepseek_router_hash_batch(
+    const float* input, const std::uint16_t* weights,
+    const std::int64_t* token_experts, std::uint32_t token_zero,
+    std::uint32_t token_one, float* logits, float* scores,
+    std::uint32_t* indices, float route_scale, void* raw) noexcept {
+  if (!input || !weights || !token_experts || !logits || !scores ||
+      !indices || token_zero >= 129280U || token_one >= 129280U ||
+      !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek batched hash router");
+  auto status = gemv_bf16_batch(weights, 256U, 4096U, input, logits, 2U, raw);
+  if (!status.ok()) return status;
+  deepseek_hash_router_batch_kernel<<<2U, 32U, 0,
+                                      static_cast<cudaStream_t>(raw)>>>(
+      logits, token_experts, token_zero, token_one, route_scale, scores,
+      indices);
+  return checked(cudaPeekAtLastError(),
+                 "DeepSeek batched hash router select");
+}
+Status deepseek_router_learned_batch(
+    const float* input, const std::uint16_t* weights,
+    const float* selection_bias, float* logits, float* scores,
+    std::uint32_t* indices, float route_scale, void* raw) noexcept {
+  if (!input || !weights || !selection_bias || !logits || !scores ||
+      !indices || !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek batched learned router");
+  auto status = gemv_bf16_batch(weights, 256U, 4096U, input, logits, 2U, raw);
+  if (!status.ok()) return status;
+  deepseek_learned_router_batch_kernel<<<
+      2U, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      logits, selection_bias, route_scale, scores, indices);
+  return checked(cudaPeekAtLastError(),
+                 "DeepSeek batched learned router select");
 }
 Status qwen3_next_qkv_rope_cache(
     float* q_and_gate, float* key, const float* value,

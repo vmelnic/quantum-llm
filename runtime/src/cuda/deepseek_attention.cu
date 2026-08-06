@@ -690,19 +690,15 @@ Status deepseek_attention_decode_pair(
     return {ErrorCode::invalid_argument,
             "missing DeepSeek pair speculative checkpoint"};
 
-  // HCA control is row-local, but all large dense projections below consume
-  // contiguous [2, columns] activations and read each weight row once.
-  for (std::uint32_t row = 0U; row < 2U; ++row) {
-    status = deepseek_hca_pre(
-        {weights.hca_function, weights.hca_base, weights.hca_scale, kHidden},
-        launch.streams[row], workspace.collapsed_ + row * kHidden,
-        workspace.pre_ + row * 4U, workspace.post_ + row * 4U,
-        workspace.comb_ + row * 16U,
-        {workspace.hca_normalized_ + row * 4U * kHidden,
-         workspace.hca_mixes_ + row * 24U},
-        launch.epsilon, launch.sinkhorn_iterations, launch.stream);
-    if (!status.ok()) return status;
-  }
+  // HCA control and all large dense projections consume contiguous
+  // [2, columns] activations and read each weight row once.
+  status = deepseek_hca_pre_pair(
+      {weights.hca_function, weights.hca_base, weights.hca_scale, kHidden},
+      {launch.streams[0], launch.streams[1]}, workspace.collapsed_,
+      workspace.pre_, workspace.post_, workspace.comb_,
+      {workspace.hca_normalized_, workspace.hca_mixes_}, launch.epsilon,
+      launch.sinkhorn_iterations, launch.stream);
+  if (!status.ok()) return status;
   status = rms_norm_bf16_weight_batch(
       workspace.collapsed_, weights.attention_norm,
       workspace.attention_input_, 2U, kHidden, launch.epsilon,

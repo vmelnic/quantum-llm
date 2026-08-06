@@ -52,6 +52,8 @@ class DeepSeekFfnState final {
       const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
   friend Status deepseek_ffn_gather_pair_routes(
       const struct DeepSeekFfnPairRouteGather&) noexcept;
+  friend Status deepseek_ffn_route_pair(
+      const struct DeepSeekFfnPairRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_pair(
       const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
   DeepSeekFfnState(void* allocation, std::uint64_t bytes,
@@ -123,10 +125,10 @@ struct DeepSeekFfnExecuteLaunch final {
 [[nodiscard]] Status deepseek_ffn_execute(
     const DeepSeekFfnExecuteLaunch& launch) noexcept;
 
-// Request-private two-row workspace. Route state remains independently owned
-// by each causal row, while the compute-ready arrays are gathered here so the
-// expert kernels can read each resident weight set for both verifier rows in a
-// single multi-row launch.
+// Request-private two-row workspace. HCA/router state and compute-ready arrays
+// are produced directly here so dense and expert kernels can read each weight
+// set once for both verifier rows. The two ordinary FFN states retain only
+// their bounded ownership/identity role in this path.
 class DeepSeekFfnPairWorkspace final {
  public:
   ~DeepSeekFfnPairWorkspace();
@@ -146,6 +148,8 @@ class DeepSeekFfnPairWorkspace final {
   friend std::uint64_t deepseek_ffn_pair_workspace_size() noexcept;
   friend Status deepseek_ffn_gather_pair_routes(
       const struct DeepSeekFfnPairRouteGather&) noexcept;
+  friend Status deepseek_ffn_route_pair(
+      const struct DeepSeekFfnPairRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_pair(
       const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
   DeepSeekFfnPairWorkspace(void* allocation, std::uint64_t bytes) noexcept;
@@ -153,7 +157,9 @@ class DeepSeekFfnPairWorkspace final {
 
   void* allocation_{};
   std::uint64_t bytes_{};
-  float *ffn_input_{}, *routing_weights_{}, *routed_intermediate_{},
+  float *hca_normalized_{}, *hca_mixes_{}, *collapsed_{}, *pre_{}, *post_{},
+      *comb_{}, *ffn_input_{}, *router_logits_{}, *routing_weights_{},
+      *routed_intermediate_{},
       *routed_selection_outputs_{}, *routed_output_{},
       *shared_intermediate_{}, *shared_output_{};
   std::uint32_t *expert_indices_{}, *routed_indices_{}, *shared_indices_{};
@@ -170,6 +176,22 @@ struct DeepSeekFfnPairWorkspaceResult final {
 [[nodiscard]] std::uint64_t deepseek_ffn_pair_workspace_size() noexcept;
 [[nodiscard]] DeepSeekFfnPairWorkspaceResult
 create_deepseek_ffn_pair_workspace() noexcept;
+
+struct DeepSeekFfnPairRouteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  std::array<DeepSeekFfnState*, 2U> states{};
+  DeepSeekFfnPairWorkspace* workspace{};
+  std::array<const float*, 2U> streams{};
+  std::array<std::uint32_t, 2U> token_ids{};
+  float epsilon{1e-6F};
+  std::uint32_t sinkhorn_iterations{20U};
+  void* stream{};
+};
+
+// Computes both exact routes with shared HCA/router weight reads and publishes
+// the 14-entry directory layout directly in the pair workspace.
+[[nodiscard]] Status deepseek_ffn_route_pair(
+    const DeepSeekFfnPairRouteLaunch& launch) noexcept;
 
 struct DeepSeekFfnPairRouteGather final {
   std::array<const DeepSeekFfnState*, 2U> states{};

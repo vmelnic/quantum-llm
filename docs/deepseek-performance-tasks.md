@@ -272,7 +272,7 @@ latency or aggregate throughput without changing model semantics.
   row one is speculative. On rejection, commit row zero and logically roll
   back row one by retaining the external position and overwriting that explicit
   KV/CSA slot on replay. Never expose a draft before target acceptance.
-- [ ] Batch the union of experts and dense projections needed by target
+- [x] Batch the union of experts and dense projections needed by target
   verification; use measured multi-row kernels instead of running two ordinary
   model steps serially.
   - [x] Pin the exact union once and run routed plus shared experts with
@@ -281,8 +281,9 @@ latency or aggregate throughput without changing model semantics.
     preserving row-zero-before-row-one KV/CSA publication. One request-private
     workspace is reused across all layers; persistent context state is not
     duplicated.
-  - [ ] Batch the two router projections and retain independent exact top-six
-    selection per row.
+  - [x] Batch the two HCA/router projections and retain independent exact
+    top-six selection per row. The pair publishes its 14-entry directory
+    layout directly, without copying through two scalar route states.
 - [x] Publish acceptance, rejection, target rows/steps, useful output tokens,
   and adaptive-suppression counters. Ratio-four checkpoint/restore bytes and
   replay attribution remain part of the next measurement pass.

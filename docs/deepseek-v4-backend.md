@@ -177,6 +177,13 @@ state before row one can publish, so window wrap cannot overwrite a value
 still needed by row zero. The ratio-four checkpoint is written at that exact
 causal boundary.
 
+The same pair workspace principle applies to the FFN control path. Both HCA
+rows share one F32 control-matrix read, both normalized activations share one
+BF16 router-matrix read, and hash or learned selection runs as two independent
+CUDA blocks. The resulting top-six rows are composed directly into the stable
+14-entry directory span, including each row's shared expert. Exact row-local
+routing and HCA post semantics are retained.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face

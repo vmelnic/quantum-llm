@@ -61,6 +61,22 @@ Status check_binding(const DeepSeekFfnBinding& weights,
   return Status::success();
 }
 
+__global__ void pair_route_layout_kernel(
+    const std::uint32_t* routed_indices, std::uint32_t* expert_indices,
+    float* shared_weights, std::uint32_t* shared_indices) {
+  const auto index = static_cast<std::uint32_t>(threadIdx.x);
+  if (index < 12U) {
+    const auto row = index / kTopK;
+    const auto slot = index % kTopK;
+    expert_indices[row * (kTopK + 1U) + slot] = routed_indices[index];
+  }
+  if (index < 2U) {
+    expert_indices[index * (kTopK + 1U) + kTopK] = kSharedExpert;
+    shared_weights[index] = 1.0F;
+    shared_indices[index] = kSharedExpert;
+  }
+}
+
 }  // namespace
 
 DeepSeekFfnState::DeepSeekFfnState(void* allocation, std::uint64_t bytes,
@@ -83,7 +99,14 @@ DeepSeekFfnPairWorkspace::~DeepSeekFfnPairWorkspace() {
 
 void DeepSeekFfnPairWorkspace::map(void* base) noexcept {
   Arena arena{static_cast<std::byte*>(base)};
+  hca_normalized_ = arena.take<float>(2U * 4U * kHidden);
+  hca_mixes_ = arena.take<float>(2U * 24U);
+  collapsed_ = arena.take<float>(2U * kHidden);
+  pre_ = arena.take<float>(2U * 4U);
+  post_ = arena.take<float>(2U * 4U);
+  comb_ = arena.take<float>(2U * 16U);
   ffn_input_ = arena.take<float>(2U * kHidden);
+  router_logits_ = arena.take<float>(2U * 256U);
   routing_weights_ = arena.take<float>(2U * kTopK);
   expert_indices_ = arena.take<std::uint32_t>(2U * (kTopK + 1U));
   routed_indices_ = arena.take<std::uint32_t>(2U * kTopK);
@@ -224,6 +247,52 @@ DeepSeekFfnPairWorkspaceResult create_deepseek_ffn_pair_workspace() noexcept {
   return {Status::success(), std::move(workspace)};
 }
 
+Status deepseek_ffn_route_pair(
+    const DeepSeekFfnPairRouteLaunch& launch) noexcept {
+  if (!launch.weights || !launch.states[0] || !launch.states[1] ||
+      !launch.workspace || !launch.streams[0] || !launch.streams[1] ||
+      launch.epsilon <= 0.0F || launch.sinkhorn_iterations == 0U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek pair FFN route launch"};
+  for (auto* state : launch.states) {
+    const auto checked = check_binding(*launch.weights, *state);
+    if (!checked.ok()) return checked;
+  }
+  auto& workspace = *launch.workspace;
+  const auto& weights = *launch.weights;
+  auto status = deepseek_hca_pre_pair(
+      {weights.hca_function, weights.hca_base, weights.hca_scale, kHidden},
+      launch.streams, workspace.collapsed_, workspace.pre_, workspace.post_,
+      workspace.comb_, {workspace.hca_normalized_, workspace.hca_mixes_},
+      launch.epsilon, launch.sinkhorn_iterations, launch.stream);
+  if (!status.ok()) return status;
+  status = rms_norm_bf16_weight_batch(
+      workspace.collapsed_, weights.ffn_norm, workspace.ffn_input_, 2U,
+      kHidden, launch.epsilon, launch.stream);
+  if (!status.ok()) return status;
+  if (weights.hash_router) {
+    status = deepseek_router_hash_batch(
+        workspace.ffn_input_, weights.router_weight, weights.token_experts,
+        launch.token_ids[0], launch.token_ids[1], workspace.router_logits_,
+        workspace.routing_weights_, workspace.routed_indices_, 1.5F,
+        launch.stream);
+  } else {
+    status = deepseek_router_learned_batch(
+        workspace.ffn_input_, weights.router_weight, weights.router_bias,
+        workspace.router_logits_, workspace.routing_weights_,
+        workspace.routed_indices_, 1.5F, launch.stream);
+  }
+  if (!status.ok()) return status;
+  pair_route_layout_kernel<<<1U, 32U, 0,
+                             static_cast<cudaStream_t>(launch.stream)>>>(
+      workspace.routed_indices_, workspace.expert_indices_,
+      workspace.shared_weights_, workspace.shared_indices_);
+  const auto error = cudaPeekAtLastError();
+  return error == cudaSuccess
+      ? Status::success()
+      : failure(error, "publish DeepSeek pair route layout");
+}
+
 Status deepseek_ffn_gather_pair_routes(
     const DeepSeekFfnPairRouteGather& launch) noexcept {
   if (!launch.workspace || !launch.states[0] || !launch.states[1] ||
@@ -310,10 +379,10 @@ Status deepseek_ffn_execute_pair(
                         2U * kHidden, launch.stream);
   if (!status.ok()) return status;
   for (std::uint32_t row = 0U; row < 2U; ++row) {
-    auto& state = *launch.states[row];
     status = deepseek_hca_post(
         workspace.routed_output_ + static_cast<std::size_t>(row) * kHidden,
-        launch.streams[row], state.post_, state.comb_,
+        launch.streams[row], workspace.post_ + row * 4U,
+        workspace.comb_ + row * 16U,
         launch.updated_streams[row], kHidden, launch.stream);
     if (!status.ok()) return status;
   }

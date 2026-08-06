@@ -42,6 +42,33 @@ __global__ void hca_normalize_kernel(const float* input, float* output,
   }
 }
 
+__global__ void hca_normalize_pair_kernel(
+    const float* input_zero, const float* input_one, float* output,
+    std::uint32_t count, float epsilon) {
+  __shared__ float partial[kThreads];
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto* input = row == 0U ? input_zero : input_one;
+  output += static_cast<std::size_t>(row) * count;
+  float sum = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x) {
+    const float value = input[index];
+    sum += value * value;
+  }
+  partial[threadIdx.x] = sum;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2U; stride; stride >>= 1U) {
+    if (threadIdx.x < stride)
+      partial[threadIdx.x] += partial[threadIdx.x + stride];
+    __syncthreads();
+  }
+  const float inverse =
+      rsqrtf(partial[0] / static_cast<float>(count) + epsilon);
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    output[index] = input[index] * inverse;
+}
+
 __global__ void hca_split_sinkhorn_kernel(
     const float* mixes, const float* base, const float* scale, float* pre,
     float* post, float* comb, float epsilon, std::uint32_t iterations) {
@@ -105,6 +132,23 @@ __global__ void hca_collapse_kernel(const float* streams, const float* pre,
   float result = 0.0F;
   for (std::uint32_t input = 0; input < 4U; ++input)
     result += pre[input] * streams[static_cast<std::size_t>(input) * hidden + dimension];
+  output[dimension] = result;
+}
+
+__global__ void hca_collapse_pair_kernel(
+    const float* streams_zero, const float* streams_one, const float* pre,
+    float* output, std::uint32_t hidden) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (dimension >= hidden) return;
+  const auto* streams = row == 0U ? streams_zero : streams_one;
+  pre += row * 4U;
+  output += static_cast<std::size_t>(row) * hidden;
+  float result = 0.0F;
+  for (std::uint32_t input = 0U; input < 4U; ++input)
+    result += pre[input] *
+        streams[static_cast<std::size_t>(input) * hidden + dimension];
   output[dimension] = result;
 }
 
@@ -193,6 +237,40 @@ Status deepseek_hca_pre(
   return deepseek_hca_pre(parameters.view(), streams, collapsed, pre, post,
                           comb, workspace, epsilon, sinkhorn_iterations,
                           stream);
+}
+
+Status deepseek_hca_pre_pair(
+    const DeepSeekHcaView& parameters,
+    const std::array<const float*, 2U>& streams, float* collapsed,
+    float* pre, float* post, float* comb,
+    const DeepSeekHcaWorkspace& workspace, float epsilon,
+    std::uint32_t sinkhorn_iterations, void* stream) noexcept {
+  if (!parameters.function || !parameters.base || !parameters.scale ||
+      !streams[0] || !streams[1] || !collapsed || !pre || !post || !comb ||
+      !workspace.normalized || !workspace.mixes || parameters.hidden == 0U ||
+      epsilon <= 0.0F || sinkhorn_iterations == 0U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek HCA pair launch"};
+  auto cuda_stream = static_cast<cudaStream_t>(stream);
+  const auto values = kDeepSeekHcaStreams * parameters.hidden;
+  hca_normalize_pair_kernel<<<2U, kThreads, 0, cuda_stream>>>(
+      streams[0], streams[1], workspace.normalized, values, epsilon);
+  auto status = gemv_f32_batch_weight_reuse(
+      parameters.function, kDeepSeekHcaMixes, values, workspace.normalized,
+      workspace.mixes, 2U, stream);
+  if (!status.ok()) return status;
+  for (std::uint32_t row = 0U; row < 2U; ++row)
+    hca_split_sinkhorn_kernel<<<1U, 32U, 0, cuda_stream>>>(
+        workspace.mixes + row * kDeepSeekHcaMixes, parameters.base,
+        parameters.scale, pre + row * 4U, post + row * 4U,
+        comb + row * 16U, epsilon, sinkhorn_iterations);
+  hca_collapse_pair_kernel<<<
+      dim3((parameters.hidden + kThreads - 1U) / kThreads, 2U), kThreads, 0,
+      cuda_stream>>>(streams[0], streams[1], pre, collapsed,
+                     parameters.hidden);
+  const auto error = cudaGetLastError();
+  return error == cudaSuccess ? Status::success()
+                              : failure(error, "DeepSeek HCA pair pre");
 }
 
 Status deepseek_hca_pre(

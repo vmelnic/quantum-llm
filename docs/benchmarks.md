@@ -828,6 +828,16 @@ tok/s. This is a real end-to-end improvement, but it also rejects dense
 attention batching as the dominant route to 30 tok/s on this host. Router
 batching remains useful; expert residency and movement remain the main gate.
 
+The final dense-pair step also batched HCA control and the FFN router. It
+published the exact 14-entry directory layout directly instead of routing into
+two scalar states and gathering afterward. The same semantic gate passed
+again. Speculative target time fell to 3.656 s for five useful tokens, about
+1.37 useful tok/s, while the clean ordinary process took 4.799 s. This is about
+24% less target-model time than ordinary decode in that run and about 21% less
+than the preceding attention-only pair gate. The result closes duplicated
+dense verification work; it does not alter the conclusion that arbitrary-route
+expert residency/movement must improve by an order of magnitude for 30 tok/s.
+
 ## Benchmark rules
 
 Any published result must include:
