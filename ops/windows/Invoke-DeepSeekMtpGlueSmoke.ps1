@@ -1,5 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$Oracle,
+    [Parameter(Mandatory = $true)][string]$MtpSet,
     [Parameter(Mandatory = $true)][string]$Snapshot
 )
 
@@ -7,6 +8,7 @@ param(
 Initialize-ExperimentDirectories
 
 $oracleRoot = [System.IO.Path]::GetFullPath($Oracle)
+$mtpRoot = [System.IO.Path]::GetFullPath($MtpSet)
 $sourceRoot = [System.IO.Path]::GetFullPath($Snapshot)
 $executable = Join-Path $script:RepoRoot `
     "out\build\windows-msvc-release\runtime\Release\expert-deepseek-mtp-glue-smoke.exe"
@@ -16,7 +18,7 @@ if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
 
 Push-Location $script:RepoRoot
 try {
-    & $executable $oracleRoot $sourceRoot
+    & $executable $oracleRoot $mtpRoot $sourceRoot
     if ($LASTEXITCODE -ne 0) { throw "DeepSeek MTP glue smoke failed" }
 }
 finally {

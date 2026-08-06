@@ -2,12 +2,16 @@
 
 #include "expert/runtime/cuda/deepseek_dense.hpp"
 #include "expert/runtime/cuda/deepseek_io.hpp"
+#include "expert/runtime/cuda/deepseek_mtp.hpp"
 #include "expert/runtime/cuda/deepseek_typed.hpp"
 
 #include <cstdint>
 #include <span>
+#include <string_view>
 
 namespace expert::runtime::cuda {
+
+enum class DeepSeekRouterKind : std::uint8_t { hash, learned };
 
 // Non-owning, geometry-checked pointers for one attention sublayer. The
 // resident model state must outlive every binding produced from it.
@@ -58,6 +62,47 @@ struct DeepSeekFfnBinding final {
   const float* hca_scale{};
 };
 
+// Owns an arbitrary authenticated DeepSeek tensor namespace. Bindings are
+// formed by prefix, so the same attention/FFN kernels serve `layers.N`,
+// `mtp.N`, or a future remotely placed block without model-specific loaders.
+class DeepSeekResidentTensorState final {
+ public:
+  DeepSeekResidentTensorState() = default;
+  DeepSeekResidentTensorState(const DeepSeekResidentTensorState&) = delete;
+  DeepSeekResidentTensorState& operator=(const DeepSeekResidentTensorState&) = delete;
+  DeepSeekResidentTensorState(DeepSeekResidentTensorState&&) noexcept = default;
+  DeepSeekResidentTensorState& operator=(DeepSeekResidentTensorState&&) noexcept = default;
+
+  [[nodiscard]] static Status load(
+      IAsyncStorage& storage, FixedBufferPool& buffers,
+      std::span<const DeepSeekDenseSpec> dense_specs,
+      std::span<const DeepSeekTypedSpec> typed_specs,
+      DeepSeekResidentTensorState& destination);
+  [[nodiscard]] Status bind_attention(
+      std::string_view prefix, std::uint32_t logical_layer,
+      std::uint32_t compress_ratio,
+      DeepSeekAttentionBinding& destination) const noexcept;
+  [[nodiscard]] Status bind_ffn(
+      std::string_view prefix, std::uint32_t logical_layer,
+      DeepSeekRouterKind router,
+      DeepSeekFfnBinding& destination) const noexcept;
+  [[nodiscard]] Status bind_io(DeepSeekIoBinding& destination) const noexcept;
+  [[nodiscard]] Status bind_mtp_glue(
+      std::string_view prefix,
+      DeepSeekMtpGlueBinding& destination) const noexcept;
+
+  [[nodiscard]] std::uint64_t bytes() const noexcept {
+    return dense_.bytes() + typed_.bytes();
+  }
+  [[nodiscard]] std::size_t dense_size() const noexcept { return dense_.size(); }
+  [[nodiscard]] std::size_t typed_size() const noexcept { return typed_.size(); }
+  void clear() noexcept;
+
+ private:
+  DeepSeekDenseSet dense_;
+  DeepSeekTypedSet typed_;
+};
+
 // Publishes the FP8-expanded dense set and dtype-preserving model tensors as
 // one transaction. A failed second phase cannot expose a partial model.
 class DeepSeekResidentModelState final {
@@ -83,15 +128,18 @@ class DeepSeekResidentModelState final {
       DeepSeekIoBinding& destination) const noexcept;
 
   [[nodiscard]] std::uint64_t bytes() const noexcept {
-    return dense_.bytes() + typed_.bytes();
+    return tensors_.bytes();
   }
-  [[nodiscard]] std::size_t dense_size() const noexcept { return dense_.size(); }
-  [[nodiscard]] std::size_t typed_size() const noexcept { return typed_.size(); }
+  [[nodiscard]] std::size_t dense_size() const noexcept {
+    return tensors_.dense_size();
+  }
+  [[nodiscard]] std::size_t typed_size() const noexcept {
+    return tensors_.typed_size();
+  }
   void clear() noexcept;
 
  private:
-  DeepSeekDenseSet dense_;
-  DeepSeekTypedSet typed_;
+  DeepSeekResidentTensorState tensors_;
 };
 
 }  // namespace expert::runtime::cuda

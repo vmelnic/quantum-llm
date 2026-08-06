@@ -82,17 +82,20 @@ cuda::DeepSeekDtype dtype(const std::string& text) {
 
 }  // namespace
 
-DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
+DeepSeekTensorArtifactsResult load_deepseek_tensor_artifacts(
     const std::filesystem::path& dense_root,
     const std::filesystem::path& typed_root,
-    const std::filesystem::path& shared_root,
-    const std::filesystem::path& checkpoint_root) noexcept {
+    const std::filesystem::path& checkpoint_root,
+    std::size_t expected_dense, std::size_t expected_typed) noexcept {
   try {
-    DeepSeekModelArtifacts result;
+    require(expected_dense != 0U && expected_typed != 0U,
+            "artifact expected counts must be nonzero");
+    DeepSeekTensorArtifacts result;
     std::ifstream dense_input(dense_root / "dense-set.tsv");
     std::string line;
     require(static_cast<bool>(std::getline(dense_input, line)) &&
-                line == "deepseek-dense-residency-v1",
+                (line == "deepseek-dense-residency-v1" ||
+                 line == "deepseek-mtp-dense-residency-v1"),
             "invalid dense artifact header");
     while (std::getline(dense_input, line)) {
       const auto item = fields(line);
@@ -114,7 +117,7 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
       result.maximum_source_record_bytes = std::max(
           result.maximum_source_record_bytes, std::stoull(item[3]));
     }
-    require(dense_input.eof() && result.dense.size() == 236U,
+    require(dense_input.eof() && result.dense.size() == expected_dense,
             "dense artifact set is incomplete");
 
     std::ifstream typed_input(typed_root / "typed-set.tsv");
@@ -132,9 +135,35 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
       result.typed.push_back({item[0], std::move(record), dtype(item[1])});
       result.typed_source_bytes += std::stoull(item[3]);
     }
-    require(typed_input.eof() && result.typed.size() == 834U,
+    require(typed_input.eof() && result.typed.size() == expected_typed,
             "typed artifact set is incomplete");
+    return {Status::success(), std::move(result)};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::invalid_argument,
+             std::string("invalid DeepSeek tensor artifacts: ") + error.what()},
+            {}};
+  }
+}
 
+DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
+    const std::filesystem::path& dense_root,
+    const std::filesystem::path& typed_root,
+    const std::filesystem::path& shared_root,
+    const std::filesystem::path& checkpoint_root) noexcept {
+  try {
+    auto loaded = load_deepseek_tensor_artifacts(
+        dense_root, typed_root, checkpoint_root, 236U, 834U);
+    if (!loaded.status.ok())
+      throw std::invalid_argument(std::string(loaded.status.message()));
+    DeepSeekModelArtifacts result;
+    result.dense = std::move(loaded.artifacts.dense);
+    result.typed = std::move(loaded.artifacts.typed);
+    result.dense_source_bytes = loaded.artifacts.dense_source_bytes;
+    result.dense_device_bytes = loaded.artifacts.dense_device_bytes;
+    result.typed_source_bytes = loaded.artifacts.typed_source_bytes;
+    result.maximum_source_record_bytes =
+        loaded.artifacts.maximum_source_record_bytes;
+    std::string line;
     std::ifstream shared_input(shared_root / "shared-set.tsv");
     require(static_cast<bool>(std::getline(shared_input, line)) &&
                 line == "deepseek-shared-residency-v1",

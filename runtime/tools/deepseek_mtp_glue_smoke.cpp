@@ -1,5 +1,9 @@
-#include "expert/runtime/cuda/deepseek_dense.hpp"
+#include "expert/runtime/buffer_pool.hpp"
+#include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_mtp.hpp"
+#include "expert/runtime/deepseek_artifacts.hpp"
+#include "expert/runtime/gather_storage.hpp"
+#include "expert/runtime/windows_iocp_storage.hpp"
 
 #include <cuda_runtime_api.h>
 
@@ -21,10 +25,6 @@ namespace {
 
 constexpr std::uint32_t kHidden = 4096U;
 constexpr std::uint32_t kStreams = 4U;
-constexpr std::uint64_t kProjectionWeightBytes =
-    static_cast<std::uint64_t>(kHidden) * kHidden;
-constexpr std::uint64_t kProjectionScaleBytes =
-    static_cast<std::uint64_t>(kHidden / 128U) * (kHidden / 128U);
 
 void require(bool condition, const std::string& message) {
   if (!condition) throw std::runtime_error(message);
@@ -34,61 +34,6 @@ void check(cudaError_t error, const char* operation) {
   if (error != cudaSuccess)
     throw std::runtime_error(std::string(operation) + ": " +
                              cudaGetErrorString(error));
-}
-
-std::filesystem::path safe_relative(const std::string& text) {
-  const std::filesystem::path path = text;
-  require(!path.empty() && !path.is_absolute(), "source shard must be relative");
-  for (const auto& part : path)
-    require(part != "..", "source shard escapes checkpoint root");
-  return path;
-}
-
-std::vector<std::byte> read_extents(const std::filesystem::path& descriptor,
-                                    const std::filesystem::path& source_root,
-                                    std::size_t expected_extents) {
-  std::ifstream input(descriptor);
-  std::string line;
-  require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-compact-extents-v1",
-          "invalid MTP extent descriptor");
-  struct Extent final {
-    std::uint64_t destination{};
-    std::uint64_t bytes{};
-    std::uint64_t source{};
-    std::filesystem::path shard;
-  };
-  std::vector<Extent> extents;
-  std::uint64_t total = 0U;
-  while (std::getline(input, line)) {
-    const auto a = line.find('\t');
-    const auto b = line.find('\t', a + 1U);
-    const auto c = line.find('\t', b + 1U);
-    require(a != std::string::npos && b != std::string::npos &&
-                c != std::string::npos &&
-                line.find('\t', c + 1U) == std::string::npos,
-            "invalid MTP extent row");
-    Extent extent;
-    extent.destination = std::stoull(line.substr(0U, a));
-    extent.bytes = std::stoull(line.substr(a + 1U, b - a - 1U));
-    extent.source = std::stoull(line.substr(b + 1U, c - b - 1U));
-    extent.shard = source_root / safe_relative(line.substr(c + 1U));
-    require(extent.destination == total, "MTP extents are not contiguous");
-    total += extent.bytes;
-    extents.push_back(std::move(extent));
-  }
-  require(input.eof() && extents.size() == expected_extents,
-          "unexpected MTP extent count");
-  std::vector<std::byte> result(static_cast<std::size_t>(total));
-  for (const auto& extent : extents) {
-    std::ifstream source(extent.shard, std::ios::binary);
-    require(static_cast<bool>(source), "missing MTP source shard");
-    source.seekg(static_cast<std::streamoff>(extent.source));
-    source.read(reinterpret_cast<char*>(result.data() + extent.destination),
-                static_cast<std::streamsize>(extent.bytes));
-    require(static_cast<bool>(source), "truncated MTP source extent");
-  }
-  return result;
 }
 
 std::vector<float> read_f32(const std::filesystem::path& path,
@@ -137,67 +82,43 @@ std::vector<float> copy_device(const float* source, std::size_t count,
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 3) {
+    if (argc != 4) {
       std::cerr << "usage: expert-deepseek-mtp-glue-smoke <oracle> "
-                   "<checkpoint>\n";
+                   "<mtp-set> <checkpoint>\n";
       return 64;
     }
     const std::filesystem::path oracle = argv[1];
-    const std::filesystem::path checkpoint = argv[2];
-    auto typed = read_extents(oracle / "resources" / "typed" / "extents.tsv",
-                              checkpoint, 6U);
-    auto e_source = read_extents(
-        oracle / "resources" / "e_proj" / "extents.tsv", checkpoint, 2U);
-    auto h_source = read_extents(
-        oracle / "resources" / "h_proj" / "extents.tsv", checkpoint, 2U);
-    require(e_source.size() == kProjectionWeightBytes + kProjectionScaleBytes &&
-                h_source.size() == e_source.size(),
-            "invalid MTP projection payload geometry");
-
-    auto e_admitted = er::cuda::admit_deepseek_dense_matrix(
-        std::span<const std::byte>(e_source).first(kProjectionWeightBytes),
-        std::span<const std::byte>(e_source).subspan(kProjectionWeightBytes),
-        kHidden, kHidden);
-    auto h_admitted = er::cuda::admit_deepseek_dense_matrix(
-        std::span<const std::byte>(h_source).first(kProjectionWeightBytes),
-        std::span<const std::byte>(h_source).subspan(kProjectionWeightBytes),
-        kHidden, kHidden);
-    require(e_admitted.status.ok() && e_admitted.matrix &&
-                h_admitted.status.ok() && h_admitted.matrix,
-            "MTP projection admission failed");
-
-    constexpr std::size_t kEnormOffset = 0U;
-    constexpr std::size_t kHnormOffset = kEnormOffset + kHidden * 2U;
-    constexpr std::size_t kHeadFunctionOffset = kHnormOffset + kHidden * 2U;
-    constexpr std::size_t kHeadBaseOffset =
-        kHeadFunctionOffset + 4U * kStreams * kHidden * sizeof(float);
-    constexpr std::size_t kHeadScaleOffset =
-        kHeadBaseOffset + kStreams * sizeof(float);
-    constexpr std::size_t kOutputNormOffset = kHeadScaleOffset + sizeof(float);
-    constexpr std::size_t kTypedBytes = kOutputNormOffset + kHidden * 2U;
-    require(typed.size() == kTypedBytes, "invalid MTP typed payload geometry");
-    std::byte* device_typed = nullptr;
-    check(cudaMalloc(reinterpret_cast<void**>(&device_typed), typed.size()),
-          "allocate MTP typed resources");
-    check(cudaMemcpy(device_typed, typed.data(), typed.size(),
-                     cudaMemcpyHostToDevice),
-          "upload MTP typed resources");
-
+    const std::filesystem::path mtp_root = argv[2];
+    const std::filesystem::path checkpoint = argv[3];
+    auto loaded = er::load_deepseek_tensor_artifacts(
+        mtp_root / "dense", mtp_root / "typed-residency", checkpoint, 7U,
+        19U);
+    require(loaded.status.ok(), std::string(loaded.status.message()));
+    const auto dense_device_bytes = loaded.artifacts.dense_device_bytes;
+    const auto staging_bytes = std::max<std::uint64_t>(
+        loaded.artifacts.maximum_source_record_bytes, 64ULL << 20U);
+    auto iocp = std::make_shared<er::WindowsIocpStorage>(2U);
+    er::ExtentGatherStorage storage(iocp);
+    er::FixedBufferPool buffers(1U, staging_bytes, er::kExpertPackAlignment,
+                                std::make_shared<er::CudaPinnedAllocator>());
+    er::cuda::DeepSeekResidentTensorState resources;
+    auto resource_status = er::cuda::DeepSeekResidentTensorState::load(
+        storage, buffers, loaded.artifacts.dense, loaded.artifacts.typed,
+        resources);
+    require(resource_status.ok(), std::string(resource_status.message()));
+    require(resources.dense_size() == 7U && resources.typed_size() == 19U,
+            "incomplete MTP tensor namespace");
     er::cuda::DeepSeekMtpGlueBinding binding;
-    binding.e_projection = e_admitted.matrix->view();
-    binding.h_projection = h_admitted.matrix->view();
-    binding.embedding_norm = reinterpret_cast<const std::uint16_t*>(
-        device_typed + kEnormOffset);
-    binding.hidden_norm = reinterpret_cast<const std::uint16_t*>(
-        device_typed + kHnormOffset);
-    binding.head_function = reinterpret_cast<const float*>(
-        device_typed + kHeadFunctionOffset);
-    binding.head_base = reinterpret_cast<const float*>(
-        device_typed + kHeadBaseOffset);
-    binding.head_scale = reinterpret_cast<const float*>(
-        device_typed + kHeadScaleOffset);
-    binding.output_norm = reinterpret_cast<const std::uint16_t*>(
-        device_typed + kOutputNormOffset);
+    resource_status = resources.bind_mtp_glue("mtp.0", binding);
+    require(resource_status.ok(), std::string(resource_status.message()));
+    er::cuda::DeepSeekAttentionBinding attention;
+    resource_status = resources.bind_attention("mtp.0", 0U, 0U, attention);
+    require(resource_status.ok(), std::string(resource_status.message()));
+    er::cuda::DeepSeekFfnBinding ffn;
+    resource_status = resources.bind_ffn(
+        "mtp.0", 0U, er::cuda::DeepSeekRouterKind::learned, ffn);
+    require(resource_status.ok() && !ffn.hash_router && ffn.router_bias,
+            "invalid learned MTP FFN binding");
 
     const auto embedding = read_f32(oracle / "embedding.f32", kHidden);
     const auto previous = read_f32(oracle / "previous-streams.f32",
@@ -294,10 +215,10 @@ int main(int argc, char** argv) {
 
     check(cudaFree(device_embedding), "free MTP embedding");
     check(cudaFree(device_previous), "free MTP previous streams");
-    check(cudaFree(device_typed), "free MTP typed resources");
     std::cout << "{\"ok\":true,\"state_bytes\":" << state.state->bytes()
+              << ",\"resident_tensor_bytes\":" << resources.bytes()
               << ",\"projection_device_bytes\":"
-              << (e_admitted.matrix->bytes() + h_admitted.matrix->bytes())
+              << dense_device_bytes
               << ",\"mix_ms\":" << mix_ms
               << ",\"collapse_ms\":" << collapse_ms
               << ",\"input_rmse\":" << input_stats.rmse()

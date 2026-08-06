@@ -503,6 +503,14 @@ iterations on the RTX 3090, the projection mix took 0.135 ms and collapse took
 current 68.3 ms target step; the still-unimplemented MTP attention and MoE are
 the cost that must be fused/reused with verification.
 
+The next residency gate loaded the complete MTP tensor namespace through the
+same generic loader used by the target model: 140,728,320 bytes for all seven
+admitted dense matrices plus 5,550,572 dtype-preserving bytes, 146,278,892
+bytes total. Geometry binding succeeded for glue, ratio-zero attention, and
+the learned-router FFN. A target-model regression after the namespace refactor
+loaded bundle v2, consumed the official five-token `Hi` encoding, and still
+emitted token `19923`; MTP remained reported available but disabled.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

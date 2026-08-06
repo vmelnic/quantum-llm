@@ -2566,13 +2566,25 @@ def export_deepseek_typed_set(
     """Describe all 834 non-quantized main-model tensors without repacking."""
 
     validate_deepseek_v4_source(checkpoint)
-    names = sorted(
+    names = tuple(sorted(
         name
         for name, info in checkpoint.tensors.items()
         if not name.startswith("mtp.") and info.dtype in ("BF16", "F32", "I64")
-    )
+    ))
     if len(names) != 834:
         raise AdapterError(f"expected 834 main-model typed tensors, got {len(names)}")
+    return _export_deepseek_typed_residency(
+        checkpoint, names=names, output=output
+    )
+
+
+def _export_deepseek_typed_residency(
+    checkpoint: SafeTensorCheckpoint, *, names: tuple[str, ...], output: Path
+) -> dict[str, object]:
+    """Publish a dtype-preserving tensor namespace for bounded residency."""
+
+    if not names:
+        raise AdapterError("typed residency namespace cannot be empty")
     output = output.resolve()
     partial = output.with_name(output.name + ".partial")
     if output.exists() or partial.exists():
@@ -2703,6 +2715,10 @@ def export_deepseek_mtp_set(
             target_abi="deepseek-sm86-source-dtypes-v1",
         )
         source_bytes += int(typed_manifest["bytes"])
+        typed_residency = _export_deepseek_typed_residency(
+            checkpoint, names=typed_names,
+            output=partial / "typed-residency",
+        )
 
         dense_root = partial / "dense"
         dense_root.mkdir()
@@ -2848,13 +2864,16 @@ def export_deepseek_mtp_set(
             "source_bytes": source_bytes,
             "resources": {
                 "typed": "typed/manifest.json",
+                "typed_residency": "typed-residency/typed-set.tsv",
                 "dense": "dense/dense-set.tsv",
                 "shared": "shared/manifest.json",
                 "routed": "routed/catalog.tsv",
             },
         }
+        if int(typed_residency["source_bytes"]) != int(typed_manifest["bytes"]):
+            raise SourceFormatError("MTP typed residency byte count mismatch")
         atomic_json(partial / "manifest.json", result)
-        os.replace(partial, output)
+        publish_directory(partial, output)
         return result
     except Exception:
         raise

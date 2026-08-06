@@ -91,8 +91,14 @@ the CUDA runtime:
 ```powershell
 ops\windows\Invoke-DeepSeekMtpGlueSmoke.ps1 `
   -Oracle C:\path\to\mtp-glue-oracle-v2 `
+  -MtpSet C:\path\to\deepseek-mtp-set `
   -Snapshot C:\path\to\checkpoint
 ```
+
+The MTP set preserves its original metadata-only manifest and now also emits
+`typed-residency/typed-set.tsv`. This fixed, per-tensor descriptor lets the
+generic runtime loader authenticate and upload the complete namespace without
+parsing JSON or relying on hard-coded byte offsets.
 
 ```powershell
 .\ops\windows\Export-DeepSeekMtpSet.ps1 `

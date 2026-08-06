@@ -246,6 +246,10 @@ latency or aggregate throughput without changing model semantics.
     production-facing state uses one four-row RMSNorm launch, batched `h_proj`,
     one `e_proj`, and the shared hyper-head implementation; both boundaries
     passed with maximum absolute error below `2.39e-7`.
+  - [x] Generalize resident tensor ownership by namespace and load the complete
+    `mtp.0` namespace transactionally. The same binders now serve `layers.N`
+    and `mtp.N`; 7 dense plus 19 typed MTP resources occupy 146,278,892 device
+    bytes and expose ratio-zero attention plus a learned-router FFN.
   - [ ] Execute the MTP attention, routed/shared FFN, mHC state and shared
     vocabulary head between the qualified boundaries; only then compare a
     one-token draft prediction.

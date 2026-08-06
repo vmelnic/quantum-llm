@@ -31,16 +31,16 @@ bool bind_tensor(const DeepSeekTypedSet& set, const std::string& name,
 
 }  // namespace
 
-Status DeepSeekResidentModelState::load(
+Status DeepSeekResidentTensorState::load(
     IAsyncStorage& storage, FixedBufferPool& buffers,
     std::span<const DeepSeekDenseSpec> dense_specs,
     std::span<const DeepSeekTypedSpec> typed_specs,
-    DeepSeekResidentModelState& destination) {
-  if (dense_specs.size() != 236U || typed_specs.size() != 834U ||
+    DeepSeekResidentTensorState& destination) {
+  if (dense_specs.empty() || typed_specs.empty() ||
       destination.dense_size() != 0U || destination.typed_size() != 0U)
     return {ErrorCode::invalid_argument,
-            "DeepSeek model load requires the complete pinned state and an empty destination"};
-  DeepSeekResidentModelState candidate;
+            "DeepSeek tensor load requires authenticated specs and an empty destination"};
+  DeepSeekResidentTensorState candidate;
   auto status = DeepSeekDenseSet::load(storage, buffers, dense_specs,
                                        candidate.dense_);
   if (!status.ok()) return status;
@@ -51,19 +51,20 @@ Status DeepSeekResidentModelState::load(
   return Status::success();
 }
 
-Status DeepSeekResidentModelState::bind_attention(
-    std::uint32_t layer, std::uint32_t compress_ratio,
+Status DeepSeekResidentTensorState::bind_attention(
+    std::string_view namespace_prefix, std::uint32_t logical_layer,
+    std::uint32_t compress_ratio,
     DeepSeekAttentionBinding& destination) const noexcept {
-  if (layer >= 43U ||
+  if (namespace_prefix.empty() ||
       (compress_ratio != 0U && compress_ratio != 4U &&
        compress_ratio != 128U))
     return {ErrorCode::invalid_argument,
-            "invalid DeepSeek attention layer or compression ratio"};
+            "invalid DeepSeek attention namespace or compression ratio"};
 
   DeepSeekAttentionBinding bound;
-  bound.layer = layer;
+  bound.layer = logical_layer;
   bound.compress_ratio = compress_ratio;
-  const auto prefix = "layers." + std::to_string(layer);
+  const std::string prefix(namespace_prefix);
   const auto attention = prefix + ".attn";
   bool valid =
       bind_matrix(dense_, attention + ".wq_a", 1024U, 4096U, bound.wq_a) &&
@@ -129,14 +130,16 @@ Status DeepSeekResidentModelState::bind_attention(
   return Status::success();
 }
 
-Status DeepSeekResidentModelState::bind_ffn(
-    std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept {
-  if (layer >= 43U)
-    return {ErrorCode::invalid_argument, "invalid DeepSeek FFN layer"};
+Status DeepSeekResidentTensorState::bind_ffn(
+    std::string_view namespace_prefix, std::uint32_t logical_layer,
+    DeepSeekRouterKind router,
+    DeepSeekFfnBinding& destination) const noexcept {
+  if (namespace_prefix.empty())
+    return {ErrorCode::invalid_argument, "invalid DeepSeek FFN namespace"};
   DeepSeekFfnBinding bound;
-  bound.layer = layer;
-  bound.hash_router = layer < 3U;
-  const auto prefix = "layers." + std::to_string(layer);
+  bound.layer = logical_layer;
+  bound.hash_router = router == DeepSeekRouterKind::hash;
+  const std::string prefix(namespace_prefix);
   const auto ffn = prefix + ".ffn";
   bool valid =
       bind_tensor(typed_, prefix + ".ffn_norm.weight", DeepSeekDtype::bf16,
@@ -165,7 +168,7 @@ Status DeepSeekResidentModelState::bind_ffn(
   return Status::success();
 }
 
-Status DeepSeekResidentModelState::bind_io(
+Status DeepSeekResidentTensorState::bind_io(
     DeepSeekIoBinding& destination) const noexcept {
   DeepSeekIoBinding bound;
   const bool valid =
@@ -192,9 +195,83 @@ Status DeepSeekResidentModelState::bind_io(
   return Status::success();
 }
 
-void DeepSeekResidentModelState::clear() noexcept {
+Status DeepSeekResidentTensorState::bind_mtp_glue(
+    std::string_view namespace_prefix,
+    DeepSeekMtpGlueBinding& destination) const noexcept {
+  if (namespace_prefix.empty())
+    return {ErrorCode::invalid_argument, "invalid DeepSeek MTP namespace"};
+  const std::string prefix(namespace_prefix);
+  DeepSeekMtpGlueBinding bound;
+  const bool valid =
+      bind_matrix(dense_, prefix + ".e_proj", 4096U, 4096U,
+                  bound.e_projection) &&
+      bind_matrix(dense_, prefix + ".h_proj", 4096U, 4096U,
+                  bound.h_projection) &&
+      bind_tensor(typed_, prefix + ".enorm.weight", DeepSeekDtype::bf16,
+                  4096U, bound.embedding_norm) &&
+      bind_tensor(typed_, prefix + ".hnorm.weight", DeepSeekDtype::bf16,
+                  4096U, bound.hidden_norm) &&
+      bind_tensor(typed_, prefix + ".norm.weight", DeepSeekDtype::bf16,
+                  4096U, bound.output_norm) &&
+      bind_tensor(typed_, prefix + ".hc_head_fn", DeepSeekDtype::f32,
+                  4ULL * 4U * 4096U, bound.head_function) &&
+      bind_tensor(typed_, prefix + ".hc_head_base", DeepSeekDtype::f32,
+                  4U, bound.head_base) &&
+      bind_tensor(typed_, prefix + ".hc_head_scale", DeepSeekDtype::f32,
+                  1U, bound.head_scale);
+  if (!valid)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek MTP glue binding is missing or incompatible"};
+  destination = bound;
+  return Status::success();
+}
+
+void DeepSeekResidentTensorState::clear() noexcept {
   dense_.clear();
   typed_.clear();
 }
+
+Status DeepSeekResidentModelState::load(
+    IAsyncStorage& storage, FixedBufferPool& buffers,
+    std::span<const DeepSeekDenseSpec> dense_specs,
+    std::span<const DeepSeekTypedSpec> typed_specs,
+    DeepSeekResidentModelState& destination) {
+  if (dense_specs.size() != 236U || typed_specs.size() != 834U ||
+      destination.dense_size() != 0U || destination.typed_size() != 0U)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek model load requires the complete pinned state and an empty destination"};
+  DeepSeekResidentModelState candidate;
+  auto status = DeepSeekResidentTensorState::load(
+      storage, buffers, dense_specs, typed_specs, candidate.tensors_);
+  if (!status.ok()) return status;
+  destination = std::move(candidate);
+  return Status::success();
+}
+
+Status DeepSeekResidentModelState::bind_attention(
+    std::uint32_t layer, std::uint32_t compress_ratio,
+    DeepSeekAttentionBinding& destination) const noexcept {
+  if (layer >= 43U)
+    return {ErrorCode::invalid_argument, "invalid DeepSeek attention layer"};
+  return tensors_.bind_attention("layers." + std::to_string(layer), layer,
+                                 compress_ratio, destination);
+}
+
+Status DeepSeekResidentModelState::bind_ffn(
+    std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept {
+  if (layer >= 43U)
+    return {ErrorCode::invalid_argument, "invalid DeepSeek FFN layer"};
+  return tensors_.bind_ffn(
+      "layers." + std::to_string(layer), layer,
+      layer < 3U ? DeepSeekRouterKind::hash : DeepSeekRouterKind::learned,
+      destination);
+}
+
+Status DeepSeekResidentModelState::bind_io(
+    DeepSeekIoBinding& destination) const noexcept {
+  return tensors_.bind_io(destination);
+}
+
+void DeepSeekResidentModelState::clear() noexcept { tensors_.clear(); }
 
 }  // namespace expert::runtime::cuda

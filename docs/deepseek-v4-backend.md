@@ -84,6 +84,31 @@ and `2.39e-7` maximum error, and the output oracle with `2.12e-10` RMSE and
 qualification: the MTP attention, FFN and cache state still have to execute
 between those two validated boundaries.
 
+Residency is namespace-driven rather than model-role-driven. An authenticated
+`DeepSeekResidentTensorState` owns an arbitrary dense/typed namespace and
+forms geometry-checked bindings from a prefix plus explicit logical layer,
+compression ratio, and router kind:
+
+```text
+shared target resources
+  embedding + vocabulary head
+
+resident tensor namespace
+  layers.N  -> attention + FFN binding
+  mtp.N     -> input glue + attention + FFN + output glue binding
+
+expert placement
+  independent directory owned by the block namespace
+```
+
+The target wrapper still fails closed unless all 236 dense and 834 typed
+resources are present. The MTP namespace independently requires all 7 dense
+and 19 typed resources, occupying 146,278,892 bytes on the qualification GPU.
+After this generalization, the five-token `Hi` target regression still emitted
+token `19923`. This boundary also permits a future placement planner to assign
+a block namespace to another GPU or worker without changing attention/FFN
+kernels.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face
