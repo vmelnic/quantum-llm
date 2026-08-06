@@ -32,18 +32,22 @@ DeepSeekDecodeController::DeepSeekDecodeController(
 DeepSeekDecodeController::~DeepSeekDecodeController() {
   static_cast<void>(cancel());
   for (auto* event : {attention_start_event_, attention_stop_event_,
-                      ffn_start_event_, ffn_stop_event_})
+                      route_stop_event_, plan_stop_event_, ffn_start_event_,
+                      ffn_stop_event_, release_stop_event_})
     if (event)
       static_cast<void>(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
 }
 
 Status DeepSeekDecodeController::enable_gpu_phase_timing() noexcept {
   if (active_ || attention_start_event_ || attention_stop_event_ ||
-      ffn_start_event_ || ffn_stop_event_)
+      route_stop_event_ || plan_stop_event_ || ffn_start_event_ ||
+      ffn_stop_event_ || release_stop_event_)
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek GPU phase timing configuration"};
-  void** destinations[] = {&attention_start_event_, &attention_stop_event_,
-                           &ffn_start_event_, &ffn_stop_event_};
+  void** destinations[] = {
+      &attention_start_event_, &attention_stop_event_, &route_stop_event_,
+      &plan_stop_event_, &ffn_start_event_, &ffn_stop_event_,
+      &release_stop_event_};
   for (auto** destination : destinations) {
     cudaEvent_t event{};
     const auto status = cuda_status(
@@ -169,23 +173,41 @@ DeepSeekDecodeController::poll_plan() noexcept {
           .count());
   if (attention_start_event_) {
     auto status = cuda_status(
-        cudaEventRecord(static_cast<cudaEvent_t>(attention_stop_event_),
+        cudaEventRecord(static_cast<cudaEvent_t>(plan_stop_event_),
                         static_cast<cudaStream_t>(stream_)),
-        "record DeepSeek attention phase stop");
+        "record DeepSeek plan phase stop");
     if (!status.ok()) return fail(status);
     status = cuda_status(
-        cudaEventSynchronize(static_cast<cudaEvent_t>(attention_stop_event_)),
-        "synchronize DeepSeek attention phase");
+        cudaEventSynchronize(static_cast<cudaEvent_t>(plan_stop_event_)),
+        "synchronize DeepSeek attention/route/plan phases");
     if (!status.ok()) return fail(status);
-    float milliseconds = 0.0F;
-    status = cuda_status(
-        cudaEventElapsedTime(
-            &milliseconds, static_cast<cudaEvent_t>(attention_start_event_),
-            static_cast<cudaEvent_t>(attention_stop_event_)),
-        "measure DeepSeek attention phase");
+    const auto measure = [&](void* start, void* stop, const char* name,
+                             std::uint64_t& destination) -> Status {
+      float milliseconds = 0.0F;
+      const auto measured = cuda_status(
+          cudaEventElapsedTime(&milliseconds, static_cast<cudaEvent_t>(start),
+                               static_cast<cudaEvent_t>(stop)),
+          name);
+      if (measured.ok())
+        destination += static_cast<std::uint64_t>(
+            static_cast<double>(milliseconds) * 1'000'000.0);
+      return measured;
+    };
+    status = measure(attention_start_event_, attention_stop_event_,
+                     "measure DeepSeek attention phase",
+                     telemetry_.gpu_attention_ns);
     if (!status.ok()) return fail(status);
-    telemetry_.gpu_attention_route_plan_ns += static_cast<std::uint64_t>(
-        static_cast<double>(milliseconds) * 1'000'000.0);
+    status = measure(attention_stop_event_, route_stop_event_,
+                     "measure DeepSeek route phase", telemetry_.gpu_route_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(route_stop_event_, plan_stop_event_,
+                     "measure DeepSeek directory plan phase",
+                     telemetry_.gpu_directory_plan_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(attention_start_event_, plan_stop_event_,
+                     "measure DeepSeek attention/route/plan phases",
+                     telemetry_.gpu_attention_route_plan_ns);
+    if (!status.ok()) return fail(status);
   }
   if (!polled.plan.status.ok()) return fail(std::move(polled.plan.status));
   return execute_plan(std::move(polled.plan));
@@ -265,6 +287,13 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
           std::chrono::steady_clock::now() - ffn_started)
           .count());
   if (!execute.ok()) return fail(execute);
+  if (ffn_start_event_) {
+    const auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(ffn_stop_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek FFN phase stop");
+    if (!status.ok()) return fail(status);
+  }
   const auto release_started = std::chrono::steady_clock::now();
   const auto release = directory_->release_pins_async(pin_id_, stream_);
   telemetry_.directory_release_ns += static_cast<std::uint64_t>(
@@ -275,23 +304,37 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
   if (!release.ok()) return fail(release);
   if (ffn_start_event_) {
     auto status = cuda_status(
-        cudaEventRecord(static_cast<cudaEvent_t>(ffn_stop_event_),
+        cudaEventRecord(static_cast<cudaEvent_t>(release_stop_event_),
                         static_cast<cudaStream_t>(stream_)),
-        "record DeepSeek FFN phase stop");
+        "record DeepSeek release phase stop");
     if (!status.ok()) return fail(status);
     status = cuda_status(
-        cudaEventSynchronize(static_cast<cudaEvent_t>(ffn_stop_event_)),
-        "synchronize DeepSeek FFN phase");
+        cudaEventSynchronize(static_cast<cudaEvent_t>(release_stop_event_)),
+        "synchronize DeepSeek FFN/release phases");
     if (!status.ok()) return fail(status);
-    float milliseconds = 0.0F;
-    status = cuda_status(
-        cudaEventElapsedTime(&milliseconds,
-                             static_cast<cudaEvent_t>(ffn_start_event_),
-                             static_cast<cudaEvent_t>(ffn_stop_event_)),
-        "measure DeepSeek FFN phase");
+    const auto measure = [&](void* start, void* stop, const char* name,
+                             std::uint64_t& destination) -> Status {
+      float milliseconds = 0.0F;
+      const auto measured = cuda_status(
+          cudaEventElapsedTime(&milliseconds, static_cast<cudaEvent_t>(start),
+                               static_cast<cudaEvent_t>(stop)),
+          name);
+      if (measured.ok())
+        destination += static_cast<std::uint64_t>(
+            static_cast<double>(milliseconds) * 1'000'000.0);
+      return measured;
+    };
+    status = measure(ffn_start_event_, ffn_stop_event_,
+                     "measure DeepSeek FFN phase", telemetry_.gpu_ffn_ns);
     if (!status.ok()) return fail(status);
-    telemetry_.gpu_ffn_release_ns += static_cast<std::uint64_t>(
-        static_cast<double>(milliseconds) * 1'000'000.0);
+    status = measure(ffn_stop_event_, release_stop_event_,
+                     "measure DeepSeek release phase",
+                     telemetry_.gpu_directory_release_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_start_event_, release_stop_event_,
+                     "measure DeepSeek FFN/release phases",
+                     telemetry_.gpu_ffn_release_ns);
+    if (!status.ok()) return fail(status);
   }
 
   const auto completed_layer = current_layer_++;
@@ -357,10 +400,24 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
        compressed ? rope_.compressed_sine : rope_.base_sine,
        group_cosine, group_sine, position_, 1e-6F, 20U, stream_});
   if (!attention.ok()) return fail(attention);
+  if (attention_start_event_) {
+    const auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(attention_stop_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek attention phase stop");
+    if (!status.ok()) return fail(status);
+  }
   const auto route = deepseek_ffn_route(
       {view.ffn_weights, view.ffn_state, request_->streams_b_, token_id_,
        1e-6F, 20U, stream_});
   if (!route.ok()) return fail(route);
+  if (attention_start_event_) {
+    const auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(route_stop_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek route phase stop");
+    if (!status.ok()) return fail(status);
+  }
   telemetry_.attention_route_submit_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - attention_route_started)

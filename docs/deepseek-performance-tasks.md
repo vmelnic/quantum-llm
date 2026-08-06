@@ -35,6 +35,10 @@ one subsystem.
 - [x] Add an opt-in first GPU boundary split for `attention+route+plan` and
   `FFN+release`. It synchronizes extra CUDA events and is profiling-only; the
   two counters are not emitted by default production runs.
+- [x] Split those profiling boundaries into attention, router, directory plan,
+  FFN compute, and directory release without adding another synchronization.
+  On the zero-miss route they account for 46.1%, 11.0%, 6.2%, 36.3%, and 0.4%
+  of measured GPU time respectively.
 - [x] Capture one external Nsight Systems warm-route kernel census and one
   Nsight Compute `int8_gemv_vector` launch. Keep profiler overhead and startup
   conversion kernels out of production throughput claims.

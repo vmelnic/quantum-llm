@@ -408,6 +408,22 @@ GPU-compute dominated; storage, H2D, CPU experts, and directory misses were
 zero on the measured path. Reaching 33.3 ms needs material reductions in both
 major device phases, not another host-directory micro-optimization.
 
+Intermediate events, recorded without another synchronization, refined the
+same zero-miss boundary on a subsequent run:
+
+| detailed device interval | 5 steps | per model step | share |
+| --- | ---: | ---: | ---: |
+| attention | 151.658 ms | 30.332 ms | 46.1% |
+| router | 36.264 ms | 7.253 ms | 11.0% |
+| directory plan | 20.384 ms | 4.077 ms | 6.2% |
+| FFN compute | 119.387 ms | 23.877 ms | 36.3% |
+| directory release | 1.304 ms | 0.261 ms | 0.4% |
+
+The detailed intervals total about 65.80 ms/step; the worker took 69.83
+ms/step under profiling. Directory plan plus release is now only 6.6% of GPU
+time. The optimization order is therefore attention, FFN compute, router, then
+directory only if its share grows after the compute reductions.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

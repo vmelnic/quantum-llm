@@ -104,9 +104,12 @@ For controlled profiling, `Start-DeepSeekExpertServer.ps1` accepts
 `-ProfileGpuPhases $true`, or the worker accepts `--profile-gpu-phases`
 directly. This adds and synchronizes CUDA events at every layer boundary and
 publishes `worker_gpu_attention_route_plan_ns` plus
-`worker_gpu_ffn_release_ns`. It intentionally perturbs scheduling and must stay
-off for production latency/throughput claims. `worker_execution` reports
-whether the mode is active.
+`worker_gpu_ffn_release_ns`. Detailed counters split those totals into
+`worker_gpu_attention_ns`, `worker_gpu_route_ns`,
+`worker_gpu_directory_plan_ns`, `worker_gpu_ffn_ns`, and
+`worker_gpu_directory_release_ns`. It intentionally perturbs scheduling and
+must stay off for production latency/throughput claims. `worker_execution`
+reports whether the mode is active.
 
 The scheduler/cache counters can overlap their parent worker counter and must
 not be summed with it as independent wall time. They exist to attribute the
