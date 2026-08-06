@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DescriptorBundle,
     [Parameter(Mandatory = $true)][string]$RoutedCatalog,
     [Parameter(Mandatory = $true)][string]$Output,
+    [string]$MtpSet = "",
     [string]$StateDirectory = "",
     [ValidateRange(0.001, 1000.0)][double]$CpuMillisecondsPerSelection = 9.342,
     [ValidateRange(0.001, 1000.0)][double]$GpuMillisecondsPerSelection = 0.543,
@@ -25,6 +26,7 @@ $source = [System.IO.Path]::GetFullPath($Snapshot)
 $descriptors = [System.IO.Path]::GetFullPath($DescriptorBundle)
 $routed = [System.IO.Path]::GetFullPath($RoutedCatalog)
 $destination = [System.IO.Path]::GetFullPath($Output)
+$mtp = if ($MtpSet) { [System.IO.Path]::GetFullPath($MtpSet) } else { "" }
 $state = if ($StateDirectory) {
     [System.IO.Path]::GetFullPath($StateDirectory)
 } else {
@@ -42,6 +44,27 @@ foreach ($path in @(
 )) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "DeepSeek bundle dependency missing: $path"
+    }
+}
+if ($mtp) {
+    foreach ($path in @(
+        (Join-Path $mtp "manifest.json"),
+        (Join-Path $mtp "dense\dense-set.tsv"),
+        (Join-Path $mtp "typed\manifest.json"),
+        (Join-Path $mtp "shared\manifest.json"),
+        (Join-Path $mtp "routed\catalog.tsv"),
+        (Join-Path $mtp "routed\extents.tsv")
+    )) {
+        if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "DeepSeek MTP bundle dependency missing: $path"
+        }
+    }
+    $mtpManifest = Get-Content -LiteralPath (Join-Path $mtp "manifest.json") `
+        -Raw | ConvertFrom-Json
+    if ($mtpManifest.format -ne "deepseek-mtp-resource-set-v1" -or
+        [int]$mtpManifest.layers -ne 1 -or
+        [int]$mtpManifest.routed_experts -ne 256) {
+        throw "Unsupported DeepSeek MTP resource set"
     }
 }
 if ((Test-Path -LiteralPath $destination) -or
@@ -75,6 +98,11 @@ $denseHash = (Get-FileHash -LiteralPath `
 $expertsHash = (Get-FileHash -LiteralPath `
     (Join-Path $routed "catalog.tsv") `
     -Algorithm SHA256).Hash.ToLowerInvariant()
+$mtpHash = if ($mtp) {
+    (Get-FileHash -LiteralPath (Join-Path $mtp "manifest.json") `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+} else { "" }
+$bundleVersion = if ($mtp) { 2 } else { 1 }
 
 New-Item -ItemType Directory -Path $partial | Out-Null
 try {
@@ -82,9 +110,13 @@ try {
         Copy-Item -LiteralPath (Join-Path $descriptors $name) `
             -Destination (Join-Path $partial $name) -Recurse
     }
+    if ($mtp) {
+        Copy-Item -LiteralPath $mtp -Destination (Join-Path $partial "mtp") `
+            -Recurse
+    }
     New-Item -ItemType Directory -Path $state -Force | Out-Null
     $runtimeLines = @(
-        "deepseek-worker-bundle-v1",
+        "deepseek-worker-bundle-v$bundleVersion",
         "model_id`t17",
         "model_sha256`t$modelHash",
         "checkpoint`t$source",
@@ -97,6 +129,7 @@ try {
         "gpu_ns_per_selection`t$([long]($GpuMillisecondsPerSelection * 1000000.0))",
         "h2d_bytes_per_second`t$([long]($H2DGigabytesPerSecond * 1000000000.0))"
     )
+    if ($mtp) { $runtimeLines += "mtp`tmtp" }
     $runtimeText = ($runtimeLines -join "`n") + "`n"
     Write-Utf8NoBom -Path (Join-Path $partial "runtime.tsv") `
         -Value $runtimeText
@@ -111,7 +144,7 @@ try {
         }
         format = [ordered]@{
             name = "deepseek-worker-bundle"
-            version = 1
+            version = $bundleVersion
             routed_storage = if ($packed) { "compact-pack" } else { "source-extents" }
         }
         quantization = [ordered]@{
@@ -125,14 +158,17 @@ try {
             hidden_size = 4096
             experts_per_layer = 256
             active_experts = 6
+            multi_token_prediction_layers = if ($mtp) { 1 } else { 0 }
         }
         masses = [ordered]@{
             routed_payload_bytes = 147169738752
             routed_shards = if ($packed) { 43 } else { 0 }
+            mtp_source_bytes = if ($mtp) { [long]$mtpManifest.source_bytes } else { 0 }
         }
         indexes = [ordered]@{
             dense_sha256 = $denseHash
             experts_sha256 = $expertsHash
+            mtp_sha256 = if ($mtp) { $mtpHash } else { $null }
         }
         integrity = [ordered]@{
             content_sha256 = $runtimeHash
@@ -159,6 +195,7 @@ $result = [PSCustomObject]@{
     checkpoint = $source
     routed_catalog = $routed
     durable_routed_pack = $packed
+    mtp_resource_set = $mtp
     model_sha256 = $modelHash
     status = "published"
 }

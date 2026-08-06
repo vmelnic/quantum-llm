@@ -172,6 +172,10 @@ allocation expressed in the same page geometry. Qwen uses on-demand FP16 pages;
 DeepSeek currently uses preallocated BF16 request state.
 `/model-info.worker_prefill` reports the backend's causal prefill mode and maximum
 tokens per chunk.
+`/model-info.worker_execution` distinguishes an authenticated MTP resource from
+an active speculative path. `mtp_resource_available` may be true while
+`mtp_enabled` remains false; clients must never infer speculative generation
+from bundle contents alone.
 
 `/model-info.worker_placement` is the authoritative effective placement
 contract. It returns the selected `profile`, exact RAM/VRAM cache bytes,

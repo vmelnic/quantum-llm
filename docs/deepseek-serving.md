@@ -12,12 +12,13 @@ not load checkpoints or create CUDA contexts.
 atomically published runtime bundle:
 
 ```text
-deepseek-worker-bundle-v1/
+deepseek-worker-bundle-v2/
   manifest.json       public service identity and architecture
   runtime.tsv         exact runtime dependencies and measured placement seed
   dense/              authenticated FP8 dense descriptors
   typed/              authenticated BF16/F32/I64 descriptors
   shared/             authenticated shared-expert descriptors
+  mtp/                optional authenticated one-layer MTP descriptors
 ```
 
 The source checkpoint and routed expert pack remain external immutable
@@ -27,6 +28,11 @@ checkpoint-index SHA-256, quantization ABI, descriptor roots, routed catalog,
 and measured CPU/CUDA/H2D seed. Unknown, duplicate, missing, corrupt, or
 model-mismatched state fails closed. A missing census is the only state-load
 condition that creates a new empty census.
+
+Bundle v1 remains accepted for base greedy serving. Bundle v2 adds the `mtp`
+resource and reports `mtp_resource_available=true`, but the worker keeps
+`mtp_enabled=false` until draft-state and target-verification gates are
+implemented. Availability is not execution and cannot change generated tokens.
 
 For development, the routed catalog may point directly at authenticated
 SafeTensors extents. For deployment, publish only after the 43-shard compact
@@ -38,7 +44,8 @@ the manifest so the distinction is visible to operators.
   -Snapshot D:\models\deepseek-v4-flash\snapshot `
   -DescriptorBundle D:\qualification\deepseek-descriptors `
   -RoutedCatalog D:\models\deepseek-v4-flash\compact-pack-v1 `
-  -Output D:\models\deepseek-v4-flash\worker-bundle-v1 `
+  -MtpSet D:\models\deepseek-v4-flash\mtp-set-v1 `
+  -Output D:\models\deepseek-v4-flash\worker-bundle-v2 `
   -StateDirectory D:\state\deepseek-v4-flash
 ```
 
@@ -60,7 +67,7 @@ python -m venv work\venv\server
   -r requirements/server.txt
 
 ./ops/windows/Start-DeepSeekExpertServer.ps1 `
-  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v1 `
+  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v2 `
   -HostAddress 127.0.0.1 `
   -Port 8080
 ```

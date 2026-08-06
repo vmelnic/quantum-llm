@@ -106,10 +106,12 @@ struct Bundle final {
   std::filesystem::path shared;
   std::filesystem::path routed;
   std::filesystem::path census;
+  std::filesystem::path mtp;
   er::Sha256Digest model_hash{};
   double cpu_ns{};
   double gpu_ns{};
   double h2d_bytes_per_second{};
+  bool mtp_available{};
 };
 
 std::filesystem::path bundle_path(const std::filesystem::path& root,
@@ -125,8 +127,10 @@ Bundle load_bundle(const std::filesystem::path& root) {
   std::ifstream input(root / "runtime.tsv");
   std::string line;
   require(static_cast<bool>(std::getline(input, line)) &&
-              line == "deepseek-worker-bundle-v1",
+              (line == "deepseek-worker-bundle-v1" ||
+               line == "deepseek-worker-bundle-v2"),
           "invalid DeepSeek worker bundle header");
+  const bool has_mtp = line == "deepseek-worker-bundle-v2";
   std::map<std::string, std::string> values;
   while (std::getline(input, line)) {
     const auto fields = split_tabs(line);
@@ -135,7 +139,8 @@ Bundle load_bundle(const std::filesystem::path& root) {
                                std::string(fields[1])).second,
             "invalid or duplicate DeepSeek worker bundle field");
   }
-  require(input.eof() && values.size() == 11U && values.at("model_id") == "17",
+  require(input.eof() && values.size() == (has_mtp ? 12U : 11U) &&
+              values.at("model_id") == "17",
           "incomplete DeepSeek worker bundle");
   Bundle result;
   result.checkpoint = bundle_path(root, values.at("checkpoint"));
@@ -144,15 +149,22 @@ Bundle load_bundle(const std::filesystem::path& root) {
   result.shared = bundle_path(root, values.at("shared"));
   result.routed = bundle_path(root, values.at("routed"));
   result.census = bundle_path(root, values.at("census"));
+  if (has_mtp) result.mtp = bundle_path(root, values.at("mtp"));
   result.model_hash = digest(values.at("model_sha256"));
   result.cpu_ns = std::stod(values.at("cpu_ns_per_selection"));
   result.gpu_ns = std::stod(values.at("gpu_ns_per_selection"));
   result.h2d_bytes_per_second = std::stod(values.at("h2d_bytes_per_second"));
+  result.mtp_available = has_mtp;
   require(std::filesystem::is_directory(result.checkpoint) &&
               std::filesystem::is_directory(result.dense) &&
               std::filesystem::is_directory(result.typed) &&
               std::filesystem::is_directory(result.shared) &&
               std::filesystem::is_directory(result.routed) &&
+              (!has_mtp ||
+               (std::filesystem::is_directory(result.mtp) &&
+                std::filesystem::is_regular_file(result.mtp / "manifest.json") &&
+                std::filesystem::is_regular_file(
+                    result.mtp / "routed" / "catalog.tsv"))) &&
               std::isfinite(result.cpu_ns) && result.cpu_ns > 0.0 &&
               std::isfinite(result.gpu_ns) && result.gpu_ns > 0.0 &&
               std::isfinite(result.h2d_bytes_per_second) &&
@@ -594,6 +606,7 @@ class Model final {
     return telemetry_.warm_start_loaded != 0U;
   }
   bool gpu_phase_timing() const noexcept { return gpu_phase_timing_; }
+  bool mtp_available() const noexcept { return bundle_.mtp_available; }
 
  private:
   static constexpr std::uint64_t rope_row_values = 8ULL * 32U;
@@ -735,7 +748,9 @@ int worker_loop(Model& model) {
             << ",\"placement_minimum_observations\":"
             << (model.placement() == "latency" ? 1 : 2)
             << ",\"gpu_phase_timing\":"
-            << (model.gpu_phase_timing() ? "true" : "false") << "}\n"
+            << (model.gpu_phase_timing() ? "true" : "false")
+            << ",\"mtp_resource_available\":"
+            << (model.mtp_available() ? "true" : "false") << "}\n"
             << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {

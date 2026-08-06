@@ -482,6 +482,16 @@ warp distribution only added work. This closes the obvious bit-exact scalar
 FP4 micro-tuning branch and moves the next effort to row/request reuse or a
 different qualified execution representation.
 
+### MTP resource boundary
+
+The real one-layer MTP export authenticated 3,593,787,756 source bytes without
+copying payloads. A v2 worker bundle declared the resource and the worker
+reported `mtp_resource_available=true`; no speculative executor was enabled.
+The same five-token `Hi` prompt still emitted greedy token `19923`, with zero
+route-time acquisitions and no CPU expert execution. This proves resource
+availability is isolated from base-model semantics; it is not an MTP speed or
+acceptance result.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

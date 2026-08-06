@@ -171,6 +171,9 @@ class CudaWorker:
             response.get("request_stream_mode", "default")
         )
         self.gpu_phase_timing = bool(response.get("gpu_phase_timing", False))
+        self.mtp_resource_available = bool(
+            response.get("mtp_resource_available", False)
+        )
         self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
@@ -800,6 +803,8 @@ class Application:
                 "request_stream_mode": self.worker.request_stream_mode,
                 "rope_mode": self.worker.rope_mode,
                 "gpu_phase_timing": self.worker.gpu_phase_timing,
+                "mtp_resource_available": self.worker.mtp_resource_available,
+                "mtp_enabled": False,
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,

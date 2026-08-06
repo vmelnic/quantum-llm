@@ -59,9 +59,10 @@ the default runtime path.
 The checkpoint's single MTP layer now has a separate authenticated descriptor
 set. It covers 3,593,787,756 source bytes across 19 dtype-preserving tensors,
 7 block-scaled FP8 matrices, one shared expert, and 256 routed FP4 experts.
-The export is extent-based and copies no weights. It is not yet a resident MTP
-state and is not referenced by the v1 production worker bundle, so base greedy
-generation remains unchanged.
+The export is extent-based and copies no weights. Bundle v2 can declare this
+resource and the worker reports its availability, but it is not yet a resident
+MTP state and remains disabled, so base greedy generation is unchanged. Bundle
+v1 remains supported without the resource.
 
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
