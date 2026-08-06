@@ -22,6 +22,7 @@ from experiment import (
     normalized_mse,
 )
 from dispatch_experiment import DispatchNeuralCpu
+from torus_experiment import TorusNeuralCpu
 
 
 def write_values(path: Path, code: str, values) -> dict:
@@ -110,6 +111,28 @@ def main() -> None:
             (2,),
             table_override=shuffled_table,
         )
+        torus = TorusNeuralCpu(hidden, 16, 4, bank_size=1, period=4)
+        torus_outputs, torus_states = torus.execute(
+            data.inputs,
+            data.layers,
+            4,
+            (1, 2, 4),
+            return_states=True,
+        )
+        if torus_outputs[4].shape != data.outputs.shape or torus_states[4].shape != (
+            records,
+            16,
+        ):
+            raise RuntimeError("invalid torus state geometry")
+        torus.execute(
+            data.inputs,
+            data.layers,
+            4,
+            (4,),
+            schedule="single",
+            identity_bank=True,
+            identity_nonlinearity=True,
+        )
         loss = normalized_mse(outputs[1], data.outputs) + normalized_mse(
             outputs[2], data.outputs
         )
@@ -142,6 +165,7 @@ def main() -> None:
         )
         del prediction, outputs, loss, models, candidate, dispatch_outputs
         del dispatch_paths, dispatch
+        del torus_outputs, torus_states, torus
         data.close()
 
 

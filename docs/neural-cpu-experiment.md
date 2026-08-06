@@ -136,6 +136,73 @@ residual with an independently testable self-consistency law. A subsequent
 design must make later ticks expand the computed dependency graph rather than
 revisit a fixed point or a collapsed path palette.
 
+### Reversible torus/butterfly result
+
+The next candidate removed both contraction and data-dependent routing. It is
+pre-classified as a **tied-depth structured map**, not as proof of a routing
+CPU. A five-instruction hard loop applies the same determinant-one 2x2 coupling
+bank and parameter-free reversible nonlinear coupling to algorithmically
+changing round-robin register pairs. It has no tick-specific learned constants
+and uses one shared decoder.
+
+At 3,936,152 persistent bytes, 3,932,160 bytes (99.90%) belong to the dense
+encode/decode boundary, 3,840 bytes to layer codes, 112 bytes to the coupling
+bank, and 40 bytes to bytecode.
+
+| torus/butterfly test | NMSE | cosine |
+|---|---:|---:|
+| 1 tick | 0.4784 | 0.6670 |
+| 16 ticks | 0.4432 | 0.6869 |
+| 32 ticks | 0.4264 | 0.6944 |
+| 64 ticks | **0.4195** | **0.6963** |
+| 128 ticks | 0.4265 | 0.6920 |
+| random address schedule, 128 | 6.8194 | -0.0451 |
+| repeated single stride, 128 | 2.3338 | 0.1463 |
+| identity coupling bank, 128 | 35.9553 | 0.3791 |
+| identity nonlinearity, 128 | 0.8877 | 0.4016 |
+| random constants + readout, 128 | 0.7284 | 0.5107 |
+
+The learned 2x2 banks preserve determinant one within `1.2e-7`, and latent
+effective rank remains stable from 9.88 at tick 1 to 9.70 at tick 128. The
+strong lesions prove that the schedule, coupling bank, and nonlinearity all
+carry function. Nevertheless:
+
+- 32 to 64 improves only 1.61%, below the registered 5%;
+- 64 to 128 regresses by 1.67%;
+- the best point, 0.4195, loses to shared-basis (0.3633), static GLU (0.3800),
+  and ordinary recurrence (0.3883);
+- total algorithmic dividend from tick 1 to the best point is only 12.32%;
+- random constants/readout is only 1.71× worse, below the required 5×.
+
+This candidate receives **kill**. It demonstrates a genuine scheduled
+computation whose controls are much stronger than the earlier programs, but
+its useful state lives in an effective rank of roughly ten and almost all
+persistent information still resides in the static boundary projections. More
+reversible ticks cannot recover input information discarded by that learned
+bottleneck.
+
+### Current evidence boundary
+
+Across three real-activation machines, the best held-out results are:
+
+| mechanism | best test NMSE | result |
+|---|---:|---|
+| branch-and-accumulate solver | 0.4496 | fixed-point saturation |
+| computed dispatch | 0.3846 | path collapse and saturation |
+| reversible torus/butterfly | 0.4195 | boundary/rank bottleneck |
+| static shared-basis reference | **0.3633** | winner |
+
+The toolchain has demonstrated hard program semantics, meaningful schedule and
+instruction lesions, real route sensitivity, and deterministic fixed-byte
+sweeps. It has not demonstrated a time-for-space advantage. For the three
+tested computational families at approximately 4 MB, the real Qwen MoE
+boundary is cheaper to store as a compressed static map than to reconstruct by
+additional execution. This is the measured conclusion; it is not a theorem
+about every possible stored-program architecture.
+
+No candidate qualifies for an in-model splice. Performing it after a failed
+boundary gate would create downstream tests without a plausible success path.
+
 The proposed system is a deterministic register machine with a fixed
 instruction set, a program counter, bounded loops, hard bytecode, and a small
 constant pool. The original Qwen checkpoint is a teacher during compilation

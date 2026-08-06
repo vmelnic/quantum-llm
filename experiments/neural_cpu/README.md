@@ -120,3 +120,21 @@ python experiments/neural_cpu/dispatch_experiment.py `
   --reference-result work/neural-cpu/pilot-result.json `
   --output work/neural-cpu/dispatch-result.json
 ```
+
+`results/torus-butterfly-pilot.json` records a fixed-trace reversible redesign.
+It used a parameter-free round-robin address program and a 112-byte learned
+determinant-one coupling bank over a width-240 latent. The best point was 0.4195
+NMSE at 64 ticks; 128 ticks regressed to 0.4265. Strong schedule, bank, and
+nonlinearity lesions confirmed that its loop carried function, but 99.90% of
+bytes remained in encode/decode and it lost to every primary static/recurrent
+reference. It is classified as a tied-depth structured map and receives `kill`.
+
+Run it with:
+
+```powershell
+python experiments/neural_cpu/torus_experiment.py `
+  --trace work/neural-cpu/pilot-trace `
+  --prompts-manifest work/neural-cpu/pilot-prompts/prompts-manifest.json `
+  --reference-result work/neural-cpu/pilot-result.json `
+  --output work/neural-cpu/torus-result.json
+```
