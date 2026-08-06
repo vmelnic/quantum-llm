@@ -39,6 +39,10 @@ one subsystem.
   FFN compute, and directory release without adding another synchronization.
   On the zero-miss route they account for 46.1%, 11.0%, 6.2%, 36.3%, and 0.4%
   of measured GPU time respectively.
+- [x] Split attention into HCA-pre/norm, Q/KV+CSA/index projections, sparse
+  attention, output projections, and HCA post. Fine-grained event overhead
+  makes the absolute time diagnostic-only; projections account for about 77%
+  of the instrumented attention phase.
 - [x] Capture one external Nsight Systems warm-route kernel census and one
   Nsight Compute `int8_gemv_vector` launch. Keep profiler overhead and startup
   conversion kernels out of production throughput claims.

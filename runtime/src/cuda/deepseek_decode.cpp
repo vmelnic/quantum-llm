@@ -33,7 +33,11 @@ DeepSeekDecodeController::~DeepSeekDecodeController() {
   static_cast<void>(cancel());
   for (auto* event : {attention_start_event_, attention_stop_event_,
                       route_stop_event_, plan_stop_event_, ffn_start_event_,
-                      ffn_stop_event_, release_stop_event_})
+                      ffn_stop_event_, release_stop_event_,
+                      attention_hca_pre_norm_stop_event_,
+                      attention_projection_stop_event_,
+                      sparse_attention_stop_event_,
+                      attention_output_projection_stop_event_})
     if (event)
       static_cast<void>(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
 }
@@ -41,13 +45,18 @@ DeepSeekDecodeController::~DeepSeekDecodeController() {
 Status DeepSeekDecodeController::enable_gpu_phase_timing() noexcept {
   if (active_ || attention_start_event_ || attention_stop_event_ ||
       route_stop_event_ || plan_stop_event_ || ffn_start_event_ ||
-      ffn_stop_event_ || release_stop_event_)
+      ffn_stop_event_ || release_stop_event_ ||
+      attention_hca_pre_norm_stop_event_ ||
+      attention_projection_stop_event_ || sparse_attention_stop_event_ ||
+      attention_output_projection_stop_event_)
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek GPU phase timing configuration"};
   void** destinations[] = {
       &attention_start_event_, &attention_stop_event_, &route_stop_event_,
       &plan_stop_event_, &ffn_start_event_, &ffn_stop_event_,
-      &release_stop_event_};
+      &release_stop_event_, &attention_hca_pre_norm_stop_event_,
+      &attention_projection_stop_event_, &sparse_attention_stop_event_,
+      &attention_output_projection_stop_event_};
   for (auto** destination : destinations) {
     cudaEvent_t event{};
     const auto status = cuda_status(
@@ -196,6 +205,31 @@ DeepSeekDecodeController::poll_plan() noexcept {
     status = measure(attention_start_event_, attention_stop_event_,
                      "measure DeepSeek attention phase",
                      telemetry_.gpu_attention_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(attention_start_event_,
+                     attention_hca_pre_norm_stop_event_,
+                     "measure DeepSeek attention HCA pre/norm phase",
+                     telemetry_.gpu_attention_hca_pre_norm_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(attention_hca_pre_norm_stop_event_,
+                     attention_projection_stop_event_,
+                     "measure DeepSeek attention projection phase",
+                     telemetry_.gpu_attention_projection_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(attention_projection_stop_event_,
+                     sparse_attention_stop_event_,
+                     "measure DeepSeek sparse attention phase",
+                     telemetry_.gpu_sparse_attention_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(sparse_attention_stop_event_,
+                     attention_output_projection_stop_event_,
+                     "measure DeepSeek attention output projection phase",
+                     telemetry_.gpu_attention_output_projection_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(attention_output_projection_stop_event_,
+                     attention_stop_event_,
+                     "measure DeepSeek attention HCA post phase",
+                     telemetry_.gpu_attention_hca_post_ns);
     if (!status.ok()) return fail(status);
     status = measure(attention_stop_event_, route_stop_event_,
                      "measure DeepSeek route phase", telemetry_.gpu_route_ns);
@@ -393,12 +427,16 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
         "record DeepSeek attention phase start");
     if (!status.ok()) return fail(status);
   }
+  const DeepSeekAttentionLaunch::ProfileEvents attention_profile{
+      attention_hca_pre_norm_stop_event_, attention_projection_stop_event_,
+      sparse_attention_stop_event_, attention_output_projection_stop_event_};
   const auto attention = deepseek_attention_decode(
       {view.attention_weights, view.attention_state, request_->streams_a_,
        request_->streams_b_,
        compressed ? rope_.compressed_cosine : rope_.base_cosine,
        compressed ? rope_.compressed_sine : rope_.base_sine,
-       group_cosine, group_sine, position_, 1e-6F, 20U, stream_});
+       group_cosine, group_sine, position_, 1e-6F, 20U, stream_,
+       attention_start_event_ ? &attention_profile : nullptr});
   if (!attention.ok()) return fail(attention);
   if (attention_start_event_) {
     const auto status = cuda_status(

@@ -29,6 +29,13 @@ Status failure(cudaError_t error, const char* operation) noexcept {
           std::string(operation) + ": " + cudaGetErrorString(error)};
 }
 
+Status record_profile_event(void* event, cudaStream_t stream,
+                            const char* operation) noexcept {
+  if (!event) return Status::success();
+  const auto error = cudaEventRecord(static_cast<cudaEvent_t>(event), stream);
+  return error == cudaSuccess ? Status::success() : failure(error, operation);
+}
+
 std::size_t align_up(std::size_t value) {
   return (value + kAlignment - 1U) & ~(kAlignment - 1U);
 }
@@ -291,6 +298,10 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
                                 state.attention_input_, kHidden,
                                 launch.epsilon, launch.stream);
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->hca_pre_norm_stop : nullptr,
+      raw_stream, "record DeepSeek HCA pre/norm stop");
+  if (!status.ok()) return status;
   status = gemv(weights.wq_a, state.attention_input_, state.query_rank_,
                 launch.stream);
   if (!status.ok()) return status;
@@ -396,6 +407,10 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
   }
   auto error = cudaPeekAtLastError();
   if (error != cudaSuccess) return failure(error, "DeepSeek attention preparation");
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->projection_stop : nullptr,
+      raw_stream, "record DeepSeek projection stop");
+  if (!status.ok()) return status;
 
   status = deepseek_sparse_attention_decode(
       state.query_bf16_, state.kv_cache_, state.indices_,
@@ -405,11 +420,24 @@ Status deepseek_attention_decode(const DeepSeekAttentionLaunch& launch) noexcept
   attention_output_kernel<<<kHeads, kHeadDim, 0, raw_stream>>>(
       reinterpret_cast<const __nv_bfloat16*>(state.attention_bf16_),
       launch.cosine, launch.sine, state.attention_output_);
+  error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+    return failure(error, "DeepSeek attention output preparation");
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->sparse_attention_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek sparse attention stop");
+  if (!status.ok()) return status;
   status = gemv_grouped_inputs(weights.wo_a, state.attention_output_,
                                state.group_output_, 8U, launch.stream);
   if (!status.ok()) return status;
   status = gemv(weights.wo_b, state.group_output_, state.sublayer_,
                 launch.stream);
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->output_projection_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek attention output projection stop");
   if (!status.ok()) return status;
   return deepseek_hca_post(state.sublayer_, launch.streams, state.post_,
                            state.comb_, launch.updated_streams, kHidden,

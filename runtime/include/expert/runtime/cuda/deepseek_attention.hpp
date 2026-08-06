@@ -93,6 +93,12 @@ struct DeepSeekAttentionLaunch final {
   float epsilon{1e-6F};
   std::uint32_t sinkhorn_iterations{20U};
   void* stream{};
+  struct ProfileEvents {
+    void* hca_pre_norm_stop{};
+    void* projection_stop{};
+    void* sparse_attention_stop{};
+    void* output_projection_stop{};
+  } const* profile_events{};
 };
 
 // One-token attention sublayer: HCA pre, normalization, Q/KV + CSA/index,

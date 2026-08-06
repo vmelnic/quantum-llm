@@ -111,6 +111,14 @@ publishes `worker_gpu_attention_route_plan_ns` plus
 must stay off for production latency/throughput claims. `worker_execution`
 reports whether the mode is active.
 
+The same mode further attributes attention through
+`worker_gpu_attention_hca_pre_norm_ns`,
+`worker_gpu_attention_projection_ns`, `worker_gpu_sparse_attention_ns`,
+`worker_gpu_attention_output_projection_ns`, and
+`worker_gpu_attention_hca_post_ns`. Extra intermediate event records inflate
+the fine-grained run; use its proportions to select work, not as a production
+latency result.
+
 The scheduler/cache counters can overlap their parent worker counter and must
 not be summed with it as independent wall time. They exist to attribute the
 parent interval and compare deltas between two snapshots.

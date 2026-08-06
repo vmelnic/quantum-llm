@@ -80,6 +80,11 @@ struct DeepSeekDecodeTelemetry final {
   std::uint64_t gpu_directory_plan_ns{};
   std::uint64_t gpu_ffn_ns{};
   std::uint64_t gpu_directory_release_ns{};
+  std::uint64_t gpu_attention_hca_pre_norm_ns{};
+  std::uint64_t gpu_attention_projection_ns{};
+  std::uint64_t gpu_sparse_attention_ns{};
+  std::uint64_t gpu_attention_output_projection_ns{};
+  std::uint64_t gpu_attention_hca_post_ns{};
 };
 
 // Executes one layer per advance() call. A cache miss returns control without
@@ -164,6 +169,10 @@ class DeepSeekDecodeController final {
   void* ffn_start_event_{};
   void* ffn_stop_event_{};
   void* release_stop_event_{};
+  void* attention_hca_pre_norm_stop_event_{};
+  void* attention_projection_stop_event_{};
+  void* sparse_attention_stop_event_{};
+  void* attention_output_projection_stop_event_{};
   std::chrono::steady_clock::time_point plan_started_{};
   bool active_{};
   bool planning_{};

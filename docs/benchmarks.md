@@ -424,6 +424,23 @@ ms/step under profiling. Directory plan plus release is now only 6.6% of GPU
 time. The optimization order is therefore attention, FFN compute, router, then
 directory only if its share grows after the compute reductions.
 
+Four additional intermediate events split the attention interval. They raised
+the profiled attention total from roughly 30.33 to 34.49 ms/step, so the
+absolute values below include material event overhead and are diagnostic only:
+
+| attention interval | per model step | share of instrumented attention |
+| --- | ---: | ---: |
+| HCA pre + attention norm | 6.570 ms | 19.0% |
+| Q/KV + CSA/index projections | 14.193 ms | 41.1% |
+| sparse attention + output transform | 1.071 ms | 3.1% |
+| `wo_a`/`wo_b` output projections | 12.344 ms | 35.8% |
+| HCA post | 0.317 ms | 0.9% |
+
+Projection work represents about 77% of instrumented attention; sparse
+attention is not the short-context bottleneck. This selects projection
+execution/weight traffic and launch amortization ahead of sparse-attention
+rewrites. The worker still emitted token `19923` with zero route misses.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

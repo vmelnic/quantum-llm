@@ -238,6 +238,11 @@ struct WorkerTelemetry final {
   std::uint64_t gpu_directory_plan_ns{};
   std::uint64_t gpu_ffn_ns{};
   std::uint64_t gpu_directory_release_ns{};
+  std::uint64_t gpu_attention_hca_pre_norm_ns{};
+  std::uint64_t gpu_attention_projection_ns{};
+  std::uint64_t gpu_sparse_attention_ns{};
+  std::uint64_t gpu_attention_output_projection_ns{};
+  std::uint64_t gpu_attention_hca_post_ns{};
   std::uint64_t warm_start_candidates{};
   std::uint64_t warm_start_loaded{};
   std::uint64_t warm_start_bytes{};
@@ -485,6 +490,21 @@ class Model final {
       telemetry_.gpu_directory_release_ns +=
           current.gpu_directory_release_ns -
           request->controller_telemetry.gpu_directory_release_ns;
+      telemetry_.gpu_attention_hca_pre_norm_ns +=
+          current.gpu_attention_hca_pre_norm_ns -
+          request->controller_telemetry.gpu_attention_hca_pre_norm_ns;
+      telemetry_.gpu_attention_projection_ns +=
+          current.gpu_attention_projection_ns -
+          request->controller_telemetry.gpu_attention_projection_ns;
+      telemetry_.gpu_sparse_attention_ns +=
+          current.gpu_sparse_attention_ns -
+          request->controller_telemetry.gpu_sparse_attention_ns;
+      telemetry_.gpu_attention_output_projection_ns +=
+          current.gpu_attention_output_projection_ns -
+          request->controller_telemetry.gpu_attention_output_projection_ns;
+      telemetry_.gpu_attention_hca_post_ns +=
+          current.gpu_attention_hca_post_ns -
+          request->controller_telemetry.gpu_attention_hca_post_ns;
       request->controller_telemetry = current;
     }
     const auto output_started = std::chrono::steady_clock::now();
@@ -829,6 +849,16 @@ int worker_loop(Model& model) {
                   << worker.gpu_ffn_ns
                   << ",\"worker_gpu_directory_release_ns\":"
                   << worker.gpu_directory_release_ns
+                  << ",\"worker_gpu_attention_hca_pre_norm_ns\":"
+                  << worker.gpu_attention_hca_pre_norm_ns
+                  << ",\"worker_gpu_attention_projection_ns\":"
+                  << worker.gpu_attention_projection_ns
+                  << ",\"worker_gpu_sparse_attention_ns\":"
+                  << worker.gpu_sparse_attention_ns
+                  << ",\"worker_gpu_attention_output_projection_ns\":"
+                  << worker.gpu_attention_output_projection_ns
+                  << ",\"worker_gpu_attention_hca_post_ns\":"
+                  << worker.gpu_attention_hca_post_ns
                   << ",\"worker_warm_start_candidates\":"
                   << worker.warm_start_candidates
                   << ",\"worker_warm_start_loaded\":"
