@@ -154,6 +154,45 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             server.server_close()
             thread.join(timeout=2)
 
+    def test_tokenizer_dependency_failure_is_structured_http_error(self) -> None:
+        class Tokenizer:
+            def apply_chat_template(self, *_args: object,
+                                    **_kwargs: object) -> list[int]:
+                raise ImportError("jinja2 is missing")
+
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(
+            model="test-model", maximum_new_tokens=32, max_context=128,
+            maximum_body_bytes=1 << 20, api_key="",
+        )
+        app.tokenizer = Tokenizer()
+        app.checkpoint_chat_encoder = None
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.app = app
+        server.daemon_threads = True
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        connection = http.client.HTTPConnection(
+            "127.0.0.1", server.server_port, timeout=5
+        )
+        try:
+            connection.request("POST", "/v1/chat/completions", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_completion_tokens": 2,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(response.status, 500)
+            self.assertEqual(
+                payload["error"]["code"], "request_preprocessing_failed"
+            )
+        finally:
+            connection.close()
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
     def test_stop_filter_hides_cross_token_stop_sequence(self) -> None:
         stop_filter = StopFilter(("<END>",))
         self.assertEqual(stop_filter.feed("answer<EN"), "answer")

@@ -1146,6 +1146,15 @@ class Handler(BaseHTTPRequestHandler):
         except (ValueError, TypeError, json.JSONDecodeError) as error:
             self._error(HTTPStatus.BAD_REQUEST, str(error), code="invalid_json")
             return
+        except Exception as error:
+            log("request_preprocessing_failed", error=str(error), endpoint=endpoint)
+            self._error(
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+                "request preprocessing failed",
+                "server_error",
+                code="request_preprocessing_failed",
+            )
+            return
         if not self.app.acquire():
             self._error(HTTPStatus.SERVICE_UNAVAILABLE, "service overloaded or draining",
                         "server_error", code="overloaded")

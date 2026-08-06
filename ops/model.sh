@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <sync|start|stop|restart|status|chat|config> [deepseek|qwen|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -127,6 +127,7 @@ start_model() {
   if is_true "${sync_on_start}"; then
     sync_remote
   fi
+  run_remote Install-ServerEnvironment.ps1 -CheckOnly
   stop_all
 
   local build_id
@@ -174,6 +175,10 @@ start_model() {
 }
 
 case "${action}" in
+  install)
+    sync_remote
+    run_remote Install-ServerEnvironment.ps1
+    ;;
   sync)
     sync_remote
     ;;
