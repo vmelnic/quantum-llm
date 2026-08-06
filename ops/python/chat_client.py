@@ -83,6 +83,25 @@ def _get_json(base_url: str, path: str) -> dict[str, Any]:
         return json.load(response)
 
 
+def _resolve_model(base_url: str, configured: str) -> str:
+    payload = _get_json(base_url, "/v1/models")
+    deployed = [str(item.get("id")) for item in payload.get("data", [])
+                if isinstance(item, dict) and item.get("id")]
+    if len(deployed) != 1:
+        raise RuntimeError(
+            f"expected exactly one deployed model, found {len(deployed)}"
+        )
+    active = deployed[0]
+    if configured == "auto":
+        return active
+    if configured != active:
+        print(
+            f"Configured model {configured!r} is not active; using {active!r}.",
+            file=sys.stderr,
+        )
+    return active
+
+
 def _print_info(base_url: str) -> None:
     info = _get_json(base_url, "/model-info")
     placement = info.get("worker_placement", {})
@@ -192,7 +211,8 @@ def main() -> int:
             tunnel = _tunnel(args.ssh, args.local_port, args.remote_port)
             base_url = f"http://127.0.0.1:{args.local_port}"
         _ready(base_url, args.ready_timeout)
-        print(f"Connected to {args.model} at {base_url}")
+        model = _resolve_model(base_url, args.model)
+        print(f"Connected to {model} at {base_url}")
         print("Commands: /help, /info, /stats, /clear, quit, exit. Ctrl+C closes.")
         messages: list[dict[str, str]] = []
         last_stats: TurnStats | None = None
@@ -225,7 +245,7 @@ def main() -> int:
             messages.append({"role": "user", "content": prompt})
             try:
                 answer, last_stats = _chat(
-                    base_url, args.model, messages, args.max_tokens
+                    base_url, model, messages, args.max_tokens
                 )
             except RuntimeError as error:
                 messages.pop()

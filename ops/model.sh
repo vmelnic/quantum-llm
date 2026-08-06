@@ -40,6 +40,8 @@ require_uint() {
 }
 
 action="${1:-status}"
+selection_explicit=0
+if (( $# >= 2 )); then selection_explicit=1; fi
 selection="${2:-${CHAT_MODEL:-deepseek-v4-flash}}"
 case "${selection}" in
   deepseek|deepseek-v4-flash)
@@ -191,7 +193,11 @@ case "${action}" in
     ;;
   chat)
     [[ "${model_alias}" != all ]] || die "chat requires deepseek or qwen"
-    exec "${script_dir}/chat.sh" --model "${model_id}"
+    if (( selection_explicit )); then
+      exec "${script_dir}/chat.sh" --model "${model_id}"
+    else
+      exec "${script_dir}/chat.sh" --model auto
+    fi
     ;;
   config)
     print_config

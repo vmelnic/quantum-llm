@@ -11,6 +11,12 @@ $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
 $ready = $false
 $lastError = ""
 $modelInfo = $null
+$expectedTaskName = if ($ExpectedModel -eq "deepseek-v4-flash") {
+    "QuantumLLM-DeepSeekV4Flash"
+} elseif ($ExpectedModel -eq "qwen3-next-80b-a3b-expert-pack-int8") {
+    "QuantumLLM-P6ExpertServer"
+} else { "" }
+$waitStarted = [DateTime]::Now
 do {
     try {
         $readyResponse = Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/ready" `
@@ -25,6 +31,20 @@ do {
     } catch {
         $lastError = $_.Exception.Message
     }
+    if (-not $ready -and $expectedTaskName -and
+        [DateTime]::Now -ge $waitStarted.AddSeconds(1)) {
+        $expectedTask = Get-ScheduledTask -TaskName $expectedTaskName `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $expectedTask -and
+            [string]$expectedTask.State -ne "Running") {
+            $expectedInfo = Get-ScheduledTaskInfo -TaskName $expectedTaskName
+            if ($expectedInfo.LastRunTime -ge $waitStarted.AddMinutes(-1) -and
+                $expectedInfo.LastTaskResult -ne 0) {
+                $lastError = "scheduled task $expectedTaskName exited with result $($expectedInfo.LastTaskResult)"
+                break
+            }
+        }
+    }
     if ([DateTime]::UtcNow -ge $deadline) { break }
     Start-Sleep -Milliseconds 500
 } while ($true)
@@ -35,7 +55,13 @@ $tasks = foreach ($name in @(
 )) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if ($null -ne $task) {
-        [PSCustomObject]@{ name = $name; state = [string]$task.State }
+        $taskInfo = Get-ScheduledTaskInfo -TaskName $name
+        [PSCustomObject]@{
+            name = $name
+            state = [string]$task.State
+            last_run = $taskInfo.LastRunTime
+            last_result = $taskInfo.LastTaskResult
+        }
     }
 }
 

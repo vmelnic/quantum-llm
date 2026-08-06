@@ -4,6 +4,7 @@ import contextlib
 import io
 import sys
 import socket
+import unittest.mock
 import threading
 import types
 import unittest
@@ -20,7 +21,7 @@ sys.modules.setdefault(
 
 import ops.python.expert_server as expert_server
 from ops.python.expert_server import (
-    Application, ContinuousDecodeBatcher, Handler, RequestError, StopFilter,
+    Application, ContinuousDecodeBatcher, CudaWorker, Handler, RequestError, StopFilter,
     _text_content,
 )
 
@@ -40,6 +41,31 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_protocol4_worker_infers_legacy_prefetch_state(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 4, "capacity": 4,
+            "prefill_mode": "causal_chunked", "prefill_chunk_tokens": 4,
+            "kv_dtype": "fp16", "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 256, "kv_page_bytes": 6 << 20,
+            "kv_page_capacity": 341, "placement_profile": "balanced",
+            "ram_cache_bytes": 48 << 30, "vram_cache_bytes": 18 << 30,
+            "placement_prefetch_enabled": True,
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            worker = CudaWorker(
+                expert_server.Path("worker.exe"), expert_server.Path("pack"),
+                65536, 1, 4, 48, 18, 2048, 256, "balanced", False,
+                False,
+            )
+        self.assertTrue(worker.placement_prefetch_enabled)
+        self.assertEqual(worker.placement_prefetch_state, "ready")
+
     def test_service_log_does_not_duplicate_to_unconsumed_stderr(self) -> None:
         previous = expert_server.LOG_FILE
         service_log = io.StringIO()

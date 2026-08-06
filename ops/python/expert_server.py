@@ -214,9 +214,15 @@ class CudaWorker:
         self.placement_prefetch_enabled = bool(
             response.get("placement_prefetch_enabled", False)
         )
-        self.placement_prefetch_state = str(
-            response.get("placement_prefetch_state", "disabled")
-        )
+        prefetch_state = response.get("placement_prefetch_state")
+        # Protocol-4 Qwen workers published the effective boolean before the
+        # explicit observing/ready state was added. Preserve that ABI while
+        # newer workers report the richer state directly.
+        if prefetch_state is None:
+            prefetch_state = (
+                "ready" if self.placement_prefetch_enabled else "disabled"
+            )
+        self.placement_prefetch_state = str(prefetch_state)
         self.placement_minimum_observations = int(
             response.get("placement_minimum_observations", 0)
         )
@@ -1359,7 +1365,11 @@ def main() -> int:
     if args.log_file:
         args.log_file.parent.mkdir(parents=True, exist_ok=True)
         LOG_FILE = args.log_file.open("a", encoding="utf-8")
-    app = Application(args)
+    try:
+        app = Application(args)
+    except Exception as error:
+        log("service_start_failed", error=str(error))
+        raise
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     server.app = app  # type: ignore[attr-defined]
     server.daemon_threads = True

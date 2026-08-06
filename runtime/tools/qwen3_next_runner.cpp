@@ -1538,6 +1538,9 @@ int worker_loop(Qwen3NextModel& model) {
             << model.vram_cache_bytes()
             << ",\"placement_prefetch_enabled\":"
             << (model.placement_prefetch_enabled() ? "true" : "false")
+            << ",\"placement_prefetch_state\":\""
+            << (model.placement_prefetch_enabled() ? "ready" : "disabled")
+            << "\""
             << ",\"placement_minimum_observations\":"
             << model.placement_minimum_observations() << "}\n" << std::flush;
   std::string line;
@@ -1891,6 +1894,9 @@ int main(int argc, char** argv) {
                 << ",\"vram_cache_bytes\":" << model.vram_cache_bytes()
                 << ",\"placement_prefetch_enabled\":"
                 << (model.placement_prefetch_enabled() ? "true" : "false")
+                << ",\"placement_prefetch_state\":\""
+                << (model.placement_prefetch_enabled() ? "ready" : "disabled")
+                << "\""
                 << ",\"placement_minimum_observations\":"
                 << model.placement_minimum_observations()
                 << ",\"warmup_rounds\":" << warmup_rounds
@@ -2077,6 +2083,9 @@ int main(int argc, char** argv) {
               << ",\"vram_cache_bytes\":" << model.vram_cache_bytes()
               << ",\"placement_prefetch_enabled\":"
               << (model.placement_prefetch_enabled() ? "true" : "false")
+              << ",\"placement_prefetch_state\":\""
+              << (model.placement_prefetch_enabled() ? "ready" : "disabled")
+              << "\""
               << ",\"placement_minimum_observations\":"
               << model.placement_minimum_observations()
               << ",\"model_load_seconds\":" << load_seconds
