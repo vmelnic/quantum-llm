@@ -191,6 +191,11 @@ single-request latency and aggregate throughput.
   took 407.218 ms/5 model steps versus 366.419 ms for the original. Both
   emitted token `19923`; the extra live accumulator/register pressure costs
   more than the saved activation load on SM86 batch-one decode.
+- [x] Evaluate branchless nibble-magnitude extraction plus one 16-bit packed
+  weight load. Reject it: the candidate took 372.857 ms/5 model steps and the
+  original took 341.462 ms on the immediately following shared census. Both
+  emitted token `19923`; NVCC's original byte-load/select lowering is better
+  on this SM86 path. The candidate was removed.
 - [ ] Fuse compatible RMSNorm, quantization, bias/gating, RoPE, top-k, and
   aggregation operations to reduce launches and global-memory traffic.
 - [ ] Capture stable resident decode segments in CUDA graphs after dynamic

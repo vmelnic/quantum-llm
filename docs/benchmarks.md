@@ -467,6 +467,13 @@ SM86, so the fused implementation was removed. Future FP4 tuning should keep a
 single dot accumulator live or prove a better register/occupancy tradeoff with
 hardware counters.
 
+A second bit-exact candidate replaced FP4's select-based magnitude decode with
+a packed-nibble shift lookup and loaded each four-code group as one 16-bit
+word. It took 372.857 ms/5 model steps; the restored original took 341.462 ms
+on the immediately following shared census. Both emitted token `19923`. The
+candidate was removed: source-level instruction-count intuition is not a
+substitute for the compiler's SM86 lowering on this kernel.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,
