@@ -391,6 +391,31 @@ concurrent lifecycle correctness, not aggregate throughput: the setup still
 prefilled the two prompts sequentially and the extra route exceeded the learned
 warm set.
 
+An opt-in CUDA-event boundary profile then measured the accepted five-step,
+215-layer zero-miss route without Nsight kernel-trace inflation. It emitted
+token `19923` and reported:
+
+| device interval | 5 steps | per model step | share of measured GPU phases |
+| --- | ---: | ---: | ---: |
+| attention + route + directory plan | 200.996 ms | 40.199 ms | 62.6% |
+| FFN + asynchronous release | 119.975 ms | 23.995 ms | 37.4% |
+| total measured GPU phases | 320.971 ms | 64.194 ms | 100% |
+
+Worker model-step wall time was 345.389 ms, or 69.078 ms/step, under the
+profiling events. The remaining ~4.88 ms/step covers embedding, output head,
+host scheduling, and event instrumentation. This proves the warm route is now
+GPU-compute dominated; storage, H2D, CPU experts, and directory misses were
+zero on the measured path. Reaching 33.3 ms needs material reductions in both
+major device phases, not another host-directory micro-optimization.
+
+A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
+projection. The repeated real HCA slice improved from 0.077568 to 0.062925
+ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,
+the full-model route incurred 15 acquisitions against the accepted census:
+the changed FP32 reduction order altered later expert IDs even though the final
+token remained `19923`. The kernel was removed. As with dense GEMV, local
+numerical tolerance and token equality are insufficient routing gates.
+
 An attempted all-device continuation placed a `missing_count` guard in every
 routed, aggregate, shared, and HCA CUDA kernel so a hot plan could execute FFN
 without returning to the host. Token `19923` and the zero-miss contract were

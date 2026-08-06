@@ -203,6 +203,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             worker_ram_cache_gib=48, worker_vram_cache_gib=18,
             placement_profile="capacity", worker_kv_cache_mib=2048,
             worker_kv_page_tokens=256, microbatch_window_ms=2.0,
+            profile_gpu_phases=False,
             latency_window=4096, queue_timeout=1.0,
             generation_timeout=120.0,
         )
@@ -217,6 +218,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             prefill_chunk_tokens=1, kv_dtype="bf16",
             request_stream_mode="per_request_nonblocking",
             rope_mode="resident_table",
+            gpu_phase_timing=False,
             kv_allocation="preallocated", kv_page_tokens=256,
             kv_page_bytes=1024, kv_page_capacity=8192,
             placement_profile="capacity", ram_cache_bytes=48 << 30,
@@ -245,6 +247,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(info["worker_execution"], {
             "request_stream_mode": "per_request_nonblocking",
             "rope_mode": "resident_table",
+            "gpu_phase_timing": False,
         })
         self.assertEqual(info["worker_kv"]["dtype"], "bf16")
         self.assertEqual(info["worker_kv"]["allocation"], "preallocated")

@@ -130,12 +130,14 @@ class CudaWorker:
                  startup_timeout: float, requested_capacity: int,
                  ram_cache_gib: int, vram_cache_gib: int,
                  kv_cache_mib: int, kv_page_tokens: int,
-                 placement_profile: str) -> None:
+                 placement_profile: str, profile_gpu_phases: bool) -> None:
         command = [
             str(executable), str(container), "--worker", str(max_context),
             str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
             str(kv_cache_mib), str(kv_page_tokens), placement_profile,
         ]
+        if profile_gpu_phases:
+            command.append("--profile-gpu-phases")
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -168,6 +170,7 @@ class CudaWorker:
         self.request_stream_mode = str(
             response.get("request_stream_mode", "default")
         )
+        self.gpu_phase_timing = bool(response.get("gpu_phase_timing", False))
         self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
@@ -404,7 +407,8 @@ class Application:
                                  args.worker_vram_cache_gib,
                                  args.worker_kv_cache_mib,
                                  args.worker_kv_page_tokens,
-                                 args.placement_profile)
+                                 args.placement_profile,
+                                 args.profile_gpu_phases)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
@@ -795,6 +799,7 @@ class Application:
             "worker_execution": {
                 "request_stream_mode": self.worker.request_stream_mode,
                 "rope_mode": self.worker.rope_mode,
+                "gpu_phase_timing": self.worker.gpu_phase_timing,
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,
@@ -1249,6 +1254,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
+    parser.add_argument("--profile-gpu-phases", action="store_true")
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)

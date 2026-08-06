@@ -16,6 +16,7 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
+    [bool]$ProfileGpuPhases = $false,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -71,6 +72,7 @@ $server = Join-Path $script:RepoRoot "ops\python\expert_server.py"
 if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $worker" }
 if (-not (Test-Path $containerPath -PathType Container)) { throw "Container missing: $containerPath" }
 if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer missing: $tokenizerPath" }
+$profileArguments = if ($ProfileGpuPhases) { @("--profile-gpu-phases") } else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -88,6 +90,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --placement-profile $PlacementProfile `
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
+    @profileArguments `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `

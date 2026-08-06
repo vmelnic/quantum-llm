@@ -32,6 +32,9 @@ one subsystem.
   for dense attention/router, routed CUDA, shared FFN, and aggregation. The
   current `directory_plan_ns` and `directory_release_ns` deliberately include
   those kernels and therefore cannot be added to future device timings.
+- [x] Add an opt-in first GPU boundary split for `attention+route+plan` and
+  `FFN+release`. It synchronizes extra CUDA events and is profiling-only; the
+  two counters are not emitted by default production runs.
 - [x] Capture one external Nsight Systems warm-route kernel census and one
   Nsight Compute `int8_gemv_vector` launch. Keep profiler overhead and startup
   conversion kernels out of production throughput claims.
@@ -154,6 +157,11 @@ single-request latency and aggregate throughput.
 - [ ] Design the dense replacement around routing stability: either preserve
   the accepted accumulation order or qualify route divergence and output
   quality explicitly. Token equality on one prompt is insufficient.
+- [x] Evaluate a block-per-row F32 GEMV for the underfilled 24×16384 HCA
+  projection. Reject it: the isolated HCA site improved 0.07757→0.06292 ms and
+  passed its local oracle, but its different reduction order changed later
+  expert routing (15 cold acquisitions on the accepted census). The kernel was
+  removed before commit.
 - [x] Qualify naive smaller dense weight ABIs offline before writing another
   CUDA executor. Symmetric 4/5/6-bit and FP4 E2M1 with FP16 block scales were
   screened across all five distinct attention geometries. Best block-32

@@ -73,6 +73,8 @@ struct DeepSeekDecodeTelemetry final {
   std::uint64_t directory_plan_ns{};
   std::uint64_t ffn_submit_ns{};
   std::uint64_t directory_release_ns{};
+  std::uint64_t gpu_attention_route_plan_ns{};
+  std::uint64_t gpu_ffn_release_ns{};
 };
 
 // Executes one layer per advance() call. A cache miss returns control without
@@ -93,6 +95,10 @@ class DeepSeekDecodeController final {
   [[nodiscard]] Status configure_hybrid(
       std::shared_ptr<cpu::DeepSeekPackedExecutor> executor,
       std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept;
+  // Profiling mode records and synchronizes CUDA events at the two existing
+  // per-layer dependency boundaries. It is opt-in because the extra events
+  // intentionally perturb production scheduling.
+  [[nodiscard]] Status enable_gpu_phase_timing() noexcept;
   [[nodiscard]] bool hybrid_configured() const noexcept {
     return cpu_executor_ != nullptr && hybrid_workspace_ != nullptr;
   }
@@ -146,6 +152,10 @@ class DeepSeekDecodeController final {
   std::shared_ptr<DeepSeekFfnHybridWorkspace> hybrid_workspace_;
   std::vector<DeepSeekCpuExpertPlacement> cpu_placements_;
   DeepSeekDecodeTelemetry telemetry_;
+  void* attention_start_event_{};
+  void* attention_stop_event_{};
+  void* ffn_start_event_{};
+  void* ffn_stop_event_{};
   std::chrono::steady_clock::time_point plan_started_{};
   bool active_{};
   bool planning_{};

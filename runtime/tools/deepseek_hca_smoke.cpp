@@ -206,7 +206,7 @@ int main(int argc, char** argv) {
     cudaEvent_t start{}, stop{};
     check(cudaEventCreate(&start), "create HCA start event");
     check(cudaEventCreate(&stop), "create HCA stop event");
-    check(cudaEventRecord(start), "record HCA start");
+    constexpr std::uint32_t kBenchmarkIterations = 100U;
     auto status = er::cuda::deepseek_hca_pre(
         *admitted.parameters, streams, collapsed, pre, post, comb,
         {normalized, mixes}, 1e-6F, 20U, nullptr);
@@ -214,10 +214,23 @@ int main(int argc, char** argv) {
     status = er::cuda::deepseek_hca_post(sublayer, streams, post, comb, updated,
                                          kHidden, nullptr);
     require(status.ok(), std::string(status.message()));
+    check(cudaDeviceSynchronize(), "warm HCA path");
+    check(cudaEventRecord(start), "record HCA start");
+    for (std::uint32_t iteration = 0U; iteration < kBenchmarkIterations;
+         ++iteration) {
+      status = er::cuda::deepseek_hca_pre(
+          *admitted.parameters, streams, collapsed, pre, post, comb,
+          {normalized, mixes}, 1e-6F, 20U, nullptr);
+      require(status.ok(), std::string(status.message()));
+      status = er::cuda::deepseek_hca_post(
+          sublayer, streams, post, comb, updated, kHidden, nullptr);
+      require(status.ok(), std::string(status.message()));
+    }
     check(cudaEventRecord(stop), "record HCA stop");
     check(cudaEventSynchronize(stop), "synchronize HCA");
     float execution_ms = 0.0F;
     check(cudaEventElapsedTime(&execution_ms, start, stop), "measure HCA");
+    execution_ms /= static_cast<float>(kBenchmarkIterations);
     std::vector<float> actual_pre(4), actual_post(4), actual_comb(16);
     std::vector<float> actual_collapsed(kHidden), actual_updated(kStreams * kHidden);
     check(cudaMemcpy(actual_pre.data(), pre, 4U * sizeof(float), cudaMemcpyDeviceToHost),
@@ -247,6 +260,7 @@ int main(int argc, char** argv) {
               << ",\"source_bytes\":" << kSourceBytes
               << ",\"device_bytes\":" << admitted.parameters->bytes()
               << ",\"admission_ms\":" << admission_ms
+              << ",\"benchmark_iterations\":" << kBenchmarkIterations
               << ",\"execution_ms\":" << execution_ms
               << ",\"control_rmse\":" << control_error.rmse()
               << ",\"control_max_abs_error\":" << control_error.maximum

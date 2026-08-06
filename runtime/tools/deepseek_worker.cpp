@@ -231,6 +231,8 @@ struct WorkerTelemetry final {
   std::uint64_t directory_plan_ns{};
   std::uint64_t ffn_submit_ns{};
   std::uint64_t directory_release_ns{};
+  std::uint64_t gpu_attention_route_plan_ns{};
+  std::uint64_t gpu_ffn_release_ns{};
   std::uint64_t warm_start_candidates{};
   std::uint64_t warm_start_loaded{};
   std::uint64_t warm_start_bytes{};
@@ -242,11 +244,12 @@ class Model final {
   Model(const std::filesystem::path& root, std::uint32_t max_context,
         std::uint64_t ram_bytes, std::uint64_t vram_bytes,
         std::uint32_t capacity, std::uint64_t kv_cache_bytes,
-        std::uint32_t kv_page_tokens, std::string placement)
+        std::uint32_t kv_page_tokens, std::string placement,
+        bool gpu_phase_timing)
       : bundle_(load_bundle(root)), max_context_(max_context),
         capacity_(capacity), ram_bytes_(ram_bytes), vram_bytes_(vram_bytes),
         kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens),
-        placement_(std::move(placement)) {
+        placement_(std::move(placement)), gpu_phase_timing_(gpu_phase_timing) {
     require(max_context_ >= 2U && capacity_ != 0U && ram_bytes_ != 0U &&
                 vram_bytes_ != 0U && kv_cache_bytes_ != 0U &&
                 kv_page_tokens_ != 0U,
@@ -381,6 +384,10 @@ class Model final {
     const auto configured = request->controller->configure_hybrid(
         cpu_, std::move(workspace.workspace));
     require(configured.ok(), configured.message());
+    if (gpu_phase_timing_) {
+      const auto timing = request->controller->enable_gpu_phase_timing();
+      require(timing.ok(), timing.message());
+    }
     return request;
   }
 
@@ -454,6 +461,12 @@ class Model final {
       telemetry_.directory_release_ns +=
           current.directory_release_ns -
           request->controller_telemetry.directory_release_ns;
+      telemetry_.gpu_attention_route_plan_ns +=
+          current.gpu_attention_route_plan_ns -
+          request->controller_telemetry.gpu_attention_route_plan_ns;
+      telemetry_.gpu_ffn_release_ns +=
+          current.gpu_ffn_release_ns -
+          request->controller_telemetry.gpu_ffn_release_ns;
       request->controller_telemetry = current;
     }
     const auto output_started = std::chrono::steady_clock::now();
@@ -522,6 +535,7 @@ class Model final {
   bool prefetch_enabled() const noexcept {
     return telemetry_.warm_start_loaded != 0U;
   }
+  bool gpu_phase_timing() const noexcept { return gpu_phase_timing_; }
 
  private:
   static constexpr std::uint64_t rope_row_values = 8ULL * 32U;
@@ -604,6 +618,7 @@ class Model final {
   std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{};
   std::uint32_t kv_page_tokens_{};
   std::string placement_;
+  bool gpu_phase_timing_{};
   er::DeepSeekModelArtifacts artifacts_;
   er::DeepSeekExpertCatalog catalog_;
   std::shared_ptr<er::WindowsIocpStorage> iocp_;
@@ -660,7 +675,9 @@ int worker_loop(Model& model) {
             << ",\"placement_prefetch_state\":\""
             << model.prefetch_state() << '\"'
             << ",\"placement_minimum_observations\":"
-            << (model.placement() == "latency" ? 1 : 2) << "}\n"
+            << (model.placement() == "latency" ? 1 : 2)
+            << ",\"gpu_phase_timing\":"
+            << (model.gpu_phase_timing() ? "true" : "false") << "}\n"
             << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
@@ -780,6 +797,10 @@ int worker_loop(Model& model) {
                   << worker.ffn_submit_ns
                   << ",\"worker_directory_release_ns\":"
                   << worker.directory_release_ns
+                  << ",\"worker_gpu_attention_route_plan_ns\":"
+                  << worker.gpu_attention_route_plan_ns
+                  << ",\"worker_gpu_ffn_release_ns\":"
+                  << worker.gpu_ffn_release_ns
                   << ",\"worker_warm_start_candidates\":"
                   << worker.warm_start_candidates
                   << ",\"worker_warm_start_loaded\":"
@@ -903,10 +924,13 @@ int worker_loop(Model& model) {
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 10 || std::string_view(argv[2]) != "--worker") {
+    if ((argc != 10 && argc != 11) ||
+        std::string_view(argv[2]) != "--worker" ||
+        (argc == 11 && std::string_view(argv[10]) != "--profile-gpu-phases")) {
       std::cerr << "usage: expert-deepseek-worker <bundle> --worker "
                    "<max-context> <ram-gib> <vram-gib> <capacity> "
-                   "<kv-cache-mib> <kv-page-tokens> <placement-profile>\n";
+                   "<kv-cache-mib> <kv-page-tokens> <placement-profile> "
+                   "[--profile-gpu-phases]\n";
       return 64;
     }
     const auto max_context = static_cast<std::uint32_t>(std::stoul(argv[3]));
@@ -921,7 +945,8 @@ int main(int argc, char** argv) {
                 placement == "capacity",
             "invalid placement profile");
     Model model(argv[1], max_context, ram_gib << 30U, vram_gib << 30U,
-                capacity, kv_cache_mib << 20U, kv_page_tokens, placement);
+                capacity, kv_cache_mib << 20U, kv_page_tokens, placement,
+                argc == 11);
     return worker_loop(model);
   } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

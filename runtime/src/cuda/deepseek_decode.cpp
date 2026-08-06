@@ -31,6 +31,28 @@ DeepSeekDecodeController::DeepSeekDecodeController(
 
 DeepSeekDecodeController::~DeepSeekDecodeController() {
   static_cast<void>(cancel());
+  for (auto* event : {attention_start_event_, attention_stop_event_,
+                      ffn_start_event_, ffn_stop_event_})
+    if (event)
+      static_cast<void>(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
+}
+
+Status DeepSeekDecodeController::enable_gpu_phase_timing() noexcept {
+  if (active_ || attention_start_event_ || attention_stop_event_ ||
+      ffn_start_event_ || ffn_stop_event_)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek GPU phase timing configuration"};
+  void** destinations[] = {&attention_start_event_, &attention_stop_event_,
+                           &ffn_start_event_, &ffn_stop_event_};
+  for (auto** destination : destinations) {
+    cudaEvent_t event{};
+    const auto status = cuda_status(
+        cudaEventCreateWithFlags(&event, cudaEventDefault),
+        "create DeepSeek phase event");
+    if (!status.ok()) return status;
+    *destination = event;
+  }
+  return Status::success();
 }
 
 Status DeepSeekDecodeController::configure_hybrid(
@@ -145,6 +167,26 @@ DeepSeekDecodeController::poll_plan() noexcept {
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - plan_started_)
           .count());
+  if (attention_start_event_) {
+    auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(attention_stop_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek attention phase stop");
+    if (!status.ok()) return fail(status);
+    status = cuda_status(
+        cudaEventSynchronize(static_cast<cudaEvent_t>(attention_stop_event_)),
+        "synchronize DeepSeek attention phase");
+    if (!status.ok()) return fail(status);
+    float milliseconds = 0.0F;
+    status = cuda_status(
+        cudaEventElapsedTime(
+            &milliseconds, static_cast<cudaEvent_t>(attention_start_event_),
+            static_cast<cudaEvent_t>(attention_stop_event_)),
+        "measure DeepSeek attention phase");
+    if (!status.ok()) return fail(status);
+    telemetry_.gpu_attention_route_plan_ns += static_cast<std::uint64_t>(
+        static_cast<double>(milliseconds) * 1'000'000.0);
+  }
   if (!polled.plan.status.ok()) return fail(std::move(polled.plan.status));
   return execute_plan(std::move(polled.plan));
 }
@@ -200,6 +242,13 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     return fail({ErrorCode::internal,
                  "DeepSeek directory returned no execution pin"});
 
+  if (ffn_start_event_) {
+    const auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(ffn_start_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek FFN phase start");
+    if (!status.ok()) return fail(status);
+  }
   const auto ffn_started = std::chrono::steady_clock::now();
   const auto execute = cpu_groups.empty()
       ? deepseek_ffn_execute(
@@ -224,6 +273,26 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
           .count());
   pin_id_ = 0U;
   if (!release.ok()) return fail(release);
+  if (ffn_start_event_) {
+    auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(ffn_stop_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek FFN phase stop");
+    if (!status.ok()) return fail(status);
+    status = cuda_status(
+        cudaEventSynchronize(static_cast<cudaEvent_t>(ffn_stop_event_)),
+        "synchronize DeepSeek FFN phase");
+    if (!status.ok()) return fail(status);
+    float milliseconds = 0.0F;
+    status = cuda_status(
+        cudaEventElapsedTime(&milliseconds,
+                             static_cast<cudaEvent_t>(ffn_start_event_),
+                             static_cast<cudaEvent_t>(ffn_stop_event_)),
+        "measure DeepSeek FFN phase");
+    if (!status.ok()) return fail(status);
+    telemetry_.gpu_ffn_release_ns += static_cast<std::uint64_t>(
+        static_cast<double>(milliseconds) * 1'000'000.0);
+  }
 
   const auto completed_layer = current_layer_++;
   waiting_for_experts_ = false;
@@ -274,6 +343,13 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
                  "DeepSeek decode is missing group-start RoPE"});
   }
   const auto attention_route_started = std::chrono::steady_clock::now();
+  if (attention_start_event_) {
+    const auto status = cuda_status(
+        cudaEventRecord(static_cast<cudaEvent_t>(attention_start_event_),
+                        static_cast<cudaStream_t>(stream_)),
+        "record DeepSeek attention phase start");
+    if (!status.ok()) return fail(status);
+  }
   const auto attention = deepseek_attention_decode(
       {view.attention_weights, view.attention_state, request_->streams_a_,
        request_->streams_b_,

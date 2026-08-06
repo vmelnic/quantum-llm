@@ -15,6 +15,7 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
+    [bool]$ProfileGpuPhases = $false,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -58,6 +59,7 @@ $arguments = @{
     PlacementProfile = $PlacementProfile
     WorkerKvCacheMiB = $WorkerKvCacheMiB
     WorkerKvPageTokens = $WorkerKvPageTokens
+    ProfileGpuPhases = $ProfileGpuPhases
     MicrobatchWindowMs = $MicrobatchWindowMs
     LatencyWindow = $LatencyWindow
     QueueTimeoutSeconds = $QueueTimeoutSeconds
