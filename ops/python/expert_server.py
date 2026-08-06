@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import importlib.util
 import json
 import os
 import queue
@@ -22,13 +23,26 @@ from dataclasses import dataclass
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 from urllib.parse import unquote, urlsplit
 
 from transformers import AutoTokenizer
 
 
 LOG_FILE: Any = None
+
+
+def _load_deepseek_chat_encoder(snapshot: Path) -> Callable[..., str]:
+    path = snapshot / "encoding" / "encoding_dsv4.py"
+    spec = importlib.util.spec_from_file_location("encoding_dsv4", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load official DeepSeek encoder: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    encoder = getattr(module, "encode_messages", None)
+    if not callable(encoder):
+        raise RuntimeError(f"official DeepSeek encoder has no encode_messages: {path}")
+    return encoder
 
 
 def log(event: str, **fields: Any) -> None:
@@ -436,6 +450,11 @@ class Application:
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
         )
+        self.checkpoint_chat_encoder: Callable[..., str] | None = None
+        if args.model == "deepseek-v4-flash" and not self.tokenizer.chat_template:
+            self.checkpoint_chat_encoder = _load_deepseek_chat_encoder(
+                args.tokenizer
+            )
         eos = self.tokenizer.eos_token_id
         if eos is None:
             self.eos_token_ids: set[int] = set()
@@ -580,6 +599,12 @@ class Application:
         return "\n".join(lines) + "\n"
 
     def _chat_prompt_ids(self, messages: list[dict[str, Any]]) -> list[int]:
+        encoder = getattr(self, "checkpoint_chat_encoder", None)
+        if encoder is not None:
+            prompt = encoder(messages, thinking_mode="chat")
+            return [int(token) for token in self.tokenizer.encode(
+                prompt, add_special_tokens=False
+            )]
         ids = self.tokenizer.apply_chat_template(
             messages, tokenize=True, add_generation_prompt=True
         )

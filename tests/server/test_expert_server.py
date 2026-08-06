@@ -169,6 +169,37 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(raised.exception.param, "max_output_tokens")
         self.assertIn("exceeds context capacity", str(raised.exception))
 
+    def test_deepseek_checkpoint_encoder_fills_missing_chat_template(self) -> None:
+        class Tokenizer:
+            def encode(self, prompt: str, **kwargs: object) -> list[int]:
+                self.prompt = prompt
+                self.kwargs = kwargs
+                return [0, 128803, 23166, 128804, 128822]
+
+            def apply_chat_template(self, *_args: object,
+                                    **_kwargs: object) -> list[int]:
+                raise AssertionError("generic template must not be used")
+
+        app = Application.__new__(Application)
+        app.tokenizer = Tokenizer()
+        seen: dict[str, object] = {}
+
+        def encode_messages(messages: object, **kwargs: object) -> str:
+            seen["messages"] = messages
+            seen["kwargs"] = kwargs
+            return "official prompt"
+
+        app.checkpoint_chat_encoder = encode_messages
+        messages = [{"role": "user", "content": "Hi"}]
+        self.assertEqual(app._chat_prompt_ids(messages),
+                         [0, 128803, 23166, 128804, 128822])
+        self.assertEqual(seen, {
+            "messages": messages, "kwargs": {"thinking_mode": "chat"},
+        })
+        self.assertEqual(app.tokenizer.prompt, "official prompt")
+        self.assertEqual(app.tokenizer.kwargs,
+                         {"add_special_tokens": False})
+
     def test_stream_disconnect_is_visible_before_next_decode(self) -> None:
         server_side, client_side = socket.socketpair()
         try:

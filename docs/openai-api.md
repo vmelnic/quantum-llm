@@ -54,6 +54,12 @@ required.
 The normal OpenAI `base_url` override works; any non-empty placeholder key is
 enough for the loopback deployment.
 
+DeepSeek-V4-Flash does not publish a Transformers `chat_template`. For that
+model the service loads the pinned checkpoint's official
+`encoding/encoding_dsv4.py` and uses its `encode_messages(...,
+thinking_mode="chat")` contract for Chat Completions and Responses. Plain
+Completions continues to tokenize the supplied prompt without a chat wrapper.
+
 ```python
 from openai import OpenAI
 
