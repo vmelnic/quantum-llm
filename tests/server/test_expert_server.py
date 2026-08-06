@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import socket
 import threading
@@ -16,6 +18,7 @@ sys.modules.setdefault(
     "transformers", types.SimpleNamespace(AutoTokenizer=object)
 )
 
+import ops.python.expert_server as expert_server
 from ops.python.expert_server import (
     Application, ContinuousDecodeBatcher, Handler, RequestError, StopFilter,
     _text_content,
@@ -37,6 +40,19 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_service_log_does_not_duplicate_to_unconsumed_stderr(self) -> None:
+        previous = expert_server.LOG_FILE
+        service_log = io.StringIO()
+        stderr = io.StringIO()
+        try:
+            expert_server.LOG_FILE = service_log
+            with contextlib.redirect_stderr(stderr):
+                expert_server.log("test", value=1)
+        finally:
+            expert_server.LOG_FILE = previous
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertIn('"event":"test"', service_log.getvalue())
+
     def test_http_openai_response_and_stream_contracts(self) -> None:
         class Tokenizer:
             def apply_chat_template(self, _messages: object, **_kwargs: object) -> list[int]:

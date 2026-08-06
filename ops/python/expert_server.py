@@ -47,9 +47,12 @@ def _load_deepseek_chat_encoder(snapshot: Path) -> Callable[..., str]:
 
 def log(event: str, **fields: Any) -> None:
     line = json.dumps({"event": event, "time": time.time(), **fields}, separators=(",", ":"))
-    print(line, file=sys.stderr, flush=True)
-    if LOG_FILE is not None:
-        print(line, file=LOG_FILE, flush=True)
+    # A scheduled task has no consumer for inherited stderr. Duplicating every
+    # file log there eventually fills the Windows pipe and blocks an HTTP
+    # handler while it still owns the GIL. Foreground mode keeps stderr; service
+    # mode writes only to its explicit durable log.
+    print(line, file=LOG_FILE if LOG_FILE is not None else sys.stderr,
+          flush=True)
 
 
 class WorkerError(RuntimeError):

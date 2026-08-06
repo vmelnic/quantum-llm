@@ -73,6 +73,10 @@ artifacts/p6-text-probe-latest.json
 
 Ship logs and metrics to external storage for a real pilot. Local JSONL has no
 rotation or retention manager. Never log API keys or prompt content.
+When a log file is configured, the Python front-end writes only to that file;
+duplicating service logs to an unconsumed Task Scheduler stderr pipe can apply
+backpressure and block request handling. Foreground launches without a log file
+continue to use stderr.
 
 Measure a real tokenizer/chat-template path separately from the synthetic
 token-ID correctness gate:
