@@ -131,12 +131,15 @@ $after = Get-MetricsText
 $afterInfo = Invoke-JsonGet "/model-info"
 $completed = (Get-MetricValue $after "expert_service_completed_total") -
     (Get-MetricValue $before "expert_service_completed_total")
+$generated = (Get-MetricValue $after "expert_service_generated_tokens_total") -
+    (Get-MetricValue $before "expert_service_generated_tokens_total")
 $rows = (Get-MetricValue $after "expert_service_decode_rows_total") -
     (Get-MetricValue $before "expert_service_decode_rows_total")
 $expectedRows = [int]$response.usage.completion_tokens +
     [int]$chat.usage.completion_tokens +
     [int]$responses.usage.output_tokens
-if ($completed -ne 3 -or $rows -lt $expectedRows -or
+if ($completed -ne 3 -or $generated -ne $expectedRows -or
+    $rows -lt 3 -or $rows -gt $generated -or
     [int]$afterInfo.active_requests -ne 0 -or
     [int]$afterInfo.worker_kv.reserved_pages -ne 0 -or
     [int]$afterInfo.worker_kv.allocated_pages -ne 0) {
@@ -165,6 +168,7 @@ $result = [PSCustomObject]@{
     responses_output_text = [string]$responses.output[0].content[0].text
     endpoint_requests = 3
     completed_delta = $completed
+    generated_tokens_delta = $generated
     decode_rows_delta = $rows
     context_released = $true
     ttft_p95_seconds = Get-MetricValue $after `
