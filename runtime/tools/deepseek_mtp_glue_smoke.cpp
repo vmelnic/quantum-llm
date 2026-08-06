@@ -94,6 +94,10 @@ int main(int argc, char** argv) {
         mtp_root / "dense", mtp_root / "typed-residency", checkpoint, 7U,
         19U);
     require(loaded.status.ok(), std::string(loaded.status.message()));
+    auto shared = er::load_deepseek_shared_artifacts(
+        mtp_root / "shared", checkpoint, 1U, 18U);
+    require(shared.status.ok() && shared.shared.size() == 1U,
+            std::string(shared.status.message()));
     const auto dense_device_bytes = loaded.artifacts.dense_device_bytes;
     const auto staging_bytes = std::max<std::uint64_t>(
         loaded.artifacts.maximum_source_record_bytes, 64ULL << 20U);

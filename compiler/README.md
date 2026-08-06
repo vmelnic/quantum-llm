@@ -66,7 +66,9 @@ atomic resource. It hashes the source extents for 19 typed tensors, 7 FP8
 matrices, one shared expert, and 256 compact routed experts without copying the
 3.59 GB payload. Publishing this descriptor does not enable speculation or
 change base greedy decoding; it establishes the input contract for the future
-MTP runtime.
+MTP runtime. Its routed and shared indexes use the same namespace-parameterized
+formats as the target model, so no MTP-specific cache or placement path is
+required.
 
 `export-deepseek-mtp-glue-oracle` qualifies the two MTP block boundaries
 without pretending that the decoder itself is complete. It reproduces the
@@ -96,14 +98,23 @@ ops\windows\Invoke-DeepSeekMtpGlueSmoke.ps1 `
 ```
 
 The MTP set preserves its original metadata-only manifest and now also emits
-`typed-residency/typed-set.tsv`. This fixed, per-tensor descriptor lets the
-generic runtime loader authenticate and upload the complete namespace without
-parsing JSON or relying on hard-coded byte offsets.
+`typed-residency/typed-set.tsv` and `shared/shared-set.tsv`. These fixed
+descriptors let the generic runtime loaders authenticate the complete
+namespace without parsing JSON or relying on hard-coded byte offsets. The
+generic routed packer infers the published layer geometry, so the same command
+packs either the 43-layer target catalog or the one-layer MTP catalog.
 
 ```powershell
 .\ops\windows\Export-DeepSeekMtpSet.ps1 `
   -Snapshot C:\path\to\deepseek-v4-flash-snapshot `
   -Output C:\path\to\deepseek-mtp-set-v1
+```
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler pack-deepseek-routed `
+  --catalog C:\path\to\deepseek-mtp-set\routed `
+  --source C:\path\to\deepseek-v4-flash-snapshot `
+  --output C:\path\to\deepseek-mtp-compact-pack
 ```
 
 ```powershell

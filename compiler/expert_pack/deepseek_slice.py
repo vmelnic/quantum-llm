@@ -1844,9 +1844,7 @@ def _pack_deepseek_routed_catalog_locked(
     """
 
     stored_bytes = 13_369_344
-    layers = 43
     experts_per_layer = 256
-    expert_count = layers * experts_per_layer
     catalog_root = catalog_root.resolve()
     source_root = source_root.resolve()
     output = output.resolve()
@@ -1871,6 +1869,12 @@ def _pack_deepseek_routed_catalog_locked(
         raise SourceFormatError("compact pack requires routed extents v1")
     rows = [line.split("\t") for line in catalog_lines[1:]]
     extents = [line.split("\t") for line in extent_lines[1:]]
+    if not rows or len(rows) % experts_per_layer:
+        raise SourceFormatError(
+            "DeepSeek source catalog has incomplete layer geometry"
+        )
+    layers = len(rows) // experts_per_layer
+    expert_count = layers * experts_per_layer
     if len(rows) != expert_count or len(extents) != expert_count * 6:
         raise SourceFormatError("DeepSeek source catalog is incomplete")
 
@@ -2765,6 +2769,16 @@ def export_deepseek_mtp_set(
             target_abi="deepseek-sm86-int8-per-row-v1",
         )
         source_bytes += int(shared_manifest["bytes"])
+        with (partial / "shared" / "shared-set.tsv").open(
+            "x", encoding="utf-8", newline="\n"
+        ) as shared_index:
+            shared_index.write("deepseek-shared-residency-v1\n")
+            shared_index.write(
+                f"0\t{shared_manifest['bytes']}\t"
+                f"{shared_manifest['combined']['sha256']}\textents.tsv\n"
+            )
+            shared_index.flush()
+            os.fsync(shared_index.fileno())
 
         routed_root = partial / "routed"
         routed_root.mkdir()
@@ -2787,8 +2801,8 @@ def export_deepseek_mtp_set(
                 )
             hash_buffer = bytearray(8 * 1024 * 1024)
             hash_view = memoryview(hash_buffer)
-            catalog.write("deepseek-mtp-routed-catalog-v1\n")
-            extents.write("deepseek-mtp-routed-extents-v1\n")
+            catalog.write("deepseek-routed-catalog-v1\n")
+            extents.write("deepseek-routed-extents-v1\n")
             extent_index = 0
             for expert in range(256):
                 expert_prefix = f"mtp.{namespace}.ffn.experts.{expert}"
@@ -2829,7 +2843,7 @@ def export_deepseek_mtp_set(
                         "DeepSeek MTP routed expert has invalid compact bytes"
                     )
                 catalog.write(
-                    f"{expert}\t{destination}\t{digest.hexdigest()}\t"
+                    f"0\t{expert}\t{destination}\t{digest.hexdigest()}\t"
                     f"{first_extent}\t6\n"
                 )
                 routed_source_bytes += destination
@@ -2841,10 +2855,11 @@ def export_deepseek_mtp_set(
         if extent_index != 256 * 6:
             raise SourceFormatError("DeepSeek MTP routed extent count mismatch")
         routed_manifest = {
-            "format": "deepseek-mtp-routed-catalog-v1",
+            "format": "deepseek-routed-catalog-v1",
             "source_abi": "deepseek-fp4-e2m1-ue8m0-block32-v1",
             "target_abi": "deepseek-sm86-fp4-q8-direct-v1",
             "namespace": namespace,
+            "layers": 1,
             "experts": 256,
             "extent_count": extent_index,
             "source_bytes": routed_source_bytes,
@@ -2867,6 +2882,7 @@ def export_deepseek_mtp_set(
                 "typed_residency": "typed-residency/typed-set.tsv",
                 "dense": "dense/dense-set.tsv",
                 "shared": "shared/manifest.json",
+                "shared_residency": "shared/shared-set.tsv",
                 "routed": "routed/catalog.tsv",
             },
         }

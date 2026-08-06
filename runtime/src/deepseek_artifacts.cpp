@@ -163,6 +163,28 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
     result.typed_source_bytes = loaded.artifacts.typed_source_bytes;
     result.maximum_source_record_bytes =
         loaded.artifacts.maximum_source_record_bytes;
+    auto shared = load_deepseek_shared_artifacts(
+        shared_root, checkpoint_root, 43U, 17U);
+    if (!shared.status.ok())
+      throw std::invalid_argument(std::string(shared.status.message()));
+    result.shared = std::move(shared.shared);
+    return {Status::success(), std::move(result)};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::invalid_argument,
+             std::string("invalid DeepSeek model artifacts: ") + error.what()},
+            {}};
+  }
+}
+
+DeepSeekSharedArtifactsResult load_deepseek_shared_artifacts(
+    const std::filesystem::path& shared_root,
+    const std::filesystem::path& checkpoint_root,
+    std::uint32_t expected_layers, std::uint64_t model_id) noexcept {
+  try {
+    require(expected_layers != 0U && model_id != 0U,
+            "shared artifact namespace identity is invalid");
+    std::vector<ResidentExpertSpec> result;
+    result.reserve(expected_layers);
     std::string line;
     std::ifstream shared_input(shared_root / "shared-set.tsv");
     require(static_cast<bool>(std::getline(shared_input, line)) &&
@@ -173,7 +195,7 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
       require(item.size() == 4U, "invalid shared artifact row");
       const auto layer = static_cast<std::uint32_t>(std::stoul(item[0]));
       const auto bytes = std::stoull(item[1]);
-      require(layer == result.shared.size() && layer < 43U &&
+      require(layer == result.size() && layer < expected_layers &&
                   bytes == 25'167'360ULL,
               "shared artifact geometry is not canonical");
       PayloadRecord record;
@@ -186,16 +208,17 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
       record.alignment = kExpertPackAlignment;
       record.header_bytes = 0U;
       record.payload_sha256 = digest(item[2]);
-      result.shared.push_back(
-          {{17U, layer, 256U, kExpertQuantAbiDeepSeekSm86},
-           std::move(record)});
+      result.push_back({{model_id, layer, 256U,
+                         kExpertQuantAbiDeepSeekSm86},
+                        std::move(record)});
     }
-    require(shared_input.eof() && result.shared.size() == 43U,
+    require(shared_input.eof() && result.size() == expected_layers,
             "shared artifact set is incomplete");
     return {Status::success(), std::move(result)};
   } catch (const std::exception& error) {
     return {{ErrorCode::invalid_argument,
-             std::string("invalid DeepSeek model artifacts: ") + error.what()},
+             std::string("invalid DeepSeek shared artifacts: ") +
+                 error.what()},
             {}};
   }
 }

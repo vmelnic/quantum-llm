@@ -47,6 +47,19 @@ struct DeepSeekModelArtifactsResult final {
   DeepSeekModelArtifacts artifacts;
 };
 
+struct DeepSeekSharedArtifactsResult final {
+  Status status;
+  std::vector<ResidentExpertSpec> shared;
+};
+
+// Parses one authenticated shared-expert namespace. model_id keeps cache and
+// directory keys collision-free when the target and MTP namespaces both use
+// logical layer zero.
+[[nodiscard]] DeepSeekSharedArtifactsResult load_deepseek_shared_artifacts(
+    const std::filesystem::path& shared_root,
+    const std::filesystem::path& checkpoint_root,
+    std::uint32_t expected_layers, std::uint64_t model_id) noexcept;
+
 // Loads only authenticated descriptors; tensor payloads remain lazy until the
 // resident model/shared set loaders consume these exact records.
 [[nodiscard]] DeepSeekModelArtifactsResult load_deepseek_model_artifacts(

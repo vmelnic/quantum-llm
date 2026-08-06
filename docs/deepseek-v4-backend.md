@@ -59,10 +59,12 @@ the default runtime path.
 The checkpoint's single MTP layer now has a separate authenticated descriptor
 set. It covers 3,593,787,756 source bytes across 19 dtype-preserving tensors,
 7 block-scaled FP8 matrices, one shared expert, and 256 routed FP4 experts.
-The export is extent-based and copies no weights. Bundle v2 can declare this
-resource and the worker reports its availability, but it is not yet a resident
-MTP state and remains disabled, so base greedy generation is unchanged. Bundle
-v1 remains supported without the resource.
+The export is extent-based and copies no weights. The dense/typed part now has
+a qualified resident state, while routed/shared experts use the same generic
+catalog, pack, cache, and CUDA directory contracts as the target model. MTP is
+still disabled in serving until the complete block and target verification are
+qualified, so base greedy generation is unchanged. Bundle v1 remains supported
+without the resource.
 
 The MTP execution contract is not inferred from the tensor names. DeepSeek V4
 normalizes the four target residual streams independently, projects them with
@@ -108,6 +110,15 @@ After this generalization, the five-token `Hi` target regression still emitted
 token `19923`. This boundary also permits a future placement planner to assign
 a block namespace to another GPU or worker without changing attention/FFN
 kernels.
+
+Expert ownership is namespace-driven as well. Catalog geometry is explicit
+rather than fixed to 43 layers, shared-expert parsing takes an explicit model
+identity, and cache/directory keys keep target layer zero distinct from MTP
+layer zero. The MTP export therefore uses the normal six-field routed catalog
+and shared-residency descriptor. Its 256 routed records were packed into one
+3,422,552,064-byte compact shard; the generic production gate authenticated,
+loaded, published, and pinned both boundary records. No MTP-only storage or
+expert execution path was introduced.
 
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the

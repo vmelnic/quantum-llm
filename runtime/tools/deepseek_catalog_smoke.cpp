@@ -10,6 +10,7 @@
 #include <cuda_runtime_api.h>
 
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -33,27 +34,38 @@ void check(cudaError_t error, const char* operation) {
   }
 }
 
+std::uint32_t parse_layers(const char* text) {
+  std::uint32_t result{};
+  const auto end = text + std::char_traits<char>::length(text);
+  const auto parsed = std::from_chars(text, end, result);
+  require(parsed.ec == std::errc{} && parsed.ptr == end && result != 0U,
+          "invalid catalog layer count");
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
-    if (argc != 3) {
+    if (argc != 3 && argc != 4) {
       std::cerr << "usage: expert-deepseek-catalog-smoke "
-                   "<catalog> <checkpoint>\n";
+                   "<catalog> <checkpoint> [layers]\n";
       return 64;
     }
+    const auto layers = argc == 4 ? parse_layers(argv[3]) : 43U;
     er::DeepSeekExpertCatalog catalog;
-    const auto status = er::DeepSeekExpertCatalog::load(
-        argv[1], argv[2], catalog);
+    const auto status = er::DeepSeekExpertCatalog::load_namespace(
+        argv[1], argv[2], layers, catalog);
     require(status.ok(), std::string(status.message()));
-    require(catalog.size() == 43U * 256U &&
-                catalog.source_bytes() == 147'169'738'752ULL,
+    require(catalog.size() == static_cast<std::size_t>(layers) * 256U &&
+                catalog.source_bytes() ==
+                    static_cast<std::uint64_t>(layers) * 256U * 13'369'344U,
             "DeepSeek routed catalog has the wrong aggregate geometry");
 
-    constexpr std::uint64_t model_id = 17U;
+    const std::uint64_t model_id = layers == 43U ? 17U : 18U;
     const std::array<er::ExpertKey, 2> keys{{
         {model_id, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86},
-        {model_id, 42U, 255U, er::kExpertQuantAbiDeepSeekSm86},
+        {model_id, layers - 1U, 255U, er::kExpertQuantAbiDeepSeekSm86},
     }};
     auto io = std::make_shared<er::WindowsIocpStorage>(2U);
     auto storage = std::make_shared<er::ExtentGatherStorage>(io);
@@ -62,7 +74,7 @@ int main(int argc, char** argv) {
         1U, 13'369'344U, er::kExpertPackAlignment,
         std::make_shared<er::CudaPinnedAllocator>());
     auto directory = std::make_shared<er::cuda::CudaExpertDirectory>(
-        model_id, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 2U);
+        model_id, er::kExpertQuantAbiDeepSeekSm86, layers, 257U, 2U);
     er::ExpertCacheConfig config;
     config.ram = {2ULL * 13'369'344U, 2ULL * 13'369'344U, 13'369'344U};
     config.vram = {2ULL * 25'198'592U, 2ULL * 25'198'592U, 25'198'592U};

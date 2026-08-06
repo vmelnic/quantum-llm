@@ -16,9 +16,6 @@ namespace {
 constexpr std::uint64_t kStoredBytes = 13'369'344U;
 constexpr std::uint64_t kDecodedBytes = 3ULL * 4096U * 2048U * sizeof(float);
 constexpr std::uint64_t kDeviceBytes = 25'198'592U;
-constexpr std::size_t kExpertCount =
-    static_cast<std::size_t>(kDeepSeekCatalogLayers) *
-    kDeepSeekCatalogExperts;
 
 std::vector<std::string> fields(const std::string& line) {
   std::vector<std::string> result;
@@ -79,10 +76,23 @@ Status DeepSeekExpertCatalog::load(
     const std::filesystem::path& catalog_root,
     const std::filesystem::path& source_root,
     DeepSeekExpertCatalog& destination) {
+  return load_namespace(catalog_root, source_root, kDeepSeekCatalogLayers,
+                        destination);
+}
+
+Status DeepSeekExpertCatalog::load_namespace(
+    const std::filesystem::path& catalog_root,
+    const std::filesystem::path& source_root, std::uint32_t layers,
+    DeepSeekExpertCatalog& destination) {
   if (!destination.records_.empty()) {
     return {ErrorCode::invalid_argument,
             "DeepSeek catalog destination is not empty"};
   }
+  if (layers == 0U || layers > 1'000'000U)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek catalog layer count is invalid"};
+  const auto expert_count =
+      static_cast<std::size_t>(layers) * kDeepSeekCatalogExperts;
   try {
     std::ifstream extent_input(catalog_root / "extents.tsv");
     std::string line;
@@ -97,7 +107,7 @@ Status DeepSeekExpertCatalog::load(
     const std::size_t extents_per_expert = packed ? 1U : 6U;
     const auto payload_root = packed ? catalog_root : source_root;
     std::vector<PayloadExtent> extents;
-    extents.reserve(kExpertCount * extents_per_expert);
+    extents.reserve(expert_count * extents_per_expert);
     while (std::getline(extent_input, line)) {
       const auto item = fields(line);
       if (item.size() != 4U)
@@ -108,7 +118,7 @@ Status DeepSeekExpertCatalog::load(
                          unsigned_integer(item[1])});
     }
     if (!extent_input.eof() ||
-        extents.size() != kExpertCount * extents_per_expert) {
+        extents.size() != expert_count * extents_per_expert) {
       return {ErrorCode::invalid_argument,
               "DeepSeek routed extent catalog is incomplete"};
     }
@@ -121,7 +131,8 @@ Status DeepSeekExpertCatalog::load(
               "invalid DeepSeek routed catalog header"};
     }
     DeepSeekExpertCatalog candidate;
-    candidate.records_.reserve(kExpertCount);
+    candidate.records_.reserve(expert_count);
+    candidate.layers_ = layers;
     std::size_t expected_index = 0U;
     while (std::getline(catalog_input, line)) {
       const auto item = fields(line);
@@ -167,7 +178,7 @@ Status DeepSeekExpertCatalog::load(
       candidate.records_.push_back(std::move(record));
       ++expected_index;
     }
-    if (!catalog_input.eof() || candidate.records_.size() != kExpertCount) {
+    if (!catalog_input.eof() || candidate.records_.size() != expert_count) {
       return {ErrorCode::invalid_argument,
               "DeepSeek routed catalog is incomplete"};
     }
@@ -181,8 +192,9 @@ Status DeepSeekExpertCatalog::load(
 
 const PayloadRecord* DeepSeekExpertCatalog::find(
     std::uint32_t layer, std::uint32_t expert) const noexcept {
-  if (layer >= kDeepSeekCatalogLayers || expert >= kDeepSeekCatalogExperts ||
-      records_.size() != kExpertCount)
+  if (layer >= layers_ || expert >= kDeepSeekCatalogExperts ||
+      records_.size() != static_cast<std::size_t>(layers_) *
+                             kDeepSeekCatalogExperts)
     return nullptr;
   return &records_[static_cast<std::size_t>(layer) *
                        kDeepSeekCatalogExperts + expert];
@@ -191,6 +203,7 @@ const PayloadRecord* DeepSeekExpertCatalog::find(
 void DeepSeekExpertCatalog::clear() noexcept {
   records_.clear();
   source_bytes_ = 0U;
+  layers_ = 0U;
 }
 
 }  // namespace expert::runtime

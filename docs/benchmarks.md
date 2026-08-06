@@ -738,6 +738,19 @@ token before returning the current one. Neither value is a 30 tok/s result.
 The gate's purpose is model identity, complete-pack use, real decoding, service
 accounting, and resource cleanup.
 
+## DeepSeek MTP namespace storage gate
+
+The one-layer MTP routed catalog now passes through the same durable pack,
+cache, uploader, and CUDA directory used by target experts. The compact pack
+contains 256 records and 3,422,552,064 authenticated bytes. Loading its first
+and last records read 26,738,688 bytes and published 50,397,184 compute bytes.
+The accompanying one-layer shared descriptor also passed the generic strict
+loader. Re-running the qualified MTP glue against this namespace retained
+`3.05e-8` input RMSE and `2.12e-10` output RMSE.
+
+This is a storage/ownership gate, not a draft-token or throughput result. It
+removes the separate MTP expert path before the full block is executed.
+
 ## Benchmark rules
 
 Any published result must include:

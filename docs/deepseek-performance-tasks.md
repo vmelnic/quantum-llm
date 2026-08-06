@@ -250,6 +250,11 @@ latency or aggregate throughput without changing model semantics.
     `mtp.0` namespace transactionally. The same binders now serve `layers.N`
     and `mtp.N`; 7 dense plus 19 typed MTP resources occupy 146,278,892 device
     bytes and expose ratio-zero attention plus a learned-router FFN.
+  - [x] Generalize routed catalogs, durable compact packing, and shared-expert
+    descriptors by namespace. The MTP routed pack contains all 256 experts in
+    one authenticated 3,422,552,064-byte shard; the production cache/directory
+    gate loaded and pinned its first and last records. The MTP shared descriptor
+    passed the same strict parser used by the 43 target shared experts.
   - [ ] Execute the MTP attention, routed/shared FFN, mHC state and shared
     vocabulary head between the qualified boundaries; only then compare a
     one-token draft prediction.
