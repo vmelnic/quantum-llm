@@ -159,11 +159,13 @@ Remove registration and stop the entire process tree:
 
 ## Context configuration
 
-`MaximumContext=4096` is the only certified value. The API rejects prompt plus
-output beyond this capacity. Raising it no longer preallocates maximum KV for
-every slot, but it still requires a matching aggregate page budget and
-long-context qualification. Do not advertise the model's 262K architectural
-maximum as an operational limit. See
+`MaximumContext=4096` is the historically qualified manual profile. The
+reference `.env` lifecycle currently advertises 65,536 context tokens and
+8,192 output tokens, but that larger admission ceiling is not yet qualified for
+long-prompt correctness, latency, or concurrency. Raising the limit no longer
+preallocates maximum KV for every slot, but it still requires a matching
+aggregate page budget and long-context qualification. Do not advertise the
+model's 262K architectural maximum as an operational guarantee. See
 [Production readiness](production-readiness.md).
 
 KV capacity is an aggregate request budget. With the tested geometry, one

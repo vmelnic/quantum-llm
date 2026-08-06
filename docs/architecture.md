@@ -14,10 +14,10 @@ SafeTensors ──────────────────────�
     │ strict architecture adapter                                     │
     │ row-streaming INT8 quantization                                  │
     ▼                                                                 │
-Expert Pack v1                                                        │
+Qwen Expert Pack / DeepSeek compact bundle                            │
     ├── manifest + checksums                                           │
-    ├── dense.qpack ───────────────────────────────┐                   │
-    └── experts-*.qpack ────────────────┐          │                   │
+    ├── dense/shared state ────────────────────────┐                   │
+    └── indexed expert records ────────┐           │                   │
                                         │          │                   │
                        inference time   ▼          ▼                   │
 OpenAI HTTP ─► admission ─► tokenizer ─► request state ─► dense CUDA  │
@@ -159,20 +159,23 @@ every payload to its declared SHA-256, canonical extent count, dtype, geometry,
 and checkpoint root before any model allocation begins. This prevents the
 worker and benchmark tools from developing separate metadata interpretations.
 
-### Qwen3-Next backend
+### Native model backends
 
-The current production candidate implements Qwen3-Next's alternating full
-attention and Gated DeltaNet, output-gated attention, partial RoPE, shared
-expert, routed experts, and isolated KV/Conv/DeltaNet state per slot. CUDA is
-compiled for SM86.
+The Qwen3-Next backend implements alternating full attention and Gated
+DeltaNet, output-gated attention, partial RoPE, shared and routed experts, and
+isolated KV/Conv/DeltaNet state per slot. The DeepSeek-V4-Flash backend
+implements its native attention/CSA/HCA, routing, shared/routed FFN, compact
+FP4 expert path, and persistent request state. CUDA is compiled for SM86.
 
 ### HTTP service
 
 The Python front-end owns tokenization, bounded admission, continuous decode
 batching, cancellation, SSE, metrics, and the OpenAI-compatible wire contract.
 The C++ worker owns model state and token selection. Their local protocol is
-line-framed and versioned; protocol v3 supports multiple active request slots,
-exact context reservations, KV telemetry, and batched `STEP`.
+line-framed and versioned. Protocol v4 supports exact context reservations, KV
+telemetry, batched `STEP`, explicit prefetch state, and one-or-more returned
+tokens for the speculative-execution boundary. The front-end accepts the
+legacy scalar-token and inferred-prefetch forms for the existing Qwen runner.
 
 ## Memory placement
 
@@ -203,8 +206,10 @@ logical KV per token            24 KiB/request
 At admission, each request reserves `ceil((prompt + output) / 256)` page
 credits. Physical CUDA pages are allocated only when prefill/decode first
 enters them, then retained in a reusable high-water pool. A released request
-returns its pages and credits. The default 4096 × four-slot profile needs at
-most 64 pages, or 384 MiB—not 768 MiB reserved at startup.
+returns its pages and credits. The historically qualified 4096 × four-slot
+profile needs at most 64 pages, or 384 MiB—not 768 MiB reserved at startup.
+The reference lifecycle currently advertises 65,536 tokens, but on-demand
+allocation does not make that larger limit correctness- or latency-qualified.
 
 Attention uses online softmax and constant shared memory instead of storing one
 score per context token. This removes the previous kernel launch ceiling for
@@ -214,7 +219,7 @@ updates remain position ordered, while projections and MoE work reuse the
 microbatch path. This is bounded chunked prefill, not FlashAttention: full
 attention remains quadratic and the chunk is tied to worker capacity. Larger
 chunks, prefill-specific workspaces/kernels, RoPE validation, and staged
-SLO/correctness gates are required before raising the certified 4096 limit.
+SLO/correctness gates are required before qualifying beyond 4096 tokens.
 
 ## Failure model
 
@@ -242,9 +247,10 @@ distributed coordinator, expert worker, placement protocol
 Distributed execution will move activations to the node that owns an expert,
 not pretend that remote RAM is local memory.
 
-DeepSeek's compact-source and derived SM86-cache boundary is specified in
-[DeepSeek-V4-Flash backend](deepseek-v4-backend.md). It deliberately does not
-reinterpret the Expert Pack v1 ABI used by the current Qwen/OLMoE backend.
+DeepSeek's compact-source and derived SM86-cache boundary is specified by the
+[DeepSeek compact pack](deepseek-compact-pack-v1.md) and
+[runtime contract](expert-runtime.md). It deliberately does not reinterpret
+the Expert Pack v1 ABI used by the Qwen/OLMoE backend.
 Its resident dense and dtype-preserving tensors are published as one model
 transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string

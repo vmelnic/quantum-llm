@@ -42,46 +42,35 @@ Interactive streaming chat can own its SSH tunnel and clean it up on exit:
 ```bash
 cp .env.example .env
 # Set CHAT_SSH in .env, then:
-./ops/chat.sh
+./ops/model.sh chat
 ```
 
 ## Windows scripts
 
-| Script | Purpose |
-|---|---|
-| `Invoke-Inventory.ps1` | hardware/toolchain/model-cache inventory |
-| `Invoke-BuildExpertRuntime.ps1` | configure, build, C++/CUDA/Python tests |
-| `Start-P6ModelDownload.ps1` | resumable Hugging Face download task |
-| `Get-P6ModelDownload.ps1` | independently verify download progress/completion |
-| `Start-HuggingFaceModelDownload.ps1` | generic pinned, disk-checked Xet download task |
-| `Get-HuggingFaceModelDownload.ps1` | progress and index/shard completion verification |
-| `Start-DeepSeekV4FlashDownload.ps1` | pinned DeepSeek-V4-Flash Xet download profile |
-| `Invoke-SourceInventory.ps1` | read-only validation and dtype/byte inventory for a cached checkpoint |
-| `Invoke-DeepSeekExpertSlice.ps1` | full real-expert decode/reference/INT8 qualification |
-| `Invoke-DeepSeekCudaAdmission.ps1` | compact H2D + SM86 admission hash gate |
-| `Invoke-DeepSeekDenseAdmission.ps1` | block-scaled FP8 dense matrix → SM86 GEMV gate |
-| `Invoke-DeepSeekCompactDenseScreen.ps1` | read-only compact dense representation screen across real projection geometries |
-| `Invoke-DeepSeekDenseResidency.ps1` | atomically load all 236 main-model FP8 matrices |
-| `Invoke-DeepSeekSharedAdmission.ps1` | FP8 shared expert → SM86 cache/compute gate |
-| `Invoke-DeepSeekSharedResidency.ps1` | atomically pin all 43 shared experts at startup |
-| `Invoke-DeepSeekHcaSlice.ps1` | real F32 HCA pre/Sinkhorn/post CUDA correctness gate |
-| `Invoke-DeepSeekTypedResidency.ps1` | stream all 834 BF16/F32/I64 tensors into typed model state |
-| `Invoke-DeepSeekModelResidency.ps1` | publish model/request state and qualify catalog-backed asynchronous layer resume |
-| `Start-DeepSeekCompactPack.ps1` | start resumable durable DeepSeek compact-pack publication outside repository scratch |
-| `Get-DeepSeekCompactPack.ps1` | report authenticated layer-shard progress and final publication state |
-| `Invoke-DeepSeekCsaSlice.ps1` | validate real ratio-4/128 CSA compressor decode state on CUDA |
-| `Invoke-P6Preflight.ps1` | exact disk/conversion feasibility for Qwen3-Next 80B |
-| `Invoke-ExpertPack.ps1` | generic compile/validate wrapper |
-| `Invoke-P6Conversion.ps1` | pinned Qwen3-Next conversion profile |
-| `Invoke-P6Gate.ps1` | hot single/aggregate correctness and throughput gates |
-| `Start-ExpertServer.ps1` | generic foreground HTTP/worker launcher |
-| `Start-P6ExpertServer.ps1` | tested Qwen profile |
-| `Install-ExpertServerTask.ps1` | install/replace pilot scheduled task |
-| `Stop-ExpertServer.ps1` | stop task and full descendant process tree |
-| `Uninstall-ExpertServerTask.ps1` | stop and remove task registration |
-| `Invoke-P6ServiceSmoke.ps1` | identity, API, streaming, batching, cancellation smoke |
-| `Get-ExpertServerStatus.ps1` | task state, readiness, identity and configured-limit verification |
-| `Install-ServerEnvironment.ps1` | create/check the isolated, pinned tokenizer environment |
+The directory is intentionally limited to supported operator workflows:
+
+- `Invoke-Bootstrap.ps1`, `Invoke-Inventory.ps1`,
+  `Invoke-BuildExpertRuntime.ps1`, and `Install-ServerEnvironment.ps1` prepare
+  and verify a host;
+- `Start-*Download.ps1`, `Get-*Download.ps1`, and their workers implement
+  pinned, resumable checkpoint acquisition and completion checks;
+- `Invoke-ExpertPack.ps1`, `Invoke-P6Preflight.ps1`, and
+  `Invoke-P6Conversion.ps1` reproduce and validate the Qwen Expert Pack;
+- `Start-DeepSeekCompactPack.ps1`, `Get-DeepSeekCompactPack.ps1`,
+  `Invoke-DeepSeekCompactPack*.ps1`, the MTP exporters, and
+  `Publish-DeepSeekWorkerBundle.ps1` reproduce the DeepSeek deployment
+  artifact;
+- `Start-ExpertServer.ps1` plus the two model-specific launchers and
+  `Install-ExpertServerTask.ps1` implement foreground and scheduled service
+  startup;
+- `Get-ExpertServerStatus.ps1`, `Stop-ExpertServer.ps1`,
+  `Uninstall-ExpertServerTask.ps1`, and the model smoke/gate scripts implement
+  bounded status, verification, shutdown, and performance checks.
+
+Intermediate phase-admission scripts used while developing the DeepSeek
+backend are not part of the supported operator surface. Their outcomes are
+preserved in [Engineering history](../docs/history.md), while current
+correctness belongs in the build/test suites.
 
 Generated logs/artifacts/work directories are ignored by Git. Model deletion is
 not part of normal automation. Source shard reclamation exists only behind an

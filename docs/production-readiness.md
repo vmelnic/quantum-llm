@@ -2,80 +2,70 @@
 
 ## Verdict
 
-The Qwen backend is suitable for a **controlled pre-production pilot at a
-4096-token context on the tested Windows/RTX 3090 host**. The DeepSeek-V4-Flash
-backend is functionally pilotable at that limit but is not throughput-ready on
-the same host. Neither backend is ready for a general multi-tenant or
-internet-facing production service.
+Both Qwen3-Next 80B and DeepSeek-V4-Flash can be started, queried and stopped
+through the same OpenAI-compatible service on the reference Windows/RTX 3090
+host. This is a research/pilot runtime, not a production service.
+
+Qwen is functionally usable but arbitrary multi-turn chat is currently about
+0.7–1.4 tok/s after the first token. DeepSeek is slower. The configured 65K
+context ceiling is not long-context-qualified. Neither backend meets the
+30 tok/s user-facing objective for representative chat.
 
 ## Readiness matrix
 
-| Area | Status | Evidence / gap |
+| Area | Status | Current evidence or gap |
 |---|---|---|
-| model/container integrity | ready | strict schema, pack and record hashes, atomic completion marker |
-| deterministic correctness | ready for tested model | isolated/batched equality and CUDA/compiler tests |
-| DeepSeek durable service path | functional | 43-shard compact pack, persistent worker, API gate, exact cleanup; throughput remains far below target |
-| bounded memory and queues | ready for pilot | explicit RAM/VRAM/staging/KV budgets and bounded admission |
-| API client compatibility | ready for text/greedy subset | verified with OpenAI SDK; unsupported capabilities fail explicitly |
-| cancellation and drain | ready for pilot | client FIN/RST cancellation and full descendant-tree stop |
-| context window | limited | paged FP16 KV and bounded four-token causal prefill implemented; 4096 certified |
-| cold latency | not ready | cold service p95 remains far below the hot throughput target |
-| authentication | partial | one shared bearer key; no identity, tenant, or rotation service |
-| TLS / edge security | missing | requires external reverse proxy and firewall |
-| observability | partial | metrics and JSONL exist; no external retention, tracing, or alerting |
-| supervision | partial | Task Scheduler pilot; not a hardened Windows service |
-| high availability | missing | one process, one GPU, no replica/failover |
-| long soak / chaos | missing | no 24h soak, forced I/O/CUDA failure campaign, or leak gate |
-| GPU CI | manual | portable GitHub CI exists; SM86 validation needs a self-hosted runner |
-| security review | missing | no independent audit or fuzz campaign |
+| immutable model artifacts | pilot-ready | strict pack/index/record hashes and completion markers |
+| deterministic greedy execution | pilot-ready for tested paths | native correctness gates and real API generation |
+| Qwen lifecycle | functional | install, start, identity/limit verification, chat and full stop tested |
+| DeepSeek lifecycle | functional | compact bundle, persistent worker and API generation tested |
+| Unicode streaming | fixed | incomplete byte-fallback sequences are held until a stable prefix exists |
+| bounded memory/admission | pilot-ready | explicit RAM/VRAM/KV/queue budgets and fail-closed credits |
+| configured context | 65,536 | enabled hard ceiling, not a quality/performance qualification |
+| qualified context | 4,096 | larger staged gates remain undone |
+| Qwen hot repeated route | capable | 30.07 tok/s post-first-token in the latest identical repeat |
+| Qwen representative chat | not ready | changing routes/history measured about 0.7–1.4 tok/s |
+| DeepSeek throughput | not ready | roughly 0.3–0.6 tok/s on the reference host |
+| conversation KV reuse | missing | unchanged history is re-prefilled every turn |
+| route-aware warm state | partial | cache/prefetch exists; no general chat-hot guarantee |
+| API compatibility | partial | documented greedy text subset; no tools/multimodal/sampling/logprobs |
+| authentication | partial | optional shared bearer key only |
+| TLS and edge controls | missing | external proxy/firewall required |
+| supervision | partial | Task Scheduler pilot, not a hardened service |
+| observability | partial | JSONL/metrics exist; Qwen request-level placement telemetry is incomplete |
+| reliability | missing | no 24-hour soak, chaos campaign, HA or failover |
+| GPU CI/security review | missing | manual SM86 validation; no independent audit/fuzz campaign |
 
-## P0 blockers for broader production
+## Release blockers
 
-### Long-context prefill and qualification
+1. Meet a declared user-facing workload SLO, not only hot runner gates.
+2. Implement conversation prefix/KV reuse and workload-aware expert placement.
+3. Qualify context sizes sequentially up to the advertised ceiling.
+4. Add a hardened supervisor, external logging/metrics/alerts and rollback gate.
+5. Add TLS/auth/rate limiting at an edge and keep the built-in server private.
+6. Pass soak, cancellation storm, I/O corruption, disk-full, OOM and worker
+   restart tests.
 
-Completed: paged on-demand FP16 KV, per-request page credits, bounded reuse,
-worker protocol v3, page observability, constant-shared-memory online decode
-attention, and a four-token causal prefill slice with full-model equality
-against scalar prefill.
+## Controlled pilot checklist
 
-Required work: a prefill workspace independent of decode concurrency, larger
-adaptive chunks, FlashAttention-class kernels, mixed-length batch scheduling,
-RoPE/numerical validation, and correctness/memory/SLO gates at 8K, 16K, 32K,
-and 64K. Do not claim 262K before it passes.
-
-### Cold-path latency
-
-Hot placement crosses the throughput gate; cold API latency does not. Required
-work: workload-aware warm sets, admission-aware placement, prefetch that cannot
-starve ready work, and stable SLO tests using realistic prompt distributions.
-
-### Service hardening
-
-Required work: Windows Service or equivalent supervisor, non-interactive
-identity, secret store integration, TLS reverse proxy, structured log rotation,
-request correlation, resource alerts, and documented backup/restore drills.
-
-### Reliability validation
-
-Required work: long soak under mixed concurrency/context, cancellation storms,
-overload recovery, SSD short reads, corrupted packs, CUDA reset/OOM, worker
-crash/restart, disk-full behavior, and repeated deploy/rollback.
-
-## Pilot release checklist
-
-- [ ] pin commit, model revision, compiler profile, Python dependencies, CUDA and driver;
-- [ ] validate all pack hashes and preserve the source checkpoint or verified backup;
-- [ ] run Windows build/tests and both P6 gates;
-- [ ] run service smoke and verify build/model hashes through `/model-info`;
-- [ ] use 4096 or a separately qualified context limit;
-- [ ] bind loopback, or deploy proxy/TLS/firewall/API key controls;
-- [ ] configure external logs, metrics collection, disk/RAM/VRAM alerts;
-- [ ] document capacity, owner, maintenance window, rollback commit, and stop command;
-- [ ] run an environment-specific load test and record cold plus warm latency;
-- [ ] obtain explicit operator acceptance of the known limitations.
+- pin commit, model revision, pack hashes, Python requirements, CUDA and driver;
+- run `./ops/model.sh install`, then start the selected model;
+- verify `/model-info` build, model, limits and pack identity;
+- run one real tokenizer/chat request, not only a token-ID or readiness probe;
+- record cold and warm TTFT, post-first-token and end-to-end rates;
+- bind loopback or deploy an authenticated TLS proxy and firewall;
+- retain the source checkpoint or an independently validated immutable pack;
+- configure external log/metric retention and resource alerts;
+- document capacity, rollback, maintenance and the full process-tree stop;
+- obtain explicit acceptance of the known throughput/context limitations.
 
 ## Claims policy
 
-“Model supports 262K” describes checkpoint metadata. “Runtime supports 262K”
-requires successful allocation, prefill, decode, numerical validation, and SLO
-evidence at that context. The project currently makes only the first claim.
+- Checkpoint position metadata is not an operational context guarantee.
+- `ready=true` means healthy and accepting work, not warmed or SLO-compliant.
+- Hot runner throughput is not cold API or arbitrary-chat throughput.
+- Aggregate throughput is not single-stream throughput.
+- Draft/model rows are not useful output tokens unless verification accepts them.
+
+Every published result must identify model, build, prompt/history distribution,
+cold/warm state, single/aggregate scope, TTFT, decode rate and end-to-end rate.

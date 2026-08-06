@@ -89,12 +89,12 @@ require_remote() {
 
 run_remote() {
   require_remote
-  "${script_dir}/run-on-3090box.sh" "$@"
+  "${script_dir}/run-on-windows-host.sh" "$@"
 }
 
 sync_remote() {
   require_remote
-  "${script_dir}/sync-to-3090box.sh" "${remote_host}" "${remote_root}"
+  "${script_dir}/sync-to-windows-host.sh" "${remote_host}" "${remote_root}"
 }
 
 stop_task() {

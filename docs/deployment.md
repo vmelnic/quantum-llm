@@ -31,8 +31,9 @@ py -m venv .venv
 
 Prepare at least one immutable model artifact:
 
-- DeepSeek-V4-Flash worker bundle, as described in
-  [DeepSeek serving](deepseek-serving.md);
+- DeepSeek-V4-Flash compact pack and worker bundle, as described by
+  [the compact format](deepseek-compact-pack-v1.md) and current runtime
+  contracts;
 - Qwen3-Next 80B Expert Pack, as described in
   [Getting started](getting-started.md#compile-expert-pack).
 

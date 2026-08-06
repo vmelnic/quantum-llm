@@ -6,8 +6,9 @@ text generation. It does not silently emulate capabilities that the model
 runner does not have: unsupported sampling, multimodal, tool, logprob and
 server-side state options return a structured `400` error.
 
-The canonical P6 deployment listens on `http://127.0.0.1:8080/v1`. It serves one
-model, currently `qwen3-next-80b-a3b-expert-pack-int8`.
+The canonical loopback deployment listens on `http://127.0.0.1:8080/v1`. It
+serves exactly one selected model at a time: Qwen3-Next 80B or
+DeepSeek-V4-Flash.
 
 ## Endpoints
 
@@ -60,15 +61,15 @@ output, run from a POSIX control host:
 ```bash
 cp .env.example .env
 # Set CHAT_SSH in .env, then:
-./ops/chat.sh
+./ops/model.sh chat
 ```
 
 The `.env` file controls the SSH target, model, service context/output limits,
 per-turn chat token limit, ports, readiness timeout, Python executable, base
-URL, and optional API key; every variable is listed in `.env.example`. CLI flags remain optional overrides. The client
-retains conversation history. Enter `quit` or `exit`, or press Ctrl+C, to close
-both the client and the tunnel it created. With an empty `CHAT_SSH`, it connects
-directly to `CHAT_BASE_URL`.
+URL, and optional API key; every variable is listed in `.env.example`. CLI
+flags remain optional overrides. The client retains conversation history.
+Enter `quit` or `exit`, or press Ctrl+C, to close both the client and the tunnel
+it created. With an empty `CHAT_SSH`, it connects directly to `CHAT_BASE_URL`.
 
 After readiness, the terminal client resolves the single deployed model from
 `/v1/models`. `CHAT_MODEL` remains the default selection used by lifecycle
@@ -170,6 +171,9 @@ Adding them correctly requires extending the worker protocol and GPU runner.
 
 Chat/Completions streams use `data: <json>` SSE frames, a final choice carrying
 `finish_reason`, an optional usage-only chunk, then `data: [DONE]`.
+Text deltas are stable Unicode prefixes: incomplete tokenizer byte-fallback
+sequences are held until they decode without a replacement suffix. Already
+emitted text is never replayed to repair a later prefix.
 
 Responses streams emit typed lifecycle events:
 
@@ -227,7 +231,8 @@ budget.
 
 Admission is bounded. Overload/drain returns HTTP `503` with code `overloaded`;
 it does not create an unbounded queue. Generation timeout returns `504` before
-streaming starts, or an `error` event after a Responses stream has started.
+streaming starts. After streaming begins, every endpoint emits a structured SSE
+error and terminates the stream; Chat/Completions also emit `[DONE]`.
 
 `finish_reason` is `stop` for EOS or a requested stop sequence and `length`
 when the output-token limit is reached. Usage counts are tokenizer token counts;

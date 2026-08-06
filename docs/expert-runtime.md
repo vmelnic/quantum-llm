@@ -258,9 +258,12 @@ layers. Page credits are acquired per request, physical pages are allocated on
 first use, and released pages enter a bounded reuse pool. Online-softmax
 attention does not allocate a score array proportional to context length.
 
-Only 4096 context with capacity four is certified. The model's 262K position
-metadata remains outside the runtime guarantee until efficient prefill and
-long-context gates pass.
+Only 4096 context with capacity four has completed the historical
+qualification. The reference lifecycle currently advertises 65,536 tokens and
+8,192 output tokens; Qwen allocates KV pages on demand, so short requests do
+not reserve that maximum physically. The model's 262K position metadata remains
+outside the runtime guarantee until efficient prefill and long-context gates
+pass.
 
 ## Worker protocol
 
@@ -268,8 +271,11 @@ The local line-framed protocol supports:
 
 - startup `ready` with protocol/capacity, causal prefill chunk size, and KV page
   geometry;
-- protocol-v3 `BEGIN` with an exact context reservation, then position-ordered
+- protocol-v4 `BEGIN` with an exact context reservation, then position-ordered
   causal prefill in chunks no larger than the advertised worker capacity;
+- explicit placement-prefetch state and a token list for the MTP boundary,
+  with front-end compatibility for the existing Qwen runner's older scalar
+  token and inferred-prefetch forms;
 - `STEP` to decode several active request IDs together;
 - `STATS` for current KV page allocation/reservation;
 - `END` to release/cancel request state;

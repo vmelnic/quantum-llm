@@ -1,167 +1,110 @@
-# Operations
+# Operations runbook
 
-## Deployment model
-
-The tested pre-production profile is one Windows GPU host, one Python HTTP
-front-end, and one persistent C++ CUDA worker. Task Scheduler supplies restart
-and logon activation; it is a pilot supervisor, not a full Windows service
-manager.
-
-## Control host
-
-The optional POSIX wrappers sync Git-visible source without copying `.git`,
-ignored models, work directories, logs, artifacts, or build output:
-
-```bash
-cp .env.example .env
-# Set QUANTUM_LLM_REMOTE and the two model artifact paths, then:
-./ops/model.sh start
-./ops/model.sh status
-./ops/model.sh chat
-./ops/model.sh stop
-```
-
-`CHAT_MODEL=deepseek-v4-flash` is the default. `./ops/model.sh start qwen`
-switches explicitly without editing `.env`; `start deepseek` switches back.
-Every start optionally synchronizes the Git-visible tree, stops both competing
-tasks, installs the selected task, waits for readiness, and verifies identity,
-context, and output limits. Set `MODEL_SYNC_ON_START=0` only for an already
-synchronized immutable deployment.
-
-The operational limits are local configuration, not source constants:
-
-| Variable | Example | Meaning |
-|---|---:|---|
-| `MODEL_MAX_CONTEXT` | `65536` | prompt, history and requested output combined |
-| `MODEL_MAX_OUTPUT_TOKENS` | `8192` | server ceiling for one response |
-| `CHAT_MAX_TOKENS` | `8192` | output ceiling requested by each terminal-chat turn |
-| `MODEL_GENERATION_TIMEOUT_SECONDS` | `600` | worker deadline for one generation |
-| `MODEL_READY_TIMEOUT` | `600` | how long `model.sh start` waits for readiness |
-
-The DeepSeek 65,536-token deployment fits the current 2 GiB logical KV-page
-budget at capacity one. This is an enabled operational limit, not evidence that
-65,536-token quality, latency, or prefill performance has been qualified.
-
-Sync is non-destructive: obsolete remote source files are not removed. Use a
-fresh deployment directory for a release or clean obsolete tracked files during
-the release procedure.
+Use [Install, configure and use](deployment.md) for initial setup. This page is
+the short day-two runbook.
 
 ## Lifecycle
 
-```powershell
-# Install or replace configuration and optionally start
-.\ops\windows\Install-ExpertServerTask.ps1 -Start -BuildId <commit>
-
-# DeepSeek has an independent task and model-specific safe defaults
-.\ops\windows\Install-DeepSeekExpertServerTask.ps1 `
-  -Bundle D:\models\deepseek-v4-flash\worker-bundle-v1 `
-  -EnableMtp -BuildId <commit>
-
-# Stop and release VRAM; keep the task registered
-.\ops\windows\Stop-ExpertServer.ps1
-
-# Start an installed task
-Start-ScheduledTask QuantumLLM-P6ExpertServer
-
-# Stop, kill descendants, and unregister
-.\ops\windows\Uninstall-ExpertServerTask.ps1
+```bash
+./ops/model.sh install            # after clone or requirements changes
+./ops/model.sh config             # resolved non-secret local configuration
+./ops/model.sh start              # CHAT_MODEL from .env
+./ops/model.sh start qwen         # explicit switch
+./ops/model.sh start deepseek
+./ops/model.sh status
+./ops/model.sh chat               # resolves the actually deployed model
+./ops/model.sh stop
+./ops/model.sh stop all           # release every model process and VRAM
+./ops/model.sh sync               # source/docs only, without restart
 ```
 
-Stopping only the PowerShell task is insufficient on some Windows versions:
-the CUDA worker can survive as a grandchild. The repository stop/uninstall
-scripts resolve the server command line and kill its full descendant tree.
+`start` synchronizes by default, performs a read-only dependency preflight
+before disrupting the current service, stops both competing tasks, installs the
+selected task, waits for readiness and verifies model/context/output/deadline.
+
+Only one model owns the GPU and loopback API port. Task Scheduler is a pilot
+supervisor. The repository stop command kills the complete Python/worker
+descendant tree; stopping only the visible task can leave CUDA children alive.
 
 ## Health and identity
 
 - `/health`: worker process is alive;
-- `/ready`: worker is healthy and server is accepting requests;
-- `/model-info`: model ID, build ID, manifest/index hashes, active requests,
-  effective placement profile/cache budgets, context, capacity, and timeouts;
-- `/metrics`: Prometheus counters and bounded latency-window percentiles.
+- `/ready`: healthy and admitting, not necessarily warm;
+- `/model-info`: model/build/artifact identity, configured limits, placement,
+  KV geometry, capacity and active request count;
+- `/metrics`: bounded service counters and latency summaries.
 
-Always check build ID and model content hashes after deployment. A listening
-port alone is not proof that the new worker started.
+After every deploy, require `model.sh start` to return without mismatches and
+confirm `model.sh status`. A listening port alone is not proof of identity.
 
-## Logs and artifacts
+## Limits and capacity
 
-Generated state is intentionally outside Git:
+`.env` is the deployment authority:
 
-```text
-logs/expert-server.jsonl
-artifacts/expert-runtime-build-latest.json
-artifacts/p6-service-smoke-latest.json
-artifacts/p6-gate-latest.json
-artifacts/p6-text-probe-latest.json
-```
+| Variable | Reference value | Meaning |
+|---|---:|---|
+| `MODEL_MAX_CONTEXT` | `65536` | instructions + history + input + requested output |
+| `MODEL_MAX_OUTPUT_TOKENS` | `8192` | server ceiling for one response |
+| `CHAT_MAX_TOKENS` | `8192` | terminal client request ceiling |
+| `MODEL_GENERATION_TIMEOUT_SECONDS` | `600` | request execution deadline |
+| `MODEL_READY_TIMEOUT` | `600` | lifecycle wait deadline |
 
-Ship logs and metrics to external storage for a real pilot. Local JSONL has no
-rotation or retention manager. Never log API keys or prompt content.
-When a log file is configured, the Python front-end writes only to that file;
-duplicating service logs to an unconsumed Task Scheduler stderr pipe can apply
-backpressure and block request handling. Foreground launches without a log file
-continue to use stderr.
+Qwen uses four worker slots/eight queued requests; DeepSeek uses one worker
+slot/four queued requests in the current profile. KV credits are aggregate.
+Overload or insufficient context credits returns bounded HTTP errors rather
+than allocating unbounded memory.
 
-Measure a real tokenizer/chat-template path separately from the synthetic
-token-ID correctness gate:
+The 65K ceiling is enabled but unqualified. See
+[Performance evidence](benchmarks.md) and
+[Production readiness](production-readiness.md).
 
-```powershell
-.\ops\windows\Invoke-P6TextProbe.ps1 -Rounds 2 -MaxTokens 32
-```
+## Logs and diagnosis
 
-The first round records the current placement state; the second identical round
-shows reuse. Report both—never publish only the warm result.
+The service JSONL is under the ignored remote `logs/` directory. It contains
+identity/readiness, HTTP summaries, startup failures, request failures and
+worker stderr without prompt content or API keys.
 
-## Capacity and overload
+Diagnostic order:
 
-The default deployment has four active worker slots, eight queued requests,
-and the `balanced` placement profile. Placement profiles change cache policy,
-not admission limits. Pass `-PlacementProfile latency|balanced|capacity` to the
-foreground or task installer and verify the effective policy through
-`/model-info.worker_placement`.
-Admission and worker-slot acquisition are bounded. Overload returns HTTP 503;
-clients should use bounded exponential backoff with jitter and a request
-deadline.
+1. `./ops/model.sh status`;
+2. confirm task state and last result;
+3. inspect the latest `service_start_failed`, `request_preprocessing_failed`,
+   `request_failed` or CUDA worker event;
+4. run the same launcher in foreground only when Task Scheduler hid a native
+   exception;
+5. fix the contract/dependency; do not extend timeouts blindly.
 
-An 18 GiB VRAM expert-cache budget does not allocate 18 GiB at startup. Cache
-use grows with expert reuse and remains hot until eviction or process stop.
-Stopping the service releases model VRAM.
-
-KV has an independent MiB budget. `/model-info.worker_kv` exposes page size,
-capacity, reservations, and physical high-water allocation; Prometheus exposes
-`expert_service_kv_reserved_pages`. Overcommitted context is rejected before
-streaming with `context_capacity_exhausted`.
+`model.sh install` reconciles pinned server requirements. `start` only checks
+imports/versions and fails before stopping the currently running model.
 
 ## Rollback
 
-1. Stop the task with the repository script.
-2. Deploy a previously validated commit into a fresh directory.
-3. Build and run compiler/runtime tests.
-4. Validate the existing immutable Expert Pack.
-5. install with the rollback commit as `BuildId`.
-6. Require `/model-info` identity and the full service smoke to pass.
+1. Stop all model processes.
+2. Deploy a previously validated commit to a clean directory.
+3. Reconcile pinned requirements and build/test the native runtime.
+4. Validate the immutable pack/bundle independently.
+5. Start and require `/model-info` identity plus one real chat request.
 
-Code rollback does not mutate the original Hugging Face checkpoint or the
-Expert Pack. ABI incompatibility must fail startup; never bypass validation.
+Code rollback never mutates model artifacts. Keep the original checkpoint or
+an independently validated immutable pack with hashes.
 
-## Backup and recovery
+## Exposure and security
 
-Expert Pack is reproducible from the pinned source checkpoint, adapter, and
-compiler commit. Keep at least one of:
+The default loopback bind plus SSH tunnel is the supported pilot configuration.
+The built-in server is not an internet edge. For broader access, add a private
+firewall allowlist and a TLS/authenticated/rate-limited reverse proxy. Rotate
+keys outside the repository and restrict health/metrics/model-info separately.
 
-- the original checkpoint plus revision and hashes;
-- an independently validated Expert Pack plus manifest and pack hashes.
+## Performance reporting
 
-A `.partial` conversion is not deployable. Resume only with the same source
-bytes and options. Do not treat a model directory without `COMPLETED` as valid.
+Never publish one unqualified “tok/s” number. Record:
 
-## Remote exposure
+- cold or warm and how warming was obtained;
+- single-stream or aggregate;
+- prompt/history and output token counts;
+- TTFT, post-first-token and end-to-end rates;
+- cache/storage/transfer state when available.
 
-Loopback is the safe default. For network access:
-
-1. set `EXPERT_API_KEY` in the service environment;
-2. bind the service only on a private interface;
-3. terminate TLS and enforce rate/body limits at a reverse proxy;
-4. restrict health/metrics/model-info separately;
-5. use firewall allowlists and rotate the shared key.
-
-The built-in server is not an internet-facing edge server.
+An identical repeated Qwen prompt can exceed 30 tok/s after the first token,
+while changing multi-turn chat remains near 1 tok/s. Both facts must remain
+visible.
