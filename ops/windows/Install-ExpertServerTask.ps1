@@ -18,6 +18,7 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
+    [switch]$EnableMtp,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -95,6 +96,9 @@ foreach ($entry in @(
         $taskArguments.Add((Quote-TaskArgument ([string]$entry.Value)))
     }
 }
+if ($Profile -eq "DeepSeekV4Flash" -and $EnableMtp) {
+    $taskArguments.Add("-EnableMtp")
+}
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument ($taskArguments -join " ")
@@ -118,5 +122,6 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     maximum_new_tokens = $MaximumNewTokens
     model_input = if ($Profile -eq "P6") { $Container } else { $Bundle }
     placement_profile = $PlacementProfile
+    mtp_enabled = [bool]$EnableMtp
     started = [bool]$Start
 } | ConvertTo-Json

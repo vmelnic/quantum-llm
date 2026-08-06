@@ -181,6 +181,7 @@ passes. Registration does not start it unless `-Start` is supplied:
 ```powershell
 ./ops/windows/Install-DeepSeekExpertServerTask.ps1 `
   -Bundle D:\models\deepseek-v4-flash\worker-bundle-v1 `
+  -EnableMtp `
   -BuildId (git rev-parse --short HEAD)
 
 # Explicit lifecycle
