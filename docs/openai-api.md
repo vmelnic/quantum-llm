@@ -70,6 +70,13 @@ retains conversation history. Enter `quit` or `exit`, or press Ctrl+C, to close
 both the client and the tunnel it created. With an empty `CHAT_SSH`, it connects
 directly to `CHAT_BASE_URL`.
 
+With `CHAT_SHOW_STATS=1`, every turn prints prompt/output token counts, TTFT,
+total request time, end-to-end tokens/s, post-first-token rate, and finish
+reason. `/info` displays the deployed build, placement profile, MTP state,
+context/output limits, capacity, current RAM/VRAM expert-cache use, KV pages,
+storage format, prefetch state, and worker protocol. `/stats` repeats the last
+turn, while `/clear` starts a new conversation without restarting the model.
+
 DeepSeek-V4-Flash does not publish a Transformers `chat_template`. For that
 model the service loads the pinned checkpoint's official
 `encoding/encoding_dsv4.py` and uses its `encode_messages(...,

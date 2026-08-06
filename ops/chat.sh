@@ -22,6 +22,11 @@ chat_args=(
 if [[ -n "${CHAT_SSH:-}" ]]; then
   chat_args+=(--ssh "${CHAT_SSH}")
 fi
+case "${CHAT_SHOW_STATS:-1}" in
+  1|true|TRUE|yes|YES) chat_args+=(--show-stats) ;;
+  0|false|FALSE|no|NO) chat_args+=(--no-show-stats) ;;
+  *) echo "CHAT_SHOW_STATS must be 1/0, true/false, or yes/no" >&2; exit 2 ;;
+esac
 
 exec "${CHAT_PYTHON:-python3}" "${script_dir}/python/chat_client.py" \
   "${chat_args[@]}" "$@"
