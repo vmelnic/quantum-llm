@@ -277,8 +277,12 @@ latency or aggregate throughput without changing model semantics.
   model steps serially.
   - [x] Pin the exact union once and run routed plus shared experts with
     `rows=2`; duplicates across rows keep stable routing order.
-  - [ ] Batch compatible attention and router dense projections while
-    preserving row-zero-before-row-one causal cache publication.
+  - [x] Batch compatible attention projections with weight-reuse kernels while
+    preserving row-zero-before-row-one KV/CSA publication. One request-private
+    workspace is reused across all layers; persistent context state is not
+    duplicated.
+  - [ ] Batch the two router projections and retain independent exact top-six
+    selection per row.
 - [x] Publish acceptance, rejection, target rows/steps, useful output tokens,
   and adaptive-suppression counters. Ratio-four checkpoint/restore bytes and
   replay attribution remain part of the next measurement pass.

@@ -22,6 +22,9 @@ struct Int8Matrix final {
 [[nodiscard]] Status gemv_grouped_inputs(
     const Int8Matrix& matrix, const float* input, float* output,
     std::uint32_t groups, void* stream) noexcept;
+[[nodiscard]] Status gemv_grouped_inputs_batch_weight_reuse(
+    const Int8Matrix& matrix, const float* input, float* output,
+    std::uint32_t groups, std::uint32_t batch, void* stream) noexcept;
 // Inputs and outputs are row-major [batch, columns] and [batch, rows]. Blocks
 // for the same matrix row are adjacent so concurrent requests reuse weights.
 [[nodiscard]] Status gemv_batch(const Int8Matrix& matrix, const float* input,
@@ -44,6 +47,10 @@ struct Int8Matrix final {
                                std::uint32_t rows, std::uint32_t columns,
                                const float* input, float* output,
                                void* stream) noexcept;
+[[nodiscard]] Status gemv_bf16_batch(
+    const std::uint16_t* matrix, std::uint32_t rows, std::uint32_t columns,
+    const float* input, float* output, std::uint32_t batch,
+    void* stream) noexcept;
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;

@@ -344,7 +344,8 @@ class Model final {
     require(request_size.status.ok(), request_size.status.message());
     request_bytes_ = request_size.total_bytes;
     if (mtp_enabled_) {
-      const auto verify_size = er::cuda::deepseek_verify_state_size();
+      const auto verify_size =
+          er::cuda::deepseek_verify_state_size(max_context_);
       require(verify_size.status.ok(), verify_size.status.message());
       verify_request_bytes_ = verify_size.total_bytes;
     }

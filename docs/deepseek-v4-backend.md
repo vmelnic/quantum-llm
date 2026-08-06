@@ -167,6 +167,16 @@ row zero remains committed and the minimal ratio-four checkpoint is restored.
 The target head decides acceptance before protocol v5 exposes a second token.
 Deeper draft trees would still require a general checkpoint policy.
 
+Attention verification is also one pair operation rather than two hidden
+single-token calls. A request-private transient workspace holds two rows of
+projection scratch and is reused across every target layer. INT8 Q/KV/output
+matrices and BF16 compressor/index matrices are read once per pair. Persistent
+KV, CSA, and compressor ownership remains in the original per-layer request
+state. Within the pair operation row zero publishes and consumes its cache
+state before row one can publish, so window wrap cannot overwrite a value
+still needed by row zero. The ratio-four checkpoint is written at that exact
+causal boundary.
+
 Storage packing and compute packing are separate contracts. Durable Expert
 Packs make each authenticated expert contiguous for predictable I/O; the
 record inside remains native FP4/UE8M0. A catalog over original Hugging Face

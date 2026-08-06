@@ -10,6 +10,8 @@ namespace expert::runtime::cuda {
 
 struct DeepSeekAttentionStateResult;
 struct DeepSeekAttentionStateSize;
+struct DeepSeekAttentionPairWorkspaceResult;
+struct DeepSeekAttentionPairWorkspaceSize;
 
 class DeepSeekAttentionState final {
  public:
@@ -39,6 +41,8 @@ class DeepSeekAttentionState final {
   friend DeepSeekAttentionStateSize deepseek_attention_state_size(
       std::uint32_t, std::uint32_t) noexcept;
   friend Status deepseek_attention_decode(const struct DeepSeekAttentionLaunch&) noexcept;
+  friend Status deepseek_attention_decode_pair(
+      const struct DeepSeekAttentionPairLaunch&) noexcept;
   DeepSeekAttentionState(void* allocation, std::uint64_t allocation_bytes,
                          std::uint32_t ratio, std::uint32_t max_context,
                          std::uint32_t max_compressed) noexcept;
@@ -68,6 +72,72 @@ class DeepSeekAttentionState final {
   float *index_compress_values_{}, *index_compress_scores_{};
   float *index_compress_pooled_{}, *index_compress_output_{};
 };
+
+// Request-private transient storage for two causally adjacent target rows.
+// Persistent KV, CSA, and compressor state remains owned by the per-layer
+// DeepSeekAttentionState; this allocation is reused across all 43 layers.
+class DeepSeekAttentionPairWorkspace final {
+ public:
+  ~DeepSeekAttentionPairWorkspace();
+  DeepSeekAttentionPairWorkspace(const DeepSeekAttentionPairWorkspace&) = delete;
+  DeepSeekAttentionPairWorkspace& operator=(
+      const DeepSeekAttentionPairWorkspace&) = delete;
+
+  [[nodiscard]] std::uint64_t bytes() const noexcept {
+    return allocation_bytes_;
+  }
+  [[nodiscard]] std::uint32_t max_context_tokens() const noexcept {
+    return max_context_;
+  }
+
+ private:
+  friend DeepSeekAttentionPairWorkspaceResult
+  create_deepseek_attention_pair_workspace(std::uint32_t) noexcept;
+  friend DeepSeekAttentionPairWorkspaceSize
+  deepseek_attention_pair_workspace_size(std::uint32_t) noexcept;
+  friend Status deepseek_attention_decode_pair(
+      const struct DeepSeekAttentionPairLaunch&) noexcept;
+  DeepSeekAttentionPairWorkspace(void* allocation,
+                                 std::uint64_t allocation_bytes,
+                                 std::uint32_t max_context) noexcept;
+  void map(void* base) noexcept;
+
+  void* allocation_{};
+  std::uint64_t allocation_bytes_{};
+  std::uint32_t max_context_{};
+  std::uint32_t selected_per_row_{};
+  std::uint32_t index_scores_per_row_{};
+
+  std::uint16_t *query_bf16_{}, *attention_bf16_{}, *index_query_bf16_{};
+  std::int32_t* indices_{};
+  float *hca_normalized_{}, *hca_mixes_{}, *collapsed_{}, *attention_input_{};
+  float *pre_{}, *post_{}, *comb_{};
+  float *query_rank_{}, *query_norm_{}, *query_{}, *kv_{}, *kv_norm_{};
+  float *attention_output_{}, *group_output_{}, *sublayer_{};
+  float *compress_values_{}, *compress_scores_{}, *compress_pooled_{};
+  float* compress_output_{};
+  float *index_query_{}, *index_head_weights_{}, *index_scores_{};
+  float *index_compress_values_{}, *index_compress_scores_{};
+  float *index_compress_pooled_{}, *index_compress_output_{};
+};
+
+struct DeepSeekAttentionPairWorkspaceResult final {
+  Status status;
+  std::shared_ptr<DeepSeekAttentionPairWorkspace> workspace;
+};
+
+struct DeepSeekAttentionPairWorkspaceSize final {
+  Status status;
+  std::uint64_t bytes{};
+};
+
+[[nodiscard]] DeepSeekAttentionPairWorkspaceSize
+deepseek_attention_pair_workspace_size(
+    std::uint32_t max_context_tokens) noexcept;
+
+[[nodiscard]] DeepSeekAttentionPairWorkspaceResult
+create_deepseek_attention_pair_workspace(
+    std::uint32_t max_context_tokens) noexcept;
 
 struct DeepSeekAttentionStateResult final {
   Status status;
@@ -121,5 +191,30 @@ struct DeepSeekAttentionLaunch final {
 // sparse attention, grouped output projection, and HCA post.
 [[nodiscard]] Status deepseek_attention_decode(
     const DeepSeekAttentionLaunch& launch) noexcept;
+
+struct DeepSeekAttentionPairLaunch final {
+  const DeepSeekAttentionBinding* weights{};
+  DeepSeekAttentionState* state{};
+  DeepSeekAttentionPairWorkspace* workspace{};
+  const float* streams[2]{};          // each [4, 4096]
+  float* updated_streams[2]{};        // each [4, 4096]
+  const float* cosine[2]{};
+  const float* sine[2]{};
+  const float* compressed_cosine[2]{};
+  const float* compressed_sine[2]{};
+  std::uint32_t positions[2]{};
+  // Optional destination for the minimal ratio-four recurrent checkpoint.
+  // It is written after row zero and before any row-one state mutation.
+  void* speculative_checkpoint{};
+  float epsilon{1e-6F};
+  std::uint32_t sinkhorn_iterations{20U};
+  void* stream{};
+};
+
+// Two-token target attention with shared dense-weight reads. Projection work
+// is batched, while cache publication and sparse attention remain strictly
+// row-zero-before-row-one so ring-buffer and compressor semantics are exact.
+[[nodiscard]] Status deepseek_attention_decode_pair(
+    const DeepSeekAttentionPairLaunch& launch) noexcept;
 
 }  // namespace expert::runtime::cuda

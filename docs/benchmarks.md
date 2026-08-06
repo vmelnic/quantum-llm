@@ -815,6 +815,19 @@ have insufficient overlap to keep I/O/upload off the critical path. The next
 optimization is batched dense attention projection plus a placement/profile
 decision that prevents cold expert movement; MTP cannot manufacture bandwidth.
 
+The next gate replaced the two serial attention calls inside each verifier
+layer with one causal pair transaction. INT8 and BF16 dense projections read
+each matrix row once for both activations; KV/CSA publication remains ordered,
+and a roughly 2 MiB request-private workspace is reused across all 43 layers.
+The ordinary and speculative workers again returned exactly
+`14, 552, 438, 223, 25`. The speculative transcript contained two acceptances
+and one rejection. In separate balanced-placement processes, target-model time
+for five useful tokens was 4.610 s speculative versus 4.952 s ordinary, about
+a 7% reduction. The corresponding speculative rate was only about 1.08 useful
+tok/s. This is a real end-to-end improvement, but it also rejects dense
+attention batching as the dominant route to 30 tok/s on this host. Router
+batching remains useful; expert residency and movement remain the main gate.
+
 ## Benchmark rules
 
 Any published result must include:

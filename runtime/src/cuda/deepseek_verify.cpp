@@ -32,7 +32,8 @@ Status failure(cudaError_t error, const char* operation) noexcept {
 
 }  // namespace
 
-DeepSeekVerifyStateSize deepseek_verify_state_size() noexcept {
+DeepSeekVerifyStateSize deepseek_verify_state_size(
+    std::uint32_t max_context_tokens) noexcept {
   DeepSeekVerifyStateSize result{Status::success()};
   const auto ffn_bytes = deepseek_ffn_state_size();
   if (ffn_bytes > std::numeric_limits<std::uint64_t>::max() /
@@ -41,6 +42,10 @@ DeepSeekVerifyStateSize deepseek_verify_state_size() noexcept {
              "DeepSeek verify FFN state size overflow"}};
   result.secondary_ffn_bytes = ffn_bytes * kDeepSeekLayers;
   result.pair_ffn_bytes = deepseek_ffn_pair_workspace_size();
+  const auto attention_pair =
+      deepseek_attention_pair_workspace_size(max_context_tokens);
+  if (!attention_pair.status.ok()) return {attention_pair.status};
+  result.pair_attention_bytes = attention_pair.bytes;
   result.secondary_io_bytes = deepseek_io_state_size();
   result.secondary_stream_bytes = kSecondaryStreamBytes;
   for (const auto ratio : kCompressionRatios) {
@@ -50,6 +55,7 @@ DeepSeekVerifyStateSize deepseek_verify_state_size() noexcept {
                "DeepSeek verify rollback size overflow"}};
   }
   for (const auto value : {result.secondary_ffn_bytes, result.pair_ffn_bytes,
+                           result.pair_attention_bytes,
                            result.secondary_io_bytes,
                            result.secondary_stream_bytes,
                            result.rollback_bytes}) {
@@ -100,21 +106,19 @@ Status DeepSeekVerifyState::begin_transaction(
   return Status::success();
 }
 
-Status DeepSeekVerifyState::checkpoint_layer(std::uint32_t index,
-                                             void* stream) noexcept {
+Status DeepSeekVerifyState::mark_layer_checkpointed(
+    std::uint32_t index) noexcept {
   if (!active_ || index >= kDeepSeekLayers || checkpointed_[index])
     return {ErrorCode::invalid_argument,
-            "invalid DeepSeek verification checkpoint"};
+            "invalid DeepSeek verification checkpoint mark"};
   if (!recurrent_boundary_ || kCompressionRatios[index] != 4U)
     return Status::success();
   const auto view = layer(index);
   if (!view.attention_state || !view.rollback_checkpoint)
     return {ErrorCode::internal,
             "DeepSeek verification checkpoint state is incomplete"};
-  auto status = view.attention_state->checkpoint_speculative_state(
-      view.rollback_checkpoint, stream);
-  if (status.ok()) checkpointed_[index] = true;
-  return status;
+  checkpointed_[index] = true;
+  return Status::success();
 }
 
 Status DeepSeekVerifyState::project_pair_logits(void* stream) noexcept {
@@ -187,7 +191,8 @@ DeepSeekVerifyStateResult create_deepseek_verify_state(
   if (!request || device_state_budget_bytes == 0U)
     return {{ErrorCode::invalid_argument,
              "DeepSeek verify state requires a request and budget"}, {}};
-  const auto estimate = deepseek_verify_state_size();
+  const auto estimate =
+      deepseek_verify_state_size(request->max_context_tokens());
   if (!estimate.status.ok()) return {estimate.status, {}};
   if (estimate.total_bytes > device_state_budget_bytes)
     return {{ErrorCode::backpressure,
@@ -211,6 +216,13 @@ DeepSeekVerifyStateResult create_deepseek_verify_state(
   if (!add_checked(candidate->ffn_workspace_->bytes(), actual))
     return {{ErrorCode::internal,
              "DeepSeek verify pair workspace size overflow"}, {}};
+  auto attention_pair = create_deepseek_attention_pair_workspace(
+      candidate->request_->max_context_tokens());
+  if (!attention_pair.status.ok()) return {attention_pair.status, {}};
+  candidate->attention_workspace_ = std::move(attention_pair.workspace);
+  if (!add_checked(candidate->attention_workspace_->bytes(), actual))
+    return {{ErrorCode::internal,
+             "DeepSeek verify attention workspace size overflow"}, {}};
   auto io = create_deepseek_io_state();
   if (!io.status.ok()) return {io.status, {}};
   candidate->secondary_io_state_ = std::move(io.state);

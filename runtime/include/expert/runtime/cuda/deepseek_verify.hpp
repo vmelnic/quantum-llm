@@ -12,13 +12,15 @@ struct DeepSeekVerifyStateSize final {
   Status status;
   std::uint64_t secondary_ffn_bytes{};
   std::uint64_t pair_ffn_bytes{};
+  std::uint64_t pair_attention_bytes{};
   std::uint64_t secondary_io_bytes{};
   std::uint64_t secondary_stream_bytes{};
   std::uint64_t rollback_bytes{};
   std::uint64_t total_bytes{};
 };
 
-[[nodiscard]] DeepSeekVerifyStateSize deepseek_verify_state_size() noexcept;
+[[nodiscard]] DeepSeekVerifyStateSize deepseek_verify_state_size(
+    std::uint32_t max_context_tokens = 4096U) noexcept;
 
 struct DeepSeekVerifyLayerStateView final {
   const DeepSeekAttentionBinding* attention_weights{};
@@ -51,6 +53,10 @@ class DeepSeekVerifyState final {
   [[nodiscard]] DeepSeekFfnPairWorkspace* ffn_workspace() const noexcept {
     return ffn_workspace_.get();
   }
+  [[nodiscard]] DeepSeekAttentionPairWorkspace* attention_workspace()
+      const noexcept {
+    return attention_workspace_.get();
+  }
   [[nodiscard]] const float* primary_streams() const noexcept;
   [[nodiscard]] const float* speculative_streams() const noexcept {
     return speculative_streams_a_;
@@ -62,8 +68,7 @@ class DeepSeekVerifyState final {
                                          void* stream) noexcept;
   [[nodiscard]] Status begin_transaction(
       std::uint32_t speculative_position) noexcept;
-  [[nodiscard]] Status checkpoint_layer(std::uint32_t layer,
-                                        void* stream) noexcept;
+  [[nodiscard]] Status mark_layer_checkpointed(std::uint32_t layer) noexcept;
   [[nodiscard]] Status project_pair_logits(void* stream) noexcept;
   [[nodiscard]] const std::uint32_t* primary_sampled_token() const noexcept;
   [[nodiscard]] const std::uint32_t* bonus_sampled_token() const noexcept;
@@ -87,6 +92,7 @@ class DeepSeekVerifyState final {
   std::array<std::shared_ptr<DeepSeekFfnState>, kDeepSeekLayers>
       secondary_ffn_states_{};
   std::shared_ptr<DeepSeekFfnPairWorkspace> ffn_workspace_;
+  std::shared_ptr<DeepSeekAttentionPairWorkspace> attention_workspace_;
   std::shared_ptr<DeepSeekIoState> secondary_io_state_;
   void* stream_allocation_{};
   float* speculative_streams_a_{};

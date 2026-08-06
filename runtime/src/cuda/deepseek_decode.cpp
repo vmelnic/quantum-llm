@@ -572,35 +572,42 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::advance() noexcept {
                    "DeepSeek pair verification is missing group RoPE");
     };
     const auto attention_route_started = std::chrono::steady_clock::now();
-    const float *group_cosine{}, *group_sine{};
-    auto status = group_rope(0U, group_cosine, group_sine);
+    const float* group_cosine[2]{};
+    const float* group_sine[2]{};
+    auto status = group_rope(0U, group_cosine[0], group_sine[0]);
     if (!status.ok()) return fail(status);
-    status = deepseek_attention_decode({
-        view.attention_weights, view.attention_state, request_->streams_a_,
-        request_->streams_b_,
-        view.compress_ratio ? pair_rope_[0].compressed_cosine
-                            : pair_rope_[0].base_cosine,
-        view.compress_ratio ? pair_rope_[0].compressed_sine
-                            : pair_rope_[0].base_sine,
-        group_cosine, group_sine, pair_positions_[0], 1e-6F, 20U, stream_});
+    status = group_rope(1U, group_cosine[1], group_sine[1]);
+    if (!status.ok()) return fail(status);
+    DeepSeekAttentionPairLaunch attention_pair{};
+    attention_pair.weights = view.attention_weights;
+    attention_pair.state = view.attention_state;
+    attention_pair.workspace = verify_->attention_workspace();
+    attention_pair.streams[0] = request_->streams_a_;
+    attention_pair.streams[1] = verify_->speculative_streams_a_;
+    attention_pair.updated_streams[0] = request_->streams_b_;
+    attention_pair.updated_streams[1] = verify_->speculative_streams_b_;
+    for (std::uint32_t row = 0U; row < 2U; ++row) {
+      attention_pair.cosine[row] = view.compress_ratio
+          ? pair_rope_[row].compressed_cosine
+          : pair_rope_[row].base_cosine;
+      attention_pair.sine[row] = view.compress_ratio
+          ? pair_rope_[row].compressed_sine
+          : pair_rope_[row].base_sine;
+      attention_pair.compressed_cosine[row] = group_cosine[row];
+      attention_pair.compressed_sine[row] = group_sine[row];
+      attention_pair.positions[row] = pair_positions_[row];
+    }
+    attention_pair.speculative_checkpoint = view.rollback_checkpoint;
+    attention_pair.epsilon = 1e-6F;
+    attention_pair.sinkhorn_iterations = 20U;
+    attention_pair.stream = stream_;
+    status = deepseek_attention_decode_pair(attention_pair);
+    if (!status.ok()) return fail(status);
+    status = verify_->mark_layer_checkpointed(current_layer_);
     if (!status.ok()) return fail(status);
     status = deepseek_ffn_route({
         view.ffn_weights, view.ffn_states[0], request_->streams_b_,
         pair_token_ids_[0], 1e-6F, 20U, stream_});
-    if (!status.ok()) return fail(status);
-
-    status = verify_->checkpoint_layer(current_layer_, stream_);
-    if (!status.ok()) return fail(status);
-    status = group_rope(1U, group_cosine, group_sine);
-    if (!status.ok()) return fail(status);
-    status = deepseek_attention_decode({
-        view.attention_weights, view.attention_state,
-        verify_->speculative_streams_a_, verify_->speculative_streams_b_,
-        view.compress_ratio ? pair_rope_[1].compressed_cosine
-                            : pair_rope_[1].base_cosine,
-        view.compress_ratio ? pair_rope_[1].compressed_sine
-                            : pair_rope_[1].base_sine,
-        group_cosine, group_sine, pair_positions_[1], 1e-6F, 20U, stream_});
     if (!status.ok()) return fail(status);
     status = deepseek_ffn_route({
         view.ffn_weights, view.ffn_states[1],

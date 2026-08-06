@@ -112,6 +112,41 @@ __global__ void int8_gemv_grouped_inputs_vector_kernel(
   if (lane == 0) output[row] = partial * scales[row];
 }
 
+__global__ void int8_gemv_grouped_inputs_batch_reuse_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t rows_per_group, std::uint32_t groups,
+    std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const auto group = row / rows_per_group;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  float partial[kMaximumWeightReuseBatch]{};
+  for (std::uint32_t column = lane * 4U; column < columns;
+       column += kWarpSize * 4U) {
+    const auto packed = *reinterpret_cast<const char4*>(weight + column);
+    for (std::uint32_t request = 0U; request < batch; ++request) {
+      const auto* activation = input +
+          (static_cast<std::size_t>(request) * groups + group) * columns;
+      const auto values =
+          *reinterpret_cast<const float4*>(activation + column);
+      partial[request] += static_cast<float>(packed.x) * values.x;
+      partial[request] += static_cast<float>(packed.y) * values.y;
+      partial[request] += static_cast<float>(packed.z) * values.z;
+      partial[request] += static_cast<float>(packed.w) * values.w;
+    }
+  }
+  for (std::uint32_t request = 0U; request < batch; ++request) {
+    const auto sum = warp_sum(partial[request]);
+    if (lane == 0U)
+      output[static_cast<std::size_t>(request) * rows + row] =
+          sum * scales[row];
+  }
+}
+
 __global__ void int8_gemv_batch_kernel(
     const std::int8_t* weights, const float* scales, const float* input,
     float* output, std::uint32_t rows, std::uint32_t columns,
@@ -208,6 +243,31 @@ __global__ void bf16_gemv_kernel(const std::uint16_t* weights,
     partial += __uint_as_float(static_cast<unsigned>(weight[i]) << 16U) * input[i];
   partial = warp_sum(partial);
   if (lane == 0) output[row] = partial;
+}
+
+__global__ void bf16_gemv_batch_reuse_kernel(
+    const std::uint16_t* weights, const float* input, float* output,
+    std::uint32_t rows, std::uint32_t columns, std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  float partial[kMaximumWeightReuseBatch]{};
+  for (std::uint32_t column = lane; column < columns;
+       column += kWarpSize) {
+    const auto value =
+        __uint_as_float(static_cast<unsigned>(weight[column]) << 16U);
+    for (std::uint32_t request = 0U; request < batch; ++request)
+      partial[request] += value *
+          input[static_cast<std::size_t>(request) * columns + column];
+  }
+  for (std::uint32_t request = 0U; request < batch; ++request) {
+    const auto sum = warp_sum(partial[request]);
+    if (lane == 0U)
+      output[static_cast<std::size_t>(request) * rows + row] = sum;
+  }
 }
 
 __global__ void rms_kernel(const float* input, const float* weight,
@@ -984,6 +1044,22 @@ Status gemv_grouped_inputs(const Int8Matrix& m, const float* input,
       m.rows / groups);
   return checked(cudaPeekAtLastError(), "grouped-input int8 gemv");
 }
+Status gemv_grouped_inputs_batch_weight_reuse(
+    const Int8Matrix& m, const float* input, float* output,
+    std::uint32_t groups, std::uint32_t batch, void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !groups || m.rows % groups != 0U ||
+      m.columns % 4U != 0U || !batch || batch > kMaximumWeightReuseBatch)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid grouped-input weight-reuse batched gemv");
+  const auto blocks = (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  int8_gemv_grouped_inputs_batch_reuse_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, input, output, m.rows, m.columns,
+      m.rows / groups, groups, batch);
+  return checked(cudaPeekAtLastError(),
+                 "grouped-input weight-reuse int8 batched gemv");
+}
 Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
                   std::uint32_t batch, void* raw) noexcept {
   if (!m.weights || !m.scales || !input || !output || !m.rows ||
@@ -1042,6 +1118,20 @@ Status gemv_bf16(const std::uint16_t* matrix, std::uint32_t rows,
   bf16_gemv_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
       matrix, input, output, rows, columns);
   return checked(cudaPeekAtLastError(), "bf16 gemv");
+}
+Status gemv_bf16_batch(const std::uint16_t* matrix, std::uint32_t rows,
+                       std::uint32_t columns, const float* input,
+                       float* output, std::uint32_t batch,
+                       void* raw) noexcept {
+  if (!matrix || !input || !output || !rows || !columns || !batch ||
+      batch > kMaximumWeightReuseBatch)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid weight-reuse batched bf16 gemv");
+  const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
+  bf16_gemv_batch_reuse_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      matrix, input, output, rows, columns, batch);
+  return checked(cudaPeekAtLastError(), "weight-reuse bf16 batched gemv");
 }
 Status rms_norm(const float* input, const float* weight, float* output, std::uint32_t elements, float epsilon, void* raw) noexcept {
   if (!input || !weight || !output || !elements || epsilon <= 0) return Status(ErrorCode::invalid_argument, "invalid rms norm");
