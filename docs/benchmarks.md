@@ -848,6 +848,16 @@ and is not claimed as a throughput gain. The result qualifies the safety bound:
 one prediction per layer, one promotion globally, no speculative SSD read, and
 exact demand priority.
 
+The persistent `balanced` service then qualified bounded authenticated-census
+warm-start. Its prior policy sized the list from RAM alone even though
+`acquire()` also required a device lease, and a larger census could stop making
+progress at the VRAM boundary. The corrected policy uses both tier budgets and
+warms at most the six hottest records per each of 43 layers. One restart loaded
+258/258 records, 3,449,290,752 routed bytes, in 1.864 seconds. The subsequent
+three-endpoint API gate completed Completions, Chat Completions, and Responses,
+emitted six tokens from four MTP decode rows, and returned all request/KV
+ownership to zero. This is a lifecycle fix, not a 30 tok/s claim.
+
 ## Benchmark rules
 
 Any published result must include:

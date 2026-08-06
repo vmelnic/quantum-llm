@@ -176,13 +176,14 @@ checks model and bundle hashes, backend-specific prefill/KV metadata, real
 Completions, Chat Completions, and Responses requests, metrics, and complete
 request/KV cleanup. Use `probe_openai_api.py` for a real Chat streaming gate.
 
-The latest persistent pilot was qualified with MTP enabled and the `capacity`
+The latest persistent pilot was qualified with MTP enabled and the `balanced`
 placement profile. Completions, streaming Chat Completions, and Responses all
 returned real model text, after which active requests and allocated/reserved KV
-pages returned to zero. A `balanced` restart with an authenticated census
-stopped making progress during warm-load and is not the deployed profile until
-that lifecycle bug is resolved; the service does not erase or rewrite census
-state as a workaround.
+pages returned to zero. Authenticated-census warm-start is bounded by both
+physical cache tiers and one top-6 working set per layer. The qualified restart
+loaded 258/258 routed records (3,449,290,752 bytes) in 1.864 seconds and reached
+readiness without rewriting census state. This replaces the former unbounded
+warm list that could leave a device-acquire future permanently queued.
 
 For a controlled pilot, register a separate restartable task after the gate
 passes. Registration does not start it unless `-Start` is supplied:
