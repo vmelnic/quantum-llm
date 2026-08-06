@@ -470,6 +470,26 @@ Future dense work must first reduce authenticated weight bytes or otherwise
 reuse them across real rows/requests, then qualify the changed representation
 against the independent model oracle.
 
+The subsequent read-only compact-weight screen evaluated symmetric 4/5/6-bit
+integers and FP4 E2M1, each with FP16 scales at block sizes 32, 64, and 128.
+Four deterministic activation probes were projected through every distinct
+layer-0 INT8 attention geometry. Block 32 was the most accurate candidate in
+every family:
+
+| candidate | storage ratio | projection-relative RMSE across 5 shapes |
+| --- | ---: | ---: |
+| symmetric 4-bit | 1.78x | 9.55–10.45% |
+| FP4 E2M1 | 1.78x | 9.99–10.64% |
+| symmetric 5-bit | 1.45x | 4.67–4.94% |
+| symmetric 6-bit | 1.23x | 2.25–2.40% |
+
+These are screening errors, not model-quality scores, but they are already far
+outside the existing independent block-oracle budgets. The naive formats are
+therefore rejected before kernel implementation. The screening command and
+Windows runner remain as a fail-closed gate for future calibrated schemes; the
+next compact candidate must use representative activation statistics and pass
+the attention/full-model oracle before it can become a runtime ABI.
+
 An eight-token single-stream diagnostic measured the placement problem rather
 than claiming a throughput gate. With the 64-slot global routed cache it ran at
 0.311 tok/s, performed 2,597 cold acquisitions, and read 35.80 GB. Exact route

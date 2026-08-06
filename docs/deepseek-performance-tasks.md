@@ -154,10 +154,14 @@ single-request latency and aggregate throughput.
 - [ ] Design the dense replacement around routing stability: either preserve
   the accepted accumulation order or qualify route divergence and output
   quality explicitly. Token equality on one prompt is insufficient.
-- [ ] Qualify a smaller dense weight ABI offline before writing another CUDA
-  executor. Report reconstruction error for every distinct projection shape
-  and reject any representation that cannot pass the existing block/model
-  oracle budget.
+- [x] Qualify naive smaller dense weight ABIs offline before writing another
+  CUDA executor. Symmetric 4/5/6-bit and FP4 E2M1 with FP16 block scales were
+  screened across all five distinct attention geometries. Best block-32
+  projection-relative RMSE was 9.55–10.45% at 4-bit, 4.67–4.94% at 5-bit, and
+  2.25–2.40% at 6-bit; none is admissible. No executor was built.
+- [ ] Add calibration capture for representative real dense activations, then
+  evaluate an activation-aware/GPTQ-class compact dense candidate. The screen
+  must cover all distinct projection shapes and precede ABI/kernel work.
 - [ ] Add grouped INT8-MMA/Tensor Core kernels for prefill and multi-row MoE,
   while retaining the faster measured decode path for batch one.
 - [ ] Tile and tune the direct FP4/UE8M0 routed kernel; unpack reusable weight
