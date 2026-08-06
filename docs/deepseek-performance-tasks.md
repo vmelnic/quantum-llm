@@ -28,7 +28,7 @@ one subsystem.
 - [x] Add cumulative nanosecond counters for the whole model step, output head,
   controller, directory planning/release, storage wait, RAM retention copy,
   H2D admission, and CPU experts.
-- [ ] Split the two synchronized controller intervals into GPU-event timings
+- [x] Split the two synchronized controller intervals into GPU-event timings
   for dense attention/router, routed CUDA, shared FFN, and aggregation. The
   current `directory_plan_ns` and `directory_release_ns` deliberately include
   those kernels and therefore cannot be added to future device timings.
@@ -43,6 +43,10 @@ one subsystem.
   attention, output projections, and HCA post. Fine-grained event overhead
   makes the absolute time diagnostic-only; projections account for about 77%
   of the instrumented attention phase.
+- [x] Split FFN into routed experts, routed aggregation, shared expert, merge,
+  and HCA post. Routed packed-FP4 compute accounts for about 73% and the shared
+  expert for about 24% of the instrumented FFN phase; aggregation and merge are
+  not primary optimization targets.
 - [x] Capture one external Nsight Systems warm-route kernel census and one
   Nsight Compute `int8_gemv_vector` launch. Keep profiler overhead and startup
   conversion kernels out of production throughput claims.

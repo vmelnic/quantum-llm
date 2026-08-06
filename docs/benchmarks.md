@@ -441,6 +441,23 @@ attention is not the short-context bottleneck. This selects projection
 execution/weight traffic and launch amortization ahead of sparse-attention
 rewrites. The worker still emitted token `19923` with zero route misses.
 
+Four FFN boundaries were then added to the same opt-in profiler. They increased
+the FFN interval from roughly 23.88 to 27.54 ms/step, so these values are also
+diagnostic proportions rather than a production latency claim:
+
+| FFN interval | per model step | share of instrumented FFN |
+| --- | ---: | ---: |
+| routed packed-FP4 experts | 20.112 ms | 73.0% |
+| routed aggregation | 0.333 ms | 1.2% |
+| shared expert | 6.545 ms | 23.8% |
+| routed/shared merge | 0.281 ms | 1.0% |
+| HCA post | 0.271 ms | 1.0% |
+
+The isolated route again emitted token `19923`; scheduler acquisitions and
+CPU expert execution were zero. This selects the packed-FP4 routed kernel
+first and the shared expert second. Reworking aggregation, merge, directory
+release, or host scheduling cannot close the current single-stream gap.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,

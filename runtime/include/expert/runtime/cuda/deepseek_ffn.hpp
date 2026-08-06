@@ -104,6 +104,12 @@ struct DeepSeekFfnExecuteLaunch final {
   std::uint32_t experts_per_layer{257U};
   void* stream{};
   DeepSeekFfnExecutionTiming* timing{};
+  struct ProfileEvents {
+    void* routed_stop{};
+    void* aggregate_stop{};
+    void* shared_stop{};
+    void* merge_stop{};
+  } const* profile_events{};
 };
 
 // Requires an active directory pin covering state.expert_indices()[0..7).
@@ -165,6 +171,7 @@ struct DeepSeekFfnHybridExecuteLaunch final {
   std::span<const cpu::DeepSeekPackedWorkGroup> cpu_groups;
   std::uint32_t experts_per_layer{257U};
   void* stream{};
+  const DeepSeekFfnExecuteLaunch::ProfileEvents* profile_events{};
 };
 
 // Executes the unmasked selections on CUDA while the designated compact RAM

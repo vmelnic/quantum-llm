@@ -119,6 +119,13 @@ The same mode further attributes attention through
 the fine-grained run; use its proportions to select work, not as a production
 latency result.
 
+FFN attribution is exposed through `worker_gpu_ffn_routed_ns`,
+`worker_gpu_ffn_aggregate_ns`, `worker_gpu_ffn_shared_ns`,
+`worker_gpu_ffn_merge_ns`, and `worker_gpu_ffn_hca_post_ns`. These boundaries
+have the same profiling-only contract: each intermediate event perturbs the
+short batch-one path, so compare shares inside one run rather than treating the
+fine-grained absolute values as production throughput.
+
 The scheduler/cache counters can overlap their parent worker counter and must
 not be summed with it as independent wall time. They exist to attribute the
 parent interval and compare deltas between two snapshots.

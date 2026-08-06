@@ -26,6 +26,13 @@ Status failure(cudaError_t error, const char* operation) noexcept {
           std::string(operation) + ": " + cudaGetErrorString(error)};
 }
 
+Status record_profile_event(void* event, cudaStream_t stream,
+                            const char* operation) noexcept {
+  if (!event) return Status::success();
+  const auto error = cudaEventRecord(static_cast<cudaEvent_t>(event), stream);
+  return error == cudaSuccess ? Status::success() : failure(error, operation);
+}
+
 std::size_t align_up(std::size_t value) noexcept {
   return (value + kAlignment - 1U) & ~(kAlignment - 1U);
 }
@@ -206,6 +213,7 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
   if (!status.ok()) return status;
   auto& state = *launch.state;
   const auto layer = launch.weights->layer;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
   cudaEvent_t routed_start{}, routed_stop{};
   if (launch.timing) {
     auto error = cudaEventCreate(&routed_start);
@@ -231,6 +239,10 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
     if (routed_start) static_cast<void>(cudaEventDestroy(routed_start));
     return status;
   }
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->routed_stop : nullptr,
+      stream, "record DeepSeek routed FFN stop");
+  if (!status.ok()) return status;
   if (launch.timing) {
     auto error = cudaEventRecord(routed_stop,
                                  static_cast<cudaStream_t>(launch.stream));
@@ -249,6 +261,10 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
       state.routing_weights_, state.routed_output_, 0U, 1U, kHidden, kTopK,
       launch.stream});
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->aggregate_stop : nullptr,
+      stream, "record DeepSeek routed aggregate stop");
+  if (!status.ok()) return status;
   status = launch_moe_single_token({
       state.ffn_input_, nullptr, nullptr, nullptr, nullptr,
       state.routing_weights_ + kTopK, state.expert_indices_ + kTopK,
@@ -256,8 +272,16 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
       kIntermediate, 1U, launch.experts_per_layer, launch.stream,
       launch.directory_entries, layer, 10.0F, true});
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->shared_stop : nullptr,
+      stream, "record DeepSeek shared FFN stop");
+  if (!status.ok()) return status;
   status = add_in_place(state.routed_output_, state.shared_output_, kHidden,
                         launch.stream);
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->merge_stop : nullptr,
+      stream, "record DeepSeek FFN merge stop");
   if (!status.ok()) return status;
   return deepseek_hca_post(state.routed_output_, launch.streams, state.post_,
                            state.comb_, launch.updated_streams, kHidden,
@@ -332,6 +356,10 @@ Status deepseek_ffn_execute_hybrid(
       launch.experts_per_layer, launch.stream, launch.directory_entries, layer,
       10.0F, true, true});
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->routed_stop : nullptr,
+      stream, "record DeepSeek hybrid routed FFN stop");
+  if (!status.ok()) return status;
 
   status = launch.cpu_executor->execute(
       launch.cpu_groups,
@@ -356,6 +384,10 @@ Status deepseek_ffn_execute_hybrid(
       state.routing_weights_, state.routed_output_, alternate_count, 1U,
       kHidden, kTopK, launch.stream});
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->aggregate_stop : nullptr,
+      stream, "record DeepSeek hybrid aggregate stop");
+  if (!status.ok()) return status;
   status = launch_moe_single_token({
       state.ffn_input_, nullptr, nullptr, nullptr, nullptr,
       state.routing_weights_ + kTopK, state.expert_indices_ + kTopK,
@@ -363,8 +395,16 @@ Status deepseek_ffn_execute_hybrid(
       kIntermediate, 1U, launch.experts_per_layer, launch.stream,
       launch.directory_entries, layer, 10.0F, true});
   if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->shared_stop : nullptr,
+      stream, "record DeepSeek hybrid shared FFN stop");
+  if (!status.ok()) return status;
   status = add_in_place(state.routed_output_, state.shared_output_, kHidden,
                         launch.stream);
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->merge_stop : nullptr,
+      stream, "record DeepSeek hybrid FFN merge stop");
   if (!status.ok()) return status;
   return deepseek_hca_post(state.routed_output_, launch.streams, state.post_,
                            state.comb_, launch.updated_streams, kHidden,

@@ -243,6 +243,11 @@ struct WorkerTelemetry final {
   std::uint64_t gpu_sparse_attention_ns{};
   std::uint64_t gpu_attention_output_projection_ns{};
   std::uint64_t gpu_attention_hca_post_ns{};
+  std::uint64_t gpu_ffn_routed_ns{};
+  std::uint64_t gpu_ffn_aggregate_ns{};
+  std::uint64_t gpu_ffn_shared_ns{};
+  std::uint64_t gpu_ffn_merge_ns{};
+  std::uint64_t gpu_ffn_hca_post_ns{};
   std::uint64_t warm_start_candidates{};
   std::uint64_t warm_start_loaded{};
   std::uint64_t warm_start_bytes{};
@@ -505,6 +510,21 @@ class Model final {
       telemetry_.gpu_attention_hca_post_ns +=
           current.gpu_attention_hca_post_ns -
           request->controller_telemetry.gpu_attention_hca_post_ns;
+      telemetry_.gpu_ffn_routed_ns +=
+          current.gpu_ffn_routed_ns -
+          request->controller_telemetry.gpu_ffn_routed_ns;
+      telemetry_.gpu_ffn_aggregate_ns +=
+          current.gpu_ffn_aggregate_ns -
+          request->controller_telemetry.gpu_ffn_aggregate_ns;
+      telemetry_.gpu_ffn_shared_ns +=
+          current.gpu_ffn_shared_ns -
+          request->controller_telemetry.gpu_ffn_shared_ns;
+      telemetry_.gpu_ffn_merge_ns +=
+          current.gpu_ffn_merge_ns -
+          request->controller_telemetry.gpu_ffn_merge_ns;
+      telemetry_.gpu_ffn_hca_post_ns +=
+          current.gpu_ffn_hca_post_ns -
+          request->controller_telemetry.gpu_ffn_hca_post_ns;
       request->controller_telemetry = current;
     }
     const auto output_started = std::chrono::steady_clock::now();
@@ -859,6 +879,16 @@ int worker_loop(Model& model) {
                   << worker.gpu_attention_output_projection_ns
                   << ",\"worker_gpu_attention_hca_post_ns\":"
                   << worker.gpu_attention_hca_post_ns
+                  << ",\"worker_gpu_ffn_routed_ns\":"
+                  << worker.gpu_ffn_routed_ns
+                  << ",\"worker_gpu_ffn_aggregate_ns\":"
+                  << worker.gpu_ffn_aggregate_ns
+                  << ",\"worker_gpu_ffn_shared_ns\":"
+                  << worker.gpu_ffn_shared_ns
+                  << ",\"worker_gpu_ffn_merge_ns\":"
+                  << worker.gpu_ffn_merge_ns
+                  << ",\"worker_gpu_ffn_hca_post_ns\":"
+                  << worker.gpu_ffn_hca_post_ns
                   << ",\"worker_warm_start_candidates\":"
                   << worker.warm_start_candidates
                   << ",\"worker_warm_start_loaded\":"

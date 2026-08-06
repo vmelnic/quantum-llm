@@ -37,7 +37,9 @@ DeepSeekDecodeController::~DeepSeekDecodeController() {
                       attention_hca_pre_norm_stop_event_,
                       attention_projection_stop_event_,
                       sparse_attention_stop_event_,
-                      attention_output_projection_stop_event_})
+                      attention_output_projection_stop_event_,
+                      ffn_routed_stop_event_, ffn_aggregate_stop_event_,
+                      ffn_shared_stop_event_, ffn_merge_stop_event_})
     if (event)
       static_cast<void>(cudaEventDestroy(static_cast<cudaEvent_t>(event)));
 }
@@ -48,7 +50,9 @@ Status DeepSeekDecodeController::enable_gpu_phase_timing() noexcept {
       ffn_stop_event_ || release_stop_event_ ||
       attention_hca_pre_norm_stop_event_ ||
       attention_projection_stop_event_ || sparse_attention_stop_event_ ||
-      attention_output_projection_stop_event_)
+      attention_output_projection_stop_event_ || ffn_routed_stop_event_ ||
+      ffn_aggregate_stop_event_ || ffn_shared_stop_event_ ||
+      ffn_merge_stop_event_)
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek GPU phase timing configuration"};
   void** destinations[] = {
@@ -56,7 +60,9 @@ Status DeepSeekDecodeController::enable_gpu_phase_timing() noexcept {
       &plan_stop_event_, &ffn_start_event_, &ffn_stop_event_,
       &release_stop_event_, &attention_hca_pre_norm_stop_event_,
       &attention_projection_stop_event_, &sparse_attention_stop_event_,
-      &attention_output_projection_stop_event_};
+      &attention_output_projection_stop_event_, &ffn_routed_stop_event_,
+      &ffn_aggregate_stop_event_, &ffn_shared_stop_event_,
+      &ffn_merge_stop_event_};
   for (auto** destination : destinations) {
     cudaEvent_t event{};
     const auto status = cuda_status(
@@ -306,16 +312,21 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     if (!status.ok()) return fail(status);
   }
   const auto ffn_started = std::chrono::steady_clock::now();
+  const DeepSeekFfnExecuteLaunch::ProfileEvents ffn_profile{
+      ffn_routed_stop_event_, ffn_aggregate_stop_event_,
+      ffn_shared_stop_event_, ffn_merge_stop_event_};
   const auto execute = cpu_groups.empty()
       ? deepseek_ffn_execute(
             {view.ffn_weights, view.ffn_state, directory_->device_entries(),
              request_->streams_b_, request_->streams_a_,
-             directory_->experts_per_layer(), stream_})
+             directory_->experts_per_layer(), stream_, nullptr,
+             ffn_start_event_ ? &ffn_profile : nullptr})
       : deepseek_ffn_execute_hybrid(
             {view.ffn_weights, view.ffn_state, directory_->device_entries(),
              request_->streams_b_, request_->streams_a_,
              hybrid_workspace_.get(), cpu_executor_.get(), cpu_groups,
-             directory_->experts_per_layer(), stream_});
+             directory_->experts_per_layer(), stream_,
+             ffn_start_event_ ? &ffn_profile : nullptr});
   telemetry_.ffn_submit_ns += static_cast<std::uint64_t>(
       std::chrono::duration_cast<std::chrono::nanoseconds>(
           std::chrono::steady_clock::now() - ffn_started)
@@ -360,6 +371,26 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     };
     status = measure(ffn_start_event_, ffn_stop_event_,
                      "measure DeepSeek FFN phase", telemetry_.gpu_ffn_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_start_event_, ffn_routed_stop_event_,
+                     "measure DeepSeek routed FFN phase",
+                     telemetry_.gpu_ffn_routed_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_routed_stop_event_, ffn_aggregate_stop_event_,
+                     "measure DeepSeek routed aggregate phase",
+                     telemetry_.gpu_ffn_aggregate_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_aggregate_stop_event_, ffn_shared_stop_event_,
+                     "measure DeepSeek shared FFN phase",
+                     telemetry_.gpu_ffn_shared_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_shared_stop_event_, ffn_merge_stop_event_,
+                     "measure DeepSeek FFN merge phase",
+                     telemetry_.gpu_ffn_merge_ns);
+    if (!status.ok()) return fail(status);
+    status = measure(ffn_merge_stop_event_, ffn_stop_event_,
+                     "measure DeepSeek FFN HCA post phase",
+                     telemetry_.gpu_ffn_hca_post_ns);
     if (!status.ok()) return fail(status);
     status = measure(ffn_stop_event_, release_stop_event_,
                      "measure DeepSeek release phase",
