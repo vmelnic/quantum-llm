@@ -58,13 +58,17 @@ For an interactive terminal chat, including an owned SSH tunnel and streaming
 output, run from a POSIX control host:
 
 ```bash
-./ops/chat.sh --ssh user@gpu-host
+cp .env.example .env
+# Set CHAT_SSH in .env, then:
+./ops/chat.sh
 ```
 
-Use `--max-tokens`, `--local-port`, and `--remote-port` to override the safe
-defaults. The client retains conversation history. Enter `quit` or `exit`, or
-press Ctrl+C, to close both the client and the tunnel it created. Without
-`--ssh`, it connects to `--base-url` (default `http://127.0.0.1:8080`).
+The `.env` file controls the SSH target, model, token limit, ports, readiness
+timeout, Python executable, base URL, and optional API key; every variable is
+listed in `.env.example`. CLI flags remain optional overrides. The client
+retains conversation history. Enter `quit` or `exit`, or press Ctrl+C, to close
+both the client and the tunnel it created. With an empty `CHAT_SSH`, it connects
+directly to `CHAT_BASE_URL`.
 
 DeepSeek-V4-Flash does not publish a Transformers `chat_template`. For that
 model the service loads the pinned checkpoint's official

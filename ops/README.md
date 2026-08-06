@@ -19,7 +19,9 @@ remote files.
 Interactive streaming chat can own its SSH tunnel and clean it up on exit:
 
 ```bash
-./ops/chat.sh --ssh user@gpu-host
+cp .env.example .env
+# Set CHAT_SSH in .env, then:
+./ops/chat.sh
 ```
 
 ## Windows scripts

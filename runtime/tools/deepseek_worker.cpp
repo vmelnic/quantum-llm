@@ -977,11 +977,14 @@ class Model final {
     const auto vram_entries =
         (warm_vram_limit - usage.vram_bytes) / device_record_bytes;
     const auto maximum_entries = static_cast<std::size_t>(
-        std::min(ram_entries, vram_entries));
+        std::min<std::uint64_t>(
+            std::min(ram_entries, vram_entries),
+            static_cast<std::uint64_t>(er::kDeepSeekCatalogLayers) * 6U));
     if (maximum_entries == 0U) return;
-    const auto maximum_per_layer =
-        (maximum_entries + er::kDeepSeekCatalogLayers - 1U) /
-        er::kDeepSeekCatalogLayers;
+    // Startup warms at most one complete top-k working set per layer. Filling
+    // the entire cache speculatively is both unnecessary for readiness and
+    // vulnerable to allocator/driver headroom below the logical tier budget.
+    constexpr std::size_t maximum_per_layer = 6U;
     auto warm = census_->stable_warm_set(maximum_entries, maximum_per_layer);
     telemetry_.warm_start_candidates = warm.size();
     if (warm.empty()) return;

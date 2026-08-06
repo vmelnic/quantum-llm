@@ -70,7 +70,9 @@ must not imply that a policy is active when it is only collecting evidence.
 
 - [x] Bound authenticated-census warm-load by both RAM and VRAM availability.
   `acquire()` resolves to a device lease, so a RAM-only bound could leave its
-  final waiter queued forever after VRAM admission stopped improving.
+  final waiter queued forever after VRAM admission stopped improving. Startup
+  is additionally capped at one top-6 working set per layer (258 records),
+  leaving allocator/driver headroom below the logical tier limit.
 - [x] Consume `RouteCensus::stable_warm_set()` at worker startup.
 - [x] Convert the byte budgets into deterministic per-layer RAM and VRAM warm
   sets while reserving dense, shared, KV, request, staging, and OS headroom.
