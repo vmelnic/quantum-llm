@@ -21,6 +21,7 @@ from experiment import (
     load_trace,
     normalized_mse,
 )
+from dispatch_experiment import DispatchNeuralCpu
 
 
 def write_values(path: Path, code: str, values) -> dict:
@@ -89,6 +90,26 @@ def main() -> None:
             data.inputs, data.layers, 2, (2,), SHUFFLED_PROGRAM
         )
         candidate.execute(data.inputs, data.layers, 2, (2,), RANDOM_PROGRAM)
+        dispatch = DispatchNeuralCpu(hidden, 8, 4, fanout=4, operators=4, rank=2)
+        dispatch_outputs, dispatch_paths = dispatch.execute(
+            data.inputs,
+            data.layers,
+            2,
+            (1, 2),
+            return_paths=True,
+        )
+        if dispatch_paths.shape != (records, 2):
+            raise RuntimeError("invalid dispatch path geometry")
+        shuffled_table = dispatch.hard_table().flatten().roll(1).reshape_as(
+            dispatch.hard_table()
+        )
+        dispatch.execute(
+            data.inputs,
+            data.layers,
+            2,
+            (2,),
+            table_override=shuffled_table,
+        )
         loss = normalized_mse(outputs[1], data.outputs) + normalized_mse(
             outputs[2], data.outputs
         )
@@ -119,7 +140,8 @@ def main() -> None:
                 }
             )
         )
-        del prediction, outputs, loss, models, candidate
+        del prediction, outputs, loss, models, candidate, dispatch_outputs
+        del dispatch_paths, dispatch
         data.close()
 
 

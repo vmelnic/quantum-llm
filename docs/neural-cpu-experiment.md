@@ -101,10 +101,40 @@ Two distinct redesign families remain technically credible:
    therefore monotonic pursuit cannot be claimed merely from teacher error
    measured after the fact.
 
-The next implementation candidate is computed dispatch because its route is
-available from the input activation without access to teacher output. The
-matching-pursuit design remains blocked until it defines a non-oracular
-residual with an independently testable self-consistency law.
+Computed dispatch was implemented next because its route is available from the
+input activation without access to teacher output. It used a hard two-level
+16-way JTABLE, 17 dispatch nodes, and 16 reusable rank-8 subroutines at
+3,925,792 persistent bytes.
+
+| computed-dispatch test | NMSE | cosine |
+|---|---:|---:|
+| 1 tick | 0.4330 | 0.6971 |
+| 8 ticks | 0.3927 | 0.7143 |
+| 16 ticks | 0.3863 | 0.7176 |
+| 32 ticks | 0.3846 | 0.7185 |
+| shuffled JTABLE | 0.4986 | 0.6623 |
+| random bytecode + readout | 0.7180 | 0.5216 |
+
+This is a material improvement over the first machine and narrowly beats the
+ordinary recurrent baseline, 0.3846 versus 0.3883. It still fails:
+
+- total time-for-space improvement is only 11.18%;
+- tick 16 to 32 improves only 0.44%;
+- shared-basis remains 5.85% lower-error;
+- shuffled and random controls degrade only 1.30× and 1.87×, not 10× and 5×;
+- only 14 of 256 two-tick paths are used, with 2.95 bits path entropy.
+
+Raw path-to-top-route mutual information is 2.21 bits, evidence that dispatch
+responds to real routing structure. It is not corrected for finite-sample
+bias and is therefore diagnostic rather than a pass claim. The machine learned
+useful conditional paths but collapsed most of its program space and repeated
+the same subroutine palette until saturation. Computed dispatch as implemented
+also receives **kill/redesign**.
+
+The matching-pursuit design remains blocked until it defines a non-oracular
+residual with an independently testable self-consistency law. A subsequent
+design must make later ticks expand the computed dependency graph rather than
+revisit a fixed point or a collapsed path palette.
 
 The proposed system is a deterministic register machine with a fixed
 instruction set, a program counter, bounded loops, hard bytecode, and a small

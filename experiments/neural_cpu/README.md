@@ -103,3 +103,20 @@ an ordinary recurrent baseline reached 0.3883. Instruction order and hard
 branching were functional, but they did not provide an advantage over ordinary
 compression. The registered pilot verdict is `kill/redesign`; no downstream
 splice claim is made for this candidate.
+
+`results/computed-dispatch-pilot.json` records the first redesign. It replaced
+the fixed loop with hard 16-way paths through reusable low-rank subroutines.
+At 3.93 MB it reached 0.3846 test NMSE, beating the ordinary recurrent baseline
+but not shared-basis at 0.3633. It saturated after tick 16 and used only 14 of
+256 possible two-tick paths. Its strict result is also `kill/redesign`.
+
+Run that candidate against an existing authenticated pilot and reference result
+with:
+
+```powershell
+python experiments/neural_cpu/dispatch_experiment.py `
+  --trace work/neural-cpu/pilot-trace `
+  --prompts-manifest work/neural-cpu/pilot-prompts/prompts-manifest.json `
+  --reference-result work/neural-cpu/pilot-result.json `
+  --output work/neural-cpu/dispatch-result.json
+```
