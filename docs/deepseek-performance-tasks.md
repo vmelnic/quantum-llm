@@ -186,6 +186,11 @@ single-request latency and aggregate throughput.
   while retaining the faster measured decode path for batch one.
 - [ ] Tile and tune the direct FP4/UE8M0 routed kernel; unpack reusable weight
   blocks once per tile and reduce redundant scale decoding.
+- [x] Evaluate fusing packed-FP4 gate and up dots so both reuse one Q8
+  activation traversal. Reject it: on one shared warm census the fused kernel
+  took 407.218 ms/5 model steps versus 366.419 ms for the original. Both
+  emitted token `19923`; the extra live accumulator/register pressure costs
+  more than the saved activation load on SM86 batch-one decode.
 - [ ] Fuse compatible RMSNorm, quantization, bias/gating, RoPE, top-k, and
   aggregation operations to reduce launches and global-memory traffic.
 - [ ] Capture stable resident decode segments in CUDA graphs after dynamic

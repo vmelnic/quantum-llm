@@ -458,6 +458,15 @@ CPU expert execution were zero. This selects the packed-FP4 routed kernel
 first and the shared expert second. Reworking aggregation, merge, directory
 release, or host scheduling cannot close the current single-stream gap.
 
+A first packed-FP4 tuning candidate fused the gate and up dots, preserving the
+per-projection accumulation order while sharing one traversal of the Q8 input.
+On the same warm census it regressed five model steps from 366.419 to 407.218
+ms. Both paths emitted token `19923` and performed no route-time acquisitions.
+The likely register/occupancy cost dominates the cached activation saving on
+SM86, so the fused implementation was removed. Future FP4 tuning should keep a
+single dot accumulator live or prove a better register/occupancy tradeoff with
+hardware counters.
+
 A block-per-row F32 GEMV was also tested for HCA's underfilled 24×16384
 projection. The repeated real HCA slice improved from 0.077568 to 0.062925
 ms/site and stayed far inside its `2e-4` local oracle tolerance. Nevertheless,
