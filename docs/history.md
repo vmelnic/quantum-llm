@@ -259,3 +259,52 @@ is retained as Plan B rather than treated as a required rewrite.
 research, not equivalent products. None of the reviewed systems combined
 instant ingest, hundreds-of-GB sharding, latent injection, ACL/version
 semantics, fail-closed answers, exact citations and a production API.
+
+## ConflictQA v4 and Romanian external result
+
+V4 removed the undertraining ambiguity. It completed three full epochs,
+39,801 example visits and 1,245 optimizer updates. Its in-distribution ConflictQA
+evaluation reached 28/30 strict oracle answers and 30/30 source selections,
+compared with 6/30 strict answers without memory. Unknown-memory abstention was
+perfect. Automatic retrieval found only 3/10 authoritative records, so the
+complete PoW gate did not pass.
+
+More importantly, the unchanged Romanian legal test isolated generalization
+from retrieval. BGE-M3 admitted the intended evidence for all five questions;
+the adapter answered only the 16-year criminal-responsibility question
+correctly. Manual inspection confirmed that the other four were semantic
+failures rather than harmless matcher misses. No further tuning is permitted
+against those five external questions. The next experiment uses the official
+Doc-to-LoRA Qwen3-4B checkpoint as a materially different no-per-document-
+training baseline. Generic multilingual semantic scoring remains a TODO and
+is not allowed to obscure this failed promotion result.
+
+## English out-of-distribution closure
+
+An adversarial code review found that ConflictQA evaluation was not fully
+held out: the best epoch checkpoint used a deterministic prefix of the eval
+split for selection, and the reported 30 examples came from that prefix. It
+also found a serving-format mismatch: capability training encoded bare record
+bodies, while real serving prepended a durable ID and document metadata. The
+retrieval gate additionally measured a placeholder hashing index rather than
+the BGE-M3 serving path. Qwen's tokenizer was checked directly and confirmed
+to right-pad, eliminating the suspected padding error. The actual v4 run used
+the same 768-token bound in training and serving, so length configuration did
+not explain the external failures.
+
+A same-day English control used a wholly invented five-section field dossier
+and eight natural questions. The result matrix was:
+
+| Arm | Evidence retrieval | Strict answers | Valid source selection |
+| --- | ---: | ---: | ---: |
+| V4, serving metadata | 8/8 | 2/8 | 1/8 |
+| V4, raw body matching training | 8/8 | 3/8 | 8/8 |
+| Frozen Qwen, full prompt context | all five records | 8/8 | 8/8 |
+
+The raw-body ablation proves that metadata noise broke request-local source
+binding, but its one-answer gain cannot explain the factual corruption. The
+adapter changed 19 hours to 29.82 minutes, 27 minutes to two hours and a 2037
+date to 2017 despite receiving the exact evidence. The v4 architecture as
+trained is therefore closed as a ConflictQA-specific reader. No further v4
+training or matcher tuning is planned; the next baseline must use a materially
+different document-internalization mechanism.

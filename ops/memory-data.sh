@@ -150,7 +150,7 @@ case "${action}" in
     fi
     "${script_dir}/run-on-windows-host.sh" "${capability_arguments[@]}"
     ;;
-  index|query|status|selftest)
+  index|query|control|status|selftest)
     remote_arguments=(Invoke-MemoryData.ps1 \
       -Action "${action}" -DatasetName "${dataset_name}" \
       -EncoderModel "${encoder_model}" -EncoderRevision "${encoder_revision}" \
@@ -159,6 +159,7 @@ case "${action}" in
       -TopK "${MEMORY_RETRIEVAL_TOP_K:-2}" \
       -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
       -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}" \
+      -MemoryRecordFormat "${MEMORY_RECORD_FORMAT:-metadata}" \
       -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v3/memory-expert.pt}")
     if [[ -n "${MEMORY_QUERY_LANGUAGE:-}" ]]; then
       remote_arguments+=(-Language "${MEMORY_QUERY_LANGUAGE}")
@@ -166,7 +167,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|status|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac

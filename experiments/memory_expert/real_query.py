@@ -60,11 +60,14 @@ def read_questions(path: Path) -> list[dict[str, object]]:
     return questions
 
 
-def as_memory_record(record: KnowledgeRecord) -> MemoryRecord:
+def as_memory_record(record: KnowledgeRecord,
+                     record_format: str = "metadata") -> MemoryRecord:
+    if record_format not in {"metadata", "raw"}:
+        raise ValueError(f"unsupported memory record format: {record_format}")
     return MemoryRecord(
         record_id=record.record_id,
         citation_id=record.citation_id,
-        text=record.memory_text,
+        text=record.text if record_format == "raw" else record.memory_text,
         shard_key=f"{record.namespace}:{record.document_id}",
         generation=1,
         acl=",".join(record.acl),
@@ -144,7 +147,8 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 question_path: Path, output_path: Path, encoder_model: str,
                 encoder_revision: str, top_k: int, maximum_memory_tokens: int,
                 maximum_new_tokens: int, acl: set[str], language: str | None,
-                device: torch.device) -> dict[str, object]:
+                device: torch.device, memory_record_format: str = "metadata",
+                ) -> dict[str, object]:
     started = time.perf_counter()
     questions = read_questions(question_path)
     encoder_started = time.perf_counter()
@@ -192,7 +196,7 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
             tuple(hit.record.record_id for hit in hits) for hits in retrievals
         ]
         admitted = {
-            hit.record.record_id: as_memory_record(hit.record)
+            hit.record.record_id: as_memory_record(hit.record, memory_record_format)
             for hits in retrievals for hit in hits
         }
         memory_started = time.perf_counter()
@@ -289,6 +293,7 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
         summary = {
             "schema_version": 3,
             "contract": "quantum-llm-memory-query-report-v3",
+            "memory_record_format": memory_record_format,
             "questions": count,
             "passed": sum(bool(row["passed"]) for row in results),
             "strict_text_match_rate": sum(
@@ -341,6 +346,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-new-tokens", type=int, default=128)
     parser.add_argument("--acl", action="append")
     parser.add_argument("--language")
+    parser.add_argument(
+        "--memory-record-format", choices=("metadata", "raw"), default="metadata",
+        help="Render admitted memory with source metadata or as its raw text body",
+    )
     return parser.parse_args()
 
 
@@ -351,7 +360,7 @@ def main() -> int:
         args.questions.resolve(), args.output.resolve(), args.encoder_model,
         args.encoder_revision, args.top_k, args.maximum_memory_tokens,
         args.maximum_new_tokens, set(args.acl or ["public"]), args.language,
-        torch.device(args.device),
+        torch.device(args.device), args.memory_record_format,
     )
     print(json.dumps({
         "event": "real-query-summary",

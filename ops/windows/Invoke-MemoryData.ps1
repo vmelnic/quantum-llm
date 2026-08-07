@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("index", "query", "status", "selftest")][string]$Action = "status",
+    [ValidateSet("index", "query", "control", "status", "selftest")][string]$Action = "status",
     [Parameter(Mandatory = $true)][string]$DatasetName,
     [string]$EncoderModel = "BAAI/bge-m3",
     [string]$EncoderRevision = "5617a9f61b028005a4858fdac845db406aefb181",
@@ -8,6 +8,7 @@ param(
     [int]$TopK = 2,
     [int]$MaximumMemoryTokens = 768,
     [int]$MaximumNewTokens = 128,
+    [ValidateSet("metadata", "raw")][string]$MemoryRecordFormat = "metadata",
     [string]$Checkpoint = "work/memory-expert-capability/memory-expert.pt",
     [string]$Language = "",
     [int64]$MinimumFreeVramMiB = 18000
@@ -28,7 +29,13 @@ $dataset = Join-Path (Join-Path $script:RepoRoot "work\memory-data") $DatasetNam
 $ingest = Join-Path $dataset "ingest"
 $index = Join-Path $dataset "index"
 $questions = Join-Path $dataset "questions.jsonl"
-$report = Join-Path $dataset "query-report.json"
+$reportName = if ($MemoryRecordFormat -eq "metadata") {
+    "query-report.json"
+} else {
+    "query-report-$MemoryRecordFormat.json"
+}
+$report = Join-Path $dataset $reportName
+$controlReport = Join-Path $dataset "context-control-report.json"
 $checkpoint = if ([System.IO.Path]::IsPathRooted($Checkpoint)) {
     $Checkpoint
 } else { Join-Path $script:RepoRoot $Checkpoint }
@@ -43,6 +50,7 @@ if ($Action -eq "status") {
         index_ready = Test-Path -LiteralPath $indexManifest -PathType Leaf
         questions_ready = Test-Path -LiteralPath $questions -PathType Leaf
         report_ready = Test-Path -LiteralPath $report -PathType Leaf
+        control_report_ready = Test-Path -LiteralPath $controlReport -PathType Leaf
         ingest_manifest = if (Test-Path $ingestManifest) {
             Get-Content -LiteralPath $ingestManifest -Raw | ConvertFrom-Json
         } else { $null }
@@ -78,13 +86,13 @@ if ($Action -eq "selftest") {
 }
 
 $requiredArtifacts = @((Join-Path $ingest "manifest.json"))
-if ($Action -eq "query") { $requiredArtifacts += $checkpoint }
+if ($Action -in @("query", "control")) { $requiredArtifacts += $checkpoint }
 foreach ($required in $requiredArtifacts) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required Memory Data artifact is missing: $required"
     }
 }
-if ($Action -eq "query" -and
+if ($Action -in @("query", "control") -and
     -not (Test-Path -LiteralPath $questions -PathType Leaf)) {
     throw "Question file is missing: $questions"
 }
@@ -107,7 +115,7 @@ if ($Action -eq "index") {
     & $python $script --ingest $ingest --output $index --model $EncoderModel `
         --revision $EncoderRevision --device cuda `
         --maximum-tokens $EncoderMaximumTokens --batch-size $EncoderBatchSize
-} else {
+} elseif ($Action -eq "query") {
     if (-not (Test-Path -LiteralPath (Join-Path $index "manifest.json") -PathType Leaf)) {
         throw "Build the dataset index before querying"
     }
@@ -119,10 +127,16 @@ if ($Action -eq "index") {
         "--encoder-revision", $EncoderRevision, "--device", "cuda",
         "--top-k", [string]$TopK,
         "--maximum-memory-tokens", [string]$MaximumMemoryTokens,
-        "--maximum-new-tokens", [string]$MaximumNewTokens
+        "--maximum-new-tokens", [string]$MaximumNewTokens,
+        "--memory-record-format", $MemoryRecordFormat
     )
     if ($Language) { $arguments += @("--language", $Language) }
     & $python @arguments
+} else {
+    $script = Join-Path $script:RepoRoot "experiments\memory_expert\context_control.py"
+    & $python $script --ingest $ingest --checkpoint $checkpoint `
+        --questions $questions --output $controlReport --device cuda `
+        --maximum-new-tokens $MaximumNewTokens
 }
 $exitCode = $LASTEXITCODE
 $status = [PSCustomObject]@{

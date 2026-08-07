@@ -3,8 +3,10 @@
 ## Current status
 
 The project has proved that a frozen Qwen3-4B can receive information through
-a separate layer-wise memory channel. It has **not** yet proved that the adapter
-generalizes to arbitrary natural documents.
+a separate layer-wise memory channel. It has also disproved the current gate's
+ability to generalize reliably beyond ConflictQA, in both Romanian legal data
+and an invented English dossier. The checkpoint is diagnostic and must not be
+promoted.
 
 The distinction matters:
 
@@ -32,15 +34,43 @@ and one answer followed parametric knowledge instead of the admitted evidence.
 The causal channel works; the natural answer contract does not. Held-out
 evaluation was deliberately not run after this prerequisite failed.
 
-The v4 training path fixes the definite scheduling defect without changing the
-memory architecture: it trains in complete deterministic epochs, visits every
-row once per epoch including the last partial batch, normalizes accumulated
-gradients by the exact supervised-token count, validates after every epoch,
-keeps the best checkpoint, and can resume only from a matching corpus and
-training contract. The configured three-epoch run is 39,801 example visits,
-19,902 microsteps, and 1,245 optimizer updates. Its code and corpus contract
-have passed validation on the GPU host; no v4 capability result is claimed
-until training and the independent gates finish.
+The v4 training path fixed that scheduling defect without changing the memory
+architecture. It completed three deterministic epochs: 39,801 example visits,
+19,902 microsteps and 1,245 optimizer updates. On its ConflictQA evaluation,
+oracle memory produced 28/30 strict answers and 30/30 correct source selections;
+no-memory produced 6/30 strict answers. Unknown-memory abstention was 100%.
+Automatic retrieval recovered the authoritative record in only 3/10 paired
+cases, but that arm used the placeholder hashing index rather than the BGE-M3
+serving index.
+
+The 30 examples were not a truly untouched test: the best of three epoch
+checkpoints was selected by validation NLL on a deterministic 256-example prefix
+from the same eval split, and the reported 30 are a prefix of that selection.
+No gradients used them, but the result has checkpoint-selection bias and is now
+described as in-distribution evaluation rather than independent held-out proof.
+
+The decisive external test used five Romanian questions about an ingested
+criminal code. Retrieval recovered the intended evidence in 5/5 cases, but
+the v4 adapter answered only 1/5 correctly under both strict and manual review.
+The four failures included ignoring an explicit quote, incomplete extraction,
+malformed source output and token degeneration. This is a model/adaptation
+failure after correct evidence admission, not a retrieval failure.
+
+An English out-of-distribution control then removed language and legal register
+as explanations. A new five-section fictional dossier contained names, dates,
+measurements and an exact quotation that could not exist in pretraining. BGE-M3
+retrieved the intended section for 8/8 questions. The default Memory Expert
+serving format answered only 2/8 and emitted a valid source slot for 1/8. An
+inference-only ablation removed the durable ID, title, section metadata and slug,
+feeding the same bare record-body format used in training. Source binding rose
+to 8/8, but strict answers rose only to 3/8. The same frozen Qwen3-4B, with all
+five records in its prompt and hooks disabled, answered and cited 8/8.
+
+This matrix closes the v4 direction: metadata formatting caused a real source-
+slot mismatch, but does not explain factual failures such as changing 19 hours
+to 29.82 minutes, 27 minutes to two hours, or 14 October 2037 to 24 October
+2017. V4 learned a ConflictQA-specific latent reader, not the generic memory
+capability required by the project. It will not receive another training run.
 
 ## Architecture under test
 
@@ -146,13 +176,14 @@ The audit found material differences from TokenMem:
   exact answer in visible source text. This made the evidence validation claim
   weaker than its name suggested.
 
-Those differences are research hypotheses, not evidence that the independent
-architecture is invalid. To isolate the known defect, Plan A keeps the current
-mechanism and natural joint-grounding corpus while fixing full-epoch training
-and checkpoint selection. It must not tune against the three failed examples.
-TokenMem reproduction or migration remains Plan B only if the adequately
-trained independent adapter still fails its untouched causal and held-out
-gates.
+Those differences are research hypotheses, not evidence that every
+layer-wise-memory architecture is invalid. Full-epoch training isolated the
+known scheduling defect but did not close the external generalization gap.
+Further tuning of this checkpoint against the five legal questions is stopped:
+it would turn the external test into training data. The next baseline is the
+official Doc-to-LoRA Qwen3-4B checkpoint, which generates temporary LoRA
+weights from a document without per-document gradient descent. TokenMem remains
+a separate Plan B rather than an unlicensed code dependency.
 
 No reviewed public project supplies the complete target system. The closest
 components are [KBLaM](https://github.com/microsoft/KBLaM), which injects
@@ -228,6 +259,16 @@ Three different claims are kept separate:
    follow the evidence? Until a separately validated judge exists, this
    requires manual review.
 
+TODO: replace the normalized-substring answer matcher with a generic,
+multilingual semantic scorer validated against labeled positive and negative
+pairs. The current matcher can reject correct shorter formulations, so its
+strict score remains diagnostic and must be reported separately from manual
+semantic review; do not add answer-specific aliases or dataset-specific rules.
+
+The external English failures above were also manually inspected. Their large
+numeric substitutions, refusals and invented locations are semantic failures,
+not matcher artifacts.
+
 The capability run must pass eval-only contradictory-memory preference,
 generation, source selection, abstention, no-memory, full-context-control, and paired
 retrieval/oracle gates. Passing the natural suite is necessary but not
@@ -264,19 +305,31 @@ with:
 ./ops/memory-data.sh query
 ```
 
+The frozen-base full-context ceiling for any ingested dataset is available as:
+
+```bash
+./ops/memory-data.sh control
+```
+
+`MEMORY_RECORD_FORMAT=raw` performs the inference-only canonical-format
+ablation. It must not be mistaken for a new trained checkpoint.
+
 Generated corpora, checkpoints, indexes, and reports stay under `work/` and are
 not versioned.
 
 ## Remaining boundary
 
-- ConflictQA v3 completed training but failed the mandatory generation gate at
-  9/12 exact despite 6/6 memory-sensitive families; no natural capability pass
-  is claimed and held-out evaluation was not run;
-- v4 must finish three complete epochs and pass both the untouched causal probe
-  and held-out evaluation before it can replace the diagnostic v3 checkpoint;
-- TokenMem stays Plan B if adequate training does not close the capability gap;
-- v3 initially validates the mechanism in English; Romanian and Russian remain
-  external generalization work after the causal gate passes;
+- ConflictQA v4 completed full-epoch training and reached 28/30 oracle answers,
+  but its test subset participated in checkpoint selection; it then failed the
+  Romanian external test at 1/5 despite 5/5 evidence retrieval;
+- the invented English control failed at 2/8 with serving metadata and 3/8 with
+  canonical raw records, while the frozen full-context control passed 8/8;
+  neither v3 nor v4 is promotable and no further v4 training is planned;
+- the answer matcher and generic multilingual paraphrase scoring remain a
+  documented TODO, but cannot explain the manually verified legal failures;
+- the official Doc-to-LoRA Qwen3-4B checkpoint is the next same-day baseline;
+  TokenMem remains Plan B if that materially different mechanism also fails;
+- Romanian and Russian capability remains unproved;
 - Python hooks recompute memory K/V and are a research implementation, not a
   throughput backend;
 - exact dense shard scan must become routed hybrid retrieval at large scale;

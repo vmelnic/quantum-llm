@@ -147,6 +147,7 @@ Then run each durable stage explicitly:
 ./ops/memory-data.sh selftest
 ./ops/memory-data.sh index
 ./ops/memory-data.sh query
+./ops/memory-data.sh control
 ./ops/memory-data.sh status
 ```
 
@@ -156,14 +157,19 @@ optional expected answer fragments and section regexes. These expectations
 produce a strict text match, not a semantic judge. Source data, generated
 indexes, reports, and machine paths remain ignored by Git.
 
+`control` runs the frozen base model with all ingested records in its prompt and
+the latent adapter bypassed. It is an experimental ceiling, not the production
+memory path. `MEMORY_RECORD_FORMAT=raw` makes `query` feed only each admitted
+record body into the latent channel; the default `metadata` preserves the
+historical serving format. This switch is an inference-only ablation and never
+changes model weights.
+
 ## Next gate
 
 Do not train on each document and do not add more legal facts to weights. The
-next step is the reusable natural capability run described in
-[External Memory Expert](memory-expert.md). Its current English capability gate
-uses pinned ConflictQA causal pairs and never this legal document.
-
-It passes only if the same already-ingested document reaches all of these:
+ConflictQA v4 adapter is closed after failing both Romanian and invented-English
+external data. A replacement mechanism passes only if the same already-ingested
+document reaches all of these:
 
 - rank-1 retrieval remains 5/5;
 - at least 4/5 strict answers, with no unsupported answer counted as correct;
