@@ -82,6 +82,7 @@ Switch models or release all GPU memory with the same command:
 - [DeepSeek compact pack v1](docs/deepseek-compact-pack-v1.md)
 - [Compute-ready representations](docs/compute-ready.md)
 - [External Memory Expert](docs/memory-expert.md)
+- [Memory Data ingestion and retrieval](docs/memory-data.md)
 - [Runtime contract](docs/expert-runtime.md)
 - [OpenAI-compatible API](docs/openai-api.md)
 - [Operations](docs/operations.md)

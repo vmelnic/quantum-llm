@@ -146,8 +146,9 @@ Individual phases are available for diagnosis:
 ## Known limits and next boundary
 
 - the corpus is synthetic, English, small, and structurally regular;
-- the hashing encoder and exact shard scan are test doubles, not a real
-  multilingual hundred-gigabyte retrieval stack;
+- the synthetic PoW still uses its hashing test double; the real-data path now
+  uses BGE-M3, although its exact dense shard scan is not yet a
+  hundred-gigabyte retrieval backend;
 - memory encoding is JIT and not yet exposed through the serving API;
 - the Python hooks recompute cross-attention K/V during decode and are not a
   throughput implementation;
@@ -161,7 +162,9 @@ Individual phases are available for diagnosis:
 - adapters are backbone-specific; the interface can port to Qwen3-Next and
   DeepSeek, but these Qwen3-4B gate weights cannot.
 
-The next meaningful vertical slice is real document ingestion plus a
-multilingual compact encoder and a serving endpoint, while preserving the same
-oracle/automatic/no-memory/causal gates. More synthetic training is not the
-next milestone.
+The ingestion and retrieval portion of the real-data slice is now implemented and
+measured in [Memory Data ingestion and retrieval](memory-data.md). BGE-M3 found
+the correct Romanian legal article at rank 1 for 5/5 questions, but the existing
+English synthetic adapter answered only 2/5 strictly. The next model-side gate
+is therefore one corpus-independent multilingual/extractive capability adapter,
+not per-document training.

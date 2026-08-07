@@ -64,6 +64,22 @@ The validated default is a 1,024-microstep run; `run` requires the
 same-question counterfactual causal probe before it spends time on held-out
 evaluation. See [External Memory Expert](../docs/memory-expert.md).
 
+Real sources use the separate generic data wrapper:
+
+```bash
+./ops/memory-data.sh ingest
+./ops/memory-data.sh sync
+./ops/memory-data.sh encoder-download
+./ops/memory-data.sh selftest
+./ops/memory-data.sh index
+./ops/memory-data.sh query
+./ops/memory-data.sh status
+```
+
+The source adapter, stable source URI, encoder, dataset name, language and
+bounded query limits are configured in `.env`. Raw sources are not copied to
+the worker. See [Memory Data ingestion and retrieval](../docs/memory-data.md).
+
 ## Windows scripts
 
 The directory is intentionally limited to supported operator workflows:
@@ -88,6 +104,8 @@ The directory is intentionally limited to supported operator workflows:
 - `Install-MemoryExpertEnvironment.ps1` and `Invoke-MemoryExpertPow.ps1`
   provide the isolated, bounded external-memory experiment described in
   [`experiments/memory_expert`](../experiments/memory_expert/README.md).
+- `Install-MemoryEncoder.ps1` and `Invoke-MemoryData.ps1` build and query the
+  generic real-data contract without synchronizing raw source files.
 
 Intermediate phase-admission scripts used while developing the DeepSeek
 backend are not part of the supported operator surface. Their outcomes are

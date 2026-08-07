@@ -5,6 +5,7 @@ import json
 import math
 import random
 import re
+import unicodedata
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -542,7 +543,13 @@ def parse_response(text: str) -> tuple[str, tuple[str, ...]]:
 
 
 def normalized_contains(actual: str, expected: str) -> bool:
-    normalize = lambda value: " ".join(_TOKEN.findall(value.lower()))
+    def normalize(value: str) -> str:
+        decomposed = unicodedata.normalize("NFKD", value.casefold())
+        plain = "".join(
+            character for character in decomposed
+            if not unicodedata.combining(character)
+        )
+        return " ".join(re.findall(r"\w+", plain, re.UNICODE))
     return normalize(expected) in normalize(actual)
 
 

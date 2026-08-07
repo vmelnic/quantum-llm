@@ -114,22 +114,26 @@ activations move instead of whole experts per token.
 
 ## P7 — production external knowledge
 
-The synthetic Memory Expert PoW has passed. The next work is a real data plane,
-not more synthetic demonstrations:
+The synthetic Memory Expert PoW has passed. Generic immutable ingestion and a
+pinned multilingual dense index are now implemented; the first Romanian legal
+document reached rank-1 retrieval for 5/5 questions. The old English adapter
+reached only 2/5 strict answers, so production knowledge remains incomplete:
 
-1. ingest immutable source bytes, stable generations, language, ACL, temporal
-   validity and deletion/tombstone semantics;
-2. replace hashing/exact scan with a calibrated multilingual encoder and
-   routed ANN/full-text shards while retaining an explicit no-evidence result;
-3. expose bounded memory admission, citations and verbatim evidence through the
+1. train one data-independent Romanian/Russian/English extractive capability
+   adapter; never retrain it merely because records were ingested;
+2. extend the implemented immutable record generations, language and ACL
+   contract with temporal selection and deletion/tombstone semantics;
+3. extend the pinned BGE-M3 exact sharded scan to calibrated routed
+   ANN/full-text or sparse shards while retaining an explicit no-evidence result;
+4. expose bounded memory admission, citations and verbatim evidence through the
    serving API without placing records in the conversation context;
-4. cache only hot JIT memory states under independent RAM/VRAM budgets;
-5. replace the continuation heuristic with a trained/general copy-span head
+5. cache only hot JIT memory states under independent RAM/VRAM budgets;
+6. replace the continuation heuristic with a trained/general copy-span head
    if real-corpus exact-literal gates require it;
-6. evaluate Moldovan/Romanian/Russian legislation and structured order data for
+7. evaluate Moldovan/Romanian/Russian legislation and structured order data for
    temporal correctness, ACL isolation, injection resistance, updates, exact
    quotes and abstention;
-7. port the interface—not the Qwen3-4B weights—to larger Qwen and DeepSeek
+8. port the interface—not the Qwen3-4B weights—to larger Qwen and DeepSeek
    backbones only after the small-model real-data gate passes.
 
 Acceptance: unseen ingests become queryable without weight updates; unsupported

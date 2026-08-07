@@ -150,3 +150,15 @@ New records do not require adapter training. Production follow-up replaces the
 test-double index and synthetic corpus, adds a serving API and security/data
 lifecycle, then ports the interface independently to larger backbones. Adapter
 weights are not portable between residual spaces.
+
+The first generic real-data path now lives beside the PoW:
+
+- `ingest.py` and `data_contract.py` create immutable, model-independent shards;
+- `dense_index.py` builds a pinned multilingual index;
+- `real_query.py` separates retrieval, neuronal answers, and authoritative
+  evidence rendering;
+- `configs/` contains replaceable source profiles rather than source-specific
+  paths in code.
+
+Its measured Romanian legal result and current adapter limitation are in
+[`docs/memory-data.md`](../../docs/memory-data.md).

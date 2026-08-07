@@ -153,3 +153,19 @@ Several rejected intermediate results were essential:
 The result and limitations are documented in
 [External Memory Expert](memory-expert.md). It is a feasibility result, not a
 claim that the current synthetic index is ready for real private data.
+
+## First real Memory Data slice
+
+The next slice introduced a generic immutable record contract, configurable
+JSON/text adapters, article-aware but replaceable segmentation, a pinned
+BGE-M3 dense encoder, FP16 vector shards, ACL/language admission, and
+authority-plane quote rendering. One Romanian legal document became 731
+records in 0.025 seconds and its index was computed in 3.98 seconds. Five
+Romanian questions retrieved the correct article at rank 1 in every case.
+
+The existing English synthetic Memory Expert adapter answered only two of five
+strictly. Top-2 versus top-1 admission did not change that conclusion. This
+localized the next problem to multilingual/extractive adapter capability,
+rather than ingestion or dense retrieval. Model-generated synthetic citation
+IDs were rejected; exact citations were rendered only from ACL-admitted source
+records. See [Memory Data ingestion and retrieval](memory-data.md).
