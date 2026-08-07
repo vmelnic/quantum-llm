@@ -67,10 +67,10 @@ evaluation. See [External Memory Expert](../docs/memory-expert.md).
 Natural capability training and real sources use the generic data wrapper:
 
 ```bash
+./ops/memory-data.sh capability-download
 ./ops/memory-data.sh capability-prepare
-./ops/memory-data.sh capability-rewrite
-./ops/memory-data.sh capability-build
 ./ops/memory-data.sh capability-sync
+./ops/memory-data.sh capability-validate
 ./ops/memory-data.sh capability-run
 ./ops/memory-data.sh ingest
 ./ops/memory-data.sh sync
@@ -81,13 +81,13 @@ Natural capability training and real sources use the generic data wrapper:
 ./ops/memory-data.sh status
 ```
 
-The first three commands create rewrite jobs, generate independently validated
-coherent counterfactuals through a configured offline OpenAI-compatible
-teacher, then build the corpus. There is no answer-span substitution fallback.
-The natural capability corpus is separate from evaluated source data and the
-causal probe uses eval families only. The source adapter, stable source URI,
-encoder, dataset name, language and bounded query limits are configured in
-`.env`. Raw sources are not copied to the worker. See
+The first command uses the official Hugging Face CLI and `hf_xet` with pinned
+revisions; the second verifies the selected ConflictQA SHA and builds the
+causal corpus. There is no teacher or locally generated counterfactual path.
+The capability corpus is separate from evaluated source data and the causal
+probe uses eval families only. The source adapter, stable source URI, encoder,
+dataset name, language and bounded query limits are configured in `.env`. Raw
+user sources are not copied to the worker. See
 [Memory Data ingestion and retrieval](../docs/memory-data.md).
 
 ## Windows scripts

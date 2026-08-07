@@ -20,8 +20,8 @@ The distinction matters:
   capability.
 
 The invalid multilingual checkpoint remains historical data and must not be
-promoted. The current gate is `xquad-coherent-counterfactual-memory-v2`; its
-full training and evaluation result must be recorded before claiming success.
+promoted. The current gate is `conflictqa-causal-memory-v3`; its full training
+and evaluation result must be recorded before claiming success.
 
 ## Architecture under test
 
@@ -69,29 +69,30 @@ The adapter is trained once to perform a capability—read admitted natural
 memory, follow its current authority, cite it, and abstain—not to memorize a
 particular ingest.
 
-The capability corpus is constructed from the pinned `google/xquad` revision
-`51adfef1c1287aab1d2d91b5bead9bcfb9c68583` (CC-BY-SA-4.0):
+The capability corpus is constructed from the pinned Apache-2.0
+[`osunlp/ConflictQA`](https://huggingface.co/datasets/osunlp/ConflictQA)
+revision `056384049e63c1ddae853891c24610fa07d85744`:
 
-- Romanian, Russian, and English natural questions and passages;
-- original and coherently rewritten counterfactual memories for the same
-  natural question;
+- 7,940 English causal families retained from 7,947 source rows;
+- 16,674 examples: original and counterfactual memories for the same natural
+  question plus absent-evidence cases;
 - natural answers, opaque IDs, distractor records, and absent-evidence cases;
-- duplicate questions and their translations are assigned atomically to one
-  split, preventing train/eval leakage;
-- each rewrite must change the answer, remove the original answer, remain in
-  the source language, stay coherent, and be answerable by an independent
-  extraction pass; blind answer-span substitution has no fallback;
-- answer-bearing passages are bounded around exact source spans, and a
-  tokenizer-aware preflight requires every answer and local source label to remain
-  visible after the configured 384-token truncation;
+- normalized duplicate questions are assigned atomically to one split,
+  preventing train/eval leakage;
+- seven ambiguous source families that retained the sibling answer were
+  rejected automatically;
+- the corpus builder downloads no source itself: the official Hugging Face CLI
+  with `hf_xet`, a pinned revision, and a pinned file SHA-256 owns acquisition;
+- a tokenizer-aware preflight requires every local source label to survive the
+  configured 768-token memory bound;
 - the model emits only zero-based request-local slots such as `SOURCES: 1`;
   opaque record IDs, ACL decisions, and exact quotes are mapped and rendered by
   the authority plane after generation, never learned as output tokens;
 - the evaluated legal questions are forbidden training material.
 
 The loader rejects the old patterned keys, closed-span markers, citation IDs in
-questions, non-extractive targets, family split leakage, missing language
-coverage, and single-record-only corpora.
+questions, family split leakage, changed distractors or source positions inside
+a causal pair, ambiguous sibling answers, and single-record-only corpora.
 
 Training mixes original, counterfactual, and abstention examples from the first
 optimizer phase. The causal probe now uses eval families only. Automatic
@@ -134,21 +135,23 @@ sufficient: the untouched Romanian law dataset is the external test.
 Configure `.env` from `.env.example`, then:
 
 ```bash
+./ops/memory-data.sh capability-download
 ./ops/memory-data.sh capability-prepare
-./ops/memory-data.sh capability-rewrite
-./ops/memory-data.sh capability-build
 ./ops/memory-data.sh capability-sync
+./ops/memory-data.sh capability-validate
 ./ops/memory-data.sh capability-run
 ```
 
-`capability-prepare` downloads only the pinned public XQuAD rows and writes
-versioned rewrite jobs. `capability-rewrite` calls the configured
-OpenAI-compatible offline teacher and a separate verification pass; it is not
-part of inference. `capability-build` refuses unvalidated or stale rewrites and
-writes the ignored corpus plus SHA-256 manifests. `capability-run` synchronizes
-and validates that artifact, trains on the GPU host, then runs the eval-only
-causal probe and held-out evaluation. Individual train/probe/evaluate actions
-remain available for diagnosis.
+`capability-download` uses `hf download --repo-type dataset` with Xet and pinned
+revisions for ConflictQA, FaithEval, and ParaConflict. `capability-prepare`
+verifies the selected ConflictQA file hash and deterministically writes the
+ignored corpus plus its SHA-256 manifest. `capability-run` synchronizes and
+validates that artifact, trains on the GPU host, then runs the eval-only causal
+probe and held-out evaluation. `capability-validate` performs the complete
+manifest, corpus, family, and anti-leak validation on the GPU host without
+loading a model or changing weights. Individual train/probe/evaluate actions
+remain available for diagnosis. FaithEval and ParaConflict stay untouched
+external benchmarks and are not training rows.
 
 After a capability checkpoint passes, the untouched external dataset is run
 with:
@@ -163,8 +166,10 @@ not versioned.
 
 ## Remaining boundary
 
-- coherent multilingual rewrite generation, training, and evaluation have not
-  completed; no natural capability pass is claimed yet;
+- ConflictQA v3 training and evaluation have not completed; no natural
+  capability pass is claimed yet;
+- v3 initially validates the mechanism in English; Romanian and Russian remain
+  external generalization work after the causal gate passes;
 - Python hooks recompute memory K/V and are a research implementation, not a
   throughput backend;
 - exact dense shard scan must become routed hybrid retrieval at large scale;

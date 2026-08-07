@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("train", "probe", "evaluate", "run")][string]$Action = "run",
+    [ValidateSet("validate", "train", "probe", "evaluate", "run")][string]$Action = "run",
     [int]$Steps = 4096,
     [int]$BatchSize = 2,
     [int]$GradientAccumulation = 16,
@@ -8,9 +8,9 @@ param(
     [int]$GateRank = 16,
     [double]$GateAlpha = 32.0,
     [double]$KnowledgeDropout = 0.2,
-    [int]$MaximumMemoryTokens = 384,
+    [int]$MaximumMemoryTokens = 768,
     [int]$MaximumNewTokens = 128,
-    [string]$OutputName = "memory-expert-capability-natural-v2",
+    [string]$OutputName = "memory-expert-capability-conflictqa-v3",
     [Parameter(Mandatory = $true)][string]$Corpus,
     [string]$ForbiddenFile = "",
     [int64]$MemoryCacheBytes = 4294967296,

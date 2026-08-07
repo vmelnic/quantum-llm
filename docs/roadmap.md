@@ -120,8 +120,8 @@ legal document reached rank-1 retrieval for 5/5 questions. The first
 multilingual capability benchmark was invalidated by shortcuts and its legal
 run was unusable. Production knowledge therefore remains incomplete:
 
-1. complete and externally validate the natural XQuAD-based
-   Romanian/Russian/English capability adapter; never retrain it merely because
+1. complete and externally validate the pinned ConflictQA English capability
+   adapter, then test Romanian/Russian transfer; never retrain it merely because
    records were ingested;
 2. extend the implemented immutable record generations, language and ACL
    contract with temporal selection and deletion/tombstone semantics;

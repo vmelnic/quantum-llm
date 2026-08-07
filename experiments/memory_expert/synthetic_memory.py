@@ -44,6 +44,7 @@ class MemoryExample:
     language: str = "en"
     family_id: str = ""
     source_slots: tuple[int, ...] = ()
+    answer_support: str = "extractive"
 
     @property
     def target(self) -> str:

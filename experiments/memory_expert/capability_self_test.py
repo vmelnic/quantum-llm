@@ -16,7 +16,6 @@ try:
     from .synthetic_memory import (
         UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
     )
-    from .prepare_capability_data import _load_validated_rewrites
 except ImportError:
     from capability_corpus import (
         LANGUAGES,
@@ -28,7 +27,6 @@ except ImportError:
     from synthetic_memory import (
         UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
     )
-    from prepare_capability_data import _load_validated_rewrites
 
 
 def _record(language: str, split: str, family: str, variant: int,
@@ -87,6 +85,9 @@ def _fixture() -> list[dict[str, object]]:
                     "language": language,
                     "question": question,
                     "answer": answer,
+                    "answer_support": (
+                        "dataset-label" if language == "ru" else "extractive"
+                    ),
                     "citations": [records[variant]["citation_id"]],
                     "kind": "natural" if variant == 0 else "counterfactual",
                     "records": admitted,
@@ -99,6 +100,7 @@ def _fixture() -> list[dict[str, object]]:
                 "language": language,
                 "question": question + " Missing authority.",
                 "answer": UNKNOWN_ANSWER,
+                "answer_support": "absent",
                 "citations": [],
                 "kind": "unknown",
                 "records": [records[0], distractor],
@@ -138,34 +140,6 @@ def main() -> int:
         rendered = format_memory(records[:2])
         assert "SOURCE 0:" in rendered and "SOURCE 1:" in rendered
         assert parse_response("ANSWER: amber\nSOURCES: 1") == ("amber", (1,))
-        rewrite_path = Path(directory) / "rewrites.jsonl"
-        rewrite_row = {
-            "schema_version": 1,
-            "status": "accepted",
-            "family_id": "MEM-F-TEST",
-            "source_sha256": "source-hash",
-            "counterfactual_context": "The recorded value is sapphire.",
-            "counterfactual_answer": "sapphire",
-            "validation": {
-                "extracted_answer": "sapphire",
-                "question_answerable": True,
-                "context_coherent": True,
-                "language_match": True,
-            },
-        }
-        rewrite_path.write_text(
-            json.dumps(rewrite_row) + "\n", encoding="utf-8"
-        )
-        rewrite_path.with_suffix(".jsonl.manifest.json").write_text(json.dumps({
-            "schema_version": 1,
-            "contract": "memory-counterfactual-rewrites-v1",
-            "rows": 1,
-            "accepted": 1,
-            "rejected": 0,
-            "sha256": hashlib.sha256(rewrite_path.read_bytes()).hexdigest(),
-        }) + "\n", encoding="utf-8")
-        rewrites = _load_validated_rewrites(rewrite_path)
-        assert rewrites["MEM-F-TEST"]["answer"] == "sapphire"
         train_questions = {
             (example.language, example.question) for example in examples
             if example.split == "train"

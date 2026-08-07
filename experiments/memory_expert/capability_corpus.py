@@ -89,7 +89,7 @@ def validate_capability_manifest(
     if not manifest_path.is_file():
         raise ValueError(f"capability manifest is missing: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (1, 2):
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (1, 2, 3):
         raise ValueError("invalid capability manifest")
     actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
     if manifest.get("sha256") != actual_hash:
@@ -111,6 +111,7 @@ def load_capability_corpus(
     path: Path,
     minimum_train_families_per_language: int = 500,
     minimum_eval_families_per_language: int = 100,
+    required_languages: Sequence[str] = ("en",),
 ) -> tuple[list[MemoryRecord], list[MemoryExample]]:
     """Load natural multilingual QA with explicit causal memory variants.
 
@@ -138,10 +139,13 @@ def load_capability_corpus(
         question = str(row.get("question", "")).strip()
         answer = str(row.get("answer", "")).strip()
         kind = str(row.get("kind", "natural"))
+        answer_support = str(row.get("answer_support", "extractive"))
         citations_raw = row.get("citations", [])
         records_raw = row.get("records", [])
         if split not in ("train", "eval") or language not in LANGUAGES:
             raise ValueError(f"row {index} has invalid split/language")
+        if answer_support not in ("extractive", "dataset-label", "absent"):
+            raise ValueError(f"row {index} has invalid answer support")
         if not family_id or not example_id or not question or not answer:
             raise ValueError(f"row {index} is missing identity or QA text")
         if family_splits.setdefault(family_id, split) != split:
@@ -204,13 +208,17 @@ def load_capability_corpus(
             if public_id in set(citations)
         )
         if kind == "unknown":
-            if answer != UNKNOWN_ANSWER or citations:
+            if answer != UNKNOWN_ANSWER or citations or answer_support != "absent":
                 raise ValueError("unknown rows require exact abstention and no citations")
             unknown_counts[(split, language)] += 1
         else:
             if not citations:
                 raise ValueError("answerable rows require an authoritative citation")
-            if not any(normalized_contains(text, answer) for text in memory_texts):
+            if answer_support == "absent":
+                raise ValueError("answerable rows cannot declare absent support")
+            if answer_support == "extractive" and not any(
+                normalized_contains(text, answer) for text in memory_texts
+            ):
                 raise ValueError(f"answer is not extractive from admitted memory: {example_id}")
 
         example = MemoryExample(
@@ -224,6 +232,7 @@ def load_capability_corpus(
             language=language,
             family_id=family_id,
             source_slots=source_slots,
+            answer_support=answer_support,
         )
         examples.append(example)
         family_rows[family_id].append(example)
@@ -248,6 +257,8 @@ def load_capability_corpus(
             raise ValueError(
                 f"family {family_id} leaks the intervention through source position"
             )
+        if len({member.answer_support for member in answerable}) != 1:
+            raise ValueError(f"family {family_id} changes answer support contract")
         distractor_sets: set[tuple[str, ...]] = set()
         for member in answerable:
             authority = set(member.citations)
@@ -274,7 +285,10 @@ def load_capability_corpus(
         member = answerable[0]
         family_counts[(member.split, member.language)] += 1
 
-    for language in LANGUAGES:
+    invalid_required = set(required_languages) - set(LANGUAGES)
+    if invalid_required:
+        raise ValueError(f"unsupported required languages: {sorted(invalid_required)}")
+    for language in required_languages:
         if family_counts[("train", language)] < minimum_train_families_per_language:
             raise ValueError(f"insufficient train families for {language}")
         if family_counts[("eval", language)] < minimum_eval_families_per_language:

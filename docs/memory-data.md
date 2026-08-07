@@ -160,8 +160,8 @@ indexes, reports, and machine paths remain ignored by Git.
 
 Do not train on each document and do not add more legal facts to weights. The
 next step is the reusable natural capability run described in
-[External Memory Expert](memory-expert.md). It is trained on pinned XQuAD
-Romanian/Russian/English examples and never on this legal document.
+[External Memory Expert](memory-expert.md). Its current English capability gate
+uses pinned ConflictQA causal pairs and never this legal document.
 
 It passes only if the same already-ingested document reaches all of these:
 

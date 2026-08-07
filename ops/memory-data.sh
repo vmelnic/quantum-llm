@@ -23,29 +23,21 @@ fi
 encoder_model="${MEMORY_ENCODER_MODEL:-BAAI/bge-m3}"
 encoder_revision="${MEMORY_ENCODER_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}"
 action="${1:-status}"
-capability_corpus="${MEMORY_CAPABILITY_CORPUS:-work/memory-capability/xquad-coherent-v2.jsonl}"
+capability_corpus="${MEMORY_CAPABILITY_CORPUS:-work/memory-capability/conflictqa-causal-v3.jsonl}"
 if [[ "${capability_corpus}" != /* ]]; then
   capability_corpus="${repo_root}/${capability_corpus}"
 fi
 capability_corpus_name="$(basename "${capability_corpus}")"
 remote_capability_dir="${remote_root}/work/memory-capability"
 remote_capability_corpus="${remote_capability_dir}/${capability_corpus_name}"
-capability_rewrite_jobs="${MEMORY_CAPABILITY_REWRITE_JOBS:-${repo_root}/work/memory-capability/counterfactual-rewrite-jobs.jsonl}"
-capability_rewrites="${MEMORY_CAPABILITY_REWRITES:-${repo_root}/work/memory-capability/counterfactual-rewrites.jsonl}"
-capability_source_cache="${MEMORY_CAPABILITY_SOURCE_CACHE:-${repo_root}/work/memory-capability/source-cache}"
-if [[ "${capability_rewrite_jobs}" != /* ]]; then
-  capability_rewrite_jobs="${repo_root}/${capability_rewrite_jobs}"
-fi
-if [[ "${capability_rewrites}" != /* ]]; then
-  capability_rewrites="${repo_root}/${capability_rewrites}"
-fi
-if [[ "${capability_source_cache}" != /* ]]; then
-  capability_source_cache="${repo_root}/${capability_source_cache}"
+capability_source="${MEMORY_CAPABILITY_SOURCE:-${repo_root}/work/memory-capability/hf-datasets/conflictqa/conflictQA-popQA-chatgpt.json}"
+if [[ "${capability_source}" != /* ]]; then
+  capability_source="${repo_root}/${capability_source}"
 fi
 
 [[ "${dataset_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid MEMORY_DATASET_NAME" >&2; exit 2; }
-if [[ "${action}" != "ingest" && "${action}" != "capability-prepare" \
-   && "${action}" != "capability-rewrite" && "${action}" != "capability-build" ]]; then
+if [[ "${action}" != "ingest" && "${action}" != "capability-download" \
+   && "${action}" != "capability-prepare" ]]; then
   [[ -n "${remote_host}" ]] || { echo "Set QUANTUM_LLM_REMOTE in ${env_file}" >&2; exit 2; }
   export QUANTUM_LLM_REMOTE="${remote_host}"
   export QUANTUM_LLM_REMOTE_ROOT="${remote_root}"
@@ -72,7 +64,7 @@ sync_data() {
 
 sync_capability_data() {
   [[ -f "${capability_corpus}" ]] || {
-    echo "Run capability-prepare, capability-rewrite, and capability-build first" >&2; exit 2;
+    echo "Run capability-download and capability-prepare first" >&2; exit 2;
   }
   python3 "${repo_root}/experiments/memory_expert/prepare_capability_data.py" \
     --output "${capability_corpus}" --validate-only >/dev/null
@@ -90,32 +82,16 @@ sync_capability_data() {
 }
 
 case "${action}" in
+  capability-download)
+    "${script_dir}/hf-memory-datasets.sh"
+    ;;
   capability-prepare)
-    python3 "${repo_root}/experiments/memory_expert/prepare_capability_data.py" \
-      --output "${capability_corpus}" \
-      --source-cache "${capability_source_cache}" \
-      --rewrite-jobs "${capability_rewrite_jobs}"
-    ;;
-  capability-rewrite)
-    [[ -f "${capability_rewrite_jobs}" ]] || {
-      echo "Run ./ops/memory-data.sh capability-prepare first" >&2; exit 2;
-    }
-    python3 "${repo_root}/experiments/memory_expert/generate_counterfactual_rewrites.py" \
-      --jobs "${capability_rewrite_jobs}" \
-      --output "${capability_rewrites}" \
-      --limit "${MEMORY_REWRITE_LIMIT:-0}" \
-      --attempts "${MEMORY_REWRITE_ATTEMPTS:-3}" \
-      --timeout "${MEMORY_REWRITE_TIMEOUT:-180}"
-    ;;
-  capability-build)
-    [[ -f "${capability_rewrites}" ]] || {
-      echo "Run ./ops/memory-data.sh capability-rewrite first" >&2; exit 2;
+    [[ -f "${capability_source}" ]] || {
+      echo "Run ./ops/memory-data.sh capability-download first" >&2; exit 2;
     }
     python3 "${repo_root}/experiments/memory_expert/prepare_capability_data.py" \
       --output "${capability_corpus}" \
-      --source-cache "${capability_source_cache}" \
-      --rewrite-jobs "${capability_rewrite_jobs}" \
-      --rewrites "${capability_rewrites}"
+      --source "${capability_source}"
     ;;
   capability-sync)
     sync_capability_data
@@ -139,7 +115,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" Install-MemoryEncoder.ps1 \
       -ModelId "${encoder_model}" -Revision "${encoder_revision}"
     ;;
-  capability-train|capability-probe|capability-evaluate|capability-run)
+  capability-validate|capability-train|capability-probe|capability-evaluate|capability-run)
     capability_action="${action#capability-}"
     sync_capability_data
     capability_arguments=(Invoke-MemoryCapability.ps1 \
@@ -156,7 +132,7 @@ case "${action}" in
       -MaximumMemoryTokens "${MEMORY_CAPABILITY_MEMORY_TOKENS:-384}" \
       -MaximumNewTokens "${MEMORY_CAPABILITY_NEW_TOKENS:-128}" \
       -MemoryCacheBytes "${MEMORY_CAPABILITY_CACHE_BYTES:-4294967296}" \
-      -OutputName "${MEMORY_CAPABILITY_OUTPUT_NAME:-memory-expert-capability-natural-v2}")
+      -OutputName "${MEMORY_CAPABILITY_OUTPUT_NAME:-memory-expert-capability-conflictqa-v3}")
     if [[ -f "${local_dataset_root}/questions.jsonl" ]]; then
       ssh -o BatchMode=yes "${remote_host}" \
         "if not exist \"${remote_dataset_root}\" mkdir \"${remote_dataset_root}\""
@@ -179,14 +155,14 @@ case "${action}" in
       -TopK "${MEMORY_RETRIEVAL_TOP_K:-2}" \
       -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
       -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}" \
-      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-natural-v2/memory-expert.pt}")
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v3/memory-expert.pt}")
     if [[ -n "${MEMORY_QUERY_LANGUAGE:-}" ]]; then
       remote_arguments+=(-Language "${MEMORY_QUERY_LANGUAGE}")
     fi
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|status|capability-prepare|capability-rewrite|capability-build|capability-sync|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|status|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac

@@ -53,7 +53,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train and gate the multilingual Memory Expert operation"
     )
-    parser.add_argument("action", choices=("train", "probe", "evaluate", "run"))
+    parser.add_argument(
+        "action", choices=("validate", "train", "probe", "evaluate", "run")
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-4B")
     parser.add_argument("--revision", default="1cfa9a7208912126459214e8b04321603b3df60c")
     parser.add_argument("--output", type=Path, required=True)
@@ -91,7 +93,7 @@ def main() -> int:
         seed=args.seed,
     )
     manifest = validate_capability_manifest(
-        args.corpus.resolve(), "xquad-coherent-counterfactual-memory-v2"
+        args.corpus.resolve(), "conflictqa-causal-memory-v3"
     )
     corpus = load_capability_corpus(
         args.corpus.resolve(),
@@ -102,12 +104,22 @@ def main() -> int:
     assert_no_forbidden_overlap(
         training_texts(*corpus), forbidden, ngram_width=8
     )
+    if args.action == "validate":
+        records, examples = corpus
+        print(json.dumps({
+            "event": "capability-validation-summary",
+            "contract": manifest["contract"],
+            "corpus_sha256": manifest["sha256"],
+            "records": len(records),
+            "examples": len(examples),
+        }, indent=2))
+        return 0
     checkpoint = args.checkpoint or args.output / "memory-expert.pt"
     if args.action in ("train", "run"):
         result = train(
             config, args.output, args.steps, args.batch_size,
             args.learning_rate, args.gradient_accumulation, "adamw",
-            corpus=corpus, corpus_name="xquad-coherent-counterfactual-v2",
+            corpus=corpus, corpus_name="conflictqa-causal-memory-v3",
             augment_examples=False, staged_curriculum=False,
             memory_cache_bytes=args.memory_cache_bytes,
         )

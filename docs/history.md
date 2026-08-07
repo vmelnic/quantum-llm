@@ -206,3 +206,13 @@ and source position across each causal pair, and fails closed on missing or
 stale rewrites. Neural supervision uses request-local `SOURCES` slots; durable
 citation hashes remain metadata and are mapped to exact quotes only by the
 authority plane. Full multilingual generation and training remain pending.
+
+That proposed rewrite pipeline was then removed before use. Existing public
+datasets were a better source than generating another private benchmark.
+`conflictqa-causal-memory-v3` now consumes the pinned Apache-2.0 ConflictQA
+artifact through the official Hugging Face CLI and Xet. It retained 7,940 of
+7,947 same-question contradictory-memory families, rejected seven whose
+authoritative context still contained the sibling answer, and produced 16,674
+English capability examples. FaithEval and ParaConflict were downloaded at
+pinned revisions as untouched future external evaluations. No Qwen teacher
+generation occurred, and no production-model artifact was changed.

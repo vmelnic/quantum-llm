@@ -317,7 +317,10 @@ def validate_visible_evidence(tokenizer, examples: Sequence[MemoryExample],
         )["input_ids"]
         for example, token_ids in zip(batch, encoded):
             visible = tokenizer.decode(token_ids, skip_special_tokens=True)
-            answer_visible = normalized_contains(visible, example.answer)
+            answer_visible = (
+                example.answer_support != "extractive"
+                or normalized_contains(visible, example.answer)
+            )
             sources_visible = all(
                 f"source {slot}:" in visible.casefold()
                 for slot in example.source_slots
