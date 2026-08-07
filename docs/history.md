@@ -216,3 +216,37 @@ authoritative context still contained the sibling answer, and produced 16,674
 English capability examples. FaithEval and ParaConflict were downloaded at
 pinned revisions as untouched future external evaluations. No Qwen teacher
 generation occurred, and no production-model artifact was changed.
+
+## ConflictQA v3 result and implementation audit
+
+The v3 adapter trained 2,949,120 gate parameters while keeping Qwen3-4B
+frozen. Its advertised 4,096 steps were microsteps, not optimizer updates:
+batch size 2 with gradient accumulation 16 produced 256 updates and consumed
+8,192 of 13,267 training examples, or 0.62 epochs. The run completed in
+1,607.87 seconds, reduced observed minibatch loss from 2.71209 to 0.02451 and
+peaked at 12.21 GiB VRAM.
+
+The mandatory eval-only causal probe failed promotion. All six tested families
+were memory-sensitive and contrastive candidate accuracy was 12/12, showing
+that the separate channel affected the answer. Exact generation was only 9/12:
+`Daniel Mulloy` became `Daniel Mullony`, `Bobby Hebb` became `Bobbie Hebert`,
+and the Akari Hayami answer followed parametric knowledge rather than the
+admitted evidence. Held-out evaluation was not run after this prerequisite
+failed. The checkpoint remains an ignored diagnostic artifact.
+
+The review found the authors' previously missed
+[TokenMem repository](https://github.com/iomgaa-ycz/TokenMem). It contains the
+reference model modifications, two-phase training and evaluation code, but no
+published gate checkpoint or declared repository license. Comparison exposed
+curriculum, cross-attention RoPE, memory-compression and target-format
+differences. It also exposed a local contract defect: `dataset-label` rows
+could pass visible-evidence validation without the exact answer occurring in
+the admitted text. A future run must resolve these points structurally rather
+than patch the three failed outputs.
+
+[KBLaM](https://github.com/microsoft/KBLaM),
+[MeMo](https://github.com/arunv3rma/MeMo) and
+[delta-mem](https://github.com/declare-lab/delta-Mem) were recorded as adjacent
+research, not equivalent products. None of the reviewed systems combined
+instant ingest, hundreds-of-GB sharding, latent injection, ACL/version
+semantics, fail-closed answers, exact citations and a production API.

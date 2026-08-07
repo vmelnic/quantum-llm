@@ -120,9 +120,11 @@ legal document reached rank-1 retrieval for 5/5 questions. The first
 multilingual capability benchmark was invalidated by shortcuts and its legal
 run was unusable. Production knowledge therefore remains incomplete:
 
-1. complete and externally validate the pinned ConflictQA English capability
-   adapter, then test Romanian/Russian transfer; never retrain it merely because
-   records were ingested;
+1. realign the failed ConflictQA adapter with the public TokenMem reference:
+   reproduce the factual-then-counterfactual curriculum, resolve the
+   hook/RoPE/state-compression differences, require honest visible-evidence
+   validation, and report epochs plus optimizer updates rather than ambiguous
+   microsteps; do not tune against only the three failed examples;
 2. extend the implemented immutable record generations, language and ACL
    contract with temporal selection and deletion/tombstone semantics;
 3. extend the pinned BGE-M3 exact sharded scan to calibrated routed
@@ -135,7 +137,9 @@ run was unusable. Production knowledge therefore remains incomplete:
 7. evaluate Moldovan/Romanian/Russian legislation and structured order data for
    temporal correctness, ACL isolation, injection resistance, updates, exact
    quotes and abstention;
-8. port the interface—not the Qwen3-4B weights—to larger Qwen and DeepSeek
+8. test Romanian/Russian transfer only after the English causal and held-out
+   gates pass; never retrain merely because records were ingested;
+9. port the interface—not the Qwen3-4B weights—to larger Qwen and DeepSeek
    backbones only after the small-model real-data gate passes.
 
 Acceptance: unseen ingests become queryable without weight updates; unsupported

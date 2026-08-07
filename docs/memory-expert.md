@@ -20,8 +20,17 @@ The distinction matters:
   capability.
 
 The invalid multilingual checkpoint remains historical data and must not be
-promoted. The current gate is `conflictqa-causal-memory-v3`; its full training
-and evaluation result must be recorded before claiming success.
+promoted. The `conflictqa-causal-memory-v3` run completed on 2026-08-07, but it
+also failed its promotion gate. Its configured 4,096 steps were microsteps:
+with batch size 2 and gradient accumulation 16, the run made only 256 optimizer
+updates and consumed 8,192 of 13,267 training rows (0.62 epochs). Training took
+1,608 seconds and its observed minibatch loss fell from 2.7121 to 0.0245.
+
+On six untouched causal families, all six changed answers when authoritative
+memory changed, but only 9/12 generations were exact. Two names were corrupted
+and one answer followed parametric knowledge instead of the admitted evidence.
+The causal channel works; the natural answer contract does not. Held-out
+evaluation was deliberately not run after this prerequisite failed.
 
 ## Architecture under test
 
@@ -63,6 +72,43 @@ admitted records reach the decoder only through the separate layer-wise memory
 channel. The capability corpus below trains that channel; it is not the user's
 knowledge base and it is not rebuilt when knowledge is ingested.
 
+## Research provenance and implementation audit
+
+The neural branch is an independent **TokenMem-style** implementation, not a
+claim that this project invented gated layer-wise knowledge injection. The
+reference is [TokenMem: Faithful Knowledge Injection for Frozen
+LLMs](https://arxiv.org/abs/2607.22625). Its authors publish a
+[research repository](https://github.com/iomgaa-ycz/TokenMem) with Qwen, Llama
+and OLMo training/evaluation code. That repository currently publishes no gate
+checkpoints and declares no code license, so it is a behavioral reference and
+its source is not copied here.
+
+The audit found material differences that must be resolved before another run:
+
+- the reference trains a factual phase followed by a counterfactual phase;
+  v3 mixed factual, counterfactual and abstention rows from the first step;
+- the reference modifies the model implementation directly and applies RoPE
+  differently on the cross-attention query; v3 used hooks over stock Qwen;
+- the reference compresses memory states and trains multiple-choice CoT
+  targets; v3 kept longer states and trained natural answers plus source slots;
+- v3 reported microsteps as `steps`, obscuring optimizer updates and epochs;
+- v3 allowed `dataset-label` evidence to pass preflight without requiring the
+  exact answer in visible source text. This made the evidence validation claim
+  weaker than its name suggested.
+
+These are structural questions. The next iteration must reconcile them before
+training and must not tune against the three failed examples.
+
+No reviewed public project supplies the complete target system. The closest
+components are [KBLaM](https://github.com/microsoft/KBLaM), which injects
+knowledge tokens but explicitly remains a limited research system;
+[MeMo](https://github.com/arunv3rma/MeMo), which trains a memory model per
+corpus; and [delta-mem](https://github.com/declare-lab/delta-Mem), which stores
+compact interaction history rather than a large immutable factual corpus. The
+unproved integration sought here adds generic ingestion, bounded selection,
+sharding, ACL/version semantics, fail-closed answers, exact authority-plane
+citations, caching and serving.
+
 ## Generic capability protocol
 
 The adapter is trained once to perform a capability—read admitted natural
@@ -94,8 +140,9 @@ The loader rejects the old patterned keys, closed-span markers, citation IDs in
 questions, family split leakage, changed distractors or source positions inside
 a causal pair, ambiguous sibling answers, and single-record-only corpora.
 
-Training mixes original, counterfactual, and abstention examples from the first
-optimizer phase. The causal probe now uses eval families only. Automatic
+The failed v3 run mixed original, counterfactual, and abstention examples from
+the first optimizer phase. This is recorded behavior, not the accepted design
+for the next run. The causal probe uses eval families only. Automatic
 retrieval is reported only on eligible natural records and is compared with an
 oracle score over the exact same example IDs. Retrieval recall follows the
 authoritative citation, not the deliberately injected distractor record.
@@ -166,8 +213,11 @@ not versioned.
 
 ## Remaining boundary
 
-- ConflictQA v3 training and evaluation have not completed; no natural
-  capability pass is claimed yet;
+- ConflictQA v3 completed training but failed the mandatory generation gate at
+  9/12 exact despite 6/6 memory-sensitive families; no natural capability pass
+  is claimed and held-out evaluation was not run;
+- the next run must align its mechanism, evidence contract, curriculum and
+  epoch/update accounting with the public TokenMem reference before training;
 - v3 initially validates the mechanism in English; Romanian and Russian remain
   external generalization work after the causal gate passes;
 - Python hooks recompute memory K/V and are a research implementation, not a
