@@ -72,6 +72,100 @@ class PowConfig:
     seed: int
 
 
+@dataclass(frozen=True)
+class TrainingBatch:
+    """One deterministic microbatch with explicit optimizer accounting."""
+
+    epoch: int
+    batch_in_epoch: int
+    batches_in_epoch: int
+    microstep: int
+    optimizer_update: int
+    accumulation_window_batches: int
+    optimizer_step: bool
+    phase: str
+    examples: tuple[MemoryExample, ...]
+
+
+@dataclass(frozen=True)
+class TrainingGeometry:
+    examples_per_epoch: int
+    batches_per_epoch: int
+    optimizer_updates_per_epoch: int
+    total_examples: int
+    total_microsteps: int
+    total_optimizer_updates: int
+
+
+def training_geometry(
+    example_count: int, batch_size: int,
+    gradient_accumulation: int, epochs: int,
+) -> TrainingGeometry:
+    """Derive all training counts from complete epochs."""
+    if example_count <= 0 or batch_size <= 0:
+        raise ValueError("training geometry requires positive examples and batch size")
+    if gradient_accumulation <= 0 or epochs <= 0:
+        raise ValueError("training geometry requires positive accumulation and epochs")
+    batches_per_epoch = math.ceil(example_count / batch_size)
+    updates_per_epoch = math.ceil(
+        batches_per_epoch / gradient_accumulation
+    )
+    return TrainingGeometry(
+        examples_per_epoch=example_count,
+        batches_per_epoch=batches_per_epoch,
+        optimizer_updates_per_epoch=updates_per_epoch,
+        total_examples=example_count * epochs,
+        total_microsteps=batches_per_epoch * epochs,
+        total_optimizer_updates=updates_per_epoch * epochs,
+    )
+
+
+def build_epoch_training_schedule(
+    examples: Sequence[MemoryExample], batch_size: int,
+    gradient_accumulation: int, epochs: int, seed: int,
+    start_epoch: int = 0,
+) -> list[TrainingBatch]:
+    """Visit every example exactly once per epoch, including partial batches."""
+    if not examples:
+        raise ValueError("training schedule requires examples")
+    if batch_size <= 0 or gradient_accumulation <= 0 or epochs <= 0:
+        raise ValueError("training schedule limits must be positive")
+    if start_epoch < 0 or start_epoch >= epochs:
+        raise ValueError("start_epoch must be within the configured epoch range")
+
+    geometry = training_geometry(
+        len(examples), batch_size, gradient_accumulation, epochs
+    )
+    schedule: list[TrainingBatch] = []
+    microstep = start_epoch * geometry.batches_per_epoch
+    optimizer_update = start_epoch * geometry.optimizer_updates_per_epoch
+    for epoch_index in range(start_epoch, epochs):
+        ordered = list(examples)
+        random.Random(seed + epoch_index).shuffle(ordered)
+        batches = [
+            tuple(ordered[start:start + batch_size])
+            for start in range(0, len(ordered), batch_size)
+        ]
+        for window_start in range(0, len(batches), gradient_accumulation):
+            window = batches[window_start:window_start + gradient_accumulation]
+            optimizer_update += 1
+            for window_index, batch in enumerate(window):
+                microstep += 1
+                batch_index = window_start + window_index
+                schedule.append(TrainingBatch(
+                    epoch=epoch_index + 1,
+                    batch_in_epoch=batch_index + 1,
+                    batches_in_epoch=len(batches),
+                    microstep=microstep,
+                    optimizer_update=optimizer_update,
+                    accumulation_window_batches=len(window),
+                    optimizer_step=window_index + 1 == len(window),
+                    phase="joint-grounding",
+                    examples=batch,
+                ))
+    return schedule
+
+
 class MemoryExpert(nn.Module):
     """Layer-local TokenMem-style gate over frozen Q/K/V/O projections."""
 
@@ -538,16 +632,79 @@ def augment_training_examples(examples: Sequence[MemoryExample], records: Sequen
     return augmented
 
 
-def train(config: PowConfig, output: Path, steps: int, batch_size: int,
+@torch.inference_mode()
+def supervised_validation_nll(
+    model, tokenizer, adapter: MemoryExpertStack,
+    hooks: dict[int, MemoryHook], memory_state_cache: BoundedMemoryStateCache,
+    examples: Sequence[MemoryExample], batch_size: int, device: torch.device,
+) -> float:
+    """Measure token-weighted held-out NLL without generating or changing weights."""
+    if not examples:
+        raise ValueError("validation requires at least one example")
+    was_training = adapter.training
+    adapter.eval()
+    total_loss = 0.0
+    target_tokens = 0
+    try:
+        for start in range(0, len(examples), batch_size):
+            batch = examples[start:start + batch_size]
+            tokens, labels, attention_mask = pad_token_batches(
+                [supervised_tokens(tokenizer, example) for example in batch],
+                tokenizer.pad_token_id,
+                device,
+            )
+            memory_ids = [example.memory_ids for example in batch]
+            memory_cache = memory_state_cache.ensure(memory_ids)
+            set_memory_batch(
+                hooks, memory_cache, memory_ids,
+                model.config.hidden_size, device,
+            )
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                logits = model(
+                    input_ids=tokens,
+                    attention_mask=attention_mask,
+                    use_cache=False,
+                    return_dict=True,
+                ).logits.float()
+            shifted_labels = labels[:, 1:]
+            valid = shifted_labels.ne(-100)
+            loss = functional.cross_entropy(
+                logits[:, :-1].reshape(-1, logits.shape[-1]),
+                shifted_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="sum",
+            )
+            total_loss += float(loss.detach().cpu())
+            target_tokens += int(valid.sum().item())
+    finally:
+        adapter.train(was_training)
+    if target_tokens == 0:
+        raise ValueError("validation examples contain no supervised target tokens")
+    return total_loss / target_tokens
+
+
+def train(config: PowConfig, output: Path, epochs: int, batch_size: int,
           learning_rate: float, gradient_accumulation: int,
           optimizer_name: str,
           corpus: tuple[list[MemoryRecord], list[MemoryExample]] | None = None,
           corpus_name: str = "synthetic-english-v1",
           initial_checkpoint: Path | None = None,
           augment_examples: bool = True,
-          staged_curriculum: bool = True,
-          memory_cache_bytes: int = 4 << 30) -> dict[str, object]:
+          memory_cache_bytes: int = 4 << 30,
+          validation_limit: int = 256,
+          resume: bool = False) -> dict[str, object]:
+    """Train complete deterministic epochs and checkpoint every epoch.
+
+    `epochs` always means complete traversals of the selected training corpus.
+    Microsteps and optimizer updates are derived and reported independently.
+    Gradient accumulation is flushed at each epoch boundary and normalized by
+    the exact supervised-token count, including a final partial window.
+    """
     seed_everything(config.seed)
+    if epochs <= 0 or batch_size <= 0 or gradient_accumulation <= 0:
+        raise ValueError("epochs, batch size, and accumulation must be positive")
+    if validation_limit < 0:
+        raise ValueError("validation limit cannot be negative")
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Memory Expert PoW")
     device = torch.device("cuda:0")
@@ -570,7 +727,46 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
         model.config.hidden_size, layer_indices, config.gate_rank,
         config.gate_alpha, config.knowledge_dropout,
     ).to(device)
-    if initial_checkpoint is not None:
+    output.mkdir(parents=True, exist_ok=True)
+    training_state_path = output / "training-state.pt"
+    if training_state_path.is_file() and not resume:
+        raise ValueError(
+            f"output already contains training state: {training_state_path}; "
+            "use --resume or choose a new output"
+        )
+    geometry = training_geometry(
+        len(train_examples), batch_size, gradient_accumulation, epochs
+    )
+    training_contract = {
+        "batch_size": batch_size,
+        "gradient_accumulation": gradient_accumulation,
+        "learning_rate": learning_rate,
+        "optimizer": optimizer_name,
+        "training_examples": len(train_examples),
+    }
+    resume_state: dict[str, object] | None = None
+    if resume:
+        if initial_checkpoint is not None:
+            raise ValueError("resume and initial checkpoint are mutually exclusive")
+        if not training_state_path.is_file():
+            raise ValueError(f"resume state is missing: {training_state_path}")
+        resume_state = torch.load(
+            training_state_path, map_location="cpu", weights_only=True
+        )
+        if resume_state.get("architecture_version") != ARCHITECTURE_VERSION:
+            raise RuntimeError("resume adapter architecture does not match")
+        if resume_state.get("config") != asdict(config):
+            raise RuntimeError("resume model or adapter configuration does not match")
+        if resume_state.get("corpus_fingerprint") != corpus_fingerprint(records):
+            raise RuntimeError("resume corpus fingerprint does not match")
+        if resume_state.get("examples_fingerprint") != examples_fingerprint(examples):
+            raise RuntimeError("resume example fingerprint does not match")
+        if tuple(resume_state["layer_indices"]) != layer_indices:
+            raise RuntimeError("resume adapter layer layout does not match")
+        if resume_state.get("training_contract") != training_contract:
+            raise RuntimeError("resume training hyperparameters do not match")
+        adapter.load_state_dict(resume_state["adapter"], strict=True)
+    elif initial_checkpoint is not None:
         initial = torch.load(initial_checkpoint, map_location="cpu", weights_only=True)
         if initial.get("architecture_version") != ARCHITECTURE_VERSION:
             raise RuntimeError("initial adapter architecture does not match")
@@ -599,35 +795,39 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             )
         else:
             raise ValueError(f"unsupported optimizer: {optimizer_name}")
+        start_epoch = 0
+        best_validation_nll = float("inf")
+        validation_history: list[dict[str, float | int]] = []
+        if resume_state is not None:
+            start_epoch = int(resume_state["completed_epochs"])
+            if start_epoch >= epochs:
+                raise ValueError(
+                    f"resume already completed {start_epoch} epochs; target={epochs}"
+                )
+            optimizer.load_state_dict(resume_state["optimizer"])
+            best_validation_nll = float(
+                resume_state.get("best_validation_nll", float("inf"))
+            )
+            validation_history = list(resume_state.get("validation_history", []))
+
+        schedule = build_epoch_training_schedule(
+            train_examples, batch_size, gradient_accumulation,
+            epochs, config.seed, start_epoch=start_epoch,
+        )
+        validation_examples = (
+            select_eval_examples(examples, validation_limit)
+            if validation_limit else []
+        )
         losses: list[float] = []
         adapter.train()
-        utilization_examples = [
-            example for example in train_examples
-            if example.kind not in ("unknown", "counterfactual")
-        ]
-        grounding_examples = list(train_examples)
-        phase_switch = max(1, int(steps * 0.40))
-        phase_order: list[MemoryExample] = []
-        phase_name = ""
-        cursor = 0
+        examples_seen = 0
+        optimizer_updates = 0
+        epoch_loss_sum = 0.0
+        epoch_target_tokens = 0
+        accumulated_target_tokens = 0
         optimizer.zero_grad(set_to_none=True)
-        for step in range(steps):
-            if staged_curriculum:
-                current_phase = "utilization" if step < phase_switch else "grounding"
-                pool = (
-                    utilization_examples
-                    if current_phase == "utilization" else grounding_examples
-                )
-            else:
-                current_phase = "joint-grounding"
-                pool = grounding_examples
-            if current_phase != phase_name or cursor + batch_size > len(phase_order):
-                phase_order = list(pool)
-                random.shuffle(phase_order)
-                cursor = 0
-                phase_name = current_phase
-            batch = phase_order[cursor:cursor + batch_size]
-            cursor += batch_size
+        for scheduled in schedule:
+            batch = scheduled.examples
             tokens, labels, attention_mask = pad_token_batches(
                 [supervised_tokens(tokenizer, example) for example in batch],
                 tokenizer.pad_token_id,
@@ -646,28 +846,51 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
                     use_cache=False,
                     return_dict=True,
                 ).logits.float()
-                loss = functional.cross_entropy(
+                loss_sum = functional.cross_entropy(
                     logits[:, :-1].reshape(-1, logits.shape[-1]),
                     labels[:, 1:].reshape(-1),
                     ignore_index=-100,
+                    reduction="sum",
                 )
+            target_tokens = int(labels[:, 1:].ne(-100).sum().item())
+            if target_tokens == 0:
+                raise RuntimeError("training batch contains no supervised target tokens")
+            loss = loss_sum / target_tokens
             if not torch.isfinite(loss):
-                raise RuntimeError(f"non-finite loss at step {step}")
-            (loss / gradient_accumulation).backward()
-            optimizer_step = (
-                (step + 1) % gradient_accumulation == 0 or step + 1 == steps
-            )
-            if optimizer_step:
+                raise RuntimeError(
+                    f"non-finite loss at epoch {scheduled.epoch} "
+                    f"batch {scheduled.batch_in_epoch}"
+                )
+            # Accumulate summed token losses. Divide gradients once by the
+            # exact token count in this window so a final partial microbatch is
+            # neither dropped nor over-weighted.
+            loss_sum.backward()
+            accumulated_target_tokens += target_tokens
+            if scheduled.optimizer_step:
+                for parameter in adapter.parameters():
+                    if parameter.grad is not None:
+                        parameter.grad.div_(accumulated_target_tokens)
                 torch.nn.utils.clip_grad_norm_(adapter.parameters(), 1.0)
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
+                optimizer_updates += 1
+                accumulated_target_tokens = 0
             losses.append(float(loss.detach().cpu()))
-            if step == 0 or (step + 1) % 10 == 0:
+            epoch_loss_sum += float(loss_sum.detach().cpu())
+            epoch_target_tokens += target_tokens
+            examples_seen += len(batch)
+            if len(losses) == 1 or scheduled.microstep % 100 == 0:
                 print(json.dumps({
                     "event": "train",
-                    "step": step + 1,
-                    "phase": current_phase,
-                    "optimizer_step": optimizer_step,
+                    "epoch": scheduled.epoch,
+                    "batch_in_epoch": scheduled.batch_in_epoch,
+                    "batches_in_epoch": scheduled.batches_in_epoch,
+                    "microstep": scheduled.microstep,
+                    "optimizer_update": scheduled.optimizer_update,
+                    "optimizer_updates_this_run": optimizer_updates,
+                    "optimizer_step": scheduled.optimizer_step,
+                    "examples_seen": examples_seen,
+                    "phase": scheduled.phase,
                     "loss": losses[-1],
                     "gate_norm": float(sum(
                         item.gate_up.weight.float().norm().detach().cpu()
@@ -675,29 +898,111 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
                     )),
                     "vram_gib": torch.cuda.max_memory_allocated() / (1 << 30),
                 }), flush=True)
+            if scheduled.batch_in_epoch == scheduled.batches_in_epoch:
+                validation_nll = (
+                    supervised_validation_nll(
+                        model, tokenizer, adapter, hooks, memory_state_cache,
+                        validation_examples, batch_size, device,
+                    )
+                    if validation_examples else float("nan")
+                )
+                epoch_training_nll = epoch_loss_sum / epoch_target_tokens
+                validation_history.append({
+                    "epoch": scheduled.epoch,
+                    "training_nll": epoch_training_nll,
+                    "validation_nll": validation_nll,
+                })
+                checkpoint = {
+                    "schema_version": 1,
+                    "architecture_version": ARCHITECTURE_VERSION,
+                    "config": asdict(config),
+                    "layer_indices": layer_indices,
+                    "hidden_size": model.config.hidden_size,
+                    "corpus_fingerprint": corpus_fingerprint(records),
+                    "examples_fingerprint": examples_fingerprint(examples),
+                    "training_corpus": corpus_name,
+                    "training_contract": training_contract,
+                    "visible_evidence_validation": evidence_validation,
+                    "initial_checkpoint": (
+                        str(initial_checkpoint) if initial_checkpoint else None
+                    ),
+                    "training": {
+                        "epochs": epochs,
+                        "completed_epochs": scheduled.epoch,
+                        "microsteps": scheduled.epoch * geometry.batches_per_epoch,
+                        "optimizer_updates": (
+                            scheduled.epoch * geometry.optimizer_updates_per_epoch
+                        ),
+                        "examples_seen": scheduled.epoch * len(train_examples),
+                        "microsteps_this_run": len(losses),
+                        "optimizer_updates_this_run": optimizer_updates,
+                        "examples_seen_this_run": examples_seen,
+                        "validation_nll": validation_nll,
+                    },
+                    "adapter": {
+                        key: value.detach().cpu()
+                        for key, value in adapter.state_dict().items()
+                    },
+                }
+                last_path = output / "memory-expert.last.pt"
+                last_temporary = output / "memory-expert.last.pt.tmp"
+                torch.save(checkpoint, last_temporary)
+                last_temporary.replace(last_path)
+                improved = (
+                    not validation_examples
+                    or validation_nll < best_validation_nll
+                )
+                if improved:
+                    best_validation_nll = validation_nll
+                    best_path = output / "memory-expert.pt"
+                    best_temporary = output / "memory-expert.pt.tmp"
+                    torch.save(checkpoint, best_temporary)
+                    best_temporary.replace(best_path)
+                state = {
+                    **checkpoint,
+                    "schema_version": 2,
+                    "optimizer": optimizer.state_dict(),
+                    "completed_epochs": scheduled.epoch,
+                    "best_validation_nll": best_validation_nll,
+                    "validation_history": validation_history,
+                }
+                state_temporary = output / "training-state.pt.tmp"
+                torch.save(state, state_temporary)
+                state_temporary.replace(training_state_path)
+                print(json.dumps({
+                    "event": "epoch-complete",
+                    "epoch": scheduled.epoch,
+                    "epochs": epochs,
+                    "training_nll": epoch_training_nll,
+                    "validation_nll": validation_nll,
+                    "best_validation_nll": best_validation_nll,
+                    "microsteps": scheduled.epoch * geometry.batches_per_epoch,
+                    "optimizer_updates": (
+                        scheduled.epoch * geometry.optimizer_updates_per_epoch
+                    ),
+                    "examples_seen": scheduled.epoch * len(train_examples),
+                    "checkpoint_improved": improved,
+                }), flush=True)
+                epoch_loss_sum = 0.0
+                epoch_target_tokens = 0
 
-        output.mkdir(parents=True, exist_ok=True)
-        checkpoint = {
-            "schema_version": 1,
-            "architecture_version": ARCHITECTURE_VERSION,
-            "config": asdict(config),
-            "layer_indices": layer_indices,
-            "hidden_size": model.config.hidden_size,
-            "corpus_fingerprint": corpus_fingerprint(records),
-            "examples_fingerprint": examples_fingerprint(examples),
-            "training_corpus": corpus_name,
-            "visible_evidence_validation": evidence_validation,
-            "initial_checkpoint": str(initial_checkpoint) if initial_checkpoint else None,
-            "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
-        }
         checkpoint_path = output / "memory-expert.pt"
-        torch.save(checkpoint, checkpoint_path)
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
             "model": config.model,
             "revision": config.revision,
             "injection_layers": len(layer_indices),
-            "steps": steps,
+            "epochs": epochs,
+            "resumed_from_epoch": start_epoch,
+            "training_examples": len(train_examples),
+            "batches_per_epoch": geometry.batches_per_epoch,
+            "optimizer_updates_per_epoch": geometry.optimizer_updates_per_epoch,
+            "microsteps_this_run": len(schedule),
+            "optimizer_updates_this_run": optimizer_updates,
+            "examples_seen_this_run": examples_seen,
+            "total_microsteps": geometry.total_microsteps,
+            "total_optimizer_updates": geometry.total_optimizer_updates,
+            "total_examples_seen": geometry.total_examples,
             "batch_size": batch_size,
             "gradient_accumulation": gradient_accumulation,
             "effective_batch_size": batch_size * gradient_accumulation,
@@ -705,6 +1010,9 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "optimizer": optimizer_name,
             "training_corpus": corpus_name,
             "visible_evidence_validation": evidence_validation,
+            "validation_examples": len(validation_examples),
+            "validation_history": validation_history,
+            "best_validation_nll": best_validation_nll,
             "initial_loss": losses[0],
             "final_loss": losses[-1],
             "minimum_loss": min(losses),
@@ -716,6 +1024,8 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "memory_state_cache_limit_bytes": memory_cache_bytes,
             "memory_state_cache_peak_bytes": memory_state_cache.peak_bytes,
             "checkpoint": str(checkpoint_path),
+            "last_checkpoint": str(output / "memory-expert.last.pt"),
+            "training_state": str(training_state_path),
         }
         (output / "train-summary.json").write_text(
             json.dumps(summary, indent=2) + "\n", encoding="utf-8"
@@ -1230,7 +1540,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--knowledge-dropout", type=float, default=0.2)
     parser.add_argument("--maximum-memory-tokens", type=int, default=192)
     parser.add_argument("--maximum-new-tokens", type=int, default=72)
-    parser.add_argument("--steps", type=int, default=60)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=1.0e-3)
@@ -1258,7 +1568,7 @@ def main() -> int:
         print(json.dumps({
             "event": "train-summary",
             **train(
-                config, args.output, args.steps, args.batch_size,
+                config, args.output, args.epochs, args.batch_size,
                 args.learning_rate, args.gradient_accumulation, args.optimizer,
             ),
         }, indent=2), flush=True)

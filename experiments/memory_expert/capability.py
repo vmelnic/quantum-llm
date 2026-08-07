@@ -12,7 +12,9 @@ try:
         training_texts,
         validate_capability_manifest,
     )
-    from .pow import PowConfig, causal_probe, evaluate, train
+    from .pow import (
+        PowConfig, causal_probe, evaluate, train, training_geometry,
+    )
 except ImportError:  # Direct execution on a worker.
     from capability_corpus import (
         assert_no_forbidden_overlap,
@@ -20,7 +22,7 @@ except ImportError:  # Direct execution on a worker.
         training_texts,
         validate_capability_manifest,
     )
-    from pow import PowConfig, causal_probe, evaluate, train
+    from pow import PowConfig, causal_probe, evaluate, train, training_geometry
 
 
 def _walk_strings(value: object) -> Iterable[str]:
@@ -61,10 +63,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--steps", type=int, default=4096)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=0.0002)
+    parser.add_argument("--validation-limit", type=int, default=256)
+    parser.add_argument("--resume", action="store_true")
     parser.add_argument("--evaluation-limit", type=int, default=30)
     parser.add_argument("--gate-rank", type=int, default=16)
     parser.add_argument("--gate-alpha", type=float, default=32.0)
@@ -106,22 +110,40 @@ def main() -> int:
     )
     if args.action == "validate":
         records, examples = corpus
+        training_examples = [
+            example for example in examples if example.split == "train"
+        ]
+        geometry = training_geometry(
+            len(training_examples), args.batch_size,
+            args.gradient_accumulation, args.epochs,
+        )
         print(json.dumps({
             "event": "capability-validation-summary",
             "contract": manifest["contract"],
             "corpus_sha256": manifest["sha256"],
             "records": len(records),
             "examples": len(examples),
+            "training_examples": len(training_examples),
+            "epochs": args.epochs,
+            "batch_size": args.batch_size,
+            "gradient_accumulation": args.gradient_accumulation,
+            "batches_per_epoch": geometry.batches_per_epoch,
+            "optimizer_updates_per_epoch": geometry.optimizer_updates_per_epoch,
+            "total_examples_seen": geometry.total_examples,
+            "total_microsteps": geometry.total_microsteps,
+            "total_optimizer_updates": geometry.total_optimizer_updates,
         }, indent=2))
         return 0
     checkpoint = args.checkpoint or args.output / "memory-expert.pt"
     if args.action in ("train", "run"):
         result = train(
-            config, args.output, args.steps, args.batch_size,
+            config, args.output, args.epochs, args.batch_size,
             args.learning_rate, args.gradient_accumulation, "adamw",
             corpus=corpus, corpus_name="conflictqa-causal-memory-v3",
-            augment_examples=False, staged_curriculum=False,
+            augment_examples=False,
             memory_cache_bytes=args.memory_cache_bytes,
+            validation_limit=args.validation_limit,
+            resume=args.resume,
         )
         print(json.dumps({
             "event": "capability-train-summary",

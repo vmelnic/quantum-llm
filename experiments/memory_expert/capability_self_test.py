@@ -16,6 +16,7 @@ try:
     from .synthetic_memory import (
         UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
     )
+    from .pow import build_epoch_training_schedule, training_geometry
 except ImportError:
     from capability_corpus import (
         LANGUAGES,
@@ -27,6 +28,7 @@ except ImportError:
     from synthetic_memory import (
         UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
     )
+    from pow import build_epoch_training_schedule, training_geometry
 
 
 def _record(language: str, split: str, family: str, variant: int,
@@ -149,6 +151,58 @@ def main() -> int:
             if example.split == "eval"
         }
         assert train_questions.isdisjoint(eval_questions)
+        train_examples = [
+            example for example in examples if example.split == "train"
+        ]
+        geometry = training_geometry(
+            len(train_examples), batch_size=2,
+            gradient_accumulation=2, epochs=3,
+        )
+        assert geometry.examples_per_epoch == 9
+        assert geometry.batches_per_epoch == 5
+        assert geometry.optimizer_updates_per_epoch == 3
+        assert geometry.total_examples == 27
+        assert geometry.total_microsteps == 15
+        assert geometry.total_optimizer_updates == 9
+        schedule = build_epoch_training_schedule(
+            train_examples, batch_size=2, gradient_accumulation=2,
+            epochs=3, seed=20260807,
+        )
+        repeated = build_epoch_training_schedule(
+            train_examples, batch_size=2, gradient_accumulation=2,
+            epochs=3, seed=20260807,
+        )
+        assert [
+            tuple(example.example_id for example in batch.examples)
+            for batch in schedule
+        ] == [
+            tuple(example.example_id for example in batch.examples)
+            for batch in repeated
+        ]
+        assert len(schedule) == geometry.total_microsteps
+        assert sum(batch.optimizer_step for batch in schedule) == 9
+        for epoch in range(1, 4):
+            epoch_batches = [batch for batch in schedule if batch.epoch == epoch]
+            visited = [
+                example.example_id
+                for batch in epoch_batches for example in batch.examples
+            ]
+            assert sorted(visited) == sorted(
+                example.example_id for example in train_examples
+            )
+            assert [len(batch.examples) for batch in epoch_batches] == [2, 2, 2, 2, 1]
+            assert [batch.accumulation_window_batches for batch in epoch_batches] == [
+                2, 2, 2, 2, 1,
+            ]
+        resumed = build_epoch_training_schedule(
+            train_examples, batch_size=2, gradient_accumulation=2,
+            epochs=3, seed=20260807, start_epoch=2,
+        )
+        assert resumed[0].epoch == 3
+        assert resumed[0].microstep == 11
+        assert resumed[0].optimizer_update == 7
+        assert resumed[-1].microstep == geometry.total_microsteps
+        assert resumed[-1].optimizer_update == geometry.total_optimizer_updates
         corpus_text = training_texts(records, examples)
         assert_no_forbidden_overlap(corpus_text, ["unrelated benchmark sentence"])
         try:

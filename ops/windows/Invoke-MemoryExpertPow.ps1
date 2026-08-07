@@ -2,7 +2,7 @@ param(
     [ValidateSet("train", "probe", "evaluate", "run")][string]$Action = "run",
     [string]$ModelId = "Qwen/Qwen3-4B",
     [string]$Revision = "1cfa9a7208912126459214e8b04321603b3df60c",
-    [int]$Steps = 1024,
+    [int]$Epochs = 3,
     [int]$BatchSize = 2,
     [int]$GradientAccumulation = 16,
     [double]$LearningRate = 0.0002,
@@ -19,7 +19,7 @@ param(
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
 
-if ($Steps -lt 1 -or $BatchSize -lt 1 -or $GradientAccumulation -lt 1 -or
+if ($Epochs -lt 1 -or $BatchSize -lt 1 -or $GradientAccumulation -lt 1 -or
     $LearningRate -le 0 -or $EvaluationLimit -lt 1 -or
     $GateRank -lt 1 -or $GateAlpha -le 0 -or $InjectionEvery -lt 1 -or
     $KnowledgeDropout -lt 0 -or $KnowledgeDropout -ge 1 -or
@@ -88,7 +88,7 @@ $arguments = @(
     "--model", $ModelId,
     "--revision", $Revision,
     "--output", $OutputDirectory,
-    "--steps", [string]$Steps,
+    "--epochs", [string]$Epochs,
     "--batch-size", [string]$BatchSize,
     "--gradient-accumulation", [string]$GradientAccumulation,
     "--learning-rate", [string]$LearningRate,
@@ -104,13 +104,13 @@ $started = [DateTime]::UtcNow
 & $python.FullName @arguments
 $exitCode = $LASTEXITCODE
 $status = [PSCustomObject]@{
-    schema_version = 1
+    schema_version = 2
     action = $Action
     model_id = $ModelId
     revision = $Revision
     snapshot = $snapshot
     output_directory = [System.IO.Path]::GetFullPath($OutputDirectory)
-    steps = $Steps
+    epochs = $Epochs
     batch_size = $BatchSize
     gradient_accumulation = $GradientAccumulation
     learning_rate = $LearningRate

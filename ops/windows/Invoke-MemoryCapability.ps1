@@ -1,16 +1,18 @@
 param(
     [ValidateSet("validate", "train", "probe", "evaluate", "run")][string]$Action = "run",
-    [int]$Steps = 4096,
+    [int]$Epochs = 3,
     [int]$BatchSize = 2,
     [int]$GradientAccumulation = 16,
     [double]$LearningRate = 0.0002,
+    [int]$ValidationLimit = 256,
+    [switch]$Resume,
     [int]$EvaluationLimit = 30,
     [int]$GateRank = 16,
     [double]$GateAlpha = 32.0,
     [double]$KnowledgeDropout = 0.2,
     [int]$MaximumMemoryTokens = 768,
     [int]$MaximumNewTokens = 128,
-    [string]$OutputName = "memory-expert-capability-conflictqa-v3",
+    [string]$OutputName = "memory-expert-capability-conflictqa-v4",
     [Parameter(Mandatory = $true)][string]$Corpus,
     [string]$ForbiddenFile = "",
     [int64]$MemoryCacheBytes = 4294967296,
@@ -21,8 +23,9 @@ param(
 Initialize-ExperimentDirectories
 
 if ($OutputName -notmatch '^[A-Za-z0-9._-]+$' -or
-    $Steps -lt 1 -or $BatchSize -lt 1 -or $GradientAccumulation -lt 1 -or
-    $LearningRate -le 0 -or $EvaluationLimit -lt 1 -or $GateRank -lt 1 -or
+    $Epochs -lt 1 -or $BatchSize -lt 1 -or $GradientAccumulation -lt 1 -or
+    $LearningRate -le 0 -or $ValidationLimit -lt 0 -or
+    $EvaluationLimit -lt 1 -or $GateRank -lt 1 -or
     $GateAlpha -le 0 -or $KnowledgeDropout -lt 0 -or $KnowledgeDropout -ge 1 -or
     $MaximumMemoryTokens -lt 32 -or $MaximumNewTokens -lt 8 -or
     $MemoryCacheBytes -lt 268435456) {
@@ -62,10 +65,11 @@ if ($LASTEXITCODE -ne 0) { throw "Memory Expert capability self-test failed" }
 $arguments = @(
     $script, $Action, "--output", $output,
     "--corpus", $corpusPath,
-    "--steps", [string]$Steps,
+    "--epochs", [string]$Epochs,
     "--batch-size", [string]$BatchSize,
     "--gradient-accumulation", [string]$GradientAccumulation,
     "--learning-rate", [string]$LearningRate,
+    "--validation-limit", [string]$ValidationLimit,
     "--evaluation-limit", [string]$EvaluationLimit,
     "--gate-rank", [string]$GateRank,
     "--gate-alpha", [string]$GateAlpha,
@@ -74,6 +78,7 @@ $arguments = @(
     "--maximum-new-tokens", [string]$MaximumNewTokens,
     "--memory-cache-bytes", [string]$MemoryCacheBytes
 )
+if ($Resume) { $arguments += "--resume" }
 if ($ForbiddenFile) {
     $forbiddenPath = if ([System.IO.Path]::IsPathRooted($ForbiddenFile)) {
         $ForbiddenFile
@@ -88,9 +93,13 @@ $started = [DateTime]::UtcNow
 & $python @arguments
 $exitCode = $LASTEXITCODE
 $status = [PSCustomObject]@{
-    schema_version = 1
+    schema_version = 2
     action = $Action
-    steps = $Steps
+    epochs = $Epochs
+    batch_size = $BatchSize
+    gradient_accumulation = $GradientAccumulation
+    validation_limit = $ValidationLimit
+    resume = [bool]$Resume
     output = [System.IO.Path]::GetFullPath($output)
     free_vram_mib_before = $freeVramMiB
     started_utc = $started.ToString("o")

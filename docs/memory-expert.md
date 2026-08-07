@@ -32,6 +32,16 @@ and one answer followed parametric knowledge instead of the admitted evidence.
 The causal channel works; the natural answer contract does not. Held-out
 evaluation was deliberately not run after this prerequisite failed.
 
+The v4 training path fixes the definite scheduling defect without changing the
+memory architecture: it trains in complete deterministic epochs, visits every
+row once per epoch including the last partial batch, normalizes accumulated
+gradients by the exact supervised-token count, validates after every epoch,
+keeps the best checkpoint, and can resume only from a matching corpus and
+training contract. The configured three-epoch run is 39,801 example visits,
+19,902 microsteps, and 1,245 optimizer updates. Its code and corpus contract
+have passed validation on the GPU host; no v4 capability result is claimed
+until training and the independent gates finish.
+
 ## Architecture under test
 
 ```text
@@ -65,6 +75,46 @@ of the same layer. The branch reuses the frozen layer's normalization and
 attention projections. Only 2,949,120 low-rank gate parameters are trainable;
 the Qwen checkpoint stays frozen.
 
+## What is actually trained
+
+The model is not trained to memorize ConflictQA and it is not retrained for
+each new law or database. Qwen already knows how to read and answer. We train a
+small set of gates to make Qwen consult a second, non-prompt memory channel.
+
+```text
+                         frozen forever
+question ───────────────► Qwen3-4B ───────────────► answer
+                              ▲
+                              │ correction at each decoder layer
+                              │
+admitted record ─► frozen Q/K/V/O attention ─► trainable rank-16 gate
+                                                 2.95M parameters
+```
+
+A training pair is conceptually:
+
+```text
+same question:  "Who wrote the work?"
+
+memory A:       "The author is Ana."  ─► expected answer: Ana
+memory B:       "The author is Boris." ─► expected answer: Boris
+no evidence:    unrelated record       ─► expected answer: I don't know
+```
+
+Because the question remains the same while authoritative memory changes, the
+small gate cannot solve the pair reliably by memorizing the question alone. It
+must learn three operations: use admitted memory, prefer it over conflicting
+parametric knowledge, and abstain when it has no support.
+
+After that capability is learned, ingest is only data work:
+
+```text
+new law/book/order ─► immutable chunks + index ─► admitted records at query time
+                                                   │
+                                                   └─► same trained gate
+                                                       no weight update
+```
+
 This is not a prompt-RAG generation path: source text does not consume the
 conversation context or causal KV cache. A bounded selector admits records
 because hundreds of gigabytes cannot be activated for every question, but the
@@ -72,7 +122,7 @@ admitted records reach the decoder only through the separate layer-wise memory
 channel. The capability corpus below trains that channel; it is not the user's
 knowledge base and it is not rebuilt when knowledge is ingested.
 
-## Research provenance and implementation audit
+## Research provenance and Plan B
 
 The neural branch is an independent **TokenMem-style** implementation, not a
 claim that this project invented gated layer-wise knowledge injection. The
@@ -83,7 +133,7 @@ and OLMo training/evaluation code. That repository currently publishes no gate
 checkpoints and declares no code license, so it is a behavioral reference and
 its source is not copied here.
 
-The audit found material differences that must be resolved before another run:
+The audit found material differences from TokenMem:
 
 - the reference trains a factual phase followed by a counterfactual phase;
   v3 mixed factual, counterfactual and abstention rows from the first step;
@@ -96,8 +146,13 @@ The audit found material differences that must be resolved before another run:
   exact answer in visible source text. This made the evidence validation claim
   weaker than its name suggested.
 
-These are structural questions. The next iteration must reconcile them before
-training and must not tune against the three failed examples.
+Those differences are research hypotheses, not evidence that the independent
+architecture is invalid. To isolate the known defect, Plan A keeps the current
+mechanism and natural joint-grounding corpus while fixing full-epoch training
+and checkpoint selection. It must not tune against the three failed examples.
+TokenMem reproduction or migration remains Plan B only if the adequately
+trained independent adapter still fails its untouched causal and held-out
+gates.
 
 No reviewed public project supplies the complete target system. The closest
 components are [KBLaM](https://github.com/microsoft/KBLaM), which injects
@@ -140,9 +195,10 @@ The loader rejects the old patterned keys, closed-span markers, citation IDs in
 questions, family split leakage, changed distractors or source positions inside
 a causal pair, ambiguous sibling answers, and single-record-only corpora.
 
-The failed v3 run mixed original, counterfactual, and abstention examples from
-the first optimizer phase. This is recorded behavior, not the accepted design
-for the next run. The causal probe uses eval families only. Automatic
+The v3 run mixed original, counterfactual, and abstention examples from the
+first optimizer phase. V4 deliberately preserves that joint-grounding
+curriculum so the schedule fix is tested without an architectural or dataset
+change. The causal probe uses eval families only. Automatic
 retrieval is reported only on eligible natural records and is compared with an
 oracle score over the exact same example IDs. Retrieval recall follows the
 authoritative citation, not the deliberately injected distractor record.
@@ -216,8 +272,9 @@ not versioned.
 - ConflictQA v3 completed training but failed the mandatory generation gate at
   9/12 exact despite 6/6 memory-sensitive families; no natural capability pass
   is claimed and held-out evaluation was not run;
-- the next run must align its mechanism, evidence contract, curriculum and
-  epoch/update accounting with the public TokenMem reference before training;
+- v4 must finish three complete epochs and pass both the untouched causal probe
+  and held-out evaluation before it can replace the diagnostic v3 checkpoint;
+- TokenMem stays Plan B if adequate training does not close the capability gap;
 - v3 initially validates the mechanism in English; Romanian and Russian remain
   external generalization work after the causal gate passes;
 - Python hooks recompute memory K/V and are a research implementation, not a

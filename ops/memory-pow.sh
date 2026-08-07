@@ -38,7 +38,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" Install-MemoryExpertEnvironment.ps1
     "${script_dir}/run-on-windows-host.sh" Invoke-MemoryExpertPow.ps1 \
       -Action "${action}" \
-      -Steps "${MEMORY_POW_STEPS:-1024}" \
+      -Epochs "${MEMORY_POW_EPOCHS:-3}" \
       -BatchSize "${MEMORY_POW_BATCH_SIZE:-2}" \
       -GradientAccumulation "${MEMORY_POW_GRADIENT_ACCUMULATION:-16}" \
       -LearningRate "${MEMORY_POW_LEARNING_RATE:-0.0002}" \

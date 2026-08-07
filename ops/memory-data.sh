@@ -121,10 +121,11 @@ case "${action}" in
     capability_arguments=(Invoke-MemoryCapability.ps1 \
       -Action "${capability_action}" \
       -Corpus "${remote_capability_corpus}" \
-      -Steps "${MEMORY_CAPABILITY_STEPS:-4096}" \
+      -Epochs "${MEMORY_CAPABILITY_EPOCHS:-3}" \
       -BatchSize "${MEMORY_CAPABILITY_BATCH_SIZE:-2}" \
       -GradientAccumulation "${MEMORY_CAPABILITY_GRADIENT_ACCUMULATION:-16}" \
       -LearningRate "${MEMORY_CAPABILITY_LEARNING_RATE:-0.0002}" \
+      -ValidationLimit "${MEMORY_CAPABILITY_VALIDATION_LIMIT:-256}" \
       -EvaluationLimit "${MEMORY_CAPABILITY_EVALUATION_LIMIT:-30}" \
       -GateRank "${MEMORY_CAPABILITY_GATE_RANK:-16}" \
       -GateAlpha "${MEMORY_CAPABILITY_GATE_ALPHA:-32}" \
@@ -132,7 +133,10 @@ case "${action}" in
       -MaximumMemoryTokens "${MEMORY_CAPABILITY_MEMORY_TOKENS:-384}" \
       -MaximumNewTokens "${MEMORY_CAPABILITY_NEW_TOKENS:-128}" \
       -MemoryCacheBytes "${MEMORY_CAPABILITY_CACHE_BYTES:-4294967296}" \
-      -OutputName "${MEMORY_CAPABILITY_OUTPUT_NAME:-memory-expert-capability-conflictqa-v3}")
+      -OutputName "${MEMORY_CAPABILITY_OUTPUT_NAME:-memory-expert-capability-conflictqa-v4}")
+    if [[ "${MEMORY_CAPABILITY_RESUME:-0}" =~ ^(1|true|yes|on)$ ]]; then
+      capability_arguments+=(-Resume)
+    fi
     if [[ -f "${local_dataset_root}/questions.jsonl" ]]; then
       ssh -o BatchMode=yes "${remote_host}" \
         "if not exist \"${remote_dataset_root}\" mkdir \"${remote_dataset_root}\""

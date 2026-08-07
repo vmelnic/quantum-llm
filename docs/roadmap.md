@@ -120,11 +120,12 @@ legal document reached rank-1 retrieval for 5/5 questions. The first
 multilingual capability benchmark was invalidated by shortcuts and its legal
 run was unusable. Production knowledge therefore remains incomplete:
 
-1. realign the failed ConflictQA adapter with the public TokenMem reference:
-   reproduce the factual-then-counterfactual curriculum, resolve the
-   hook/RoPE/state-compression differences, require honest visible-evidence
-   validation, and report epochs plus optimizer updates rather than ambiguous
-   microsteps; do not tune against only the three failed examples;
+1. complete Plan A without changing the architecture: train the independent
+   adapter for complete deterministic epochs, validate and checkpoint per
+   epoch, report example visits/microsteps/optimizer updates separately, then
+   run untouched causal and held-out gates; do not tune against only the three
+   failed examples. Reproduce TokenMem only as Plan B if this adequate run
+   still fails;
 2. extend the implemented immutable record generations, language and ACL
    contract with temporal selection and deletion/tombstone semantics;
 3. extend the pinned BGE-M3 exact sharded scan to calibrated routed

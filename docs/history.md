@@ -244,6 +244,15 @@ could pass visible-evidence validation without the exact answer occurring in
 the admitted text. A future run must resolve these points structurally rather
 than patch the three failed outputs.
 
+The subsequent review separated a proven defect from untested architectural
+hypotheses. The proven defect was training geometry: v3 stopped after 0.62
+epochs and 256 optimizer updates. Plan A therefore keeps the independent
+architecture and fixes full-epoch scheduling, exact token-weighted gradient
+accumulation, per-epoch held-out NLL, best/last checkpoints, and resumable
+state. With the current corpus and defaults, v4 is exactly three epochs,
+39,801 example visits, 19,902 microsteps, and 1,245 optimizer updates. TokenMem
+is retained as Plan B rather than treated as a required rewrite.
+
 [KBLaM](https://github.com/microsoft/KBLaM),
 [MeMo](https://github.com/arunv3rma/MeMo) and
 [delta-mem](https://github.com/declare-lab/delta-Mem) were recorded as adjacent

@@ -12,6 +12,12 @@ This directory contains two deliberately separate paths:
 The old procedural closed-vocabulary corpus was removed after audit. It must
 not be recreated as a fallback.
 
+Capability training is epoch-based. Every training row is visited exactly once
+per deterministic epoch; microsteps and optimizer updates are derived values,
+not user-selected aliases. Validation NLL, best/last checkpoints, and an
+optimizer-bearing resume state are written at each epoch boundary. TokenMem is
+a documented Plan B, not the active implementation path.
+
 ## Current data flow
 
 ```text

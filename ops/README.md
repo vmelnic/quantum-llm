@@ -60,7 +60,7 @@ start, stop, or modify either production model:
 Qwen3-4B checkpoint, adapter checkpoint, generated corpus, index shards, and
 Python environment are independent of the Qwen3-Next/DeepSeek packs. The
 optional `MEMORY_POW_*` variables in `.env` control only this experiment.
-The validated default is a 1,024-microstep run; `run` requires the
+The default is three complete epochs; `run` requires the
 same-question counterfactual causal probe before it spends time on held-out
 evaluation. See [External Memory Expert](../docs/memory-expert.md).
 
