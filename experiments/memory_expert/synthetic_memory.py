@@ -43,11 +43,13 @@ class MemoryExample:
     split: str
     language: str = "en"
     family_id: str = ""
+    source_slots: tuple[int, ...] = ()
 
     @property
     def target(self) -> str:
-        citations = ",".join(self.citations) if self.citations else "NONE"
-        return f"ANSWER: {self.answer}\nCITATIONS: {citations}"
+        sources = ",".join(str(slot) for slot in self.source_slots) \
+            if self.source_slots else "NONE"
+        return f"ANSWER: {self.answer}\nSOURCES: {sources}"
 
 
 _FIRST = (
@@ -141,6 +143,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                 answer=sender,
                 citations=(first_id,),
                 memory_ids=(first_id,),
+                source_slots=(0,),
                 kind="single-hop",
                 split=split,
             ),
@@ -150,6 +153,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                 answer=city,
                 citations=(first_id,),
                 memory_ids=(first_id,),
+                source_slots=(0,),
                 kind="single-hop",
                 split=split,
             ),
@@ -162,6 +166,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                 answer=f"{code}; {vault}",
                 citations=(first_id, second_id),
                 memory_ids=(first_id, second_id),
+                source_slots=(0, 1),
                 kind="two-hop",
                 split=split,
             ),
@@ -194,6 +199,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                     answer=alternate_sender,
                     citations=(first_id,),
                     memory_ids=(sender_id,),
+                    source_slots=(0,),
                     kind="counterfactual",
                     split="train",
                 ))
@@ -218,6 +224,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                     answer=alternate_city,
                     citations=(first_id,),
                     memory_ids=(city_id,),
+                    source_slots=(0,),
                     kind="counterfactual",
                     split="train",
                 ))
@@ -264,6 +271,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
                     answer=f"{alternate_code}; {alternate_vault}",
                     citations=(first_id, second_id),
                     memory_ids=(code_a, code_b),
+                    source_slots=(0, 1),
                     kind="counterfactual",
                     split="train",
                 ))
@@ -281,6 +289,16 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
         ))
 
     return records, examples
+
+
+def examples_fingerprint(examples: Sequence[MemoryExample]) -> str:
+    payload = [
+        asdict(example) for example in sorted(examples, key=lambda item: item.example_id)
+    ]
+    rendered = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(rendered).hexdigest()
 
 
 _TOKEN = re.compile(r"\w+", re.IGNORECASE | re.UNICODE)
@@ -488,7 +506,11 @@ class ShardedVectorIndex:
 
 
 def format_memory(records: Sequence[MemoryRecord]) -> str:
-    return "\n".join(record.text for record in records)
+    """Render request-local source slots without exposing durable identifiers."""
+    return "\n\n".join(
+        f"SOURCE {slot}:\n{record.text}"
+        for slot, record in enumerate(records)
+    )
 
 
 def retrieve_adaptive(index: ShardedVectorIndex, embedder: HashingEmbedder,
@@ -530,29 +552,31 @@ def retrieve_adaptive(index: ShardedVectorIndex, embedder: HashingEmbedder,
     return selected
 
 
-def parse_response(text: str) -> tuple[str, tuple[str, ...]]:
+def parse_response(text: str) -> tuple[str, tuple[int, ...]]:
     answer_match = re.search(r"ANSWER:\s*(.+?)(?:\r?\n|$)", text, re.IGNORECASE)
-    citation_match = re.search(r"CITATIONS:\s*([^\r\n]+)", text, re.IGNORECASE)
+    source_match = re.search(r"SOURCES:\s*([^\r\n]+)", text, re.IGNORECASE)
     answer = answer_match.group(1).strip() if answer_match else ""
-    if not citation_match or citation_match.group(1).strip().upper() == "NONE":
+    if not source_match or source_match.group(1).strip().upper() == "NONE":
         return answer, ()
-    citations = tuple(
-        item.strip().upper()
-        for item in citation_match.group(1).split(",")
-        if item.strip()
-    )
-    return answer, citations
+    raw_slots = [item.strip() for item in source_match.group(1).split(",")]
+    if any(not re.fullmatch(r"\d+", item) for item in raw_slots):
+        return answer, ()
+    return answer, tuple(int(item) for item in raw_slots)
 
 
 def normalized_contains(actual: str, expected: str) -> bool:
-    def normalize(value: str) -> str:
+    def normalize(value: str) -> list[str]:
         decomposed = unicodedata.normalize("NFKD", value.casefold())
         plain = "".join(
             character for character in decomposed
             if not unicodedata.combining(character)
         )
-        return " ".join(re.findall(r"\w+", plain, re.UNICODE))
-    return normalize(expected) in normalize(actual)
+        return re.findall(r"\w+", plain, re.UNICODE)
+    haystack, needle = normalize(actual), normalize(expected)
+    return bool(needle) and any(
+        haystack[index:index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
 
 
 def corpus_fingerprint(records: Sequence[MemoryRecord]) -> str:

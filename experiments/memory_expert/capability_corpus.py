@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -81,6 +82,31 @@ def _read_rows(path: Path) -> list[dict[str, object]]:
     return rows
 
 
+def validate_capability_manifest(
+    path: Path, expected_contract: str | None = None
+) -> dict[str, object]:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    if not manifest_path.is_file():
+        raise ValueError(f"capability manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in (1, 2):
+        raise ValueError("invalid capability manifest")
+    actual_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+    if manifest.get("sha256") != actual_hash:
+        raise ValueError("capability corpus hash does not match its manifest")
+    actual_rows = sum(
+        bool(line.strip())
+        for line in path.read_text(encoding="utf-8").splitlines()
+    )
+    if manifest.get("rows") != actual_rows:
+        raise ValueError("capability corpus row count does not match its manifest")
+    if expected_contract and manifest.get("contract") != expected_contract:
+        raise ValueError(
+            f"capability corpus contract is not {expected_contract}"
+        )
+    return manifest
+
+
 def load_capability_corpus(
     path: Path,
     minimum_train_families_per_language: int = 500,
@@ -140,7 +166,7 @@ def load_capability_corpus(
             raise ValueError(f"row {index} contains a rejected synthetic shortcut")
 
         memory_ids: list[str] = []
-        public_ids: set[str] = set()
+        public_ids: list[str] = []
         memory_texts: list[str] = []
         for record_index, raw in enumerate(records_raw):
             if not isinstance(raw, dict):
@@ -165,12 +191,18 @@ def load_capability_corpus(
             if previous != record:
                 raise ValueError(f"record ID collision with different content: {record_id}")
             memory_ids.append(record_id)
-            public_ids.add(citation_id)
+            public_ids.append(citation_id)
             memory_texts.append(text)
 
         citations = tuple(str(item) for item in citations_raw)
-        if not set(citations).issubset(public_ids):
+        if len(set(public_ids)) != len(public_ids):
+            raise ValueError(f"row {index} admits duplicate public source IDs")
+        if not set(citations).issubset(set(public_ids)):
             raise ValueError(f"row {index} cites a record that was not admitted")
+        source_slots = tuple(
+            slot for slot, public_id in enumerate(public_ids)
+            if public_id in set(citations)
+        )
         if kind == "unknown":
             if answer != UNKNOWN_ANSWER or citations:
                 raise ValueError("unknown rows require exact abstention and no citations")
@@ -191,6 +223,7 @@ def load_capability_corpus(
             split=split,
             language=language,
             family_id=family_id,
+            source_slots=source_slots,
         )
         examples.append(example)
         family_rows[family_id].append(example)
@@ -204,6 +237,39 @@ def load_capability_corpus(
         if len(questions) != 1 or len(answers) < 2:
             raise ValueError(
                 f"family {family_id} must contain same-question contradictory memories"
+            )
+        citation_sets = {member.citations for member in answerable}
+        if len(citation_sets) != 1:
+            raise ValueError(
+                f"family {family_id} leaks the intervention through citations"
+            )
+        source_slot_sets = {member.source_slots for member in answerable}
+        if len(source_slot_sets) != 1:
+            raise ValueError(
+                f"family {family_id} leaks the intervention through source position"
+            )
+        distractor_sets: set[tuple[str, ...]] = set()
+        for member in answerable:
+            authority = set(member.citations)
+            authoritative_texts = [
+                records[record_id].text for record_id in member.memory_ids
+                if records[record_id].public_id in authority
+            ]
+            distractor_sets.add(tuple(sorted(
+                record_id for record_id in member.memory_ids
+                if records[record_id].public_id not in authority
+            )))
+            for sibling_answer in answers - {member.answer}:
+                if any(
+                    normalized_contains(text, sibling_answer)
+                    for text in authoritative_texts
+                ):
+                    raise ValueError(
+                        f"family {family_id} retains a sibling answer in authority"
+                    )
+        if len(distractor_sets) != 1:
+            raise ValueError(
+                f"family {family_id} changes distractors during intervention"
             )
         member = answerable[0]
         family_counts[(member.split, member.language)] += 1

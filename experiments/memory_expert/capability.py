@@ -10,6 +10,7 @@ try:
         assert_no_forbidden_overlap,
         load_capability_corpus,
         training_texts,
+        validate_capability_manifest,
     )
     from .pow import PowConfig, causal_probe, evaluate, train
 except ImportError:  # Direct execution on a worker.
@@ -17,6 +18,7 @@ except ImportError:  # Direct execution on a worker.
         assert_no_forbidden_overlap,
         load_capability_corpus,
         training_texts,
+        validate_capability_manifest,
     )
     from pow import PowConfig, causal_probe, evaluate, train
 
@@ -88,6 +90,9 @@ def main() -> int:
         maximum_new_tokens=args.maximum_new_tokens,
         seed=args.seed,
     )
+    manifest = validate_capability_manifest(
+        args.corpus.resolve(), "xquad-coherent-counterfactual-memory-v2"
+    )
     corpus = load_capability_corpus(
         args.corpus.resolve(),
         minimum_train_families_per_language=args.minimum_train_families,
@@ -102,11 +107,15 @@ def main() -> int:
         result = train(
             config, args.output, args.steps, args.batch_size,
             args.learning_rate, args.gradient_accumulation, "adamw",
-            corpus=corpus, corpus_name="xquad-natural-multilingual-v1",
+            corpus=corpus, corpus_name="xquad-coherent-counterfactual-v2",
             augment_examples=False, staged_curriculum=False,
             memory_cache_bytes=args.memory_cache_bytes,
         )
-        print(json.dumps({"event": "capability-train-summary", **result}, indent=2))
+        print(json.dumps({
+            "event": "capability-train-summary",
+            "corpus_sha256": manifest["sha256"],
+            **result,
+        }, indent=2))
     if args.action in ("probe", "run"):
         result = causal_probe(checkpoint, args.output, family_limit=6, corpus=corpus)
         print(json.dumps({"event": "capability-probe-summary", **result}, indent=2))

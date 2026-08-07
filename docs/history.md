@@ -193,7 +193,16 @@ Until this replacement passes both its natural eval and the untouched legal
 test, the project claims only channel causality—not generic external knowledge.
 
 A first replacement run was stopped before completion when review found that
-384-token memory truncation could hide the answer in 162 examples. The data
-builder now emits bounded natural answer-centered passages and the runtime
-preflight verifies the post-tokenization representation. The corrected corpus
-exposes answer and citation evidence for 7,140/7,140 answerable examples.
+384-token memory truncation could hide the answer in 162 examples. A later
+review caught a deeper corpus defect before promotion: its “counterfactual”
+passages were made by substituting answer spans from unrelated examples, which
+could produce incoherent language and ambiguous questions. That artifact and
+its partial checkpoints do not establish natural memory capability.
+
+The replacement contract now has no substitution fallback. It emits rewrite
+jobs from bounded natural passages, requires a coherent same-language rewrite
+plus an independent answer-extraction validation, preserves the same question
+and source position across each causal pair, and fails closed on missing or
+stale rewrites. Neural supervision uses request-local `SOURCES` slots; durable
+citation hashes remain metadata and are mapped to exact quotes only by the
+authority plane. Full multilingual generation and training remain pending.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 from pathlib import Path
 
@@ -10,16 +11,24 @@ try:
         assert_no_forbidden_overlap,
         load_capability_corpus,
         training_texts,
+        validate_capability_manifest,
     )
-    from .synthetic_memory import UNKNOWN_ANSWER, corpus_fingerprint
+    from .synthetic_memory import (
+        UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
+    )
+    from .prepare_capability_data import _load_validated_rewrites
 except ImportError:
     from capability_corpus import (
         LANGUAGES,
         assert_no_forbidden_overlap,
         load_capability_corpus,
         training_texts,
+        validate_capability_manifest,
     )
-    from synthetic_memory import UNKNOWN_ANSWER, corpus_fingerprint
+    from synthetic_memory import (
+        UNKNOWN_ANSWER, corpus_fingerprint, format_memory, parse_response,
+    )
+    from prepare_capability_data import _load_validated_rewrites
 
 
 def _record(language: str, split: str, family: str, variant: int,
@@ -57,7 +66,19 @@ def _fixture() -> list[dict[str, object]]:
                 _record(language, split, family, variant, answer)
                 for variant, answer in enumerate(answers[language])
             ]
+            distractor = {
+                "record_id": f"MEM-R-D-{language.upper()}{split.upper()}",
+                "citation_id": f"MEM-C-D-{language.upper()}{split.upper()}",
+                "text": "Independent memory with unrelated background material.",
+                "shard_key": f"MEM-S-D-{language.upper()}{split.upper()}",
+                "generation": 1,
+                "indexable": True,
+            }
+            target_slot = 1 if language == "ru" else 0
             for variant, answer in enumerate(answers[language]):
+                admitted = [records[variant], distractor]
+                if target_slot == 1:
+                    admitted.reverse()
                 rows.append({
                     "schema_version": 1,
                     "family_id": f"MEM-F-{language.upper()}{split.upper()}{family}",
@@ -68,7 +89,7 @@ def _fixture() -> list[dict[str, object]]:
                     "answer": answer,
                     "citations": [records[variant]["citation_id"]],
                     "kind": "natural" if variant == 0 else "counterfactual",
-                    "records": [records[variant], records[1 - variant]],
+                    "records": admitted,
                 })
             rows.append({
                 "schema_version": 1,
@@ -80,7 +101,7 @@ def _fixture() -> list[dict[str, object]]:
                 "answer": UNKNOWN_ANSWER,
                 "citations": [],
                 "kind": "unknown",
-                "records": records,
+                "records": [records[0], distractor],
             })
     return rows
 
@@ -91,6 +112,15 @@ def main() -> int:
         path.write_text("".join(
             json.dumps(row, ensure_ascii=False) + "\n" for row in _fixture()
         ), encoding="utf-8")
+        path.with_suffix(path.suffix + ".manifest.json").write_text(
+            json.dumps({
+                "schema_version": 1,
+                "rows": len(_fixture()),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            }) + "\n",
+            encoding="utf-8",
+        )
+        validate_capability_manifest(path)
         records, examples = load_capability_corpus(path, 1, 1)
         second_records, _ = load_capability_corpus(path, 1, 1)
         assert corpus_fingerprint(records) == corpus_fingerprint(second_records)
@@ -98,6 +128,44 @@ def main() -> int:
         assert {example.language for example in examples} == set(LANGUAGES)
         assert all(len(example.memory_ids) == 2 for example in examples)
         assert all(example.family_id for example in examples)
+        answerable = [example for example in examples if example.kind != "unknown"]
+        assert {example.source_slots for example in answerable} == {(0,), (1,)}
+        assert all(
+            f"SOURCES: {example.source_slots[0]}" in example.target
+            for example in answerable
+        )
+        assert all("CITATIONS:" not in example.target for example in examples)
+        rendered = format_memory(records[:2])
+        assert "SOURCE 0:" in rendered and "SOURCE 1:" in rendered
+        assert parse_response("ANSWER: amber\nSOURCES: 1") == ("amber", (1,))
+        rewrite_path = Path(directory) / "rewrites.jsonl"
+        rewrite_row = {
+            "schema_version": 1,
+            "status": "accepted",
+            "family_id": "MEM-F-TEST",
+            "source_sha256": "source-hash",
+            "counterfactual_context": "The recorded value is sapphire.",
+            "counterfactual_answer": "sapphire",
+            "validation": {
+                "extracted_answer": "sapphire",
+                "question_answerable": True,
+                "context_coherent": True,
+                "language_match": True,
+            },
+        }
+        rewrite_path.write_text(
+            json.dumps(rewrite_row) + "\n", encoding="utf-8"
+        )
+        rewrite_path.with_suffix(".jsonl.manifest.json").write_text(json.dumps({
+            "schema_version": 1,
+            "contract": "memory-counterfactual-rewrites-v1",
+            "rows": 1,
+            "accepted": 1,
+            "rejected": 0,
+            "sha256": hashlib.sha256(rewrite_path.read_bytes()).hexdigest(),
+        }) + "\n", encoding="utf-8")
+        rewrites = _load_validated_rewrites(rewrite_path)
+        assert rewrites["MEM-F-TEST"]["answer"] == "sapphire"
         train_questions = {
             (example.language, example.question) for example in examples
             if example.split == "train"

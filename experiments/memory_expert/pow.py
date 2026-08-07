@@ -25,6 +25,7 @@ try:
         ShardedVectorIndex,
         build_corpus,
         corpus_fingerprint,
+        examples_fingerprint,
         format_memory,
         normalized_contains,
         parse_response,
@@ -38,6 +39,7 @@ except ImportError:  # Direct script execution on the Windows worker.
         ShardedVectorIndex,
         build_corpus,
         corpus_fingerprint,
+        examples_fingerprint,
         format_memory,
         normalized_contains,
         parse_response,
@@ -51,9 +53,10 @@ contain evidence for the question, answer exactly: I don't know from the
 attached memory. Otherwise, answer in the same language as the user's question.
 Never use general knowledge for factual answers. Return two
 lines only. Start the first with `ANSWER: ` followed by the answer. Start the
-second with `CITATIONS: ` followed by comma-separated record IDs or `NONE`."""
+second with `SOURCES: ` followed by comma-separated zero-based source slots or
+`NONE`. Source slots are local to this request; never invent durable IDs."""
 
-ARCHITECTURE_VERSION = "tokenmem-input-state-rmsnorm-v1"
+ARCHITECTURE_VERSION = "tokenmem-input-state-rmsnorm-source-slots-v2"
 
 
 @dataclass(frozen=True)
@@ -258,8 +261,8 @@ def chat_prompt(tokenizer, question: str, control_context: str | None = None) ->
 provided records. If they do not support the question, answer exactly: I don't
 know from the attached memory. Otherwise, answer in the same language as the
 user's question. Return two lines only. Start the first with
-`ANSWER: ` followed by the answer. Start the second with `CITATIONS: ` followed
-by comma-separated record IDs or `NONE`."""
+`ANSWER: ` followed by the answer. Start the second with `SOURCES: ` followed
+by comma-separated zero-based source slots or `NONE`."""
         user = f"RECORDS:\n{control_context}\n\nQUESTION:\n{question}"
     messages = [
         {"role": "system", "content": system},
@@ -315,11 +318,11 @@ def validate_visible_evidence(tokenizer, examples: Sequence[MemoryExample],
         for example, token_ids in zip(batch, encoded):
             visible = tokenizer.decode(token_ids, skip_special_tokens=True)
             answer_visible = normalized_contains(visible, example.answer)
-            citations_visible = all(
-                citation.casefold() in visible.casefold()
-                for citation in example.citations
+            sources_visible = all(
+                f"source {slot}:" in visible.casefold()
+                for slot in example.source_slots
             )
-            if not answer_visible or not citations_visible:
+            if not answer_visible or not sources_visible:
                 failures.append(example.example_id)
     if failures:
         sample = ", ".join(failures[:8])
@@ -678,6 +681,7 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "layer_indices": layer_indices,
             "hidden_size": model.config.hidden_size,
             "corpus_fingerprint": corpus_fingerprint(records),
+            "examples_fingerprint": examples_fingerprint(examples),
             "training_corpus": corpus_name,
             "visible_evidence_validation": evidence_validation,
             "initial_checkpoint": str(initial_checkpoint) if initial_checkpoint else None,
@@ -767,30 +771,34 @@ def generate(model, tokenizer, hooks: dict[int, MemoryHook],
 def score_example(example: MemoryExample, response: str,
                   admitted_ids: Sequence[str],
                   records_by_id: dict[str, MemoryRecord]) -> dict[str, object]:
-    answer, citations = parse_response(response)
+    answer, source_slots = parse_response(response)
     answer_text_match = normalized_contains(answer, example.answer)
     admitted_records = [records_by_id[item] for item in admitted_ids]
-    admitted_by_public_id = {
-        record.public_id: record for record in admitted_records
-    }
-    citation_authorized = set(citations).issubset(set(admitted_by_public_id))
-    citation_ok = citations == example.citations and citation_authorized
+    sources_authorized = (
+        len(set(source_slots)) == len(source_slots)
+        and all(0 <= slot < len(admitted_records) for slot in source_slots)
+    )
+    source_selection_ok = source_slots == example.source_slots and sources_authorized
     rendered_citations = [
-        {"record_id": citation, "quote": admitted_by_public_id[citation].text}
-        for citation in citations
-        if citation_authorized and citation in admitted_by_public_id
+        {
+            "source_slot": slot,
+            "record_id": admitted_records[slot].public_id,
+            "quote": admitted_records[slot].text,
+        }
+        for slot in source_slots
+        if sources_authorized
     ]
     return {
         "example_id": example.example_id,
         "kind": example.kind,
         "response": response,
         "parsed_answer": answer,
-        "parsed_citations": citations,
-        "citation_authorized": citation_authorized,
+        "parsed_source_slots": source_slots,
+        "sources_authorized": sources_authorized,
         "rendered_citations": rendered_citations,
         "answer_text_match": answer_text_match,
-        "citation_ok": citation_ok,
-        "passed": answer_text_match and citation_ok,
+        "source_selection_ok": source_selection_ok,
+        "passed": answer_text_match and source_selection_ok,
     }
 
 
@@ -890,6 +898,9 @@ def causal_probe(checkpoint_path: Path, output: Path,
     records, examples = corpus or build_corpus(seed=config.seed)
     if raw_checkpoint["corpus_fingerprint"] != corpus_fingerprint(records):
         raise RuntimeError("checkpoint corpus fingerprint mismatch")
+    expected_examples = raw_checkpoint.get("examples_fingerprint")
+    if expected_examples and expected_examples != examples_fingerprint(examples):
+        raise RuntimeError("checkpoint example contract fingerprint mismatch")
     records_by_id = {record.record_id: record for record in records}
     tokenizer, model = load_model(config, device)
     layers = resolve_layers(model)
@@ -1020,6 +1031,9 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
     records, examples = corpus or build_corpus(seed=config.seed)
     if raw_checkpoint["corpus_fingerprint"] != corpus_fingerprint(records):
         raise RuntimeError("checkpoint corpus fingerprint mismatch")
+    expected_examples = raw_checkpoint.get("examples_fingerprint")
+    if expected_examples and expected_examples != examples_fingerprint(examples):
+        raise RuntimeError("checkpoint example contract fingerprint mismatch")
     records_by_id = {record.record_id: record for record in records}
     tokenizer, model = load_model(config, device)
     layers = resolve_layers(model)
@@ -1120,7 +1134,9 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
                 "strict_answer_text_match_rate": sum(
                     bool(row["answer_text_match"]) for row in rows
                 ) / count,
-                "citation_accuracy": sum(bool(row["citation_ok"]) for row in rows) / count,
+                "source_selection_accuracy": sum(
+                    bool(row["source_selection_ok"]) for row in rows
+                ) / count,
                 "joint_accuracy": sum(bool(row["passed"]) for row in rows) / count,
             }
             if mode == "automatic-retrieval":
@@ -1140,8 +1156,8 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
             "strict_answer_text_match_rate": sum(
                 bool(row["answer_text_match"]) for row in paired_oracle_rows
             ) / paired_count,
-            "citation_accuracy": sum(
-                bool(row["citation_ok"]) for row in paired_oracle_rows
+            "source_selection_accuracy": sum(
+                bool(row["source_selection_ok"]) for row in paired_oracle_rows
             ) / paired_count,
             "joint_accuracy": sum(
                 bool(row["passed"]) for row in paired_oracle_rows

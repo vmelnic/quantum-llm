@@ -10,7 +10,7 @@ param(
     [double]$KnowledgeDropout = 0.2,
     [int]$MaximumMemoryTokens = 384,
     [int]$MaximumNewTokens = 128,
-    [string]$OutputName = "memory-expert-capability-natural-v1",
+    [string]$OutputName = "memory-expert-capability-natural-v2",
     [Parameter(Mandatory = $true)][string]$Corpus,
     [string]$ForbiddenFile = "",
     [int64]$MemoryCacheBytes = 4294967296,

@@ -20,8 +20,8 @@ The distinction matters:
   capability.
 
 The invalid multilingual checkpoint remains historical data and must not be
-promoted. The current gate is `xquad-natural-multilingual-v1`; its full training
-and evaluation result must be recorded before claiming success.
+promoted. The current gate is `xquad-coherent-counterfactual-memory-v2`; its
+full training and evaluation result must be recorded before claiming success.
 
 ## Architecture under test
 
@@ -46,9 +46,9 @@ question-only prompt ─► frozen decoder layers
                  trainable rank-16 residual gate only
                               │
                               ▼
-                    answer + model citation IDs
+                    answer + request-local source slots
                               │
-                 authority-plane ACL and exact quotes
+             authority-plane slot→record mapping, ACL, exact quotes
 ```
 
 For decoder layer `i`, the memory pass supplies `hidden_states[i]`, the input
@@ -56,10 +56,12 @@ of the same layer. The branch reuses the frozen layer's normalization and
 attention projections. Only 2,949,120 low-rank gate parameters are trainable;
 the Qwen checkpoint stays frozen.
 
-This is not prompt RAG: source text does not consume the conversation context
-or causal KV cache. Retrieval is still used as an admission mechanism because
-hundreds of gigabytes cannot be processed for every question. The admitted
-records are communicated through the separate memory channel.
+This is not a prompt-RAG generation path: source text does not consume the
+conversation context or causal KV cache. A bounded selector admits records
+because hundreds of gigabytes cannot be activated for every question, but the
+admitted records reach the decoder only through the separate layer-wise memory
+channel. The capability corpus below trains that channel; it is not the user's
+knowledge base and it is not rebuilt when knowledge is ingested.
 
 ## Generic capability protocol
 
@@ -67,19 +69,24 @@ The adapter is trained once to perform a capability—read admitted natural
 memory, follow its current authority, cite it, and abstain—not to memorize a
 particular ingest.
 
-The current corpus is generated from the pinned `google/xquad` revision
+The capability corpus is constructed from the pinned `google/xquad` revision
 `51adfef1c1287aab1d2d91b5bead9bcfb9c68583` (CC-BY-SA-4.0):
 
 - Romanian, Russian, and English natural questions and passages;
-- 7,497 examples over 7,140 immutable records;
-- 5,934 train examples and 1,563 eval examples;
-- original and counterfactual memories for the same natural question;
+- original and coherently rewritten counterfactual memories for the same
+  natural question;
 - natural answers, opaque IDs, distractor records, and absent-evidence cases;
 - duplicate questions and their translations are assigned atomically to one
   split, preventing train/eval leakage;
+- each rewrite must change the answer, remove the original answer, remain in
+  the source language, stay coherent, and be answerable by an independent
+  extraction pass; blind answer-span substitution has no fallback;
 - answer-bearing passages are bounded around exact source spans, and a
-  tokenizer-aware preflight requires every answer and citation to remain
+  tokenizer-aware preflight requires every answer and local source label to remain
   visible after the configured 384-token truncation;
+- the model emits only zero-based request-local slots such as `SOURCES: 1`;
+  opaque record IDs, ACL decisions, and exact quotes are mapped and rendered by
+  the authority plane after generation, never learned as output tokens;
 - the evaluated legal questions are forbidden training material.
 
 The loader rejects the old patterned keys, closed-span markers, citation IDs in
@@ -118,7 +125,7 @@ Three different claims are kept separate:
    requires manual review.
 
 The capability run must pass eval-only contradictory-memory preference,
-generation, citation, abstention, no-memory, full-context-control, and paired
+generation, source selection, abstention, no-memory, full-context-control, and paired
 retrieval/oracle gates. Passing the natural suite is necessary but not
 sufficient: the untouched Romanian law dataset is the external test.
 
@@ -128,15 +135,20 @@ Configure `.env` from `.env.example`, then:
 
 ```bash
 ./ops/memory-data.sh capability-prepare
+./ops/memory-data.sh capability-rewrite
+./ops/memory-data.sh capability-build
 ./ops/memory-data.sh capability-sync
 ./ops/memory-data.sh capability-run
 ```
 
-`capability-prepare` downloads only the pinned public XQuAD rows and writes an
-ignored JSONL plus a SHA-256 manifest. `capability-run` synchronizes source and
-corpus, validates the contract, trains on the GPU host, runs the eval-only
-causal probe, then runs held-out evaluation. Individual train/probe/evaluate
-actions remain available for diagnosis.
+`capability-prepare` downloads only the pinned public XQuAD rows and writes
+versioned rewrite jobs. `capability-rewrite` calls the configured
+OpenAI-compatible offline teacher and a separate verification pass; it is not
+part of inference. `capability-build` refuses unvalidated or stale rewrites and
+writes the ignored corpus plus SHA-256 manifests. `capability-run` synchronizes
+and validates that artifact, trains on the GPU host, then runs the eval-only
+causal probe and held-out evaluation. Individual train/probe/evaluate actions
+remain available for diagnosis.
 
 After a capability checkpoint passes, the untouched external dataset is run
 with:
@@ -151,8 +163,8 @@ not versioned.
 
 ## Remaining boundary
 
-- natural multilingual training/evaluation is currently running; no pass is
-  claimed yet;
+- coherent multilingual rewrite generation, training, and evaluation have not
+  completed; no natural capability pass is claimed yet;
 - Python hooks recompute memory K/V and are a research implementation, not a
   throughput backend;
 - exact dense shard scan must become routed hybrid retrieval at large scale;

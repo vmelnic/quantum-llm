@@ -4,8 +4,12 @@ import argparse
 import hashlib
 import json
 import random
+import re
+import time
+import unicodedata
 import urllib.parse
 import urllib.request
+from urllib.error import HTTPError
 from collections import defaultdict
 from pathlib import Path
 
@@ -13,6 +17,33 @@ DATASET = "google/xquad"
 REVISION = "51adfef1c1287aab1d2d91b5bead9bcfb9c68583"
 LANGUAGES = ("ro", "ru", "en")
 UNKNOWN_ANSWER = "I don't know from the attached memory."
+
+
+def _normalized_tokens(value: str) -> list[str]:
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    plain = "".join(
+        character for character in decomposed
+        if not unicodedata.combining(character)
+    )
+    return re.findall(r"\w+", plain, re.UNICODE)
+
+
+def _contains_tokens(text: str, fragment: str) -> bool:
+    haystack, needle = _normalized_tokens(text), _normalized_tokens(fragment)
+    return bool(needle) and any(
+        haystack[index:index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
+
+
+def _token_occurrences(text: str, fragment: str) -> int:
+    haystack, needle = _normalized_tokens(text), _normalized_tokens(fragment)
+    if not needle:
+        return 0
+    return sum(
+        haystack[index:index + len(needle)] == needle
+        for index in range(len(haystack) - len(needle) + 1)
+    )
 
 
 def _digest(value: str, width: int = 20) -> str:
@@ -34,16 +65,45 @@ def _fetch_language(language: str) -> list[dict[str, object]]:
             "offset": offset,
             "length": 100,
         })
-        with urllib.request.urlopen(
-            f"https://datasets-server.huggingface.co/rows?{query}", timeout=60
-        ) as response:
-            payload = json.load(response)
+        url = f"https://datasets-server.huggingface.co/rows?{query}"
+        for attempt in range(6):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as response:
+                    payload = json.load(response)
+                break
+            except HTTPError as error:
+                if error.code != 429 or attempt == 5:
+                    raise
+                time.sleep(2 ** attempt)
         page = [item["row"] for item in payload["rows"]]
         rows.extend(page)
         offset += len(page)
         if not page or offset >= int(payload["num_rows_total"]):
             break
     return rows
+
+
+def _load_languages(cache_root: Path) -> dict[str, list[dict[str, object]]]:
+    cache_root.mkdir(parents=True, exist_ok=True)
+    loaded: dict[str, list[dict[str, object]]] = {}
+    for language in LANGUAGES:
+        path = cache_root / f"xquad-{REVISION}-{language}.json"
+        if path.is_file():
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if payload.get("revision") != REVISION or not isinstance(
+                payload.get("rows"), list
+            ):
+                raise ValueError(f"invalid source cache: {path}")
+            loaded[language] = payload["rows"]
+            continue
+        rows = _fetch_language(language)
+        path.write_text(json.dumps({
+            "revision": REVISION,
+            "language": language,
+            "rows": rows,
+        }, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        loaded[language] = rows
+    return loaded
 
 
 def _answer(row: dict[str, object]) -> tuple[str, int]:
@@ -60,38 +120,6 @@ def _answer(row: dict[str, object]) -> tuple[str, int]:
     if start < 0 or not text:
         raise ValueError(f"cannot locate answer for {row['id']}")
     return text, start
-
-
-def _shape(answer: str) -> tuple[str, int]:
-    tokens = answer.split()
-    if any(character.isdigit() for character in answer):
-        kind = "numeric"
-    elif tokens and all(token[:1].isupper() for token in tokens if token[:1].isalpha()):
-        kind = "named"
-    else:
-        kind = "phrase"
-    return kind, min(4, max(1, len(tokens)))
-
-
-def _counterfactual_answer(
-    rng: random.Random,
-    original: str,
-    context: str,
-    pool: dict[tuple[str, int], list[str]],
-) -> str:
-    folded_context = context.casefold()
-    candidates = [
-        item for item in pool[_shape(original)]
-        if item != original and item.casefold() not in folded_context
-    ]
-    if not candidates:
-        candidates = [
-            item for values in pool.values() for item in values
-            if item != original and item.casefold() not in folded_context
-        ]
-    if not candidates:
-        raise ValueError("cannot construct a counterfactual answer pool")
-    return rng.choice(candidates)
 
 
 def _answer_window(context: str, start: int, answer_length: int,
@@ -126,11 +154,91 @@ def _record(
     return {
         "record_id": record_id,
         "citation_id": citation_id,
-        "text": f"Memory record {citation_id}. {context}",
+        "text": context,
         "shard_key": _opaque_id("S", f"{language}:{source_id}"),
         "generation": variant + 1,
         "indexable": indexable,
     }
+
+
+def _rewrite_source_hash(question: str, context: str, answer: str) -> str:
+    payload = json.dumps(
+        {"question": question, "context": context, "answer": answer},
+        ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _write_rewrite_jobs(path: Path, prepared: list[dict[str, str]]) -> dict[str, object]:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="\n") as stream:
+        for item in prepared:
+            row = {
+                "schema_version": 1,
+                "family_id": item["family_id"],
+                "language": item["language"],
+                "split": item["split"],
+                "question": item["question"],
+                "original_context": item["context"],
+                "original_answer": item["answer"],
+                "source_sha256": item["source_sha256"],
+            }
+            stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    manifest = {
+        "schema_version": 1,
+        "contract": "memory-counterfactual-rewrite-jobs-v1",
+        "rows": len(prepared),
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+    }
+    path.with_suffix(path.suffix + ".manifest.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+    return manifest
+
+
+def _load_validated_rewrites(path: Path) -> dict[str, dict[str, str]]:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    if not manifest_path.is_file():
+        raise ValueError(f"rewrite manifest is missing: {manifest_path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("contract") != "memory-counterfactual-rewrites-v1"
+        or manifest.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("rewrite artifact does not match its manifest")
+    rewrites: dict[str, dict[str, str]] = {}
+    row_count = 0
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        row_count += 1
+        raw = json.loads(line)
+        if raw.get("schema_version") != 1 or raw.get("status") != "accepted":
+            continue
+        validation = raw.get("validation")
+        if not isinstance(validation, dict) or not all(
+            validation.get(key) is True
+            for key in ("question_answerable", "context_coherent", "language_match")
+        ):
+            raise ValueError(f"rewrite row {line_number} lacks independent validation")
+        family_id = str(raw.get("family_id", ""))
+        answer = str(raw.get("counterfactual_answer", "")).strip()
+        context = str(raw.get("counterfactual_context", "")).strip()
+        extracted = str(validation.get("extracted_answer", "")).strip()
+        if not family_id or not answer or not context or extracted != answer:
+            raise ValueError(f"rewrite row {line_number} is incomplete")
+        if family_id in rewrites:
+            raise ValueError(f"duplicate accepted rewrite: {family_id}")
+        rewrites[family_id] = {
+            "source_sha256": str(raw.get("source_sha256", "")),
+            "answer": answer,
+            "context": context,
+        }
+    if not rewrites:
+        raise ValueError("rewrite artifact contains no accepted counterfactuals")
+    if manifest.get("rows") != row_count or manifest.get("accepted") != len(rewrites):
+        raise ValueError("rewrite artifact counts do not match its manifest")
+    return rewrites
 
 
 def _source_splits(
@@ -174,68 +282,109 @@ def _source_splits(
     return splits
 
 
-def build(output: Path, seed: int) -> dict[str, object]:
+def build(
+    output: Path,
+    seed: int,
+    source_cache: Path | None = None,
+    rewrite_jobs: Path | None = None,
+    rewrites_path: Path | None = None,
+) -> dict[str, object]:
     rng = random.Random(seed)
     source_sha = json.load(urllib.request.urlopen(
         f"https://huggingface.co/api/datasets/{DATASET}", timeout=60
     ))["sha"]
     if source_sha != REVISION:
         raise RuntimeError(f"dataset revision changed: expected {REVISION}, got {source_sha}")
-    by_language = {language: _fetch_language(language) for language in LANGUAGES}
+    cache_root = source_cache or output.parent / "source-cache"
+    by_language = _load_languages(cache_root)
     source_splits = _source_splits(by_language)
-    answer_pools: dict[str, dict[tuple[str, int], list[str]]] = {}
-    for language, rows in by_language.items():
-        pool: dict[tuple[str, int], list[str]] = defaultdict(list)
-        for row in rows:
-            answer, _ = _answer(row)
-            pool[_shape(answer)].append(answer)
-        answer_pools[language] = pool
 
     output_rows: list[dict[str, object]] = []
     records_for_distractors: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
-    prepared: list[tuple[str, str, dict[str, object], str, int, str, str]] = []
+    prepared: list[dict[str, str]] = []
     for language, rows in by_language.items():
         for row in rows:
             source_id = str(row["id"])
             split = source_splits[source_id]
             answer, start = _answer(row)
-            context, local_start = _answer_window(
+            context, _ = _answer_window(
                 str(row["context"]), start, len(answer)
             )
+            if _token_occurrences(context, answer) != 1:
+                continue
             citation_id = _opaque_id("C", f"citation:{language}:{source_id}")
             original = _record(
                 language, source_id, 0, citation_id, context, True
             )
             records_for_distractors[(language, split)].append(original)
-            prepared.append((
-                language, split, row, answer, local_start, citation_id, context
-            ))
+            question = str(row["question"]).strip()
+            family_id = _opaque_id("F", f"family:{language}:{source_id}")
+            prepared.append({
+                "language": language,
+                "split": split,
+                "source_id": source_id,
+                "question": question,
+                "answer": answer,
+                "citation_id": citation_id,
+                "context": context,
+                "family_id": family_id,
+                "source_sha256": _rewrite_source_hash(question, context, answer),
+            })
 
-    for language, split, row, answer, start, citation_id, context in prepared:
-        source_id = str(row["id"])
-        question = str(row["question"]).strip()
-        family_id = _opaque_id("F", f"family:{language}:{source_id}")
+    jobs_path = rewrite_jobs or output.parent / "counterfactual-rewrite-jobs.jsonl"
+    jobs_manifest = _write_rewrite_jobs(jobs_path, prepared)
+    if rewrites_path is None:
+        return {
+            "status": "rewrite-required",
+            "rewrite_jobs": str(jobs_path),
+            "rewrite_jobs_sha256": jobs_manifest["sha256"],
+            "jobs": len(prepared),
+        }
+    rewrites = _load_validated_rewrites(rewrites_path)
+    accepted_families: set[str] = set()
+    for item in prepared:
+        language = item["language"]
+        split = item["split"]
+        source_id = item["source_id"]
+        question = item["question"]
+        family_id = item["family_id"]
+        answer = item["answer"]
+        citation_id = item["citation_id"]
+        context = item["context"]
+        rewrite = rewrites.get(family_id)
+        if rewrite is None:
+            continue
+        if rewrite["source_sha256"] != item["source_sha256"]:
+            raise ValueError(f"stale counterfactual rewrite for {family_id}")
+        alternate = rewrite["answer"]
+        alternate_context = rewrite["context"]
+        if alternate.casefold() == answer.casefold():
+            raise ValueError(f"counterfactual answer did not change for {family_id}")
+        if _token_occurrences(alternate_context, alternate) != 1:
+            raise ValueError(f"counterfactual answer must occur exactly once: {family_id}")
+        if _contains_tokens(alternate_context, answer):
+            raise ValueError(f"counterfactual retained original answer: {family_id}")
         original = _record(language, source_id, 0, citation_id, context, True)
-        alternate = _counterfactual_answer(
-            rng, answer, context, answer_pools[language]
-        )
-        alternate_context = context[:start] + alternate + context[start + len(answer):]
         counterfactual = _record(
             language, source_id, 1, citation_id, alternate_context, False
         )
         distractors = [
             item for item in records_for_distractors[(language, split)]
             if item["citation_id"] != citation_id
-            and answer.casefold() not in str(item["text"]).casefold()
-            and alternate.casefold() not in str(item["text"]).casefold()
+            and not _contains_tokens(str(item["text"]), answer)
+            and not _contains_tokens(str(item["text"]), alternate)
         ]
         if not distractors:
             raise ValueError("cannot construct a non-answering distractor")
         distractor = rng.choice(distractors)
+        target_slot = int(_digest(f"slot:{family_id}", 2), 16) % 2
         for variant, target, target_answer, kind in (
             (0, original, answer, "natural"),
             (1, counterfactual, alternate, "counterfactual"),
         ):
+            admitted_records = [distractor, target]
+            if target_slot == 0:
+                admitted_records.reverse()
             output_rows.append({
                 "schema_version": 1,
                 "family_id": family_id,
@@ -246,8 +395,19 @@ def build(output: Path, seed: int) -> dict[str, object]:
                 "answer": target_answer,
                 "citations": [citation_id],
                 "kind": kind,
-                "records": [target, distractor],
+                "records": admitted_records,
             })
+        accepted_families.add(family_id)
+
+    family_counts: dict[tuple[str, str], int] = defaultdict(int)
+    for item in prepared:
+        if item["family_id"] in accepted_families:
+            family_counts[(item["split"], item["language"])] += 1
+    for language in LANGUAGES:
+        if family_counts[("train", language)] < 500:
+            raise ValueError(f"fewer than 500 accepted train rewrites for {language}")
+        if family_counts[("eval", language)] < 100:
+            raise ValueError(f"fewer than 100 accepted eval rewrites for {language}")
 
     for language, rows in by_language.items():
         for index, row in enumerate(rows[::10]):
@@ -256,7 +416,7 @@ def build(output: Path, seed: int) -> dict[str, object]:
             original_answer, _ = _answer(row)
             distractors = [
                 item for item in records_for_distractors[(language, split)]
-                if original_answer.casefold() not in str(item["text"]).casefold()
+                if not _contains_tokens(str(item["text"]), original_answer)
             ]
             if len(distractors) < 2:
                 raise ValueError("cannot construct an unanswerable memory set")
@@ -284,12 +444,36 @@ def build(output: Path, seed: int) -> dict[str, object]:
         for row in output_rows:
             stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
     manifest = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "contract": "xquad-coherent-counterfactual-memory-v2",
         "source_dataset": DATASET,
         "source_revision": REVISION,
         "source_license": "cc-by-sa-4.0",
         "languages": list(LANGUAGES),
+        "rewrite_artifact_sha256": hashlib.sha256(rewrites_path.read_bytes()).hexdigest(),
+        "rewrite_jobs_sha256": jobs_manifest["sha256"],
         "rows": len(output_rows),
+        "records": len({
+            str(record["record_id"])
+            for row in output_rows for record in row["records"]
+        }),
+        "examples_by_split_language_kind": {
+            "/".join(key): value
+            for key, value in sorted(
+                {
+                    key: sum(
+                        row["split"] == key[0]
+                        and row["language"] == key[1]
+                        and row["kind"] == key[2]
+                        for row in output_rows
+                    )
+                    for key in {
+                        (str(row["split"]), str(row["language"]), str(row["kind"]))
+                        for row in output_rows
+                    }
+                }.items()
+            )
+        },
         "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
     }
     manifest_path = output.with_suffix(output.suffix + ".manifest.json")
@@ -299,12 +483,38 @@ def build(output: Path, seed: int) -> dict[str, object]:
     return manifest
 
 
+def validate_built_corpus(path: Path) -> dict[str, object]:
+    manifest_path = path.with_suffix(path.suffix + ".manifest.json")
+    if not path.is_file() or not manifest_path.is_file():
+        raise ValueError("built capability corpus or manifest is missing")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if (
+        manifest.get("schema_version") != 2
+        or manifest.get("contract") != "xquad-coherent-counterfactual-memory-v2"
+        or manifest.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest()
+    ):
+        raise ValueError("capability corpus is stale or uses a superseded contract")
+    return manifest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare natural multilingual Memory Expert QA")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260807)
+    parser.add_argument("--source-cache", type=Path)
+    parser.add_argument("--rewrite-jobs", type=Path)
+    parser.add_argument("--rewrites", type=Path)
+    parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(build(args.output.resolve(), args.seed), indent=2))
+    if args.validate_only:
+        print(json.dumps(validate_built_corpus(args.output.resolve()), indent=2))
+        return 0
+    print(json.dumps(build(
+        args.output.resolve(), args.seed,
+        args.source_cache.resolve() if args.source_cache else None,
+        args.rewrite_jobs.resolve() if args.rewrite_jobs else None,
+        args.rewrites.resolve() if args.rewrites else None,
+    ), indent=2))
     return 0
 
 

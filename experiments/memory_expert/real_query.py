@@ -212,10 +212,20 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 config.maximum_new_tokens, device,
             )
             generation_elapsed = time.perf_counter() - generation_started
-            answer, model_citations = parse_response(response)
+            answer, model_source_slots = parse_response(response)
             hit_records = [hit.record for hit in hits]
-            citation_map = {record.citation_id: record for record in hit_records}
-            evidence_citations = tuple(record.citation_id for record in hit_records)
+            model_sources_authorized = (
+                bool(model_source_slots)
+                and len(set(model_source_slots)) == len(model_source_slots)
+                and all(0 <= slot < len(hit_records) for slot in model_source_slots)
+            )
+            selected_records = (
+                [hit_records[slot] for slot in model_source_slots]
+                if model_sources_authorized else []
+            )
+            evidence_citations = tuple(
+                record.citation_id for record in selected_records
+            )
             expected_answers = row.get("expected_answers", [])
             if isinstance(expected_answers, str):
                 expected_answers = [expected_answers]
@@ -233,19 +243,16 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 not expected_answers
                 or all(normalized_contains(answer, str(value)) for value in expected_answers)
             )
-            model_citations_authorized = bool(model_citations) and all(
-                citation in citation_map for citation in model_citations
-            )
-            evidence_authorized = bool(hit_records) and all(
-                acl.intersection(record.acl) for record in hit_records
+            evidence_authorized = bool(selected_records) and all(
+                acl.intersection(record.acl) for record in selected_records
             )
             result = {
                 "id": row["id"],
                 "question": row["question"],
                 "response": response,
                 "answer": answer,
-                "model_citations": model_citations,
-                "model_citations_authorized": model_citations_authorized,
+                "model_source_slots": model_source_slots,
+                "model_sources_authorized": model_sources_authorized,
                 "citations": evidence_citations,
                 "answer_text_match": answer_text_match,
                 "retrieval_ok": retrieval_ok,
@@ -267,11 +274,12 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 ],
                 "rendered_citations": [
                     {
-                        "citation_id": citation,
-                        "section_label": citation_map[citation].section_label,
-                        "quote": citation_map[citation].text,
+                        "source_slot": slot,
+                        "citation_id": record.citation_id,
+                        "section_label": record.section_label,
+                        "quote": record.text,
                     }
-                    for citation in evidence_citations
+                    for slot, record in zip(model_source_slots, selected_records)
                 ],
             }
             results.append(result)
@@ -292,8 +300,8 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
             "authorized_evidence_rate": sum(
                 bool(row["citations_authorized"]) for row in results
             ) / count,
-            "authorized_model_citation_rate": sum(
-                bool(row["model_citations_authorized"]) for row in results
+            "authorized_model_source_rate": sum(
+                bool(row["model_sources_authorized"]) for row in results
             ) / count,
             "timing_seconds": {
                 "encoder_load": encoder_loaded - encoder_started,

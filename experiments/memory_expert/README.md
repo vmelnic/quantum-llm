@@ -16,7 +16,9 @@ not be recreated as a fallback.
 
 ```text
 pinned XQuAD rows
-  └─► natural original/counterfactual/unknown JSONL
+  └─► versioned counterfactual rewrite jobs
+       └─► teacher rewrite + independent extraction/coherence validation
+            └─► natural original/counterfactual/unknown JSONL
        └─► strict corpus + anti-leak validation
             └─► frozen Qwen memory-pass layer states
                  └─► bounded lazy CPU LRU
@@ -24,10 +26,12 @@ pinned XQuAD rows
                            └─► eval-only causal and held-out gates
 ```
 
-`real_query.py` connects a checkpoint that has passed the capability gate to
-generic ingested records. Retrieval, strict literal matching, and semantic
-correctness are separate report concepts. The code does not claim an automatic
-semantic score.
+There is deliberately no blind span-substitution fallback. The neural target
+contains request-local `SOURCES` slots, while durable IDs and exact quotes stay
+in the authority plane. `real_query.py` connects a checkpoint that has passed
+the capability gate to generic ingested records. Admission, strict literal
+matching, and semantic correctness are separate report concepts; the code does
+not claim an automatic semantic score.
 
 Run through `ops/memory-data.sh`; see
 [the public design](../../docs/memory-expert.md) for commands, invariants, and

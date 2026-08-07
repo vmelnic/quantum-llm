@@ -68,6 +68,8 @@ Natural capability training and real sources use the generic data wrapper:
 
 ```bash
 ./ops/memory-data.sh capability-prepare
+./ops/memory-data.sh capability-rewrite
+./ops/memory-data.sh capability-build
 ./ops/memory-data.sh capability-sync
 ./ops/memory-data.sh capability-run
 ./ops/memory-data.sh ingest
@@ -79,11 +81,14 @@ Natural capability training and real sources use the generic data wrapper:
 ./ops/memory-data.sh status
 ```
 
+The first three commands create rewrite jobs, generate independently validated
+coherent counterfactuals through a configured offline OpenAI-compatible
+teacher, then build the corpus. There is no answer-span substitution fallback.
 The natural capability corpus is separate from evaluated source data and the
 causal probe uses eval families only. The source adapter, stable source URI,
 encoder, dataset name, language and bounded query limits are configured in
-`.env`. Raw sources are not copied to
-the worker. See [Memory Data ingestion and retrieval](../docs/memory-data.md).
+`.env`. Raw sources are not copied to the worker. See
+[Memory Data ingestion and retrieval](../docs/memory-data.md).
 
 ## Windows scripts
 
