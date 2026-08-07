@@ -42,6 +42,7 @@ class MemoryExample:
     kind: str
     split: str
     language: str = "en"
+    family_id: str = ""
 
     @property
     def target(self) -> str:

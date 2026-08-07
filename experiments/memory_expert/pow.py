@@ -728,7 +728,7 @@ def score_example(example: MemoryExample, response: str,
                   admitted_ids: Sequence[str],
                   records_by_id: dict[str, MemoryRecord]) -> dict[str, object]:
     answer, citations = parse_response(response)
-    answer_ok = normalized_contains(answer, example.answer)
+    answer_text_match = normalized_contains(answer, example.answer)
     admitted_records = [records_by_id[item] for item in admitted_ids]
     admitted_by_public_id = {
         record.public_id: record for record in admitted_records
@@ -748,9 +748,9 @@ def score_example(example: MemoryExample, response: str,
         "parsed_citations": citations,
         "citation_authorized": citation_authorized,
         "rendered_citations": rendered_citations,
-        "answer_ok": answer_ok,
+        "answer_text_match": answer_text_match,
         "citation_ok": citation_ok,
-        "passed": answer_ok and citation_ok,
+        "passed": answer_text_match and citation_ok,
     }
 
 
@@ -779,7 +779,8 @@ def select_causal_examples(examples: Sequence[MemoryExample],
     groups: dict[str, list[MemoryExample]] = {}
     for example in examples:
         if example.split == "eval" and example.kind != "unknown":
-            groups.setdefault(example.question, []).append(example)
+            key = example.family_id or example.question
+            groups.setdefault(key, []).append(example)
     candidates = [
         rows for rows in groups.values()
         if len(rows) >= 2 and len({row.answer for row in rows}) == len(rows)
@@ -1072,7 +1073,9 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
             count = max(1, len(rows))
             metrics[mode] = {
                 "examples": len(rows),
-                "answer_accuracy": sum(bool(row["answer_ok"]) for row in rows) / count,
+                "strict_answer_text_match_rate": sum(
+                    bool(row["answer_text_match"]) for row in rows
+                ) / count,
                 "citation_accuracy": sum(bool(row["citation_ok"]) for row in rows) / count,
                 "joint_accuracy": sum(bool(row["passed"]) for row in rows) / count,
             }
@@ -1090,8 +1093,8 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
         paired_count = max(1, len(paired_oracle_rows))
         metrics["paired-oracle-memory"] = {
             "examples": len(paired_oracle_rows),
-            "answer_accuracy": sum(
-                bool(row["answer_ok"]) for row in paired_oracle_rows
+            "strict_answer_text_match_rate": sum(
+                bool(row["answer_text_match"]) for row in paired_oracle_rows
             ) / paired_count,
             "citation_accuracy": sum(
                 bool(row["citation_ok"]) for row in paired_oracle_rows
@@ -1122,7 +1125,13 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
             "retrieval": metrics["automatic-retrieval"].get("retrieval_recall", 0.0) >= 0.75,
         }
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "metric_semantics": {
+                "strict_answer_text_match_rate": (
+                    "deterministic normalized substring match; not semantic accuracy"
+                ),
+                "manual_semantic_review_required": True,
+            },
             "model": config.model,
             "evaluation_split": "eval",
             "examples": len(selected),

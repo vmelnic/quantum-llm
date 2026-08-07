@@ -97,6 +97,7 @@ def main() -> int:
         assert {record.language for record in records} == set(LANGUAGES)
         assert {example.language for example in examples} == set(LANGUAGES)
         assert all(len(example.memory_ids) == 2 for example in examples)
+        assert all(example.family_id for example in examples)
         train_questions = {
             (example.language, example.question) for example in examples
             if example.split == "train"

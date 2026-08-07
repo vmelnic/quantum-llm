@@ -57,7 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--corpus", type=Path, required=True)
     parser.add_argument("--checkpoint", type=Path)
-    parser.add_argument("--steps", type=int, default=2048)
+    parser.add_argument("--steps", type=int, default=4096)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--gradient-accumulation", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=0.0002)

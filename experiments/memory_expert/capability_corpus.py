@@ -190,6 +190,7 @@ def load_capability_corpus(
             kind=kind,
             split=split,
             language=language,
+            family_id=family_id,
         )
         examples.append(example)
         family_rows[family_id].append(example)
