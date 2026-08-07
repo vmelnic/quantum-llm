@@ -48,6 +48,7 @@ if ($null -ne $existingTask -and $existingTask.State -eq "Running") {
 $escapedModel = [WildcardPattern]::Escape($ModelId)
 $existing = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
+        $_.ProcessId -ne $PID -and
         $_.Name -in @("python.exe", "hf.exe", "powershell.exe") -and
         $_.CommandLine -like "*download*$escapedModel*"
     } | Select-Object -First 1
@@ -58,9 +59,11 @@ if ($null -ne $existing) {
 $cacheName = "models--" + ($ModelId -replace "/", "--")
 $cacheRoot = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
 $snapshot = Join-Path (Join-Path $cacheRoot "snapshots") $Revision
-$initialShardBytes = [int64]((Get-ChildItem $snapshot `
-    -Filter "model-*.safetensors" -File -ErrorAction SilentlyContinue |
-    Measure-Object Length -Sum).Sum)
+$initialShardBytes = [int64]0
+foreach ($shard in @(Get-ChildItem $snapshot -Filter "model-*.safetensors" `
+        -File -ErrorAction SilentlyContinue)) {
+    $initialShardBytes += [int64]$shard.Length
+}
 $cachedBytes = [int64]0
 foreach ($blob in @(Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
         -ErrorAction SilentlyContinue)) {

@@ -35,6 +35,7 @@ context ceiling is not long-context-qualified. Neither backend meets the
 | observability | partial | JSONL/metrics exist; Qwen request-level placement telemetry is incomplete |
 | reliability | missing | no 24-hour soak, chaos campaign, HA or failover |
 | GPU CI/security review | missing | manual SM86 validation; no independent audit/fuzz campaign |
+| external Memory Expert | research PoW | synthetic causal and held-out gates pass; no real-data ingest/API/security qualification |
 
 ## Release blockers
 

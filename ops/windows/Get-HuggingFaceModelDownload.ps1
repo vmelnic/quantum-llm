@@ -9,6 +9,7 @@ $state = Get-Content $artifact -Raw | ConvertFrom-Json
 $escapedModel = [WildcardPattern]::Escape([string]$state.model_id)
 $worker = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
     Where-Object {
+        $_.ProcessId -ne $PID -and
         $_.Name -in @("python.exe", "hf.exe", "powershell.exe") -and
         ($_.CommandLine -like "*download*$escapedModel*" -or
          $_.CommandLine -like "*$escapedModel*--max-workers*")
@@ -26,10 +27,17 @@ foreach ($blob in @(Get-ChildItem (Join-Path $root "blobs") -File `
 }
 $incomplete = @(Get-ChildItem (Join-Path $root "blobs") -Filter "*.incomplete" `
     -File -ErrorAction SilentlyContinue)
+$incompleteBytes = [int64]0
+foreach ($partial in $incomplete) {
+    $incompleteBytes += [int64]$partial.Length
+}
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
 $shards = @(Get-ChildItem $snapshot -Filter "model-*.safetensors" -File `
     -ErrorAction SilentlyContinue)
-$completeShardBytes = [int64](($shards | Measure-Object Length -Sum).Sum)
+$completeShardBytes = [int64]0
+foreach ($shard in $shards) {
+    $completeShardBytes += [int64]$shard.Length
+}
 $indexPath = Join-Path $snapshot "model.safetensors.index.json"
 $indexTensorBytes = [int64]0
 $missingReferencedFiles = @()
@@ -72,6 +80,7 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     complete_shards = $shards.Count
     expected_shards = [int]$state.expected_shards
     incomplete_transfers = $incomplete.Count
+    incomplete_bytes = $incompleteBytes
     missing_referenced_files = $missingReferencedFiles.Count
     index_tensor_bytes = $indexTensorBytes
     expected_tensor_bytes = [int64]$state.expected_tensor_bytes

@@ -45,6 +45,25 @@ cp .env.example .env
 ./ops/model.sh chat
 ```
 
+The isolated Memory Expert proof of concept has its own wrapper and does not
+start, stop, or modify either production model:
+
+```bash
+./ops/memory-pow.sh download
+./ops/memory-pow.sh download-status
+./ops/memory-pow.sh run
+./ops/memory-pow.sh probe
+./ops/memory-pow.sh status
+```
+
+`run` refuses to start unless at least 18 GiB of VRAM is free. Its frozen
+Qwen3-4B checkpoint, adapter checkpoint, generated corpus, index shards, and
+Python environment are independent of the Qwen3-Next/DeepSeek packs. The
+optional `MEMORY_POW_*` variables in `.env` control only this experiment.
+The validated default is a 1,024-microstep run; `run` requires the
+same-question counterfactual causal probe before it spends time on held-out
+evaluation. See [External Memory Expert](../docs/memory-expert.md).
+
 ## Windows scripts
 
 The directory is intentionally limited to supported operator workflows:
@@ -66,6 +85,9 @@ The directory is intentionally limited to supported operator workflows:
 - `Get-ExpertServerStatus.ps1`, `Stop-ExpertServer.ps1`,
   `Uninstall-ExpertServerTask.ps1`, and the model smoke/gate scripts implement
   bounded status, verification, shutdown, and performance checks.
+- `Install-MemoryExpertEnvironment.ps1` and `Invoke-MemoryExpertPow.ps1`
+  provide the isolated, bounded external-memory experiment described in
+  [`experiments/memory_expert`](../experiments/memory_expert/README.md).
 
 Intermediate phase-admission scripts used while developing the DeepSeek
 backend are not part of the supported operator surface. Their outcomes are

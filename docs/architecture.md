@@ -256,6 +256,12 @@ transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string
 lookups or per-layer uploads in the hot path.
 
+The independently validated external-knowledge path is documented in
+[External Memory Expert](memory-expert.md). It attaches bounded retrieved
+records through a separate frozen pass and layer-wise gated cross-attention; it
+does not place source text in the request context and does not alter MoE expert
+placement.
+
 One `DeepSeekRequestState` owns the mutable attention, FFN, HC-head/logits, and
 four-stream state for all 43 layers and retains the immutable model object that
 its bindings reference. The

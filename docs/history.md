@@ -123,3 +123,33 @@ existing quantization project.
 
 RTX 3090/CUDA remains the first backend. Metal/macOS and remote expert workers
 remain later phases after the local runtime has truthful single-host evidence.
+
+## External Memory Expert experiment
+
+The project also tested whether a frozen model can consume newly ingested
+knowledge without prompt stuffing, corpus-wide KV materialization, or
+per-ingest training. The final Qwen3-4B PoW trained 2,949,120 low-rank gate
+parameters and passed both causal and held-out gates: 12/12 contradictory
+memory interventions exact, 16/16 oracle held-out exact, and 15/16 through
+automatic retrieval.
+
+Several rejected intermediate results were essential:
+
+- one late-layer cross-attention branch matched the no-memory baseline and did
+  not transmit arbitrary values;
+- the first all-layer version used the output of layer `i` as memory for layer
+  `i`, an off-by-one state, generic LayerNorm instead of the frozen RMSNorm,
+  and reversed zero/random gate initialization;
+- LAMB at the short PoW horizon made one large first move and then nearly
+  stalled; AdamW at 2e-4 remained stable and converged in the bounded run;
+- ordinary examples allowed a question-to-answer shortcut; same-question,
+  same-visible-ID contradictory records made memory content the only causal
+  discriminator;
+- the neural channel selected codes correctly but reconstructed digits
+  approximately; an admitted-source continuation pointer made literals exact;
+- unconditional nearest-neighbor admission hallucinated on absent facts; a
+  held-out score floor separated known and unknown synthetic queries.
+
+The result and limitations are documented in
+[External Memory Expert](memory-expert.md). It is a feasibility result, not a
+claim that the current synthetic index is ready for real private data.
