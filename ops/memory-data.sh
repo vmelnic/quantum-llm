@@ -23,9 +23,16 @@ fi
 encoder_model="${MEMORY_ENCODER_MODEL:-BAAI/bge-m3}"
 encoder_revision="${MEMORY_ENCODER_REVISION:-5617a9f61b028005a4858fdac845db406aefb181}"
 action="${1:-status}"
+capability_corpus="${MEMORY_CAPABILITY_CORPUS:-work/memory-capability/xquad-natural-v1.jsonl}"
+if [[ "${capability_corpus}" != /* ]]; then
+  capability_corpus="${repo_root}/${capability_corpus}"
+fi
+capability_corpus_name="$(basename "${capability_corpus}")"
+remote_capability_dir="${remote_root}/work/memory-capability"
+remote_capability_corpus="${remote_capability_dir}/${capability_corpus_name}"
 
 [[ "${dataset_name}" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "Invalid MEMORY_DATASET_NAME" >&2; exit 2; }
-if [[ "${action}" != "ingest" ]]; then
+if [[ "${action}" != "ingest" && "${action}" != "capability-prepare" ]]; then
   [[ -n "${remote_host}" ]] || { echo "Set QUANTUM_LLM_REMOTE in ${env_file}" >&2; exit 2; }
   export QUANTUM_LLM_REMOTE="${remote_host}"
   export QUANTUM_LLM_REMOTE_ROOT="${remote_root}"
@@ -50,7 +57,31 @@ sync_data() {
   fi
 }
 
+sync_capability_data() {
+  [[ -f "${capability_corpus}" ]] || {
+    echo "Run ./ops/memory-data.sh capability-prepare first" >&2; exit 2;
+  }
+  "${script_dir}/sync-to-windows-host.sh" "${remote_host}" "${remote_root}"
+  ssh -o BatchMode=yes "${remote_host}" \
+    "if not exist \"${remote_capability_dir}\" mkdir \"${remote_capability_dir}\""
+  capability_files=("${capability_corpus_name}")
+  if [[ -f "${capability_corpus}.manifest.json" ]]; then
+    capability_files+=("${capability_corpus_name}.manifest.json")
+  fi
+  tar --format=ustar --no-xattrs --no-acls --no-fflags \
+    -C "$(dirname "${capability_corpus}")" -cf - "${capability_files[@]}" \
+    | ssh -o BatchMode=yes "${remote_host}" \
+      "tar -xf - -C \"${remote_capability_dir}\""
+}
+
 case "${action}" in
+  capability-prepare)
+    python3 "${repo_root}/experiments/memory_expert/prepare_capability_data.py" \
+      --output "${capability_corpus}"
+    ;;
+  capability-sync)
+    sync_capability_data
+    ;;
   ingest)
     [[ -n "${MEMORY_INGEST_SOURCE:-}" ]] || {
       echo "Set MEMORY_INGEST_SOURCE in ${env_file}" >&2; exit 2;
@@ -70,6 +101,37 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" Install-MemoryEncoder.ps1 \
       -ModelId "${encoder_model}" -Revision "${encoder_revision}"
     ;;
+  capability-train|capability-probe|capability-evaluate|capability-run)
+    capability_action="${action#capability-}"
+    sync_capability_data
+    capability_arguments=(Invoke-MemoryCapability.ps1 \
+      -Action "${capability_action}" \
+      -Corpus "${remote_capability_corpus}" \
+      -Steps "${MEMORY_CAPABILITY_STEPS:-4096}" \
+      -BatchSize "${MEMORY_CAPABILITY_BATCH_SIZE:-2}" \
+      -GradientAccumulation "${MEMORY_CAPABILITY_GRADIENT_ACCUMULATION:-16}" \
+      -LearningRate "${MEMORY_CAPABILITY_LEARNING_RATE:-0.0002}" \
+      -EvaluationLimit "${MEMORY_CAPABILITY_EVALUATION_LIMIT:-30}" \
+      -GateRank "${MEMORY_CAPABILITY_GATE_RANK:-16}" \
+      -GateAlpha "${MEMORY_CAPABILITY_GATE_ALPHA:-32}" \
+      -KnowledgeDropout "${MEMORY_CAPABILITY_KNOWLEDGE_DROPOUT:-0.2}" \
+      -MaximumMemoryTokens "${MEMORY_CAPABILITY_MEMORY_TOKENS:-384}" \
+      -MaximumNewTokens "${MEMORY_CAPABILITY_NEW_TOKENS:-128}" \
+      -MemoryCacheBytes "${MEMORY_CAPABILITY_CACHE_BYTES:-4294967296}" \
+      -OutputName "${MEMORY_CAPABILITY_OUTPUT_NAME:-memory-expert-capability-natural-v1}")
+    if [[ -f "${local_dataset_root}/questions.jsonl" ]]; then
+      ssh -o BatchMode=yes "${remote_host}" \
+        "if not exist \"${remote_dataset_root}\" mkdir \"${remote_dataset_root}\""
+      tar --format=ustar --no-xattrs --no-acls --no-fflags \
+        -C "${local_dataset_root}" -cf - questions.jsonl \
+        | ssh -o BatchMode=yes "${remote_host}" \
+          "tar -xf - -C \"${remote_dataset_root}\""
+      capability_arguments+=(
+        -ForbiddenFile "${remote_dataset_root}/questions.jsonl"
+      )
+    fi
+    "${script_dir}/run-on-windows-host.sh" "${capability_arguments[@]}"
+    ;;
   index|query|status|selftest)
     remote_arguments=(Invoke-MemoryData.ps1 \
       -Action "${action}" -DatasetName "${dataset_name}" \
@@ -78,14 +140,15 @@ case "${action}" in
       -EncoderBatchSize "${MEMORY_ENCODER_BATCH_SIZE:-16}" \
       -TopK "${MEMORY_RETRIEVAL_TOP_K:-2}" \
       -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
-      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-96}")
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}" \
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-natural-v1/memory-expert.pt}")
     if [[ -n "${MEMORY_QUERY_LANGUAGE:-}" ]]; then
       remote_arguments+=(-Language "${MEMORY_QUERY_LANGUAGE}")
     fi
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|status>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|status|capability-prepare|capability-sync|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac

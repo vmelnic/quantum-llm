@@ -169,3 +169,25 @@ localized the next problem to multilingual/extractive adapter capability,
 rather than ingestion or dense retrieval. Model-generated synthetic citation
 IDs were rejected; exact citations were rendered only from ACL-admitted source
 records. See [Memory Data ingestion and retrieval](memory-data.md).
+
+## Multilingual capability benchmark audit
+
+The next adapter initially appeared to improve its internal multilingual
+metrics, but an independent code-and-data audit invalidated that conclusion.
+The corpus was a synthetic codebook: patterned `ZX...` keys, 18 closed span
+labels, and citation IDs correlated with record identity. More importantly,
+the causal probe sampled training families instead of eval families and
+automatic/oracle modes reported different example subsets.
+
+The untouched Romanian law run exposed the mismatch: evidence retrieval stayed
+at 5/5, strict text match was 0/5, and manual semantic review found only one
+clearly correct answer. No Qwen or DeepSeek production-model artifact was
+modified by this experiment.
+
+The invalid generator was removed rather than patched. Its replacement uses
+pinned natural XQuAD passages and questions in Romanian, Russian, and English,
+same-question counterfactual memories, distractors, opaque identifiers,
+absent-evidence cases, atomic duplicate/translation splits, an eval-only causal
+probe, paired retrieval/oracle reporting, and a bounded lazy layer-state cache.
+Until this replacement passes both its natural eval and the untouched legal
+test, the project claims only channel causality—not generic external knowledge.

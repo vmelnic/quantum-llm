@@ -7,7 +7,8 @@ param(
     [int]$EncoderBatchSize = 16,
     [int]$TopK = 2,
     [int]$MaximumMemoryTokens = 768,
-    [int]$MaximumNewTokens = 96,
+    [int]$MaximumNewTokens = 128,
+    [string]$Checkpoint = "work/memory-expert-capability/memory-expert.pt",
     [string]$Language = "",
     [int64]$MinimumFreeVramMiB = 18000
 )
@@ -28,7 +29,9 @@ $ingest = Join-Path $dataset "ingest"
 $index = Join-Path $dataset "index"
 $questions = Join-Path $dataset "questions.jsonl"
 $report = Join-Path $dataset "query-report.json"
-$checkpoint = Join-Path $script:RepoRoot "work\memory-expert-pow\memory-expert.pt"
+$checkpoint = if ([System.IO.Path]::IsPathRooted($Checkpoint)) {
+    $Checkpoint
+} else { Join-Path $script:RepoRoot $Checkpoint }
 
 if ($Action -eq "status") {
     $ingestManifest = Join-Path $ingest "manifest.json"
@@ -74,7 +77,9 @@ if ($Action -eq "selftest") {
     exit 0
 }
 
-foreach ($required in @((Join-Path $ingest "manifest.json"), $checkpoint)) {
+$requiredArtifacts = @((Join-Path $ingest "manifest.json"))
+if ($Action -eq "query") { $requiredArtifacts += $checkpoint }
+foreach ($required in $requiredArtifacts) {
     if (-not (Test-Path -LiteralPath $required -PathType Leaf)) {
         throw "Required Memory Data artifact is missing: $required"
     }

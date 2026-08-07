@@ -64,9 +64,12 @@ The validated default is a 1,024-microstep run; `run` requires the
 same-question counterfactual causal probe before it spends time on held-out
 evaluation. See [External Memory Expert](../docs/memory-expert.md).
 
-Real sources use the separate generic data wrapper:
+Natural capability training and real sources use the generic data wrapper:
 
 ```bash
+./ops/memory-data.sh capability-prepare
+./ops/memory-data.sh capability-sync
+./ops/memory-data.sh capability-run
 ./ops/memory-data.sh ingest
 ./ops/memory-data.sh sync
 ./ops/memory-data.sh encoder-download
@@ -76,8 +79,10 @@ Real sources use the separate generic data wrapper:
 ./ops/memory-data.sh status
 ```
 
-The source adapter, stable source URI, encoder, dataset name, language and
-bounded query limits are configured in `.env`. Raw sources are not copied to
+The natural capability corpus is separate from evaluated source data and the
+causal probe uses eval families only. The source adapter, stable source URI,
+encoder, dataset name, language and bounded query limits are configured in
+`.env`. Raw sources are not copied to
 the worker. See [Memory Data ingestion and retrieval](../docs/memory-data.md).
 
 ## Windows scripts

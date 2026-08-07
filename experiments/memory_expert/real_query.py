@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import contextlib
 import gc
 import json
 import re
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Sequence
 
@@ -13,11 +13,9 @@ import numpy as np
 import torch
 
 try:
-    from .data_contract import KnowledgeRecord, read_records
-    from .dense_index import TransformerDenseEncoder, search
+    from .data_contract import KnowledgeRecord, SourceSpan, content_sha256
+    from .dense_index import SearchHit, TransformerDenseEncoder, search
     from .pow import (
-        MemoryExpert,
-        MemoryExpertStack,
         MemoryHook,
         PowConfig,
         chat_prompt,
@@ -30,8 +28,8 @@ try:
     )
     from .synthetic_memory import MemoryRecord, normalized_contains, parse_response
 except ImportError:  # Direct execution on a worker.
-    from data_contract import KnowledgeRecord, read_records
-    from dense_index import TransformerDenseEncoder, search
+    from data_contract import KnowledgeRecord, SourceSpan, content_sha256
+    from dense_index import SearchHit, TransformerDenseEncoder, search
     from pow import (
         MemoryHook,
         PowConfig,
@@ -79,6 +77,69 @@ def section_matches(record: KnowledgeRecord, patterns: Sequence[str]) -> bool:
     return any(re.search(pattern, record.section_label, re.IGNORECASE) for pattern in patterns)
 
 
+def candidate_subspans(record: KnowledgeRecord, maximum_characters: int = 900
+                       ) -> list[tuple[int, int]]:
+    """Return exact paragraph/sentence spans for second-stage admission."""
+    spans: list[tuple[int, int]] = []
+    for match in re.finditer(r"\S(?:.*?\S)?(?=\n\s*\n|\Z)", record.text, re.DOTALL):
+        text = match.group(0)
+        if " ".join(text.split()) == " ".join(record.section_label.split()):
+            continue
+        if len(text) <= maximum_characters:
+            spans.append((match.start(), match.end()))
+            continue
+        cursor = match.start()
+        for sentence in re.finditer(r"\S.*?(?:[.!?;](?=\s|\Z)|\Z)", text, re.DOTALL):
+            start = match.start() + sentence.start()
+            end = match.start() + sentence.end()
+            if end - start > maximum_characters:
+                for offset in range(start, end, maximum_characters):
+                    spans.append((offset, min(offset + maximum_characters, end)))
+            else:
+                spans.append((start, end))
+            cursor = end
+        if cursor < match.end():
+            spans.append((cursor, match.end()))
+    return spans or [(0, len(record.text))]
+
+
+def rerank_admitted_segments(encoder: TransformerDenseEncoder,
+                             query_vector: np.ndarray,
+                             hits: Sequence[SearchHit]) -> list[SearchHit]:
+    reranked: list[SearchHit] = []
+    for hit in hits:
+        spans = candidate_subspans(hit.record)
+        texts = [
+            f"{hit.record.section_label}\n{hit.record.text[start:end]}"
+            for start, end in spans
+        ]
+        vectors = encoder.encode(texts, batch_size=min(16, len(texts)))
+        scores = vectors @ np.asarray(query_vector, dtype=np.float32)
+        selected = int(np.argmax(scores))
+        relative_start, relative_end = spans[selected]
+        selected_text = hit.record.text[relative_start:relative_end]
+        absolute_start = hit.record.source_span.character_start + relative_start
+        absolute_end = hit.record.source_span.character_start + relative_end
+        selected_hash = content_sha256(selected_text)
+        record = replace(
+            hit.record,
+            record_id=(
+                f"{hit.record.record_id}-S{absolute_start}-{absolute_end}-"
+                f"{selected_hash[:12]}"
+            ),
+            text=selected_text,
+            content_sha256=selected_hash,
+            source_span=SourceSpan(absolute_start, absolute_end),
+            attributes={
+                **hit.record.attributes,
+                "parent_record_id": hit.record.record_id,
+                "segment_reranked": True,
+            },
+        )
+        reranked.append(SearchHit(record, hit.score, float(scores[selected])))
+    return reranked
+
+
 def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 question_path: Path, output_path: Path, encoder_model: str,
                 encoder_revision: str, top_k: int, maximum_memory_tokens: int,
@@ -93,14 +154,15 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
     encoder_loaded = time.perf_counter()
     query_vectors = encoder.encode([str(row["question"]) for row in questions])
     encoded_queries = time.perf_counter()
-    retrievals: list[list[object]] = []
+    retrievals: list[list[SearchHit]] = []
     retrieval_seconds: list[float] = []
     for row, query_vector in zip(questions, query_vectors):
         query_started = time.perf_counter()
-        retrievals.append(search(
+        hits = search(
             ingest_root, index_root, query_vector, maximum=top_k,
             allowed_acl=acl, language=language,
-        ))
+        )
+        retrievals.append(rerank_admitted_segments(encoder, query_vector, hits))
         retrieval_seconds.append(time.perf_counter() - query_started)
     del encoder
     gc.collect()
@@ -110,13 +172,11 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
 
     raw_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     config = PowConfig(**raw_checkpoint["config"])
-    config = PowConfig(
-        **{
-            **config.__dict__,
-            "maximum_memory_tokens": maximum_memory_tokens,
-            "maximum_new_tokens": maximum_new_tokens,
-        }
-    )
+    config = PowConfig(**{
+        **config.__dict__,
+        "maximum_memory_tokens": maximum_memory_tokens,
+        "maximum_new_tokens": maximum_new_tokens,
+    })
     seed_everything(config.seed)
     tokenizer, model = load_model(config, device)
     model_loaded = time.perf_counter()
@@ -128,15 +188,12 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
         layers[index].register_forward_hook(hooks[index]) for index in layer_indices
     ]
     try:
-        knowledge_by_id = {
-            record.record_id: record for record in read_records(ingest_root)
-        }
         selected_ids = [
             tuple(hit.record.record_id for hit in hits) for hits in retrievals
         ]
         admitted = {
-            record_id: as_memory_record(knowledge_by_id[record_id])
-            for key in selected_ids for record_id in key
+            hit.record.record_id: as_memory_record(hit.record)
+            for hits in retrievals for hit in hits
         }
         memory_started = time.perf_counter()
         memory_cache = encode_memory_sets(
@@ -158,9 +215,6 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
             answer, model_citations = parse_response(response)
             hit_records = [hit.record for hit in hits]
             citation_map = {record.citation_id: record for record in hit_records}
-            # Citation identifiers and quotes are authority-plane output, not
-            # free-form model output. The model's attempted IDs remain in the
-            # report as a diagnostic, but can never authorize a source.
             evidence_citations = tuple(record.citation_id for record in hit_records)
             expected_answers = row.get("expected_answers", [])
             if isinstance(expected_answers, str):
@@ -175,7 +229,7 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                     for pattern in expected_sections
                 )
             )
-            answer_ok = (
+            answer_text_match = (
                 not expected_answers
                 or all(normalized_contains(answer, str(value)) for value in expected_answers)
             )
@@ -193,16 +247,18 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 "model_citations": model_citations,
                 "model_citations_authorized": model_citations_authorized,
                 "citations": evidence_citations,
-                "answer_ok": answer_ok,
+                "answer_text_match": answer_text_match,
                 "retrieval_ok": retrieval_ok,
                 "citations_authorized": evidence_authorized,
-                "passed": answer_ok and retrieval_ok and evidence_authorized,
+                "passed": answer_text_match and retrieval_ok and evidence_authorized,
                 "retrieval_seconds": retrieval_elapsed,
                 "generation_seconds": generation_elapsed,
                 "hits": [
                     {
                         "score": hit.score,
+                        "segment_score": hit.segment_score,
                         "record_id": hit.record.record_id,
+                        "parent_record_id": hit.record.attributes.get("parent_record_id"),
                         "citation_id": hit.record.citation_id,
                         "section_label": hit.record.section_label,
                         "source_span": hit.record.to_dict()["source_span"],
@@ -223,11 +279,15 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
         finished = time.perf_counter()
         count = len(results)
         summary = {
-            "schema_version": 1,
-            "contract": "quantum-llm-memory-query-report-v1",
+            "schema_version": 3,
+            "contract": "quantum-llm-memory-query-report-v3",
             "questions": count,
             "passed": sum(bool(row["passed"]) for row in results),
-            "answer_accuracy": sum(bool(row["answer_ok"]) for row in results) / count,
+            "strict_text_match_rate": sum(
+                bool(row["answer_text_match"]) for row in results
+            ) / count,
+            "semantic_answer_accuracy": None,
+            "manual_semantic_review_required": True,
             "retrieval_recall": sum(bool(row["retrieval_ok"]) for row in results) / count,
             "authorized_evidence_rate": sum(
                 bool(row["citations_authorized"]) for row in results
@@ -241,7 +301,9 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 "retrieval_total": retrieval_finished - encoded_queries,
                 "model_load": model_loaded - retrieval_finished,
                 "memory_encode": memory_finished - memory_started,
-                "generation_total": sum(float(row["generation_seconds"]) for row in results),
+                "generation_total": sum(
+                    float(result["generation_seconds"]) for result in results
+                ),
                 "total": finished - started,
             },
             "results": results,
@@ -268,7 +330,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--top-k", type=int, default=2)
     parser.add_argument("--maximum-memory-tokens", type=int, default=768)
-    parser.add_argument("--maximum-new-tokens", type=int, default=96)
+    parser.add_argument("--maximum-new-tokens", type=int, default=128)
     parser.add_argument("--acl", action="append")
     parser.add_argument("--language")
     return parser.parse_args()

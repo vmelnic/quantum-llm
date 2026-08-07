@@ -114,13 +114,15 @@ activations move instead of whole experts per token.
 
 ## P7 — production external knowledge
 
-The synthetic Memory Expert PoW has passed. Generic immutable ingestion and a
-pinned multilingual dense index are now implemented; the first Romanian legal
-document reached rank-1 retrieval for 5/5 questions. The old English adapter
-reached only 2/5 strict answers, so production knowledge remains incomplete:
+The synthetic Memory Expert PoW proved channel causality only. Generic immutable
+ingestion and a pinned multilingual dense index are implemented; the Romanian
+legal document reached rank-1 retrieval for 5/5 questions. The first
+multilingual capability benchmark was invalidated by shortcuts and its legal
+run was unusable. Production knowledge therefore remains incomplete:
 
-1. train one data-independent Romanian/Russian/English extractive capability
-   adapter; never retrain it merely because records were ingested;
+1. complete and externally validate the natural XQuAD-based
+   Romanian/Russian/English capability adapter; never retrain it merely because
+   records were ingested;
 2. extend the implemented immutable record generations, language and ACL
    contract with temporal selection and deletion/tombstone semantics;
 3. extend the pinned BGE-M3 exact sharded scan to calibrated routed
@@ -128,8 +130,8 @@ reached only 2/5 strict answers, so production knowledge remains incomplete:
 4. expose bounded memory admission, citations and verbatim evidence through the
    serving API without placing records in the conversation context;
 5. cache only hot JIT memory states under independent RAM/VRAM budgets;
-6. replace the continuation heuristic with a trained/general copy-span head
-   if real-corpus exact-literal gates require it;
+6. add a general copy mechanism only if natural-corpus evidence shows it is
+   required; do not restore a benchmark-specific continuation heuristic;
 7. evaluate Moldovan/Romanian/Russian legislation and structured order data for
    temporal correctness, ACL isolation, injection resistance, updates, exact
    quotes and abstention;

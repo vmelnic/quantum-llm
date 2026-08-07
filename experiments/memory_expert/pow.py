@@ -6,6 +6,7 @@ import json
 import math
 import random
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Sequence
@@ -47,12 +48,12 @@ except ImportError:  # Direct script execution on the Windows worker.
 SYSTEM_PROMPT = """You answer using a separate authoritative memory channel.
 The source text is not present in this prompt. If the memory channel does not
 contain evidence for the question, answer exactly: I don't know from the
-attached memory. Never use general knowledge for factual answers. Return two
+attached memory. Otherwise, answer in the same language as the user's question.
+Never use general knowledge for factual answers. Return two
 lines only. Start the first with `ANSWER: ` followed by the answer. Start the
 second with `CITATIONS: ` followed by comma-separated record IDs or `NONE`."""
 
 ARCHITECTURE_VERSION = "tokenmem-input-state-rmsnorm-v1"
-COPY_CONTINUATION_BIAS = 8.0
 
 
 @dataclass(frozen=True)
@@ -255,7 +256,8 @@ def chat_prompt(tokenizer, question: str, control_context: str | None = None) ->
     if control_context is not None:
         system = """This is a full-context control run. Answer only from the
 provided records. If they do not support the question, answer exactly: I don't
-know from the attached memory. Return two lines only. Start the first with
+know from the attached memory. Otherwise, answer in the same language as the
+user's question. Return two lines only. Start the first with
 `ANSWER: ` followed by the answer. Start the second with `CITATIONS: ` followed
 by comma-separated record IDs or `NONE`."""
         user = f"RECORDS:\n{control_context}\n\nQUESTION:\n{question}"
@@ -364,11 +366,8 @@ def encode_memory_sets(model, tokenizer, hooks: dict[int, MemoryHook],
                        ) -> dict[tuple[str, ...], dict[int, torch.Tensor]]:
     cache: dict[tuple[str, ...], dict[int, torch.Tensor]] = {
         (): {
-            **{
-                index: torch.empty(0, model.config.hidden_size)
-                for index in hooks
-            },
-            -1: torch.empty(0, dtype=torch.long),
+            index: torch.empty(0, model.config.hidden_size)
+            for index in hooks
         }
     }
     pending = [key for key in dict.fromkeys(memory_sets) if key]
@@ -399,11 +398,62 @@ def encode_memory_sets(model, tokenizer, hooks: dict[int, MemoryHook],
                 )
                 for index in hooks
             }
-            # Retain token identities next to their layer-wise representations.
-            # They power an exact extractive continuation path without placing
-            # source text in the decoder prompt or its causal KV cache.
-            cache[key][-1] = encoded["input_ids"][row, :count].detach().cpu()
     return cache
+
+
+def _state_bytes(states: dict[int, torch.Tensor]) -> int:
+    return sum(item.nelement() * item.element_size() for item in states.values())
+
+
+class BoundedMemoryStateCache:
+    """Lazy CPU cache for frozen layer states; bounded independently of corpus size."""
+
+    def __init__(self, model, tokenizer, hooks: dict[int, MemoryHook],
+                 records_by_id: dict[str, MemoryRecord], maximum_tokens: int,
+                 device: torch.device, maximum_bytes: int) -> None:
+        if maximum_bytes <= 0:
+            raise ValueError("memory cache byte limit must be positive")
+        self.model = model
+        self.tokenizer = tokenizer
+        self.hooks = hooks
+        self.records_by_id = records_by_id
+        self.maximum_tokens = maximum_tokens
+        self.device = device
+        self.maximum_bytes = maximum_bytes
+        self.cache: OrderedDict[tuple[str, ...], dict[int, torch.Tensor]] = OrderedDict()
+        self.cache[()] = {
+            index: torch.empty(0, model.config.hidden_size) for index in hooks
+        }
+        self.bytes = 0
+        self.peak_bytes = 0
+
+    def ensure(self, keys: Sequence[tuple[str, ...]]) -> dict[
+        tuple[str, ...], dict[int, torch.Tensor]
+    ]:
+        ordered = list(dict.fromkeys(keys))
+        missing = [key for key in ordered if key and key not in self.cache]
+        if missing:
+            encoded = encode_memory_sets(
+                self.model, self.tokenizer, self.hooks, self.records_by_id,
+                missing, self.maximum_tokens, self.device,
+            )
+            for key in missing:
+                states = encoded[key]
+                self.cache[key] = states
+                self.bytes += _state_bytes(states)
+                self.peak_bytes = max(self.peak_bytes, self.bytes)
+        for key in ordered:
+            if key in self.cache:
+                self.cache.move_to_end(key)
+        protected = set(ordered)
+        while self.bytes > self.maximum_bytes:
+            victim = next(
+                (key for key in self.cache if key and key not in protected), None
+            )
+            if victim is None:
+                break
+            self.bytes -= _state_bytes(self.cache.pop(victim))
+        return self.cache
 
 
 def set_memory_batch(hooks: dict[int, MemoryHook],
@@ -449,14 +499,26 @@ def augment_training_examples(examples: Sequence[MemoryExample], records: Sequen
 
 def train(config: PowConfig, output: Path, steps: int, batch_size: int,
           learning_rate: float, gradient_accumulation: int,
-          optimizer_name: str) -> dict[str, object]:
+          optimizer_name: str,
+          corpus: tuple[list[MemoryRecord], list[MemoryExample]] | None = None,
+          corpus_name: str = "synthetic-english-v1",
+          initial_checkpoint: Path | None = None,
+          augment_examples: bool = True,
+          staged_curriculum: bool = True,
+          memory_cache_bytes: int = 4 << 30) -> dict[str, object]:
     seed_everything(config.seed)
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Memory Expert PoW")
     device = torch.device("cuda:0")
-    records, examples = build_corpus(seed=config.seed)
+    records, examples = corpus or build_corpus(seed=config.seed)
     records_by_id = {record.record_id: record for record in records}
-    train_examples = augment_training_examples(examples, records, config.seed)
+    train_examples = (
+        augment_training_examples(examples, records, config.seed)
+        if augment_examples else
+        [example for example in examples if example.split == "train"]
+    )
+    if not train_examples:
+        raise ValueError("training corpus has no train examples")
     tokenizer, model = load_model(config, device)
     layers = resolve_layers(model)
     layer_indices = tuple(range(0, len(layers), config.injection_every))
@@ -464,6 +526,13 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
         model.config.hidden_size, layer_indices, config.gate_rank,
         config.gate_alpha, config.knowledge_dropout,
     ).to(device)
+    if initial_checkpoint is not None:
+        initial = torch.load(initial_checkpoint, map_location="cpu", weights_only=True)
+        if initial.get("architecture_version") != ARCHITECTURE_VERSION:
+            raise RuntimeError("initial adapter architecture does not match")
+        if tuple(initial["layer_indices"]) != layer_indices:
+            raise RuntimeError("initial adapter layer layout does not match")
+        adapter.load_state_dict(initial["adapter"], strict=True)
     hooks = {
         index: MemoryHook(adapter.adapter(index)) for index in layer_indices
     }
@@ -472,10 +541,9 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
     ]
     started = time.perf_counter()
     try:
-        memory_cache = encode_memory_sets(
+        memory_state_cache = BoundedMemoryStateCache(
             model, tokenizer, hooks, records_by_id,
-            [example.memory_ids for example in train_examples],
-            config.maximum_memory_tokens, device,
+            config.maximum_memory_tokens, device, memory_cache_bytes,
         )
         if optimizer_name == "adamw":
             optimizer = torch.optim.AdamW(
@@ -500,8 +568,15 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
         cursor = 0
         optimizer.zero_grad(set_to_none=True)
         for step in range(steps):
-            current_phase = "utilization" if step < phase_switch else "grounding"
-            pool = utilization_examples if current_phase == "utilization" else grounding_examples
+            if staged_curriculum:
+                current_phase = "utilization" if step < phase_switch else "grounding"
+                pool = (
+                    utilization_examples
+                    if current_phase == "utilization" else grounding_examples
+                )
+            else:
+                current_phase = "joint-grounding"
+                pool = grounding_examples
             if current_phase != phase_name or cursor + batch_size > len(phase_order):
                 phase_order = list(pool)
                 random.shuffle(phase_order)
@@ -514,8 +589,10 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
                 tokenizer.pad_token_id,
                 device,
             )
+            batch_memory_ids = [example.memory_ids for example in batch]
+            memory_cache = memory_state_cache.ensure(batch_memory_ids)
             set_memory_batch(
-                hooks, memory_cache, [example.memory_ids for example in batch],
+                hooks, memory_cache, batch_memory_ids,
                 model.config.hidden_size, device,
             )
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
@@ -563,6 +640,8 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "layer_indices": layer_indices,
             "hidden_size": model.config.hidden_size,
             "corpus_fingerprint": corpus_fingerprint(records),
+            "training_corpus": corpus_name,
+            "initial_checkpoint": str(initial_checkpoint) if initial_checkpoint else None,
             "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
         }
         checkpoint_path = output / "memory-expert.pt"
@@ -578,6 +657,7 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "effective_batch_size": batch_size * gradient_accumulation,
             "learning_rate": learning_rate,
             "optimizer": optimizer_name,
+            "training_corpus": corpus_name,
             "initial_loss": losses[0],
             "final_loss": losses[-1],
             "minimum_loss": min(losses),
@@ -586,6 +666,8 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             ),
             "elapsed_seconds": time.perf_counter() - started,
             "peak_vram_gib": torch.cuda.max_memory_allocated() / (1 << 30),
+            "memory_state_cache_limit_bytes": memory_cache_bytes,
+            "memory_state_cache_peak_bytes": memory_state_cache.peak_bytes,
             "checkpoint": str(checkpoint_path),
         }
         (output / "train-summary.json").write_text(
@@ -625,7 +707,6 @@ def generate(model, tokenizer, hooks: dict[int, MemoryHook],
     attention_mask = torch.ones_like(input_ids)
     past = None
     generated: list[int] = []
-    source_tokens = memory_cache[memory_ids][-1].tolist()
     for _ in range(maximum_new_tokens):
         outputs = model(
             input_ids=input_ids if past is None else input_ids[:, -1:],
@@ -634,16 +715,7 @@ def generate(model, tokenizer, hooks: dict[int, MemoryHook],
             use_cache=True,
             return_dict=True,
         )
-        next_logits = outputs.logits[0, -1].float()
-        copy_candidates = continuation_candidates(
-            generated, source_tokens, tokenizer
-        )
-        if copy_candidates:
-            candidate_ids = torch.tensor(
-                sorted(copy_candidates), dtype=torch.long, device=device
-            )
-            next_logits[candidate_ids] += COPY_CONTINUATION_BIAS
-        token = int(torch.argmax(next_logits).item())
+        token = int(torch.argmax(outputs.logits[0, -1]).item())
         generated.append(token)
         if token == tokenizer.eos_token_id:
             break
@@ -651,34 +723,6 @@ def generate(model, tokenizer, hooks: dict[int, MemoryHook],
         input_ids = torch.cat((input_ids, torch.tensor([[token]], device=device)), dim=1)
         attention_mask = torch.ones_like(input_ids)
     return tokenizer.decode(generated, skip_special_tokens=True).strip()
-
-
-def continuation_candidates(generated: Sequence[int], source: Sequence[int],
-                            tokenizer, maximum_prefix: int = 16) -> set[int]:
-    """Return exact source continuations for the longest meaningful suffix.
-
-    The language model still chooses whether to begin an extractive span. Once
-    it has emitted a meaningful prefix found in admitted memory, this pointer
-    path favors the exact following source token instead of reconstructing
-    identifiers or quotations from a continuous hidden representation.
-    """
-    if not generated or not source:
-        return set()
-    limit = min(maximum_prefix, len(generated), len(source))
-    for width in range(limit, 0, -1):
-        suffix = list(generated[-width:])
-        visible = tokenizer.decode(suffix, skip_special_tokens=True)
-        if len("".join(character for character in visible if character.isalnum())) < 3:
-            continue
-        candidates = {
-            int(source[offset + width])
-            for offset in range(0, len(source) - width)
-            if list(source[offset:offset + width]) == suffix
-        }
-        if candidates:
-            return candidates
-    return set()
-
 
 def score_example(example: MemoryExample, response: str,
                   admitted_ids: Sequence[str],
@@ -712,15 +756,15 @@ def score_example(example: MemoryExample, response: str,
 
 def select_eval_examples(examples: Sequence[MemoryExample], limit: int) -> list[MemoryExample]:
     candidates = [example for example in examples if example.split == "eval"]
-    buckets: dict[str, list[MemoryExample]] = {}
+    buckets: dict[tuple[str, str], list[MemoryExample]] = {}
     for example in candidates:
-        buckets.setdefault(example.kind, []).append(example)
+        buckets.setdefault((example.language, example.kind), []).append(example)
     selected: list[MemoryExample] = []
     while len(selected) < min(limit, len(candidates)):
         changed = False
-        for kind in sorted(buckets):
-            if buckets[kind] and len(selected) < limit:
-                selected.append(buckets[kind].pop(0))
+        for stratum in sorted(buckets):
+            if buckets[stratum] and len(selected) < limit:
+                selected.append(buckets[stratum].pop(0))
                 changed = True
         if not changed:
             break
@@ -728,18 +772,35 @@ def select_eval_examples(examples: Sequence[MemoryExample], limit: int) -> list[
 
 
 def select_causal_examples(examples: Sequence[MemoryExample],
-                           family_limit: int = 3) -> list[list[MemoryExample]]:
+                           family_limit: int = 3,
+                           records_by_id: dict[str, MemoryRecord] | None = None,
+                           ) -> list[list[MemoryExample]]:
     """Select same-question interventions whose only authority is memory."""
     groups: dict[str, list[MemoryExample]] = {}
     for example in examples:
-        if example.split == "train" and example.kind != "unknown":
+        if example.split == "eval" and example.kind != "unknown":
             groups.setdefault(example.question, []).append(example)
     candidates = [
         rows for rows in groups.values()
         if len(rows) >= 2 and len({row.answer for row in rows}) == len(rows)
     ]
     candidates.sort(key=lambda rows: rows[0].example_id)
-    return candidates[:family_limit]
+    if not records_by_id:
+        return candidates[:family_limit]
+    by_language: dict[str, list[list[MemoryExample]]] = {}
+    for family in candidates:
+        language = family[0].language
+        by_language.setdefault(language, []).append(family)
+    selected: list[list[MemoryExample]] = []
+    while len(selected) < min(family_limit, len(candidates)):
+        changed = False
+        for language in sorted(by_language):
+            if by_language[language] and len(selected) < family_limit:
+                selected.append(by_language[language].pop(0))
+                changed = True
+        if not changed:
+            break
+    return selected
 
 
 @torch.inference_mode()
@@ -773,7 +834,9 @@ def candidate_nll(model, tokenizer, hooks: dict[int, MemoryHook],
 
 
 def causal_probe(checkpoint_path: Path, output: Path,
-                 family_limit: int = 3) -> dict[str, object]:
+                 family_limit: int = 3,
+                 corpus: tuple[list[MemoryRecord], list[MemoryExample]] | None = None
+                 ) -> dict[str, object]:
     """Prove that changing only admitted memory changes the exact answer."""
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Memory Expert PoW")
@@ -783,7 +846,7 @@ def causal_probe(checkpoint_path: Path, output: Path,
         raise RuntimeError("checkpoint architecture does not match this runtime")
     config = PowConfig(**raw_checkpoint["config"])
     seed_everything(config.seed)
-    records, examples = build_corpus(seed=config.seed)
+    records, examples = corpus or build_corpus(seed=config.seed)
     if raw_checkpoint["corpus_fingerprint"] != corpus_fingerprint(records):
         raise RuntimeError("checkpoint corpus fingerprint mismatch")
     records_by_id = {record.record_id: record for record in records}
@@ -795,7 +858,7 @@ def causal_probe(checkpoint_path: Path, output: Path,
     handles = [
         layers[index].register_forward_hook(hooks[index]) for index in layer_indices
     ]
-    families = select_causal_examples(examples, family_limit)
+    families = select_causal_examples(examples, family_limit, records_by_id)
     selected = [example for family in families for example in family]
     started = time.perf_counter()
     try:
@@ -904,14 +967,16 @@ def causal_probe(checkpoint_path: Path, output: Path,
             handle.remove()
 
 
-def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int) -> dict[str, object]:
+def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
+             corpus: tuple[list[MemoryRecord], list[MemoryExample]] | None = None
+             ) -> dict[str, object]:
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for the Memory Expert PoW")
     device = torch.device("cuda:0")
     raw_checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
     config = PowConfig(**raw_checkpoint["config"])
     seed_everything(config.seed)
-    records, examples = build_corpus(seed=config.seed)
+    records, examples = corpus or build_corpus(seed=config.seed)
     if raw_checkpoint["corpus_fingerprint"] != corpus_fingerprint(records):
         raise RuntimeError("checkpoint corpus fingerprint mismatch")
     records_by_id = {record.record_id: record for record in records}
@@ -960,8 +1025,13 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int) -> dict
             modes = {
                 "no-memory": (),
                 "oracle-memory": example.memory_ids,
-                "automatic-retrieval": automatic_ids[example.example_id],
             }
+            retrieval_eligible = example.kind != "unknown" and all(
+                records_by_id[record_id].indexable
+                for record_id in example.memory_ids
+            )
+            if retrieval_eligible:
+                modes["automatic-retrieval"] = automatic_ids[example.example_id]
             for mode, memory_ids in modes.items():
                 response = generate(
                     model, tokenizer, hooks, memory_cache, memory_ids, prompt,
@@ -997,10 +1067,11 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int) -> dict
                 "event": "evaluation", "mode": "full-context-ceiling", **scored
             }), flush=True)
 
-        metrics: dict[str, dict[str, float]] = {}
+        metrics: dict[str, dict[str, float | int]] = {}
         for mode, rows in results.items():
             count = max(1, len(rows))
             metrics[mode] = {
+                "examples": len(rows),
                 "answer_accuracy": sum(bool(row["answer_ok"]) for row in rows) / count,
                 "citation_accuracy": sum(bool(row["citation_ok"]) for row in rows) / count,
                 "joint_accuracy": sum(bool(row["passed"]) for row in rows) / count,
@@ -1009,6 +1080,26 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int) -> dict
                 metrics[mode]["retrieval_recall"] = sum(
                     bool(row["retrieval_recall"]) for row in rows
                 ) / count
+        automatic_example_ids = {
+            str(row["example_id"]) for row in results["automatic-retrieval"]
+        }
+        paired_oracle_rows = [
+            row for row in results["oracle-memory"]
+            if str(row["example_id"]) in automatic_example_ids
+        ]
+        paired_count = max(1, len(paired_oracle_rows))
+        metrics["paired-oracle-memory"] = {
+            "examples": len(paired_oracle_rows),
+            "answer_accuracy": sum(
+                bool(row["answer_ok"]) for row in paired_oracle_rows
+            ) / paired_count,
+            "citation_accuracy": sum(
+                bool(row["citation_ok"]) for row in paired_oracle_rows
+            ) / paired_count,
+            "joint_accuracy": sum(
+                bool(row["passed"]) for row in paired_oracle_rows
+            ) / paired_count,
+        }
         unknown_rows = [
             row for row, example in zip(results["oracle-memory"], selected)
             if example.kind == "unknown"
@@ -1033,6 +1124,7 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int) -> dict
         summary = {
             "schema_version": 1,
             "model": config.model,
+            "evaluation_split": "eval",
             "examples": len(selected),
             "metrics": metrics,
             "unknown_oracle_joint_accuracy": unknown_accuracy,

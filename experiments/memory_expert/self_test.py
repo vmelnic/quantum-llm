@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import torch
 import torch.nn as nn
 
-from pow import MemoryExpert, continuation_candidates
+from pow import MemoryExpert
 from synthetic_memory import (
     HashingEmbedder,
     ShardedVectorIndex,
@@ -119,15 +119,6 @@ def main() -> int:
     output.square().mean().backward()
     assert adapter.gate_up.weight.grad is not None
     assert torch.isfinite(output).all()
-
-    tokenizer = SimpleNamespace(
-        decode=lambda tokens, skip_special_tokens=True: "".join(
-            chr(token) for token in tokens
-        )
-    )
-    source = [ord(character) for character in "code NOVA-9526 end"]
-    generated = [ord(character) for character in "NOVA-"]
-    assert continuation_candidates(generated, source, tokenizer) == {ord("9")}
 
     print(json.dumps({
         "records": len(records),

@@ -26,6 +26,7 @@ except ImportError:  # Direct execution on a worker.
 class SearchHit:
     record: KnowledgeRecord
     score: float
+    segment_score: float | None = None
 
 
 class TransformerDenseEncoder:

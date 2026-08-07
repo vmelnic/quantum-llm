@@ -41,6 +41,7 @@ class MemoryExample:
     memory_ids: tuple[str, ...]
     kind: str
     split: str
+    language: str = "en"
 
     @property
     def target(self) -> str:
@@ -281,7 +282,7 @@ def build_corpus(seed: int = 20260807, train_worlds: int = 48,
     return records, examples
 
 
-_TOKEN = re.compile(r"[a-z0-9]+", re.IGNORECASE)
+_TOKEN = re.compile(r"\w+", re.IGNORECASE | re.UNICODE)
 
 
 class HashingEmbedder:

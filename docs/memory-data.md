@@ -103,16 +103,22 @@ Five Romanian questions targeted five different articles. With top-1 admission:
 |---|---:|
 | correct article at rank 1 | 5/5 |
 | authorized evidence rendered from source | 5/5 |
-| strict generated answer | 2/5 |
+| strict generated answer in the first English-adapter run | 2/5 |
 | model-generated citation ID authorized | 0/5 |
 | complete five-query run | 30.18 s |
 
-The two exact answers were the general age of criminal responsibility and the
-base imprisonment range for murder. The adapter produced incorrect or
-incomplete answers for purpose, self-defence conditions, and retroactivity.
-Top-2 admission did not improve strict accuracy, so the failure is not a missed
-retrieval or lack of source text. It is a capability/generalization failure of
-the existing English synthetic adapter.
+That historical report used the original English synthetic adapter. A later
+all-layer multilingual capability attempt retained 5/5 evidence retrieval but
+reached 0/5 strict text matches; manual semantic review found only the age-of-
+responsibility answer clearly correct. The latter corpus was subsequently
+rejected because patterned keys, a closed answer vocabulary, correlated
+citations, and a train-split causal probe made its internal scores invalid as a
+generalization claim.
+
+The report contract now calls the deterministic field
+`strict_text_match_rate` instead of `answer_accuracy`. It checks configured
+literal fragments and must not be interpreted as semantic correctness. Reports
+explicitly require manual semantic review.
 
 Model-emitted IDs such as synthetic `K...` identifiers are retained only as a
 diagnostic and never authorize data. Citation IDs and quotes are rendered by
@@ -146,15 +152,16 @@ Then run each durable stage explicitly:
 
 Questions are local, unversioned JSONL under
 `work/memory-data/<dataset>/questions.jsonl`. Each row has a question plus
-optional expected answer fragments and section regexes. Source data, generated
+optional expected answer fragments and section regexes. These expectations
+produce a strict text match, not a semantic judge. Source data, generated
 indexes, reports, and machine paths remain ignored by Git.
 
 ## Next gate
 
 Do not train on each document and do not add more legal facts to weights. The
-next step is one reusable capability adapter trained on counterfactual,
-extractive memory use in Romanian, Russian, and English, with arbitrary
-citation shapes. It must be trained independently of the evaluated legal text.
+next step is the reusable natural capability run described in
+[External Memory Expert](memory-expert.md). It is trained on pinned XQuAD
+Romanian/Russian/English examples and never on this legal document.
 
 It passes only if the same already-ingested document reaches all of these:
 
