@@ -3,8 +3,6 @@ from __future__ import annotations
 import json
 import tempfile
 from pathlib import Path
-from types import SimpleNamespace
-
 import torch
 import torch.nn as nn
 

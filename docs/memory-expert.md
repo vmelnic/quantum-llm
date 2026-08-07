@@ -77,6 +77,9 @@ The current corpus is generated from the pinned `google/xquad` revision
 - natural answers, opaque IDs, distractor records, and absent-evidence cases;
 - duplicate questions and their translations are assigned atomically to one
   split, preventing train/eval leakage;
+- answer-bearing passages are bounded around exact source spans, and a
+  tokenizer-aware preflight requires every answer and citation to remain
+  visible after the configured 384-token truncation;
 - the evaluated legal questions are forbidden training material.
 
 The loader rejects the old patterned keys, closed-span markers, citation IDs in
@@ -86,7 +89,8 @@ coverage, and single-record-only corpora.
 Training mixes original, counterfactual, and abstention examples from the first
 optimizer phase. The causal probe now uses eval families only. Automatic
 retrieval is reported only on eligible natural records and is compared with an
-oracle score over the exact same example IDs.
+oracle score over the exact same example IDs. Retrieval recall follows the
+authoritative citation, not the deliberately injected distractor record.
 
 ## Bounded execution
 

@@ -295,6 +295,41 @@ def supervised_tokens(tokenizer, example: MemoryExample) -> tuple[list[int], lis
     return tokens, labels
 
 
+def validate_visible_evidence(tokenizer, examples: Sequence[MemoryExample],
+                              records_by_id: dict[str, MemoryRecord],
+                              maximum_tokens: int,
+                              batch_size: int = 64) -> dict[str, int]:
+    """Require every answer and citation to survive the real memory truncation."""
+    answerable = [example for example in examples if example.kind != "unknown"]
+    failures: list[str] = []
+    for start in range(0, len(answerable), batch_size):
+        batch = answerable[start:start + batch_size]
+        rendered = [
+            format_memory([records_by_id[item] for item in example.memory_ids])
+            for example in batch
+        ]
+        encoded = tokenizer(
+            rendered, truncation=True, max_length=maximum_tokens,
+            add_special_tokens=True,
+        )["input_ids"]
+        for example, token_ids in zip(batch, encoded):
+            visible = tokenizer.decode(token_ids, skip_special_tokens=True)
+            answer_visible = normalized_contains(visible, example.answer)
+            citations_visible = all(
+                citation.casefold() in visible.casefold()
+                for citation in example.citations
+            )
+            if not answer_visible or not citations_visible:
+                failures.append(example.example_id)
+    if failures:
+        sample = ", ".join(failures[:8])
+        raise ValueError(
+            f"{len(failures)} answerable examples lose evidence under "
+            f"maximum_memory_tokens={maximum_tokens}; examples: {sample}"
+        )
+    return {"answerable_examples": len(answerable), "failures": 0}
+
+
 def pad_token_batches(items: Sequence[tuple[list[int], list[int]]], pad_id: int,
                       device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     length = max(len(tokens) for tokens, _ in items)
@@ -520,6 +555,9 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
     if not train_examples:
         raise ValueError("training corpus has no train examples")
     tokenizer, model = load_model(config, device)
+    evidence_validation = validate_visible_evidence(
+        tokenizer, examples, records_by_id, config.maximum_memory_tokens
+    )
     layers = resolve_layers(model)
     layer_indices = tuple(range(0, len(layers), config.injection_every))
     adapter = MemoryExpertStack(
@@ -641,6 +679,7 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "hidden_size": model.config.hidden_size,
             "corpus_fingerprint": corpus_fingerprint(records),
             "training_corpus": corpus_name,
+            "visible_evidence_validation": evidence_validation,
             "initial_checkpoint": str(initial_checkpoint) if initial_checkpoint else None,
             "adapter": {key: value.detach().cpu() for key, value in adapter.state_dict().items()},
         }
@@ -658,6 +697,7 @@ def train(config: PowConfig, output: Path, steps: int, batch_size: int,
             "learning_rate": learning_rate,
             "optimizer": optimizer_name,
             "training_corpus": corpus_name,
+            "visible_evidence_validation": evidence_validation,
             "initial_loss": losses[0],
             "final_loss": losses[-1],
             "minimum_loss": min(losses),
@@ -1041,9 +1081,13 @@ def evaluate(checkpoint_path: Path, output: Path, evaluation_limit: int,
                 scored = score_example(example, response, memory_ids, records_by_id)
                 scored["admitted_memory_ids"] = memory_ids
                 if mode == "automatic-retrieval":
-                    scored["retrieval_recall"] = (
-                        not example.memory_ids or
-                        set(example.memory_ids).issubset(set(memory_ids))
+                    expected_evidence = set(example.citations)
+                    retrieved_evidence = {
+                        records_by_id[record_id].public_id
+                        for record_id in memory_ids
+                    }
+                    scored["retrieval_recall"] = expected_evidence.issubset(
+                        retrieved_evidence
                     )
                 results[mode].append(scored)
                 print(json.dumps({"event": "evaluation", "mode": mode, **scored}), flush=True)

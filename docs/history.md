@@ -191,3 +191,9 @@ absent-evidence cases, atomic duplicate/translation splits, an eval-only causal
 probe, paired retrieval/oracle reporting, and a bounded lazy layer-state cache.
 Until this replacement passes both its natural eval and the untouched legal
 test, the project claims only channel causality—not generic external knowledge.
+
+A first replacement run was stopped before completion when review found that
+384-token memory truncation could hide the answer in 162 examples. The data
+builder now emits bounded natural answer-centered passages and the runtime
+preflight verifies the post-tokenization representation. The corrected corpus
+exposes answer and citation evidence for 7,140/7,140 answerable examples.

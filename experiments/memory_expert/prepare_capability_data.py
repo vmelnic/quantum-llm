@@ -94,6 +94,26 @@ def _counterfactual_answer(
     return rng.choice(candidates)
 
 
+def _answer_window(context: str, start: int, answer_length: int,
+                   flank_characters: int = 220) -> tuple[str, int]:
+    """Select a natural bounded passage while preserving the exact answer span."""
+    left = max(0, start - flank_characters)
+    right = min(len(context), start + answer_length + flank_characters)
+    if left:
+        boundary = context.find(" ", left, min(start, left + 48))
+        if boundary >= 0:
+            left = boundary + 1
+    if right < len(context):
+        boundary = context.rfind(" ", max(start + answer_length, right - 48), right)
+        if boundary >= 0:
+            right = boundary
+    window = context[left:right].strip()
+    local_start = window.find(context[start:start + answer_length])
+    if local_start < 0:
+        raise ValueError("answer window lost the source span")
+    return window, local_start
+
+
 def _record(
     language: str,
     source_id: str,
@@ -173,22 +193,26 @@ def build(output: Path, seed: int) -> dict[str, object]:
 
     output_rows: list[dict[str, object]] = []
     records_for_distractors: dict[tuple[str, str], list[dict[str, object]]] = defaultdict(list)
-    prepared: list[tuple[str, str, dict[str, object], str, int, str]] = []
+    prepared: list[tuple[str, str, dict[str, object], str, int, str, str]] = []
     for language, rows in by_language.items():
         for row in rows:
             source_id = str(row["id"])
             split = source_splits[source_id]
             answer, start = _answer(row)
+            context, local_start = _answer_window(
+                str(row["context"]), start, len(answer)
+            )
             citation_id = _opaque_id("C", f"citation:{language}:{source_id}")
             original = _record(
-                language, source_id, 0, citation_id, str(row["context"]), True
+                language, source_id, 0, citation_id, context, True
             )
             records_for_distractors[(language, split)].append(original)
-            prepared.append((language, split, row, answer, start, citation_id))
+            prepared.append((
+                language, split, row, answer, local_start, citation_id, context
+            ))
 
-    for language, split, row, answer, start, citation_id in prepared:
+    for language, split, row, answer, start, citation_id, context in prepared:
         source_id = str(row["id"])
-        context = str(row["context"])
         question = str(row["question"]).strip()
         family_id = _opaque_id("F", f"family:{language}:{source_id}")
         original = _record(language, source_id, 0, citation_id, context, True)
@@ -202,7 +226,11 @@ def build(output: Path, seed: int) -> dict[str, object]:
         distractors = [
             item for item in records_for_distractors[(language, split)]
             if item["citation_id"] != citation_id
+            and answer.casefold() not in str(item["text"]).casefold()
+            and alternate.casefold() not in str(item["text"]).casefold()
         ]
+        if not distractors:
+            raise ValueError("cannot construct a non-answering distractor")
         distractor = rng.choice(distractors)
         for variant, target, target_answer, kind in (
             (0, original, answer, "natural"),
