@@ -1,21 +1,46 @@
 # Memory KV-Attach v1 — prototype design
 
-Status: milestone 1 validated on 2026-08-08 (artifact
-`work/memory-kv-attach-v1/kv-attach.json`, schema 5). With the frozen
-Qwen3-4B and zero trained parameters, the Nacre OOD dossier admitted as an
-attached K/V prefix reached 8/8 strict answers and 7/8 joint with sources
-(raw prefix: 8/8 and 6/8), versus 8/8 joint for the full-context control;
-the split-vs-joint identity check is exact in float32 (argmax agreement
-1.0). Caveat recorded: iterations v1–v5 of the harness carried a wrong
+Status: milestones 1 and 2 validated on 2026-08-08.
+
+Milestone 1 (frozen, zero trained parameters; artifact
+`work/memory-kv-attach-v1/kv-attach.json`, schema 5): with the Nacre OOD
+dossier admitted as an attached K/V prefix, frozen Qwen3-4B reached 8/8
+strict answers and 7/8 joint (synthetic-turn wrap), versus 8/8 joint for
+the full-context control; the split-vs-joint identity check is exact in
+float32 (argmax agreement 1.0). Romanian criminal code with retrieval
+selection (`query-report-top2.json`): 4/5 strict answers, 3/5 joint.
+Caveat recorded: iterations v1–v5 of the harness carried a wrong
 `past_length` (KV-head count instead of sequence length), so every
 behavioural conclusion from those runs was retracted; only v6 numbers are
-valid. The no-memory arm still hallucinates 2/8, which is the target of
-milestone 2 (zero-init gates, learned null K/V, abstention training). This
-document follows the closure of the
-rank-16 latent-gate direction (v4/v5, see `memory-expert.md` and
-`history.md`). It defines the smallest architecture that tests whether a
-frozen-or-lightly-tuned Qwen3-4B can read attached memory through its **own
-native attention**, instead of through a separately trained read-out gate.
+valid.
+
+Milestone 2 (LoRA discipline training, `kv_attach_train.py`, checkpoint
+`kv-attach-lora-v2`): a 2.4M-parameter LoRA on the attention projections,
+trained once on ConflictQA only (3 epochs, 1,884 optimizer updates, best
+eval NLL 3.7e-05), with the memory prefill always running LoRA-disabled
+(native frozen K/V at training and serving). The answer contract is a
+slot-level pointer (`ANSWER: @slot`); the authority plane renders the
+record verbatim. Sentence-level pointing was tried first (v1 checkpoint)
+and proved fragile across document structures — headings become
+"sentence 0" — so v2 points at the record. Unknown rows are additionally
+trained with an empty prefix (50%) so abstention covers the no-memory case.
+Results: Nacre 6/8 joint with **8/8 correct abstentions** (frozen: 7/8
+joint, 6/8 abstentions); Romanian 4/5 joint and semantically 5/5 (the one
+strict miss is an orthography mismatch in the question file, not the
+model), with **5/5 abstentions** and no nonexistent slots cited. The two
+Nacre misses both point at record slot 4, which never occurs in the
+≤4-record ConflictQA corpus — a corpus limit, not a mechanism limit;
+fix via ≥5-record training rows or k≤4 at serving.
+
+Net: the frozen native-attention read transfers across languages and
+invented content with no training, and the trained discipline (abstention,
+valid slots, memory over parametric knowledge) transfers out-of-distribution
+— the two known regressions have identified, repairable causes. The
+rank-16 latent-gate direction (v4/v5) remains closed; KV-attach dominates
+it externally with ~1000× fewer trained parameters and no custom
+attention. This document follows the closure of that direction (see
+`memory-expert.md` and `history.md`). The architecture below is what
+milestones 1–2 validated.
 
 ## Why this pivot
 
@@ -61,44 +86,44 @@ Query plane (per query):
      information (the v4/v5 missing-RoPE defect cannot recur);
    - attention is causal within the query; all query positions may attend to
      all memory positions.
-4. Memory contribution is separated from self-attention contribution (two
-   partial attentions sharing the same softmax denominator, computed
-   explicitly) and injected as
-   `hidden += g_i * O(attn_over_memory)`, where `g_i` is a per-layer learned
-   scalar gate **initialized at 0** — at initialization the model is exactly
-   frozen Qwen, so training starts from correct base behavior instead of
-   corrupting it.
-5. A learned **null key/value pair per layer** is always present in the
-   memory segment and never masked. Attention mass on null is a genuine
-   no-op: the model can natively decline memory, fixing the forced-attention
-   defect. Abstention for unknown questions is trained against this path.
+4. As built, no custom attention was needed: the attached prefix is simply
+   the K/V cache of the prefilled records and the model's own attention
+   reads it natively (this is what milestone 1 validated). The split
+   softmax/gate machinery originally planned here was dropped — gates can
+   only scale memory contribution, while the observed failures were
+   output-distribution behaviours.
+5. Abstention is trained through the answer contract, not through a null
+   key: unknown rows teach "memory attached but irrelevant → abstain", and
+   50% of them are additionally trained with an empty prefix so "no memory
+   at all → abstain" is covered as well.
 
-Trained parameters, variant A (frozen Qwen): 36 gate scalars + 36 null K/V
-pairs (~0.2M parameters). Variant B (fallback): add LoRA on attention
-projections if gates alone cannot learn selection/abstention — still a
-one-time capability training, no per-ingest training, satisfying the project
-constraints.
+Trained parameters (as built): a rank-16 LoRA (alpha 32) on q/k/v/o of all
+36 layers, ~2.4M parameters, trained once on ConflictQA. The memory prefill
+always runs with LoRA disabled, so attached records keep native frozen K/V
+at training and at serving; the adapter only learns to read and to follow
+the contract. No per-ingest training, satisfying the project constraints.
 
-Answer contract: reuse the v5 pointer contract — the model emits
-`ANSWER: @slot:phrase`, and the authority plane renders the phrase verbatim
-from the admitted record. Citations are never generated by the model. The
-v5 data pipeline (`prepare_capability_data.py`, schema 2) is reused as-is.
+Answer contract: slot-level pointer — the model emits `ANSWER: @slot` and
+the authority plane renders the whole record verbatim. Citations are never
+generated by the model. (A sentence-level `@slot:sentence` pointer was
+tried first and abandoned: sentence indexing is corpus-structure-dependent
+and did not transfer; the v5 data pipeline, schema 2, is reused as-is.)
 
-## What changes in code
+## What changed in code (as built)
 
-- new `experiments/memory_expert/kv_attach.py`: per-layer K/V capture during
-  record prefill, concatenated-attention forward with the split
-  memory/self softmax, zero-init gates, always-available null K/V;
-- `pow.py` / `real_query.py`: the memory branch calls `kv_attach` instead of
-  the rank-16 gate residual; record formatting stays `MEMORY_RECORD_FORMAT`
-  compatible; pointer rendering and authority-plane logic unchanged;
-- `dense_index.py`: hidden-state persistence is dropped; text + embedding
-  only (kept backward-readable for existing datasets);
-- `capability.py`: training loop trains gates/nulls (variant A) or
-  gates/nulls + LoRA (variant B); checkpoint format versioned separately;
-- `mechanism_trace.py` / `mechanism_intervene.py` are extended to the new
-  injection point so this run does not repeat the v4 audit gap: attention
-  mass on memory vs null vs self, per layer, is measured from day one.
+- `experiments/memory_expert/kv_attach.py`: memory prefix prefill with
+  per-layer K/V capture, cache-backed generation, synthetic-turn wrapping,
+  retrieval-selection mode, pointer rendering, identity check, Nacre and
+  Romanian validation arms, optional LoRA loading;
+- `experiments/memory_expert/kv_attach_train.py`: manual LoRA (no new
+  dependencies), frozen memory prefill with LoRA disabled, empty-memory
+  abstention augmentation, deterministic epochs, best checkpoint by eval
+  NLL, progress logging with ETA;
+- `synthetic_memory.py`: slot-level pointer target and parser (legacy
+  sentence pointers remain parseable); `pow.py` / `real_query.py`: pointer
+  rendering updated accordingly;
+- `ops/memory-data.sh` + `ops/windows/Invoke-MemoryKvAttach{,Train}.ps1`:
+  the `kv-attach` and `kv-attach-train` actions.
 
 ## Training data
 

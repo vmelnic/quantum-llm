@@ -19,6 +19,7 @@ in milestone 2; nothing here is trained.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import re
 import time
@@ -30,10 +31,14 @@ from transformers import DynamicCache
 
 try:
     from .pow import chat_prompt
-    from .synthetic_memory import normalized_contains, parse_response
+    from .synthetic_memory import (
+        normalized_contains, parse_pointer, parse_response, split_sentences,
+    )
 except ImportError:  # Direct script execution on the Windows worker.
     from pow import chat_prompt
-    from synthetic_memory import normalized_contains, parse_response
+    from synthetic_memory import (
+        normalized_contains, parse_pointer, parse_response, split_sentences,
+    )
 
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -202,22 +207,32 @@ def encode_memory(tokenizer, record_texts: Sequence[str],
 
 @torch.inference_mode()
 def prefill_memory(model, memory_ids: Sequence[int],
-                   device: torch.device) -> tuple[tuple[tuple[torch.Tensor, ...], ...], int]:
+                   device: torch.device,
+                   lora_modules=None) -> tuple[tuple[tuple[torch.Tensor, ...], ...], int]:
     """Run the memory prefix once and keep per-layer (key, value) tensors.
 
     Keys carry contiguous RoPE positions 0..M-1, exactly as if the records
     had been read as a text prefix. Tensors are stored in legacy cache form
     so every query can rebuild a fresh DynamicCache without mutation risk.
+    When a LoRA adapter is loaded, prefill always runs with it disabled:
+    attached records keep their native frozen K/V, at serving as in training.
     """
     if not memory_ids:
         return tuple(), 0
     input_ids = torch.tensor([memory_ids], dtype=torch.long, device=device)
-    outputs = model(
-        input_ids=input_ids,
-        attention_mask=torch.ones_like(input_ids),
-        use_cache=True,
-        return_dict=True,
-    )
+    if lora_modules:
+        # Local import: kv_attach_train already imports this module.
+        from kv_attach_train import lora_disabled
+        guard_context = lora_disabled(lora_modules)
+    else:
+        guard_context = contextlib.nullcontext()
+    with guard_context:
+        outputs = model(
+            input_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
+            use_cache=True,
+            return_dict=True,
+        )
     past = outputs.past_key_values
     if hasattr(past, "layers"):  # transformers layered-cache API
         states = tuple((layer.keys, layer.values) for layer in past.layers)
@@ -311,9 +326,25 @@ def identity_check(model, tokenizer, memory_ids: Sequence[int],
 def score_case(row: dict[str, object], records: Sequence[dict[str, object]],
                response: str) -> dict[str, object]:
     answer, slots = parse_response(response)
+    # Pointer contract: the authority plane renders the pointed sentence
+    # verbatim; scoring checks the expected literal against the rendering.
+    rendered = None
+    pointer = parse_pointer(answer)
+    if pointer is not None:
+        slot, sentence_index = pointer
+        if 0 <= slot < len(records):
+            text = str(records[slot].get("text", ""))
+            if sentence_index is None:
+                # Slot-level pointer: the authority plane renders the record.
+                rendered = text
+            else:
+                sentences = split_sentences(text)
+                if 0 <= sentence_index < len(sentences):
+                    rendered = sentences[sentence_index]
+    answer_text = rendered if rendered is not None else answer
     expected_answers = [str(item) for item in row.get("expected_answers", [])]
     answer_strict = any(
-        normalized_contains(answer, expected) for expected in expected_answers
+        normalized_contains(answer_text, expected) for expected in expected_answers
     )
     wanted_slots = expected_slot(records, row.get("expected_sections", []))
     return {
@@ -321,6 +352,7 @@ def score_case(row: dict[str, object], records: Sequence[dict[str, object]],
         "question": row.get("question"),
         "response": response,
         "parsed_answer": answer,
+        "rendered_answer": rendered,
         "parsed_source_slots": slots,
         "expected_slots": wanted_slots,
         "answer_strict": answer_strict,
@@ -355,6 +387,9 @@ def main() -> int:
     # question then attaches only its retrieved records (the real serving
     # path for corpora too large to attach whole).
     parser.add_argument("--selection", type=Path, default=None)
+    # Optional trained LoRA checkpoint from kv_attach_train.py. The memory
+    # prefill keeps LoRA disabled; only the query side uses it.
+    parser.add_argument("--lora", type=Path, default=None)
     # float32 makes the identity check decisive; bf16 split-vs-joint logits
     # differ by accumulation order and obscure real plumbing bugs.
     parser.add_argument("--dtype", choices=("bfloat16", "float32"),
@@ -368,6 +403,15 @@ def main() -> int:
     tokenizer, model = load_frozen_model(
         arguments.model, arguments.revision, dtype, device
     )
+    lora_modules = None
+    if arguments.lora is not None:
+        from kv_attach_train import load_lora_into
+        checkpoint = torch.load(arguments.lora, map_location="cpu", weights_only=True)
+        if checkpoint.get("architecture_version") not in (
+            "kv-attach-lora-v1", "kv-attach-lora-v2"
+        ):
+            raise RuntimeError("unrecognized LoRA checkpoint architecture")
+        lora_modules = load_lora_into(model, checkpoint, device)
 
     records = load_ingest_records(arguments.ingest)
     questions = read_questions(arguments.questions)
@@ -394,7 +438,7 @@ def main() -> int:
                 tokenizer, selected_texts, question
             )
             prefix_ids = prefix_ids[:arguments.maximum_memory_tokens]
-            states, _ = prefill_memory(model, prefix_ids, device)
+            states, _ = prefill_memory(model, prefix_ids, device, lora_modules)
             attached = generate(
                 model, tokenizer, query_ids,
                 states, arguments.maximum_new_tokens, device,
@@ -430,7 +474,9 @@ def main() -> int:
         tokenizer, record_texts, arguments.maximum_memory_tokens,
         header=MEMORY_HEADER,
     )
-    memory_states, memory_tokens = prefill_memory(model, memory_ids, device)
+    memory_states, memory_tokens = prefill_memory(
+        model, memory_ids, device, lora_modules
+    )
 
     # Synthetic-turn arm: full conversation rendered once at token level and
     # split before the real question turn; the prefix is question-independent.
@@ -438,16 +484,22 @@ def main() -> int:
         tokenizer, record_texts, str(questions[0]["question"])
     )
     turn_prefix_ids = turn_prefix_ids[:arguments.maximum_memory_tokens]
-    turn_states, turn_memory_tokens = prefill_memory(model, turn_prefix_ids, device)
+    turn_states, turn_memory_tokens = prefill_memory(
+        model, turn_prefix_ids, device, lora_modules
+    )
     turn_token_audit = tokenizer.convert_ids_to_tokens(
         turn_prefix_ids[-8:] + turn_query_ids[:16]
     )
 
     probe_question = str(questions[0]["question"])
-    identity = identity_check(
-        model, tokenizer, memory_ids, attach_prompt(tokenizer, probe_question),
-        device,
-    )
+    identity = None
+    if lora_modules is None:
+        # The identity check compares against a joint forward, which is only
+        # meaningful for the purely frozen model.
+        identity = identity_check(
+            model, tokenizer, memory_ids,
+            attach_prompt(tokenizer, probe_question), device,
+        )
 
     control_context = "\n\n".join(
         f"source {slot}:\n{text}" for slot, text in enumerate(record_texts)
@@ -487,6 +539,7 @@ def main() -> int:
         "model": arguments.model,
         "revision": arguments.revision,
         "dtype": arguments.dtype,
+        "lora": str(arguments.lora) if arguments.lora else None,
         "memory_header": MEMORY_HEADER,
         "turn_token_audit": turn_token_audit,
         "records": len(records),
@@ -502,7 +555,8 @@ def main() -> int:
     arguments.output.write_text(
         json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8"
     )
-    print(json.dumps(artifact["identity"]))
+    if identity is not None:
+        print(json.dumps(identity))
     print(json.dumps(artifact["summary"], indent=2))
     return 0
 

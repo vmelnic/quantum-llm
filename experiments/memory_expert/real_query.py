@@ -226,18 +226,22 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
             hit_records = [hit.record for hit in hits]
             pointer = parse_pointer(answer)
             if pointer is not None:
-                # Pointer contract: the authority plane resolves the
-                # (slot, sentence) reference against the exact admitted memory
-                # text and renders the verbatim sentence. Unresolvable
-                # pointers fail closed (the answer stays the raw pointer).
+                # Pointer contract: the authority plane resolves the pointer
+                # against the exact admitted memory text. Slot-level pointers
+                # render the whole record; legacy `@slot:sentence` pointers
+                # render the pointed sentence. Unresolvable pointers fail
+                # closed (the answer stays the raw pointer).
                 slot, sentence_index = pointer
                 if 0 <= slot < len(hit_records):
                     admitted_text = as_memory_record(
                         hit_records[slot], memory_record_format
                     ).text
-                    sentences = split_sentences(admitted_text)
-                    if 0 <= sentence_index < len(sentences):
-                        answer = sentences[sentence_index]
+                    if sentence_index is None:
+                        answer = admitted_text
+                    else:
+                        sentences = split_sentences(admitted_text)
+                        if 0 <= sentence_index < len(sentences):
+                            answer = sentences[sentence_index]
             model_sources_authorized = (
                 bool(model_source_slots)
                 and len(set(model_source_slots)) == len(model_source_slots)

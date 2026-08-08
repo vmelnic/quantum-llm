@@ -20,15 +20,21 @@ try:
 except ImportError:  # Direct execution on a worker.
     from data_contract import split_sentences
 
-_POINTER = re.compile(r"@(\d+):(\d+)")
+_POINTER = re.compile(r"@(\d+)(?::(\d+))?")
 
 
-def parse_pointer(answer: str) -> tuple[int, int] | None:
-    """Parse an `@slot:sentence` pointer answer; None for prose answers."""
+def parse_pointer(answer: str) -> tuple[int, int | None] | None:
+    """Parse an `@slot` (or legacy `@slot:sentence`) pointer; None for prose.
+
+    The slot-level form is the current contract: the authority plane renders
+    the whole admitted record. The sentence form remains parseable for the
+    historical v5 checkpoints only.
+    """
     match = _POINTER.fullmatch(answer.strip())
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2))
+    sentence = match.group(2)
+    return int(match.group(1)), int(sentence) if sentence is not None else None
 
 
 @dataclass(frozen=True)
@@ -61,8 +67,10 @@ class MemoryExample:
     source_slots: tuple[int, ...] = ()
     answer_support: str = "extractive"
     # (slot, sentence_index) into the admitted record text. When set, the
-    # supervised target is a pointer and the authority plane renders the
-    # verbatim sentence; the model never generates literals.
+    # supervised target is a slot-level pointer and the authority plane
+    # renders the whole record verbatim; the model never generates literals.
+    # Sentence-level pointing proved fragile across document structures
+    # (headings become "sentence 0"), so the pointer is the slot only.
     answer_span: tuple[int, int] | None = None
 
     @property
@@ -70,8 +78,8 @@ class MemoryExample:
         sources = ",".join(str(slot) for slot in self.source_slots) \
             if self.source_slots else "NONE"
         if self.answer_span is not None:
-            slot, sentence = self.answer_span
-            return f"ANSWER: @{slot}:{sentence}\nSOURCES: {sources}"
+            slot, _sentence = self.answer_span
+            return f"ANSWER: @{slot}\nSOURCES: {sources}"
         return f"ANSWER: {self.answer}\nSOURCES: {sources}"
 
 

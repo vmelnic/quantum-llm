@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$DatasetName,
     [string]$OutputName = "memory-kv-attach-v1",
     [string]$Selection = "",
+    [string]$Lora = "",
     [string]$ModelId = "Qwen/Qwen3-4B",
     [string]$Revision = "1cfa9a7208912126459214e8b04321603b3df60c",
     [int]$MaximumMemoryTokens = 768,
@@ -55,6 +56,15 @@ if ($Selection -ne "") {
         throw "Required Memory KV-Attach selection artifact is missing: $selectionPath"
     }
     $selectionArguments = @("--selection", $selectionPath)
+}
+if ($Lora -ne "") {
+    $loraPath = if ([System.IO.Path]::IsPathRooted($Lora)) {
+        $Lora
+    } else { Join-Path $script:RepoRoot $Lora }
+    if (-not (Test-Path -LiteralPath $loraPath -PathType Leaf)) {
+        throw "Required Memory KV-Attach LoRA checkpoint is missing: $loraPath"
+    }
+    $selectionArguments += @("--lora", $loraPath)
 }
 & $python $script --model $ModelId --revision $Revision `
     --ingest $ingest --questions $questions --output $output --device cuda `

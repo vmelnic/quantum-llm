@@ -205,12 +205,32 @@ case "${action}" in
     ;;
   kv-attach)
     sync_data
-    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryKvAttach.ps1 \
+    kv_attach_args=(Invoke-MemoryKvAttach.ps1 \
       -DatasetName "${dataset_name}" \
       -OutputName "${MEMORY_KV_ATTACH_OUTPUT_NAME:-memory-kv-attach-v1}" \
-      -Selection "${MEMORY_KV_ATTACH_SELECTION:-}" \
       -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
-      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}"
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}")
+    # Empty parameter values do not survive the ssh/cmd/PowerShell chain.
+    if [[ -n "${MEMORY_KV_ATTACH_SELECTION:-}" ]]; then
+      kv_attach_args+=(-Selection "${MEMORY_KV_ATTACH_SELECTION}")
+    fi
+    if [[ -n "${MEMORY_KV_ATTACH_LORA:-}" ]]; then
+      kv_attach_args+=(-Lora "${MEMORY_KV_ATTACH_LORA}")
+    fi
+    "${script_dir}/run-on-windows-host.sh" "${kv_attach_args[@]}"
+    ;;
+  kv-attach-train)
+    sync_capability_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryKvAttachTrain.ps1 \
+      -Corpus "${remote_capability_corpus}" \
+      -OutputName "${MEMORY_KV_ATTACH_TRAIN_OUTPUT_NAME:-memory-kv-attach-lora-v2}" \
+      -Rank "${MEMORY_KV_ATTACH_LORA_RANK:-16}" \
+      -Alpha "${MEMORY_KV_ATTACH_LORA_ALPHA:-32}" \
+      -Epochs "${MEMORY_KV_ATTACH_EPOCHS:-3}" \
+      -Accumulation "${MEMORY_KV_ATTACH_ACCUMULATION:-16}" \
+      -LearningRate "${MEMORY_KV_ATTACH_LEARNING_RATE:-0.0002}" \
+      -EvalLimit "${MEMORY_KV_ATTACH_EVAL_LIMIT:-128}" \
+      -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}"
     ;;
   index|query|control|status|selftest)
     remote_arguments=(Invoke-MemoryData.ps1 \
@@ -229,7 +249,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|mechanism-probe|mechanism-trace|mechanism-intervene|mechanism-span-rank|kv-attach|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|mechanism-probe|mechanism-trace|mechanism-intervene|mechanism-span-rank|kv-attach|kv-attach-train|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac

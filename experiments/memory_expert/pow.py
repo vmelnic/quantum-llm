@@ -53,14 +53,21 @@ except ImportError:  # Direct script execution on the Windows worker.
 
 def render_pointer_answer(parsed_answer: object, example: MemoryExample,
                           records_by_id: dict[str, MemoryRecord]) -> str | None:
-    """Resolve an `@slot:sentence` pointer against the admitted records."""
+    """Resolve a pointer against the admitted records.
+
+    Slot-level pointers render the whole record; legacy `@slot:sentence`
+    pointers render the pointed sentence.
+    """
     pointer = parse_pointer(str(parsed_answer))
     if pointer is None:
         return None
     slot, sentence_index = pointer
     if not 0 <= slot < len(example.memory_ids):
         return None
-    sentences = split_sentences(records_by_id[example.memory_ids[slot]].text)
+    text = records_by_id[example.memory_ids[slot]].text
+    if sentence_index is None:
+        return text
+    sentences = split_sentences(text)
     if not 0 <= sentence_index < len(sentences):
         return None
     return sentences[sentence_index]
