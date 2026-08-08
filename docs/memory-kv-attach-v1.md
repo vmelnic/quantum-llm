@@ -42,6 +42,23 @@ attention. This document follows the closure of that direction (see
 `memory-expert.md` and `history.md`). The architecture below is what
 milestones 1–2 validated.
 
+## Known issues (deferred, fixes agreed)
+
+1. **Slot 4 unreachable.** ConflictQA admits at most 4 records per example,
+   so the v2 adapter never saw `@4` as a target and maps record-5 questions
+   to the nearest plausible slot (both Nacre misses). Fix: training-time
+   augmentation in `kv_attach_train.py` — pad examples with 1–2 distractor
+   records drawn from other families so the gold record lands on slots
+   4–5 — then retrain (~3 h). The serving-side alternative (cap
+   `top_k <= 4`) hides the bug but blocks larger k for big corpora.
+2. **Romanian orthography mismatch in the test file.** `questions.jsonl`
+   expects `săvârşirii` (new orthography) while the 2009 law text contains
+   `săvîrşirii` (old); NFKD normalization maps them to different base
+   letters, so a verbatim-correct answer fails strict matching. Fix: list
+   both orthography variants in `expected_answers` (the scorer already
+   accepts any-of), then re-score the existing v2 artifact locally — no
+   GPU rerun needed.
+
 ## Why this pivot
 
 The v4/v5 mechanism audits established:
