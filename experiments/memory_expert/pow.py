@@ -437,8 +437,9 @@ def seed_everything(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def chat_prompt(tokenizer, question: str, control_context: str | None = None) -> list[int]:
-    system = SYSTEM_PROMPT
+def chat_prompt(tokenizer, question: str, control_context: str | None = None,
+                system_prompt: str | None = None) -> list[int]:
+    system = system_prompt if system_prompt is not None else SYSTEM_PROMPT
     user = question
     if control_context is not None:
         system = """This is a full-context control run. Answer only from the

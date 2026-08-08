@@ -196,6 +196,14 @@ case "${action}" in
       -OutputName "${MEMORY_MECHANISM_SPAN_RANK_OUTPUT_NAME:-memory-mechanism-span-rank-v1}" \
       -OutOfDistributionCases "${MEMORY_MECHANISM_SPAN_RANK_OOD_CASES:-8}"
     ;;
+  kv-attach)
+    sync_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryKvAttach.ps1 \
+      -DatasetName "${dataset_name}" \
+      -OutputName "${MEMORY_KV_ATTACH_OUTPUT_NAME:-memory-kv-attach-v1}" \
+      -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}"
+    ;;
   index|query|control|status|selftest)
     remote_arguments=(Invoke-MemoryData.ps1 \
       -Action "${action}" -DatasetName "${dataset_name}" \
@@ -213,7 +221,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|mechanism-probe|mechanism-trace|mechanism-intervene|mechanism-span-rank|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|mechanism-probe|mechanism-trace|mechanism-intervene|mechanism-span-rank|kv-attach|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac

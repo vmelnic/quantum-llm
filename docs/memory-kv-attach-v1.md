@@ -1,6 +1,17 @@
 # Memory KV-Attach v1 — prototype design
 
-Status: proposal, not implemented. This document follows the closure of the
+Status: milestone 1 validated on 2026-08-08 (artifact
+`work/memory-kv-attach-v1/kv-attach.json`, schema 5). With the frozen
+Qwen3-4B and zero trained parameters, the Nacre OOD dossier admitted as an
+attached K/V prefix reached 8/8 strict answers and 7/8 joint with sources
+(raw prefix: 8/8 and 6/8), versus 8/8 joint for the full-context control;
+the split-vs-joint identity check is exact in float32 (argmax agreement
+1.0). Caveat recorded: iterations v1–v5 of the harness carried a wrong
+`past_length` (KV-head count instead of sequence length), so every
+behavioural conclusion from those runs was retracted; only v6 numbers are
+valid. The no-memory arm still hallucinates 2/8, which is the target of
+milestone 2 (zero-init gates, learned null K/V, abstention training). This
+document follows the closure of the
 rank-16 latent-gate direction (v4/v5, see `memory-expert.md` and
 `history.md`). It defines the smallest architecture that tests whether a
 frozen-or-lightly-tuned Qwen3-4B can read attached memory through its **own
