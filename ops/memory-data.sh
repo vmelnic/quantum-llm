@@ -150,6 +150,52 @@ case "${action}" in
     fi
     "${script_dir}/run-on-windows-host.sh" "${capability_arguments[@]}"
     ;;
+  mechanism-probe)
+    sync_data
+    sync_capability_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryMechanismProbe.ps1 \
+      -DatasetName "${dataset_name}" \
+      -Corpus "${remote_capability_corpus}" \
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v4/memory-expert.pt}" \
+      -OutputName "${MEMORY_MECHANISM_PROBE_OUTPUT_NAME:-memory-mechanism-probe-v1}" \
+      -InDistributionCases "${MEMORY_MECHANISM_PROBE_ID_CASES:-4}" \
+      -OutOfDistributionCases "${MEMORY_MECHANISM_PROBE_OOD_CASES:-8}" \
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-96}"
+    ;;
+  mechanism-trace)
+    sync_data
+    sync_capability_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryMechanismTrace.ps1 \
+      -DatasetName "${dataset_name}" \
+      -Corpus "${remote_capability_corpus}" \
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v4/memory-expert.pt}" \
+      -OutputName "${MEMORY_MECHANISM_TRACE_OUTPUT_NAME:-memory-mechanism-trace-v1}" \
+      -InDistributionCases "${MEMORY_MECHANISM_TRACE_ID_CASES:-2}" \
+      -OutOfDistributionCases "${MEMORY_MECHANISM_TRACE_OOD_CASES:-8}" \
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-96}"
+    ;;
+  mechanism-intervene)
+    sync_data
+    sync_capability_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemoryMechanismIntervene.ps1 \
+      -DatasetName "${dataset_name}" \
+      -Corpus "${remote_capability_corpus}" \
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v4/memory-expert.pt}" \
+      -OutputName "${MEMORY_MECHANISM_INTERVENE_OUTPUT_NAME:-memory-mechanism-intervene-v1}" \
+      -InDistributionCases "${MEMORY_MECHANISM_INTERVENE_ID_CASES:-8}" \
+      -OutOfDistributionCases "${MEMORY_MECHANISM_INTERVENE_OOD_CASES:-8}" \
+      -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-96}"
+    ;;
+  mechanism-span-rank)
+    sync_data
+    sync_capability_data
+    "${script_dir}/run-on-windows-host.sh" Invoke-MemorySpanRank.ps1 \
+      -DatasetName "${dataset_name}" \
+      -Corpus "${remote_capability_corpus}" \
+      -Checkpoint "${MEMORY_ADAPTER_CHECKPOINT:-work/memory-expert-capability-conflictqa-v4/memory-expert.pt}" \
+      -OutputName "${MEMORY_MECHANISM_SPAN_RANK_OUTPUT_NAME:-memory-mechanism-span-rank-v1}" \
+      -OutOfDistributionCases "${MEMORY_MECHANISM_SPAN_RANK_OOD_CASES:-8}"
+    ;;
   index|query|control|status|selftest)
     remote_arguments=(Invoke-MemoryData.ps1 \
       -Action "${action}" -DatasetName "${dataset_name}" \
@@ -167,7 +213,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" "${remote_arguments[@]}"
     ;;
   *)
-    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
+    echo "Usage: ./ops/memory-data.sh <ingest|sync|encoder-download|selftest|index|query|control|status|mechanism-probe|mechanism-trace|mechanism-intervene|mechanism-span-rank|capability-download|capability-prepare|capability-sync|capability-validate|capability-train|capability-probe|capability-evaluate|capability-run>" >&2
     exit 2
     ;;
 esac
