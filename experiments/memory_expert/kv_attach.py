@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 from typing import Sequence
@@ -168,13 +169,20 @@ def read_questions(path: Path) -> list[dict[str, object]]:
 def expected_slot(records: Sequence[dict[str, object]],
                   sections: Sequence[str]) -> list[int]:
     slots = []
+    labels = [str(record.get("section_label", "")) for record in records]
     for section in sections:
         wanted = section.lstrip("#").strip().casefold()
-        for index, record in enumerate(records):
-            label = str(record.get("section_label", ""))
+        for index, label in enumerate(labels):
             if label.lstrip("#").strip().casefold() == wanted:
                 slots.append(index)
                 break
+        else:
+            # Datasets like the Romanian criminal code express sections as
+            # regular expressions against the label.
+            for index, label in enumerate(labels):
+                if re.search(section, label):
+                    slots.append(index)
+                    break
     return slots
 
 
@@ -343,6 +351,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--maximum-memory-tokens", type=int, default=768)
     parser.add_argument("--maximum-new-tokens", type=int, default=128)
+    # Selection mode: a query report with per-question retrieval hits; each
+    # question then attaches only its retrieved records (the real serving
+    # path for corpora too large to attach whole).
+    parser.add_argument("--selection", type=Path, default=None)
     # float32 makes the identity check decisive; bf16 split-vs-joint logits
     # differ by accumulation order and obscure real plumbing bugs.
     parser.add_argument("--dtype", choices=("bfloat16", "float32"),
@@ -359,6 +371,60 @@ def main() -> int:
 
     records = load_ingest_records(arguments.ingest)
     questions = read_questions(arguments.questions)
+
+    if arguments.selection is not None:
+        report = json.loads(arguments.selection.read_text(encoding="utf-8"))
+        hits_by_id = {
+            str(result["id"]): result["hits"] for result in report["results"]
+        }
+        records_by_id = {
+            str(record["record_id"]): record for record in records
+        }
+        arms = {"kv_attach_turn": [], "no_memory": []}
+        for row in questions:
+            question = str(row["question"])
+            hits = hits_by_id.get(str(row["id"]), [])
+            selected = [
+                records_by_id[str(hit["record_id"])]
+                for hit in hits
+                if str(hit["record_id"]) in records_by_id
+            ]
+            selected_texts = [str(record["text"]) for record in selected]
+            prefix_ids, query_ids = build_segments(
+                tokenizer, selected_texts, question
+            )
+            prefix_ids = prefix_ids[:arguments.maximum_memory_tokens]
+            states, _ = prefill_memory(model, prefix_ids, device)
+            attached = generate(
+                model, tokenizer, query_ids,
+                states, arguments.maximum_new_tokens, device,
+            )
+            arms["kv_attach_turn"].append(score_case(row, selected, attached))
+            blind = generate(
+                model, tokenizer, attach_prompt(tokenizer, question),
+                tuple(), arguments.maximum_new_tokens, device,
+            )
+            arms["no_memory"].append(score_case(row, selected, blind))
+        artifact = {
+            "schema_version": 5,
+            "tool": "kv-attach-validate",
+            "mode": "selection",
+            "model": arguments.model,
+            "revision": arguments.revision,
+            "dtype": arguments.dtype,
+            "records": len(records),
+            "questions": len(questions),
+            "summary": {arm: summarize(cases) for arm, cases in arms.items()},
+            "arms": arms,
+            "elapsed_seconds": round(time.perf_counter() - started, 3),
+        }
+        arguments.output.parent.mkdir(parents=True, exist_ok=True)
+        arguments.output.write_text(
+            json.dumps(artifact, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+        print(json.dumps(artifact["summary"], indent=2))
+        return 0
+
     record_texts = [str(record["text"]) for record in records]
     memory_ids = encode_memory(
         tokenizer, record_texts, arguments.maximum_memory_tokens,

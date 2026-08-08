@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$DatasetName,
     [string]$OutputName = "memory-kv-attach-v1",
+    [string]$Selection = "",
     [string]$ModelId = "Qwen/Qwen3-4B",
     [string]$Revision = "1cfa9a7208912126459214e8b04321603b3df60c",
     [int]$MaximumMemoryTokens = 768,
@@ -47,10 +48,18 @@ $env:TOKENIZERS_PARALLELISM = "false"
 $env:PYTHONUTF8 = "1"
 
 $script = Join-Path $script:RepoRoot "experiments\memory_expert\kv_attach.py"
+$selectionArguments = @()
+if ($Selection -ne "") {
+    $selectionPath = Join-Path $dataset $Selection
+    if (-not (Test-Path -LiteralPath $selectionPath -PathType Leaf)) {
+        throw "Required Memory KV-Attach selection artifact is missing: $selectionPath"
+    }
+    $selectionArguments = @("--selection", $selectionPath)
+}
 & $python $script --model $ModelId --revision $Revision `
     --ingest $ingest --questions $questions --output $output --device cuda `
     --maximum-memory-tokens $MaximumMemoryTokens `
-    --maximum-new-tokens $MaximumNewTokens
+    --maximum-new-tokens $MaximumNewTokens @selectionArguments
 $exitCode = $LASTEXITCODE
 
 [PSCustomObject]@{

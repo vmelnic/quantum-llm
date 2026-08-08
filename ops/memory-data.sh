@@ -60,6 +60,13 @@ sync_data() {
       | ssh -o BatchMode=yes "${remote_host}" \
         "tar -xf - -C \"${remote_dataset_root}\""
   fi
+  if [[ -n "${MEMORY_KV_ATTACH_SELECTION:-}" \
+     && -f "${local_dataset_root}/${MEMORY_KV_ATTACH_SELECTION}" ]]; then
+    tar --format=ustar --no-xattrs --no-acls --no-fflags \
+      -C "${local_dataset_root}" -cf - "${MEMORY_KV_ATTACH_SELECTION}" \
+      | ssh -o BatchMode=yes "${remote_host}" \
+        "tar -xf - -C \"${remote_dataset_root}\""
+  fi
 }
 
 sync_capability_data() {
@@ -201,6 +208,7 @@ case "${action}" in
     "${script_dir}/run-on-windows-host.sh" Invoke-MemoryKvAttach.ps1 \
       -DatasetName "${dataset_name}" \
       -OutputName "${MEMORY_KV_ATTACH_OUTPUT_NAME:-memory-kv-attach-v1}" \
+      -Selection "${MEMORY_KV_ATTACH_SELECTION:-}" \
       -MaximumMemoryTokens "${MEMORY_MAX_MEMORY_TOKENS:-768}" \
       -MaximumNewTokens "${MEMORY_MAX_NEW_TOKENS:-128}"
     ;;
