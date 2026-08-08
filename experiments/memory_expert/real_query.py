@@ -26,7 +26,10 @@ try:
         resolve_layers,
         seed_everything,
     )
-    from .synthetic_memory import MemoryRecord, normalized_contains, parse_response
+    from .synthetic_memory import (
+        MemoryRecord, normalized_contains, parse_pointer, parse_response,
+        split_sentences,
+    )
 except ImportError:  # Direct execution on a worker.
     from data_contract import KnowledgeRecord, SourceSpan, content_sha256
     from dense_index import SearchHit, TransformerDenseEncoder, search
@@ -41,7 +44,10 @@ except ImportError:  # Direct execution on a worker.
         resolve_layers,
         seed_everything,
     )
-    from synthetic_memory import MemoryRecord, normalized_contains, parse_response
+    from synthetic_memory import (
+        MemoryRecord, normalized_contains, parse_pointer, parse_response,
+        split_sentences,
+    )
 
 
 def read_questions(path: Path) -> list[dict[str, object]]:
@@ -218,6 +224,20 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
             generation_elapsed = time.perf_counter() - generation_started
             answer, model_source_slots = parse_response(response)
             hit_records = [hit.record for hit in hits]
+            pointer = parse_pointer(answer)
+            if pointer is not None:
+                # Pointer contract: the authority plane resolves the
+                # (slot, sentence) reference against the exact admitted memory
+                # text and renders the verbatim sentence. Unresolvable
+                # pointers fail closed (the answer stays the raw pointer).
+                slot, sentence_index = pointer
+                if 0 <= slot < len(hit_records):
+                    admitted_text = as_memory_record(
+                        hit_records[slot], memory_record_format
+                    ).text
+                    sentences = split_sentences(admitted_text)
+                    if 0 <= sentence_index < len(sentences):
+                        answer = sentences[sentence_index]
             model_sources_authorized = (
                 bool(model_source_slots)
                 and len(set(model_source_slots)) == len(model_source_slots)
@@ -255,6 +275,7 @@ def run_queries(ingest_root: Path, index_root: Path, checkpoint_path: Path,
                 "question": row["question"],
                 "response": response,
                 "answer": answer,
+                "answer_pointer": list(pointer) if pointer is not None else None,
                 "model_source_slots": model_source_slots,
                 "model_sources_authorized": model_sources_authorized,
                 "citations": evidence_citations,

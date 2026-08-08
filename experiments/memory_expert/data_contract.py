@@ -79,6 +79,25 @@ def content_sha256(value: str | bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def split_sentences(text: str) -> list[str]:
+    """Single deterministic sentence segmentation for the pointer contract.
+
+    Prepare, training and the authority plane must segment record text
+    identically, otherwise `@slot:sentence` pointers drift. This helper lives
+    here (not in synthetic_memory) so corpus preparation stays free of heavy
+    dependencies.
+    """
+    sentences = [
+        part.strip()
+        for part in _SENTENCE_SPLIT.split(text.replace("\n", " "))
+        if part.strip()
+    ]
+    return sentences or [text]
+
+
 def safe_identifier(value: str, maximum: int = 48) -> str:
     normalized = re.sub(r"[^A-Za-z0-9]+", "-", value).strip("-").upper()
     return normalized[:maximum] or "UNNAMED"

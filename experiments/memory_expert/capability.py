@@ -97,7 +97,7 @@ def main() -> int:
         seed=args.seed,
     )
     manifest = validate_capability_manifest(
-        args.corpus.resolve(), "conflictqa-causal-memory-v3"
+        args.corpus.resolve(), "conflictqa-causal-memory-v4"
     )
     corpus = load_capability_corpus(
         args.corpus.resolve(),
@@ -139,7 +139,7 @@ def main() -> int:
         result = train(
             config, args.output, args.epochs, args.batch_size,
             args.learning_rate, args.gradient_accumulation, "adamw",
-            corpus=corpus, corpus_name="conflictqa-causal-memory-v3",
+            corpus=corpus, corpus_name="conflictqa-causal-memory-v4",
             augment_examples=False,
             memory_cache_bytes=args.memory_cache_bytes,
             validation_limit=args.validation_limit,

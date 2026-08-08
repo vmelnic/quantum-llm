@@ -308,3 +308,42 @@ date to 2017 despite receiving the exact evidence. The v4 architecture as
 trained is therefore closed as a ConflictQA-specific reader. No further v4
 training or matcher tuning is planned; the next baseline must use a materially
 different document-internalization mechanism.
+
+## Mechanism probes and the v5 pointer closure
+
+Inference-only instrumentation established the v4 failure mechanism before any
+new training. An internal probe (attention mass, entropy, residual norms over
+all 36 layers, prefill and decode) showed the gate stays active out of
+distribution and that correct and failed cases are internally
+indistinguishable; the null key is masked whenever memory exists, so its mass
+is zero by construction. A token-level trace at the answer-divergence step
+showed the gold literal reaching the final logits at ranks 2–100 — once losing
+on an exact logit tie — with diffuse attention and a readable but weak
+mid-stack signal. Interventions then closed the cheap fixes: scaling the gate
+residual by 1.5–3 degraded both out-of- and in-distribution accuracy into
+degeneration (the signal is not amplifiable), and unmasking the null key
+changed nothing. An NLL span-ranking test with a no-memory control showed
+selection is only marginally memory-driven out of distribution (5/8 gold at
+rank 1 versus 3/8 blind; one dramatic swing on the exact quotation).
+
+V5 tested the resulting design: pointer targets (`ANSWER: @slot:sentence`)
+with the authority plane rendering the verbatim sentence, so the channel only
+selects and never renders literals. The regenerated corpus
+(`conflictqa-causal-memory-v4`, 12,664 rows) rejects the 1,912 families
+without a confidently derivable gold sentence. Training completed three epochs
+(30,153 visits, 945 updates, best validation NLL 0.0147). The causal probe was
+repaired for the pointer contract (contrastive NLL on shared sibling
+coordinates is degenerate) and passed semantically: 6/6 evaluation families
+rendered distinct memory-tracking content. Held-out evaluation reached 28/30
+pointer-exact oracle answers, 30/30 sources and 100% unknown abstention.
+
+The pre-registered external bar (≥7/8 English dossier, ≥4/5 Romanian code)
+decided: v5 scored 2/8 on the dossier (neighbouring-sentence pointers,
+malformed pointers, one abstention) and abstained on all five Romanian
+questions, with retrieval at 5/5. V5 is closed. Its failures were fail-closed:
+abstentions or verbatim admitted quotes, never invented literals. The
+three-version arc now bounds the design space: the synthetic PoW needed a copy
+pointer for exact digits, v4 proved a rank-16 residual cannot render literals,
+and v5 proved the same gate cannot select finely enough out of distribution
+when trained on a single English corpus. The trained capability tracks the
+training distribution, not "admitted memory" as a general channel.

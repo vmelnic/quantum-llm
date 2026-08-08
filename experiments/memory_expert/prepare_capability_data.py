@@ -10,14 +10,79 @@ from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Iterable
 
+try:
+    from .data_contract import split_sentences
+except ImportError:  # Direct execution.
+    from data_contract import split_sentences
+
 
 SOURCE_REPOSITORY = "osunlp/ConflictQA"
 SOURCE_REVISION = "056384049e63c1ddae853891c24610fa07d85744"
 SOURCE_FILE = "conflictQA-popQA-chatgpt.json"
 SOURCE_SHA256 = "835f7d80d009d10b077551779c0decfae6ede4ef7cfcfdc0c5148eda30516a2f"
 SOURCE_LICENSE = "apache-2.0"
-CORPUS_CONTRACT = "conflictqa-causal-memory-v3"
+CORPUS_CONTRACT = "conflictqa-causal-memory-v4"
+ROW_SCHEMA_VERSION = 2
 UNKNOWN_ANSWER = "I don't know from the attached memory."
+
+_STOP_TOKENS = frozenset(
+    "a an the is was were are be been being of in on at to for with by from as "
+    "it its this that and or not no do does did have has had he she they we "
+    "you i his her their our your my who what which where when how s".split()
+)
+
+
+def _content_tokens(value: str) -> list[str]:
+    return [
+        token for token in _normalized_tokens(value) if token not in _STOP_TOKENS
+    ]
+
+
+def _stem_match(token: str, sentence_tokens: set[str]) -> bool:
+    if token in sentence_tokens:
+        return True
+    if len(token) < 5:
+        return False
+    return any(
+        len(candidate) >= 5
+        and (candidate.startswith(token[:5]) or token.startswith(candidate[:5]))
+        for candidate in sentence_tokens
+    )
+
+
+def _derive_answer_span(text: str, answer: str, sibling_answer: str
+                        ) -> int | None:
+    """Sentence index carrying the answer, or None when not confidently derivable.
+
+    Discriminating tokens are the answer's content tokens absent from the
+    sibling answer of the same causal family. The winning sentence must
+    contain all of them (exact first, stem match as fallback); ties resolve to
+    the highest full-answer coverage, then to the earliest sentence.
+    """
+    answer_tokens = _normalized_tokens(answer)
+    content = _content_tokens(answer)
+    sibling = set(_content_tokens(sibling_answer))
+    distinctive = [token for token in content if token not in sibling] or content
+    if not distinctive:
+        return None
+    sentences = split_sentences(text)
+    for matcher in (
+        lambda token, tokens: token in tokens,
+        _stem_match,
+    ):
+        candidates: list[tuple[int, float]] = []
+        for index, sentence in enumerate(sentences):
+            tokens = set(_normalized_tokens(sentence))
+            if all(matcher(token, tokens) for token in distinctive):
+                coverage = (
+                    sum(1 for token in answer_tokens if token in tokens)
+                    / max(1, len(answer_tokens))
+                )
+                candidates.append((index, coverage))
+        if candidates:
+            best = max(candidates, key=lambda item: (item[1], -item[0]))
+            return best[0]
+    return None
 
 
 def _digest(value: str, width: int = 20) -> str:
@@ -170,6 +235,7 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
         })
 
     output_rows: list[dict[str, object]] = []
+    rejected_no_span = 0
     for family_index, item in enumerate(prepared):
         family_id = item["family_id"]
         split = item["split"]
@@ -180,6 +246,17 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
             _record(family_id, 0, citation_id, item["factual_context"], True),
             _record(family_id, 1, citation_id, item["counterfactual_context"], False),
         )
+        spans = (
+            _derive_answer_span(
+                item["factual_context"], answers[0], answers[1]
+            ),
+            _derive_answer_span(
+                item["counterfactual_context"], answers[1], answers[0]
+            ),
+        )
+        if any(span is None for span in spans):
+            rejected_no_span += 1
+            continue
         pool = distractors[split]
         distractor = _choose_distractor(
             pool, int(_digest(f"distractor:{family_id}", 8), 16) % len(pool),
@@ -196,7 +273,7 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
             if target_slot == 0:
                 records.reverse()
             output_rows.append({
-                "schema_version": 1,
+                "schema_version": ROW_SCHEMA_VERSION,
                 "family_id": family_id,
                 "example_id": _opaque_id("E", f"{family_id}:{variant}"),
                 "split": split,
@@ -204,6 +281,7 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
                 "question": question,
                 "answer": answer,
                 "answer_support": "dataset-label",
+                "answer_span": [target_slot, spans[variant]],
                 "citations": [citation_id],
                 "kind": kind,
                 "records": records,
@@ -219,7 +297,7 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
                 continue
             unknown_family = _opaque_id("U", family_id)
             output_rows.append({
-                "schema_version": 1,
+                "schema_version": ROW_SCHEMA_VERSION,
                 "family_id": unknown_family,
                 "example_id": _opaque_id("E", unknown_family),
                 "split": split,
@@ -227,6 +305,7 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
                 "question": question,
                 "answer": UNKNOWN_ANSWER,
                 "answer_support": "absent",
+                "answer_span": None,
                 "citations": [],
                 "kind": "unknown",
                 "records": [distractor, second],
@@ -248,6 +327,8 @@ def build(output: Path, source: Path, seed: int) -> dict[str, object]:
         "source_license": SOURCE_LICENSE,
         "languages": ["en"],
         "causal_families": len(prepared),
+        "families_rejected_no_span": rejected_no_span,
+        "pointer_target": "sentence-v1",
         "rows": row_count,
         "examples_by_split_language_kind": {
             "/".join(key): value for key, value in sorted(distribution.items())

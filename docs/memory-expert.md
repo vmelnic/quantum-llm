@@ -72,6 +72,52 @@ to 29.82 minutes, 27 minutes to two hours, or 14 October 2037 to 24 October
 2017. V4 learned a ConflictQA-specific latent reader, not the generic memory
 capability required by the project. It will not receive another training run.
 
+## Mechanism probes and the v5 pointer run
+
+A series of inference-only instruments (`mechanism_probe.py`,
+`mechanism_trace.py`, `mechanism_intervene.py`, `mechanism_span_rank.py`;
+artifacts under `work/memory-mechanism-*`) established why v4 fails:
+
+- the gate does not shut down out of distribution: residual amplitude on the
+  fictional dossier is ~78% of the in-distribution level, and failed and
+  correct cases are internally indistinguishable;
+- token-level traces show the gold literal reaches the final logits at ranks
+  2–100 (one failure lost on an exact logit tie), but the signal is not
+  separable: scaling the gate residual by 1.5–3 degrades both out-of- and
+  in-distribution accuracy monotonically into degeneration;
+- the masked null key is irrelevant to the failure: unmasking it at inference
+  changes nothing;
+- an NLL span-ranking test showed weakly positive selection: the gold answer
+  ranked first in 5/8 cases versus 3/8 with empty memory, with only one
+  dramatic memory-driven swing. Reading out of distribution is marginal, not
+  absent.
+
+V5 tested the resulting hypothesis directly: if the channel can select but
+cannot render, train pointer targets (`ANSWER: @slot:sentence`) and let the
+authority plane render the verbatim sentence. The corpus became
+`conflictqa-causal-memory-v4` (12,664 rows; 1,912 of 7,940 families rejected
+because no confident gold sentence exists). Training completed three epochs
+(30,153 visits, 945 optimizer updates, best validation NLL 0.0147). The causal
+probe was adapted for the pointer contract — contrastive NLL on coordinates is
+degenerate because siblings share them — and passed semantically: 6/6
+evaluation families rendered different, memory-tracking content. Held-out
+evaluation: 28/30 pointer-exact oracle answers, 30/30 sources, 100% unknown
+abstention.
+
+The external gate then decided. On the fictional English dossier the v5
+checkpoint passed only 2/8: pointers landed on neighbouring sentences, two
+pointers were malformed, one case abstained. On the Romanian criminal code it
+abstained on all five questions (retrieval again 5/5). Both results miss the
+pre-registered bar (≥7/8 and ≥4/5), so v5 is closed. Its one product-relevant
+property is that failures are fail-closed abstentions or verbatim quotes from
+the admitted record, never invented literals.
+
+The combined conclusion: a rank-16 residual gate trained on a single English
+corpus learns a ConflictQA-specific reader. It cannot render literals (v4) and
+cannot select them finely enough out of distribution (v5). Both external
+verdicts converge on the same boundary: the trained capability is bound to the
+training distribution, not to "reading admitted memory" in general.
+
 ## Architecture under test
 
 ```text
@@ -324,11 +370,15 @@ not versioned.
   Romanian external test at 1/5 despite 5/5 evidence retrieval;
 - the invented English control failed at 2/8 with serving metadata and 3/8 with
   canonical raw records, while the frozen full-context control passed 8/8;
-  neither v3 nor v4 is promotable and no further v4 training is planned;
+- mechanism probes closed the v4 hypotheses: no gate suppression, no null-key
+  effect, no amplifiable signal; literal transport is lossy and entangled;
+- v5 (pointer targets plus authority-plane verbatim rendering) trained cleanly
+  and passed the semantic causal probe and held-out suite (28/30 oracle), but
+  failed the external bar: 2/8 on the English dossier, 0/5 abstentions on the
+  Romanian code; neither v3, v4 nor v5 is promotable and no further training
+  of this gate-on-ConflictQA design is planned;
 - the answer matcher and generic multilingual paraphrase scoring remain a
   documented TODO, but cannot explain the manually verified legal failures;
-- the official Doc-to-LoRA Qwen3-4B checkpoint is the next same-day baseline;
-  TokenMem remains Plan B if that materially different mechanism also fails;
 - Romanian and Russian capability remains unproved;
 - Python hooks recompute memory K/V and are a research implementation, not a
   throughput backend;

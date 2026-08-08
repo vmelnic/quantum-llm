@@ -13,6 +13,7 @@ try:
         MemoryRecord,
         UNKNOWN_ANSWER,
         normalized_contains,
+        split_sentences,
     )
 except ImportError:
     from synthetic_memory import (
@@ -20,6 +21,7 @@ except ImportError:
         MemoryRecord,
         UNKNOWN_ANSWER,
         normalized_contains,
+        split_sentences,
     )
 
 
@@ -130,8 +132,9 @@ def load_capability_corpus(
     multi_record = 0
 
     for index, row in enumerate(rows):
-        if row.get("schema_version") != 1:
+        if row.get("schema_version") not in (1, 2):
             raise ValueError(f"row {index} has unsupported schema_version")
+        row_schema = int(row["schema_version"])
         split = str(row.get("split", ""))
         language = str(row.get("language", ""))
         family_id = str(row.get("family_id", ""))
@@ -140,6 +143,7 @@ def load_capability_corpus(
         answer = str(row.get("answer", "")).strip()
         kind = str(row.get("kind", "natural"))
         answer_support = str(row.get("answer_support", "extractive"))
+        answer_span_raw = row.get("answer_span")
         citations_raw = row.get("citations", [])
         records_raw = row.get("records", [])
         if split not in ("train", "eval") or language not in LANGUAGES:
@@ -221,6 +225,30 @@ def load_capability_corpus(
             ):
                 raise ValueError(f"answer is not extractive from admitted memory: {example_id}")
 
+        answer_span: tuple[int, int] | None = None
+        if kind == "unknown":
+            if answer_span_raw is not None:
+                raise ValueError("unknown rows cannot carry an answer span")
+        elif answer_span_raw is not None:
+            if (
+                not isinstance(answer_span_raw, list)
+                or len(answer_span_raw) != 2
+                or not all(isinstance(item, int) for item in answer_span_raw)
+            ):
+                raise ValueError(f"row {index} has an invalid answer span")
+            span_slot, span_sentence = answer_span_raw
+            if not 0 <= span_slot < len(memory_texts):
+                raise ValueError(f"row {index} answer span slot out of range")
+            if public_ids[span_slot] not in set(citations):
+                raise ValueError(
+                    f"row {index} answer span points outside the citation"
+                )
+            if not 0 <= span_sentence < len(split_sentences(memory_texts[span_slot])):
+                raise ValueError(f"row {index} answer span sentence out of range")
+            answer_span = (span_slot, span_sentence)
+        elif row_schema == 2:
+            raise ValueError(f"row {index} answerable schema-2 row lacks a span")
+
         example = MemoryExample(
             example_id=example_id,
             question=question,
@@ -233,6 +261,7 @@ def load_capability_corpus(
             family_id=family_id,
             source_slots=source_slots,
             answer_support=answer_support,
+            answer_span=answer_span,
         )
         examples.append(example)
         family_rows[family_id].append(example)

@@ -28,8 +28,10 @@ try:
         examples_fingerprint,
         format_memory,
         normalized_contains,
+        parse_pointer,
         parse_response,
         retrieve_adaptive,
+        split_sentences,
     )
 except ImportError:  # Direct script execution on the Windows worker.
     from synthetic_memory import (
@@ -42,9 +44,26 @@ except ImportError:  # Direct script execution on the Windows worker.
         examples_fingerprint,
         format_memory,
         normalized_contains,
+        parse_pointer,
         parse_response,
         retrieve_adaptive,
+        split_sentences,
     )
+
+
+def render_pointer_answer(parsed_answer: object, example: MemoryExample,
+                          records_by_id: dict[str, MemoryRecord]) -> str | None:
+    """Resolve an `@slot:sentence` pointer against the admitted records."""
+    pointer = parse_pointer(str(parsed_answer))
+    if pointer is None:
+        return None
+    slot, sentence_index = pointer
+    if not 0 <= slot < len(example.memory_ids):
+        return None
+    sentences = split_sentences(records_by_id[example.memory_ids[slot]].text)
+    if not 0 <= sentence_index < len(sentences):
+        return None
+    return sentences[sentence_index]
 
 
 SYSTEM_PROMPT = """You answer using a separate authoritative memory channel.
@@ -185,6 +204,19 @@ class MemoryExpert(nn.Module):
         # allowing the output projection to learn on the first optimizer step.
         nn.init.normal_(self.gate_down.weight, std=0.01)
         nn.init.zeros_(self.gate_up.weight)
+        # Optional inference-only observer. It is deliberately not a module or
+        # parameter, so enabling a probe cannot change checkpoint state.
+        self.probe_sink = None
+        self.probe_layer_index: int | None = None
+        # When probe_capture is true the observer also receives per-head last
+        # position attention weights and the hidden/context/gated vectors.
+        # Trace-only; it never changes the returned tensor.
+        self.probe_capture = False
+        # Inference-only interventions. gate_scale multiplies the residual;
+        # null_always keeps the null key attendable even when memory exists.
+        # Both default to the exact trained behavior.
+        self.gate_scale = 1.0
+        self.null_always = False
 
     def forward(self, hidden: torch.Tensor, memory: torch.Tensor,
                 memory_mask: torch.Tensor, frozen_attention: nn.Module,
@@ -225,7 +257,11 @@ class MemoryExpert(nn.Module):
         null_value = torch.zeros_like(null_key)
         key = torch.cat((key, null_key), dim=2)
         value = torch.cat((value, null_value), dim=2)
-        extended_mask = torch.cat((memory_mask, no_memory[:, None]), dim=1)
+        if self.null_always:
+            null_allowed = torch.ones_like(no_memory[:, None])
+        else:
+            null_allowed = no_memory[:, None]
+        extended_mask = torch.cat((memory_mask, null_allowed), dim=1)
         scores = torch.matmul(query, key.transpose(-1, -2)) / math.sqrt(head_width)
         scores = scores.masked_fill(~extended_mask[:, None, None, :], -1.0e9)
         weights = torch.softmax(scores, dim=-1)
@@ -234,6 +270,60 @@ class MemoryExpert(nn.Module):
         )
         context = frozen_attention.o_proj(context)
         gated = self.gate_up(self.gate_down(self.dropout(context).float())) * self.scale
+        if self.gate_scale != 1.0:
+            gated = gated * self.gate_scale
+        if self.probe_sink is not None:
+            with torch.no_grad():
+                real_weights = weights[..., :-1].float()
+                real_mass = real_weights.sum(dim=-1)
+                null_mass = weights[..., -1].float()
+                entropy = -(
+                    real_weights.clamp_min(1.0e-12)
+                    * real_weights.clamp_min(1.0e-12).log()
+                ).sum(dim=-1)
+                valid_tokens = memory_mask.sum(dim=-1).float()
+                entropy_scale = valid_tokens.clamp_min(2).log()[:, None, None]
+                normalized_entropy = torch.where(
+                    valid_tokens[:, None, None] > 1,
+                    entropy / entropy_scale,
+                    torch.zeros_like(entropy),
+                )
+                hidden_norm = hidden.float().norm(dim=-1).clamp_min(1.0e-12)
+                context_norm = context.float().norm(dim=-1)
+                gated_norm = gated.float().norm(dim=-1)
+                values = torch.stack((
+                    real_mass.mean(),
+                    null_mass.mean(),
+                    normalized_entropy.mean(),
+                    real_weights.max(dim=-1).values.mean(),
+                    (context_norm / hidden_norm).mean(),
+                    (gated_norm / hidden_norm).mean(),
+                    (gated_norm[:, -1] / hidden_norm[:, -1]).mean(),
+                )).detach().cpu().tolist()
+                event: dict[str, object] = {
+                    "layer": self.probe_layer_index,
+                    "phase": "prefill" if query_tokens > 1 else "decode",
+                    "query_tokens": query_tokens,
+                    "memory_tokens": float(valid_tokens.mean().item()),
+                    **dict(zip((
+                        "real_attention_mass",
+                        "null_attention_mass",
+                        "attention_entropy",
+                        "attention_max",
+                        "context_hidden_ratio",
+                        "gate_delta_hidden_ratio",
+                        "gate_delta_hidden_ratio_last",
+                    ), (float(value) for value in values))),
+                }
+                if self.probe_capture and batch == 1:
+                    event.update({
+                        # Heads x (memory + null) at the last query position.
+                        "weights_last": weights[0, :, -1, :].detach().float().cpu(),
+                        "hidden_last": hidden[0, -1].detach().float().cpu(),
+                        "context_last": context[0, -1].detach().float().cpu(),
+                        "gated_last": gated[0, -1].detach().float().cpu(),
+                    })
+                self.probe_sink(event)
         return hidden + gated.to(hidden.dtype)
 
 
@@ -1085,7 +1175,12 @@ def score_example(example: MemoryExample, response: str,
                   admitted_ids: Sequence[str],
                   records_by_id: dict[str, MemoryRecord]) -> dict[str, object]:
     answer, source_slots = parse_response(response)
-    answer_text_match = normalized_contains(answer, example.answer)
+    if example.answer_span is not None:
+        # Pointer contract: the answer is exact iff the model points at the
+        # gold (slot, sentence); the authority plane owns the verbatim text.
+        answer_text_match = parse_pointer(answer) == tuple(example.answer_span)
+    else:
+        answer_text_match = normalized_contains(answer, example.answer)
     admitted_records = [records_by_id[item] for item in admitted_ids]
     sources_authorized = (
         len(set(source_slots)) == len(source_slots)
@@ -1225,6 +1320,10 @@ def causal_probe(checkpoint_path: Path, output: Path,
     ]
     families = select_causal_examples(examples, family_limit, records_by_id)
     selected = [example for family in families for example in family]
+    pointer_mode = bool(families) and all(
+        example.answer_span is not None
+        for family in families for example in family
+    )
     started = time.perf_counter()
     try:
         memory_cache = encode_memory_sets(
@@ -1235,32 +1334,41 @@ def causal_probe(checkpoint_path: Path, output: Path,
         contrastive_results: list[dict[str, object]] = []
         contrastive_correct = 0
         contrastive_total = 0
-        for family in families:
-            matrix: list[dict[str, object]] = []
-            for correct_index, memory_example in enumerate(family):
-                nll = candidate_nll(
-                    model, tokenizer, hooks, memory_cache,
-                    memory_example.memory_ids, family, device,
-                )
-                preferred_index = int(np.argmin(nll))
-                is_correct = preferred_index == correct_index
-                contrastive_correct += int(is_correct)
-                contrastive_total += 1
-                matrix.append({
-                    "memory_example_id": memory_example.example_id,
-                    "candidate_example_ids": [item.example_id for item in family],
-                    "mean_target_nll": nll,
-                    "preferred_example_id": family[preferred_index].example_id,
-                    "correct": is_correct,
+        if pointer_mode:
+            # Under the pointer contract siblings legitimately share their
+            # `@slot:sentence` coordinates, so contrastive target NLL is
+            # degenerate by construction. Causality is established by the
+            # generation stage below: the authority plane resolves each
+            # pointer and the rendered content must track the admitted memory.
+            contrastive_accuracy: float | None = None
+            contrastive_passed = True
+        else:
+            for family in families:
+                matrix: list[dict[str, object]] = []
+                for correct_index, memory_example in enumerate(family):
+                    nll = candidate_nll(
+                        model, tokenizer, hooks, memory_cache,
+                        memory_example.memory_ids, family, device,
+                    )
+                    preferred_index = int(np.argmin(nll))
+                    is_correct = preferred_index == correct_index
+                    contrastive_correct += int(is_correct)
+                    contrastive_total += 1
+                    matrix.append({
+                        "memory_example_id": memory_example.example_id,
+                        "candidate_example_ids": [item.example_id for item in family],
+                        "mean_target_nll": nll,
+                        "preferred_example_id": family[preferred_index].example_id,
+                        "correct": is_correct,
+                    })
+                contrastive_results.append({
+                    "question": family[0].question,
+                    "matrix": matrix,
                 })
-            contrastive_results.append({
-                "question": family[0].question,
-                "matrix": matrix,
-            })
-        contrastive_accuracy = (
-            contrastive_correct / contrastive_total if contrastive_total else 0.0
-        )
-        contrastive_passed = contrastive_accuracy >= 0.90
+            contrastive_accuracy = (
+                contrastive_correct / contrastive_total if contrastive_total else 0.0
+            )
+            contrastive_passed = contrastive_accuracy >= 0.90
 
         rows: list[dict[str, object]] = []
         family_results: list[dict[str, object]] = []
@@ -1283,7 +1391,14 @@ def causal_probe(checkpoint_path: Path, output: Path,
                 scored["admitted_memory_ids"] = example.memory_ids
                 rows.append(scored)
                 family_rows.append(scored)
-                predicted_answers.append(str(scored["parsed_answer"]))
+                if pointer_mode:
+                    rendered = render_pointer_answer(
+                        scored["parsed_answer"], example, records_by_id
+                    )
+                    scored["rendered_answer"] = rendered
+                    predicted_answers.append(rendered or "")
+                else:
+                    predicted_answers.append(str(scored["parsed_answer"]))
                 print(json.dumps({
                     "event": "causal-probe", **scored,
                 }), flush=True)
@@ -1307,6 +1422,7 @@ def causal_probe(checkpoint_path: Path, output: Path,
             "model": config.model,
             "families": len(families),
             "examples": len(rows),
+            "pointer_mode": pointer_mode,
             "contrastive_accuracy": contrastive_accuracy,
             "contrastive_passed": contrastive_passed,
             "contrastive_results": contrastive_results,

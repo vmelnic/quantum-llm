@@ -15,6 +15,21 @@ import numpy as np
 
 UNKNOWN_ANSWER = "I don't know from the attached memory."
 
+try:
+    from .data_contract import split_sentences
+except ImportError:  # Direct execution on a worker.
+    from data_contract import split_sentences
+
+_POINTER = re.compile(r"@(\d+):(\d+)")
+
+
+def parse_pointer(answer: str) -> tuple[int, int] | None:
+    """Parse an `@slot:sentence` pointer answer; None for prose answers."""
+    match = _POINTER.fullmatch(answer.strip())
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2))
+
 
 @dataclass(frozen=True)
 class MemoryRecord:
@@ -45,11 +60,18 @@ class MemoryExample:
     family_id: str = ""
     source_slots: tuple[int, ...] = ()
     answer_support: str = "extractive"
+    # (slot, sentence_index) into the admitted record text. When set, the
+    # supervised target is a pointer and the authority plane renders the
+    # verbatim sentence; the model never generates literals.
+    answer_span: tuple[int, int] | None = None
 
     @property
     def target(self) -> str:
         sources = ",".join(str(slot) for slot in self.source_slots) \
             if self.source_slots else "NONE"
+        if self.answer_span is not None:
+            slot, sentence = self.answer_span
+            return f"ANSWER: @{slot}:{sentence}\nSOURCES: {sources}"
         return f"ANSWER: {self.answer}\nSOURCES: {sources}"
 
 
