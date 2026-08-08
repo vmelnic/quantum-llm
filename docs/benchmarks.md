@@ -77,6 +77,121 @@ The Unicode verification after commit `86a4b3e` produced `Hello! 😊` once,
 without a replacement character or replayed prefix. That was a correctness
 gate, not a performance measurement.
 
+### W2 hot decode path (2026-08-08, build `w02`)
+
+Changes: asynchronous directory planning on the per-token path
+(`begin_plan_async`/`wait_plan_async`/`poll_plan_async` instead of
+`pin_or_collect_misses`, non-blocking `release_pins_async`), worker-mode
+placement freeze after an 8-decode-step warmup boundary (positional worker
+argument `settle-after-decode-steps`, 0 disables), and vectorized
+`char4`/`float4` dispatch in `gemv_batch`.
+
+Six-turn chat suite (growing history, 48 max output tokens per turn,
+post-first-token decode tok/s), same probe against the W1 build and the W2
+build, both with session retention:
+
+| Turn | W1 decode | W2 decode | W1 wall | W2 wall | W1 wait share | W2 wait share |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.72 | 0.82 | 91.9 s | 69.8 s | 93% | 95% |
+| 2 | 1.27 | 1.49 | 46.3 s | 38.4 s | 83% | 88% |
+| 3 | 2.08 | 2.77 | 28.6 s | 21.9 s | 76% | 79% |
+| 4 | 1.83 | 2.29 | 15.1 s | 12.3 s | 74% | 80% |
+| 5 | 2.31 | 3.14 | 10.0 s | 7.8 s | 70% | 76% |
+| 6 | 2.72 | 3.55 | 20.2 s | 15.7 s | 65% | 70% |
+
+Wait share is `expert_cache_wait_ns` divided by request wall; on these turns
+it is dominated by real storage/upload waits for not-yet-resident routes
+(1–6 GiB per turn still crosses the disks), which is W3/W4 territory.
+
+Repeated identical request (19-token prompt, 48 output tokens) on a freshly
+restarted service, so the route becomes fully resident after the first run:
+
+| Run | TTFT | Post-first-token |
+|---:|---:|---:|
+| 1 (cold, SSD load) | 26.890 s | 0.75 tok/s |
+| 2 | 0.813 s | 27.16 tok/s |
+| 3 | 0.462 s | 26.69 tok/s |
+| 4 | 0.552 s | 27.69 tok/s |
+
+On the resident runs the per-request telemetry shows zero expert storage
+reads, zero H2D uploads, and `expert_cache_wait_ns` at ~24–30% of forward
+wall (down from 65–95%); the residual is the event wait for in-flight GPU
+layer work plus the CPU-executed share of the route (the 48-token route's
+unique experts exceed the 18 GiB VRAM budget, so a fraction executes from
+RAM on the CPU executor once placement is frozen).
+
+### W3 async expert supply (2026-08-08, build `w03`)
+
+Landed changes: uploads in `CudaExpertUploader` complete through per-upload
+CUDA events consumed by a dedicated completion thread instead of
+`cudaStreamSynchronize` under the pool lock (all three paths: Qwen INT8
+sections, DeepSeek direct compact, DeepSeek compact expansion) — neither the
+decode thread nor a storage callback pays a stream-wide sync on the hot path;
+the DeepSeek scheduler no longer suspends prefetch while a demand acquire is
+in flight and runs 4 in-flight prefetches with 2 transition predictions per
+layer (was 1/1); the DeepSeek worker uses 4 IOCP threads (was 2) and 8
+staging slots (was 4 — a full top-6 demand route plus two prefetches in
+flight), charges the 512 MiB MTP reserve against the main cache budgets only
+when MTP is enabled, and earns the pageable RAM-retention copy on the second
+demand load of a record (`ram_retention_minimum_frequency = 2`), leaving
+first-touch records pack-resident without the 13.4 MB memcpy on the miss
+path.
+
+Reverted experiment: a Qwen route-ahead prefetch (acquire layer i+1's
+previous-token route during layer i's compute) was implemented, measured,
+and removed. The telemetry showed it cannot help this regime: predicted
+experts were always already RAM-resident (storage bytes identical to
+baseline), so the prefetch only drove extra H2D uploads — 2–7× more uploaded
+bytes per turn — which churned the 18 GiB VRAM tier and slightly regressed
+every turn (novel-route mean 2.83 vs 3.24 tok/s). First-touch experts, the
+actual misses, are by construction unpredictable from route history.
+
+Qwen, six-turn chat suite (same probe as W1/W2, 48 max output tokens per
+turn, freshly restarted service, post-first-token decode tok/s):
+
+| Turn | W3-before | W3-after | before wait share | after wait share | storage read (both) |
+|---:|---:|---:|---:|---:|---:|
+| 1 (cold) | 0.76 | 0.75 | 97% | 97% | 23.9 GiB |
+| 2 | 1.44 | 1.38 | 90% | 90% | 7.35 GiB |
+| 3 | 2.51 | 2.44 | 82% | 82% | 3.69 GiB |
+| 4 | 2.14 | 2.13 | 81% | 81% | 1.72 GiB |
+| 5 | 2.99 | 2.82 | 77% | 77% | 1.05 GiB |
+| 6 | 3.47 | 3.36 | 72% | 71% | 1.51 GiB |
+
+Novel-route probe (8 independent single-turn questions on unrelated topics,
+48 max output tokens): before 2.57–4.22 tok/s (mean 3.24, 0.84–3.65 GiB read
+per turn, wait share 60–80%); after 2.43–4.15 tok/s (mean 3.06, identical
+read bytes and wait shares). Qwen is unchanged within noise: the multi-turn
+and novel-route cost is SATA first-touch reads, which neither the
+event-driven uploader nor history-based prefetch can remove.
+
+Repeated identical request (19-token prompt, 48 output tokens, freshly
+restarted service), hot-path regression check:
+
+| Run | W2 TTFT | W2 decode | W3 TTFT | W3 decode |
+|---:|---:|---:|---:|---:|
+| 1 (cold) | 26.890 s | 0.75 tok/s | 26.954 s | 0.75 tok/s |
+| 2 | 0.813 s | 27.16 tok/s | 0.694 s | 28.22 tok/s |
+| 3 | 0.462 s | 26.69 tok/s | 0.484 s | 27.27 tok/s |
+| 4 | 0.552 s | 27.69 tok/s | 0.529 s | 26.99 tok/s |
+
+DeepSeek-V4-Flash, 3-turn bounded probe (24/24/11 output tokens, freshly
+restarted service; `w02r` is a reference build of the pre-W3 tree):
+
+| Turn | w02r TTFT | w03 TTFT | w02r decode | w03 decode | w02r expert wait | w03 expert wait | w02r read | w03 read |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 64.3 s | 51.9 s | 0.44 | 0.46 | 89.9 s | 80.5 s | 38.8 GiB | 56.1 GiB |
+| 2 | 47.4 s | 45.4 s | 0.47 | 0.52 | 67.4 s | 62.8 s | 24.5 GiB | 29.8 GiB |
+| 3 | 37.4 s | 31.8 s | 0.36 | 0.47 | 46.2 s | 35.3 s | 18.0 GiB | 14.6 GiB |
+
+DeepSeek improves modestly (turn-3 wall −19%, expert wait −24%) but stays in
+the ~0.4–0.5 tok/s class; the W3 pipeline work removes stalls, not the
+bandwidth arithmetic (3.21 GiB/token). Caveats: the route census persists
+across runs, so the w03 turns saw a census warmed by the w02r probe, and
+turn 1 reads more under w03 because the widened prefetch window reads
+predictions ahead of demand (wall time still improves). Both smokes pass on
+w03 (`Invoke-P6ServiceSmoke.ps1`, `Invoke-DeepSeekServiceSmoke.ps1`).
+
 ## DeepSeek-V4-Flash
 
 The 284B-class DeepSeek backend is functionally complete enough for greedy API

@@ -340,6 +340,12 @@ class Model final {
     }
     require(!mtp_enabled_ || bundle_.mtp_runtime_ready,
             "MTP execution requires worker bundle v3 resources");
+    // The 512 MiB MTP cache tier always exists when the bundle ships MTP
+    // resources, but its reserve is only charged against the main cache
+    // budgets when MTP execution is actually enabled; a disabled MTP path
+    // must not shrink the routed-expert budgets.
+    const auto mtp_reserve_bytes =
+        mtp_enabled_ ? mtp_cache_bytes_ : 0ULL;
     const auto request_size = er::cuda::deepseek_request_state_size(max_context_);
     require(request_size.status.ok(), request_size.status.message());
     request_bytes_ = request_size.total_bytes;
@@ -363,8 +369,8 @@ class Model final {
             "DeepSeek KV cache cannot reserve configured request capacity");
     constexpr std::uint64_t shared_bytes = 43ULL * 25'198'592U;
     require(vram_bytes_ >= shared_bytes + 7ULL * 13'369'344U +
-                               mtp_cache_bytes_ &&
-                ram_bytes_ > mtp_cache_bytes_,
+                               mtp_reserve_bytes &&
+                ram_bytes_ > mtp_reserve_bytes,
             "DeepSeek VRAM cache cannot hold shared plus one route");
     std::size_t free{}, total{};
     cuda_check(cudaMemGetInfo(&free, &total), "inspect DeepSeek worker VRAM");
@@ -378,23 +384,30 @@ class Model final {
     require(fixed + vram_bytes_ + (1ULL << 30U) <= free,
             "DeepSeek worker VRAM preflight failed");
 
-    iocp_ = std::make_shared<er::WindowsIocpStorage>(2U);
+    // Four IOCP workers match the Qwen runner and the useful NCQ depth of
+    // the SATA pack drive; more outstanding random reads mostly add seeks.
+    iocp_ = std::make_shared<er::WindowsIocpStorage>(4U);
     storage_ = std::make_shared<er::ExtentGatherStorage>(iocp_);
     const auto staging = std::max<std::uint64_t>(
         64ULL << 20U,
         std::max(artifacts_.maximum_source_record_bytes,
                  mtp_artifacts_.maximum_source_record_bytes));
+    // Eight staging slots keep a full top-6 demand route in flight and still
+    // leave room for two census prefetches during a demand burst.
+    constexpr std::uint32_t staging_slots = 8U;
     MEMORYSTATUSEX memory{sizeof(memory)};
     require(GlobalMemoryStatusEx(&memory) != 0,
             "inspect DeepSeek worker RAM failed");
     constexpr std::uint64_t operating_system_reserve = 4ULL << 30U;
     require(ram_bytes_ <= std::numeric_limits<std::uint64_t>::max() -
-                              staging * 4U - operating_system_reserve &&
-                ram_bytes_ + staging * 4U + operating_system_reserve <=
+                              staging * staging_slots -
+                              operating_system_reserve &&
+                ram_bytes_ + staging * staging_slots +
+                        operating_system_reserve <=
                     memory.ullAvailPhys,
             "DeepSeek worker RAM preflight failed");
     buffers_ = std::make_shared<er::FixedBufferPool>(
-        4U, staging, er::kExpertPackAlignment,
+        staging_slots, staging, er::kExpertPackAlignment,
         std::make_shared<er::CudaPinnedAllocator>());
     model_ = std::make_shared<er::cuda::DeepSeekResidentModelState>();
     const auto model_status = er::cuda::DeepSeekResidentModelState::load(
@@ -416,13 +429,18 @@ class Model final {
         er::cuda::CudaExpertUploaderOptions{
             0U, true, 0U, true});
     er::ExpertCacheConfig cache_config;
-    const auto target_ram_bytes = ram_bytes_ - mtp_cache_bytes_;
-    const auto target_vram_bytes = vram_bytes_ - mtp_cache_bytes_;
+    const auto target_ram_bytes = ram_bytes_ - mtp_reserve_bytes;
+    const auto target_vram_bytes = vram_bytes_ - mtp_reserve_bytes;
     cache_config.ram = {target_ram_bytes, target_ram_bytes,
                         target_ram_bytes * 7U / 8U};
     cache_config.vram = {target_vram_bytes, target_vram_bytes,
                          target_vram_bytes * 7U / 8U};
     cache_config.retain_host_copy = true;
+    // First-touch records keep the pack as their only RAM-tier backing: the
+    // pageable retention copy (13.4 MB memcpy per record on the miss path) is
+    // earned on the second demand load, which filters one-shot novel-route
+    // churn out of the 40 GiB RAM tier.
+    cache_config.ram_retention_minimum_frequency = 2U;
     cache_config.trusted_immutable_source = true;
     cache_ = std::make_unique<er::ExpertCache>(
         cache_config, storage_, uploader_, buffers_, directory_);
@@ -476,7 +494,7 @@ class Model final {
     scheduler_ = std::make_unique<er::cuda::DeepSeekDecodeScheduler>(
         er::cuda::DeepSeekDecodeSchedulerConfig{
             17U, capacity_, std::max<std::uint32_t>(6U, capacity_ * 2U),
-            capacity_, 1U, 1U, true},
+            capacity_, 4U, 2U, true},
         *cache_, catalog_,
         er::cuda::DeepSeekHybridSchedulerDependencies{cpu_, planner_, census_});
   }
@@ -1060,12 +1078,33 @@ struct Active final {
   std::unique_ptr<Request> request;
 };
 
+std::string sanitize_error(std::string_view message) {
+  std::string result;
+  result.reserve(message.size());
+  for (const char character : message) {
+    if (character == '\t' || character == '\n' || character == '\r' ||
+        character == '"')
+      result += ' ';
+    else if (character == '\\')
+      result += '/';
+    else
+      result += character;
+  }
+  return result;
+}
+
 std::uint32_t free_slot(const std::unordered_map<std::uint64_t, Active>& active,
+                        const std::unordered_map<std::uint64_t, Active>& retained,
                         std::uint32_t capacity) {
   std::vector<bool> used(capacity);
   for (const auto& [id, item] : active) {
     static_cast<void>(id);
     require(item.request->slot < capacity, "invalid active worker slot");
+    used[item.request->slot] = true;
+  }
+  for (const auto& [key, item] : retained) {
+    static_cast<void>(key);
+    require(item.request->slot < capacity, "invalid retained worker slot");
     used[item.request->slot] = true;
   }
   const auto available = std::find(used.begin(), used.end(), false);
@@ -1075,10 +1114,35 @@ std::uint32_t free_slot(const std::unordered_map<std::uint64_t, Active>& active,
 
 int worker_loop(Model& model) {
   std::unordered_map<std::uint64_t, Active> active;
+  std::unordered_map<std::uint64_t, Active> retained;
+  const auto feed_prompt = [&](Request& request,
+                               std::span<const std::uint32_t> tokens,
+                               std::uint32_t start_position) {
+    for (std::size_t index = 0U; index < tokens.size(); ++index) {
+      const auto position =
+          static_cast<std::uint32_t>(start_position + index);
+      Request* pointer = &request;
+      request.predicted = model.forward(
+          std::span<Request* const>(&pointer, 1U),
+          tokens.subspan(index, 1U),
+          std::span<const std::uint32_t>(&position, 1U)).front();
+      if (model.mtp_enabled()) {
+        const bool final_prompt = index + 1U == tokens.size();
+        const auto next_token =
+            final_prompt ? request.predicted : tokens[index + 1U];
+        model.advance_mtp(request, next_token,
+                          request.state->current_streams(), position,
+                          final_prompt);
+      }
+    }
+    request.next_position =
+        start_position + static_cast<std::uint32_t>(tokens.size());
+  };
   std::cout << "{\"type\":\"ready\",\"protocol\":5,\"capacity\":"
             << model.capacity()
             << ",\"prefill_mode\":\"causal_sequential\""
             << ",\"prefill_chunk_tokens\":1"
+            << ",\"session_retention\":true"
             << ",\"request_stream_mode\":\"per_request_nonblocking\""
             << ",\"rope_mode\":\"resident_table\""
             << ",\"kv_dtype\":\"bf16\""
@@ -1127,9 +1191,17 @@ int worker_loop(Model& model) {
               (item.request->context_limit + model.kv_page_tokens() - 1U) /
               model.kv_page_tokens();
         }
+        for (const auto& [key, item] : retained) {
+          static_cast<void>(key);
+          reserved_pages +=
+              (item.request->context_limit + model.kv_page_tokens() - 1U) /
+              model.kv_page_tokens();
+        }
         std::cout << "{\"type\":\"stats\",\"active_requests\":"
-                  << active.size() << ",\"kv_allocated_pages\":"
-                  << active.size() * model.kv_pages_per_request()
+                  << active.size() << ",\"retained_sessions\":"
+                  << retained.size() << ",\"kv_allocated_pages\":"
+                  << (active.size() + retained.size()) *
+                         model.kv_pages_per_request()
                   << ",\"kv_reserved_pages\":" << reserved_pages
                   << ",\"route_observations\":"
                   << scheduler.route_observations
@@ -1289,38 +1361,49 @@ int worker_loop(Model& model) {
                   << worker.mtp_suppressions
                   << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
-        require(fields.size() == 4U, "invalid BEGIN");
+        require(fields.size() == 4U || fields.size() == 6U, "invalid BEGIN");
         const auto id = std::stoull(std::string(fields[1]));
         const auto context = std::stoull(std::string(fields[2]));
         require(id != 0U && !active.contains(id) &&
-                    active.size() < model.capacity() &&
                     context <= model.max_context(),
-                "invalid or over-capacity BEGIN");
-        auto request = model.create_request();
+                "invalid BEGIN");
         const auto prompt = parse_tokens(fields[3]);
-        require(prompt.size() <= context, "prompt exceeds reserved context");
-        request->context_limit = static_cast<std::uint32_t>(context);
-        request->slot = free_slot(active, model.capacity());
-        for (std::uint32_t position = 0U; position < prompt.size(); ++position) {
-          Request* pointer = request.get();
-          request->predicted = model.forward(
-              std::span<Request* const>(&pointer, 1U),
-              std::span<const std::uint32_t>(&prompt[position], 1U),
-              std::span<const std::uint32_t>(&position, 1U)).front();
-          if (model.mtp_enabled()) {
-            const bool final_prompt = position + 1U == prompt.size();
-            const auto next_token = final_prompt
-                ? request->predicted : prompt[position + 1U];
-            model.advance_mtp(*request, next_token,
-                              request->state->current_streams(), position,
-                              final_prompt);
+        if (fields.size() == 6U) {
+          require(fields[4] == "RESUME", "invalid BEGIN resume marker");
+          const auto key = std::stoull(std::string(fields[5]));
+          auto retained_iterator = retained.find(key);
+          require(retained_iterator != retained.end(),
+                  "unknown retained session");
+          auto request = std::move(retained_iterator->second.request);
+          retained.erase(retained_iterator);
+          try {
+            require(request->next_position + prompt.size() <= context,
+                    "prompt exceeds reserved context");
+            request->context_limit = std::max(
+                request->context_limit, static_cast<std::uint32_t>(context));
+            feed_prompt(*request, prompt, request->next_position);
+            const auto slot = request->slot;
+            active.emplace(id, Active{std::move(request)});
+            std::cout << "{\"type\":\"begun\",\"id\":" << id
+                      << ",\"slot\":" << slot << "}\n" << std::flush;
+          } catch (...) {
+            // A failed resume leaves the request state partially
+            // overwritten; destroying it frees the slot for a fresh prefill.
+            throw;
           }
+        } else {
+          require(active.size() + retained.size() < model.capacity(),
+                  "over-capacity BEGIN");
+          auto request = model.create_request();
+          require(prompt.size() <= context, "prompt exceeds reserved context");
+          request->context_limit = static_cast<std::uint32_t>(context);
+          request->slot = free_slot(active, retained, model.capacity());
+          feed_prompt(*request, prompt, 0U);
+          const auto slot = request->slot;
+          active.emplace(id, Active{std::move(request)});
+          std::cout << "{\"type\":\"begun\",\"id\":" << id
+                    << ",\"slot\":" << slot << "}\n" << std::flush;
         }
-        request->next_position = static_cast<std::uint32_t>(prompt.size());
-        const auto slot = request->slot;
-        active.emplace(id, Active{std::move(request)});
-        std::cout << "{\"type\":\"begun\",\"id\":" << id
-                  << ",\"slot\":" << slot << "}\n" << std::flush;
       } else if (fields[0] == "NEXT" || fields[0] == "STEP") {
         std::vector<std::pair<std::uint64_t, bool>> steps;
         std::set<std::uint64_t> unique_ids;
@@ -1419,13 +1502,37 @@ int worker_loop(Model& model) {
         for (const auto& [id, final] : steps)
           if (final) active.erase(id);
       } else if (fields[0] == "END") {
-        require(fields.size() == 2U, "invalid END");
+        require(fields.size() == 2U || fields.size() == 4U,
+                "invalid END");
         const auto id = std::stoull(std::string(fields[1]));
-        require(active.erase(id) == 1U, "END request mismatch");
-        std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
+        if (fields.size() == 4U) {
+          require(fields[2] == "RETAIN", "invalid END retain marker");
+          const auto key = std::stoull(std::string(fields[3]));
+          require(!retained.contains(key), "duplicate retained session");
+          auto iterator = active.find(id);
+          require(id != 0U && iterator != active.end(),
+                  "END request mismatch");
+          const auto tokens = iterator->second.request->next_position;
+          retained.emplace(key, Active{std::move(iterator->second.request)});
+          active.erase(iterator);
+          std::cout << "{\"type\":\"ended\",\"id\":" << id
+                    << ",\"retained_tokens\":" << tokens << "}\n"
+                    << std::flush;
+        } else {
+          require(active.erase(id) == 1U, "END request mismatch");
+          std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
+                    << std::flush;
+        }
+      } else if (fields[0] == "DROP") {
+        require(fields.size() == 2U, "invalid DROP");
+        const auto key = std::stoull(std::string(fields[1]));
+        const bool found = retained.erase(key) == 1U;
+        std::cout << "{\"type\":\"dropped\",\"key\":" << key
+                  << ",\"found\":" << (found ? "true" : "false") << "}\n"
                   << std::flush;
       } else if (fields[0] == "SHUTDOWN") {
-        require(fields.size() == 1U && active.empty(), "invalid SHUTDOWN");
+        require(fields.size() == 1U && active.empty() && retained.empty(),
+                "invalid SHUTDOWN");
         std::cout << "{\"type\":\"shutdown\"}\n" << std::flush;
         return 0;
       } else {
@@ -1434,7 +1541,8 @@ int worker_loop(Model& model) {
     } catch (const std::exception& error) {
       std::cerr << "worker command failed: " << error.what() << '\n';
       std::cout << "{\"type\":\"error\",\"active_requests\":"
-                << active.size() << "}\n" << std::flush;
+                << active.size() << ",\"message\":\""
+                << sanitize_error(error.what()) << "\"}\n" << std::flush;
     }
   }
   return 0;

@@ -656,7 +656,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       entry->validated_compact = compact;
     }
 
-    if (config.retain_host_copy && !entry->host_copy) {
+    if (config.retain_host_copy && !entry->host_copy &&
+        entry->frequency >= config.ram_retention_minimum_frequency) {
       const auto copy_started = std::chrono::steady_clock::now();
       try {
         entry->host_copy = std::make_shared<std::vector<std::byte>>(count);
@@ -807,7 +808,11 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           transition_locked(entry, CacheState::vram_ready);
           Telemetry::add(metrics.upload_completed_);
           Telemetry::add(metrics.uploaded_bytes_, result.uploaded_bytes);
-          if (!config.retain_host_copy) {
+          if (!config.retain_host_copy || !entry.host_copy) {
+            // Either the RAM tier is disabled or the record stayed
+            // pack-resident (below the retention frequency): no pageable copy
+            // exists, so drop the staging lease together with its RAM
+            // reservation instead of charging bytes nothing backs.
             release_host_locked(entry);
           } else {
             // The long-lived RAM tier is pageable. Pinned buffers remain a

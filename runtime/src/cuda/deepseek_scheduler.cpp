@@ -348,7 +348,9 @@ struct DeepSeekDecodeScheduler::Core final {
 
   void pump_prefetch() {
     collect_prefetch();
-    if (inflight_acquires != 0U) return;
+    // Prefetch deliberately runs while demand acquires are in flight: the
+    // demand route is usually resident after a few tokens, and suspending
+    // predictions during every demand read starved the pipeline.
     while (pending_prefetch.size() < config.maximum_inflight_prefetch &&
            !prefetch_queue.empty()) {
       const auto key = prefetch_queue.front();

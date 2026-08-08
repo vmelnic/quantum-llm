@@ -5,7 +5,9 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <iterator>
 #include <list>
 #include <limits>
@@ -14,6 +16,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -35,6 +38,17 @@ struct CudaExpertPool final {
     std::list<ExpertKey>::iterator lru;
   };
 
+  // One upload handed off to the completion thread. The allocation keeps the
+  // device slot alive until the consumer's callback has observed the event;
+  // on a stream error the allocation is dropped before the callback runs,
+  // which returns the slot to the pool through the usual release path.
+  struct PendingCompletion final {
+    cudaEvent_t event{};
+    UploadCompletion completion;
+    std::shared_ptr<IDeviceAllocation> allocation;
+    std::uint64_t bytes{};
+  };
+
   cudaStream_t stream{};
   mutable std::mutex mutex;
   std::uint64_t recycled_capacity_bytes{};
@@ -48,6 +62,16 @@ struct CudaExpertPool final {
   std::map<ExpertKey, CompactEntry> compact_cache;
   std::list<ExpertKey> compact_lru;
   CudaExpertUploaderTelemetry metrics;
+  // Uploads complete through events instead of stream-wide host syncs: the
+  // enqueueing thread only records an event, and this thread blocks on it and
+  // then invokes the completion callback. One stream keeps H2D copies,
+  // admission kernels and staging reuse stream-ordered, so no host-side
+  // serialization is required for correctness.
+  std::mutex completion_mutex;
+  std::condition_variable completion_cv;
+  std::deque<PendingCompletion> pending_completions;
+  bool completion_stop{false};
+  std::thread completion_thread;
 
   void update_device_high_water_locked() noexcept {
     metrics.device_bytes_high_water = std::max(
@@ -121,6 +145,12 @@ struct CudaExpertPool final {
   }
 
   ~CudaExpertPool() {
+    {
+      std::lock_guard lock(completion_mutex);
+      completion_stop = true;
+    }
+    completion_cv.notify_one();
+    if (completion_thread.joinable()) completion_thread.join();
     if (stream != nullptr) {
       for (const auto& [_, slots] : recycled) {
         for (auto* slot : slots) static_cast<void>(cudaFreeAsync(slot, stream));
@@ -134,6 +164,42 @@ struct CudaExpertPool final {
     }
   }
 };
+
+namespace {
+
+// Completion-thread body: drains queued uploads in enqueue order, blocking on
+// each event instead of the whole stream. Runs on its own thread so neither
+// the decode thread nor a storage callback ever pays a stream-wide sync.
+void upload_completion_loop(CudaExpertPool* pool) {
+  for (;;) {
+    CudaExpertPool::PendingCompletion work;
+    {
+      std::unique_lock lock(pool->completion_mutex);
+      pool->completion_cv.wait(lock, [&] {
+        return pool->completion_stop || !pool->pending_completions.empty();
+      });
+      if (pool->pending_completions.empty()) {
+        if (pool->completion_stop) return;
+        continue;
+      }
+      work = std::move(pool->pending_completions.front());
+      pool->pending_completions.pop_front();
+    }
+    const auto error = cudaEventSynchronize(work.event);
+    static_cast<void>(cudaEventDestroy(work.event));
+    if (error != cudaSuccess) {
+      // Dropping the allocation returns the slot to the pool; the consumer
+      // only observes the failure status.
+      work.allocation.reset();
+      work.completion({cuda_failure("expert upload stream", error), {}, 0U});
+      continue;
+    }
+    const auto bytes = work.bytes;
+    work.completion({Status::success(), std::move(work.allocation), bytes});
+  }
+}
+
+}  // namespace
 
 CudaExpertAllocation::CudaExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
@@ -210,6 +276,8 @@ CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
     throw std::runtime_error(std::string("cudaMemPoolSetAttribute: ") +
                              cudaGetErrorString(error));
   }
+  pool_->completion_thread =
+      std::thread(upload_completion_loop, pool_.get());
 }
 
 CudaExpertUploader::~CudaExpertUploader() = default;
@@ -229,6 +297,36 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       sections.gate_up_q_bytes + sections.gate_up_scale_bytes +
       sections.down_q_bytes + sections.down_scale_bytes);
   const auto stream = pool_->stream;
+  // Hands a fully enqueued upload to the completion thread. Only event
+  // publication and admission-launch failures still complete inline; stream
+  // execution errors surface when the completion thread syncs the event.
+  const auto finish_async = [&](std::shared_ptr<IDeviceAllocation> allocation,
+                                std::uint64_t bytes, Status admission) {
+    if (admission.ok()) {
+      cudaEvent_t event{};
+      auto event_error = cudaEventCreateWithFlags(&event, cudaEventDisableTiming);
+      if (event_error == cudaSuccess)
+        event_error = cudaEventRecord(event, stream);
+      if (event_error == cudaSuccess) {
+        {
+          std::lock_guard lock(pool_->completion_mutex);
+          pool_->pending_completions.push_back(
+              CudaExpertPool::PendingCompletion{
+                  event, std::move(completion), std::move(allocation), bytes});
+        }
+        pool_->completion_cv.notify_one();
+        stream_lock.unlock();
+        return;
+      }
+      if (event != nullptr) static_cast<void>(cudaEventDestroy(event));
+      admission = cuda_failure("expert upload event", event_error);
+    }
+    stream_lock.unlock();
+    // The allocation returns its slot to the pool as it goes out of scope,
+    // after the pool lock has been dropped.
+    allocation.reset();
+    completion({admission, {}, 0});
+  };
   if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86 &&
       request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
       pool_->direct_compact_execution) {
@@ -239,7 +337,6 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       error = cudaMemcpyAsync(compact_raw, request.complete_record.data(),
                               compact_bytes, cudaMemcpyHostToDevice, stream);
     }
-    if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
     if (error != cudaSuccess) {
       if (compact_raw != nullptr)
         pool_->release_locked(compact_raw, compact_bytes);
@@ -249,10 +346,9 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
       return operation;
     }
     pool_->metrics.compact_h2d_bytes += compact_bytes;
-    auto allocation = std::make_shared<CudaCompactExpertAllocation>(
-        pool_, compact_raw, compact_bytes, request.compact);
-    stream_lock.unlock();
-    completion({Status::success(), std::move(allocation), compact_bytes});
+    finish_async(std::make_shared<CudaCompactExpertAllocation>(
+                     pool_, compact_raw, compact_bytes, request.compact),
+                 compact_bytes, Status::success());
     return operation;
   }
   void* raw = nullptr;
@@ -376,21 +472,10 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
           admission = cuda_failure("DeepSeek compact release", free_error);
         }
       }
-      const auto synchronize_error = cudaStreamSynchronize(stream);
-      if (admission.ok() && synchronize_error != cudaSuccess) {
-        admission = cuda_failure("DeepSeek compact admission", synchronize_error);
-      }
     }
-    if (!admission.ok()) {
-      pool_->release_locked(raw, total);
-      stream_lock.unlock();
-      completion({admission, {}, 0});
-      return operation;
-    }
-    auto allocation = std::make_shared<CudaExpertAllocation>(
-        pool_, raw, total, gate, gate_scales, down, down_scales);
-    stream_lock.unlock();
-    completion({Status::success(), std::move(allocation), total});
+    finish_async(std::make_shared<CudaExpertAllocation>(
+                     pool_, raw, total, gate, gate_scales, down, down_scales),
+                 total, std::move(admission));
     return operation;
   }
   const auto copy = [&](void* destination, std::uint64_t offset,
@@ -408,24 +493,22 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   if (error == cudaSuccess)
     error = copy(down_scales, sections.down_scale_offset,
                  sections.down_scale_bytes);
-  if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess) {
-    static_cast<void>(cudaStreamSynchronize(stream));
     pool_->release_locked(raw, total);
     stream_lock.unlock();
     completion({cuda_failure("expert H2D", error), {}, 0});
     return operation;
   }
-  auto allocation = std::make_shared<CudaExpertAllocation>(
-      pool_, raw, total, gate, gate_scales, down, down_scales);
-  stream_lock.unlock();
-  completion({Status::success(), std::move(allocation), total});
+  finish_async(std::make_shared<CudaExpertAllocation>(
+                   pool_, raw, total, gate, gate_scales, down, down_scales),
+               total, Status::success());
   return operation;
 }
 
 void CudaExpertUploader::cancel(OperationId) noexcept {
-  // v1 upload is bounded and synchronous; cache abandonment is observed before
-  // the next cache operation.
+  // Uploads complete through the event queue shortly after enqueue; cache
+  // abandonment is observed before the next cache operation, so there is no
+  // mid-flight cancellation to perform here.
 }
 
 }  // namespace expert::runtime::cuda

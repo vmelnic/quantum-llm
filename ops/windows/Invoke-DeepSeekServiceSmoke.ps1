@@ -138,11 +138,19 @@ $rows = (Get-MetricValue $after "expert_service_decode_rows_total") -
 $expectedRows = [int]$response.usage.completion_tokens +
     [int]$chat.usage.completion_tokens +
     [int]$responses.usage.output_tokens
+# Session retention intentionally keeps worker state between turns; every
+# reserved/allocated KV page must be accounted to a retained session.
+$retainedSessions = [int]$afterInfo.worker_sessions.retained
+$retainedPages = [int]$afterInfo.worker_sessions.reserved_pages
+$pagesPerRequest = [int][Math]::Ceiling(
+    [double]$afterInfo.runtime_config.max_context /
+    [double]$afterInfo.worker_kv.page_tokens)
 if ($completed -ne 3 -or $generated -ne $expectedRows -or
     $rows -lt 3 -or $rows -gt $generated -or
     [int]$afterInfo.active_requests -ne 0 -or
-    [int]$afterInfo.worker_kv.reserved_pages -ne 0 -or
-    [int]$afterInfo.worker_kv.allocated_pages -ne 0) {
+    [int]$afterInfo.worker_kv.reserved_pages -ne $retainedPages -or
+    [int]$afterInfo.worker_kv.allocated_pages -ne
+        ($retainedSessions * $pagesPerRequest)) {
     throw "DeepSeek request resources or counters did not settle"
 }
 
@@ -170,7 +178,9 @@ $result = [PSCustomObject]@{
     completed_delta = $completed
     generated_tokens_delta = $generated
     decode_rows_delta = $rows
-    context_released = $true
+    retained_sessions = $retainedSessions
+    retained_reserved_pages = $retainedPages
+    context_settled = $true
     ttft_p95_seconds = Get-MetricValue $after `
         "expert_service_ttft_seconds_p95"
     inter_token_p95_seconds = Get-MetricValue $after `

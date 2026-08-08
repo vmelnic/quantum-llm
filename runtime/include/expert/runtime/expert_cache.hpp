@@ -87,6 +87,12 @@ struct ExpertCacheConfig final {
   // Safe only after a complete catalog has authenticated an immutable source.
   // Geometry and ABI validation remain mandatory on every admission.
   bool trusted_immutable_source{false};
+  // Minimum access frequency before a record earns its pageable RAM copy at
+  // upload time. One (the default) retains every record on first upload;
+  // higher values leave first-touch records pack-resident on the immutable
+  // source and skip the retention memcpy until demand repeats. Appended last
+  // to keep positional aggregate initializers source-compatible.
+  std::uint32_t ram_retention_minimum_frequency{1};
 };
 
 class ExpertLease final {
