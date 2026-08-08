@@ -170,7 +170,11 @@ selection. Interactive commands are:
 | `quit` or `exit` | close chat and its SSH tunnel |
 
 The client resends the full retained history on every turn. Use `/clear`
-before the history plus requested output reaches `MODEL_MAX_CONTEXT`.
+before the history plus requested output reaches `MODEL_MAX_CONTEXT`. The
+server retains the conversation's worker state between turns (LRU-bounded by
+worker slots and KV capacity, idle-expiring after `--session-idle-seconds`),
+so a continuing conversation prefills only each turn's new tokens; a `/clear`
+or a divergent history simply falls back to a full prefill.
 
 ## 5. Use the OpenAI-compatible API
 

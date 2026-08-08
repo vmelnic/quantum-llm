@@ -269,17 +269,23 @@ pass.
 
 The local line-framed protocol supports:
 
-- startup `ready` with protocol/capacity, causal prefill chunk size, and KV page
-  geometry;
-- protocol-v4 `BEGIN` with an exact context reservation, then position-ordered
-  causal prefill in chunks no larger than the advertised worker capacity;
+- startup `ready` with protocol/capacity, causal prefill chunk size, session
+  retention support, and KV page geometry;
+- protocol-v5 `BEGIN` with an exact context reservation, then position-ordered
+  causal prefill in chunks decoupled from the decode batch capacity (Qwen);
+  `BEGIN … RESUME <key>` reuses a retained slot and prefills only the delta
+  tokens of a continued conversation;
 - explicit placement-prefetch state and a token list for the MTP boundary,
   with front-end compatibility for the existing Qwen runner's older scalar
   token and inferred-prefetch forms;
 - `STEP` to decode several active request IDs together;
-- `STATS` for current KV page allocation/reservation;
-- `END` to release/cancel request state;
-- `SHUTDOWN` for orderly worker exit.
+- `STATS` for KV page allocation/reservation plus cumulative phase, cache,
+  and scheduler counters used for per-request telemetry deltas;
+- `END` to release/cancel request state, or `END … RETAIN <key>` to park the
+  slot's KV/recurrent state as a retained session; `DROP <key>` evicts a
+  retained session (LRU/idle pressure from the front-end);
+- `SHUTDOWN` for orderly worker exit (all requests ended, no retained
+  sessions).
 
 Unexpected message type, duplicate ID, invalid capacity or mismatched response
 is fatal to the affected control flow. The front-end serializes worker commands

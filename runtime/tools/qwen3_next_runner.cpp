@@ -547,7 +547,8 @@ class Qwen3NextModel final {
                  std::uint32_t capacity = 1,
                  std::uint64_t kv_cache_bytes = 2ULL << 30U,
                  std::uint32_t kv_page_tokens = 256,
-                 std::string_view placement_profile = "balanced")
+                 std::string_view placement_profile = "balanced",
+                 std::uint32_t prefill_chunk_tokens = 0)
       : root_(root), max_context_(max_context), capacity_(capacity),
         ram_cache_bytes_(ram_cache_bytes),
         vram_cache_bytes_(vram_cache_bytes), kv_cache_bytes_(kv_cache_bytes),
@@ -555,6 +556,14 @@ class Qwen3NextModel final {
         placement_profile_(placement_profile) {
     if (!capacity_ || !max_context_ || !kv_cache_bytes_ || !kv_page_tokens_)
       throw std::runtime_error("zero request/KV capacity");
+    // Prefill batching is decoupled from the decode batch capacity: wide
+    // causal chunks reuse the same per-slot state but need their own row
+    // workspace.
+    prefill_chunk_tokens_ =
+        prefill_chunk_tokens ? prefill_chunk_tokens : capacity_;
+    if (prefill_chunk_tokens_ > max_context_)
+      throw std::runtime_error("prefill chunk exceeds configured context");
+    workspace_rows_ = std::max(capacity_, prefill_chunk_tokens_);
     expert::runtime::AdaptivePlacementConfig placement_config;
     if (placement_profile_ == "latency") {
       placement_config.minimum_recent_observations = 1;
@@ -633,8 +642,8 @@ class Qwen3NextModel final {
     route_score_sums_.resize(experts_);
     route_score_maxima_.resize(experts_);
     route_accesses_.reserve(experts_);
-    routed_expert_keys_.reserve(capacity_ * top_k_);
-    missing_expert_keys_.reserve(capacity_ * top_k_);
+    routed_expert_keys_.reserve(workspace_rows_ * top_k_);
+    missing_expert_keys_.reserve(workspace_rows_ * top_k_);
 
     const auto slot_bytes = static_cast<std::size_t>(max_expert_record_bytes_);
     const auto slot_count = std::max<std::size_t>(top_k_ * 2U, 32U);
@@ -642,7 +651,17 @@ class Qwen3NextModel final {
     uploader_ = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
     directory_ =
         std::make_shared<expert::runtime::cuda::CudaExpertDirectory>(
-            model_id_, 1, layers_, experts_, capacity_ * top_k_);
+            model_id_, 1, layers_, experts_, workspace_rows_ * top_k_);
+    {
+      auto plan_workspace = directory_->create_plan_workspace();
+      if (!plan_workspace.status.ok() || !plan_workspace.workspace)
+        throw std::runtime_error(
+            std::string("CUDA directory plan workspace: ") +
+            std::string(plan_workspace.status.ok()
+                            ? "unavailable"
+                            : plan_workspace.status.message()));
+      plan_workspace_ = std::move(plan_workspace.workspace);
+    }
     buffers_ = std::make_shared<expert::runtime::FixedBufferPool>(
         slot_count, slot_bytes, expert::runtime::kExpertPackAlignment,
         std::make_shared<expert::runtime::CudaPinnedAllocator>());
@@ -699,13 +718,14 @@ class Qwen3NextModel final {
       std::span<const std::uint32_t> tokens,
       std::span<const std::uint32_t> positions,
       std::span<const std::uint32_t> state_slots = {},
-      bool causal_same_slot = false) {
+      bool causal_same_slot = false,
+      std::span<const std::uint32_t> head_rows = {}) {
     const auto forward_started = std::chrono::steady_clock::now();
     const auto cpu_expert_before = phase_.cpu_expert_ns;
     const auto gpu_expert_before = phase_.gpu_expert_ns;
     const auto expert_compute_before = phase_.expert_compute_ns;
     if (tokens.empty() || tokens.size() != positions.size() ||
-        tokens.size() > capacity_ ||
+        tokens.size() > workspace_rows_ ||
         (!state_slots.empty() && state_slots.size() != tokens.size()))
       throw std::runtime_error("invalid Qwen3-Next microbatch");
     if (causal_same_slot && state_slots.empty())
@@ -717,6 +737,20 @@ class Qwen3NextModel final {
       std::iota(default_slots.begin(), default_slots.end(), 0U);
       state_slots = default_slots;
     }
+    // Only the rows listed in head_rows run the vocabulary head; an empty
+    // list means every row (the decode path). The logits/argmax workspace is
+    // sized for capacity_ rows, so partial heads must fit within it.
+    std::vector<std::uint32_t> default_heads;
+    if (head_rows.empty()) {
+      default_heads.resize(rows);
+      std::iota(default_heads.begin(), default_heads.end(), 0U);
+      head_rows = default_heads;
+    }
+    if (head_rows.size() > capacity_)
+      throw std::runtime_error("head rows exceed logits workspace");
+    for (const auto row : head_rows)
+      if (row >= rows)
+        throw std::runtime_error("head row outside microbatch");
     std::vector<bool> seen_slots(capacity_);
     for (std::uint32_t row = 0; row < rows; ++row) {
       if (positions[row] >= max_context_ || tokens[row] >= vocab_)
@@ -767,22 +801,32 @@ class Qwen3NextModel final {
       run_moe(prefix, layer, positions, state_slots, rows);
     }
     const auto final_head_started = std::chrono::steady_clock::now();
-    for (std::uint32_t row = 0; row < rows; ++row)
+    for (const auto row : head_rows)
       status_check(expert::runtime::cuda::qwen3_next_rms_norm(
           hidden_state_ + static_cast<std::size_t>(row) * hidden_,
           fp32("model.norm.weight"),
           normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
           epsilon_, nullptr));
-    if (rows == 1) {
-      status_check(expert::runtime::cuda::gemv_batch(
-          matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+    const auto head_count = static_cast<std::uint32_t>(head_rows.size());
+    std::vector<std::uint32_t> result(head_rows.size());
+    if (head_count == rows) {
+      if (rows == 1) {
+        status_check(expert::runtime::cuda::gemv_batch(
+            matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+      } else {
+        status_check(expert::runtime::cuda::gemv_batch_weight_reuse(
+            matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+      }
     } else {
-      status_check(expert::runtime::cuda::gemv_batch_weight_reuse(
-          matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+      for (std::uint32_t head = 0; head < head_count; ++head)
+        status_check(expert::runtime::cuda::gemv_batch(
+            matrix("lm_head.weight"),
+            normalized_ +
+                static_cast<std::size_t>(head_rows[head]) * hidden_,
+            logits_ + static_cast<std::size_t>(head) * vocab_, 1, nullptr));
     }
     status_check(expert::runtime::cuda::argmax_batch(
-        logits_, vocab_, rows, output_token_, nullptr));
-    std::vector<std::uint32_t> result(rows);
+        logits_, vocab_, head_count, output_token_, nullptr));
     cuda_check(cudaMemcpy(result.data(), output_token_,
                           result.size() * sizeof(result[0]),
                           cudaMemcpyDeviceToHost),
@@ -814,22 +858,28 @@ class Qwen3NextModel final {
   }
 
   std::uint32_t prefill(std::uint32_t slot,
-                        std::span<const std::uint32_t> prompt) {
+                        std::span<const std::uint32_t> prompt,
+                        std::uint32_t start_position = 0) {
     if (prompt.empty()) throw std::runtime_error("empty prefill prompt");
     std::uint32_t predicted = 0;
     std::vector<std::uint32_t> positions;
     std::vector<std::uint32_t> slots;
-    positions.reserve(capacity_);
-    slots.reserve(capacity_);
-    for (std::size_t offset = 0; offset < prompt.size(); offset += capacity_) {
-      const auto rows = static_cast<std::uint32_t>(
-          std::min<std::size_t>(capacity_, prompt.size() - offset));
+    positions.reserve(prefill_chunk_tokens_);
+    slots.reserve(prefill_chunk_tokens_);
+    for (std::size_t offset = 0; offset < prompt.size();
+         offset += prefill_chunk_tokens_) {
+      const auto rows = static_cast<std::uint32_t>(std::min<std::size_t>(
+          prefill_chunk_tokens_, prompt.size() - offset));
       positions.resize(rows);
       slots.assign(rows, slot);
       for (std::uint32_t row = 0; row < rows; ++row)
-        positions[row] = static_cast<std::uint32_t>(offset + row);
+        positions[row] =
+            static_cast<std::uint32_t>(start_position + offset + row);
+      // Only the last row of a chunk needs the vocabulary head; the rest
+      // only extend the slot's attention/recurrent state.
+      const std::array<std::uint32_t, 1> head{rows - 1U};
       predicted = forward_batch(prompt.subspan(offset, rows), positions, slots,
-                                true).back();
+                                true, head).back();
     }
     return predicted;
   }
@@ -865,7 +915,9 @@ class Qwen3NextModel final {
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
-  std::uint32_t prefill_chunk_tokens() const noexcept { return capacity_; }
+  std::uint32_t prefill_chunk_tokens() const noexcept {
+    return prefill_chunk_tokens_;
+  }
   const std::string& placement_profile() const noexcept {
     return placement_profile_;
   }
@@ -874,6 +926,7 @@ class Qwen3NextModel final {
   bool placement_prefetch_enabled() const noexcept {
     return placement_profile_ != "capacity";
   }
+  bool placement_frozen() const noexcept { return placement_->frozen(); }
   std::uint32_t placement_minimum_observations() const noexcept {
     return placement_profile_ == "latency" ? 1U : 2U;
   }
@@ -965,6 +1018,23 @@ class Qwen3NextModel final {
       }
     }
   }
+  void grow_slot(std::uint32_t slot, std::uint32_t context_tokens) {
+    if (slot >= capacity_ || !context_tokens || context_tokens > max_context_)
+      throw std::runtime_error("invalid slot context growth");
+    if (!slot_context_limits_[slot])
+      throw std::runtime_error("slot has no context reservation to grow");
+    if (context_tokens <= slot_context_limits_[slot]) return;
+    const auto pages = (static_cast<std::uint64_t>(context_tokens) +
+                        kv_page_tokens_ - 1U) / kv_page_tokens_;
+    const auto current =
+        static_cast<std::uint64_t>(slot_kv_pages_[slot].size());
+    if (pages - current > kv_page_capacity_ - kv_reserved_pages_)
+      throw std::runtime_error("KV page credits exhausted");
+    slot_kv_pages_[slot].resize(static_cast<std::size_t>(pages), nullptr);
+    kv_reserved_pages_ += pages - current;
+    slot_context_limits_[slot] = context_tokens;
+  }
+
   void reset_request() {
     const auto conv_elements =
         (static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
@@ -1057,60 +1127,63 @@ class Qwen3NextModel final {
         static_cast<std::size_t>(2U) * value_heads_ * value_head_dim_;
     const auto conv_size = static_cast<std::size_t>(2U) * key_heads_ * key_head_dim_ +
                            static_cast<std::size_t>(value_heads_) * value_head_dim_;
-    hidden_state_ = device_allocate<float>(capacity_ * hidden_);
-    normalized_ = device_allocate<float>(capacity_ * hidden_);
-    residual_ = device_allocate<float>(capacity_ * hidden_);
-    query_gate_ = device_allocate<float>(capacity_ * query_size);
-    key_ = device_allocate<float>(capacity_ * key_value_size);
-    value_ = device_allocate<float>(capacity_ * key_value_size);
-    attention_ = device_allocate<float>(capacity_ * query_heads_ * head_dim_);
-    projected_qkvz_ = device_allocate<float>(capacity_ * projected_size);
-    projected_ba_ = device_allocate<float>(capacity_ * 2U * value_heads_);
+    const auto rows = workspace_rows_;
+    hidden_state_ = device_allocate<float>(rows * hidden_);
+    normalized_ = device_allocate<float>(rows * hidden_);
+    residual_ = device_allocate<float>(rows * hidden_);
+    query_gate_ = device_allocate<float>(rows * query_size);
+    key_ = device_allocate<float>(rows * key_value_size);
+    value_ = device_allocate<float>(rows * key_value_size);
+    attention_ = device_allocate<float>(rows * query_heads_ * head_dim_);
+    projected_qkvz_ = device_allocate<float>(rows * projected_size);
+    projected_ba_ = device_allocate<float>(rows * 2U * value_heads_);
     delta_output_ =
-        device_allocate<float>(capacity_ * value_heads_ * value_head_dim_);
-    conv_output_ = device_allocate<float>(capacity_ * conv_size);
-    shared_gate_ = device_allocate<float>(capacity_ * shared_width_);
-    shared_up_ = device_allocate<float>(capacity_ * shared_width_);
-    shared_intermediate_ = device_allocate<float>(capacity_ * shared_width_);
-    shared_output_ = device_allocate<float>(capacity_ * hidden_);
-    shared_scalar_ = device_allocate<float>(capacity_);
-    router_logits_ = device_allocate<float>(capacity_ * experts_);
-    routing_scores_ = device_allocate<float>(capacity_ * top_k_);
+        device_allocate<float>(rows * value_heads_ * value_head_dim_);
+    conv_output_ = device_allocate<float>(rows * conv_size);
+    shared_gate_ = device_allocate<float>(rows * shared_width_);
+    shared_up_ = device_allocate<float>(rows * shared_width_);
+    shared_intermediate_ = device_allocate<float>(rows * shared_width_);
+    shared_output_ = device_allocate<float>(rows * hidden_);
+    shared_scalar_ = device_allocate<float>(rows);
+    router_logits_ = device_allocate<float>(rows * experts_);
+    routing_scores_ = device_allocate<float>(rows * top_k_);
     routing_indices_ =
-        device_allocate<std::uint32_t>(capacity_ * top_k_);
+        device_allocate<std::uint32_t>(rows * top_k_);
     moe_intermediate_ = device_allocate<float>(
-        static_cast<std::size_t>(capacity_) * top_k_ * expert_width_);
+        static_cast<std::size_t>(rows) * top_k_ * expert_width_);
     moe_selection_output_ = device_allocate<float>(
-        static_cast<std::size_t>(capacity_) * top_k_ * hidden_);
+        static_cast<std::size_t>(rows) * top_k_ * hidden_);
     cpu_selection_output_device_ = device_allocate<float>(
-        static_cast<std::size_t>(capacity_) * top_k_ * hidden_);
+        static_cast<std::size_t>(rows) * top_k_ * hidden_);
     gpu_selection_mask_ =
-        device_allocate<std::uint8_t>(capacity_ * top_k_);
+        device_allocate<std::uint8_t>(rows * top_k_);
     cpu_slot_by_selection_ =
-        device_allocate<std::uint32_t>(capacity_ * top_k_);
-    moe_output_ = device_allocate<float>(capacity_ * hidden_);
+        device_allocate<std::uint32_t>(rows * top_k_);
+    moe_output_ = device_allocate<float>(rows * hidden_);
+    // The vocabulary head only ever runs for decode rows or one prefill row,
+    // so logits stay sized by the decode batch capacity.
     logits_ = device_allocate<float>(capacity_ * vocab_);
     output_token_ = device_allocate<std::uint32_t>(capacity_);
     cuda_check(cudaHostAlloc(
                    reinterpret_cast<void**>(&host_normalized_),
-                   static_cast<std::size_t>(capacity_) * hidden_ * sizeof(float),
+                   static_cast<std::size_t>(rows) * hidden_ * sizeof(float),
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU expert input");
     cuda_check(cudaHostAlloc(
                    reinterpret_cast<void**>(&host_routing_indices_),
-                   static_cast<std::size_t>(capacity_) * top_k_ *
+                   static_cast<std::size_t>(rows) * top_k_ *
                        sizeof(std::uint32_t),
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU route indices");
     cuda_check(cudaHostAlloc(
                    reinterpret_cast<void**>(&host_routing_scores_),
-                   static_cast<std::size_t>(capacity_) * top_k_ *
+                   static_cast<std::size_t>(rows) * top_k_ *
                        sizeof(float),
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU route scores");
     cuda_check(cudaHostAlloc(
                    reinterpret_cast<void**>(&host_cpu_selection_output_),
-                   static_cast<std::size_t>(capacity_) * top_k_ * hidden_ *
+                   static_cast<std::size_t>(rows) * top_k_ * hidden_ *
                        sizeof(float),
                    cudaHostAllocDefault),
                "cudaHostAlloc CPU expert output");
@@ -1288,11 +1361,29 @@ class Qwen3NextModel final {
         top_k_, router_logits_, routing_scores_, routing_indices_, nullptr));
     cuda_check(cudaEventRecord(router_done_event_), "record router done");
 
+    // Launch the directory plan on the same stream right behind the router;
+    // its results are consumed through a completion event instead of a
+    // stream-wide host synchronization.
+    struct PlanGuard final {
+      expert::runtime::cuda::CudaExpertDirectory* directory{};
+      expert::runtime::cuda::CudaDirectoryPlanWorkspace* workspace{};
+      bool active{};
+      ~PlanGuard() {
+        if (active && directory != nullptr && workspace != nullptr)
+          static_cast<void>(directory->cancel_plan_async(*workspace));
+      }
+    } plan_guard{directory_.get(), plan_workspace_.get(), false};
+    status_check(directory_->begin_plan_async(
+        *plan_workspace_, layer, routing_indices_, rows * top_k_, nullptr,
+        true));
+    plan_guard.active = true;
+
     const auto cache_started = std::chrono::steady_clock::now();
     std::vector<expert::runtime::ExpertLease> leases;
     std::vector<expert::runtime::HostExpertLease> host_leases;
     std::vector<expert::runtime::cpu::ExpertWorkGroup> cpu_groups;
     std::vector<std::uint32_t> cpu_experts;
+    std::vector<std::uint32_t> cpu_group_expert;
     if (!placement_->frozen()) placement_->poll();
     std::uint64_t route_pin_id = 0U;
     struct PinGuard final {
@@ -1306,8 +1397,13 @@ class Qwen3NextModel final {
     } pin_guard{directory_.get(), &route_pin_id};
     bool split_execution = false;
     std::uint32_t compact_cpu_selection_count = 0;
-    auto plan = directory_->pin_or_collect_misses(
-        layer, routing_indices_, rows * top_k_, nullptr, true);
+    status_check(directory_->wait_plan_async(*plan_workspace_));
+    auto polled_plan = directory_->poll_plan_async(*plan_workspace_);
+    status_check(polled_plan.status);
+    if (!polled_plan.complete)
+      throw std::runtime_error("directory plan incomplete after wait");
+    plan_guard.active = false;
+    auto plan = std::move(polled_plan.plan);
     status_check(plan.status);
     route_pin_id = plan.pin_id;
     routed_expert_keys_.clear();
@@ -1481,9 +1577,12 @@ class Qwen3NextModel final {
 
       std::unordered_map<std::uint32_t, std::size_t> cpu_group_by_expert;
       cpu_groups.reserve(cpu_experts.size());
+      cpu_group_expert.clear();
+      cpu_group_expert.reserve(cpu_experts.size());
       for (std::size_t index = 0; index < cpu_experts.size(); ++index) {
         const auto host_slot = host_slot_by_expert.at(cpu_experts[index]);
         cpu_group_by_expert.emplace(cpu_experts[index], index);
+        cpu_group_expert.push_back(cpu_experts[index]);
         cpu_groups.push_back({host_leases[host_slot].bytes(),
                               host_leases[host_slot].sections(), {}, {}});
       }
@@ -1496,14 +1595,27 @@ class Qwen3NextModel final {
       }
       std::vector<std::uint8_t> gpu_mask(selection_count, 1);
       std::vector<std::uint32_t> cpu_slot_by_selection(selection_count, 0);
+      // The CPU executor blocks an expert's work group at 32 selections;
+      // wide prefill chunks must spill into follow-up groups for the same
+      // expert instead of violating that bound.
+      constexpr std::size_t kCpuGroupSelectionLimit = 32;
       for (std::uint32_t selection = 0; selection < selection_count;
            ++selection) {
         const auto expert = host_routing_indices_[selection];
         const auto cpu_group = cpu_group_by_expert.find(expert);
         if (cpu_group != cpu_group_by_expert.end()) {
           gpu_mask[selection] = 0;
-          cpu_groups[cpu_group->second].selections.push_back(selection);
-          cpu_groups[cpu_group->second].output_slots.push_back(
+          std::size_t group_index = cpu_group->second;
+          if (cpu_groups[group_index].selections.size() ==
+              kCpuGroupSelectionLimit) {
+            cpu_groups.push_back({cpu_groups[group_index].record_bytes,
+                                  cpu_groups[group_index].sections, {}, {}});
+            group_index = cpu_groups.size() - 1U;
+            cpu_group->second = group_index;
+            cpu_group_expert.push_back(expert);
+          }
+          cpu_groups[group_index].selections.push_back(selection);
+          cpu_groups[group_index].output_slots.push_back(
               compact_cpu_selection_count);
           cpu_slot_by_selection[selection] = compact_cpu_selection_count++;
         }
@@ -1617,7 +1729,7 @@ class Qwen3NextModel final {
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, moe_output_, rows * hidden_, nullptr));
       if (route_pin_id != 0U) {
-        status_check(directory_->release_pins(route_pin_id, nullptr));
+        status_check(directory_->release_pins_async(route_pin_id, nullptr));
         route_pin_id = 0U;
       } else {
         cuda_check(cudaStreamSynchronize(nullptr),
@@ -1625,7 +1737,7 @@ class Qwen3NextModel final {
       }
       if (!placement_->frozen()) {
         for (std::size_t index = 0; index < cpu_groups.size(); ++index) {
-          const auto expert = cpu_experts.at(index);
+          const auto expert = cpu_group_expert.at(index);
           const auto& record = expert_records_.at(
               static_cast<std::size_t>(layer) * experts_ + expert);
           placement_->consider(
@@ -1639,6 +1751,7 @@ class Qwen3NextModel final {
 
   std::filesystem::path root_;
   std::uint32_t max_context_{}, capacity_{}, full_attention_layers_{};
+  std::uint32_t prefill_chunk_tokens_{}, workspace_rows_{};
   std::uint32_t hidden_{}, expert_width_{}, vocab_{}, layers_{};
   std::uint32_t query_heads_{}, kv_heads_{}, head_dim_{}, experts_{}, top_k_{};
   std::uint32_t full_interval_{}, conv_kernel_{}, key_head_dim_{},
@@ -1666,6 +1779,8 @@ class Qwen3NextModel final {
   std::shared_ptr<expert::runtime::WindowsIocpStorage> storage_;
   std::shared_ptr<expert::runtime::cuda::CudaExpertUploader> uploader_;
   std::shared_ptr<expert::runtime::cuda::CudaExpertDirectory> directory_;
+  std::shared_ptr<expert::runtime::cuda::CudaDirectoryPlanWorkspace>
+      plan_workspace_;
   std::shared_ptr<expert::runtime::FixedBufferPool> buffers_;
   std::unique_ptr<expert::runtime::ExpertCache> cache_;
   std::unique_ptr<expert::runtime::cpu::ExpertExecutor> cpu_executor_;
@@ -1769,14 +1884,50 @@ struct WorkerRequest final {
   std::uint32_t next_position{};
 };
 
-int worker_loop(Qwen3NextModel& model) {
+struct RetainedRequest final {
+  std::uint32_t slot{};
+  std::uint32_t tokens{};
+};
+
+std::string sanitize_error(std::string_view message) {
+  std::string result;
+  result.reserve(message.size());
+  for (const char character : message) {
+    if (character == '\t' || character == '\n' || character == '\r' ||
+        character == '"')
+      result += ' ';
+    else if (character == '\\')
+      result += '/';
+    else
+      result += character;
+  }
+  return result;
+}
+
+int worker_loop(Qwen3NextModel& model, std::uint32_t settle_after_steps) {
   std::unordered_map<std::uint64_t, WorkerRequest> active;
+  std::unordered_map<std::uint64_t, RetainedRequest> retained;
   std::vector<bool> used_slots(model.capacity());
-  std::cout << "{\"type\":\"ready\",\"protocol\":4,\"capacity\":"
+  // Decode-step counter driving the one-time placement freeze. Once the
+  // warmup boundary is reached the planner is quiesced and frozen, which
+  // retires the per-layer routing-feedback D2H copies on the hot path.
+  std::uint64_t decode_steps = 0;
+  bool placement_settled = false;
+  const auto maybe_settle_placement = [&]() {
+    if (placement_settled || settle_after_steps == 0U) return;
+    if (++decode_steps < settle_after_steps) return;
+    model.settle_placement();
+    placement_settled = true;
+    std::cerr << "worker placement settled after " << decode_steps
+              << " decode steps\n";
+  };
+  std::cout << "{\"type\":\"ready\",\"protocol\":5,\"capacity\":"
             << model.capacity()
             << ",\"prefill_mode\":\"causal_chunked\""
             << ",\"prefill_chunk_tokens\":"
-            << model.prefill_chunk_tokens() << ",\"kv_page_tokens\":"
+            << model.prefill_chunk_tokens()
+            << ",\"session_retention\":true"
+            << ",\"kv_page_tokens\":"
             << model.kv_page_tokens() << ",\"kv_page_bytes\":"
             << model.kv_page_bytes() << ",\"kv_page_capacity\":"
             << model.kv_page_capacity()
@@ -1792,7 +1943,9 @@ int worker_loop(Qwen3NextModel& model) {
             << (model.placement_prefetch_enabled() ? "ready" : "disabled")
             << "\""
             << ",\"placement_minimum_observations\":"
-            << model.placement_minimum_observations() << "}\n" << std::flush;
+            << model.placement_minimum_observations()
+            << ",\"placement_settle_after_steps\":" << settle_after_steps
+            << "}\n" << std::flush;
   std::string line;
   while (std::getline(std::cin, line)) {
     try {
@@ -1802,12 +1955,45 @@ int worker_loop(Qwen3NextModel& model) {
         std::cout << "{\"type\":\"pong\"}\n" << std::flush;
       } else if (fields[0] == "STATS") {
         if (fields.size() != 1) throw std::runtime_error("invalid STATS");
-        std::cout << "{\"type\":\"stats\",\"kv_allocated_pages\":"
+        const auto phase = model.phase_telemetry();
+        const auto cache = model.telemetry();
+        std::cout << "{\"type\":\"stats\",\"placement_frozen\":"
+                  << (model.placement_frozen() ? "true" : "false")
+                  << ",\"kv_allocated_pages\":"
                   << model.kv_allocated_pages()
                   << ",\"kv_reserved_pages\":"
-                  << model.kv_reserved_pages() << "}\n" << std::flush;
+                  << model.kv_reserved_pages()
+                  << ",\"retained_sessions\":" << retained.size()
+                  << ",\"forward_calls\":" << phase.forward_calls
+                  << ",\"forward_wall_ns\":" << phase.forward_wall_ns
+                  << ",\"dense_router_ns\":" << phase.dense_router_ns
+                  << ",\"attention_delta_ns\":" << phase.attention_delta_ns
+                  << ",\"shared_expert_ns\":" << phase.shared_expert_ns
+                  << ",\"router_ns\":" << phase.router_ns
+                  << ",\"expert_cache_wait_ns\":"
+                  << phase.expert_cache_wait_ns
+                  << ",\"expert_compute_ns\":" << phase.expert_compute_ns
+                  << ",\"cpu_expert_ns\":" << phase.cpu_expert_ns
+                  << ",\"gpu_expert_ns\":" << phase.gpu_expert_ns
+                  << ",\"cpu_gpu_overlap_ns\":" << phase.cpu_gpu_overlap_ns
+                  << ",\"final_head_ns\":" << phase.final_head_ns
+                  << ",\"cpu_expert_selections\":"
+                  << phase.cpu_expert_selections
+                  << ",\"gpu_expert_selections\":"
+                  << phase.gpu_expert_selections
+                  << ",\"useful_prefetches\":" << phase.useful_prefetches
+                  << ",\"wasted_prefetches\":" << phase.wasted_prefetches
+                  << ",\"cache_read_bytes\":" << cache.read_bytes
+                  << ",\"cache_uploaded_bytes\":" << cache.uploaded_bytes
+                  << ",\"cache_vram_hits\":" << cache.acquire_vram_hits
+                  << ",\"cache_ram_hits\":" << cache.acquire_ram_hits
+                  << ",\"cache_ssd_misses\":" << cache.acquire_ssd_misses
+                  << ",\"cache_storage_wait_ns\":" << cache.storage_wait_ns
+                  << ",\"cache_upload_wait_ns\":" << cache.upload_wait_ns
+                  << "}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
-        if (fields.size() != 4) throw std::runtime_error("invalid BEGIN");
+        if (fields.size() != 4 && fields.size() != 6)
+          throw std::runtime_error("invalid BEGIN");
         const auto request_id = std::stoull(std::string(fields[1]));
         const auto context_limit_u64 = std::stoull(std::string(fields[2]));
         if (context_limit_u64 > std::numeric_limits<std::uint32_t>::max())
@@ -1816,28 +2002,61 @@ int worker_loop(Qwen3NextModel& model) {
             static_cast<std::uint32_t>(context_limit_u64);
         if (!request_id || active.contains(request_id))
           throw std::runtime_error("invalid or duplicate request id");
-        const auto available =
-            std::find(used_slots.begin(), used_slots.end(), false);
-        if (available == used_slots.end())
-          throw std::runtime_error("worker request capacity exhausted");
-        const auto slot = static_cast<std::uint32_t>(
-            std::distance(used_slots.begin(), available));
         const auto prompt = parse_tokens(fields[3]);
-        used_slots[slot] = true;
-        try {
-          model.reserve_slot(slot, context_limit);
-          const auto predicted = model.prefill(slot, prompt);
-          active.emplace(
-              request_id, WorkerRequest{
-                              slot, predicted,
-                              static_cast<std::uint32_t>(prompt.size())});
-        } catch (...) {
-          model.release_slot(slot);
-          used_slots[slot] = false;
-          throw;
+        if (fields.size() == 6) {
+          if (fields[4] != "RESUME")
+            throw std::runtime_error("invalid BEGIN resume marker");
+          const auto key = std::stoull(std::string(fields[5]));
+          const auto retained_iterator = retained.find(key);
+          if (retained_iterator == retained.end())
+            throw std::runtime_error("unknown retained session");
+          const auto slot = retained_iterator->second.slot;
+          const auto base = retained_iterator->second.tokens;
+          if (static_cast<std::uint64_t>(base) + prompt.size() >
+              context_limit)
+            throw std::runtime_error("BEGIN context limit below resume length");
+          try {
+            model.grow_slot(slot, context_limit);
+            const auto predicted = model.prefill(slot, prompt, base);
+            active.emplace(request_id,
+                           WorkerRequest{slot, predicted,
+                                         base + static_cast<std::uint32_t>(
+                                                    prompt.size())});
+            retained.erase(retained_iterator);
+          } catch (...) {
+            // A failed resume leaves the slot state partially overwritten;
+            // drop it so the server can fall back to a fresh prefill.
+            model.release_slot(slot);
+            used_slots[slot] = false;
+            retained.erase(retained_iterator);
+            throw;
+          }
+          std::cout << "{\"type\":\"begun\",\"id\":" << request_id
+                    << ",\"slot\":" << slot << ",\"resumed_tokens\":" << base
+                    << "}\n" << std::flush;
+        } else {
+          const auto available =
+              std::find(used_slots.begin(), used_slots.end(), false);
+          if (available == used_slots.end())
+            throw std::runtime_error("worker request capacity exhausted");
+          const auto slot = static_cast<std::uint32_t>(
+              std::distance(used_slots.begin(), available));
+          used_slots[slot] = true;
+          try {
+            model.reserve_slot(slot, context_limit);
+            const auto predicted = model.prefill(slot, prompt);
+            active.emplace(
+                request_id, WorkerRequest{
+                                slot, predicted,
+                                static_cast<std::uint32_t>(prompt.size())});
+          } catch (...) {
+            model.release_slot(slot);
+            used_slots[slot] = false;
+            throw;
+          }
+          std::cout << "{\"type\":\"begun\",\"id\":" << request_id
+                    << ",\"slot\":" << slot << "}\n" << std::flush;
         }
-        std::cout << "{\"type\":\"begun\",\"id\":" << request_id
-                  << ",\"slot\":" << slot << "}\n" << std::flush;
       } else if (fields[0] == "NEXT") {
         if (fields.size() != 3) throw std::runtime_error("invalid NEXT");
         const auto id = std::stoull(std::string(fields[1]));
@@ -1857,6 +2076,7 @@ int worker_loop(Qwen3NextModel& model) {
         }
           std::cout << "{\"type\":\"token\",\"id\":" << id
                     << ",\"tokens\":[" << token << "]}\n" << std::flush;
+        if (!final) maybe_settle_placement();
         if (final) {
           model.release_slot(iterator->second.slot);
           used_slots[iterator->second.slot] = false;
@@ -1911,6 +2131,7 @@ int worker_loop(Qwen3NextModel& model) {
                     << ",\"tokens\":[" << steps[index].token << "]}";
         }
         std::cout << "]}\n" << std::flush;
+        if (!tokens.empty()) maybe_settle_placement();
         for (const auto& step : steps) {
           if (step.final) {
             const auto slot = active.at(step.id).slot;
@@ -1920,19 +2141,47 @@ int worker_loop(Qwen3NextModel& model) {
           }
         }
       } else if (fields[0] == "END") {
-        if (fields.size() != 2)
+        if (fields.size() != 2 && fields.size() != 4)
           throw std::runtime_error("END request mismatch");
         const auto id = std::stoull(std::string(fields[1]));
         const auto iterator = active.find(id);
         if (!id || iterator == active.end())
           throw std::runtime_error("END request mismatch");
-        model.release_slot(iterator->second.slot);
-        used_slots[iterator->second.slot] = false;
-        active.erase(iterator);
-        std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
+        if (fields.size() == 4) {
+          if (fields[2] != "RETAIN")
+            throw std::runtime_error("invalid END retain marker");
+          const auto key = std::stoull(std::string(fields[3]));
+          if (retained.contains(key))
+            throw std::runtime_error("duplicate retained session");
+          const auto slot = iterator->second.slot;
+          const auto tokens = iterator->second.next_position;
+          retained.emplace(key, RetainedRequest{slot, tokens});
+          active.erase(iterator);
+          std::cout << "{\"type\":\"ended\",\"id\":" << id
+                    << ",\"retained_tokens\":" << tokens << "}\n"
+                    << std::flush;
+        } else {
+          model.release_slot(iterator->second.slot);
+          used_slots[iterator->second.slot] = false;
+          active.erase(iterator);
+          std::cout << "{\"type\":\"ended\",\"id\":" << id << "}\n"
+                    << std::flush;
+        }
+      } else if (fields[0] == "DROP") {
+        if (fields.size() != 2) throw std::runtime_error("invalid DROP");
+        const auto key = std::stoull(std::string(fields[1]));
+        const auto iterator = retained.find(key);
+        const bool found = iterator != retained.end();
+        if (found) {
+          model.release_slot(iterator->second.slot);
+          used_slots[iterator->second.slot] = false;
+          retained.erase(iterator);
+        }
+        std::cout << "{\"type\":\"dropped\",\"key\":" << key
+                  << ",\"found\":" << (found ? "true" : "false") << "}\n"
                   << std::flush;
       } else if (fields[0] == "SHUTDOWN") {
-        if (fields.size() != 1 || !active.empty())
+        if (fields.size() != 1 || !active.empty() || !retained.empty())
           throw std::runtime_error("invalid SHUTDOWN");
         std::cout << "{\"type\":\"shutdown\"}\n" << std::flush;
         return 0;
@@ -1942,7 +2191,8 @@ int worker_loop(Qwen3NextModel& model) {
     } catch (const std::exception& error) {
       std::cerr << "worker command failed: " << error.what() << '\n';
       std::cout << "{\"type\":\"error\",\"active_requests\":"
-                << active.size() << "}\n" << std::flush;
+                << active.size() << ",\"message\":\""
+                << sanitize_error(error.what()) << "\"}\n" << std::flush;
     }
   }
   return 0;
@@ -2001,11 +2251,12 @@ int main(int argc, char** argv) {
       return 0;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--batch") {
-      if (argc < 4 || argc > 12)
+      if (argc < 4 || argc > 13)
         throw std::runtime_error(
             "batch usage: <container> --batch <token-ids-csv> [new-tokens] "
             "[concurrency] [ram-gib] [vram-gib] [warmup-rounds] "
-            "[kv-cache-mib] [kv-page-tokens] [placement-profile]");
+            "[kv-cache-mib] [kv-page-tokens] [placement-profile] "
+            "[prefill-chunk-tokens]");
       auto prompts = parse_prompt_batch(argv[3]);
       const auto new_tokens = argc >= 5
           ? static_cast<std::uint32_t>(std::stoul(argv[4])) : 8U;
@@ -2020,6 +2271,8 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::stoul(argv[10])) : 256U;
       const std::string_view placement_profile =
           argc >= 12 ? argv[11] : "balanced";
+      const auto prefill_chunk_tokens = argc >= 13
+          ? static_cast<std::uint32_t>(std::stoul(argv[12])) : 0U;
       if (!new_tokens || !concurrency || !ram_gib || !vram_gib)
         throw std::runtime_error("zero batched runtime setting");
       if (prompts.size() == 1U) prompts.resize(concurrency, prompts.front());
@@ -2039,7 +2292,8 @@ int main(int argc, char** argv) {
       const auto started_load = std::chrono::steady_clock::now();
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                            vram_gib << 30U, concurrency, kv_cache_mib << 20U,
-                           kv_page_tokens, placement_profile);
+                           kv_page_tokens, placement_profile,
+                           prefill_chunk_tokens);
       for (std::uint32_t row = 0; row < concurrency; ++row)
         model.reserve_slot(
             row, static_cast<std::uint32_t>(prompts[row].size()) + new_tokens);
@@ -2268,11 +2522,12 @@ int main(int argc, char** argv) {
       return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
-      if (argc > 10)
+      if (argc > 12)
         throw std::runtime_error(
             "worker usage: <container> --worker [max-context] [ram-gib] "
             "[vram-gib] [capacity] [kv-cache-mib] [kv-page-tokens] "
-            "[placement-profile]");
+            "[placement-profile] [prefill-chunk-tokens] "
+            "[settle-after-decode-steps]");
       const auto max_context = argc >= 4
           ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
       const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
@@ -2284,10 +2539,17 @@ int main(int argc, char** argv) {
           ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
       const std::string_view placement_profile =
           argc >= 10 ? argv[9] : "balanced";
+      const auto prefill_chunk_tokens = argc >= 11
+          ? static_cast<std::uint32_t>(std::stoul(argv[10])) : 0U;
+      // Warmup boundary for the one-time placement freeze in worker mode;
+      // 0 keeps placement adaptive forever (benchmarking).
+      const auto settle_after_steps = argc >= 12
+          ? static_cast<std::uint32_t>(std::stoul(argv[11])) : 8U;
       Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
                            vram_gib << 30U, capacity, kv_cache_mib << 20U,
-                           kv_page_tokens, placement_profile);
-      return worker_loop(model);
+                           kv_page_tokens, placement_profile,
+                           prefill_chunk_tokens);
+      return worker_loop(model, settle_after_steps);
     }
     if (argc < 3 || argc > 10) {
       std::cerr << "usage: expert-qwen3-next-runner <container> <token-ids-csv> "

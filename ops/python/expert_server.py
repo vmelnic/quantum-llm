@@ -17,7 +17,7 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
+from collections import OrderedDict, deque
 from collections.abc import Mapping
 from dataclasses import dataclass
 from http import HTTPStatus
@@ -90,6 +90,25 @@ class GenerationRequest:
     instructions: str | None = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
+
+
+@dataclass
+class Session:
+    """A retained worker-side conversation prefix (LRU-managed)."""
+
+    key: int
+    tokens: list[int]
+    pages: int
+    last_used: float
+
+
+@dataclass
+class RequestContext:
+    """Admission state owned by one HTTP request while it generates."""
+
+    session: Session | None
+    held_pages: int
+    retained: bool = False
 
 
 class StopFilter:
@@ -179,12 +198,20 @@ class CudaWorker:
                  ram_cache_gib: int, vram_cache_gib: int,
                  kv_cache_mib: int, kv_page_tokens: int,
                  placement_profile: str, profile_gpu_phases: bool,
-                 enable_mtp: bool) -> None:
+                 enable_mtp: bool, prefill_chunk_tokens: int = 0,
+                 placement_settle_steps: int | None = None) -> None:
         command = [
             str(executable), str(container), "--worker", str(max_context),
             str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
             str(kv_cache_mib), str(kv_page_tokens), placement_profile,
         ]
+        if prefill_chunk_tokens:
+            command.append(str(prefill_chunk_tokens))
+        if placement_settle_steps is not None:
+            # The settle-steps slot is positional after the prefill chunk.
+            if not prefill_chunk_tokens:
+                command.append("0")
+            command.append(str(placement_settle_steps))
         if profile_gpu_phases:
             command.append("--profile-gpu-phases")
         if enable_mtp:
@@ -218,6 +245,7 @@ class CudaWorker:
         self.capacity = int(response.get("capacity", 1))
         self.prefill_mode = str(response.get("prefill_mode", ""))
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
+        self.session_retention = bool(response.get("session_retention", False))
         self.request_stream_mode = str(
             response.get("request_stream_mode", "default")
         )
@@ -260,7 +288,9 @@ class CudaWorker:
         expected_observations = 1 if placement_profile == "latency" else 2
         if (self.protocol < 4 or self.capacity != requested_capacity or
                 self.prefill_mode not in {"causal_chunked", "causal_sequential"} or
-                not 1 <= self.prefill_chunk_tokens <= requested_capacity or
+                not 1 <= self.prefill_chunk_tokens <= max_context or
+                (prefill_chunk_tokens and
+                 self.prefill_chunk_tokens != prefill_chunk_tokens) or
                 self.kv_dtype not in {"fp16", "bf16"} or
                 self.kv_allocation not in {"paged_on_demand", "preallocated"} or
                 self.kv_page_tokens != kv_page_tokens or
@@ -297,6 +327,9 @@ class CudaWorker:
         except json.JSONDecodeError as error:
             raise WorkerError(f"invalid CUDA worker response: {line!r}") from error
         if payload.get("type") == "error":
+            detail = payload.get("message")
+            if isinstance(detail, str) and detail:
+                raise WorkerError(f"CUDA worker rejected the command: {detail}")
             raise WorkerError("CUDA worker rejected the command")
         return payload
 
@@ -319,6 +352,33 @@ class CudaWorker:
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
         self.active_ids.add(request_id)
+
+    def begin_resume(self, request_id: int, session_key: int,
+                     delta_ids: list[int], context_limit: int) -> None:
+        if request_id in self.active_ids:
+            raise WorkerError("duplicate worker request")
+        if not delta_ids:
+            raise WorkerError("resume requires at least one delta token")
+        response = self._command(
+            f"BEGIN\t{request_id}\t{context_limit}\t" +
+            ",".join(str(token) for token in delta_ids) +
+            f"\tRESUME\t{session_key}"
+        )
+        if response.get("type") != "begun" or response.get("id") != request_id:
+            raise WorkerError("unexpected BEGIN response")
+        self.active_ids.add(request_id)
+
+    def end_retain(self, request_id: int, session_key: int) -> int:
+        response = self._command(f"END\t{request_id}\tRETAIN\t{session_key}")
+        if response.get("type") != "ended" or response.get("id") != request_id:
+            raise WorkerError("unexpected END response")
+        self.active_ids.discard(request_id)
+        return int(response.get("retained_tokens", 0))
+
+    def drop_session(self, session_key: int) -> None:
+        response = self._command(f"DROP\t{session_key}")
+        if response.get("type") != "dropped":
+            raise WorkerError("unexpected DROP response")
 
     def next(self, request_id: int, final: bool) -> list[int]:
         response = self._command(f"NEXT\t{request_id}\t{1 if final else 0}")
@@ -478,6 +538,10 @@ class ContinuousDecodeBatcher:
         with self.buffer_lock:
             self.buffered.pop(request_id, None)
 
+    def take_buffered(self, request_id: int) -> list[int]:
+        with self.buffer_lock:
+            return list(self.buffered.pop(request_id, []))
+
 
 class Application:
     def __init__(self, args: argparse.Namespace) -> None:
@@ -498,6 +562,16 @@ class Application:
             self.eos_token_ids = {eos}
         else:
             self.eos_token_ids = {int(token) for token in eos}
+        # The DeepSeek worker prefills sequentially (chunk 1) and rejects extra
+        # positional arguments; only the Qwen runner takes a prefill chunk.
+        prefill_chunk = (
+            0 if args.model == "deepseek-v4-flash"
+            else args.worker_prefill_chunk_tokens
+        )
+        settle_steps = (
+            None if args.model == "deepseek-v4-flash"
+            else args.worker_placement_settle_steps
+        )
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
                                  args.startup_timeout, args.worker_capacity,
                                  args.worker_ram_cache_gib,
@@ -506,13 +580,17 @@ class Application:
                                  args.worker_kv_page_tokens,
                                  args.placement_profile,
                                  args.profile_gpu_phases,
-                                 args.enable_mtp)
+                                 args.enable_mtp, prefill_chunk,
+                                 settle_steps)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
         self.worker_slots = threading.BoundedSemaphore(args.worker_capacity)
         self.kv_credit_lock = threading.Lock()
         self.kv_reserved_pages = 0
+        self.session_lock = threading.Lock()
+        self.sessions: OrderedDict[int, Session] = OrderedDict()
+        self.next_session_key = 1
         self.id_lock = threading.Lock()
         self.next_id = 1
         self.draining = threading.Event()
@@ -577,6 +655,130 @@ class Application:
             if pages <= 0 or pages > self.kv_reserved_pages:
                 raise RuntimeError("invalid KV context credit release")
             self.kv_reserved_pages -= pages
+
+    def retention_enabled(self) -> bool:
+        return (not self.args.disable_session_retention and
+                getattr(self.worker, "session_retention", False))
+
+    def _context_pages(self, context_tokens: int) -> int:
+        return (context_tokens + self.worker.kv_page_tokens - 1) // \
+            self.worker.kv_page_tokens
+
+    def _acquire_pages(self, pages: int) -> bool:
+        with self.kv_credit_lock:
+            if self.kv_reserved_pages + pages > self.worker.kv_page_capacity:
+                return False
+            self.kv_reserved_pages += pages
+        return True
+
+    def _drop_worker_session(self, session_key: int) -> None:
+        try:
+            self.worker.drop_session(session_key)
+        except WorkerError:
+            # The worker already forgot the session (or never retained it);
+            # the server-side entry is dropped either way.
+            pass
+
+    def _sweep_idle_sessions(self) -> None:
+        if not self.sessions:
+            return
+        cutoff = time.monotonic() - self.args.session_idle_seconds
+        expired: list[Session] = []
+        with self.session_lock:
+            for key, session in list(self.sessions.items()):
+                if session.last_used < cutoff:
+                    expired.append(self.sessions.pop(key))
+        for session in expired:
+            self._drop_worker_session(session.key)
+            self.release_context_credits(session.pages)
+            log("session_expired", key=session.key, tokens=len(session.tokens))
+
+    def evict_lru_session(self) -> bool:
+        with self.session_lock:
+            if not self.sessions:
+                return False
+            _key, session = self.sessions.popitem(last=False)
+        self._drop_worker_session(session.key)
+        self.release_context_credits(session.pages)
+        log("session_evicted", key=session.key, tokens=len(session.tokens))
+        return True
+
+    def checkout_session(self, prompt_ids: list[int]) -> Session | None:
+        """Take the longest retained prefix of prompt_ids out of the map."""
+        if not self.retention_enabled():
+            return None
+        self._sweep_idle_sessions()
+        with self.session_lock:
+            best: Session | None = None
+            for session in self.sessions.values():
+                length = len(session.tokens)
+                if (length <= len(prompt_ids) and
+                        prompt_ids[:length] == session.tokens and
+                        (best is None or length > len(best.tokens))):
+                    best = session
+            if best is not None:
+                del self.sessions[best.key]
+        return best
+
+    def store_session(self, session_key: int, tokens: list[int],
+                      pages: int) -> None:
+        duplicates: list[Session] = []
+        with self.session_lock:
+            for key, session in list(self.sessions.items()):
+                if session.tokens == tokens:
+                    duplicates.append(self.sessions.pop(key))
+            self.sessions[session_key] = Session(
+                key=session_key, tokens=tokens, pages=pages,
+                last_used=time.monotonic(),
+            )
+        for duplicate in duplicates:
+            self._drop_worker_session(duplicate.key)
+            self.release_context_credits(duplicate.pages)
+
+    def abandon_session(self, session: Session) -> None:
+        """Drop a checked-out session whose request never started."""
+        self._drop_worker_session(session.key)
+        self.release_context_credits(session.pages)
+
+    def allocate_session_key(self) -> int:
+        with self.session_lock:
+            key = self.next_session_key
+            self.next_session_key += 1
+            return key
+
+    def acquire_request_context(self, prompt_ids: list[int],
+                                maximum: int) -> RequestContext | None:
+        session = self.checkout_session(prompt_ids)
+        # One extra position covers the non-final trailing decode step that
+        # retained turns require.
+        total_pages = self._context_pages(len(prompt_ids) + maximum + 1)
+        base_pages = session.pages if session is not None else 0
+        needed = max(0, total_pages - base_pages)
+        while needed > 0 and not self._acquire_pages(needed):
+            if not self.evict_lru_session():
+                if session is not None:
+                    self.abandon_session(session)
+                return None
+        return RequestContext(session=session,
+                              held_pages=base_pages + needed)
+
+    def release_request_context(self, context: RequestContext) -> None:
+        if context.retained:
+            # The retained session keeps the worker slot and its KV pages.
+            return
+        if context.held_pages > 0:
+            self.release_context_credits(context.held_pages)
+        if context.session is not None:
+            self._drop_worker_session(context.session.key)
+
+    def worker_stats(self) -> dict[str, int]:
+        stats = getattr(self.worker, "stats", None)
+        if stats is None:
+            return {}
+        try:
+            return stats()
+        except Exception:
+            return {}
 
     def record_decode_batch(self, rows: int) -> None:
         self.increment("decode_batches")
@@ -825,23 +1027,81 @@ class Application:
             metadata=metadata, user=user,
         )
 
-    def generate(self, prompt_ids: list[int], maximum: int) -> Iterator[tuple[int, str]]:
+    _TELEMETRY_DELTA_KEYS = (
+        "forward_calls", "forward_wall_ns", "expert_cache_wait_ns",
+        "expert_compute_ns", "cpu_expert_ns", "gpu_expert_ns",
+        "cpu_gpu_overlap_ns", "final_head_ns", "cache_read_bytes",
+        "cache_uploaded_bytes", "cache_storage_wait_ns",
+        "cache_upload_wait_ns", "worker_model_steps", "worker_model_step_ns",
+        "worker_scheduler_poll_ns", "worker_output_head_ns",
+        "scheduler_expert_wait_ns",
+    )
+
+    @staticmethod
+    def _capacity_error(error: Exception) -> bool:
+        message = str(error)
+        return "capacity" in message or "slot available" in message or \
+            "credits" in message
+
+    def generate(self, prompt_ids: list[int], maximum: int,
+                 context: RequestContext | None = None
+                 ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
         decoder = IncrementalTextDecoder()
         started = time.monotonic()
+        first_token_seconds: float | None = None
         previous_token_at: float | None = None
-        self.worker.begin(request_id, prompt_ids, len(prompt_ids) + maximum)
+        session = context.session if context is not None else None
+        retain = context is not None and self.retention_enabled()
+        context_limit = len(prompt_ids) + maximum
+        if retain:
+            if context_limit < self.args.max_context:
+                # Retained turns always end with a non-final decode step so
+                # the slot survives; reserve one extra position for the
+                # trailing feed (or speculative pair under MTP).
+                context_limit += 1
+            else:
+                retain = False
+        stats_before = self.worker_stats()
+        prefill_tokens = len(prompt_ids)
+        resumed = False
+        finished = False
+        while True:
+            try:
+                if session is not None:
+                    delta = prompt_ids[len(session.tokens):]
+                    self.worker.begin_resume(request_id, session.key, delta,
+                                             context_limit)
+                    resumed = True
+                    prefill_tokens = len(delta)
+                else:
+                    self.worker.begin(request_id, prompt_ids, context_limit)
+                break
+            except WorkerError as error:
+                if self._capacity_error(error) and self.evict_lru_session():
+                    continue
+                if session is not None:
+                    # The retained state is gone or inconsistent; fall back
+                    # to a fresh full prefill.
+                    self._drop_worker_session(session.key)
+                    session = None
+                    continue
+                raise
         try:
             for index in range(maximum):
                 if time.monotonic() - started > self.args.generation_timeout:
                     raise TimeoutError("generation deadline exceeded")
+                # A final STEP makes the worker release the slot inline, which
+                # is incompatible with retaining it; retained conversations
+                # end with an explicit retaining END instead.
                 token = self.decode_batcher.step(
-                    request_id, index + 1 == maximum
+                    request_id, index + 1 == maximum and not retain
                 )
                 token_at = time.monotonic()
                 if previous_token_at is None:
-                    self.observe_latency("ttft_seconds", token_at - started)
+                    first_token_seconds = token_at - started
+                    self.observe_latency("ttft_seconds", first_token_seconds)
                 else:
                     self.observe_latency(
                         "inter_token_seconds", token_at - previous_token_at
@@ -855,19 +1115,68 @@ class Application:
                 )
                 final_text = token in self.eos_token_ids or index + 1 == maximum
                 delta = decoder.push(current, final=final_text)
+                if final_text:
+                    # The consumer closes the generator right after this
+                    # final token; from here on the turn is complete and its
+                    # state is safe to retain.
+                    finished = True
                 yield token, delta
                 if token in self.eos_token_ids:
                     break
+            finished = True
         finally:
-            discard = getattr(self.decode_batcher, "discard", None)
-            if discard is not None:
-                discard(request_id)
+            take_buffered = getattr(self.decode_batcher, "take_buffered", None)
+            buffered = take_buffered(request_id) if take_buffered is not None \
+                else []
+            if finished and retain:
+                try:
+                    session_key = session.key if session is not None \
+                        else self.allocate_session_key()
+                    retained_tokens = self.worker.end_retain(
+                        request_id, session_key
+                    )
+                    tokens = (prompt_ids + generated + buffered)[
+                        :retained_tokens]
+                    if 0 < retained_tokens == len(tokens):
+                        self.store_session(session_key, tokens,
+                                           context.held_pages)
+                        context.retained = True
+                        log("session_retained", key=session_key,
+                            tokens=retained_tokens, resumed=resumed)
+                    else:
+                        self.worker.drop_session(session_key)
+                        log("session_retain_mismatch", key=session_key,
+                            retained_tokens=retained_tokens,
+                            expected_tokens=len(prompt_ids) + len(generated) +
+                            len(buffered))
+                except WorkerError as error:
+                    log("session_retain_failed", error=str(error))
             if request_id in self.worker.active_ids:
                 self.worker.cancel(request_id)
+            if context is not None and not context.retained and \
+                    session is not None:
+                self._drop_worker_session(session.key)
+            stats_after = self.worker_stats()
+            deltas = {
+                key: stats_after[key] - stats_before[key]
+                for key in self._TELEMETRY_DELTA_KEYS
+                if key in stats_before and key in stats_after
+            }
+            log("request_telemetry", request_id=request_id, resumed=resumed,
+                prefill_tokens=prefill_tokens,
+                generated_tokens=len(generated), finished=finished,
+                wall_seconds=time.monotonic() - started,
+                ttft_seconds=first_token_seconds, **deltas)
 
     def info(self) -> dict[str, Any]:
         with self.active_lock:
             active = self.active
+        with self.session_lock:
+            session_count = len(self.sessions)
+            session_tokens = sum(len(session.tokens)
+                                 for session in self.sessions.values())
+            session_pages = sum(session.pages
+                                for session in self.sessions.values())
         kv_stats = self.worker.stats()
         runtime_stats = {
             key: value for key, value in kv_stats.items()
@@ -920,6 +1229,12 @@ class Application:
                 "allocated_pages": kv_stats["allocated_pages"],
                 "reserved_pages": kv_stats["reserved_pages"],
             },
+            "worker_sessions": {
+                "enabled": self.retention_enabled(),
+                "retained": session_count,
+                "retained_tokens": session_tokens,
+                "reserved_pages": session_pages,
+            },
             "worker_runtime": runtime_stats,
             "runtime_config": {
                 "host": self.args.host,
@@ -933,6 +1248,10 @@ class Application:
                 "placement_profile": self.args.placement_profile,
                 "worker_kv_cache_mib": self.args.worker_kv_cache_mib,
                 "worker_kv_page_tokens": self.args.worker_kv_page_tokens,
+                "worker_prefill_chunk_tokens":
+                    self.args.worker_prefill_chunk_tokens,
+                "session_retention": self.retention_enabled(),
+                "session_idle_seconds": self.args.session_idle_seconds,
                 "microbatch_window_ms": self.args.microbatch_window_ms,
                 "latency_window": self.args.latency_window,
                 "queue_timeout_seconds": self.args.queue_timeout,
@@ -950,6 +1269,11 @@ class Application:
                     break
             time.sleep(0.05)
         self.decode_batcher.close()
+        with self.session_lock:
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
+        for session in sessions:
+            self._drop_worker_session(session.key)
         self.worker.close()
 
 
@@ -1054,12 +1378,14 @@ class Handler(BaseHTTPRequestHandler):
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
-    def _run_generation(self, request: GenerationRequest, emit: Any) -> tuple[str, int, str]:
+    def _run_generation(self, request: GenerationRequest, emit: Any,
+                        context: RequestContext) -> tuple[str, int, str]:
         pieces: list[str] = []
         count = 0
         finish_reason = "length"
         stop_filter = StopFilter(request.stop)
-        generation = self.app.generate(request.prompt_ids, request.maximum)
+        generation = self.app.generate(request.prompt_ids, request.maximum,
+                                       context)
         try:
             for token, delta in generation:
                 if request.stream and self._client_disconnected():
@@ -1191,10 +1517,10 @@ class Handler(BaseHTTPRequestHandler):
             self._error(HTTPStatus.SERVICE_UNAVAILABLE,
                         "all model slots are busy", "server_error", code="overloaded")
             return
-        context_pages = self.app.acquire_context_credits(
-            len(request.prompt_ids) + request.maximum
+        context = self.app.acquire_request_context(
+            request.prompt_ids, request.maximum
         )
-        if not context_pages:
+        if context is None:
             self.app.release_worker_slot()
             self.app.release()
             self._error(HTTPStatus.SERVICE_UNAVAILABLE,
@@ -1241,7 +1567,7 @@ class Handler(BaseHTTPRequestHandler):
                         sequence += 1
 
                     text, completion_count, _finish_reason = self._run_generation(
-                        request, emit_response
+                        request, emit_response, context
                     )
                     self._sse({"type": "response.output_text.done", "item_id": message_uuid,
                                "output_index": 0, "content_index": 0, "text": text,
@@ -1285,7 +1611,7 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse({**base, "choices": [choice]})
 
                     _text, completion_count, finish_reason = self._run_generation(
-                        request, emit_completion
+                        request, emit_completion, context
                     )
                     final_choice: dict[str, Any] = {
                         "index": 0, "finish_reason": finish_reason, "logprobs": None,
@@ -1300,7 +1626,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 pieces: list[str] = []
                 text, completion_count, finish_reason = self._run_generation(
-                    request, pieces.append
+                    request, pieces.append, context
                 )
                 if endpoint == "responses":
                     self._json(HTTPStatus.OK, self._response_object(
@@ -1354,7 +1680,7 @@ class Handler(BaseHTTPRequestHandler):
                            "code": "generation_failed"}})
                 self._sse("[DONE]")
         finally:
-            self.app.release_context_credits(context_pages)
+            self.app.release_request_context(context)
             self.app.release_worker_slot()
             self.app.release()
 
@@ -1383,6 +1709,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
+    parser.add_argument("--worker-prefill-chunk-tokens", type=int, default=256)
+    parser.add_argument(
+        "--worker-placement-settle-steps", type=int, default=None,
+        help="decode steps before the Qwen worker freezes adaptive placement "
+             "(0 disables the freeze; omitted keeps the worker default)",
+    )
+    parser.add_argument("--disable-session-retention", action="store_true")
+    parser.add_argument("--session-idle-seconds", type=float, default=1800.0)
     parser.add_argument("--profile-gpu-phases", action="store_true")
     parser.add_argument("--enable-mtp", action="store_true")
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
@@ -1403,6 +1737,10 @@ def main() -> int:
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
         args.worker_kv_cache_mib < 1 or args.worker_kv_page_tokens < 1 or
+        args.worker_prefill_chunk_tokens < 1 or
+        (args.worker_placement_settle_steps is not None and
+         args.worker_placement_settle_steps < 0) or
+        args.session_idle_seconds < 0 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
     if (args.host not in {"127.0.0.1", "::1", "localhost"} and

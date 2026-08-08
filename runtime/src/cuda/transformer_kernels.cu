@@ -168,6 +168,39 @@ __global__ void int8_gemv_batch_kernel(
         partial * scales[row];
 }
 
+// Vectorized twin of int8_gemv_batch_kernel: identical scales/groups
+// semantics, but each lane consumes four weights and four activations per
+// iteration through char4/float4 loads. Requires columns % 4 == 0; row and
+// request strides then stay naturally aligned for both vector types.
+__global__ void int8_gemv_batch_vector_kernel(
+    const std::int8_t* weights, const float* scales, const float* input,
+    float* output, std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto work = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  const auto row = static_cast<std::uint32_t>(work / batch);
+  const auto request = static_cast<std::uint32_t>(work % batch);
+  if (row >= rows) return;
+  const auto* weight = weights + static_cast<std::size_t>(row) * columns;
+  const auto* activation = input + static_cast<std::size_t>(request) * columns;
+  float partial = 0.0F;
+  for (std::uint32_t column = lane * 4U; column < columns;
+       column += kWarpSize * 4U) {
+    const auto packed = *reinterpret_cast<const char4*>(weight + column);
+    const auto values =
+        *reinterpret_cast<const float4*>(activation + column);
+    partial += static_cast<float>(packed.x) * values.x;
+    partial += static_cast<float>(packed.y) * values.y;
+    partial += static_cast<float>(packed.z) * values.z;
+    partial += static_cast<float>(packed.w) * values.w;
+  }
+  partial = warp_sum(partial);
+  if (lane == 0)
+    output[static_cast<std::size_t>(request) * rows + row] =
+        partial * scales[row];
+}
+
 __global__ void int8_gemv_batch_weight_reuse_kernel(
     const std::int8_t* weights, const float* scales, const float* input,
     float* output, std::uint32_t rows, std::uint32_t columns,
@@ -1177,9 +1210,15 @@ Status gemv_batch(const Int8Matrix& m, const float* input, float* output,
   if (blocks > 0xffffffffULL)
     return Status(ErrorCode::invalid_argument, "batched gemv grid too large");
   const auto grid = (blocks + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  int8_gemv_batch_kernel<<<static_cast<unsigned>(grid), kThreads, 0,
-                           static_cast<cudaStream_t>(raw)>>>(
-      m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  if (m.columns % 4U == 0U) {
+    int8_gemv_batch_vector_kernel<<<static_cast<unsigned>(grid), kThreads, 0,
+                                    static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  } else {
+    int8_gemv_batch_kernel<<<static_cast<unsigned>(grid), kThreads, 0,
+                             static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  }
   return checked(cudaPeekAtLastError(), "int8 batched gemv");
 }
 Status gemv_batch_weight_reuse(const Int8Matrix& m, const float* input,

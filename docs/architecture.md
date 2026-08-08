@@ -172,10 +172,13 @@ FP4 expert path, and persistent request state. CUDA is compiled for SM86.
 The Python front-end owns tokenization, bounded admission, continuous decode
 batching, cancellation, SSE, metrics, and the OpenAI-compatible wire contract.
 The C++ worker owns model state and token selection. Their local protocol is
-line-framed and versioned. Protocol v4 supports exact context reservations, KV
-telemetry, batched `STEP`, explicit prefetch state, and one-or-more returned
-tokens for the speculative-execution boundary. The front-end accepts the
-legacy scalar-token and inferred-prefetch forms for the existing Qwen runner.
+line-framed and versioned. Protocol v5 supports exact context reservations, KV
+telemetry, batched `STEP`, explicit prefetch state, one-or-more returned
+tokens for the speculative-execution boundary, and retained conversation
+sessions (`BEGIN … RESUME` / `END … RETAIN` / `DROP`) so multi-turn chat
+prefills only the delta tokens of a turn. The front-end matches retained
+sessions by token-prefix and stays stateless for clients and workers without
+retention support.
 
 ## Memory placement
 

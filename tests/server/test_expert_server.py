@@ -128,11 +128,13 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.release = lambda: None
         app.acquire_worker_slot = lambda: True
         app.release_worker_slot = lambda: None
-        app.kv_credit_lock = threading.Lock()
-        app.kv_reserved_pages = 0
+        app.acquire_request_context = lambda _ids, _maximum: types.SimpleNamespace(
+            session=None, held_pages=0, retained=False
+        )
+        app.release_request_context = lambda _context: None
         app.increment = lambda *_args, **_kwargs: None
 
-        def generate(_prompt: list[int], maximum: int):
+        def generate(_prompt: list[int], maximum: int, _context: object = None):
             for index, value in enumerate(("hello", " world")[:maximum]):
                 yield index + 1, value
 
@@ -344,7 +346,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             worker_ram_cache_gib=48, worker_vram_cache_gib=18,
             placement_profile="capacity", worker_kv_cache_mib=2048,
             worker_kv_page_tokens=256, microbatch_window_ms=2.0,
-            profile_gpu_phases=False,
+            profile_gpu_phases=False, worker_prefill_chunk_tokens=256,
+            disable_session_retention=False, session_idle_seconds=1800.0,
             latency_window=4096, queue_timeout=1.0,
             generation_timeout=120.0,
         )
@@ -374,8 +377,14 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.active = 0
         app.active_lock = threading.Lock()
         app.draining = threading.Event()
+        app.session_lock = threading.Lock()
+        app.sessions = {}
 
         info = app.info()
+        self.assertEqual(info["worker_sessions"], {
+            "enabled": False, "retained": 0, "retained_tokens": 0,
+            "reserved_pages": 0,
+        })
         self.assertEqual(info["worker_placement"], {
             "profile": "capacity", "ram_cache_bytes": 48 << 30,
             "vram_cache_bytes": 18 << 30, "prefetch_enabled": False,
@@ -483,6 +492,109 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         result = list(app.generate([3], 5))
         self.assertEqual(result, [(7, "7")])
         self.assertEqual(app.worker.active_ids, set())
+
+    def test_retained_session_resumes_with_delta_tokens(self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+                self.session_retention = True
+                self.kv_page_tokens = 4
+                self.kv_page_capacity = 64
+                self.retained: dict[int, int] = {}
+                self.fed: dict[int, int] = {}
+                self.begins: list[tuple[str, list[int]]] = []
+
+            def begin(self, request_id: int, prompt: list[int],
+                      _context_limit: int) -> None:
+                self.active_ids.add(request_id)
+                self.fed[request_id] = len(prompt)
+                self.begins.append(("fresh", list(prompt)))
+
+            def begin_resume(self, request_id: int, session_key: int,
+                             delta: list[int], _context_limit: int) -> None:
+                assert session_key in self.retained
+                self.active_ids.add(request_id)
+                self.fed[request_id] = self.retained.pop(session_key) + len(delta)
+                self.begins.append(("resume", list(delta)))
+
+            def end_retain(self, request_id: int, session_key: int) -> int:
+                self.active_ids.discard(request_id)
+                self.retained[session_key] = self.fed.pop(request_id)
+                return self.retained[session_key]
+
+            def drop_session(self, session_key: int) -> None:
+                self.retained.pop(session_key, None)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+            def stats(self) -> dict[str, int]:
+                return {}
+
+        class Batcher:
+            def __init__(self, worker: Worker, tokens: list[int]) -> None:
+                self.worker = worker
+                self.tokens = tokens
+
+            def step(self, request_id: int, _final: bool) -> int:
+                self.worker.fed[request_id] += 1
+                return self.tokens.pop(0)
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return ",".join(str(token) for token in tokens)
+
+        worker = Worker()
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(
+            generation_timeout=60.0, disable_session_retention=False,
+            session_idle_seconds=1800.0, max_context=64,
+        )
+        app.worker = worker
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = {22}
+        app.request_id = iter(range(1, 100)).__next__
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        app.session_lock = threading.Lock()
+        app.sessions = expert_server.OrderedDict()
+        app.next_session_key = 1
+
+        app.decode_batcher = Batcher(worker, [20, 21])
+        context = app.acquire_request_context([10, 11, 12], 2)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIsNone(context.session)
+        self.assertEqual(context.held_pages, 2)
+        self.assertEqual(len(list(app.generate([10, 11, 12], 2, context))), 2)
+        app.release_request_context(context)
+        self.assertTrue(context.retained)
+        self.assertEqual(app.kv_reserved_pages, 2)
+
+        app.decode_batcher = Batcher(worker, [22])
+        followup = [10, 11, 12, 20, 21, 30, 31]
+        context = app.acquire_request_context(followup, 2)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertIsNotNone(context.session)
+        self.assertEqual(context.held_pages, 3)
+        self.assertEqual(len(list(app.generate(followup, 2, context))), 1)
+        app.release_request_context(context)
+        self.assertTrue(context.retained)
+        self.assertEqual(worker.begins, [
+            ("fresh", [10, 11, 12]),
+            ("resume", [30, 31]),
+        ])
+        session = next(iter(app.sessions.values()))
+        self.assertEqual(session.tokens, followup + [22])
+        self.assertEqual(session.pages, 3)
+        self.assertEqual(app.kv_reserved_pages, 3)
+
+        self.assertTrue(app.evict_lru_session())
+        self.assertEqual(worker.retained, {})
+        self.assertEqual(app.kv_reserved_pages, 0)
 
 
 if __name__ == "__main__":
