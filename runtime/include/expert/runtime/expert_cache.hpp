@@ -239,6 +239,13 @@ class ExpertCache final {
   // currently unreferenced VRAM entries (or unused VRAM already exists).
   [[nodiscard]] bool vram_admission_would_improve(
       const ExpertKey& key, const PayloadRecord& record);
+  // Total bytes held by currently unreferenced VRAM residents whose last
+  // access is at least minimum_age access-clock ticks old. One scan per
+  // forward pass lets a frozen-placement re-promotion bound itself to victims
+  // that have not been routed for a long stretch, instead of rotating the
+  // overflow of a working set that exceeds the VRAM budget.
+  [[nodiscard]] std::uint64_t vram_stale_resident_bytes(
+      std::uint64_t minimum_age) const;
   [[nodiscard]] std::optional<CacheEntrySnapshot> inspect(
       const ExpertKey& key) const;
   [[nodiscard]] TelemetrySnapshot telemetry() const noexcept;

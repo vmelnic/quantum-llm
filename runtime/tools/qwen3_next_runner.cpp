@@ -343,6 +343,8 @@ struct PhaseTelemetry final {
   std::uint64_t cpu_expert_selections{};
   std::uint64_t gpu_expert_selections{};
   std::uint64_t adaptive_promotions{};
+  std::uint64_t frozen_promotions{};
+  std::uint64_t frozen_promotion_bytes{};
   std::uint64_t useful_prefetches{};
   std::uint64_t useful_prefetch_bytes{};
   std::uint64_t wasted_prefetches{};
@@ -380,6 +382,8 @@ PhaseTelemetry phase_delta(const PhaseTelemetry& value,
       value.cpu_expert_selections - baseline.cpu_expert_selections,
       value.gpu_expert_selections - baseline.gpu_expert_selections,
       value.adaptive_promotions - baseline.adaptive_promotions,
+      value.frozen_promotions - baseline.frozen_promotions,
+      value.frozen_promotion_bytes - baseline.frozen_promotion_bytes,
       value.useful_prefetches - baseline.useful_prefetches,
       value.useful_prefetch_bytes - baseline.useful_prefetch_bytes,
       value.wasted_prefetches - baseline.wasted_prefetches,
@@ -451,6 +455,8 @@ void print_phase_json(std::ostream& output, const PhaseTelemetry& phase) {
          << gpu_ns_per_selection
          << ",\"cpu_gpu_overlap_ratio\":" << overlap_ratio
          << ",\"adaptive_promotions\":" << phase.adaptive_promotions
+         << ",\"frozen_promotions\":" << phase.frozen_promotions
+         << ",\"frozen_promotion_bytes\":" << phase.frozen_promotion_bytes
          << ",\"useful_prefetches\":" << phase.useful_prefetches
          << ",\"useful_prefetch_bytes\":" << phase.useful_prefetch_bytes
          << ",\"wasted_prefetches\":" << phase.wasted_prefetches
@@ -538,6 +544,19 @@ void print_cpu_executor_json(
          << ",\"cpu_executor_effective_weight_bytes_per_second\":"
          << bytes_per_second;
 }
+
+// W4: minimum victim age in cache access-clock ticks (one tick per routed
+// selection fed back to the cache) before an unreferenced VRAM resident
+// counts as a dead-topic corpse eligible for frozen re-promotion
+// displacement. Measured pacing: a 48-token chat turn with a short delta
+// prefill advances the clock by roughly 60-80k ticks, so 2^19 ticks lets a
+// resident survive about seven unrouted turns — long enough that a repeating
+// or drifting route never displaces itself, short enough that a settled new
+// topic reclaims VRAM from dead ones. A 2^16 threshold was measured to
+// ping-pong: at about one turn of tolerance every topic change re-uploaded
+// the whole turn's misses (10-20 GiB H2D per turn) instead of using the CPU
+// executor overflow.
+constexpr std::uint64_t kFrozenPromotionMinVictimAge = 1ULL << 19U;
 
 class Qwen3NextModel final {
  public:
@@ -731,6 +750,9 @@ class Qwen3NextModel final {
     if (causal_same_slot && state_slots.empty())
       throw std::runtime_error("causal chunk requires an explicit state slot");
     const auto rows = static_cast<std::uint32_t>(tokens.size());
+    // W4: the frozen re-promotion victim budget is rescanned at most once per
+    // forward pass and shared by every layer's misses.
+    frozen_stale_budget_valid_ = false;
     std::vector<std::uint32_t> default_slots;
     if (state_slots.empty()) {
       default_slots.resize(rows);
@@ -1415,6 +1437,12 @@ class Qwen3NextModel final {
     placement_->observe_routes(routed_expert_keys_, missing_expert_keys_);
     const auto selection_count = rows * top_k_;
     const bool placement_feedback = !placement_->frozen();
+    // W4: once placement is frozen the per-selection D2H copies stay retired,
+    // but the asynchronous directory plan already carries the exact route to
+    // the host. Keep feeding the cache LFU from it so post-freeze placement
+    // (eviction victims and re-promotion admission) tracks the observed
+    // routing instead of the warmup snapshot.
+    const bool frozen_route_feedback = placement_->frozen();
     if (!plan.missing_experts.empty() || placement_feedback) {
       cuda_check(cudaMemcpy(host_routing_indices_, routing_indices_,
                             static_cast<std::size_t>(selection_count) *
@@ -1448,14 +1476,26 @@ class Qwen3NextModel final {
               std::max(route_score_maxima_[expert], score);
         }
       }
+    } else if (frozen_route_feedback) {
+      // Fully resident frozen layer: no host route copy was needed, so count
+      // the plan's host-side selection list instead.
+      std::fill(route_access_counts_.begin(), route_access_counts_.end(), 0U);
+      for (const auto expert : plan.selected_experts) {
+        if (expert >= experts_)
+          throw std::runtime_error("router expert out of range");
+        ++route_access_counts_[expert];
+      }
     }
-    if (placement_feedback) {
+    if (placement_feedback || frozen_route_feedback) {
       route_accesses_.clear();
       for (std::uint32_t expert = 0; expert < experts_; ++expert) {
         if (route_access_counts_[expert] != 0) {
+          // Routing scores ride the pre-freeze D2H copy only; frozen feedback
+          // carries access counts, and the cache ignores non-positive scores.
           route_accesses_.push_back(
               {{model_id_, layer, expert, 1}, route_access_counts_[expert],
-               route_score_sums_[expert], route_score_maxima_[expert]});
+               placement_feedback ? route_score_sums_[expert] : 0.0,
+               placement_feedback ? route_score_maxima_[expert] : 0.0});
         }
       }
       static_cast<void>(cache_->record_accesses(route_accesses_));
@@ -1512,9 +1552,19 @@ class Qwen3NextModel final {
       }
       const auto has_cold_fallback =
           host_slot_by_expert.size() != plan.missing_experts.size();
-      const auto may_upload_from_ram =
-          !placement_->frozen() && placement_profile_ != "capacity";
-      if (has_cold_fallback || may_upload_from_ram) {
+      const auto may_upload_from_ram = placement_profile_ != "capacity";
+      // W4: scan the stale-victim budget once per forward pass, ahead of the
+      // admission decisions below. With no long-unrouted residents there is
+      // nothing to displace, so no protection leases are needed either.
+      if (frozen_route_feedback && may_upload_from_ram &&
+          !frozen_stale_budget_valid_) {
+        frozen_stale_budget_bytes_ =
+            cache_->vram_stale_resident_bytes(kFrozenPromotionMinVictimAge);
+        frozen_stale_budget_valid_ = true;
+      }
+      if (has_cold_fallback ||
+          (may_upload_from_ram &&
+           (!frozen_route_feedback || frozen_stale_budget_bytes_ > 0))) {
         // Admission checks and uploads require cache references mirroring the
         // directory pins so no current-route entry can become a victim.
         acquire_device(plan.ready_experts);
@@ -1533,13 +1583,38 @@ class Qwen3NextModel final {
         const auto& record = expert_records_.at(
             static_cast<std::size_t>(layer) * experts_ + expert);
         const auto host_available = host_slot_by_expert.contains(expert);
-        const auto gpu_available =
-            !host_available ||
-            (may_upload_from_ram && cache_->vram_admission_would_improve(
-                                        {model_id_, layer, expert, 1}, record));
+        auto cpu_available = host_available;
+        auto gpu_available = !host_available;
+        if (host_available && may_upload_from_ram) {
+          bool admit = false;
+          if (!frozen_route_feedback) {
+            admit = cache_->vram_admission_would_improve(
+                {model_id_, layer, expert, 1}, record);
+          } else {
+            // W4 router-aware re-promotion: the per-forward stale-victim
+            // budget bounds promotions to displacing residents that have not
+            // been routed for a long stretch. A repeating route whose working
+            // set exceeds the VRAM budget keeps its overflow on the CPU
+            // executor (no resident is stale), while a conversation that
+            // moved on heals its placement over dead topics' residents.
+            const auto need = record.device_bytes == 0
+                                  ? record.stored_bytes
+                                  : record.device_bytes;
+            admit = frozen_stale_budget_bytes_ >= need;
+            if (admit) {
+              frozen_stale_budget_bytes_ -= need;
+              ++phase_.frozen_promotions;
+              phase_.frozen_promotion_bytes += record.stored_bytes;
+            }
+          }
+          if (admit) {
+            gpu_available = true;
+            if (frozen_route_feedback) cpu_available = false;
+          }
+        }
         candidates.push_back(
             {expert, route_access_counts_[expert], record.stored_bytes, false,
-             host_available, gpu_available});
+             cpu_available, gpu_available});
       }
       const auto dispatch_plan = dispatch_->plan(candidates);
       status_check(dispatch_plan.status);
@@ -1767,6 +1842,10 @@ class Qwen3NextModel final {
   std::uint32_t kv_page_tokens_{}, max_kv_pages_per_slot_{};
   std::string placement_profile_;
   std::uint64_t directory_vram_hits_{};
+  // W4 frozen re-promotion budget: bytes of long-unrouted VRAM residents
+  // available as displacement victims, valid for one forward pass.
+  std::uint64_t frozen_stale_budget_bytes_{};
+  bool frozen_stale_budget_valid_{};
   PhaseTelemetry phase_;
   DevicePack dense_pack_;
   std::unordered_map<std::string, Tensor> tensors_;
@@ -1983,6 +2062,9 @@ int worker_loop(Qwen3NextModel& model, std::uint32_t settle_after_steps) {
                   << phase.gpu_expert_selections
                   << ",\"useful_prefetches\":" << phase.useful_prefetches
                   << ",\"wasted_prefetches\":" << phase.wasted_prefetches
+                  << ",\"frozen_promotions\":" << phase.frozen_promotions
+                  << ",\"frozen_promotion_bytes\":"
+                  << phase.frozen_promotion_bytes
                   << ",\"cache_read_bytes\":" << cache.read_bytes
                   << ",\"cache_uploaded_bytes\":" << cache.uploaded_bytes
                   << ",\"cache_vram_hits\":" << cache.acquire_vram_hits

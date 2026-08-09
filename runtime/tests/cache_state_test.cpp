@@ -1172,6 +1172,38 @@ void test_vram_replacement_requires_a_strictly_colder_victim() {
   require(!planner.frozen(), "placement epoch did not resume");
 }
 
+void test_vram_stale_resident_bytes_tracks_victim_recency() {
+  Harness harness(16384, 4, 8192);
+  const auto stale = make_record(60, 0, 0);
+  const auto fresh = make_record(61, 4096, 0);
+  const auto load = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_success(er::kExpertPackAlignment);
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "staleness fixture failed to load expert");
+    result.lease = {};
+  };
+  load(stale);
+  load(fresh);
+  require(harness.cache.vram_stale_resident_bytes(10) == 0,
+          "freshly loaded residents counted as stale");
+  require(harness.cache.record_access(fresh.key, 100),
+          "staleness fixture did not advance the access clock");
+  require(harness.cache.vram_stale_resident_bytes(50) ==
+              er::kExpertPackAlignment,
+          "long-unrouted resident did not count toward stale bytes");
+  require(harness.cache.vram_stale_resident_bytes(1000) == 0,
+          "resident counted as stale beyond its actual age");
+  auto lease = harness.cache.acquire(fresh.key, fresh.record).get();
+  require(static_cast<bool>(lease.lease),
+          "fresh resident protection lease was not acquired");
+  require(harness.cache.vram_stale_resident_bytes(50) ==
+              er::kExpertPackAlignment,
+          "referenced fresh resident changed the stale total");
+}
+
 void test_prefetch_credits_and_stale_epoch_cancel_pending_work() {
   Harness harness(16384, 4, 8192);
   const auto candidate = make_record(53, 0, 0);
@@ -1429,6 +1461,7 @@ int main() {
     test_frequency_admission_protects_reused_expert();
     test_routing_score_temperature_breaks_frequency_ties();
     test_vram_replacement_requires_a_strictly_colder_victim();
+    test_vram_stale_resident_bytes_tracks_victim_recency();
     test_prefetch_credits_and_stale_epoch_cancel_pending_work();
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();

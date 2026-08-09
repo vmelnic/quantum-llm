@@ -1033,6 +1033,7 @@ class Application:
         "cpu_gpu_overlap_ns", "final_head_ns", "cache_read_bytes",
         "cache_uploaded_bytes", "cache_storage_wait_ns",
         "cache_upload_wait_ns", "worker_model_steps", "worker_model_step_ns",
+        "frozen_promotions", "frozen_promotion_bytes",
         "worker_scheduler_poll_ns", "worker_output_head_ns",
         "scheduler_expert_wait_ns",
     )

@@ -192,6 +192,100 @@ turn 1 reads more under w03 because the widened prefetch window reads
 predictions ahead of demand (wall time still improves). Both smokes pass on
 w03 (`Invoke-P6ServiceSmoke.ps1`, `Invoke-DeepSeekServiceSmoke.ps1`).
 
+### W4 router-aware hot-expert cache (2026-08-09, build `w04r3`)
+
+Landed changes: the frozen placement now keeps receiving router feedback —
+the asynchronous directory plan already carries the exact route to the host,
+so per-layer access counts flow into the cache LFU from
+`plan.selected_experts` without resurrecting the retired per-selection D2H
+copies (`run_moe` in `qwen3_next_runner.cpp`); and a RAM-resident miss can be
+re-promoted to VRAM while frozen. Re-promotion is gated by victim recency,
+not by candidate hotness: once per forward pass the cache scans for
+unreferenced VRAM residents that have not been routed for at least 2^19
+access-clock ticks (`ExpertCache::vram_stale_resident_bytes`, roughly seven
+48-token chat turns at the measured ~60-80k ticks per turn), and promotions
+are bounded by that stale-victim byte budget. A repeating route whose working
+set exceeds the VRAM budget has no stale residents, so its overflow stays on
+the CPU executor as in W2; a conversation that has moved on displaces dead
+topics' residents. Promotions upload from the RAM tier and add no storage
+reads. The current route's protection leases are acquired only when the
+stale budget is nonzero — unconditional lease acquire/release pairs each
+force a full cache-map `drive()` scan, which alone cost ~8 ms/token on the
+resident route in an intermediate build. New per-request telemetry:
+`frozen_promotions`, `frozen_promotion_bytes` (worker STATS and
+`request_telemetry`). DeepSeek code paths are untouched:
+`vram_admission_would_improve` keeps its exact pre-W4 semantics and
+`ram_retention_minimum_frequency = 2` is preserved.
+
+Repeated identical request (19-token prompt, 48 output tokens, freshly
+restarted service), resident-route regression gate:
+
+| Run | W3 TTFT | W3 decode | W4 TTFT | W4 decode | W4 promotions |
+|---:|---:|---:|---:|---:|---:|
+| 1 (cold, SSD load) | 26.954 s | 0.75 tok/s | 26.906 s | 0.75 tok/s | 0 |
+| 2 | 0.694 s | 28.22 tok/s | 0.676 s | 28.93 tok/s | 0 |
+| 3 | 0.484 s | 27.27 tok/s | 0.570 s | 28.62 tok/s | 0 |
+| 4 | 0.529 s | 26.99 tok/s | 0.461 s | 27.77 tok/s | 0 |
+
+Resident runs show zero expert storage reads, zero H2D uploads and zero
+frozen promotions — the gate holds.
+
+Long diverse-session probe (one retained session, 16 turns drifting across
+eight topics and returning to the opening topic at turns 15-16, 48 max
+output tokens, freshly restarted service; turns 2-16 totals, W3 build `w03`
+vs W4 build `w04r3`):
+
+| Metric | W3 (before) | W4 (after) |
+|---|---:|---:|
+| total wall, turns 2-16 | 341.6 s | 337.3 s |
+| total storage read, turns 2-16 | 35.87 GiB | 34.91 GiB |
+| turns 2-11 (drift phase) | unchanged within noise | 0 promotions |
+| turn 13 wall / storage-wait share / CPU expert | 31.73 s / 57.5% / 1.81 s | 22.44 s / 19.2% / 1.15 s (1,538 promotions) |
+| turn 14 wall / storage-wait share / CPU expert | 33.28 s / 64.4% / 1.69 s | 18.81 s / 16.2% / 0.77 s (1,540 promotions) |
+| turn 15-16 (revisit) wall | 29.66 s / 13.06 s | 37.95 s / 23.08 s |
+
+The mechanism works where it can: once early topics are long-dead, their
+VRAM residents are displaced by the current conversation's hot RAM-resident
+experts (turns 13-14: wall −29%/−43%, storage-wait share down 3-4×, CPU
+executor share down ~2×, fewer bytes re-read). The revisit turns are **not**
+healed: by turn 15 the session had pushed ~55 GiB of unique experts through
+the 48 GiB RAM tier, so the opening topic's experts were no longer
+RAM-resident and had to come from SATA again (2.80 GiB read on turn 15) —
+a RAM-capacity limit that VRAM re-promotion cannot address, and the extra
+promotion work on top of a storage-bound turn made those two turns slower.
+A dedicated revisit probe (two opening-topic turns, twelve drift turns, then
+two revisit turns, freshly restarted service) hit the same boundary: ~57 GiB
+had passed through the RAM tier by the revisit, so despite promotions firing
+(441-1,593 per turn on turns 12-16) the revisit turns still read 2.80/1.19
+GiB from storage.
+
+Honest negatives (two failed gating variants, measured and discarded before
+landing the recency gate):
+
+- **Ungated re-promotion** (any admission-improving RAM-resident miss is
+  uploaded): the resident repeat route collapsed to ~10 tok/s — ~3,800
+  promotions and ~10 GiB of H2D per 48-token request, ping-ponging between
+  equally hot entries of a route that exceeds the VRAM budget. Zero storage
+  reads, pure VRAM churn.
+- **Temperature-margin gating** (promote only if strictly hotter by 2×):
+  still ~800 promotions per repeat request (a repeating route has intrinsic
+  temperature spread) — resident route ~15 tok/s. A per-miss O(cache-map)
+  admission scan added a further ~10 ms/token until the scan was hoisted to
+  once per forward pass.
+- **2^16-tick recency (~1 turn)**: resident gate clean, but every topic
+  change re-uploaded the turn's misses (3-6k promotions, 10-20 GiB H2D per
+  turn); long-session total wall regressed +23% (419.1 s vs 341.6 s).
+
+Net: W4 lands as a safe, bounded self-healing mechanism — resident route
+unchanged at ~27-29 tok/s, drift-phase behavior unchanged, settled new
+topics reclaim VRAM from dead ones (up to −43% turn wall), no added storage
+reads anywhere. It does not move the multi-turn chat totals on this probe,
+because those turns sit at the SATA first-touch floor, and it cannot heal a
+revisited topic whose experts have already left the 48 GiB RAM tier.
+`Invoke-P6ServiceSmoke.ps1` passes on `w04r3`; the full build/ctest/Python
+suite (46 tests) is green, including a new cache test
+(`test_vram_stale_resident_bytes_tracks_victim_recency`).
+
 ## DeepSeek-V4-Flash
 
 The 284B-class DeepSeek backend is functionally complete enough for greedy API

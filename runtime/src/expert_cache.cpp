@@ -986,6 +986,28 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     return false;
   }
 
+  std::uint64_t vram_stale_resident_bytes(std::uint64_t minimum_age) const {
+    std::lock_guard lock(mutex);
+    if (shutting_down) return 0;
+    std::uint64_t stale_bytes = 0;
+    for (const auto& [key, entry] : entries) {
+      (void)key;
+      if (!entry->device || entry->references != 0 ||
+          !entry->waiters.empty() ||
+          entry->state == CacheState::gpu_uploading ||
+          entry->state == CacheState::failed ||
+          access_clock - entry->last_access < minimum_age) {
+        continue;
+      }
+      stale_bytes =
+          entry->vram_reserved >
+                  std::numeric_limits<std::uint64_t>::max() - stale_bytes
+              ? std::numeric_limits<std::uint64_t>::max()
+              : stale_bytes + entry->vram_reserved;
+    }
+    return stale_bytes;
+  }
+
   void cancel_waiter(const ExpertKey& key, std::uint64_t waiter_id) noexcept {
     OperationId io = 0;
     OperationId upload = 0;
@@ -1232,6 +1254,11 @@ std::uint64_t ExpertCache::record_accesses(
 bool ExpertCache::vram_admission_would_improve(
     const ExpertKey& key, const PayloadRecord& record) {
   return core_->vram_admission_would_improve(key, record);
+}
+
+std::uint64_t ExpertCache::vram_stale_resident_bytes(
+    std::uint64_t minimum_age) const {
+  return core_->vram_stale_resident_bytes(minimum_age);
 }
 
 std::optional<CacheEntrySnapshot> ExpertCache::inspect(
