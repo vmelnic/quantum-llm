@@ -14,6 +14,11 @@ from array import array
 from collections.abc import Iterable
 from typing import BinaryIO
 
+from .constants import (
+    FP4_QUANT_GROUP_SIZE,
+    FP4_UE8M0_MAX_CODE,
+    FP4_UE8M0_MIN_CODE,
+)
 from .errors import SourceFormatError
 from .safetensors import TensorView
 from .util import write_all
@@ -76,7 +81,6 @@ def _row_geometry(view: TensorView) -> tuple[int, int, int]:
 
 def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> bytes:
     """Write row-major int8 values and return little-endian FP32 scales."""
-
     rows, columns, row_bytes = _row_geometry(view)
     scales = bytearray()
     for row in range(rows):
@@ -117,6 +121,131 @@ def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> 
         write_all(destination, payload)
         digest.update(payload)
         scales.extend(struct.pack("<f", scale))
+    return bytes(scales)
+
+
+# E2M1 finite magnitudes in nibble-index order; the sign rides bit 3.  This is
+# the exact inverse of the runtime decode table (2x these values, with the
+# kernel's final 0.5 factor) and of deepseek_quant.FP4_E2M1_VALUES.
+_FP4_E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _fp4_block_code(maximum: float) -> int:
+    """Pick the UE8M0 code whose scale covers a block maximum with E2M1."""
+
+    if maximum == 0.0:
+        return 127
+    exponent = math.ceil(math.log2(maximum / 6.0))
+    return min(FP4_UE8M0_MAX_CODE, max(FP4_UE8M0_MIN_CODE, exponent + 127))
+
+
+def _fp4_nearest_index(magnitude: float) -> int:
+    """Nearest E2M1 level index; exact ties go to the even index."""
+
+    upper = 1
+    while upper < len(_FP4_E2M1_LEVELS) and _FP4_E2M1_LEVELS[upper] < magnitude:
+        upper += 1
+    if upper == len(_FP4_E2M1_LEVELS):
+        return len(_FP4_E2M1_LEVELS) - 1
+    lower = upper - 1
+    low_distance = magnitude - _FP4_E2M1_LEVELS[lower]
+    high_distance = _FP4_E2M1_LEVELS[upper] - magnitude
+    if high_distance < low_distance or (
+        high_distance == low_distance and upper % 2 == 0
+    ):
+        return upper
+    return lower
+
+
+def _fp4_pack_nibbles(indices: list[int], signs: list[int]) -> bytes:
+    packed = bytearray(len(indices) // 2)
+    for pair in range(len(packed)):
+        packed[pair] = (indices[2 * pair] | (signs[2 * pair] << 3)) | (
+            (indices[2 * pair + 1] | (signs[2 * pair + 1] << 3)) << 4
+        )
+    return bytes(packed)
+
+
+def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: object) -> bytes:
+    """Write FP4-E2M1 packed rows and return UE8M0 block scales.
+
+    Each output row is encoded independently: every block of
+    ``FP4_QUANT_GROUP_SIZE`` values shares one UE8M0 scale chosen as the
+    smallest power of two covering the block maximum, values round to the
+    nearest E2M1 level (ties to the even level index), and nibbles pack
+    low-then-high per byte.  NumPy and stdlib paths both compute in float64 so
+    their bytes are identical.
+    """
+
+    rows, columns, row_bytes = _row_geometry(view)
+    if columns % FP4_QUANT_GROUP_SIZE:
+        raise SourceFormatError(
+            f"FP4 block-{FP4_QUANT_GROUP_SIZE} requires a multiple of "
+            f"{FP4_QUANT_GROUP_SIZE} columns, got {columns} for {view.info.name}"
+        )
+    blocks = columns // FP4_QUANT_GROUP_SIZE
+    scales = bytearray()
+    for row in range(rows):
+        start = row * row_bytes
+        values = _decode_float_row(view.raw[start : start + row_bytes], view.info.dtype)
+        if _np is not None:
+            numeric = _np.asarray(values, dtype="<f8")
+            if numeric.size != columns:
+                raise SourceFormatError(f"short decoded row in {view.info.name}")
+            if not bool(_np.isfinite(numeric).all()):
+                raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
+            grid = numeric.reshape(blocks, FP4_QUANT_GROUP_SIZE)
+            maxima = _np.max(_np.abs(grid), axis=1)
+            codes = _np.array(
+                [_fp4_block_code(float(maximum)) for maximum in maxima], dtype="<f8"
+            )
+            block_scales = _np.ldexp(1.0, codes.astype("<i8") - 127)
+            quotient = grid / block_scales[:, None]
+            magnitude = _np.abs(quotient)
+            levels = _np.asarray(_FP4_E2M1_LEVELS, dtype="<f8")
+            upper = _np.clip(
+                _np.searchsorted(levels, magnitude, side="left"), 1, len(levels) - 1
+            )
+            lower = upper - 1
+            low_distance = magnitude - levels[lower]
+            high_distance = levels[upper] - magnitude
+            choose_upper = (high_distance < low_distance) | (
+                (high_distance == low_distance) & (upper % 2 == 0)
+            )
+            indices = _np.where(choose_upper, upper, lower).astype("<u1")
+            signs = (quotient < 0.0).astype("<u1")
+            nibbles = (indices | (signs << 3)).reshape(-1)
+            payload = (
+                nibbles[0::2] | (nibbles[1::2] << 4)
+            ).astype("<u1").tobytes()
+            write_all(destination, payload)
+            digest.update(payload)
+            scales.extend(codes.astype("<u1").tobytes())
+            continue
+        materialized: list[float] = []
+        for value in values:
+            scalar = float(value)
+            if not math.isfinite(scalar):
+                raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
+            materialized.append(scalar)
+        if len(materialized) != columns:
+            raise SourceFormatError(f"short decoded row in {view.info.name}")
+        for block in range(blocks):
+            chunk = materialized[
+                block * FP4_QUANT_GROUP_SIZE : (block + 1) * FP4_QUANT_GROUP_SIZE
+            ]
+            code = _fp4_block_code(max(abs(value) for value in chunk))
+            scale = math.ldexp(1.0, code - 127)
+            indices = []
+            signs = []
+            for value in chunk:
+                quotient = value / scale
+                indices.append(_fp4_nearest_index(abs(quotient)))
+                signs.append(1 if quotient < 0.0 else 0)
+            payload = _fp4_pack_nibbles(indices, signs)
+            write_all(destination, payload)
+            digest.update(payload)
+            scales.append(code)
     return bytes(scales)
 
 

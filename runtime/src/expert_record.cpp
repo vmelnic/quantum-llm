@@ -85,7 +85,9 @@ ExpertRecordValidation validate_expert_record(
   const auto record_bytes = read_le<std::uint64_t>(raw + 44);
 
   if (version != kExpertPackVersion || header_bytes != kExpertHeaderBytes ||
-      flags != kRequiredFlags || quant_abi != kExpertQuantAbiInt8PerRow ||
+      flags != kRequiredFlags ||
+      (quant_abi != kExpertQuantAbiInt8PerRow &&
+       quant_abi != kExpertQuantAbiFp4Block32) ||
       quant_abi != key.quant_abi || reserved != 0 ||
       layer < 0 || expert < 0 || static_cast<std::uint32_t>(layer) != key.layer ||
       static_cast<std::uint32_t>(expert) != key.expert ||
@@ -93,6 +95,12 @@ ExpertRecordValidation validate_expert_record(
       fused_rows != 2U * intermediate) {
     return failure(ErrorCode::checksum_mismatch,
                    "expert header/manifest ABI mismatch");
+  }
+  const bool fp4 = quant_abi == kExpertQuantAbiFp4Block32;
+  if (fp4 && (hidden % kExpertFp4BlockSize != 0 ||
+              intermediate % kExpertFp4BlockSize != 0)) {
+    return failure(ErrorCode::checksum_mismatch,
+                   "FP4 expert geometry is not block-aligned");
   }
   for (std::size_t index = kStructuredHeaderBytes;
        index < kExpertHeaderBytes; ++index) {
@@ -115,7 +123,21 @@ ExpertRecordValidation validate_expert_record(
   sections.down_scale_bytes = read_le<std::uint64_t>(raw + 108);
 
   std::uint64_t hidden_intermediate = 0;
-  if (!multiply(hidden, intermediate, hidden_intermediate) ||
+  if (!multiply(hidden, intermediate, hidden_intermediate)) {
+    return failure(ErrorCode::checksum_mismatch,
+                   "expert section dimensions are inconsistent");
+  }
+  if (fp4) {
+    if (sections.gate_up_q_bytes != hidden_intermediate ||
+        sections.gate_up_scale_bytes !=
+            2ULL * hidden_intermediate / kExpertFp4BlockSize ||
+        sections.down_q_bytes != hidden_intermediate / 2U ||
+        sections.down_scale_bytes !=
+            hidden_intermediate / kExpertFp4BlockSize) {
+      return failure(ErrorCode::checksum_mismatch,
+                     "expert section dimensions are inconsistent");
+    }
+  } else if (
       sections.gate_up_q_bytes != 2U * hidden_intermediate ||
       sections.gate_up_scale_bytes != 2ULL * intermediate * sizeof(float) ||
       sections.down_q_bytes != hidden_intermediate ||
@@ -136,6 +158,25 @@ ExpertRecordValidation validate_expert_record(
                      "expert section is unaligned, overlapping, or out of range");
     }
     previous_end = offset + length;
+  }
+  if (fp4) {
+    // UE8M0 scales must be finite (0xff is NaN) and unambiguous: the compiler
+    // clamps codes to [1, 254] because code 0 decodes inconsistently between
+    // toolchain and kernel paths.
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 2> scale_spans = {{
+        {sections.gate_up_scale_offset, sections.gate_up_scale_bytes},
+        {sections.down_scale_offset, sections.down_scale_bytes},
+    }};
+    for (const auto& [offset, length] : scale_spans) {
+      const auto begin = bytes.begin() + static_cast<std::size_t>(offset);
+      const auto end = begin + static_cast<std::size_t>(length);
+      if (std::find_if(begin, end, [](std::byte code) {
+            return code == std::byte{0x00} || code == std::byte{0xff};
+          }) != end) {
+        return failure(ErrorCode::checksum_mismatch,
+                       "FP4 expert contains an invalid UE8M0 scale code");
+      }
+    }
   }
   const auto expected_decoded = 3ULL * hidden_intermediate * sizeof(float);
   if (expected.decoded_bytes != 0 && expected.decoded_bytes != expected_decoded) {
@@ -162,7 +203,8 @@ ExpertRecordValidation validate_expert_record(
 ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& key,
     const PayloadRecord& expected, bool verify_payload_sha256) noexcept {
-  if (key.quant_abi == kExpertQuantAbiInt8PerRow &&
+  if ((key.quant_abi == kExpertQuantAbiInt8PerRow ||
+       key.quant_abi == kExpertQuantAbiFp4Block32) &&
       expected.source_abi == kExpertSourceAbiExpertPackV1) {
     const auto validated = validate_expert_record(bytes, key, expected);
     return {validated.status, validated.record.sections, {}};

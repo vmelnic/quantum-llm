@@ -6,6 +6,7 @@
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/expert_record.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/sha256.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
@@ -600,6 +601,12 @@ class Qwen3NextModel final {
     if (Required(architecture, "family", "architecture").AsString("family") !=
         "qwen3_next")
       throw std::runtime_error("runner requires qwen3_next Expert Pack");
+    const auto& quantization =
+        Required(manifest, "quantization", "manifest").AsObject("quantization");
+    quant_abi_ = u32(quantization, "abi_id", "quantization");
+    if (quant_abi_ != expert::runtime::kExpertQuantAbiInt8PerRow &&
+        quant_abi_ != expert::runtime::kExpertQuantAbiFp4Block32)
+      throw std::runtime_error("unsupported Qwen expert quant ABI");
     hidden_ = u32(architecture, "hidden_size", "architecture");
     expert_width_ = u32(architecture, "intermediate_size", "architecture");
     vocab_ = u32(architecture, "vocab_size", "architecture");
@@ -670,7 +677,7 @@ class Qwen3NextModel final {
     uploader_ = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
     directory_ =
         std::make_shared<expert::runtime::cuda::CudaExpertDirectory>(
-            model_id_, 1, layers_, experts_, workspace_rows_ * top_k_);
+            model_id_, quant_abi_, layers_, experts_, workspace_rows_ * top_k_);
     {
       auto plan_workspace = directory_->create_plan_workspace();
       if (!plan_workspace.status.ok() || !plan_workspace.workspace)
@@ -1182,6 +1189,14 @@ class Qwen3NextModel final {
     cpu_slot_by_selection_ =
         device_allocate<std::uint32_t>(rows * top_k_);
     moe_output_ = device_allocate<float>(rows * hidden_);
+    if (quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32) {
+      moe_q8_input_ = device_allocate<std::int8_t>(rows * hidden_);
+      moe_q8_input_scales_ = device_allocate<float>(rows);
+      moe_q8_intermediate_ = device_allocate<std::int8_t>(
+          static_cast<std::size_t>(rows) * top_k_ * expert_width_);
+      moe_q8_intermediate_scales_ =
+          device_allocate<float>(static_cast<std::size_t>(rows) * top_k_);
+    }
     // The vocabulary head only ever runs for decode rows or one prefill row,
     // so logits stay sized by the decode batch capacity.
     logits_ = device_allocate<float>(capacity_ * vocab_);
@@ -1431,9 +1446,9 @@ class Qwen3NextModel final {
     routed_expert_keys_.clear();
     missing_expert_keys_.clear();
     for (const auto expert : plan.ready_experts)
-      routed_expert_keys_.push_back({model_id_, layer, expert, 1});
+      routed_expert_keys_.push_back({model_id_, layer, expert, quant_abi_});
     for (const auto expert : plan.missing_experts)
-      missing_expert_keys_.push_back({model_id_, layer, expert, 1});
+      missing_expert_keys_.push_back({model_id_, layer, expert, quant_abi_});
     placement_->observe_routes(routed_expert_keys_, missing_expert_keys_);
     const auto selection_count = rows * top_k_;
     const bool placement_feedback = !placement_->frozen();
@@ -1493,7 +1508,7 @@ class Qwen3NextModel final {
           // Routing scores ride the pre-freeze D2H copy only; frozen feedback
           // carries access counts, and the cache ignores non-positive scores.
           route_accesses_.push_back(
-              {{model_id_, layer, expert, 1}, route_access_counts_[expert],
+              {{model_id_, layer, expert, quant_abi_}, route_access_counts_[expert],
                placement_feedback ? route_score_sums_[expert] : 0.0,
                placement_feedback ? route_score_maxima_[expert] : 0.0});
         }
@@ -1517,7 +1532,7 @@ class Qwen3NextModel final {
           const auto& record = expert_records_.at(
               static_cast<std::size_t>(layer) * experts_ + expert);
           handles.push_back(
-              cache_->acquire({model_id_, layer, expert, 1}, record));
+              cache_->acquire({model_id_, layer, expert, quant_abi_}, record));
         }
         for (std::size_t slot = 0; slot < handles.size(); ++slot) {
           if (handles[slot].wait_for(std::chrono::seconds(30)) !=
@@ -1544,7 +1559,7 @@ class Qwen3NextModel final {
         const auto& record = expert_records_.at(
             static_cast<std::size_t>(layer) * experts_ + expert);
         auto host = cache_->try_acquire_host(
-            {model_id_, layer, expert, 1}, record, false);
+            {model_id_, layer, expert, quant_abi_}, record, false);
         if (host) {
           host_slot_by_expert.emplace(expert, host_leases.size());
           host_leases.push_back(std::move(*host));
@@ -1583,13 +1598,18 @@ class Qwen3NextModel final {
         const auto& record = expert_records_.at(
             static_cast<std::size_t>(layer) * experts_ + expert);
         const auto host_available = host_slot_by_expert.contains(expert);
-        auto cpu_available = host_available;
-        auto gpu_available = !host_available;
-        if (host_available && may_upload_from_ram) {
+        // The CPU executor decodes int8-per-row records only; FP4 packs send
+        // every miss to the GPU uploader instead, bypassing the admission
+        // heuristics that would otherwise pin overflow selections on the CPU.
+        const bool fp4 = quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32;
+        auto cpu_available = host_available &&
+            quant_abi_ == expert::runtime::kExpertQuantAbiInt8PerRow;
+        auto gpu_available = !host_available || fp4;
+        if (host_available && may_upload_from_ram && !fp4) {
           bool admit = false;
           if (!frozen_route_feedback) {
             admit = cache_->vram_admission_would_improve(
-                {model_id_, layer, expert, 1}, record);
+                {model_id_, layer, expert, quant_abi_}, record);
           } else {
             // W4 router-aware re-promotion: the per-forward stale-victim
             // budget bounds promotions to displacing residents that have not
@@ -1727,6 +1747,11 @@ class Qwen3NextModel final {
     const auto expert_started = std::chrono::steady_clock::now();
     cuda_check(cudaEventRecord(expert_start_events_[layer]),
                "record expert lane start");
+    // FP4 packs always take the selection-batch path: the plain batch kernels
+    // have no packed-FP4 dispatch, while the selection kernels share the
+    // DeepSeek-proven dp4a GEMVs.
+    if (quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32)
+      split_execution = true;
     if (!split_execution) {
         status_check(expert::runtime::cuda::launch_moe_batch({
             normalized_, nullptr, nullptr, nullptr, nullptr, routing_scores_,
@@ -1743,9 +1768,11 @@ class Qwen3NextModel final {
               normalized_, routing_scores_, routing_indices_,
               compact_cpu_selection_count ? gpu_selection_mask_ : nullptr,
               moe_intermediate_, moe_selection_output_,
-              nullptr, nullptr, nullptr, nullptr, rows, hidden_, expert_width_,
+              moe_q8_input_, moe_q8_input_scales_, moe_q8_intermediate_,
+              moe_q8_intermediate_scales_, rows, hidden_, expert_width_,
               top_k_, experts_, nullptr, directory_->device_entries(), layer,
-              0.0F, false, false}));
+              0.0F, false,
+              quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32}));
         }
         phase_.gpu_expert_selections +=
             selection_count - compact_cpu_selection_count;
@@ -1816,7 +1843,7 @@ class Qwen3NextModel final {
           const auto& record = expert_records_.at(
               static_cast<std::size_t>(layer) * experts_ + expert);
           placement_->consider(
-              {model_id_, layer, expert, 1}, record,
+              {model_id_, layer, expert, quant_abi_}, record,
               static_cast<std::uint32_t>(cpu_groups[index].selections.size()),
               route_score_sums_[expert]);
         }
@@ -1834,6 +1861,7 @@ class Qwen3NextModel final {
       rotary_dim_{};
   float epsilon_{}, rope_theta_{};
   std::uint64_t model_id_{0x51334e4558540001ULL};
+  std::uint32_t quant_abi_{expert::runtime::kExpertQuantAbiInt8PerRow};
   std::uint64_t total_pack_bytes_{}, dense_read_bytes_{},
       max_expert_record_bytes_{};
   std::uint64_t ram_cache_bytes_{}, vram_cache_bytes_{}, kv_cache_bytes_{},
@@ -1876,6 +1904,10 @@ class Qwen3NextModel final {
   std::uint32_t *routing_indices_{}, *output_token_{}, *host_routing_indices_{},
       *cpu_slot_by_selection_{};
   std::uint8_t* gpu_selection_mask_{};
+  // FP4 block-32 packs run the dp4a GEMVs, which read q8-quantized
+  // activations; these buffers hold them when quant_abi_ is 3.
+  std::int8_t *moe_q8_input_{}, *moe_q8_intermediate_{};
+  float *moe_q8_input_scales_{}, *moe_q8_intermediate_scales_{};
   void** device_kv_page_table_{};
   std::vector<std::vector<void*>> slot_kv_pages_;
   std::vector<void*> free_kv_pages_;

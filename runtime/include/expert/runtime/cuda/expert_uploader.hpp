@@ -46,7 +46,9 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   CudaExpertAllocation(std::shared_ptr<CudaExpertPool> pool, void* storage,
                        std::size_t bytes,
                        const std::int8_t* gate_up, const float* gate_up_scales,
-                       const std::int8_t* down, const float* down_scales) noexcept;
+                       const std::int8_t* down, const float* down_scales,
+                       std::uint32_t hidden = 0,
+                       std::uint32_t intermediate = 0) noexcept;
   ~CudaExpertAllocation() override;
   CudaExpertAllocation(const CudaExpertAllocation&) = delete;
   CudaExpertAllocation& operator=(const CudaExpertAllocation&) = delete;
@@ -56,6 +58,10 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   [[nodiscard]] const float* gate_up_scales() const noexcept;
   [[nodiscard]] const std::int8_t* down() const noexcept;
   [[nodiscard]] const float* down_scales() const noexcept;
+  // Nonzero only for FP4 block-32 records, where the directory derives the
+  // w1/w3/w2 views from the contiguous gate-up/down sections.
+  [[nodiscard]] std::uint32_t hidden() const noexcept;
+  [[nodiscard]] std::uint32_t intermediate() const noexcept;
 
  private:
   std::shared_ptr<CudaExpertPool> pool_;
@@ -65,6 +71,8 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   const float* gate_up_scales_{};
   const std::int8_t* down_{};
   const float* down_scales_{};
+  std::uint32_t hidden_{};
+  std::uint32_t intermediate_{};
 };
 
 class CudaCompactExpertAllocation final : public IDeviceAllocation {

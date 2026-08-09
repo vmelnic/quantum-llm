@@ -19,6 +19,11 @@ from .constants import (
     FLAG_SYMMETRIC,
     FORMAT_NAME,
     FORMAT_VERSION,
+    FP4_QUANT_ABI_ID,
+    FP4_QUANT_GROUP_SIZE,
+    FP4_QUANT_PROFILE,
+    FP4_UE8M0_MAX_CODE,
+    FP4_UE8M0_MIN_CODE,
     HEADER_BYTES,
     MANIFEST_SCHEMA,
     PACK_ALIGNMENT,
@@ -68,6 +73,17 @@ def _validate_scales(path: Path, absolute_offset: int, byte_count: int, label: s
     _require(len(raw) == byte_count, f"short {label} scale read")
     values = struct.iter_unpack("<f", raw)
     _require(all(math.isfinite(value[0]) and value[0] > 0.0 for value in values), f"invalid {label} scale")
+
+
+def _validate_ue8m0_scales(path: Path, absolute_offset: int, byte_count: int, label: str) -> None:
+    with path.open("rb") as handle:
+        handle.seek(absolute_offset)
+        raw = handle.read(byte_count)
+    _require(len(raw) == byte_count, f"short {label} scale read")
+    _require(
+        all(FP4_UE8M0_MIN_CODE <= code <= FP4_UE8M0_MAX_CODE for code in raw),
+        f"invalid {label} UE8M0 scale code",
+    )
 
 
 def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> None:
@@ -182,14 +198,33 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
     _require(magic == EXPERT_MAGIC and version == FORMAT_VERSION, "unknown expert record ABI")
     _require(header_bytes == HEADER_BYTES and reserved == 0, "invalid expert header fields")
     required_flags = FLAG_ROW_MAJOR | FLAG_GATE_UP_FUSED | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
-    _require(flags == required_flags and quant_abi == QUANT_ABI_ID, "unknown expert quant/layout ABI")
+    _require(flags == required_flags, "unknown expert quant/layout ABI")
+    fp4 = quant_abi == FP4_QUANT_ABI_ID
+    _require(quant_abi in (QUANT_ABI_ID, FP4_QUANT_ABI_ID), "unknown expert quant/layout ABI")
     _require(layer == entry.get("layer") and expert == entry.get("expert"), "expert identity mismatch")
     _require(record_bytes == stored_bytes, "expert record/manifest size mismatch")
     _require(fused_rows == 2 * intermediate, "expert fused-row count mismatch")
-    _require(gate_up_q_bytes == 2 * intermediate * hidden, "gate+up byte count mismatch")
-    _require(gate_up_scale_bytes == 2 * intermediate * 4, "gate+up scale count mismatch")
-    _require(down_q_bytes == hidden * intermediate, "down byte count mismatch")
-    _require(down_scale_bytes == hidden * 4, "down scale count mismatch")
+    if fp4:
+        _require(
+            hidden % FP4_QUANT_GROUP_SIZE == 0
+            and intermediate % FP4_QUANT_GROUP_SIZE == 0,
+            "FP4 expert geometry is not block-aligned",
+        )
+        _require(gate_up_q_bytes == intermediate * hidden, "gate+up byte count mismatch")
+        _require(
+            gate_up_scale_bytes == 2 * intermediate * hidden // FP4_QUANT_GROUP_SIZE,
+            "gate+up scale count mismatch",
+        )
+        _require(down_q_bytes == hidden * intermediate // 2, "down byte count mismatch")
+        _require(
+            down_scale_bytes == hidden * intermediate // FP4_QUANT_GROUP_SIZE,
+            "down scale count mismatch",
+        )
+    else:
+        _require(gate_up_q_bytes == 2 * intermediate * hidden, "gate+up byte count mismatch")
+        _require(gate_up_scale_bytes == 2 * intermediate * 4, "gate+up scale count mismatch")
+        _require(down_q_bytes == hidden * intermediate, "down byte count mismatch")
+        _require(down_scale_bytes == hidden * 4, "down scale count mismatch")
     section_values = {
         "gate_up_q": {"offset": gate_up_q_offset, "bytes": gate_up_q_bytes},
         "gate_up_scales": {"offset": gate_up_scale_offset, "bytes": gate_up_scale_bytes},
@@ -206,8 +241,12 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
         _require(section_offset >= previous_end, f"overlapping expert section {name}")
         _require(section_offset + section_bytes <= record_bytes, f"expert section exceeds record: {name}")
         previous_end = section_offset + section_bytes
-    _validate_scales(path, offset + gate_up_scale_offset, gate_up_scale_bytes, "gate+up")
-    _validate_scales(path, offset + down_scale_offset, down_scale_bytes, "down")
+    if fp4:
+        _validate_ue8m0_scales(path, offset + gate_up_scale_offset, gate_up_scale_bytes, "gate+up")
+        _validate_ue8m0_scales(path, offset + down_scale_offset, down_scale_bytes, "down")
+    else:
+        _validate_scales(path, offset + gate_up_scale_offset, gate_up_scale_bytes, "gate+up")
+        _validate_scales(path, offset + down_scale_offset, down_scale_bytes, "down")
     _require(entry.get("decoded_bytes") == 3 * hidden * intermediate * 4, "expert decoded byte mismatch")
     actual_hash = _payload_hash(path, offset + HEADER_BYTES, record_bytes - HEADER_BYTES)
     _require(actual_hash == payload_hash.hex(), "expert payload/header checksum mismatch")
@@ -257,7 +296,12 @@ def validate_container(root: Path | str) -> dict[str, Any]:
     _require(format_info.get("version") == FORMAT_VERSION, "unsupported format version")
     quant = manifest.get("quantization")
     _require(isinstance(quant, dict), "manifest quantization block missing")
-    _require(quant.get("profile") == QUANT_PROFILE and quant.get("abi_id") == QUANT_ABI_ID, "unsupported quant ABI")
+    profile = quant.get("profile")
+    expected_abi = {QUANT_PROFILE: QUANT_ABI_ID, FP4_QUANT_PROFILE: FP4_QUANT_ABI_ID}
+    _require(
+        profile in expected_abi and quant.get("abi_id") == expected_abi[profile],
+        "unsupported quant ABI",
+    )
     alignment = manifest.get("alignment")
     _require(isinstance(alignment, dict), "manifest alignment block missing")
     pack_alignment = alignment.get("pack_bytes")

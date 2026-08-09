@@ -205,9 +205,11 @@ CudaExpertAllocation::CudaExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
     const std::int8_t* gate_up,
     const float* gate_up_scales, const std::int8_t* down,
-    const float* down_scales) noexcept
+    const float* down_scales, std::uint32_t hidden,
+    std::uint32_t intermediate) noexcept
     : pool_(std::move(pool)), storage_(storage), bytes_(bytes), gate_up_(gate_up),
-      gate_up_scales_(gate_up_scales), down_(down), down_scales_(down_scales) {}
+      gate_up_scales_(gate_up_scales), down_(down), down_scales_(down_scales),
+      hidden_(hidden), intermediate_(intermediate) {}
 
 CudaExpertAllocation::~CudaExpertAllocation() {
   if (storage_ != nullptr && pool_) {
@@ -220,6 +222,8 @@ const std::int8_t* CudaExpertAllocation::gate_up() const noexcept { return gate_
 const float* CudaExpertAllocation::gate_up_scales() const noexcept { return gate_up_scales_; }
 const std::int8_t* CudaExpertAllocation::down() const noexcept { return down_; }
 const float* CudaExpertAllocation::down_scales() const noexcept { return down_scales_; }
+std::uint32_t CudaExpertAllocation::hidden() const noexcept { return hidden_; }
+std::uint32_t CudaExpertAllocation::intermediate() const noexcept { return intermediate_; }
 
 CudaCompactExpertAllocation::CudaCompactExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
@@ -500,7 +504,13 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
     return operation;
   }
   finish_async(std::make_shared<CudaExpertAllocation>(
-                   pool_, raw, total, gate, gate_scales, down, down_scales),
+                   pool_, raw, total, gate, gate_scales, down, down_scales,
+                   request.key.quant_abi == kExpertQuantAbiFp4Block32
+                       ? sections.hidden
+                       : 0U,
+                   request.key.quant_abi == kExpertQuantAbiFp4Block32
+                       ? sections.intermediate
+                       : 0U),
                total, Status::success());
   return operation;
 }

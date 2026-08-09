@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .compile import CompileOptions, compile_checkpoint
-from .constants import PACK_ALIGNMENT, QUANT_PROFILE
+from .constants import PACK_ALIGNMENT, QUANT_PROFILE, QUANT_PROFILES
 from .deepseek_v4 import (
     estimate_deepseek_v4_representations,
     validate_deepseek_v4_source,
@@ -46,7 +46,7 @@ def _parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--source", type=Path, required=True)
     compile_parser.add_argument("--output", type=Path, required=True)
     compile_parser.add_argument("--adapter", choices=("olmoe", "qwen3_next"), default="olmoe")
-    compile_parser.add_argument("--quant-profile", choices=(QUANT_PROFILE,), default=QUANT_PROFILE)
+    compile_parser.add_argument("--quant-profile", choices=QUANT_PROFILES, default=QUANT_PROFILE)
     compile_parser.add_argument("--alignment", type=int, default=PACK_ALIGNMENT)
     compile_parser.add_argument("--max-expert-pack-bytes", type=int, default=2 * 1024**3)
     compile_parser.add_argument("--source-id")

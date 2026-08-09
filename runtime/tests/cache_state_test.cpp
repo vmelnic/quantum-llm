@@ -194,6 +194,104 @@ FixtureRecord make_record(std::uint32_t expert_id,
   return result;
 }
 
+FixtureRecord make_fp4_record(std::uint32_t expert_id,
+                              std::uint64_t file_offset = 0,
+                              std::uint32_t layer = 3) {
+  // Block-32 aligned FP4-E2M1/UE8M0 record: hidden 32, intermediate 32.
+  FixtureRecord result;
+  result.key = {0x0123456789abcdefULL, layer, expert_id,
+                er::kExpertQuantAbiFp4Block32};
+  result.bytes.resize(er::kExpertPackAlignment);
+  for (std::size_t index = er::kExpertHeaderBytes; index < result.bytes.size();
+       ++index) {
+    result.bytes[index] = static_cast<std::byte>((index * 37U + expert_id) & 0xffU);
+  }
+  // Scale spans must carry valid UE8M0 codes in [1, 254].
+  for (const auto& span : {std::pair{1280ULL, 64ULL}, {2048ULL, 32ULL}}) {
+    for (std::size_t index = span.first; index < span.first + span.second;
+         ++index) {
+      const auto code = static_cast<unsigned>(result.bytes[index]) % 254U;
+      result.bytes[index] = static_cast<std::byte>(code + 1U);
+    }
+  }
+
+  auto* header = result.bytes.data();
+  std::memcpy(header, "EPEXPR01", 8);
+  write_le<std::uint16_t>(header + 8, er::kExpertPackVersion);
+  write_le<std::uint16_t>(header + 10, er::kExpertHeaderBytes);
+  write_le<std::uint32_t>(header + 12, 0x0fU);
+  write_le<std::uint32_t>(header + 16, er::kExpertQuantAbiFp4Block32);
+  write_le<std::int32_t>(header + 20, static_cast<std::int32_t>(layer));
+  write_le<std::int32_t>(header + 24, static_cast<std::int32_t>(expert_id));
+  write_le<std::uint32_t>(header + 28, 32);
+  write_le<std::uint32_t>(header + 32, 32);
+  write_le<std::uint32_t>(header + 36, 64);
+  write_le<std::uint32_t>(header + 40, 0);
+  write_le<std::uint64_t>(header + 44, result.bytes.size());
+  write_le<std::uint64_t>(header + 52, 256);    // gate_up_q: 2*32*32/2
+  write_le<std::uint64_t>(header + 60, 1024);
+  write_le<std::uint64_t>(header + 68, 1280);   // gate_up scales: 2*32*32/32
+  write_le<std::uint64_t>(header + 76, 64);
+  write_le<std::uint64_t>(header + 84, 1536);   // down_q: 32*32/2
+  write_le<std::uint64_t>(header + 92, 512);
+  write_le<std::uint64_t>(header + 100, 2048);  // down scales: 32*32/32
+  write_le<std::uint64_t>(header + 108, 32);
+  const auto digest = er::sha256(std::span<const std::byte>(result.bytes).subspan(
+      er::kExpertHeaderBytes));
+  std::copy(digest.begin(), digest.end(), header + 116);
+
+  result.record.path = "fixture.qpack";
+  result.record.record_offset = file_offset;
+  result.record.stored_bytes = result.bytes.size();
+  result.record.decoded_bytes = 3ULL * 32 * 32 * sizeof(float);
+  result.record.header_bytes = er::kExpertHeaderBytes;
+  result.record.alignment = er::kExpertPackAlignment;
+  result.record.source_abi = er::kExpertSourceAbiExpertPackV1;
+  result.record.payload_sha256 = digest;
+  return result;
+}
+
+void test_fp4_block32_admission_validation() {
+  auto fixture = make_fp4_record(7);
+  const auto valid = er::validate_expert_admission(
+      fixture.bytes, fixture.key, fixture.record);
+  require(valid.status.ok() && valid.target.hidden == 32U &&
+              valid.target.gate_up_q_bytes == 1024U &&
+              valid.target.gate_up_scale_bytes == 64U &&
+              valid.target.down_q_bytes == 512U &&
+              valid.target.down_scale_bytes == 32U,
+          "valid FP4 block-32 admission was rejected");
+
+  auto corrupt = make_fp4_record(7);
+  corrupt.bytes[er::kExpertHeaderBytes + 5] ^= std::byte{1};
+  require(!er::validate_expert_admission(corrupt.bytes, corrupt.key,
+                                         corrupt.record)
+               .status.ok(),
+          "corrupt FP4 block-32 admission was accepted");
+
+  for (const auto bad_code : {std::byte{0x00}, std::byte{0xff}}) {
+    auto invalid_scale = make_fp4_record(7);
+    invalid_scale.bytes[1280] = bad_code;
+    const auto digest = er::sha256(
+        std::span<const std::byte>(invalid_scale.bytes)
+            .subspan(er::kExpertHeaderBytes));
+    std::copy(digest.begin(), digest.end(), invalid_scale.bytes.data() + 116);
+    invalid_scale.record.payload_sha256 = digest;
+    require(!er::validate_expert_admission(invalid_scale.bytes,
+                                           invalid_scale.key,
+                                           invalid_scale.record)
+                 .status.ok(),
+            "FP4 block-32 admission accepted an invalid UE8M0 code");
+  }
+
+  auto abi_mismatch = make_fp4_record(7);
+  abi_mismatch.key.quant_abi = er::kExpertQuantAbiInt8PerRow;
+  require(!er::validate_expert_admission(abi_mismatch.bytes, abi_mismatch.key,
+                                         abi_mismatch.record)
+               .status.ok(),
+          "FP4 record was admitted under the int8 ABI");
+}
+
 class ControlledStorage final : public er::IAsyncStorage {
  public:
   struct Pending final {
@@ -1444,6 +1542,7 @@ int main() {
     test_deepseek_compact_and_sm86_hot_abi();
     test_deepseek_compact_admission_validation();
     test_deepseek_fp8_shared_admission_validation();
+    test_fp4_block32_admission_validation();
     test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
     test_expanding_admission_reserves_exact_device_bytes();

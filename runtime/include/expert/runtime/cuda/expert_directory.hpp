@@ -17,6 +17,10 @@ enum class DeviceExpertState : std::uint32_t {
 
 enum class DeviceExpertFormat : std::uint32_t {
   int8_per_row = 0,
+  // FP4-E2M1 packed nibbles with one UE8M0 scale per 32-value block. Shared
+  // by the DeepSeek compact records (quant ABI 2) and Expert Pack FP4
+  // records (quant ABI 3); the packed_fp4_q8_dot kernels are
+  // geometry-generic, only the w1/w3/w2 views differ per source.
   deepseek_fp4_block32 = 1,
 };
 

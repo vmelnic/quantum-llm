@@ -23,6 +23,19 @@ QUANT_PROFILE = "int8-symmetric-per-row-v1"
 QUANT_ABI_ID = 1
 QUANT_GROUP_SIZE = 0  # 0 means one scale per complete output row.
 
+# FP4 E2M1 payload with one UE8M0 scale per 32-value block along each output
+# row, matching the device format already used by the DeepSeek compact path.
+# Scale codes are clamped to [1, 254]: 255 is the UE8M0 NaN and code 0 decodes
+# inconsistently between the toolchain decoder and the CUDA kernel, so the
+# compiler never emits it.
+FP4_QUANT_PROFILE = "fp4-e2m1-ue8m0-block32-v1"
+FP4_QUANT_ABI_ID = 3
+FP4_QUANT_GROUP_SIZE = 32
+FP4_UE8M0_MIN_CODE = 1
+FP4_UE8M0_MAX_CODE = 254
+
+QUANT_PROFILES = (QUANT_PROFILE, FP4_QUANT_PROFILE)
+
 DENSE_MAGIC = b"EPDENS01"
 EXPERT_MAGIC = b"EPEXPR01"
 DENSE_RECORD_KIND = 1

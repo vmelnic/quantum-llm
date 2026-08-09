@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/expert_directory.hpp"
 
 #include "expert/runtime/cuda/expert_uploader.hpp"
+#include "expert/runtime/expert_record.hpp"
 
 #include <cuda_runtime.h>
 
@@ -650,12 +651,40 @@ Status CudaExpertDirectory::publish(
                      key.expert;
   DeviceExpertEntry entry{};
   if (cuda_allocation) {
-    entry.gate_up = cuda_allocation->gate_up();
-    entry.gate_up_scales = cuda_allocation->gate_up_scales();
-    entry.down = cuda_allocation->down();
-    entry.down_scales = cuda_allocation->down_scales();
-    entry.format = static_cast<std::uint32_t>(
-        DeviceExpertFormat::int8_per_row);
+    if (key.quant_abi == kExpertQuantAbiFp4Block32) {
+      // Expert Pack FP4 record: the contiguous device buffer holds
+      // [gate rows][up rows][gate/up UE8M0 scales][down rows][down scales],
+      // so the w1/w3/w2 views are plain offsets into the same sections.
+      const auto hidden = cuda_allocation->hidden();
+      const auto intermediate = cuda_allocation->intermediate();
+      if (hidden == 0U || intermediate == 0U) {
+        return Status(ErrorCode::invalid_argument,
+                      "FP4 expert allocation is missing geometry");
+      }
+      const std::size_t matrix_packed =
+          static_cast<std::size_t>(hidden) * intermediate / 2U;
+      const std::size_t matrix_scales =
+          static_cast<std::size_t>(hidden) * intermediate / kExpertFp4BlockSize;
+      entry.w1_fp4 =
+          reinterpret_cast<const std::uint8_t*>(cuda_allocation->gate_up());
+      entry.w3_fp4 = entry.w1_fp4 + matrix_packed;
+      entry.w1_ue8m0 = reinterpret_cast<const std::uint8_t*>(
+          cuda_allocation->gate_up_scales());
+      entry.w3_ue8m0 = entry.w1_ue8m0 + matrix_scales;
+      entry.w2_fp4 =
+          reinterpret_cast<const std::uint8_t*>(cuda_allocation->down());
+      entry.w2_ue8m0 = reinterpret_cast<const std::uint8_t*>(
+          cuda_allocation->down_scales());
+      entry.format = static_cast<std::uint32_t>(
+          DeviceExpertFormat::deepseek_fp4_block32);
+    } else {
+      entry.gate_up = cuda_allocation->gate_up();
+      entry.gate_up_scales = cuda_allocation->gate_up_scales();
+      entry.down = cuda_allocation->down();
+      entry.down_scales = cuda_allocation->down_scales();
+      entry.format = static_cast<std::uint32_t>(
+          DeviceExpertFormat::int8_per_row);
+    }
   } else {
     const auto* base = compact_allocation->base();
     const auto& sections = compact_allocation->sections();

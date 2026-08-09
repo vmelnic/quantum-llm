@@ -14,6 +14,11 @@ inline constexpr std::uint32_t kExpertHeaderBytes = 256;
 inline constexpr std::uint32_t kExpertPackAlignment = 4096;
 inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow = 1;
 inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 = 2;
+// FP4-E2M1 packed nibbles with one UE8M0 scale per 32-value block along each
+// output row, stored in a standard EPEXPR01 record. Shares the DeepSeek
+// compact device format (DeviceExpertFormat::deepseek_fp4_block32).
+inline constexpr std::uint32_t kExpertQuantAbiFp4Block32 = 3;
+inline constexpr std::uint32_t kExpertFp4BlockSize = 32;
 inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
 inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 = 2;
 inline constexpr std::uint32_t kExpertSourceAbiDeepSeekFp8Block128V1 = 3;

@@ -14,6 +14,9 @@ from .adapters import AdaptedModel, adapt_checkpoint
 from .constants import (
     FORMAT_NAME,
     FORMAT_VERSION,
+    FP4_QUANT_ABI_ID,
+    FP4_QUANT_GROUP_SIZE,
+    FP4_QUANT_PROFILE,
     HASH_ALGORITHM,
     MANIFEST_SCHEMA,
     MIN_RUNTIME_VERSION,
@@ -22,6 +25,7 @@ from .constants import (
     QUANT_ABI_ID,
     QUANT_GROUP_SIZE,
     QUANT_PROFILE,
+    QUANT_PROFILES,
     SECTION_ALIGNMENT,
     TOKENIZER_FILES,
 )
@@ -55,6 +59,14 @@ class CompileOptions:
     source_revision: str | None = None
     resume: bool = False
     reclaim_source_shards: bool = False
+
+
+def _expert_quant_abi(quant_profile: str) -> int:
+    if quant_profile == QUANT_PROFILE:
+        return QUANT_ABI_ID
+    if quant_profile == FP4_QUANT_PROFILE:
+        return FP4_QUANT_ABI_ID
+    raise ValueError(f"unsupported quant profile {quant_profile!r}")
 
 
 def _utc_now() -> str:
@@ -336,6 +348,8 @@ def _build_manifest(
         tokenizer_metadata = {}
     config = checkpoint.config
     pack_bytes = dense_bytes + expert_bytes
+    expert_abi = _expert_quant_abi(options.quant_profile)
+    fp4 = expert_abi == FP4_QUANT_ABI_ID
     manifest: dict[str, object] = {
         "schema": MANIFEST_SCHEMA,
         "format": {
@@ -357,19 +371,23 @@ def _build_manifest(
         },
         "architecture": architecture,
         "quantization": {
-            "profile": QUANT_PROFILE,
-            "abi_id": QUANT_ABI_ID,
-            "expert_weights": "symmetric-int8",
+            "profile": options.quant_profile,
+            "abi_id": expert_abi,
+            "expert_weights": "fp4-e2m1-block32" if fp4 else "symmetric-int8",
             "dense_matrix_weights": "symmetric-int8-except-router",
             "router_and_norms": "float32",
-            "scale_dtype": "float32",
-            "group_size": QUANT_GROUP_SIZE,
+            "scale_dtype": "ue8m0" if fp4 else "float32",
+            "group_size": FP4_QUANT_GROUP_SIZE if fp4 else QUANT_GROUP_SIZE,
             "rounding": "nearest-ties-to-even",
             "zero_points": False,
         },
         "kernel_abi": {
-            "id": "expert-pack-sm86-int8-row-v1",
-            "quant_abi": QUANT_ABI_ID,
+            "id": (
+                "expert-pack-sm86-fp4-block32-v1"
+                if fp4
+                else "expert-pack-sm86-int8-row-v1"
+            ),
+            "quant_abi": expert_abi,
             "gate_up_fused": True,
             "gate_up_order": ["gate", "up"],
             "down_layout": "output-major-row-contiguous",
@@ -432,7 +450,8 @@ def compile_checkpoint(
     started = time.monotonic()
     source = Path(options.source).resolve()
     output = Path(options.output).resolve()
-    if options.quant_profile != QUANT_PROFILE:
+    expert_abi = _expert_quant_abi(options.quant_profile)
+    if options.quant_profile not in QUANT_PROFILES:
         raise ValueError(f"unsupported quant profile {options.quant_profile!r}")
     if options.alignment < PACK_ALIGNMENT or options.alignment & (options.alignment - 1):
         raise ValueError(f"alignment must be a power of two >= {PACK_ALIGNMENT}")
@@ -505,7 +524,9 @@ def compile_checkpoint(
     pack_index = len({entry["pack"] for entry in expert_entries})
     hidden = int(adapted.architecture["hidden_size"])
     intermediate = int(adapted.architecture["intermediate_size"])
-    predicted_record_bytes = expert_record_size(hidden, intermediate, options.alignment)
+    predicted_record_bytes = expert_record_size(
+        hidden, intermediate, options.alignment, expert_abi
+    )
     while next_expert < len(adapted.experts):
         pack_name = f"experts-{pack_index:03d}.qpack"
         temporary = partial / (pack_name + ".tmp")
@@ -522,6 +543,7 @@ def compile_checkpoint(
                     hidden,
                     intermediate,
                     options.alignment,
+                    expert_abi,
                 )
                 pack_entries.append(result.entry)
                 next_expert += 1
