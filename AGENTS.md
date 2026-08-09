@@ -10,6 +10,11 @@
   real change, then verify it.
 - Communicate in Romanian; repository artifacts (code comments, commit
   messages, docs) stay in English.
+- Hugging Face downloads only via xet through the repo scripts
+  (`ops/windows/Start-HuggingFaceModelDownload.ps1` /
+  `Get-HuggingFaceModelDownload.ps1`). Never curl/parallel ad-hoc
+  downloads, never invented scheduled tasks, and do not set
+  `HF_HUB_DISABLE_XET`.
 
 ## Project pointers
 
