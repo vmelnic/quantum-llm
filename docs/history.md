@@ -150,8 +150,9 @@ Several rejected intermediate results were essential:
 - unconditional nearest-neighbor admission hallucinated on absent facts; a
   held-out score floor separated known and unknown synthetic queries.
 
-The result and limitations are documented in
-[External Memory Expert](memory-expert.md). It is a feasibility result, not a
+The result and limitations were documented in the External Memory Expert
+notes (since extracted to the standalone `memory-expert` project). It is a
+feasibility result, not a
 claim that the current synthetic index is ready for real private data.
 
 ## First real Memory Data slice
@@ -168,7 +169,8 @@ strictly. Top-2 versus top-1 admission did not change that conclusion. This
 localized the next problem to multilingual/extractive adapter capability,
 rather than ingestion or dense retrieval. Model-generated synthetic citation
 IDs were rejected; exact citations were rendered only from ACL-admitted source
-records. See [Memory Data ingestion and retrieval](memory-data.md).
+records. See the Memory Data ingestion and retrieval notes (since extracted
+to the standalone `memory-expert` project).
 
 ## Multilingual capability benchmark audit
 
@@ -347,3 +349,17 @@ pointer for exact digits, v4 proved a rank-16 residual cannot render literals,
 and v5 proved the same gate cannot select finely enough out of distribution
 when trained on a single English corpus. The trained capability tracks the
 training distribution, not "admitted memory" as a general channel.
+
+## Memory Expert extraction
+
+The KV-attach pivot that followed the v5 closure — frozen native attention
+reading a lazily prefilled record K/V prefix, plus a 2.4M-parameter LoRA
+reader trained once on ConflictQA — validated its first two milestones on
+2026-08-08 (frozen: Nacre 8/8 strict answers; LoRA: 8/8 and 5/5 correct
+abstentions on the external sets). The complete experiment — code,
+architecture and results documentation, the Nacre demo set, and the
+operations runbooks — was then extracted from this repository into the
+standalone public `memory-expert` project. This chronology is kept intact
+as the design-space evidence that led there; nothing described above
+changes, and the memory-expert docs, ops scripts, and experiment code no
+longer live in this repository.

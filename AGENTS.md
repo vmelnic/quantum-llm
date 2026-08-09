@@ -20,6 +20,6 @@
 
 - `docs/inference-30toks-plan.md` — the serving-speed work plan for the
   3090 host (Qwen3-Next-80B / DeepSeek-V4-Flash).
-- `docs/memory-kv-attach-v1.md` — the KV-attach memory architecture
-  (milestones 1–2 validated); `docs/memory-expert.md` — the closed
-  rank-16 gate direction (v4/v5).
+- The Memory Expert (KV-attach) experiment was extracted into the standalone
+  public project at `../memory-expert` (validated architecture, results, and
+  runbooks live there now).

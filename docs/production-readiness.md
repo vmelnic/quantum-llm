@@ -35,7 +35,7 @@ context ceiling is not long-context-qualified. Neither backend meets the
 | observability | partial | JSONL/metrics exist; Qwen request-level placement telemetry is incomplete |
 | reliability | missing | no 24-hour soak, chaos campaign, HA or failover |
 | GPU CI/security review | missing | manual SM86 validation; no independent audit/fuzz campaign |
-| external Memory Expert | research, not qualified | channel causality passed synthetically; generic multilingual benchmark was invalidated and natural replacement is pending |
+| external Memory Expert | research, not qualified | KV-attach milestones 1–2 validated in the extracted standalone `memory-expert` project; serving integration here is not started |
 
 ## Release blockers
 

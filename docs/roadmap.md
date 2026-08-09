@@ -114,6 +114,13 @@ activations move instead of whole experts per token.
 
 ## P7 — production external knowledge
 
+The Memory Expert experiment moved to the standalone public `memory-expert`
+project, where the KV-attach architecture (native-attention read of a
+prefilled record K/V prefix, plus a small LoRA reader) validated its first
+two milestones and superseded the rank-16 gate Plan A below. The remaining
+items describe what production knowledge would require for integration into
+this runtime; the mechanism work itself continues there.
+
 The synthetic Memory Expert PoW proved channel causality only. Generic immutable
 ingestion and a pinned multilingual dense index are implemented; the Romanian
 legal document reached rank-1 retrieval for 5/5 questions. The first

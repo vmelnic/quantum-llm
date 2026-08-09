@@ -259,12 +259,12 @@ transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string
 lookups or per-layer uploads in the hot path.
 
-The external-knowledge research path is documented in
-[External Memory Expert](memory-expert.md). It attaches bounded retrieved
-records through a separate frozen pass and layer-wise gated cross-attention; it
-does not place source text in the request context and does not alter MoE expert
-placement. Channel causality is validated; generic natural-data capability is
-still under evaluation.
+The external-knowledge research path lives in the standalone public
+`memory-expert` project (extracted from this repository; see
+[Engineering history](history.md#memory-expert-extraction)). It attaches
+bounded retrieved records as a prefilled K/V prefix read by the frozen
+model's native attention; it does not place source text in the request
+context and does not alter MoE expert placement.
 
 One `DeepSeekRequestState` owns the mutable attention, FFN, HC-head/logits, and
 four-stream state for all 43 layers and retains the immutable model object that

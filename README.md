@@ -48,8 +48,11 @@ dropped.
 - Responses, Chat Completions, and legacy Completions HTTP APIs;
 - SSE streaming, usage, cancellation, overload handling, health and metrics;
 - reproducible Windows build, correctness gates, and Task Scheduler deployment.
-- a passed external Memory Expert proof of concept that attaches newly ingested
-  evidence without prompt stuffing or per-ingest retraining.
+
+A separate KV-attach Memory Expert experiment — attaching newly ingested
+evidence to a frozen model without prompt stuffing or per-ingest retraining —
+was validated here and extracted into the standalone public project at
+`../memory-expert`.
 
 ## Quick start
 
@@ -81,8 +84,6 @@ Switch models or release all GPU memory with the same command:
 - [Expert Pack v1](docs/expert-pack-v1.md)
 - [DeepSeek compact pack v1](docs/deepseek-compact-pack-v1.md)
 - [Compute-ready representations](docs/compute-ready.md)
-- [External Memory Expert](docs/memory-expert.md)
-- [Memory Data ingestion and retrieval](docs/memory-data.md)
 - [Runtime contract](docs/expert-runtime.md)
 - [OpenAI-compatible API](docs/openai-api.md)
 - [Operations](docs/operations.md)
