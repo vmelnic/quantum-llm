@@ -89,7 +89,7 @@ The safe path preserves every source shard:
 ```powershell
 .\ops\windows\Invoke-P6Conversion.ps1 `
   -Snapshot C:\path\to\snapshot `
-  -Output C:\models\qwen3-next-80b-expert-pack-int8
+  -Output C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8
 ```
 
 Source reclamation is intentionally not shown as the default. It deletes
@@ -100,14 +100,14 @@ Validate an existing pack independently:
 
 ```powershell
 .\ops\windows\Invoke-ExpertPack.ps1 -Action Validate `
-  -Path C:\models\qwen3-next-80b-expert-pack-int8
+  -Path C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8
 ```
 
 ## Run in the foreground
 
 ```powershell
 .\ops\windows\Start-P6ExpertServer.ps1 `
-  -Container C:\models\qwen3-next-80b-expert-pack-int8 `
+  -Container C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8 `
   -Python .\.venv\Scripts\python.exe `
   -MaximumContext 4096 `
   -WorkerCapacity 4 `
@@ -137,7 +137,7 @@ changing it. The choice is visible in `/model-info.worker_placement`.
 
 ```powershell
 .\ops\windows\Install-ExpertServerTask.ps1 -Start `
-  -Container C:\models\qwen3-next-80b-expert-pack-int8 `
+  -Container C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8 `
   -Python .\.venv\Scripts\python.exe `
   -BuildId (git rev-parse --short HEAD)
 

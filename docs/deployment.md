@@ -62,8 +62,8 @@ MODEL_SYNC_ON_START=1
 MODEL_READY_TIMEOUT=600
 MODEL_GENERATION_TIMEOUT_SECONDS=600
 
-MODEL_DEEPSEEK_BUNDLE=C:/models/deepseek-v4-flash/worker-bundle-v3
-MODEL_QWEN_CONTAINER=C:/models/qwen3-next-80b-expert-pack-int8
+MODEL_DEEPSEEK_BUNDLE=C:/quantum-llm/work/models/deepseek-v4-flash/worker-bundle-v3
+MODEL_QWEN_CONTAINER=C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-int8
 
 CHAT_SSH=user@gpu-host
 CHAT_BASE_URL=http://127.0.0.1:8080
