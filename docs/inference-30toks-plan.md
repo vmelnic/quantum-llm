@@ -1,6 +1,6 @@
 # Path to ±30 tok/s on the 3090 host — hypotheses and solutions
 
-Status: work plan, 2026-08-08 (v3 — verified root causes, flat work list).
+Status: executed, 2026-08-09 (v4 — W0–W5 landed, measured outcomes in §8).
 Inputs: code audit of the serving path (runtime/, ops/python/,
 ops/windows/), docs/benchmarks.md measured numbers, and published results
 for comparable stacks. Hardware baseline: RTX 3090 24 GB, Ryzen 5 5600,
@@ -211,3 +211,45 @@ baseline.
 - No chasing DeepSeek 30 tok/s on this host.
 - No per-turn protocol changes without W0 telemetry — otherwise gains are
   unprovable.
+
+## 8. Measured outcomes (2026-08-09, all committed)
+
+- **W0+W1 (protocol v5 retained sessions, telemetry):** landed. TTFT flat
+  3–9 s (was 17–28 s growing with history); multi-turn prefills only the
+  per-turn delta. Decode unchanged (~1–3 tok/s, expert-wait 82% of wall).
+- **W2 (Qwen hot path):** landed. Async decode plan with completion
+  events, placement frozen after warmup, vectorized GEMV. Resident route
+  **27.2–27.7 tok/s with 0 disk bytes** (was ~1–2). Multi-turn decode
+  +20–30%.
+- **W3 (async expert supply):** landed with one measured revert.
+  Event-driven uploads (no stream syncs on the hot path), DeepSeek
+  prefetch pipeline (4 in-flight, 4 IOCP threads, 8 staging slots, MTP
+  reserve charged only with MTP on, retention memcpy at second touch).
+  Qwen multi-turn: neutral — first-touch SATA reads dominate and cannot
+  be uploaded away; the route-ahead prefetch variant was reverted
+  (predicted experts were already RAM-resident; 2–7× VRAM churn).
+  DeepSeek: TTFT turn 3 37.4→31.8 s, expert-wait turn 3 −24%.
+- **W4 (router-aware re-promotion):** landed as a bounded mechanism, plan
+  criterion (resident-hit ≥ 0.8) not met. Frozen placement now re-promotes
+  RAM-resident hot experts against a stale-victim byte budget; resident
+  route holds 27.8–28.9 tok/s with zero added storage reads; settled-topic
+  turns heal (e.g. wall 31.7→22.4 s, storage-wait 57.5%→19.2%); session
+  totals are a wash because novel turns sit at the SATA first-touch floor
+  and revisits past the 48 GiB RAM tier re-read from disk. Two aggressive
+  variants measured and discarded (ping-pong churn).
+- **W5 (DeepSeek MTP):** landed; verdict: **MTP is throughput-neutral in
+  this regime, 8–15 tok/s confirmed unreachable.** Acceptance 73–77%, but
+  a verify pair pays the union of two adjacent routes through the same
+  bandwidth-bound pipe (reads slightly more), so accepted drafts amortize
+  only the fixed per-step cost, which is not the bottleneck at ~2 s/token.
+  Measured: 0.47–0.54 → 0.49–0.59 tok/s. Two real bugs fixed en route:
+  premature speculation suppression (EMA seeded from 2 samples) and
+  speculative-bonus poisoning of retained sessions (new STEP "hold" mode).
+  Deployment keeps MTP on: correct, neutral, self-suppressing.
+
+**Final state.** Qwen3-Next-80B meets the target on the resident route
+(~27–29 tok/s); non-resident chat is SATA-first-touch-bound (~3 tok/s).
+DeepSeek-V4-Flash stays ~0.5 tok/s; no runtime change beats 3.21
+GiB/token over this host's bandwidth. For 30 tok/s with a
+DeepSeek-class model: fewer active bytes/token or faster storage/RAM —
+not more scheduler work.

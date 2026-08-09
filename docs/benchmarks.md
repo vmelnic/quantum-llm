@@ -286,6 +286,84 @@ revisited topic whose experts have already left the 48 GiB RAM tier.
 suite (46 tests) is green, including a new cache test
 (`test_vram_stale_resident_bytes_tracks_victim_recency`).
 
+### W5 DeepSeek MTP speculative decode (2026-08-09, build `w05-mtp`)
+
+The worker bundle v3 ships complete MTP resources (MTP dense/typed/shared
+tensors plus a 3.42 GB one-layer routed compact pack, verified in place), so
+no pack-side addition was needed; the MTP runtime (draft layer, pair
+verification, adaptive suppression) already existed but had never been
+enabled end-to-end. Landed changes:
+
+- STEP protocol gains mode 2 ("hold": plain non-speculative decode that keeps
+  the worker slot). A retained turn now ends on a hold step under MTP; the
+  hold step also advances the MTP causal stream so the next resume starts
+  with a valid draft. Without it, an accepted speculative pair on the last
+  step of a turn leaves an unemitted bonus token inside the worker state; the
+  retained session prefix then matches no client-echoed prompt, the resume
+  silently fell back to a full re-prefill, and the capacity-1 slot was freed
+  only by an LRU eviction on the next turn (`worker command failed:
+  over-capacity BEGIN` in the pre-fix logs). Qwen step handling is unchanged;
+  the server only emits mode 2 when the worker reports MTP enabled.
+- Speculation suppression now requires 8 verify pairs before tripping (was
+  2): with the EMA seeded from a single pair, any one rejection scores ~2x an
+  ordinary step per useful token and disabled speculation on noise for the
+  rest of the session. Suppression is also reset when a session resumes; the
+  model-global cost EMA still guards, so a genuinely unprofitable draft loop
+  is re-suppressed after the first new pair.
+- A turn that still ends with an unemitted bonus (EOS cut through an accepted
+  pair) is now explicitly not retained (`session_retain_skipped` log event)
+  instead of storing a session that can never match.
+- `request_telemetry` carries `worker_mtp_drafts`, `worker_mtp_accepted`,
+  `worker_mtp_rejected`, `worker_verify_pairs`, `worker_mtp_suppressions`.
+
+Three-turn bounded probe (24/24/11-12 output tokens, natural chat, freshly
+restarted service, no route census present for either run, so both runs are
+genuinely cold; `w05-base` is the same tree with MTP off):
+
+| Turn | w05-base TTFT | w05-mtp TTFT | base decode | mtp decode | base expert wait | mtp expert wait | base read | mtp read | base steps | mtp steps |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 70.3 s | 70.9 s | 0.47 | 0.49 | 97.2 s | 96.9 s | 55.2 GiB | 57.1 GiB | 41 | 31 |
+| 2 | 45.2 s | 45.6 s | 0.54 | 0.56 | 61.8 s | 61.1 s | 29.6 GiB | 28.8 GiB | 41 | 41 |
+| 3 | 33.8 s | 33.9 s | 0.54 | 0.59 | 35.1 s | 35.4 s | 14.6 GiB | 14.6 GiB | 25 | 25 |
+
+MTP acceptance on turn 1 (the only turn with enough speculation before the
+cost EMA suppressed it): 10 accepted / 13 pairs (76.9%); probe total 11/15
+(73%). Verify pairs cut model steps on turn 1 from 41 to 31 (−24%).
+
+**MTP is throughput-neutral here, and that is now measured rather than
+assumed.** A verify pair pays the union of two adjacent positions' expert
+routes through the same bandwidth-bound supply pipeline: turn-1 storage reads
+did not drop (57.1 vs 55.2 GiB) and expert wait is unchanged (96.9 vs 97.2 s)
+despite 24% fewer model steps, because adjacent-token route overlap is too
+small to amortize the 3.21 GiB/token supply. The only savings are per-step
+fixed costs (attention, output head, scheduling), which are not the
+bottleneck at ~2 s/token. The 8–15 tok/s W5 target would require the verify
+pair to cost barely more than one ordinary forward; measured pair cost is
+~2 forwards in expert bytes, so even perfect acceptance caps the gain near
+zero in this regime. The adaptive suppression EMA reaches the same conclusion
+on its own: after turn 1 it disables speculation within one pair per turn.
+
+Honest negatives (both measured on intermediate builds and fixed before the
+final numbers above):
+
+- **Suppression after 2 samples**: the pre-W5 heuristic tripped on the first
+  rejection (1 accept + 1 reject on turn 1), then stayed sticky in the
+  retained session, so turns 2-3 ran plain decode with MTP enabled and the
+  probe reproduced baseline numbers exactly.
+- **Retention poisoning by the speculative bonus** (intermediate build, same
+  probe): turn 2 fell back to a full 58-token re-prefill (TTFT 116.7 s vs
+  45.2 s baseline, turn wall 155.9 s vs 87.6 s) because the retained session
+  included the unemitted bonus token and matched no follow-up prompt.
+
+The deployment keeps MTP enabled (`ops/model.sh` already passes
+`-EnableMtp`): with the hold-step fix it is correct, retention-compatible and
+self-suppressing when unprofitable, at a small extra read cost on cold turns
+(+3.5% on turn 1). The full build/ctest/Python suite (48 tests, including
+`test_hold_step_maps_to_worker_flag_2` and
+`test_retained_mtp_turn_ends_with_hold_step`) is green on `w05-mtp`, and
+`Invoke-DeepSeekServiceSmoke.ps1` passes with MTP active.
+
+
 ## DeepSeek-V4-Flash
 
 The 284B-class DeepSeek backend is functionally complete enough for greedy API

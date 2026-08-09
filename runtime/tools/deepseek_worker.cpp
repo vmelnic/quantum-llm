@@ -871,7 +871,11 @@ class Model final {
             .count());
     update_moving_average(speculative_ns_per_useful_, speculative_samples_,
                           elapsed_ns / (accepted ? 2.0 : 1.0));
-    if (speculative_samples_ >= 2U && ordinary_samples_ != 0U &&
+    // Suppression needs a real acceptance sample: with the EMA seeded from a
+    // single pair, any one rejection trips the guard (a rejected pair scores
+    // roughly 2x an ordinary step per useful token), so a sub-8-sample check
+    // disables speculation on noise before the rate is measurable.
+    if (speculative_samples_ >= 8U && ordinary_samples_ != 0U &&
         speculative_ns_per_useful_ > ordinary_ns_per_token_ * 1.05) {
       request.speculation_suppressed = true;
       request.draft_ready = false;
@@ -1382,6 +1386,10 @@ int worker_loop(Model& model) {
             request->context_limit = std::max(
                 request->context_limit, static_cast<std::uint32_t>(context));
             feed_prompt(*request, prompt, request->next_position);
+            // A resumed turn re-evaluates speculation on fresh evidence: the
+            // global cost EMA still guards, so a genuinely unprofitable draft
+            // loop is suppressed again after the first new verify pair.
+            request->speculation_suppressed = false;
             const auto slot = request->slot;
             active.emplace(id, Active{std::move(request)});
             std::cout << "{\"type\":\"begun\",\"id\":" << id
@@ -1405,7 +1413,13 @@ int worker_loop(Model& model) {
                     << ",\"slot\":" << slot << "}\n" << std::flush;
         }
       } else if (fields[0] == "NEXT" || fields[0] == "STEP") {
-        std::vector<std::pair<std::uint64_t, bool>> steps;
+        // Step modes: 0 = decode (speculative when MTP is active), 1 = final
+        // emit-and-release, 2 = plain non-speculative decode that keeps the
+        // slot. Mode 2 exists so a retained turn can end on an exact token
+        // boundary: an accepted speculative pair would leave an unemitted
+        // bonus token in the worker state that no client-echoed prompt can
+        // match, poisoning session retention.
+        std::vector<std::pair<std::uint64_t, std::uint32_t>> steps;
         std::set<std::uint64_t> unique_ids;
         const auto add = [&](std::string_view field) {
           const auto comma = field.find(',');
@@ -1413,9 +1427,10 @@ int worker_loop(Model& model) {
           const auto id = std::stoull(std::string(field.substr(0U, comma)));
           const auto flag = field.substr(comma + 1U);
           require(active.contains(id) && unique_ids.insert(id).second &&
-                      (flag == "0" || flag == "1"),
+                      (flag == "0" || flag == "1" || flag == "2"),
                   "step request mismatch");
-          steps.emplace_back(id, flag == "1");
+          steps.emplace_back(id, static_cast<std::uint32_t>(
+                                     flag == "1" ? 1U : flag == "2" ? 2U : 0U));
         };
         if (fields[0] == "NEXT") {
           require(fields.size() == 3U, "invalid NEXT");
@@ -1430,13 +1445,13 @@ int worker_loop(Model& model) {
         std::vector<std::vector<std::uint32_t>> emitted(steps.size());
         if (model.mtp_enabled()) {
           for (std::size_t index = 0U; index < steps.size(); ++index) {
-            const auto [id, final] = steps[index];
+            const auto [id, mode] = steps[index];
             auto& request = *active.at(id).request;
-            if (final) {
+            if (mode == 1U) {
               emitted[index] = {request.predicted};
               continue;
             }
-            if (model.speculation_active(request)) {
+            if (mode == 0U && model.speculation_active(request)) {
               emitted[index] = model.verify_draft(request);
             } else {
               emitted[index] = {request.predicted};
@@ -1447,6 +1462,13 @@ int worker_loop(Model& model) {
                   std::span<Request* const>(&pointer, 1U),
                   std::span<const std::uint32_t>(&token, 1U),
                   std::span<const std::uint32_t>(&position, 1U)).front();
+              if (mode == 2U) {
+                // Keep the MTP causal stream in lockstep with the target
+                // model so the next turn's resume starts with a valid draft.
+                model.advance_mtp(request, request.predicted,
+                                  request.state->current_streams(), position,
+                                  true);
+              }
               ++request.next_position;
             }
           }
@@ -1454,10 +1476,10 @@ int worker_loop(Model& model) {
           std::vector<Request*> advancing;
           std::vector<std::uint32_t> tokens, positions;
           for (std::size_t index = 0U; index < steps.size(); ++index) {
-            const auto [id, final] = steps[index];
+            const auto [id, mode] = steps[index];
             auto& request = *active.at(id).request;
             emitted[index] = {request.predicted};
-            if (final) continue;
+            if (mode == 1U) continue;
             advancing.push_back(&request);
             tokens.push_back(request.predicted);
             positions.push_back(request.next_position);
@@ -1465,8 +1487,8 @@ int worker_loop(Model& model) {
           if (!advancing.empty()) {
             const auto predicted = model.forward(advancing, tokens, positions);
             std::size_t predicted_index = 0U;
-            for (const auto& [id, final] : steps) {
-              if (final) continue;
+            for (const auto& [id, mode] : steps) {
+              if (mode == 1U) continue;
               active.at(id).request->predicted =
                   predicted[predicted_index++];
               ++active.at(id).request->next_position;
@@ -1499,8 +1521,8 @@ int worker_loop(Model& model) {
         for (const auto& tokens : emitted)
           model.record_useful_tokens(tokens.size());
         std::cout << std::flush;
-        for (const auto& [id, final] : steps)
-          if (final) active.erase(id);
+        for (const auto& [id, mode] : steps)
+          if (mode == 1U) active.erase(id);
       } else if (fields[0] == "END") {
         require(fields.size() == 2U || fields.size() == 4U,
                 "invalid END");

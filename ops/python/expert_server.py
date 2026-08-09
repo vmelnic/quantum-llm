@@ -388,16 +388,16 @@ class CudaWorker:
             self.active_ids.discard(request_id)
         return _worker_response_tokens(response, "NEXT response has no tokens")
 
-    def step(self, items: list[tuple[int, bool]]) -> dict[int, list[int]]:
+    def step(self, items: list[tuple[int, int]]) -> dict[int, list[int]]:
         if not items or len(items) > self.capacity:
             raise WorkerError("invalid decode batch")
         if self.protocol < 2:
             if len(items) != 1:
                 raise WorkerError("protocol v1 cannot batch decode")
-            request_id, final = items[0]
-            return {request_id: self.next(request_id, final)}
+            request_id, flag = items[0]
+            return {request_id: self.next(request_id, flag == 1)}
         response = self._command("STEP\t" + "\t".join(
-            f"{request_id},{1 if final else 0}" for request_id, final in items
+            f"{request_id},{flag}" for request_id, flag in items
         ))
         if response.get("type") != "batch" or not isinstance(response.get("items"), list):
             raise WorkerError("unexpected STEP response")
@@ -452,9 +452,10 @@ class CudaWorker:
 
 
 class DecodeWaiter:
-    def __init__(self, request_id: int, final: bool) -> None:
+    def __init__(self, request_id: int, final: bool, hold: bool = False) -> None:
         self.request_id = request_id
         self.final = final
+        self.hold = hold
         self.event = threading.Event()
         self.token: int | None = None
         self.error: Exception | None = None
@@ -472,7 +473,7 @@ class ContinuousDecodeBatcher:
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
-    def step(self, request_id: int, final: bool) -> int:
+    def step(self, request_id: int, final: bool, hold: bool = False) -> int:
         with self.buffer_lock:
             buffered = self.buffered.get(request_id)
             if buffered:
@@ -483,7 +484,7 @@ class ContinuousDecodeBatcher:
                     self.buffered.pop(request_id, None)
                     self.worker.cancel(request_id)
                 return token
-        waiter = DecodeWaiter(request_id, final)
+        waiter = DecodeWaiter(request_id, final, hold)
         self.pending.put(waiter)
         waiter.event.wait()
         if waiter.error is not None:
@@ -512,8 +513,15 @@ class ContinuousDecodeBatcher:
                     break
                 batch.append(item)
             try:
+                # Step modes: 0 = decode (speculative under MTP), 1 = final
+                # emit-and-release, 2 = plain decode that keeps the slot. A
+                # retained turn ends with mode 2 so the worker state stops on
+                # an exact emitted-token boundary instead of holding an
+                # unemitted speculative bonus token.
                 tokens = self.worker.step([
-                    (item.request_id, item.final) for item in batch
+                    (item.request_id,
+                     1 if item.final else (2 if item.hold else 0))
+                    for item in batch
                 ])
                 self.on_batch(len(batch))
                 for item in batch:
@@ -1035,7 +1043,9 @@ class Application:
         "cache_upload_wait_ns", "worker_model_steps", "worker_model_step_ns",
         "frozen_promotions", "frozen_promotion_bytes",
         "worker_scheduler_poll_ns", "worker_output_head_ns",
-        "scheduler_expert_wait_ns",
+        "scheduler_expert_wait_ns", "worker_mtp_drafts",
+        "worker_mtp_accepted", "worker_mtp_rejected", "worker_verify_pairs",
+        "worker_mtp_suppressions",
     )
 
     @staticmethod
@@ -1095,9 +1105,15 @@ class Application:
                     raise TimeoutError("generation deadline exceeded")
                 # A final STEP makes the worker release the slot inline, which
                 # is incompatible with retaining it; retained conversations
-                # end with an explicit retaining END instead.
+                # end with an explicit retaining END instead. Under MTP the
+                # last step of a retained turn is a hold (mode 2): a
+                # speculative pair could leave an unemitted bonus token in the
+                # worker state, and no client-echoed prompt would match the
+                # retained session afterwards.
+                last = index + 1 == maximum
                 token = self.decode_batcher.step(
-                    request_id, index + 1 == maximum and not retain
+                    request_id, last and not retain,
+                    hold=last and retain and self.worker.mtp_enabled,
                 )
                 token_at = time.monotonic()
                 if previous_token_at is None:
@@ -1129,7 +1145,7 @@ class Application:
             take_buffered = getattr(self.decode_batcher, "take_buffered", None)
             buffered = take_buffered(request_id) if take_buffered is not None \
                 else []
-            if finished and retain:
+            if finished and retain and not buffered:
                 try:
                     session_key = session.key if session is not None \
                         else self.allocate_session_key()
@@ -1152,6 +1168,12 @@ class Application:
                             len(buffered))
                 except WorkerError as error:
                     log("session_retain_failed", error=str(error))
+            elif finished and retain:
+                # An unemitted speculative bonus token remains buffered; the
+                # worker state no longer matches any client-echoable prefix,
+                # so this turn cannot be retained.
+                log("session_retain_skipped", reason="speculative_bonus",
+                    buffered_tokens=len(buffered))
             if request_id in self.worker.active_ids:
                 self.worker.cancel(request_id)
             if context is not None and not context.retained and \

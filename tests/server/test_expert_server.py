@@ -31,14 +31,14 @@ class FakeWorker:
     capacity = 4
 
     def __init__(self) -> None:
-        self.calls: list[list[tuple[int, bool]]] = []
+        self.calls: list[list[tuple[int, int]]] = []
         self.lock = threading.Lock()
 
-    def step(self, items: list[tuple[int, bool]]) -> dict[int, int]:
+    def step(self, items: list[tuple[int, int]]) -> dict[int, int]:
         with self.lock:
             self.calls.append(list(items))
-        return {request_id: request_id * 10 + int(final)
-                for request_id, final in items}
+        return {request_id: request_id * 10 + int(flag)
+                for request_id, flag in items}
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
@@ -459,6 +459,99 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         finally:
             batcher.close()
 
+    def test_hold_step_maps_to_worker_flag_2(self) -> None:
+        worker = FakeWorker()
+        batcher = ContinuousDecodeBatcher(worker, 0.0, lambda _rows: None)
+        try:
+            self.assertEqual(batcher.step(3, False, hold=True), 32)
+        finally:
+            batcher.close()
+        self.assertEqual(worker.calls, [[(3, 2)]])
+
+    def test_retained_mtp_turn_ends_with_hold_step(self) -> None:
+        class Worker:
+            mtp_enabled = True
+            session_retention = True
+            kv_page_tokens = 4
+            kv_page_capacity = 64
+
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+                self.retained: dict[int, int] = {}
+                self.fed: dict[int, int] = {}
+
+            def begin(self, request_id: int, prompt: list[int],
+                      _context_limit: int) -> None:
+                self.active_ids.add(request_id)
+                self.fed[request_id] = len(prompt)
+
+            def end_retain(self, request_id: int, session_key: int) -> int:
+                self.active_ids.discard(request_id)
+                self.retained[session_key] = self.fed.pop(request_id)
+                return self.retained[session_key]
+
+            def drop_session(self, session_key: int) -> None:
+                self.retained.pop(session_key, None)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+            def stats(self) -> dict[str, int]:
+                return {}
+
+        class Batcher:
+            def __init__(self, worker: Worker, tokens: list[int]) -> None:
+                self.worker = worker
+                self.tokens = tokens
+                self.steps: list[tuple[bool, bool]] = []
+
+            def step(self, request_id: int, final: bool,
+                     hold: bool = False) -> int:
+                self.steps.append((final, hold))
+                if not final:
+                    self.worker.fed[request_id] += 1
+                return self.tokens.pop(0)
+
+            def take_buffered(self, _request_id: int) -> list[int]:
+                return []
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return ",".join(str(token) for token in tokens)
+
+        worker = Worker()
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(
+            generation_timeout=60.0, disable_session_retention=False,
+            session_idle_seconds=1800.0, max_context=64,
+        )
+        app.worker = worker
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = {22}
+        app.request_id = iter(range(1, 100)).__next__
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        app.session_lock = threading.Lock()
+        app.sessions = expert_server.OrderedDict()
+        app.next_session_key = 1
+
+        app.decode_batcher = Batcher(worker, [20, 21])
+        context = app.acquire_request_context([10, 11, 12], 2)
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(len(list(app.generate([10, 11, 12], 2, context))), 2)
+        app.release_request_context(context)
+        # The last step of a retained MTP turn is a hold (plain, slot kept),
+        # never a speculative pair, so no unemitted bonus token can poison
+        # the retained session prefix.
+        self.assertEqual(app.decode_batcher.steps, [(False, False), (False, True)])
+        self.assertTrue(context.retained)
+        session = next(iter(app.sessions.values()))
+        self.assertEqual(session.tokens, [10, 11, 12, 20, 21])
+
+
     def test_generation_stops_and_cancels_after_eos(self) -> None:
         class Worker:
             def __init__(self) -> None:
@@ -472,7 +565,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 self.active_ids.discard(request_id)
 
         class Batcher:
-            def step(self, _request_id: int, _final: bool) -> int:
+            def step(self, _request_id: int, _final: bool,
+                     hold: bool = False) -> int:
                 return 7
 
         class Tokenizer:
@@ -495,6 +589,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
     def test_retained_session_resumes_with_delta_tokens(self) -> None:
         class Worker:
+            mtp_enabled = False
+
             def __init__(self) -> None:
                 self.active_ids: set[int] = set()
                 self.session_retention = True
@@ -536,7 +632,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 self.worker = worker
                 self.tokens = tokens
 
-            def step(self, request_id: int, _final: bool) -> int:
+            def step(self, request_id: int, _final: bool,
+                     hold: bool = False) -> int:
                 self.worker.fed[request_id] += 1
                 return self.tokens.pop(0)
 
