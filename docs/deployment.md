@@ -42,9 +42,9 @@ It never removes the original checkpoint or either prepared model.
 
 Note: the DeepSeek worker bundle `runtime.tsv` stores absolute paths for
 `routed`, `mtp_routed` and `census`, captured when the bundle was generated.
-If the model store is moved (e.g. the 2026-08 `C:\Users\vladi\quantum-llm`
-cleanup), those three entries must be repointed to the new root or the
-worker exits with "bundle dependency is unavailable".
+If the model store is moved to a different root, those three entries must be
+repointed to the new location or the worker exits with "bundle dependency is
+unavailable".
 
 ## 2. Configure the control host
 

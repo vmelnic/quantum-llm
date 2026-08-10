@@ -9,7 +9,11 @@ ops/windows/), docs/benchmarks.md measured numbers, and published results
 for comparable stacks. Hardware baseline: RTX 3090 24 GB, Ryzen 5 5600,
 64 GB DDR4, SATA SSD (docs/benchmarks.md).
 
-## 1. Where we are (measured, not guessed)
+## 1. Where we were at plan time (pre-W0 baseline, measured)
+
+These were the pre-campaign numbers the plan was written against; current
+measured results are in docs/benchmarks.md and
+docs/inference-scaling-next.md.
 
 - Qwen3-Next-80B expert pack: 47.67 tok/s hot native single-stream, ~30
   tok/s repeated-identical-route API, **0.7–1.4 tok/s real multi-turn
