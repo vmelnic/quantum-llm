@@ -10,6 +10,7 @@ the short day-two runbook.
 ./ops/model.sh config             # resolved non-secret local configuration
 ./ops/model.sh start              # CHAT_MODEL from .env
 ./ops/model.sh start qwen         # explicit switch
+./ops/model.sh start qwen-fp4     # Qwen FP4 pack (ABI 3)
 ./ops/model.sh start deepseek
 ./ops/model.sh status
 ./ops/model.sh chat               # resolves the actually deployed model
@@ -105,6 +106,6 @@ Never publish one unqualified “tok/s” number. Record:
 - TTFT, post-first-token and end-to-end rates;
 - cache/storage/transfer state when available.
 
-An identical repeated Qwen prompt can exceed 30 tok/s after the first token,
-while changing multi-turn chat remains near 1 tok/s. Both facts must remain
-visible.
+An identical repeated Qwen prompt can reach 27–29 tok/s after the first token
+(39.6–45.6 with the FP4 pack), while changing multi-turn chat remains
+storage-bound at a few tok/s. Both facts must remain visible.

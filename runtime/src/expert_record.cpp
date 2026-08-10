@@ -215,15 +215,18 @@ ExpertAdmissionValidation validate_expert_admission(
     return admission_failure(ErrorCode::invalid_argument,
                              "unsupported source/target expert ABI pair");
   }
-  constexpr std::uint64_t kDeviceBytes = 25'198'592U;
   const bool fp8 =
       expected.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1;
+  // FP8 shared experts expand into the int8 SM86 slot on device; compact
+  // routed experts execute directly from the packed FP4 record, so their
+  // device footprint equals the stored bytes.
+  const std::uint64_t device_bytes = fp8 ? 25'198'592U : 13'369'344U;
   const std::uint64_t weight_bytes = fp8 ? 8'388'608U : 4'194'304U;
   const std::uint64_t scale_bytes = fp8 ? 512U : 262'144U;
   const std::uint64_t source_bytes =
       fp8 ? 25'167'360U : 13'369'344U;
   if (expected.stored_bytes != source_bytes || bytes.size() != source_bytes ||
-      expected.device_bytes != kDeviceBytes || expected.header_bytes != 0U ||
+      expected.device_bytes != device_bytes || expected.header_bytes != 0U ||
       expected.decoded_bytes != 3ULL * 4096U * 2048U * sizeof(float)) {
     return admission_failure(ErrorCode::checksum_mismatch,
                              "DeepSeek compact admission geometry mismatch");

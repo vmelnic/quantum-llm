@@ -5,9 +5,17 @@ Experts models whose checkpoints do not fit in GPU memory—and may not fit in
 system RAM. It keeps dense weights on the GPU and places independently packed
 experts across VRAM, RAM, and SSD.
 
-Two native backends run on a single RTX 3090: Qwen3-Next 80B from an 81.9 GB
-INT8 Expert Pack and DeepSeek-V4-Flash from its authenticated mixed-FP4/FP8
-compact bundle. Both expose the same local HTTP API and lifecycle commands.
+Two native backends run on a single RTX 3090: Qwen3-Next 80B from an Expert
+Pack (81.9 GB INT8, or the recommended 45.4 GB FP4 variant) and
+DeepSeek-V4-Flash from its authenticated mixed-FP4/FP8 compact bundle. Both
+expose the same local HTTP API and lifecycle commands.
+
+Measured on the reference host (docs/benchmarks.md): Qwen FP4 serves
+39.6–45.6 tok/s on resident routes and 5.3–16.9 tok/s on novel routes
+(~3–6x over int8 in the same configuration); DeepSeek decodes ~3.5 tok/s on
+settled turns after the FP4 residency accounting fix. The three-tier
+VRAM/RAM/disk hierarchy behind these numbers is documented in
+[Architecture](docs/architecture.md#serving-memory-hierarchy-measured).
 
 > **Project status:** research-quality runtime with a controlled pre-production
 > pilot profile. It is not a general production inference server yet. The
@@ -39,11 +47,14 @@ dropped.
 
 ## What works
 
-- deterministic Qwen Expert Pack and DeepSeek compact-bundle conversion;
+- deterministic Qwen Expert Pack (int8 and FP4) and DeepSeek compact-bundle
+  conversion;
 - strict adapters for OLMoE, Qwen3-Next, and DeepSeek-V4-Flash;
 - Windows IOCP storage, bounded RAM/VRAM caches, pinned staging, and CUDA SM86;
-- native Qwen3-Next and DeepSeek-V4-Flash greedy inference;
+- native Qwen3-Next and DeepSeek-V4-Flash greedy inference with packed
+  `__dp4a` FP4 expert kernels;
 - paged FP16 KV with per-request credits and constant-memory online attention;
+- retained sessions with prefill-delta reuse across turns;
 - continuous decode batching with isolated request state;
 - Responses, Chat Completions, and legacy Completions HTTP APIs;
 - SSE streaming, usage, cancellation, overload handling, health and metrics;
@@ -71,10 +82,16 @@ cp .env.example .env
 Switch models or release all GPU memory with the same command:
 
 ```bash
-./ops/model.sh start qwen
+./ops/model.sh start qwen-fp4   # recommended serving configuration
+./ops/model.sh start qwen       # int8 quality reference
 ./ops/model.sh start deepseek
 ./ops/model.sh stop all
 ```
+
+End-to-end reproduction — platform, build, model download, pack compilation
+(int8 and FP4), first run, and service install — is covered by
+[Getting started](docs/getting-started.md); lifecycle and API usage by
+[Install, configure and use](docs/deployment.md).
 
 ## Documentation
 

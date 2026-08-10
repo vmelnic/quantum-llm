@@ -1,12 +1,16 @@
 # Performance architecture review
 
 This document records the independent Kimi review and the subsequent direct
-code verification performed on 2026-08-06. It explains why both current
-backends deliver roughly one output token per second for changing chat despite
-much faster exact-route hot measurements.
+code verification performed on 2026-08-06. It explains why both backends then
+delivered roughly one output token per second for changing chat despite much
+faster exact-route hot measurements.
 
-It is a design decision record, not proof that an optimization has succeeded.
-Measured results remain in [Performance evidence](benchmarks.md).
+Status 2026-08-10: the implementation constraints listed below were addressed
+by the W0–W5 serving campaign (docs/inference-30toks-plan.md §8) — retained
+sessions, decoupled prefill, async directory planning, frozen placement,
+vectorized GEMV dispatch, event-driven uploads, the widened DeepSeek pipeline,
+and immediate dispatch of a lone decode request. This document remains the
+design record; measured results are in [Performance evidence](benchmarks.md).
 
 ## Reference system and objective
 

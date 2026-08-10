@@ -126,7 +126,7 @@ Two identical sequential requests on an already-running service used a
 | first request after heterogeneous traffic | 25.664 s | 56.216 s | 1.01 tok/s |
 | immediately repeated request | 0.807 s | 2.429 s | 19.12 tok/s |
 
-### Current lifecycle/chat verification
+### Historical lifecycle/chat verification (pre-W1)
 
 After repairing lifecycle, dependency, protocol and Unicode streaming issues,
 an identical 21-token prompt producing nine tokens was measured before and
@@ -148,10 +148,12 @@ A real three-turn conversation with changing prompts/history observed:
 | 44 | 46 | 10.395 s | 1.10 tok/s | 1.44 tok/s |
 | 157 | 54 | 27.790 s | 0.73 tok/s | 1.14 tok/s |
 
-This is the representative user-facing result: approximately 0.7–1.4 tok/s
-after the first token for changing conversation routes, with TTFT increasing as
-the full history is recomputed. The API currently resends/re-prefills history;
-it does not retain a reusable conversation KV prefix between requests.
+This was the pre-W1 representative user-facing result: approximately
+0.7–1.4 tok/s after the first token for changing conversation routes, with
+TTFT increasing as the full history was recomputed. At the time the API
+resent/re-prefilled history on every turn; protocol v5 retained sessions
+(W1, below) now prefill only the per-turn delta, and the W2–W4 decode-path
+work raised these rates substantially (see the W2/W3 suites).
 
 The Unicode verification after commit `86a4b3e` produced `Hello! 😊` once,
 without a replacement character or replayed prefix. That was a correctness
@@ -448,7 +450,65 @@ self-suppressing when unprofitable, at a small extra read cost on cold turns
 
 The 284B-class DeepSeek backend is functionally complete enough for greedy API
 generation on the same host, but not performance-ready. Representative
-end-to-end decode remains roughly 0.3–0.6 tok/s depending on route/cache state.
+end-to-end decode remains roughly 0.4–0.6 tok/s depending on route/cache state
+(W3/W5 measurements, MTP enabled), improved to ~3.5 tok/s on settled turns by
+the S1-DeepSeek accounting fix (see below).
+
+### S1-DeepSeek: FP4 device accounting + warm-set recalibration (2026-08-10)
+
+Premise correction: direct-FP4 execution for DeepSeek routed experts landed
+in `05b474e` ("Execute DeepSeek experts directly from packed FP4") — upload
+keeps the 13,369,344-byte compact record (`CudaCompactExpertAllocation`) and
+compute runs the packed `__dp4a` selection-batch kernels. What was missing
+was accounting: the routed catalog still declared
+`device_bytes = 25,198,592` (the int8 SM86 expansion slot), so the VRAM
+cache, preflight and census warm set sized every FP4 slot at ~2x its real
+footprint, and `warm_from_census` was hard-capped at 6 experts/layer
+(43x6=258 entries). Fixed in `deepseek_catalog.cpp` (device_bytes =
+13,369,344 for compact routed records; shared FP8 expansion keeps 25.2 MB),
+`expert_record.cpp` (admission validates the per-source device size),
+`deepseek_worker.cpp` (per-layer warm cap derives from the VRAM entry
+budget, clamped 6..32; the 43x6 hard cap is gone) and the residency tool
+mirrors. Supporting measurement — route-skew from the persisted census
+(`work/deepseek-census/census_skew.py`, artifact `census-skew.json`):
+only 2,103/11,008 experts ever observed; top 13.1% cover 92.5% of route
+mass; per-layer top-33 (12.9%) covers a median 93.1%; token-to-token
+consecutive reuse 27.7%. Caveat: that skew is cumulative over repeated
+probe traffic; fresh-topic turns route much wider.
+
+3-turn bounded probe (same shape as W3, freshly restarted service, MTP on;
+decode = generated/(wall - TTFT)):
+
+| Turn | baseline w03 decode | S1-DeepSeek decode | read |
+|---:|---:|---:|---:|
+| 1 (cold) | 0.46 | 1.05 | 17.9 GiB |
+| 2 | 0.52 | 2.00 | 19.7 GiB |
+| 3 | 0.47 | 3.50 | 10.1 GiB |
+
+~7.4x on turn 3. MTP ablation (same build, `-EnableMtp` removed): decode
+1.31/0.91/0.96 with identical ~5 GiB/token reads — MTP no longer costs
+supply (the W5 "neutral" verdict was measured in the int8-slot regime);
+drafts 3/turn accepted 2/3, so MTP stays on and is now a 2-3.5x decode
+multiplier. Bottleneck decomposition (turn 3, MTP on): cache_storage_wait
+25s of 21s wall — SATA misses dominate; VRAM hit ~45-55% on fresh topics;
+RAM tier (40 GiB, ~3,000 experts) cannot retain the 1,500-2,500 unique
+experts a fresh request touches. The measured per-request supply is ~5
+GiB/token vs the 3.21 theoretical (churn + prefetch-ahead reads). The
+structural eviction fix from `40f595f` also proved itself here: a
+`[retire-busy]` canary fired once (victim with an in-flight pin release on
+another stream) — the victim was skipped and the request completed;
+pre-fix that interleaving was a server hang.
+
+Paths toward ~10 tok/s, by leverage, no quality-risky steps:
+
+- NVMe tier for the pack: the SATA miss path (0.47 GiB/s measured) is the
+  dominant wait; NVMe (~5 GB/s) is ~10x on exactly that term and shortens
+  warm start.
+- RAM >= 192 GB: the whole 147 GB routed pack becomes RAM-resident, the
+  disk leaves steady state entirely, every miss costs only PCIe
+  (12.46 GiB/s). With VRAM hit ~50% and MTP on: ~8-12 tok/s effective.
+- VRAM is fixed at 24 GB on this host; FP4 slots (12.75 MiB) instead of
+  int8 (25.2 MB) are why residency doubled without new hardware.
 
 Measurements established:
 
@@ -476,9 +536,14 @@ Claims at 8K–65K require separate numerical, memory, TTFT and decode evidence.
 ## Current performance verdict
 
 - Qwen native hot paths exceed 30 tok/s.
-- Qwen repeated-route API decode can reach about 30 tok/s.
-- Qwen arbitrary multi-turn chat is currently about 1 tok/s and misses the SLO.
-- DeepSeek chat is below 1 tok/s and misses the SLO by a larger margin.
+- Qwen repeated-route API decode reaches 27–29 tok/s int8 (W4) and
+  39.6–45.6 tok/s with the FP4 pack (§S1b).
+- Qwen novel-route chat is SATA first-touch bound: ~2.4–4.2 tok/s int8,
+  5.3–16.9 tok/s FP4. The 30 tok/s SLO is met on resident routes only.
+- DeepSeek chat was ~0.4–0.6 tok/s (W3/W5); S1-DeepSeek accounting brings
+  settled turns to ~3.5 tok/s with MTP on (§S1-DeepSeek). The next levers
+  are hardware (NVMe tier, RAM >= 192 GB); the SLO stays out of reach on
+  this host as shipped.
 - `ready=true` means healthy/admitting, not warmed or SLO-compliant.
 
 The acceptance target remains at least 30 useful output tok/s for a declared

@@ -59,13 +59,12 @@ python -m unittest -v tests.compiler.test_expert_pack tests.server.test_expert_s
 
 ## Obtain the model
 
-Accept the upstream model license and authenticate Hugging Face first. Either
-use the regular CLI or the resumable scheduled-task wrapper:
+Accept the upstream model license and authenticate Hugging Face first.
+Downloads go through the resumable scheduled-task wrapper (official `hf` CLI
+with Xet, defaults to the tested Qwen model); do not run ad-hoc parallel
+downloads:
 
 ```powershell
-hf download Qwen/Qwen3-Next-80B-A3B-Instruct --max-workers 4
-
-# Optional managed download:
 .\ops\windows\Start-P6ModelDownload.ps1
 .\ops\windows\Get-P6ModelDownload.ps1
 ```
@@ -102,6 +101,31 @@ Validate an existing pack independently:
 .\ops\windows\Invoke-ExpertPack.ps1 -Action Validate `
   -Path C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-int8
 ```
+
+### FP4 variant (recommended for serving)
+
+The FP4-E2M1/UE8M0 block-32 pack is the faster serving configuration on the
+reference host (measured: docs/benchmarks.md §S1b — ~3-6x over int8 in every
+mode, coherent behavioral probe, and the 45.36 GB pack fits the 48 GiB RAM
+budget so the disk leaves the steady state). The int8 pack remains the
+quality reference. Compile it from the same snapshot with the FP4 quant
+profile:
+
+```powershell
+.\.venv\Scripts\python.exe -m compiler compile `
+  --source C:\path\to\snapshot `
+  --output C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-fp4 `
+  --source-id Qwen/Qwen3-Next-80B-A3B-Instruct `
+  --source-revision 9c7f2fbe84465e40164a94cc16cd30b6999b0cc7 `
+  --adapter qwen3_next `
+  --quant-profile fp4-e2m1-ue8m0-block32-v1
+
+.\ops\windows\Invoke-ExpertPack.ps1 -Action Validate `
+  -Path C:\quantum-llm\work\models\qwen3-next-80b-expert-pack-fp4
+```
+
+Serve it with the `qwen-fp4` selector (`./ops/model.sh start qwen-fp4`), which
+uses `MODEL_QWEN_FP4_CONTAINER` from `.env`.
 
 ## Run in the foreground
 

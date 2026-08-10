@@ -12,16 +12,37 @@ kept in [Engineering history](history.md); measured results are in
    Readiness alone must never imply the throughput SLO.
 3. Add a repeatable chat workload with changing prompts and growing history.
    Report cold/warm, TTFT, post-first-token and end-to-end rates separately.
-4. Add retained conversation state or prefix/KV reuse so every turn does not
-   re-prefill the entire unchanged history.
-5. Build workload-aware expert placement/prefetch for route diversity. A single
-   repeated warm-up prompt is not an acceptance test.
+
+Completed in the W0–W5 serving campaign (see
+[Performance evidence](benchmarks.md) and
+[Engineering history](history.md#serving-path-campaign-w0w5)):
+
+- retained conversation sessions (protocol v5 `BEGIN … RESUME` /
+  `END … RETAIN`), so every turn no longer re-prefills the entire unchanged
+  history;
+- decoupled prefill chunking (default 256 tokens, independent of the decode
+  batch capacity);
+- async directory planning, frozen placement with router feedback, the
+  event-driven uploader, and the W4 bounded router-aware re-promotion.
 
 Acceptance: at least 30 useful output tok/s for a documented single-chat
 workload, with bounded memory and no omitted experts. Aggregate throughput is a
-separate SLO.
+separate SLO. Current standing against it: resident routes meet the target
+(27–29 tok/s int8, 39.6–45.6 tok/s FP4); representative novel-route chat does
+not (~2.4–4.2 tok/s int8, 5.3–16.9 tok/s FP4, SATA first-touch bound), so P0
+remains open.
 
 ## P1 — DeepSeek working-set performance
+
+Status 2026-08-10: largely executed or closed. Items 2 and 4 landed (compact
+FP4 records stay packed through storage/residency; W3 overlapped acquisition
+with ready work), item 5 is confirmed by measurement, and item 6 was executed
+in W5 — MTP measured throughput-neutral (0.47–0.54 → 0.49–0.59 tok/s) because
+a verify pair pays the union of two adjacent routes through the same
+bandwidth-bound pipe. Audit verdict: with 3.21 GiB/token over a 12.46 GiB/s
+H2D / 0.47 GiB/s SATA host, no further runtime investment is justified on
+this host; MTP stays on (correct, retention-compatible, self-suppressing).
+The remaining items stand only if work resumes on different hardware.
 
 1. Attribute every token wall-time segment to dense/attention, routing,
    acquisition, storage, H2D, expert compute, aggregation and output head.
@@ -44,7 +65,9 @@ with exact token equality; no synthetic microbenchmark may replace API evidence.
 The API ceiling is currently configurable to 65,536, but only 4,096 has passed
 the historical qualification gates.
 
-1. Decouple causal prefill chunk size from request concurrency.
+1. ~~Decouple causal prefill chunk size from request concurrency.~~ Done in
+   W1(b): `prefill_chunk_tokens` is an independent worker setting (default
+   256), no longer tied to the decode batch capacity.
 2. Add adaptive/grouped prefill and an efficient full-attention kernel.
 3. Gate 8K, 16K, 32K and 64K sequentially for numerical equality, memory high
    water, cancellation, TTFT and decode.

@@ -363,3 +363,74 @@ standalone public `memory-expert` project. This chronology is kept intact
 as the design-space evidence that led there; nothing described above
 changes, and the memory-expert docs, ops scripts, and experiment code no
 longer live in this repository.
+
+## Serving-path campaign (W0–W5)
+
+Executed 2026-08-08 to 2026-08-09 against the plan in
+[Path to 30 tok/s](inference-30toks-plan.md); full measurements in
+[Performance evidence](benchmarks.md). Landed and retained:
+
+- W0 per-phase request telemetry through the worker STATS command;
+- W1 protocol v5 retained conversation sessions (multi-turn prefills only the
+  per-turn delta; TTFT flat 3–9 s, was 17–28 s growing with history) and
+  prefill chunking decoupled from the decode batch capacity;
+- W2 asynchronous directory planning, worker-mode placement freeze after a
+  warmup boundary, and vectorized GEMV dispatch — resident route 27.2–27.7
+  tok/s with zero disk bytes (was ~1–2);
+- W3 event-driven uploads (no stream-wide syncs on the hot path) and a wider
+  DeepSeek prefetch pipeline; the Qwen route-ahead prefetch variant was
+  measured and reverted (predicted experts were already RAM-resident; 2–7×
+  VRAM churn);
+- W4 bounded router-aware re-promotion while frozen: settled topics reclaim
+  VRAM from dead ones (up to −43% turn wall) with no added storage reads;
+  resident route holds 27.8–28.9 tok/s. Two aggressive gating variants were
+  measured and discarded (ping-pong churn). The plan's resident-hit ≥ 0.8
+  criterion was not met;
+- W5 DeepSeek MTP enabled end-to-end and measured throughput-neutral
+  (0.47–0.54 → 0.49–0.59 tok/s): a verify pair pays the union of two
+  adjacent routes through the same bandwidth-bound pipe. Deployment keeps
+  MTP on — correct, retention-compatible and self-suppressing. The 8–15
+  tok/s hope for DeepSeek on this host is closed; the 3.21 GiB/token
+  arithmetic wall stands.
+
+Final state: Qwen3-Next-80B meets the 30 tok/s target on the resident route;
+non-resident chat sits at the SATA first-touch floor (~3 tok/s int8).
+
+## FP4 routed experts (S1)
+
+Follow-on work tracked in [Scaling next steps](inference-scaling-next.md):
+the FP4-E2M1/UE8M0 block-32 format already proven by the DeepSeek compact
+path was wired for Qwen routed experts as Expert Pack quant ABI 3
+(compiler encoder, manifest/schema/validator, uploader/directory dispatch,
+packed `__dp4a` GEMV kernels), and the FP4 pack (45.36 GB vs 72.3 GiB int8)
+was measured on 2026-08-10 against a same-configuration int8 arm:
+resident steady 39.6–45.6 tok/s (int8 7.75), novel routes 5.3–16.9
+(int8 1.9–4.0), behavioral probe 10/10 coherent at ~11.8% relative L2
+weight error. Two structural bugs were fixed to get there: pinned-allocator
+4096-alignment, and an eviction livelock (eviction now skips route-pinned
+victims and `try_retire()` never spins). The whole FP4 pack fits the 48 GiB
+RAM budget, so the SATA floor is cold-start-only. The host bandwidth
+measurements behind these numbers (H2D pinned 12.46 GiB/s over PCIe Gen3
+x16, SATA sequential 0.47 GiB/s) are pinned in
+[Performance evidence](benchmarks.md).
+
+## S1-DeepSeek: FP4 residency accounting (2026-08-10)
+
+Direct-FP4 execution for DeepSeek routed experts had already landed in
+`05b474e` (packed `__dp4a` kernels, compact records kept as-is in VRAM),
+but the routed catalog still accounted every slot as the 25,198,592-byte
+int8 layout, so the VRAM tier and the census warm set ran at half their
+physical capacity (warm set hard-capped at 6 experts/layer). The fix
+declares the compact record size (13,369,344 bytes) as the routed device
+footprint and derives the per-layer warm cap from the VRAM entry budget.
+A route-skew measurement on the persisted census justified the deeper warm
+set: top 13% of experts cover 92.5% of cumulative route mass. The 3-turn
+probe improved ~7.4x over the W3 baseline (turn-3 decode 3.5 vs 0.47
+tok/s), and an MTP ablation showed MTP is now a 2-3.5x decode multiplier
+under FP4 residency (the W5 "neutral" verdict belonged to the int8-slot
+regime), so MTP stays on. Remaining bottleneck, decomposed in
+[Performance evidence](benchmarks.md) §S1-DeepSeek: SATA misses on
+fresh-topic routes (storage wait dominates wall time); the next levers
+are hardware (NVMe tier, RAM >= 192 GB for a fully RAM-resident pack),
+not runtime changes. Quality-risky options (sub-4-bit requantization,
+dynamic top-K) were considered and explicitly rejected.

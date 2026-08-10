@@ -49,6 +49,8 @@ Rules:
 - RAM publishes only after complete read and checksum;
 - VRAM publishes only after copy completion event;
 - leases, scheduler reservations and incomplete CUDA events prevent eviction;
+- eviction skips route-pinned victims (host-side pin view) and retirement
+  never spins: a busy entry is skipped rather than waited on;
 - each active device route owns an independent bounded pin token, so one
   request waiting on expert readiness does not invalidate or serialize another;
 - credits are acquired before allocation and returned exactly once;
@@ -64,7 +66,11 @@ I/O begins; the cache reserves that larger value and refuses work that cannot
 fit. Upload completion may shrink a reservation but may never exceed it.
 
 `source_abi` and the key's target `quant_abi` form a fail-closed pair. Expert
-Pack v1 records continue through their existing validator and uploader.
+Pack v1 records continue through their existing validator and uploader; the
+validator accepts quant ABI 1 (INT8 per-row) and quant ABI 3 (FP4-E2M1/UE8M0
+block-32), and ABI 3 records stay packed through storage and residency and are
+consumed directly by the `__dp4a` selection-batch kernels — no expansion into
+INT8 slots.
 DeepSeek compact records are SHA-256 checked as complete 13,369,344-byte
 staging payloads, decoded only inside the CUDA uploader, and published as exact
 25,198,592-byte SM86 slots. Compact source bytes are never exposed through the
@@ -180,7 +186,14 @@ The entry snapshot exposes frequency, score evidence, and final temperature for
 diagnostics.
 
 At warmup/request barriers, admitted promotions drain and placement freezes.
-The measured frozen epoch performs no promotion, expert H2D, or policy mutation.
+The frozen epoch performs no demand promotion or policy mutation, and its
+resident routes run with zero expert storage reads and zero demand H2D. One
+bounded exception exists: a RAM-resident hot expert may be re-promoted to VRAM
+while frozen, gated once per forward pass by the stale-victim byte budget
+(`ExpertCache::vram_stale_resident_bytes` — unreferenced VRAM residents not
+routed for at least 2^19 access-clock ticks), so a repeating route whose
+working set exceeds the VRAM budget cannot ping-pong. Promotions upload from
+the RAM tier and add no storage reads.
 
 The promotion predictor retains at most 4,096 histories, requires two recent
 observations, expires them after 192 routed-layer epochs, and permits one
@@ -226,7 +239,8 @@ per-expert payload copy is created.
 ## CUDA ABI
 
 `expert-pack-sm86-int8-row-v1` consumes symmetric per-row INT8 expert weights
-and FP32 scales. Expert function:
+and FP32 scales. `expert-pack-sm86-fp4-block32-v1` consumes packed FP4-E2M1
+expert weights with one UE8M0 scale per 32-value block. Expert function:
 
 ```text
 down(silu(gate(x)) * up(x))
@@ -278,7 +292,10 @@ The local line-framed protocol supports:
 - explicit placement-prefetch state and a token list for the MTP boundary,
   with front-end compatibility for the existing Qwen runner's older scalar
   token and inferred-prefetch forms;
-- `STEP` to decode several active request IDs together;
+- `STEP` to decode several active request IDs together; each item carries a
+  mode flag — 0 decode, 1 final emit-and-release, 2 hold (plain decode that
+  keeps the slot; a retained MTP turn ends on a hold step so the worker state
+  stops on an exact emitted-token boundary);
 - `STATS` for KV page allocation/reservation plus cumulative phase, cache,
   and scheduler counters used for per-request telemetry deltas;
 - `END` to release/cancel request state, or `END … RETAIN <key>` to park the
@@ -289,7 +306,8 @@ The local line-framed protocol supports:
 
 Unexpected message type, duplicate ID, invalid capacity or mismatched response
 is fatal to the affected control flow. The front-end serializes worker commands
-and continuously batches compatible decode waiters within a bounded window.
+and continuously batches compatible decode waiters within a bounded window; a
+lone queued waiter is dispatched immediately instead of paying the window.
 
 ## Request lifecycle
 

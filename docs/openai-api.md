@@ -159,10 +159,14 @@ Consequently the API rejects nonzero temperature, nucleus sampling, penalties,
 logit bias and logprobs. The text-only runner also rejects images, audio, files,
 tool/function calling and JSON schema output.
 
-The server keeps KV state only for the lifetime of one request. Responses API
-storage, `previous_response_id`, conversations, background mode, WebSocket mode
-and retrieve/cancel-by-response-ID are not implemented. A client must resend
-conversation history.
+The server retains worker KV/recurrent state between requests as protocol-v5
+retained sessions (LRU-bounded by worker slots and KV capacity,
+idle-expiring): a continuing conversation whose new prompt extends the
+previous turn's tokens prefills only the delta. This is an internal
+optimization, not an API feature — Responses API storage,
+`previous_response_id`, conversations, background mode, WebSocket mode
+and retrieve/cancel-by-response-ID are not implemented. A client must still
+resend conversation history.
 
 These are inference/runtime capability gaps, not merely missing JSON fields.
 Adding them correctly requires extending the worker protocol and GPU runner.

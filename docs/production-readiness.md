@@ -6,10 +6,12 @@ Both Qwen3-Next 80B and DeepSeek-V4-Flash can be started, queried and stopped
 through the same OpenAI-compatible service on the reference Windows/RTX 3090
 host. This is a research/pilot runtime, not a production service.
 
-Qwen is functionally usable but arbitrary multi-turn chat is currently about
-0.7–1.4 tok/s after the first token. DeepSeek is slower. The configured 65K
-context ceiling is not long-context-qualified. Neither backend meets the
-30 tok/s user-facing objective for representative chat.
+Qwen is functionally usable and its resident routes now meet the throughput
+objective (27–29 tok/s int8, 39.6–45.6 tok/s with the FP4 pack), but arbitrary
+multi-turn chat with changing routes remains storage-bound at roughly 2–4
+tok/s int8 (5.3–16.9 tok/s FP4) after the first token. DeepSeek is slower.
+The configured 65K context ceiling is not long-context-qualified. Neither
+backend meets the 30 tok/s user-facing objective for representative chat.
 
 ## Readiness matrix
 
@@ -23,10 +25,10 @@ context ceiling is not long-context-qualified. Neither backend meets the
 | bounded memory/admission | pilot-ready | explicit RAM/VRAM/KV/queue budgets and fail-closed credits |
 | configured context | 65,536 | enabled hard ceiling, not a quality/performance qualification |
 | qualified context | 4,096 | larger staged gates remain undone |
-| Qwen hot repeated route | capable | 30.07 tok/s post-first-token in the latest identical repeat |
-| Qwen representative chat | not ready | changing routes/history measured about 0.7–1.4 tok/s |
-| DeepSeek throughput | not ready | roughly 0.3–0.6 tok/s on the reference host |
-| conversation KV reuse | missing | unchanged history is re-prefilled every turn |
+| Qwen hot repeated route | capable | 27–29 tok/s int8 (W4) and 39.6–45.6 tok/s FP4 (S1b) post-first-token on a resident route |
+| Qwen representative chat | not ready | changing routes/history measured ~2.4–4.2 tok/s int8 (novel-route probe) and 5.3–16.9 tok/s FP4; SATA first-touch bound |
+| DeepSeek throughput | not ready | roughly 0.4–0.6 tok/s on the reference host |
+| conversation KV reuse | implemented | protocol v5 retained sessions prefill only the per-turn delta; TTFT flat 3–9 s |
 | route-aware warm state | partial | cache/prefetch exists; no general chat-hot guarantee |
 | API compatibility | partial | documented greedy text subset; no tools/multimodal/sampling/logprobs |
 | authentication | partial | optional shared bearer key only |
@@ -40,7 +42,10 @@ context ceiling is not long-context-qualified. Neither backend meets the
 ## Release blockers
 
 1. Meet a declared user-facing workload SLO, not only hot runner gates.
-2. Implement conversation prefix/KV reuse and workload-aware expert placement.
+   Resident routes meet it; novel-route chat remains first-touch
+   storage-bound, so the SLO is not met for representative chat.
+2. Extend workload-aware expert placement beyond the landed W4 bounded
+   re-promotion so novel and revisited routes stay resident.
 3. Qualify context sizes sequentially up to the advertised ceiling.
 4. Add a hardened supervisor, external logging/metrics/alerts and rollback gate.
 5. Add TLS/auth/rate limiting at an edge and keep the built-in server private.

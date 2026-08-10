@@ -84,7 +84,10 @@ top-k order during weighted aggregation.
 
 Adaptive placement observes reuse and measured execution cost. Placement is
 frozen at a safe request/warmup boundary for deterministic latency measurement;
-the frozen hot path performs no expert-weight H2D.
+the frozen hot path performs no demand expert-weight H2D on resident routes.
+While frozen, a bounded re-promotion may still upload RAM-resident hot experts
+to VRAM, gated by a stale-victim byte budget so a repeating route whose working
+set exceeds the VRAM budget cannot ping-pong.
 
 The runner measures resident GPU expert work with per-layer CUDA events and
 CPU expert work with the host steady clock. It publishes selection-normalized
@@ -95,9 +98,11 @@ The portable hybrid dispatcher makes a bounded plan only when a layer has a
 non-resident expert. GPU-resident work is fixed. A RAM-resident miss may execute
 locally or upload only if measured CPU versus serialized-H2D-plus-GPU cost
 reduces the projected layer critical path and cache admission protects hotter
-or in-use residents. CPU/GPU compute may overlap; the current synchronous
-uploader is modeled before GPU expert execution. Decision reasons, alternative
-costs, and EWMAs are retained in bounded telemetry.
+or in-use residents. CPU/GPU compute may overlap; the planner models an H2D
+upload conservatively as serialized before GPU expert execution, even though
+the uploader itself completes through per-upload CUDA events on a dedicated
+completion thread rather than stream-wide host syncs. Decision reasons,
+alternative costs, and EWMAs are retained in bounded telemetry.
 
 During unfrozen placement, exact selected routing weights feed cache
 temperature. Frequency, accumulated score mass, and peak score are stored as
@@ -163,7 +168,9 @@ worker and benchmark tools from developing separate metadata interpretations.
 
 The Qwen3-Next backend implements alternating full attention and Gated
 DeltaNet, output-gated attention, partial RoPE, shared and routed experts, and
-isolated KV/Conv/DeltaNet state per slot. The DeepSeek-V4-Flash backend
+isolated KV/Conv/DeltaNet state per slot; its routed experts are consumed as
+INT8 per-row records (quant ABI 1) or FP4-E2M1/UE8M0 block-32 records (quant
+ABI 3) through packed `__dp4a` kernels. The DeepSeek-V4-Flash backend
 implements its native attention/CSA/HCA, routing, shared/routed FFN, compact
 FP4 expert path, and persistent request state. CUDA is compiled for SM86.
 
@@ -194,6 +201,59 @@ Cache budgets are upper bounds, not startup reservations. A cold server uses
 roughly dense + runtime state; repeated requests heat expert residency until
 the budget is reached.
 
+## Serving memory hierarchy (measured)
+
+The serving design is a three-tier hierarchy. Measured on the RTX 3090 host
+(2026-08-10, docs/benchmarks.md §Host bandwidth):
+
+```text
++---------------------------------------------------------------+
+| VRAM 24 GB (RTX 3090) — the only memory the GPU computes from  |
+|                                                               |
+|  - hot routed experts: operator-budgeted cache (12-18 GiB)    |
+|    FP4 slots: 12.75 MiB (DeepSeek) / ~1.9 MB (Qwen) per       |
+|    expert — roughly twice as many residents as int8           |
+|  - shared experts + dense pack (~4-5 GiB)                     |
+|  - conversation KV cache + workspaces                         |
+|  - transfer cost: none — native speed (40-47 tok/s hot Qwen)  |
++------------------------------^--------------------------------+
+                               | PCIe Gen3 x16: 12.46 GiB/s measured
+                               | every expert missing from VRAM
+                               | crosses this link, no exceptions
++------------------------------|--------------------------------+
+| RAM 64 GB (expert budget 40-48 GiB)                           |
+|  - warm experts that did not fit VRAM; staging only — the     |
+|    GPU cannot compute from RAM, entries upload on demand      |
+|  - Qwen FP4 pack (45.36 GB) fits entirely: disk leaves the    |
+|    steady state after warm-up                                 |
+|  - DeepSeek pack (147 GB) fits only ~27%: most cold experts   |
+|    still fall through to disk                                 |
++------------------------------^--------------------------------+
+                               | SATA sequential: 0.47 GiB/s measured
+                               | (26x slower than PCIe)
++------------------------------|--------------------------------+
+| DISK: the immutable expert packs (Qwen 45-72 GB, DeepSeek     |
+| 147 GB). Cold experts live here; every read from this tier    |
+| dominates request wall time (S1-DeepSeek probe: storage wait  |
+| was larger than the entire decode wall on settled turns).     |
++---------------------------------------------------------------+
+```
+
+Per-token flow for one routed layer: the directory checks VRAM — a hit
+computes immediately at zero transfer cost; a miss uploads from RAM at PCIe
+speed if RAM-resident, otherwise reads from disk first (SATA-bound) and then
+uploads. Eviction never selects an entry pinned by an in-flight route
+(structural `route_pinned` skip), so supply cannot deadlock against the
+forward pass that triggered it.
+
+Two accounting facts decide how much each tier holds: VRAM residency doubled
+when slots became FP4 (12.75 MiB) instead of int8 (25.2 MB), and the tier
+capacities follow from the pack sizes above — Qwen FP4 eliminates the disk
+tier after warm-up, DeepSeek cannot on 64 GB RAM. Hardware levers act on
+exactly one term each: an NVMe pack tier attacks the SATA miss path
+(~10x), RAM >= 192 GB removes the disk tier for DeepSeek entirely, and VRAM
+is fixed at 24 GB on this host (which is why FP4 slot size matters).
+
 ## Context memory
 
 The model advertises 262,144 positions. Qwen3-Next has twelve full-attention
@@ -216,13 +276,14 @@ allocation does not make that larger limit correctness- or latency-qualified.
 
 Attention uses online softmax and constant shared memory instead of storing one
 score per context token. This removes the previous kernel launch ceiling for
-large contexts. Prefill now groups up to four consecutive tokens from one
-request into a causal microbatch. Full-attention cache writes and DeltaNet state
+large contexts. Prefill runs in causal chunks whose size is an independent
+worker setting (`--worker-prefill-chunk-tokens`, default 256), decoupled from
+the decode batch capacity. Full-attention cache writes and DeltaNet state
 updates remain position ordered, while projections and MoE work reuse the
 microbatch path. This is bounded chunked prefill, not FlashAttention: full
-attention remains quadratic and the chunk is tied to worker capacity. Larger
-chunks, prefill-specific workspaces/kernels, RoPE validation, and staged
-SLO/correctness gates are required before qualifying beyond 4096 tokens.
+attention remains quadratic. Prefill-specific workspaces/kernels, RoPE
+validation, and staged SLO/correctness gates are required before qualifying
+beyond 4096 tokens.
 
 ## Failure model
 

@@ -89,7 +89,7 @@ void test_deepseek_compact_admission_validation() {
   er::PayloadRecord record;
   record.stored_bytes = bytes.size();
   record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
-  record.device_bytes = 25'198'592U;
+  record.device_bytes = 13'369'344U;
   record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
   record.header_bytes = 0U;
   record.alignment = 1U;

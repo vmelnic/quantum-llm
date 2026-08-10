@@ -43,7 +43,12 @@ an interpretation from tensor dimensions.
 
 Expert Pack v1 is compute-ready for the existing INT8-per-row Qwen/OLMoE
 kernels. Its cost is size: converting lower-bit source weights to INT8 can
-roughly double routed-weight traffic.
+roughly double routed-weight traffic. Since 2026-08 the same container also
+carries an FP4-E2M1/UE8M0 block-32 profile (quant ABI 3, kernel ABI
+`expert-pack-sm86-fp4-block32-v1`) consumed directly by packed `__dp4a`
+selection-batch kernels; the measured FP4 Qwen pack halves routed bytes per
+token (0.7 GiB vs 1.41 GiB) and reached 39.6–45.6 tok/s on resident routes
+(docs/benchmarks.md §S1b).
 
 DeepSeek compact pack v1 is placement-ready and preserves the checkpoint's
 13,369,344-byte FP4/UE8M0 expert records. The current SM86 DP4A path consumes

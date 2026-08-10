@@ -134,7 +134,7 @@ std::vector<er::ResidentExpertSpec> ffn_specs(
         oracle_root / relative(item[5]), source_root, 6U);
     record.stored_bytes = bytes;
     record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
-    record.device_bytes = 25'198'592ULL;
+    record.device_bytes = shared ? 25'198'592ULL : 13'369'344ULL;
     record.source_abi = shared
         ? er::kExpertSourceAbiDeepSeekFp8Block128V1
         : er::kExpertSourceAbiDeepSeekCompactV1;
@@ -942,8 +942,9 @@ int main(int argc, char** argv) {
 
     constexpr std::uint64_t shared_hot_bytes = 43ULL * 25'198'592U;
     constexpr std::uint64_t routed_cache_slots = 258U;
+    // Direct compact (FP4) routed slots, not the legacy int8 expansion.
     constexpr std::uint64_t routed_cache_bytes =
-        routed_cache_slots * 25'198'592U;
+        routed_cache_slots * 13'369'344U;
     constexpr std::uint64_t compact_cache_bytes = 0U;
     auto full_directory = std::make_shared<er::cuda::CudaExpertDirectory>(
         17U, er::kExpertQuantAbiDeepSeekSm86, 43U, 257U, 64U);

@@ -146,7 +146,10 @@ Flat list, dependency order, each step gated on measured before/after:
    pin them for the decode span, release at turn end. Measure settled
    vs novel turn tok/s on the W4 long-session probe.
 
-Not to do: spec-decode on DeepSeek-class bandwidth-bound regimes
-(measured neutral, confirmed externally); trusting top-K reduction
+Not to do: spec-decode on DeepSeek-class bandwidth-bound regimes was
+measured neutral in the int8-slot regime (W5) — note the S1-DeepSeek
+ablation reversed this under FP4 residency, MTP is now a measured
+2-3.5x decode multiplier and stays on (docs/benchmarks.md §S1-DeepSeek);
+trusting top-K reduction
 claims without a quality measurement; chasing vendor tok/s numbers from
 DDR5 dual-socket rigs.

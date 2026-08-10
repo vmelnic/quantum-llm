@@ -45,7 +45,8 @@ Key responsibilities:
 
 - `source`: immutable checkpoint identity, file sizes and SHA-256;
 - `architecture`: complete OLMoE or Qwen3-Next geometry/semantics;
-- `quantization`: `int8-symmetric-per-row-v1`, quant ABI 1;
+- `quantization`: `int8-symmetric-per-row-v1` (quant ABI 1) or
+  `fp4-e2m1-ue8m0-block32-v1` (quant ABI 3);
 - `kernel_abi`: layout, activation, ordering, target architecture;
 - `alignment`: record, section, direct-I/O, pinned and CUDA alignment;
 - `tensors` / `experts`: complete record indexes;
@@ -108,7 +109,8 @@ down_scales     F32 [H]
 ```
 
 The expert has all common flags (`0x0f`). Sections cannot overlap and appear in
-the declared order.
+the declared order. Under quant ABI 3 the same section layout carries packed
+FP4-E2M1 rows (two values per byte) with UE8M0 block scales instead of I8/F32.
 
 ## Quantization profile
 
@@ -123,6 +125,15 @@ q[i]    = clamp(round_ties_to_even(row[i] / scale), -127, 127)
 Non-finite values are rejected. Scales are finite positive FP32. There are no
 zero points. The two compiler implementations (dependency-free and optional
 NumPy acceleration) must produce the same ABI and deterministic bytes.
+
+The alternative FP4 profile (`fp4-e2m1-ue8m0-block32-v1`, quant ABI 3) stores
+routed expert weights as packed FP4-E2M1 values with one UE8M0 scale per
+32-value block along each output row — the same device format as the DeepSeek
+compact path, consumed directly by the packed `__dp4a` kernels (kernel ABI
+`expert-pack-sm86-fp4-block32-v1`). Scale codes are clamped to [1, 254]: 255
+is the UE8M0 NaN and code 0 decodes inconsistently between toolchain and CUDA
+kernel, so the compiler never emits it. Dense tensors, router matrices and
+normalizations keep their INT8/FP32 encodings under both profiles.
 
 ## Architecture semantics
 

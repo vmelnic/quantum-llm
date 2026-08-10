@@ -75,26 +75,36 @@ deletes or modifies the source checkpoint.
 ## Current compute boundary
 
 Version 1 removes six-way scattered reads and creates the stable input layout
-for a direct compressed CUDA kernel. Until that kernel is selected by the
-device ABI, admission still expands a cold record into the existing
-25,198,592-byte INT8 SM86 slot on the GPU. Validated FP4 projections are queued
-without per-projection host synchronization; publication retains one final
-stream barrier. The pack alone improves I/O shape but does not claim to remove
-conversion cost.
+for a direct compressed CUDA kernel. That kernel exists: since `05b474e`
+("Execute DeepSeek experts directly from packed FP4") the worker uploads the
+13,369,344-byte compact record unchanged (`CudaCompactExpertAllocation`),
+the directory publishes it as `DeviceExpertFormat::deepseek_fp4_block32`,
+and gate/up/down run the packed `__dp4a` selection-batch kernels — the same
+geometry-generic kernels the Qwen FP4 pack (ABI 3) reuses. The int8 SM86
+expansion path remains only for FP8 shared experts.
 
 A direct-FP4 qualification prototype kept routed records compact in VRAM and
 performed FP4 dequantization inside gate/up/down. It was numerically correct,
 but increased a real FFN block from 6.94 to 38.64 ms and the five-token prompt
-from 3.74 to 26.75 seconds, so the execution branch was removed. Direct compact
-execution becomes a production candidate only with admission-time GPU
-expansion or grouped multi-row/Tensor Core kernels.
+from 3.74 to 26.75 seconds, so the execution branch was removed. The lesson
+carried into `05b474e`: direct compact execution pays off only with packed
+vectorized (`__dp4a`) kernels, not per-value dequantization.
+
+Accounting note (fixed 2026-08-10): the routed catalog originally kept
+declaring `device_bytes = 25,198,592` (the int8 slot) after direct-FP4
+landed, so VRAM budgets, preflight and the census warm set sized every FP4
+slot at ~2x its real footprint and `warm_from_census` was hard-capped at 6
+experts/layer. The catalog now declares the compact record size
+(13,369,344) for routed records; the warm cap derives from the VRAM entry
+budget (clamped 6..32/layer). Measured effect and the route-skew analysis
+behind the cap choice: docs/benchmarks.md §S1-DeepSeek.
 
 ## Qualification result
 
 The complete pack contains 43 shards, 11,008 records, and 147,169,738,752
 payload bytes. A real five-token chat prompt retained the expected `Hello`
-token. The cold run took 29.05 seconds and read 12.57 GB; an immediate warm run
-took 3.61 seconds versus the previous 3.74-second warm baseline. This modest
+token. The cold run took 29.05 seconds and read 12.57 GB; an immediate warm
+run took 3.61 seconds versus the previous 3.74-second warm baseline. This modest
 warm improvement does not satisfy the throughput objective. The evidence
 requires persistent RAM/VRAM placement and a faster grouped compute path;
 compact files are a prerequisite, not the final optimization.

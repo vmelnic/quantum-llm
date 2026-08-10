@@ -40,6 +40,12 @@ Prepare at least one immutable model artifact:
 The lifecycle wrapper validates the selected artifact during service startup.
 It never removes the original checkpoint or either prepared model.
 
+Note: the DeepSeek worker bundle `runtime.tsv` stores absolute paths for
+`routed`, `mtp_routed` and `census`, captured when the bundle was generated.
+If the model store is moved (e.g. the 2026-08 `C:\Users\vladi\quantum-llm`
+cleanup), those three entries must be repointed to the new root or the
+worker exits with "bundle dependency is unavailable".
+
 ## 2. Configure the control host
 
 From the local repository:
@@ -64,6 +70,7 @@ MODEL_GENERATION_TIMEOUT_SECONDS=600
 
 MODEL_DEEPSEEK_BUNDLE=C:/quantum-llm/work/models/deepseek-v4-flash/worker-bundle-v3
 MODEL_QWEN_CONTAINER=C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-int8
+MODEL_QWEN_FP4_CONTAINER=C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-fp4
 
 CHAT_SSH=user@gpu-host
 CHAT_BASE_URL=http://127.0.0.1:8080
@@ -80,9 +87,13 @@ The model selectors accepted by `CHAT_MODEL` are:
 | Value | Deployment |
 |---|---|
 | `deepseek-v4-flash` | DeepSeek-V4-Flash compact worker bundle |
-| `qwen3-next-80b-a3b-expert-pack-int8` | Qwen3-Next 80B Expert Pack |
+| `qwen3-next-80b-a3b-expert-pack-int8` | Qwen3-Next 80B Expert Pack (INT8) |
+| `qwen3-next-80b-a3b-expert-pack-fp4` | Qwen3-Next 80B Expert Pack (FP4, ABI 3) |
 
-Short aliases `deepseek` and `qwen` are accepted as command arguments.
+Short aliases `deepseek`, `qwen` and `qwen-fp4` are accepted as command
+arguments. The FP4 selection reads its container from
+`MODEL_QWEN_FP4_CONTAINER`; `MODEL_QWEN_CONTAINER` steers the INT8 selection
+only.
 
 `MODEL_MAX_CONTEXT` covers the entire tokenized request: instructions, chat
 history, current input, and requested output. `MODEL_MAX_OUTPUT_TOKENS` is the

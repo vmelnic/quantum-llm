@@ -15,7 +15,9 @@ namespace {
 
 constexpr std::uint64_t kStoredBytes = 13'369'344U;
 constexpr std::uint64_t kDecodedBytes = 3ULL * 4096U * 2048U * sizeof(float);
-constexpr std::uint64_t kDeviceBytes = 25'198'592U;
+// Direct compact execution keeps the packed FP4 record as the device slot;
+// the 25,198,592-byte int8 SM86 layout only describes shared FP8 expansion.
+constexpr std::uint64_t kDeviceBytes = kStoredBytes;
 
 std::vector<std::string> fields(const std::string& line) {
   std::vector<std::string> result;

@@ -1002,15 +1002,18 @@ class Model final {
         (warm_ram_limit - usage.ram_bytes) / representative->stored_bytes;
     const auto vram_entries =
         (warm_vram_limit - usage.vram_bytes) / device_record_bytes;
+    // The per-layer warm cap tracks the VRAM entry budget: with direct
+    // compact (FP4) slots the tier holds far more than one top-k working set
+    // per layer, and the measured route skew (top-33 of 256 per layer
+    // covers ~92% of route mass) rewards warming deeper. Cap at 32 per
+    // layer to stay clear of allocator/driver headroom below the logical
+    // tier budget.
+    const auto maximum_per_layer = static_cast<std::size_t>(
+        std::clamp<std::uint64_t>(
+            vram_entries / er::kDeepSeekCatalogLayers, 6U, 32U));
     const auto maximum_entries = static_cast<std::size_t>(
-        std::min<std::uint64_t>(
-            std::min(ram_entries, vram_entries),
-            static_cast<std::uint64_t>(er::kDeepSeekCatalogLayers) * 6U));
+        std::min(ram_entries, vram_entries));
     if (maximum_entries == 0U) return;
-    // Startup warms at most one complete top-k working set per layer. Filling
-    // the entire cache speculatively is both unnecessary for readiness and
-    // vulnerable to allocator/driver headroom below the logical tier budget.
-    constexpr std::size_t maximum_per_layer = 6U;
     auto warm = census_->stable_warm_set(maximum_entries, maximum_per_layer);
     telemetry_.warm_start_candidates = warm.size();
     if (warm.empty()) return;
