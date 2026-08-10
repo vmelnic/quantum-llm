@@ -499,8 +499,12 @@ class ContinuousDecodeBatcher:
             if first is None:
                 return
             batch = [first]
+            # With a single request in flight there is no partner to wait
+            # for; dispatch immediately instead of burning the window
+            # (~6% of every decode step at 30 tok/s). Under real concurrency
+            # the queue is non-empty and the window still applies.
             deadline = time.monotonic() + self.window_seconds
-            while len(batch) < self.worker.capacity:
+            while not self.pending.empty() and len(batch) < self.worker.capacity:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break

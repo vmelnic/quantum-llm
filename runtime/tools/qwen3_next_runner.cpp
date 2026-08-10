@@ -607,6 +607,7 @@ class Qwen3NextModel final {
     if (quant_abi_ != expert::runtime::kExpertQuantAbiInt8PerRow &&
         quant_abi_ != expert::runtime::kExpertQuantAbiFp4Block32)
       throw std::runtime_error("unsupported Qwen expert quant ABI");
+    std::fprintf(stderr, "[load] manifest ok, quant_abi=%u\n", quant_abi_);
     hidden_ = u32(architecture, "hidden_size", "architecture");
     expert_width_ = u32(architecture, "intermediate_size", "architecture");
     vocab_ = u32(architecture, "vocab_size", "architecture");
@@ -660,10 +661,13 @@ class Qwen3NextModel final {
       }
     }
     if (!dense_pack_.base) throw std::runtime_error("manifest has no dense pack");
+    std::fprintf(stderr, "[load] dense pack uploaded\n");
     for (const auto& value : Required(manifest, "tensors", "manifest").AsArray("tensors"))
       add_tensor(value.AsObject("tensor"));
     build_expert_index(
         Required(manifest, "experts", "manifest").AsArray("experts"));
+    std::fprintf(stderr, "[load] tensors + expert index ok (max record %llu)\n",
+                 static_cast<unsigned long long>(max_expert_record_bytes_));
     route_access_counts_.resize(experts_);
     route_score_sums_.resize(experts_);
     route_score_maxima_.resize(experts_);
@@ -688,9 +692,11 @@ class Qwen3NextModel final {
                             : plan_workspace.status.message()));
       plan_workspace_ = std::move(plan_workspace.workspace);
     }
+    std::fprintf(stderr, "[load] CUDA directory ok\n");
     buffers_ = std::make_shared<expert::runtime::FixedBufferPool>(
         slot_count, slot_bytes, expert::runtime::kExpertPackAlignment,
         std::make_shared<expert::runtime::CudaPinnedAllocator>());
+    std::fprintf(stderr, "[load] buffer pool ok\n");
     const auto budget = [](std::uint64_t capacity) {
       if (!capacity) throw std::runtime_error("cache capacity is zero");
       return expert::runtime::TierBudget{
@@ -717,7 +723,9 @@ class Qwen3NextModel final {
     placement_ = std::make_unique<expert::runtime::AdaptivePlacementPlanner>(
         *cache_, placement_config);
     dispatch_ = std::make_unique<expert::runtime::HybridDispatchPlanner>();
+    std::fprintf(stderr, "[load] cache + planners ok\n");
     allocate_workspace();
+    std::fprintf(stderr, "[load] workspace ok\n");
     cuda_check(cudaEventCreate(&layer_start_event_), "create layer-start event");
     cuda_check(cudaEventCreate(&attention_done_event_),
                "create attention-done event");
@@ -1580,8 +1588,10 @@ class Qwen3NextModel final {
       if (has_cold_fallback ||
           (may_upload_from_ram &&
            (!frozen_route_feedback || frozen_stale_budget_bytes_ > 0))) {
-        // Admission checks and uploads require cache references mirroring the
-        // directory pins so no current-route entry can become a victim.
+        // Cache references mirroring the directory pins keep current-route
+        // entries hot and preferred by the admission heuristics. Eviction
+        // correctness no longer depends on this lease: the cache skips
+        // route-pinned victims structurally (route_pinned/try_retire).
         acquire_device(plan.ready_experts);
       }
 
@@ -2214,7 +2224,11 @@ int worker_loop(Qwen3NextModel& model, std::uint32_t settle_after_steps) {
             throw std::runtime_error("invalid STEP item");
           const auto id = std::stoull(std::string(fields[field].substr(0, separator)));
           const auto flag = fields[field].substr(separator + 1U);
-          if (!id || (flag != "0" && flag != "1") ||
+          // Modes: 0 = decode, 1 = final emit-and-release, 2 = plain decode
+          // that keeps the slot ("hold"). Without MTP speculation a hold is
+          // exactly a plain decode here; the server emits it for retained
+          // turns when MTP is enabled, so accept it before Qwen grows MTP.
+          if (!id || (flag != "0" && flag != "1" && flag != "2") ||
               std::any_of(steps.begin(), steps.end(),
                           [&](const Step& step) { return step.id == id; }))
             throw std::runtime_error("invalid STEP request");

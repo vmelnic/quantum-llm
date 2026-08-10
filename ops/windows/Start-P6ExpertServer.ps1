@@ -21,7 +21,8 @@ param(
     [double]$GenerationTimeoutSeconds = 120.0,
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
-    [string]$BuildId = "development"
+    [string]$BuildId = "development",
+    [string]$ModelId = "qwen3-next-80b-a3b-expert-pack-int8"
 )
 
 $arguments = @{
@@ -43,7 +44,7 @@ $arguments = @{
     StartupTimeoutSeconds = $StartupTimeoutSeconds
     DrainTimeoutSeconds = $DrainTimeoutSeconds
     BuildId = $BuildId
-    ModelId = "qwen3-next-80b-a3b-expert-pack-int8"
+    ModelId = $ModelId
 }
 if ($Container) { $arguments.Container = $Container }
 if ($Tokenizer) { $arguments.Tokenizer = $Tokenizer }

@@ -236,8 +236,9 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
   }
 
-  void release_device_locked(Entry& entry) noexcept {
-    if (entry.device && directory) {
+  void release_device_locked(Entry& entry,
+                             bool directory_entry_retired = false) noexcept {
+    if (entry.device && directory && !directory_entry_retired) {
       directory->retire(entry.key);
     }
     entry.device.reset();
@@ -311,6 +312,14 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           entry->state == CacheState::failed) {
         continue;
       }
+      // A route-pinned entry can never be a VRAM victim: its release depends
+      // on the in-flight forward that this very eviction would block. The
+      // host-side pin view makes the invariant structural instead of relying
+      // on the runner mirroring directory pins with cache references.
+      if (need_vram && entry->device && directory &&
+          directory->route_pinned(key)) {
+        continue;
+      }
       const bool useful = (need_ram && (entry->host || entry->host_copy)) ||
                           (need_vram && entry->device);
       if (!useful) {
@@ -362,7 +371,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       release_host_locked(*candidate);
     }
     if (need_vram && candidate->device) {
-      release_device_locked(*candidate);
+      // Non-blocking retire: route_pinned filtered above, so a busy entry
+      // here means a pin release kernel is still in flight. Skip the victim
+      // rather than spinning on a reference this thread may own itself.
+      if (directory && !directory->try_retire(candidate->key)) {
+        return false;
+      }
+      release_device_locked(*candidate, /*directory_entry_retired=*/true);
       if (candidate->state == CacheState::vram_ready) {
         transition_locked(*candidate,
                           (candidate->host || candidate->host_copy)

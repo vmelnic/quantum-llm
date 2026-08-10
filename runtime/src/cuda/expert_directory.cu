@@ -6,6 +6,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <mutex>
 #include <stdexcept>
@@ -724,6 +725,54 @@ void CudaExpertDirectory::retire(const ExpertKey& key) noexcept {
     if (retired != 0) return;
     std::this_thread::yield();
   }
+}
+
+bool CudaExpertDirectory::try_retire(const ExpertKey& key) noexcept {
+  if (!impl_ || key.model_id != impl_->model_id ||
+      key.quant_abi != impl_->quant_abi || key.layer >= impl_->layers ||
+      key.expert >= impl_->experts) {
+    return true;
+  }
+  const auto index = static_cast<std::size_t>(key.layer) * impl_->experts +
+                     key.expert;
+  std::uint32_t retired = 0;
+  static_cast<void>(cudaMemset(impl_->retired, 0, sizeof(std::uint32_t)));
+  try_retire_entry<<<1, 1>>>(impl_->entries + index, impl_->retired);
+  if (cudaPeekAtLastError() != cudaSuccess ||
+      cudaMemcpy(&retired, impl_->retired, sizeof(retired),
+                 cudaMemcpyDeviceToHost) != cudaSuccess) {
+    return false;
+  }
+  if (retired == 0) {
+    DeviceExpertEntry snapshot{};
+    if (cudaMemcpy(&snapshot, impl_->entries + index, sizeof(snapshot),
+                   cudaMemcpyDeviceToHost) == cudaSuccess) {
+      std::fprintf(stderr,
+                   "[retire-busy] layer=%u expert=%u state=%u refs=%u "
+                   "format=%u\n",
+                   key.layer, key.expert, snapshot.state,
+                   snapshot.device_references, snapshot.format);
+    }
+  }
+  return retired != 0;
+}
+
+bool CudaExpertDirectory::route_pinned(const ExpertKey& key) const noexcept {
+  if (!impl_ || key.model_id != impl_->model_id ||
+      key.quant_abi != impl_->quant_abi || key.layer >= impl_->layers ||
+      key.expert >= impl_->experts) {
+    return false;
+  }
+  std::lock_guard lock(impl_->mutex);
+  for (const auto& [pin_id, pin] : impl_->active_pins) {
+    (void)pin_id;
+    if (pin.layer != key.layer) continue;
+    if (std::find(pin.experts.begin(), pin.experts.end(), key.expert) !=
+        pin.experts.end()) {
+      return true;
+    }
+  }
+  return false;
 }
 
 DirectoryPlanResult CudaExpertDirectory::pin_or_collect_misses(

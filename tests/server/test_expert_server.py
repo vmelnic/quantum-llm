@@ -4,6 +4,7 @@ import contextlib
 import io
 import sys
 import socket
+import time
 import unittest.mock
 import threading
 import types
@@ -408,30 +409,72 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(info["worker_kv"]["allocation"], "preallocated")
         self.assertEqual(info["worker_runtime"]["cache_vram_hits"], 7)
 
-    def test_concurrent_rows_share_one_worker_step(self) -> None:
+    def test_idle_request_dispatches_without_waiting_the_window(self) -> None:
         worker = FakeWorker()
         observed: list[int] = []
+        # A huge window would make the step hang for seconds if the idle
+        # fast path regressed; the fast path dispatches immediately.
+        batcher = ContinuousDecodeBatcher(worker, 5000.0, observed.append)
+        started = time.monotonic()
+        self.assertEqual(batcher.step(1, False), 10)
+        elapsed = time.monotonic() - started
+        batcher.close()
+
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(worker.calls, [[(1, 0)]])
+        self.assertEqual(observed, [1])
+
+    def test_queued_rows_share_one_worker_step(self) -> None:
+        class BlockingWorker:
+            capacity = 4
+
+            def __init__(self) -> None:
+                self.calls: list[list[tuple[int, int]]] = []
+                self.lock = threading.Lock()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+
+            def step(self, items: list[tuple[int, int]]) -> dict[int, int]:
+                with self.lock:
+                    self.calls.append(list(items))
+                    first = len(self.calls) == 1
+                if first:
+                    self.entered.set()
+                    self.release.wait(timeout=5)
+                return {request_id: request_id * 10 + int(flag)
+                        for request_id, flag in items}
+
+        worker = BlockingWorker()
+        observed: list[int] = []
         batcher = ContinuousDecodeBatcher(worker, 50.0, observed.append)
-        barrier = threading.Barrier(5)
         results: dict[int, int] = {}
 
         def run(request_id: int) -> None:
-            barrier.wait()
             results[request_id] = batcher.step(request_id, request_id == 4)
 
+        first = threading.Thread(target=run, args=(1,))
+        first.start()
+        self.assertTrue(worker.entered.wait(timeout=2))
         threads = [threading.Thread(target=run, args=(request_id,))
-                   for request_id in range(1, 5)]
+                   for request_id in range(2, 5)]
         for thread in threads:
             thread.start()
-        barrier.wait()
+        # All three waiters enqueue while the worker is busy; when it frees
+        # up they must share exactly one follow-up step.
+        deadline = time.monotonic() + 2
+        while batcher.pending.qsize() < 3 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        worker.release.set()
+        first.join(timeout=2)
         for thread in threads:
             thread.join(timeout=2)
             self.assertFalse(thread.is_alive())
         batcher.close()
 
-        self.assertEqual(len(worker.calls), 1)
-        self.assertEqual(len(worker.calls[0]), 4)
-        self.assertEqual(observed, [4])
+        self.assertEqual(len(worker.calls), 2)
+        self.assertEqual(worker.calls[0], [(1, 0)])
+        self.assertEqual(len(worker.calls[1]), 3)
+        self.assertEqual(observed, [1, 3])
         self.assertEqual(results, {1: 10, 2: 20, 3: 30, 4: 41})
 
     def test_speculative_bonus_is_buffered_without_an_extra_worker_step(self) -> None:

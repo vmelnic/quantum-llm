@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|qwen-fp4|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -54,12 +54,17 @@ case "${selection}" in
     model_id="qwen3-next-80b-a3b-expert-pack-int8"
     task_name="QuantumLLM-P6ExpertServer"
     ;;
+  qwen-fp4|qwen3-next-fp4|qwen3-next-80b-a3b-expert-pack-fp4)
+    model_alias="qwen"
+    model_id="qwen3-next-80b-a3b-expert-pack-fp4"
+    task_name="QuantumLLM-P6ExpertServer"
+    ;;
   all)
     model_alias="all"
     model_id=""
     task_name=""
     ;;
-  *) die "unsupported model '${selection}'; use deepseek or qwen" ;;
+  *) die "unsupported model '${selection}'; use deepseek, qwen or qwen-fp4" ;;
 esac
 
 remote_host="${QUANTUM_LLM_REMOTE:-${CHAT_SSH:-}}"
@@ -72,6 +77,12 @@ generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
 deepseek_bundle="${MODEL_DEEPSEEK_BUNDLE:-C:/quantum-llm/work/models/deepseek-v4-flash/worker-bundle-v3}"
 qwen_container="${MODEL_QWEN_CONTAINER:-C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-int8}"
+# The FP4 selection has its own container variable so MODEL_QWEN_CONTAINER
+# keeps steering the int8 selection only.
+qwen_fp4_container="${MODEL_QWEN_FP4_CONTAINER:-C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-fp4}"
+if [[ "${model_id}" == qwen3-next-80b-a3b-expert-pack-fp4 ]]; then
+  qwen_container="${qwen_fp4_container}"
+fi
 
 require_uint MODEL_PORT "${port}"
 require_uint MODEL_MAX_CONTEXT "${max_context}"
@@ -159,6 +170,7 @@ start_model() {
     run_remote Install-ExpertServerTask.ps1 \
       -Profile P6 \
       -Container "${qwen_container}" \
+      -ModelId "${model_id}" \
       -MaximumQueue 8 \
       -WorkerCapacity 4 \
       -WorkerRamCacheGiB 48 \

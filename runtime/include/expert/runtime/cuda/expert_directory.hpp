@@ -105,6 +105,9 @@ class CudaExpertDirectory final : public IDeviceResidencyDirectory {
       const ExpertKey& key,
       std::shared_ptr<IDeviceAllocation> allocation) override;
   void retire(const ExpertKey& key) noexcept override;
+  [[nodiscard]] bool try_retire(const ExpertKey& key) noexcept override;
+  [[nodiscard]] bool route_pinned(const ExpertKey& key) const
+      noexcept override;
 
   // A returned pin_id holds one device reference for every ready unique expert.
   // release_pins(pin_id) is mandatory after the dependent kernels finish.

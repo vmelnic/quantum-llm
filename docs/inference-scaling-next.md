@@ -1,8 +1,9 @@
 # Scaling MoE serving beyond the 30 tok/s wall — next steps
 
-Status: research synthesis, 2026-08-09. Inputs: internal pack-format audit,
-measured W0–W5 results (docs/inference-30toks-plan.md §8,
-docs/benchmarks.md), and published low-bit MoE evidence.
+Status: research synthesis, 2026-08-09; updated 2026-08-10 with measured
+host bandwidth (§3) and S1a/S1c code status (§4). Inputs: internal
+pack-format audit, measured W0–W5 results (docs/inference-30toks-plan.md
+§8, docs/benchmarks.md), and published low-bit MoE evidence.
 
 Premise: total model size is not the speed constraint — **routed
 bytes/token and cache hit rate are**. A 1 TB model is fine if its
@@ -14,8 +15,9 @@ it fits in RAM"; every step helps at any model scale.
 
 - Quant today: `int8-symmetric-per-row-v1`, ABI 1
   (`compiler/expert_pack/constants.py:22-24`), one FP32 scale per output
-  row (`compiler/expert_pack/quant.py:77-120`). The runtime validator
-  hard-rejects anything else (`runtime/src/expert_record.cpp:88-124`).
+  row (`compiler/expert_pack/quant.py:77-120`). Since 032cccd the runtime
+  validator accepts ABI 1 and ABI 3
+  (`runtime/src/expert_record.cpp:87-91`).
 - **Dequant is in-kernel, not at upload** (`expert_uploader.cu:481-504`
   copies quantized bytes; `moe_kernels.cu:143-163` dequantizes per
   element). So a 4-bit format halves BOTH storage/RAM footprint AND the
@@ -23,11 +25,14 @@ it fits in RAM"; every step helps at any model scale.
 - The cache/uploader tiers are size-agnostic (manifest-driven
   `stored_bytes`); no tiering logic changes needed for smaller records.
 - **A working 4-bit pipeline already exists in this repo**: DeepSeek FP4
-  E2M1/UE8M0 block-32 — pack writer, ABI 2, `__dp4a` kernels
+  E2M1/UE8M0 block-32 — pack writer, `__dp4a` kernels
   (`moe_kernels.cu:68-118`), format dispatch in the `_selection_batch`
-  kernels, direct-compact upload. Reusing that format for Qwen routed
-  experts makes the runtime side mostly wiring; the compiler side is new
-  calibration/encoding work.
+  kernels, direct-compact upload. Since 032cccd the same format is wired
+  for Qwen routed experts as ABI 3
+  (`compiler/expert_pack/constants.py:32`): compiler encoder, manifest +
+  schema + validator, uploader/directory dispatch and packed `__dp4a`
+  GEMV kernels — S1a/S1c code landed; S1b measured (2026-08-10): quality
+  gate passed, resident 39.6–45.6 tok/s (docs/benchmarks.md §S1b).
 - Risk: realizing the bandwidth win needs packed vectorized loads +
   `__dp4a` in the Qwen expert GEMVs; a naive nibble-unpack loop will not
   deliver 2x. The DeepSeek FP4 kernels are the template.
@@ -60,22 +65,50 @@ it fits in RAM"; every step helps at any model scale.
 
 ## 3. The physics ladder after each step
 
-Today (int8, 1.41 GiB/token): SATA floor ~0.35-3 tok/s (real chat lives
-here), RAM tier ~15-25, VRAM-resident 27-47.
+Measured host bandwidth (2026-08-10, `work/fp4-s1/bandwidth_probe.py`,
+artifact `work/fp4-s1/bandwidth-report.json` on the GPU host):
 
-- **S1 int4 routed experts**: 0.7 GiB/token. Every tier doubles: SATA
-  ~1-6, RAM ~25-40, and twice the working set fits VRAM-resident (W4
-  re-promotion already in place). Pack 72.3 GiB -> ~36 GiB routed.
+- **H2D pinned: 12.46 GiB/s** — PCIe 3.0 x16 (`nvidia-smi`: link max
+  Gen3 x16; idles at Gen1 and ramps under load). Pageable copies reach
+  the same 12.05 GiB/s via staging. This is the hard ceiling for any
+  RAM-tier design on this host.
+- **SATA sequential read: 0.47 GiB/s** over the full 72.3 GiB int8 pack
+  (larger than RAM, so mostly cold).
+
+Implied per-token ceilings (bandwidth ÷ bytes/token):
+
+| Tier | int8 (1.41 GiB/tok) | FP4 (0.7 GiB/tok) |
+|---|---:|---:|
+| SATA | 0.3 tok/s | 0.7 tok/s |
+| RAM (over measured H2D) | 8.8 tok/s | 17.8 tok/s |
+| VRAM-resident (hot native) | 47.7 tok/s | ≥47.7 expected |
+
+Today (int8): SATA floor ~0.35-3 tok/s (real chat lives here), RAM tier
+capped at ~8.8 by the bus, VRAM-resident 27-47.
+
+- **S1 FP4 routed experts**: 0.7 GiB/token. Every tier doubles: SATA
+  ~0.7, RAM ceiling ~17.8 (NOT 25-40 — the earlier ladder assumed
+  17.5-28 GiB/s PCIe that this host does not have). Decisive structural
+  effect: the routed FP4 pack ~36 GiB fits inside the 48 GiB RAM budget
+  (72.3 GiB does not), so the SATA floor becomes cold-start-only.
+- **Consequence for the 30 tok/s target**: 30 tok/s at 0.7 GiB/token
+  needs 21 GiB/s H2D — impossible over the measured 12.46 GiB/s bus.
+  On this host, 30 tok/s is reachable ONLY through VRAM residency
+  (hot native is 47.7), i.e. capacity/hit-rate levers (W4 re-promotion,
+  S3 pinning), not bandwidth levers. S2 buys proximity to the ~17.8
+  RAM ceiling, not 30.
 - **S2 predictive cross-layer prefetch (Fate-style)**: predict layer
   i+1/i+2 routes from the gate *inputs* at layer i (not from history —
   that is why the W3 route-ahead attempt churned and was reverted).
   With S1, a miss is a cheap 0.7 GiB/token H2D that overlaps compute;
-  realistic target: real chat pinned near the RAM ceiling instead of the
-  SATA floor.
+  realistic target: real chat pinned near the ~17.8 RAM ceiling instead
+  of the SATA floor. Prefetch must carry an admission gate against the
+  stale-victim budget (W4 lesson), with churn-byte revert criteria.
 - **S3 prefill-touch pinning**: the experts touched while prefilling the
   prompt are the strongest free predictor of the decode span's routes
-  (same topic). Pin that set at the RAM/VRAM tier boundary before decode
-  starts. No learning, no model change, scales to any model size.
+  (same topic). Pin that set — budget-capped, frequency-weighted — at
+  the RAM/VRAM tier boundary before decode starts. No learning, no model
+  change, scales to any model size.
 
 Optional later, only if measured supportive: top-K 10->8 with
 renormalization (-20% bytes), 2-3-bit cold experts with high-bit
@@ -87,18 +120,24 @@ overlap over K>2 proves high — unmeasured today).
 
 Flat list, dependency order, each step gated on measured before/after:
 
-1. **S1a — compiler**: int4-groupwise (or reuse FP4-E2M1/UE8M0 block-32)
-   encoder for Qwen routed experts in `compiler/expert_pack/`, new ABI id,
-   manifest + schema + validator updates. Calibrate from the BF16/FP32
-   sources; keep router/norms FP32, dense pack int8.
-2. **S1b — quality gate**: perplexity delta vs the int8 pack on a
-   reference corpus + the KV-attach probes (Nacre 8/8, RO 4/5 must hold
-   with the requantized pack). Literature predicts ~no regression at
-   4-bit; if measured regression, stop here.
-3. **S1c — runtime**: new device format in the `entry.format` dispatch,
-   packed `__dp4a` GEMV kernels mirroring `packed_fp4_q8_dot`, uploader
-   byte-count generalization, cache-state tests. Benchmark: resident
-   route must stay >=27 tok/s; novel-route chat before/after.
+1. **S1a — compiler** ✅ landed (032cccd): FP4-E2M1/UE8M0 block-32
+   encoder for Qwen routed experts in `compiler/expert_pack/`, ABI 3,
+   manifest + schema + validator updates. Router/norms FP32, dense pack
+   int8.
+2. **S1b — quality gate** ✅ done (2026-08-10): FP4 pack compiled
+   (45.36 GB, ABI 3, valid); weight error FP4 ~11.8% vs int8 ~0.85%
+   relative L2 (RTN-expected); behavioral probe 10/10 coherent,
+   on-topic, no degeneration; bench — resident steady 39.6–45.6 tok/s
+   (int8 same-config 7.75), novel 5.3–16.9 (int8 1.9–4.0), suite
+   16.4–25.3 (int8 3.1–5.2). Two runtime bugs fixed to get there:
+   pinned-allocator alignment (cudaHostAlloc is not 4096-aligned) and
+   the FP4 eviction livelock (route-pinned victim + unbounded retire
+   spin; fixed structurally with route_pinned/try_retire). Full
+   numbers: docs/benchmarks.md §S1b.
+3. **S1c — runtime** ✅ landed (032cccd): FP4 dispatch in the uploader /
+   directory, packed `__dp4a` selection-batch kernels for Qwen packs,
+   cache-state tests (364 lines). Gate passed by S1b: resident route
+   39.6–45.6 tok/s (≥27), close to the 47.67 hot-native ceiling.
 4. **S2 — route predictor**: tap gate inputs per layer in
    `qwen3_next_runner.cpp`, predict next-layer routes, prefetch from the
    RAM tier through the existing event-driven uploader. Measure hit rate

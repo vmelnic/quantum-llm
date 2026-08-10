@@ -26,6 +26,7 @@ param(
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
+    [string]$ModelId = "",
     [switch]$Start
 )
 
@@ -89,7 +90,8 @@ foreach ($entry in @(
        Value = if ($Profile -eq "P6") { $Container } else { $Bundle } },
     @{ Name = "Tokenizer"; Value = $Tokenizer },
     @{ Name = "Runner"; Value = $Runner },
-    @{ Name = "Python"; Value = $Python }
+    @{ Name = "Python"; Value = $Python },
+    @{ Name = "ModelId"; Value = $ModelId }
 )) {
     if ($entry.Value) {
         $taskArguments.Add("-$($entry.Name)")

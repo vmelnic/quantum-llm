@@ -35,6 +35,15 @@ class IDeviceResidencyDirectory {
       const ExpertKey& key,
       std::shared_ptr<IDeviceAllocation> allocation) = 0;
   virtual void retire(const ExpertKey& key) noexcept = 0;
+  // Non-blocking single retire attempt. Returns false when the entry is still
+  // referenced by in-flight routes; the caller must treat it as ineligible
+  // for eviction and pick another victim instead of waiting.
+  [[nodiscard]] virtual bool try_retire(const ExpertKey& key) noexcept = 0;
+  // Host-side view of route pins: true while any in-flight route plan holds a
+  // device reference for key. Eviction must skip such entries unconditionally
+  // rather than predicting whether uploads can race the current route.
+  [[nodiscard]] virtual bool route_pinned(const ExpertKey& key) const
+      noexcept = 0;
 };
 
 struct UploadRequest final {

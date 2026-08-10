@@ -985,8 +985,12 @@ class Model final {
                                          : representative->device_bytes;
     require(representative->stored_bytes != 0U && device_record_bytes != 0U,
             "DeepSeek warm start record geometry is empty");
-    const auto warm_ram_limit = ram_bytes_ - mtp_cache_bytes_;
-    const auto warm_vram_limit = vram_bytes_ - mtp_cache_bytes_;
+    // Charge the MTP reserve only when MTP execution is enabled, matching
+    // the main cache budgets; a disabled MTP path must not shrink the
+    // routed-expert warm set.
+    const auto mtp_reserve = mtp_enabled_ ? mtp_cache_bytes_ : 0ULL;
+    const auto warm_ram_limit = ram_bytes_ - mtp_reserve;
+    const auto warm_vram_limit = vram_bytes_ - mtp_reserve;
     if (usage.ram_bytes >= warm_ram_limit ||
         usage.vram_bytes >= warm_vram_limit)
       return;

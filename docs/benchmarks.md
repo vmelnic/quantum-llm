@@ -25,6 +25,86 @@ Reference configuration:
 - RTX 3090 24 GB, approximately 64 GB RAM, local SATA SSD;
 - 48 GiB RAM expert budget and 18 GiB VRAM expert budget.
 
+### Host bandwidth (pinned measurement, 2026-08-10)
+
+Probe: `work/fp4-s1/bandwidth_probe.py` (torch CUDA events for copies;
+unbuffered 8 MiB sequential reads over the full 72.3 GiB int8 pack —
+larger than RAM, so mostly cold). Artifact on the GPU host:
+`work/fp4-s1/bandwidth-report.json`.
+
+| Quantity | Measured |
+|---|---:|
+| H2D pinned (64/256/1024 MiB) | 12.45 / 12.46 / 12.46 GiB/s |
+| D2H pinned | 12.26 GiB/s |
+| H2D pageable | 12.05 GiB/s |
+| PCIe link | Gen3 x16 max (idles at Gen1, ramps under load) |
+| SATA sequential read | 0.47 GiB/s (all 19 shards, 0.46–0.48) |
+
+Implied per-token ceilings (bandwidth ÷ bytes/token): int8 RAM tier
+8.8 tok/s, FP4 RAM tier 17.8 tok/s, FP4 SATA tier 0.7 tok/s. The 30
+tok/s goal at FP4 bytes/token (0.7 GiB) would need 21 GiB/s H2D — past
+this bus — so on this host it is only reachable through VRAM residency
+(hot native 47.67), not through any RAM-tier design.
+
+### S1b: FP4 routed experts — measured results (2026-08-10)
+
+Pack: `work/models/qwen3-next-80b-expert-pack-fp4`, 24,576 experts,
+45.36 GB (vs 72.3 GiB int8), ABI 3, validator `valid:true`. Probes:
+`work/fp4-s1/{fp4_weight_error,fp4_behavioral_probe,fp4_bench_probe}.py`;
+artifacts `work/fp4-s1/{weight-error,behavioral-*,bench-*}.json`.
+Same server configuration for both arms (context 4096, 48 GiB RAM /
+18 GiB VRAM expert budgets).
+
+Weight error (RTN, per-matrix relative L2 vs BF16 source): FP4 ~11.8%
+(mean, max 12.0%), int8 ~0.85%. Expected for round-to-nearest FP4-E2M1
+block-32; behavioral arm below is the quality gate that matters.
+
+Two bugs were found and fixed before the arm could run:
+
+- `cudaHostAlloc` does not guarantee 4096-byte alignment; the staging
+  `FixedBufferPool` then failed every FP4 startup with `std::bad_alloc`.
+  Fixed by over-allocating and rounding up inside the pinned allocator
+  (`cuda_pinned_allocator.cpp`).
+- FP4 livelock: with FP4 every miss goes to the GPU uploader
+  (`gpu_available = true` regardless of admission), so eviction ran
+  while the runner had skipped the ready-expert cache leases (the
+  heuristic at `qwen3_next_runner.cpp:1588` predicted no uploads).
+  Eviction could then pick a victim pinned by the in-flight route and
+  `CudaExpertDirectory::retire()` spun forever waiting for a reference
+  the blocked thread itself owned (`[retire-spin] ... refs=1`, 100% CPU
+  on one core, GPU idle). Fixed structurally: eviction skips
+  route-pinned victims via the host-side pin view
+  (`route_pinned`), and `try_retire()` never spins — a busy entry is
+  skipped, turning any future hole into a skipped victim instead of a
+  hung server. The full FP4 arm completed with zero `[retire-busy]`
+  events.
+
+Throughput, decode tok/s per call (cold first call included):
+
+| Mode | int8 | FP4 | FP4/int8 |
+|---|---|---|---|
+| resident (4 calls) | 2.40 / 6.20 / 7.79 / 7.75 | 7.90 / 39.56 / 45.59 / 45.59 | ~5.9x steady |
+| novel (8 calls) | 1.89 – 3.98 | 5.32 – 16.90 | ~3.4x mean |
+| suite (6 calls) | 3.10 – 5.24 | 16.43 – 25.27 | ~4.9x mean |
+
+Behavioral quality: 10 fixed prompts, int8 vs FP4 — no identical texts
+(expected at 11.8% weight error), but all FP4 answers are coherent,
+on-topic, and comparable in length and structure; no truncation, no
+degeneration, no factual collapse on inspection.
+
+Gate reading: the plan's S1c gate "resident ≥ 27 tok/s" is met by FP4
+within this probe (steady 39.6–45.6, close to the hot-native ceiling
+47.67 — the routed working set of these prompts fits the 18 GiB VRAM
+budget). Note the int8 arm of this probe measured 7.75 resident vs the
+27–29 recorded in W4 under a different server configuration (65,536
+context); the comparison above is valid because both arms here share
+one configuration, but the absolute int8 numbers are not comparable
+across configurations. FP4 novel-route calls reach 5.3–16.9 tok/s —
+consistent with the 12.46 GiB/s H2D ceiling at 0.7 GiB/token
+(theoretical 17.8) — and the whole 45.36 GB FP4 pack fits the 48 GiB
+RAM budget, so the SATA floor is cold-start-only.
+
+
 ### Qualified hot native gates
 
 | Measurement | Result | Meaning |
