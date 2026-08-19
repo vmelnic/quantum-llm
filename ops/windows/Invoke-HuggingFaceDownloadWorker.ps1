@@ -17,6 +17,26 @@ try {
     # High-performance mode increases concurrency without changing the Hub cache
     # layout, resumability, or Xet content verification.
     $env:HF_XET_HIGH_PERFORMANCE = "1"
+    # Publish the immutable model contract before starting large shard
+    # transfers. This keeps architecture work and source validation from
+    # depending on the Hub client's internal file ordering while retaining a
+    # single pinned, resumable Xet workflow.
+    $metadataArguments = @(
+        "download", $ModelId,
+        "config.json", "model.safetensors.index.json",
+        "--revision", $Revision,
+        "--max-workers", "1",
+        "--no-truncate"
+    )
+    $metadataStdout = "$StdoutPath.metadata"
+    $metadataStderr = "$StderrPath.metadata"
+    $metadataProcess = Start-Process -FilePath $HfPath `
+        -ArgumentList $metadataArguments -NoNewWindow -Wait -PassThru `
+        -RedirectStandardOutput $metadataStdout `
+        -RedirectStandardError $metadataStderr
+    if ([int]$metadataProcess.ExitCode -ne 0) {
+        throw "hf metadata download exited with code $($metadataProcess.ExitCode)"
+    }
     $arguments = @(
         "download", $ModelId,
         "--revision", $Revision,

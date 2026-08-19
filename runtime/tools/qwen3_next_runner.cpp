@@ -1,4 +1,3 @@
-#include "expert/core/json.hpp"
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
@@ -6,24 +5,35 @@
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/expert_catalog.hpp"
 #include "expert/runtime/expert_record.hpp"
+#include "expert/runtime/execution_provider.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
+#include "expert/runtime/model_artifact.hpp"
+#include "expert/runtime/model_descriptor.hpp"
+#include "expert/runtime/program_executor.hpp"
 #include "expert/runtime/sha256.hpp"
+#include "expert/runtime/routed_expert_runtime.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
+#include "expert/runtime/worker_contract.hpp"
+#include "expert/runtime/worker_provider.hpp"
 
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <span>
 #include <sstream>
@@ -36,9 +46,15 @@
 #include <vector>
 
 namespace {
-using expert::core::json::Required;
-using expert::core::json::Value;
-
+std::vector<expert::runtime::KernelCapability> provider_capabilities() {
+  return {
+      {"block.full-attention.output-gated.v1", 1U, 1U},
+      {"block.recurrent-linear-attention.gated-delta.v1", 1U, 1U},
+      {"router.linear-topk.shared-swiglu.v1", 1U, 1U},
+      {"moe.swiglu.routed.merge-shared.v1", 1U, 1U},
+      {"embedding.lookup.int8-row.v1", 1U, 1U},
+      {"head.rmsnorm.argmax.int8-row.v1", 1U, 1U}};
+}
 void cuda_check(cudaError_t error, const char* operation) {
   if (error != cudaSuccess)
     throw std::runtime_error(std::string(operation) + ": " +
@@ -53,43 +69,6 @@ T* device_allocate(std::size_t count) {
   cuda_check(cudaMalloc(&raw, count * sizeof(T)), "cudaMalloc");
   return reinterpret_cast<T*>(raw);
 }
-std::string read_text(const std::filesystem::path& path) {
-  std::ifstream input(path, std::ios::binary);
-  if (!input) throw std::runtime_error("cannot open " + path.string());
-  std::ostringstream output;
-  output << input.rdbuf();
-  return output.str();
-}
-double number(const Value& value) {
-  if (const auto* item = std::get_if<std::int64_t>(&value.data))
-    return static_cast<double>(*item);
-  if (const auto* item = std::get_if<std::uint64_t>(&value.data))
-    return static_cast<double>(*item);
-  if (const auto* item = std::get_if<Value::Number>(&value.data))
-    return std::stod(item->token);
-  throw std::runtime_error("JSON value is not numeric");
-}
-std::uint32_t u32(const Value::Object& object, std::string_view key,
-                  std::string_view where) {
-  const auto value = Required(object, key, where).AsU64(where);
-  if (value > 0xffffffffULL) throw std::runtime_error("integer exceeds u32");
-  return static_cast<std::uint32_t>(value);
-}
-expert::runtime::Sha256Digest parse_digest(std::string_view text) {
-  if (text.size() != 64) throw std::runtime_error("invalid SHA-256 length");
-  const auto nibble = [](char value) -> unsigned {
-    if (value >= '0' && value <= '9') return static_cast<unsigned>(value - '0');
-    if (value >= 'a' && value <= 'f') return static_cast<unsigned>(value - 'a' + 10);
-    if (value >= 'A' && value <= 'F') return static_cast<unsigned>(value - 'A' + 10);
-    throw std::runtime_error("invalid SHA-256 hex");
-  };
-  expert::runtime::Sha256Digest result{};
-  for (std::size_t i = 0; i < result.size(); ++i)
-    result[i] = static_cast<std::byte>((nibble(text[2 * i]) << 4U) |
-                                       nibble(text[2 * i + 1]));
-  return result;
-}
-
 struct DevicePack final {
   std::byte* base{};
   std::uint64_t bytes{};
@@ -288,9 +267,9 @@ class MoeTraceWriter final {
       host_positions_;
 };
 
-DevicePack upload_dense_pack(const std::filesystem::path& path,
-                             std::uint64_t expected_bytes,
-                             std::string_view expected_sha) {
+DevicePack upload_dense_pack(
+    const std::filesystem::path& path, std::uint64_t expected_bytes,
+    const expert::runtime::Sha256Digest& expected_sha) {
   if (std::filesystem::file_size(path) != expected_bytes)
     throw std::runtime_error("dense pack size mismatch");
   DevicePack result{device_allocate<std::byte>(
@@ -314,8 +293,7 @@ DevicePack upload_dense_pack(const std::filesystem::path& path,
                "upload dense pack");
     offset += count;
   }
-  if (!expert::runtime::constant_time_equal(hasher.finalize(),
-                                             parse_digest(expected_sha)))
+  if (!expert::runtime::constant_time_equal(hasher.finalize(), expected_sha))
     throw std::runtime_error("dense pack SHA-256 mismatch");
   return result;
 }
@@ -325,6 +303,16 @@ struct Tensor final {
   const float* f32{};
   std::vector<std::uint32_t> shape;
   bool quantized{};
+};
+
+constexpr std::uint32_t kNoOperation =
+    std::numeric_limits<std::uint32_t>::max();
+struct LayerOperations final {
+  std::uint32_t block_operation{kNoOperation};
+  std::uint32_t router_operation{kNoOperation};
+  std::uint32_t routed_operation{kNoOperation};
+  std::uint32_t full_attention_slot{kNoOperation};
+  bool full_attention{};
 };
 
 struct PhaseTelemetry final {
@@ -559,7 +547,8 @@ void print_cpu_executor_json(
 // executor overflow.
 constexpr std::uint64_t kFrozenPromotionMinVictimAge = 1ULL << 19U;
 
-class Qwen3NextModel final {
+class Qwen3NextModel final : public expert::runtime::IOperationProvider,
+                             public expert::runtime::IModelTensorStore {
  public:
   Qwen3NextModel(const std::filesystem::path& root, std::uint32_t max_context,
                  std::uint64_t ram_cache_bytes,
@@ -594,78 +583,87 @@ class Qwen3NextModel final {
       throw std::runtime_error(
           "placement profile must be latency, balanced, or capacity");
     }
-    const auto document = expert::core::json::Parse(read_text(root / "manifest.json"));
-    const auto& manifest = document.AsObject("manifest");
-    const auto& architecture =
-        Required(manifest, "architecture", "manifest").AsObject("architecture");
-    if (Required(architecture, "family", "architecture").AsString("family") !=
-        "qwen3_next")
-      throw std::runtime_error("runner requires qwen3_next Expert Pack");
-    const auto& quantization =
-        Required(manifest, "quantization", "manifest").AsObject("quantization");
-    quant_abi_ = u32(quantization, "abi_id", "quantization");
-    if (quant_abi_ != expert::runtime::kExpertQuantAbiInt8PerRow &&
-        quant_abi_ != expert::runtime::kExpertQuantAbiFp4Block32)
-      throw std::runtime_error("unsupported Qwen expert quant ABI");
-    std::fprintf(stderr, "[load] manifest ok, quant_abi=%u\n", quant_abi_);
-    hidden_ = u32(architecture, "hidden_size", "architecture");
-    expert_width_ = u32(architecture, "intermediate_size", "architecture");
-    vocab_ = u32(architecture, "vocab_size", "architecture");
-    const auto architecture_max_context =
-        u32(architecture, "max_position_embeddings", "architecture");
-    if (max_context_ > architecture_max_context)
-      throw std::runtime_error("configured context exceeds model architecture");
-    layers_ = u32(architecture, "num_hidden_layers", "architecture");
-    query_heads_ = u32(architecture, "num_attention_heads", "architecture");
-    kv_heads_ = u32(architecture, "num_key_value_heads", "architecture");
-    head_dim_ = u32(architecture, "head_dim", "architecture");
-    experts_ = u32(architecture, "num_experts", "architecture");
-    top_k_ = u32(architecture, "num_experts_per_token", "architecture");
-    full_interval_ = u32(architecture, "full_attention_interval", "architecture");
-    conv_kernel_ = u32(architecture, "linear_conv_kernel_dim", "architecture");
-    key_head_dim_ = u32(architecture, "linear_key_head_dim", "architecture");
-    value_head_dim_ = u32(architecture, "linear_value_head_dim", "architecture");
-    key_heads_ = u32(architecture, "linear_num_key_heads", "architecture");
-    value_heads_ = u32(architecture, "linear_num_value_heads", "architecture");
-    shared_width_ = u32(architecture, "shared_expert_intermediate_size", "architecture");
-    epsilon_ = static_cast<float>(number(
-        Required(architecture, "rms_norm_epsilon", "architecture")));
-    rotary_dim_ = static_cast<std::uint32_t>(
-        head_dim_ * number(Required(architecture, "partial_rotary_factor",
-                                    "architecture")));
-    const auto& rope = Required(architecture, "rope", "architecture").AsObject("rope");
-    rope_theta_ = static_cast<float>(number(Required(rope, "theta", "rope")));
-    if (hidden_ != 2048 || expert_width_ != 512 || query_heads_ != 16 ||
-        kv_heads_ != 2 || head_dim_ != 256 || top_k_ != 10 ||
-        key_heads_ != 16 || value_heads_ != 32 || key_head_dim_ != 128 ||
-        value_head_dim_ != 128 || conv_kernel_ != 4 || rotary_dim_ != 64)
-      throw std::runtime_error("unsupported Qwen3-Next geometry");
-    if (!full_interval_ || layers_ % full_interval_)
-      throw std::runtime_error("invalid full-attention interval");
-    full_attention_layers_ = layers_ / full_interval_;
-
-    const auto& packs = Required(manifest, "packs", "manifest").AsArray("packs");
-    for (const auto& value : packs) {
-      const auto& entry = value.AsObject("pack");
-      const auto name = Required(entry, "name", "pack").AsString("pack.name");
-      const auto bytes = Required(entry, "bytes", "pack").AsU64("pack.bytes");
-      const auto path = root / name;
-      if (!std::filesystem::is_regular_file(path) ||
-          std::filesystem::file_size(path) != bytes)
-        throw std::runtime_error("missing or truncated pack: " + name);
-      total_pack_bytes_ += bytes;
-      if (name == "dense.qpack") {
-        dense_pack_ = upload_dense_pack(
-            path, bytes, Required(entry, "sha256", "pack").AsString("pack.sha256"));
-        dense_read_bytes_ = bytes;
+    status_check(expert::runtime::ModelArtifact::load_expert_pack_v1(
+        root, artifact_));
+    model_descriptor_ = artifact_.model();
+    if (model_descriptor_.routed_components.size() != 1U)
+      throw std::runtime_error(
+          "hybrid-delta provider requires one routed component");
+    const auto& component = model_descriptor_.routed_components.front();
+    if (component.source_abi !=
+            expert::runtime::kExpertSourceAbiExpertPackV1 ||
+        component.encoding_abi !=
+            expert::runtime::kExpertEncodingAbiFp4Block32)
+      throw std::runtime_error(
+          "hybrid-delta provider requires an FP4 Expert Pack component");
+    model_hash_ = model_descriptor_.content_hash;
+    model_id_ = component.namespace_id;
+    encoding_abi_ = component.encoding_abi;
+    hidden_ = model_descriptor_.hidden_size;
+    expert_width_ = component.intermediate_size;
+    vocab_ = model_descriptor_.vocab_size;
+    layers_ = component.layer_count;
+    experts_ = component.experts_per_layer;
+    top_k_ = component.route_width;
+    shared_experts_ = component.shared_experts_per_layer;
+    query_heads_ = descriptor_u32("attention_heads");
+    kv_heads_ = descriptor_u32("kv_heads");
+    head_dim_ = descriptor_u32("head_dim");
+    conv_kernel_ = descriptor_u32("linear_conv_kernel");
+    key_head_dim_ = descriptor_u32("linear_key_head_dim");
+    value_head_dim_ = descriptor_u32("linear_value_head_dim");
+    key_heads_ = descriptor_u32("linear_key_heads");
+    value_heads_ = descriptor_u32("linear_value_heads");
+    shared_width_ = descriptor_u32("shared_intermediate_size");
+    epsilon_ = descriptor_f32("norm_epsilon_f32_bits");
+    rope_theta_ = descriptor_f32("rope_theta_f32_bits");
+    rotary_dim_ = descriptor_u32("rotary_dimension");
+    if (max_context_ > model_descriptor_.max_context_tokens)
+      throw std::runtime_error("configured context exceeds model descriptor");
+    if (!query_heads_ || !kv_heads_ || query_heads_ % kv_heads_ ||
+        !head_dim_ || head_dim_ > 256U || !rotary_dim_ ||
+        rotary_dim_ > head_dim_ || rotary_dim_ % 2U || top_k_ > 64U ||
+        !key_heads_ || !value_heads_ || value_heads_ % key_heads_ ||
+        !key_head_dim_ || key_head_dim_ > 256U || !value_head_dim_ ||
+        value_head_dim_ > 256U || !conv_kernel_ || conv_kernel_ > 16U ||
+        shared_width_ == 0U)
+      throw std::runtime_error(
+          "model geometry exceeds the registered SM86 operation capabilities");
+    if (component.hidden_size != hidden_ || shared_experts_ != 1U ||
+        model_descriptor_.layer_program.size() != layers_)
+      throw std::runtime_error(
+          "hybrid-delta operation geometry is inconsistent");
+    expert::runtime::ExecutionProviderRegistry provider_registry;
+    auto registered = provider_registry.add(
+        {"sm86-hybrid-delta-moe", 100U, provider_capabilities()});
+    if (!registered.ok())
+      throw std::runtime_error(std::string(registered.message()));
+    auto bound = provider_registry.bind(model_descriptor_);
+    if (!bound.status.ok())
+      throw std::runtime_error(std::string(bound.status.message()));
+    compiled_program_ = std::move(bound.provider.program);
+    for (const auto& pack : artifact_.packs()) {
+      total_pack_bytes_ += pack.bytes;
+      if (pack.kind == "dense") {
+        dense_packs_.emplace(
+            pack.name, upload_dense_pack(pack.path, pack.bytes, pack.sha256));
+        dense_read_bytes_ += pack.bytes;
       }
     }
-    if (!dense_pack_.base) throw std::runtime_error("manifest has no dense pack");
+    if (dense_packs_.empty())
+      throw std::runtime_error("artifact has no dense tensor pack");
     std::fprintf(stderr, "[load] dense pack uploaded\n");
-    for (const auto& value : Required(manifest, "tensors", "manifest").AsArray("tensors"))
-      add_tensor(value.AsObject("tensor"));
-    build_expert_index(
-        Required(manifest, "experts", "manifest").AsArray("experts"));
+    for (const auto& tensor : artifact_.dense_tensors()) add_tensor(tensor);
+    provider_slots_.assign(capacity_, false);
+    const auto* artifact_component = artifact_.find_component(component.name);
+    if (artifact_component == nullptr)
+      throw std::runtime_error("artifact has no routed component catalog");
+    catalog_ = &artifact_component->catalog;
+    for (std::uint32_t layer = 0; layer < layers_; ++layer)
+      for (std::uint32_t expert = 0; expert < experts_; ++expert)
+        max_expert_record_bytes_ = std::max(
+            max_expert_record_bytes_,
+            catalog_->find(layer, expert)->stored_bytes);
     std::fprintf(stderr, "[load] tensors + expert index ok (max record %llu)\n",
                  static_cast<unsigned long long>(max_expert_record_bytes_));
     route_access_counts_.resize(experts_);
@@ -681,7 +679,8 @@ class Qwen3NextModel final {
     uploader_ = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
     directory_ =
         std::make_shared<expert::runtime::cuda::CudaExpertDirectory>(
-            model_id_, quant_abi_, layers_, experts_, workspace_rows_ * top_k_);
+            model_id_, encoding_abi_, layers_, experts_,
+            workspace_rows_ * top_k_);
     {
       auto plan_workspace = directory_->create_plan_workspace();
       if (!plan_workspace.status.ok() || !plan_workspace.workspace)
@@ -716,6 +715,9 @@ class Qwen3NextModel final {
                                              shared_burst(vram_cache_bytes,
                                                           1ULL << 30U)}},
         storage_, uploader_, buffers_, directory_);
+    routed_ = std::make_unique<expert::runtime::RoutedExpertRuntime>(
+        model_descriptor_.routed_components.front(),
+        model_hash_, *catalog_, *cache_);
     const auto logical_threads = std::max(1U, std::thread::hardware_concurrency());
     cpu_executor_ =
         std::make_unique<expert::runtime::cpu::ExpertExecutor>(
@@ -724,6 +726,7 @@ class Qwen3NextModel final {
         *cache_, placement_config);
     dispatch_ = std::make_unique<expert::runtime::HybridDispatchPlanner>();
     std::fprintf(stderr, "[load] cache + planners ok\n");
+    initialize_program_contract();
     allocate_workspace();
     std::fprintf(stderr, "[load] workspace ok\n");
     cuda_check(cudaEventCreate(&layer_start_event_), "create layer-start event");
@@ -740,6 +743,313 @@ class Qwen3NextModel final {
       cuda_check(cudaEventCreate(&expert_done_events_[layer]),
                  "create expert-done event");
     }
+  }
+
+  struct PreparedOperation final : expert::runtime::IPreparedOperation {
+    std::uint32_t kernel{};
+    std::map<std::string, std::size_t, std::less<>> input_indices;
+    std::vector<std::pair<std::string, std::string>> outputs;
+  };
+
+  class ProviderRequestState final
+      : public expert::runtime::IOperationProviderRequestState {
+   public:
+    ProviderRequestState(Qwen3NextModel& model, std::uint32_t slot) noexcept
+        : model_(model), slot_(slot) {}
+    ~ProviderRequestState() override {
+      model_.release_callable_provider_slot(slot_);
+    }
+    [[nodiscard]] std::uint32_t slot() const noexcept { return slot_; }
+    std::uint32_t current_position{};
+
+   private:
+    Qwen3NextModel& model_;
+    std::uint32_t slot_{};
+  };
+
+  expert::runtime::PrepareOperationResult prepare(
+      const expert::runtime::OperationPreparationContext& context) override {
+    try {
+      if (context.model.content_hash != model_descriptor_.content_hash)
+        return {{expert::runtime::ErrorCode::invalid_argument,
+                 "provider received a different model artifact"},
+                {}};
+      const auto capabilities = provider_capabilities();
+      const auto found = std::find_if(
+          capabilities.begin(), capabilities.end(), [&](const auto& item) {
+            return item.capability == context.operation.capability &&
+                   context.operation.abi_version >= item.minimum_abi &&
+                   context.operation.abi_version <= item.maximum_abi;
+          });
+      if (found == capabilities.end())
+        return {{expert::runtime::ErrorCode::invalid_argument,
+                 "provider cannot prepare the operation capability"},
+                {}};
+      for (const auto& binding : context.tensors) {
+        if (!binding.tensor || !tensors_.contains(binding.tensor->name))
+          return {{expert::runtime::ErrorCode::invalid_argument,
+                   "provider received an unavailable immutable tensor"},
+                  {}};
+      }
+      auto prepared = std::make_shared<PreparedOperation>();
+      prepared->kernel = static_cast<std::uint32_t>(found - capabilities.begin());
+      for (std::size_t index = 0U;
+           index < context.compiled.input_values.size(); ++index)
+        prepared->input_indices.emplace(
+            context.compiled.input_values[index].port, index);
+      for (const auto& binding : context.compiled.output_values) {
+        const auto source = context.operation.output_bindings.find(binding.port);
+        if (source == context.operation.output_bindings.end())
+          return {{expert::runtime::ErrorCode::invalid_argument,
+                   "compiled provider output port is absent"},
+                  {}};
+        prepared->outputs.emplace_back(binding.port, source->second.abi);
+      }
+      return {expert::runtime::Status::success(), std::move(prepared)};
+    } catch (const std::exception& error) {
+      return {{expert::runtime::ErrorCode::internal, error.what()}, {}};
+    }
+  }
+
+  expert::runtime::CreateOperationRequestStateResult create_request_state(
+      const expert::runtime::ProgramRequestContext& request) override {
+    const auto context = request.parameters.find("reserved_context_tokens");
+    if (context == request.parameters.end() || context->second == 0U ||
+        context->second > max_context_ ||
+        context->second > std::numeric_limits<std::uint32_t>::max())
+      return {{expert::runtime::ErrorCode::invalid_argument,
+               "hybrid-delta provider requires a valid context reservation"},
+              {}};
+    const auto slot = acquire_callable_provider_slot();
+    if (!slot)
+      return {{expert::runtime::ErrorCode::backpressure,
+               "hybrid-delta provider has no free request slot"},
+              {}};
+    try {
+      reserve_slot(*slot, static_cast<std::uint32_t>(context->second));
+      return {expert::runtime::Status::success(),
+              std::make_shared<ProviderRequestState>(*this, *slot)};
+    } catch (const std::exception& error) {
+      release_callable_provider_slot(*slot);
+      return {{expert::runtime::ErrorCode::internal, error.what()}, {}};
+    }
+  }
+
+  expert::runtime::OperationExecutionHandle execute(
+      const expert::runtime::IPreparedOperation& opaque_operation,
+      const std::shared_ptr<expert::runtime::IOperationProviderRequestState>&
+          opaque_state,
+      const expert::runtime::OperationInvocation& invocation) override {
+    try {
+      const auto* prepared =
+          dynamic_cast<const PreparedOperation*>(&opaque_operation);
+      const auto state =
+          std::dynamic_pointer_cast<ProviderRequestState>(opaque_state);
+      if (prepared == nullptr || !state)
+        return completed_operation({
+            {expert::runtime::ErrorCode::invalid_argument,
+             "hybrid-delta invocation state is invalid"},
+            {}});
+      const auto input = [&](std::string_view port)
+          -> const expert::runtime::ExecutionValue& {
+        const auto found = prepared->input_indices.find(port);
+        if (found == prepared->input_indices.end() ||
+            found->second >= invocation.inputs.size())
+          throw std::runtime_error(
+              "hybrid-delta operation input is absent");
+        return invocation.inputs[found->second];
+      };
+      constexpr std::string_view hidden_abi = "batch.hidden.f32.cuda.v1";
+      constexpr std::string_view token_abi = "batch.token-id.u32.host.v1";
+      constexpr std::string_view position_abi = "batch.position.u32.host.v1";
+      constexpr std::string_view route_index_abi =
+          "batch.route-index.u32.cuda.v1";
+      constexpr std::string_view route_weight_abi =
+          "batch.route-weight.f32.cuda.v1";
+      const auto require_device_value = [&](const auto& value,
+                                            const void* pointer,
+                                            std::uint64_t bytes,
+                                            std::string_view abi) {
+        if (value.abi != abi || value.memory_domain != "cuda.device" ||
+            value.data != reinterpret_cast<const std::byte*>(pointer) ||
+            value.bytes != bytes)
+          throw std::runtime_error(
+              "hybrid-delta intermediate value ABI mismatch");
+      };
+      const auto require_hidden = [&](const auto& value, const float* pointer) {
+        require_device_value(value, pointer,
+                             static_cast<std::uint64_t>(hidden_) *
+                                 sizeof(float),
+                             hidden_abi);
+      };
+
+      std::map<std::string, expert::runtime::ExecutionValue, std::less<>>
+          outputs;
+      switch (prepared->kernel) {
+        case kEmbedding: {
+          const auto& tokens = input("token_ids");
+          if (tokens.abi != token_abi || tokens.memory_domain != "host" ||
+              tokens.bytes != sizeof(std::uint32_t))
+            throw std::runtime_error("embedding token ABI mismatch");
+          std::uint32_t token{};
+          std::memcpy(&token, tokens.data, sizeof(token));
+          if (token >= vocab_)
+            throw std::runtime_error("token exceeds vocabulary");
+          frozen_stale_budget_valid_ = false;
+          status_check(expert::runtime::cuda::embedding(
+              matrix(operation_binding(invocation.operation, "weight")),
+              token, hidden_state_, nullptr));
+          outputs.emplace("hidden", device_value(hidden_state_, hidden_));
+          break;
+        }
+        case kFullAttention:
+        case kDeltaAttention: {
+          require_hidden(input("hidden"), hidden_state_);
+          const auto& positions = input("positions");
+          if (positions.abi != position_abi ||
+              positions.memory_domain != "host" ||
+              positions.bytes != sizeof(std::uint32_t))
+            throw std::runtime_error("attention position ABI mismatch");
+          std::memcpy(&state->current_position, positions.data,
+                      sizeof(state->current_position));
+          if (state->current_position >= max_context_)
+            throw std::runtime_error("attention position exceeds context");
+          ensure_kv_page(state->slot(), state->current_position);
+          cuda_check(cudaEventRecord(layer_start_event_),
+                     "record callable layer start");
+          status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+              hidden_state_,
+              fp32(operation_binding(invocation.operation, "input_norm")),
+              normalized_, hidden_, epsilon_, nullptr));
+          const std::array positions_batch{state->current_position};
+          const std::array slots{state->slot()};
+          if (prepared->kernel == kFullAttention) {
+            const auto logical_layer = invocation.operation.logical_layer;
+            if (logical_layer >= layer_operations_.size() ||
+                !layer_operations_[logical_layer].full_attention)
+              throw std::runtime_error(
+                  "full-attention operation has no artifact layer mapping");
+            run_full_attention(
+                invocation.operation,
+                layer_operations_[logical_layer].full_attention_slot,
+                positions_batch, slots, 1U);
+          } else {
+            run_delta(invocation.operation,
+                      invocation.operation.logical_layer, slots, 1U);
+          }
+          status_check(expert::runtime::cuda::add_in_place(
+              hidden_state_, residual_, hidden_, nullptr));
+          cuda_check(cudaEventRecord(attention_done_event_),
+                     "record callable attention done");
+          outputs.emplace("hidden", device_value(hidden_state_, hidden_));
+          break;
+        }
+        case kRouter:
+          require_hidden(input("hidden"), hidden_state_);
+          status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+              hidden_state_,
+              fp32(operation_binding(invocation.operation, "input_norm")),
+              normalized_, hidden_, epsilon_, nullptr));
+          run_router(invocation.operation, 1U);
+          outputs.emplace("expert_input", device_value(normalized_, hidden_));
+          outputs.emplace("route_indices",
+                          device_value(routing_indices_, top_k_,
+                                       route_index_abi));
+          outputs.emplace("route_weights",
+                          device_value(routing_scores_, top_k_,
+                                       route_weight_abi));
+          outputs.emplace("residual", device_value(hidden_state_, hidden_));
+          outputs.emplace("shared_output",
+                          device_value(shared_output_, hidden_));
+          break;
+        case kRoutedMoe: {
+          require_hidden(input("expert_input"), normalized_);
+          require_device_value(
+              input("route_indices"), routing_indices_,
+              static_cast<std::uint64_t>(top_k_) * sizeof(std::uint32_t),
+              route_index_abi);
+          require_device_value(input("route_weights"), routing_scores_,
+                               static_cast<std::uint64_t>(top_k_) *
+                                   sizeof(float),
+                               route_weight_abi);
+          require_hidden(input("residual"), hidden_state_);
+          require_hidden(input("shared_output"), shared_output_);
+          const std::array positions{state->current_position};
+          const std::array slots{state->slot()};
+          run_routed_moe(invocation.operation, positions, slots, 1U);
+          outputs.emplace("hidden", device_value(hidden_state_, hidden_));
+          break;
+        }
+        case kHead: {
+          require_hidden(input("hidden"), hidden_state_);
+          status_check(expert::runtime::cuda::qwen3_next_rms_norm(
+              hidden_state_,
+              fp32(operation_binding(invocation.operation, "norm")),
+              normalized_, hidden_, epsilon_, nullptr));
+          status_check(expert::runtime::cuda::gemv_batch(
+              matrix(operation_binding(invocation.operation, "weight")),
+              normalized_, logits_, 1U, nullptr));
+          status_check(expert::runtime::cuda::argmax_batch(
+              logits_, vocab_, 1U, output_token_, nullptr));
+          auto host = std::make_shared<std::uint32_t>();
+          cuda_check(cudaMemcpy(host.get(), output_token_, sizeof(*host),
+                                cudaMemcpyDeviceToHost),
+                     "copy callable output token");
+          outputs.emplace(
+              "token_ids",
+              expert::runtime::ExecutionValue{
+                  std::string(token_abi), "host", host,
+                  reinterpret_cast<const std::byte*>(host.get()),
+                  sizeof(*host)});
+          break;
+        }
+        default:
+          throw std::runtime_error(
+              "hybrid-delta callable provider kernel is unsupported");
+      }
+
+      expert::runtime::OperationExecutionResult result;
+      result.status = expert::runtime::Status::success();
+      result.outputs.reserve(prepared->outputs.size());
+      for (const auto& [port, abi] : prepared->outputs) {
+        auto found = outputs.find(port);
+        if (found == outputs.end() || found->second.abi != abi)
+          throw std::runtime_error("callable provider output ABI mismatch");
+        result.outputs.push_back(std::move(found->second));
+      }
+      return completed_operation(std::move(result));
+    } catch (const std::exception& error) {
+      return completed_operation(
+          {{expert::runtime::ErrorCode::internal, error.what()}, {}});
+    }
+  }
+
+  expert::runtime::ResolveModelTensorResult resolve(
+      std::string_view name) override {
+    const auto entry = tensor_entries_.find(std::string(name));
+    if (entry == tensor_entries_.end())
+      return {{expert::runtime::ErrorCode::invalid_argument,
+               "hybrid-delta tensor is absent"},
+              {}};
+    const auto pack = dense_packs_.find(entry->second.pack);
+    if (pack == dense_packs_.end())
+      return {{expert::runtime::ErrorCode::internal,
+               "hybrid-delta dense pack is absent"},
+              {}};
+    auto tensor = std::make_shared<expert::runtime::ImmutableModelTensor>();
+    tensor->name = entry->second.name;
+    tensor->encoding = entry->second.encoding;
+    tensor->quant_abi = entry->second.quant_abi;
+    tensor->shape = entry->second.shape;
+    tensor->data_offset = entry->second.data_offset;
+    tensor->data_bytes = entry->second.data_bytes;
+    tensor->scale_offset = entry->second.scale_offset;
+    tensor->scale_bytes = entry->second.scale_bytes;
+    tensor->value = {
+        "artifact.dense-record.v1", "cuda.device", dense_lifetime_,
+        pack->second.base + entry->second.record_offset,
+        entry->second.stored_bytes};
+    return {expert::runtime::Status::success(), std::move(tensor)};
   }
 
   std::uint32_t forward(std::uint32_t token, std::uint32_t position) {
@@ -808,40 +1118,48 @@ class Qwen3NextModel final {
       seen_slots[state_slots[row]] = true;
       ensure_kv_page(state_slots[row], positions[row]);
       status_check(expert::runtime::cuda::embedding(
-          matrix("model.embed_tokens.weight"), tokens[row],
+          matrix(model_binding("token_embedding")), tokens[row],
           hidden_state_ + static_cast<std::size_t>(row) * hidden_, nullptr));
     }
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
+      const auto& layer_program = layer_operations_.at(layer);
+      const auto& block =
+          compiled_program_.operations.at(layer_program.block_operation);
+      const auto& router =
+          compiled_program_.operations.at(layer_program.router_operation);
+      const auto& routed =
+          compiled_program_.operations.at(layer_program.routed_operation);
       cuda_check(cudaEventRecord(layer_start_event_), "record layer start");
-      const auto prefix = "model.layers." + std::to_string(layer) + ".";
       for (std::uint32_t row = 0; row < rows; ++row)
         status_check(expert::runtime::cuda::qwen3_next_rms_norm(
             hidden_state_ + static_cast<std::size_t>(row) * hidden_,
-            fp32(prefix + "input_layernorm.weight"),
+            fp32(operation_binding(block, "input_norm")),
             normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
             epsilon_, nullptr));
-      if ((layer + 1U) % full_interval_ == 0) {
-        run_full_attention(prefix, layer, positions, state_slots, rows);
+      if (layer_program.full_attention) {
+        run_full_attention(block, layer_program.full_attention_slot, positions,
+                           state_slots, rows);
       } else {
-        run_delta(prefix, layer, state_slots, rows);
+        run_delta(block, layer, state_slots, rows);
       }
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, residual_, rows * hidden_, nullptr));
       for (std::uint32_t row = 0; row < rows; ++row)
         status_check(expert::runtime::cuda::qwen3_next_rms_norm(
             hidden_state_ + static_cast<std::size_t>(row) * hidden_,
-            fp32(prefix + "post_attention_layernorm.weight"),
+            fp32(operation_binding(router, "input_norm")),
             normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
             epsilon_, nullptr));
       cuda_check(cudaEventRecord(attention_done_event_),
                  "record attention done");
-      run_moe(prefix, layer, positions, state_slots, rows);
+      run_router(router, rows);
+      run_routed_moe(routed, positions, state_slots, rows);
     }
     const auto final_head_started = std::chrono::steady_clock::now();
     for (const auto row : head_rows)
       status_check(expert::runtime::cuda::qwen3_next_rms_norm(
           hidden_state_ + static_cast<std::size_t>(row) * hidden_,
-          fp32("model.norm.weight"),
+          fp32(model_binding("final_norm")),
           normalized_ + static_cast<std::size_t>(row) * hidden_, hidden_,
           epsilon_, nullptr));
     const auto head_count = static_cast<std::uint32_t>(head_rows.size());
@@ -849,15 +1167,17 @@ class Qwen3NextModel final {
     if (head_count == rows) {
       if (rows == 1) {
         status_check(expert::runtime::cuda::gemv_batch(
-            matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+            matrix(model_binding("output_head")), normalized_, logits_, rows,
+            nullptr));
       } else {
         status_check(expert::runtime::cuda::gemv_batch_weight_reuse(
-            matrix("lm_head.weight"), normalized_, logits_, rows, nullptr));
+            matrix(model_binding("output_head")), normalized_, logits_, rows,
+            nullptr));
       }
     } else {
       for (std::uint32_t head = 0; head < head_count; ++head)
         status_check(expert::runtime::cuda::gemv_batch(
-            matrix("lm_head.weight"),
+            matrix(model_binding("output_head")),
             normalized_ +
                 static_cast<std::size_t>(head_rows[head]) * hidden_,
             logits_ + static_cast<std::size_t>(head) * vocab_, 1, nullptr));
@@ -952,6 +1272,9 @@ class Qwen3NextModel final {
   std::uint64_t total_pack_bytes() const noexcept { return total_pack_bytes_; }
   std::uint64_t dense_read_bytes() const noexcept { return dense_read_bytes_; }
   std::uint32_t capacity() const noexcept { return capacity_; }
+  const expert::runtime::ModelDescriptor& descriptor() const noexcept {
+    return model_descriptor_;
+  }
   std::uint32_t prefill_chunk_tokens() const noexcept {
     return prefill_chunk_tokens_;
   }
@@ -1044,7 +1367,7 @@ class Qwen3NextModel final {
     const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
                                     key_head_dim_ * value_head_dim_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      if ((layer + 1U) % full_interval_ != 0) {
+      if (!layer_operations_.at(layer).full_attention) {
         cuda_check(cudaMemset(conv_state_[layer] + slot * conv_elements, 0,
                               conv_elements * sizeof(float)),
                    "reset delta conv slot");
@@ -1080,7 +1403,7 @@ class Qwen3NextModel final {
     const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
                                     key_head_dim_ * value_head_dim_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      if ((layer + 1U) % full_interval_ != 0) {
+      if (!layer_operations_.at(layer).full_attention) {
         cuda_check(cudaMemset(conv_state_[layer], 0,
                               capacity_ * conv_elements * sizeof(float)),
                    "reset delta conv state");
@@ -1092,6 +1415,223 @@ class Qwen3NextModel final {
   }
 
  private:
+  static constexpr std::uint32_t kFullAttention = 0U;
+  static constexpr std::uint32_t kDeltaAttention = 1U;
+  static constexpr std::uint32_t kRouter = 2U;
+  static constexpr std::uint32_t kRoutedMoe = 3U;
+  static constexpr std::uint32_t kEmbedding = 4U;
+  static constexpr std::uint32_t kHead = 5U;
+
+  template <typename T>
+  expert::runtime::ExecutionValue device_value(
+      const T* pointer, std::uint64_t elements,
+      std::string_view abi = "batch.hidden.f32.cuda.v1") const {
+    return {std::string(abi), "cuda.device", workspace_lifetime_,
+            reinterpret_cast<const std::byte*>(pointer),
+            elements * sizeof(T)};
+  }
+
+  static expert::runtime::OperationExecutionHandle completed_operation(
+      expert::runtime::OperationExecutionResult result) {
+    struct State final {
+      expert::runtime::OperationExecutionResult result;
+      bool terminal{};
+    };
+    auto state = std::make_shared<State>();
+    state->result = std::move(result);
+    return expert::runtime::OperationExecutionHandle::from_callbacks(
+        [state]() -> std::optional<expert::runtime::OperationExecutionResult> {
+          if (state->terminal) return std::nullopt;
+          state->terminal = true;
+          return std::move(state->result);
+        },
+        [state] { state->terminal = true; });
+  }
+
+  std::optional<std::uint32_t> acquire_callable_provider_slot() {
+    std::lock_guard lock(provider_slot_mutex_);
+    const auto found = std::find(provider_slots_.begin(),
+                                 provider_slots_.end(), false);
+    if (found == provider_slots_.end()) return std::nullopt;
+    *found = true;
+    return static_cast<std::uint32_t>(found - provider_slots_.begin());
+  }
+
+  void release_callable_provider_slot(std::uint32_t slot) noexcept {
+    try {
+      release_slot(slot);
+    } catch (...) {
+    }
+    std::lock_guard lock(provider_slot_mutex_);
+    if (slot < provider_slots_.size()) provider_slots_[slot] = false;
+  }
+
+  std::uint32_t descriptor_u32(std::string_view key) const {
+    const auto found = model_descriptor_.attributes.find(key);
+    if (found == model_descriptor_.attributes.end() ||
+        found->second > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error("missing or invalid model parameter " +
+                               std::string(key));
+    return static_cast<std::uint32_t>(found->second);
+  }
+  float descriptor_f32(std::string_view key) const {
+    return std::bit_cast<float>(descriptor_u32(key));
+  }
+  const std::string& model_binding(std::string_view role) const {
+    const auto found = model_descriptor_.tensor_bindings.find(role);
+    if (found == model_descriptor_.tensor_bindings.end())
+      throw std::runtime_error("missing model tensor role " +
+                               std::string(role));
+    return found->second;
+  }
+  static const std::string& operation_binding(
+      const expert::runtime::CompiledOperationProgram& operation,
+      std::string_view role) {
+    const auto found = operation.tensor_bindings.find(role);
+    if (found == operation.tensor_bindings.end())
+      throw std::runtime_error("missing operation tensor role " +
+                               std::string(role));
+    return found->second;
+  }
+  const std::string& operation_capability(
+      const expert::runtime::CompiledOperationProgram& operation) const {
+    const auto& binding = compiled_program_.kernels.at(operation.kernel_binding);
+    return model_descriptor_.required_kernels.at(binding.requirement_index)
+        .capability;
+  }
+  const Tensor& tensor(std::string_view name) const {
+    const auto found = tensors_.find(std::string(name));
+    if (found == tensors_.end())
+      throw std::runtime_error("tensor binding is absent from pack: " +
+                               std::string(name));
+    return found->second;
+  }
+  void expect_tensor(std::string_view name,
+                     std::initializer_list<std::uint32_t> shape,
+                     bool quantized) const {
+    const auto& item = tensor(name);
+    if (item.quantized != quantized ||
+        item.shape != std::vector<std::uint32_t>(shape))
+      throw std::runtime_error(
+          "tensor binding has incompatible dtype/shape: " +
+          std::string(name));
+  }
+  void initialize_program_contract() {
+    expect_tensor(model_binding("token_embedding"), {vocab_, hidden_}, true);
+    expect_tensor(model_binding("final_norm"), {hidden_}, false);
+    expect_tensor(model_binding("output_head"), {vocab_, hidden_}, true);
+    layer_operations_.assign(layers_, {});
+    bool embedding_operation = false;
+    bool head_operation = false;
+    for (std::size_t index = 0; index < compiled_program_.operations.size();
+         ++index) {
+      const auto& operation = compiled_program_.operations[index];
+      const auto& capability = operation_capability(operation);
+      if (operation.logical_layer ==
+          expert::runtime::kModelLevelOperationLayer) {
+        if (capability == "embedding.lookup.int8-row.v1") {
+          if (embedding_operation)
+            throw std::runtime_error("duplicate model embedding operation");
+          embedding_operation = true;
+          expect_tensor(operation_binding(operation, "weight"),
+                        {vocab_, hidden_}, true);
+        } else if (capability == "head.rmsnorm.argmax.int8-row.v1") {
+          if (head_operation)
+            throw std::runtime_error("duplicate model output-head operation");
+          head_operation = true;
+          expect_tensor(operation_binding(operation, "norm"), {hidden_},
+                        false);
+          expect_tensor(operation_binding(operation, "weight"),
+                        {vocab_, hidden_}, true);
+        } else {
+          throw std::runtime_error(
+              "unsupported model-level operation capability");
+        }
+        continue;
+      }
+      if (operation.logical_layer >= layers_)
+        throw std::runtime_error("compiled operation layer is out of range");
+      auto& layer = layer_operations_[operation.logical_layer];
+      const auto bind = [&](std::uint32_t& slot) {
+        if (slot != kNoOperation)
+          throw std::runtime_error("duplicate operation role in logical layer");
+        slot = static_cast<std::uint32_t>(index);
+      };
+      if (capability == "block.full-attention.output-gated.v1") {
+        bind(layer.block_operation);
+        layer.full_attention = true;
+        layer.full_attention_slot = full_attention_layers_++;
+        expect_tensor(operation_binding(operation, "input_norm"), {hidden_},
+                      false);
+        expect_tensor(operation_binding(operation, "query_projection"),
+                      {2U * query_heads_ * head_dim_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "key_projection"),
+                      {kv_heads_ * head_dim_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "value_projection"),
+                      {kv_heads_ * head_dim_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "output_projection"),
+                      {hidden_, query_heads_ * head_dim_}, true);
+        expect_tensor(operation_binding(operation, "query_norm"), {head_dim_},
+                      false);
+        expect_tensor(operation_binding(operation, "key_norm"), {head_dim_},
+                      false);
+      } else if (capability ==
+                 "block.recurrent-linear-attention.gated-delta.v1") {
+        bind(layer.block_operation);
+        const auto key_dim = key_heads_ * key_head_dim_;
+        const auto value_dim = value_heads_ * value_head_dim_;
+        expect_tensor(operation_binding(operation, "input_norm"), {hidden_},
+                      false);
+        expect_tensor(operation_binding(operation, "qkvz_projection"),
+                      {2U * key_dim + 2U * value_dim, hidden_}, true);
+        expect_tensor(operation_binding(operation, "ba_projection"),
+                      {2U * value_heads_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "convolution"),
+                      {2U * key_dim + value_dim, 1U, conv_kernel_}, false);
+        expect_tensor(operation_binding(operation, "time_bias"), {value_heads_},
+                      false);
+        expect_tensor(operation_binding(operation, "decay_log"), {value_heads_},
+                      false);
+        expect_tensor(operation_binding(operation, "output_norm"),
+                      {value_head_dim_}, false);
+        expect_tensor(operation_binding(operation, "output_projection"),
+                      {hidden_, value_dim}, true);
+      } else if (capability == "router.linear-topk.shared-swiglu.v1") {
+        bind(layer.router_operation);
+        if (operation.routed_component_index != 0U)
+          throw std::runtime_error("router binds the wrong routed component");
+        expect_tensor(operation_binding(operation, "input_norm"), {hidden_},
+                      false);
+        expect_tensor(operation_binding(operation, "router_weight"),
+                      {experts_, hidden_}, false);
+        expect_tensor(operation_binding(operation, "shared_gate_projection"),
+                      {shared_width_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "shared_up_projection"),
+                      {shared_width_, hidden_}, true);
+        expect_tensor(operation_binding(operation, "shared_down_projection"),
+                      {hidden_, shared_width_}, true);
+        expect_tensor(operation_binding(operation, "shared_router"),
+                      {1U, hidden_}, true);
+      } else if (capability == "moe.swiglu.routed.merge-shared.v1") {
+        bind(layer.routed_operation);
+        if (operation.routed_component_index != 0U)
+          throw std::runtime_error(
+              "routed execution binds the wrong component");
+      } else {
+        throw std::runtime_error(
+            "hybrid-delta provider compiled an unknown operation");
+      }
+    }
+    if (!embedding_operation || !head_operation)
+      throw std::runtime_error("model-level operation program is incomplete");
+    if (full_attention_layers_ == 0U)
+      throw std::runtime_error("operation program has no full-attention layer");
+    for (const auto& layer : layer_operations_)
+      if (layer.block_operation == kNoOperation ||
+          layer.router_operation == kNoOperation ||
+          layer.routed_operation == kNoOperation)
+        throw std::runtime_error("logical layer operation program is incomplete");
+  }
   const expert::runtime::cuda::Int8Matrix& matrix(const std::string& name) const {
     const auto& tensor = tensors_.at(name);
     if (!tensor.quantized) throw std::runtime_error(name + " is not INT8");
@@ -1102,59 +1642,36 @@ class Qwen3NextModel final {
     if (tensor.quantized) throw std::runtime_error(name + " is not FP32");
     return tensor.f32;
   }
-  void add_tensor(const Value::Object& entry) {
-    const auto name = Required(entry, "name", "tensor").AsString("tensor.name");
-    const auto record = Required(entry, "offset", "tensor").AsU64("tensor.offset");
-    const auto& sections = Required(entry, "sections", "tensor").AsObject("sections");
-    const auto& data = Required(sections, "data", "sections").AsObject("data");
-    const auto& scales = Required(sections, "scales", "sections").AsObject("scales");
+  void add_tensor(const expert::runtime::ArtifactDenseTensor& entry) {
     Tensor tensor;
-    for (const auto& dimension :
-         Required(entry, "source_shape", "tensor").AsArray("shape"))
-      tensor.shape.push_back(static_cast<std::uint32_t>(dimension.AsU64("shape")));
-    auto* data_pointer = dense_pack_.base + record +
-        Required(data, "offset", "data").AsU64("data.offset");
-    tensor.quantized =
-        Required(entry, "stored_dtype", "tensor").AsString("dtype") == "I8";
+    tensor.shape = entry.shape;
+    const auto pack = dense_packs_.find(entry.pack);
+    if (pack == dense_packs_.end())
+      throw std::runtime_error("tensor references a non-resident dense pack");
+    auto* data_pointer = pack->second.base + entry.record_offset +
+                         entry.data_offset;
+    tensor.quantized = entry.encoding == "I8";
     if (tensor.quantized) {
       tensor.int8 = {
           reinterpret_cast<const std::int8_t*>(data_pointer),
           reinterpret_cast<const float*>(
-              dense_pack_.base + record +
-              Required(scales, "offset", "scales").AsU64("scales.offset")),
+              pack->second.base + entry.record_offset + entry.scale_offset),
           tensor.shape.at(0), tensor.shape.at(1)};
     } else {
       tensor.f32 = reinterpret_cast<const float*>(data_pointer);
     }
-    tensors_.emplace(name, std::move(tensor));
+    if (!tensors_.emplace(entry.name, std::move(tensor)).second)
+      throw std::runtime_error("duplicate dense tensor " + entry.name);
+    if (!tensor_entries_.emplace(entry.name, entry).second)
+      throw std::runtime_error("duplicate dense tensor metadata " +
+                               entry.name);
   }
-  void build_expert_index(const Value::Array& entries) {
-    expert_records_.resize(static_cast<std::size_t>(layers_) * experts_);
-    std::vector<bool> seen(expert_records_.size());
-    for (const auto& value : entries) {
-      const auto& entry = value.AsObject("expert");
-      const auto layer = u32(entry, "layer", "expert");
-      const auto expert = u32(entry, "expert", "expert");
-      if (layer >= layers_ || expert >= experts_)
-        throw std::runtime_error("expert index outside architecture");
-      const auto index = static_cast<std::size_t>(layer) * experts_ + expert;
-      if (seen[index]) throw std::runtime_error("duplicate expert record");
-      seen[index] = true;
-      auto& record = expert_records_[index];
-      record.path = root_ /
-          Required(entry, "pack", "expert").AsString("expert.pack");
-      record.record_offset = Required(entry, "offset", "expert").AsU64("offset");
-      record.stored_bytes =
-          Required(entry, "stored_bytes", "expert").AsU64("stored_bytes");
-      record.decoded_bytes =
-          Required(entry, "decoded_bytes", "expert").AsU64("decoded_bytes");
-      record.payload_sha256 = parse_digest(
-          Required(entry, "payload_sha256", "expert").AsString("payload_sha256"));
-      max_expert_record_bytes_ =
-          std::max(max_expert_record_bytes_, record.stored_bytes);
-    }
-    if (std::find(seen.begin(), seen.end(), false) != seen.end())
-      throw std::runtime_error("incomplete expert index");
+
+  const expert::runtime::PayloadRecord& expert_record(
+      std::uint32_t layer, std::uint32_t expert) const {
+    const auto* record = catalog_->find(layer, expert);
+    if (record == nullptr) throw std::runtime_error("expert is absent from catalog");
+    return *record;
   }
   void allocate_workspace() {
     const auto query_size = static_cast<std::size_t>(2U) * query_heads_ * head_dim_;
@@ -1197,14 +1714,12 @@ class Qwen3NextModel final {
     cpu_slot_by_selection_ =
         device_allocate<std::uint32_t>(rows * top_k_);
     moe_output_ = device_allocate<float>(rows * hidden_);
-    if (quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32) {
-      moe_q8_input_ = device_allocate<std::int8_t>(rows * hidden_);
-      moe_q8_input_scales_ = device_allocate<float>(rows);
-      moe_q8_intermediate_ = device_allocate<std::int8_t>(
-          static_cast<std::size_t>(rows) * top_k_ * expert_width_);
-      moe_q8_intermediate_scales_ =
-          device_allocate<float>(static_cast<std::size_t>(rows) * top_k_);
-    }
+    moe_q8_input_ = device_allocate<std::int8_t>(rows * hidden_);
+    moe_q8_input_scales_ = device_allocate<float>(rows);
+    moe_q8_intermediate_ = device_allocate<std::int8_t>(
+        static_cast<std::size_t>(rows) * top_k_ * expert_width_);
+    moe_q8_intermediate_scales_ =
+        device_allocate<float>(static_cast<std::size_t>(rows) * top_k_);
     // The vocabulary head only ever runs for decode rows or one prefill row,
     // so logits stay sized by the decode batch capacity.
     logits_ = device_allocate<float>(capacity_ * vocab_);
@@ -1259,7 +1774,7 @@ class Qwen3NextModel final {
     const auto recurrent_elements = static_cast<std::size_t>(value_heads_) *
                                     key_head_dim_ * value_head_dim_;
     for (std::uint32_t layer = 0; layer < layers_; ++layer) {
-      if ((layer + 1U) % full_interval_ != 0) {
+      if (!layer_operations_.at(layer).full_attention) {
         conv_state_[layer] =
             device_allocate<float>(capacity_ * conv_elements);
         recurrent_state_[layer] =
@@ -1273,23 +1788,25 @@ class Qwen3NextModel final {
       }
     }
   }
-  void run_full_attention(const std::string& prefix, std::uint32_t layer,
+  void run_full_attention(
+                          const expert::runtime::CompiledOperationProgram& operation,
+                          std::uint32_t full_attention_layer,
                           std::span<const std::uint32_t> positions,
                           std::span<const std::uint32_t> state_slots,
                           std::uint32_t rows) {
     const auto query_size = 2U * query_heads_ * head_dim_;
     const auto kv_size = kv_heads_ * head_dim_;
     const auto attention_size = query_heads_ * head_dim_;
-    const auto full_attention_layer = layer / full_interval_;
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "self_attn.q_proj.weight"), normalized_, query_gate_,
+        matrix(operation_binding(operation, "query_projection")), normalized_,
+        query_gate_,
         rows, nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "self_attn.k_proj.weight"), normalized_, key_, rows,
-        nullptr));
+        matrix(operation_binding(operation, "key_projection")), normalized_,
+        key_, rows, nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "self_attn.v_proj.weight"), normalized_, value_, rows,
-        nullptr));
+        matrix(operation_binding(operation, "value_projection")), normalized_,
+        value_, rows, nullptr));
     for (std::uint32_t row = 0; row < rows; ++row) {
       const auto page_index = positions[row] / kv_page_tokens_;
       auto* page = slot_kv_pages_[state_slots[row]][page_index];
@@ -1297,8 +1814,8 @@ class Qwen3NextModel final {
           query_gate_ + static_cast<std::size_t>(row) * query_size,
           key_ + static_cast<std::size_t>(row) * kv_size,
           value_ + static_cast<std::size_t>(row) * kv_size,
-          fp32(prefix + "self_attn.q_norm.weight"),
-          fp32(prefix + "self_attn.k_norm.weight"),
+          fp32(operation_binding(operation, "query_norm")),
+          fp32(operation_binding(operation, "key_norm")),
           page, full_attention_layer, kv_page_tokens_, positions[row],
           query_heads_, kv_heads_, head_dim_, rotary_dim_, epsilon_,
           rope_theta_, nullptr));
@@ -1314,8 +1831,8 @@ class Qwen3NextModel final {
           query_heads_, kv_heads_, head_dim_, nullptr));
     }
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "self_attn.o_proj.weight"), attention_, residual_, rows,
-        nullptr));
+        matrix(operation_binding(operation, "output_projection")), attention_,
+        residual_, rows, nullptr));
   }
 
   void ensure_kv_page(std::uint32_t slot, std::uint32_t position) {
@@ -1340,7 +1857,8 @@ class Qwen3NextModel final {
                "publish KV page");
   }
 
-  void run_delta(const std::string& prefix, std::uint32_t layer,
+  void run_delta(const expert::runtime::CompiledOperationProgram& operation,
+                 std::uint32_t layer,
                  std::span<const std::uint32_t> state_slots,
                  std::uint32_t rows) {
     const auto projected_size = 2U * key_heads_ * key_head_dim_ +
@@ -1351,19 +1869,19 @@ class Qwen3NextModel final {
     const auto conv_state_size = conv_size * conv_kernel_;
     const auto recurrent_size = value_heads_ * key_head_dim_ * value_head_dim_;
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "linear_attn.in_proj_qkvz.weight"), normalized_,
+        matrix(operation_binding(operation, "qkvz_projection")), normalized_,
         projected_qkvz_, rows, nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "linear_attn.in_proj_ba.weight"), normalized_,
+        matrix(operation_binding(operation, "ba_projection")), normalized_,
         projected_ba_, rows, nullptr));
     for (std::uint32_t row = 0; row < rows; ++row)
       status_check(expert::runtime::cuda::qwen3_next_delta_decode({
           projected_qkvz_ + static_cast<std::size_t>(row) * projected_size,
           projected_ba_ + static_cast<std::size_t>(row) * ba_size,
-          fp32(prefix + "linear_attn.conv1d.weight"),
-          fp32(prefix + "linear_attn.dt_bias"),
-          fp32(prefix + "linear_attn.A_log"),
-          fp32(prefix + "linear_attn.norm.weight"),
+          fp32(operation_binding(operation, "convolution")),
+          fp32(operation_binding(operation, "time_bias")),
+          fp32(operation_binding(operation, "decay_log")),
+          fp32(operation_binding(operation, "output_norm")),
           conv_state_[layer] +
               static_cast<std::size_t>(state_slots[row]) * conv_state_size,
           recurrent_state_[layer] +
@@ -1373,28 +1891,27 @@ class Qwen3NextModel final {
           key_heads_, value_heads_, key_head_dim_, value_head_dim_,
           conv_kernel_, epsilon_, nullptr}));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "linear_attn.out_proj.weight"), delta_output_,
+        matrix(operation_binding(operation, "output_projection")), delta_output_,
         residual_, rows, nullptr));
   }
 
-  void run_moe(const std::string& prefix, std::uint32_t layer,
-               std::span<const std::uint32_t> positions,
-               std::span<const std::uint32_t> state_slots,
-               std::uint32_t rows) {
+  void run_router(
+      const expert::runtime::CompiledOperationProgram& router,
+      std::uint32_t rows) {
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "mlp.shared_expert.gate_proj.weight"), normalized_,
+        matrix(operation_binding(router, "shared_gate_projection")), normalized_,
         shared_gate_, rows, nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "mlp.shared_expert.up_proj.weight"), normalized_,
+        matrix(operation_binding(router, "shared_up_projection")), normalized_,
         shared_up_, rows, nullptr));
     status_check(expert::runtime::cuda::silu_product(
         shared_gate_, shared_up_, shared_intermediate_, rows * shared_width_,
         nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "mlp.shared_expert.down_proj.weight"),
+        matrix(operation_binding(router, "shared_down_projection")),
         shared_intermediate_, shared_output_, rows, nullptr));
     status_check(expert::runtime::cuda::gemv_batch(
-        matrix(prefix + "mlp.shared_expert_gate.weight"), normalized_,
+        matrix(operation_binding(router, "shared_router")), normalized_,
         shared_scalar_, rows, nullptr));
     for (std::uint32_t row = 0; row < rows; ++row)
       status_check(expert::runtime::cuda::sigmoid_scale_in_place(
@@ -1402,9 +1919,24 @@ class Qwen3NextModel final {
           shared_scalar_ + row, hidden_, nullptr));
     cuda_check(cudaEventRecord(shared_done_event_), "record shared expert done");
     status_check(expert::runtime::cuda::router_topk_normalized_batch(
-        normalized_, fp32(prefix + "mlp.gate.weight"), rows, hidden_, experts_,
+        normalized_, fp32(operation_binding(router, "router_weight")), rows,
+        hidden_, experts_,
         top_k_, router_logits_, routing_scores_, routing_indices_, nullptr));
     cuda_check(cudaEventRecord(router_done_event_), "record router done");
+  }
+
+  void run_routed_moe(
+      const expert::runtime::CompiledOperationProgram& routed,
+      std::span<const std::uint32_t> positions,
+      std::span<const std::uint32_t> state_slots,
+      std::uint32_t rows) {
+    const auto logical_layer = routed.logical_layer;
+    const auto layer = routed.component_layer;
+    if (logical_layer >= layer_operations_.size() ||
+        layer_operations_[logical_layer].routed_operation !=
+            routed.logical_operation)
+      throw std::runtime_error(
+          "routed operation disagrees with the artifact layer program");
 
     // Launch the directory plan on the same stream right behind the router;
     // its results are consumed through a completion event instead of a
@@ -1454,9 +1986,9 @@ class Qwen3NextModel final {
     routed_expert_keys_.clear();
     missing_expert_keys_.clear();
     for (const auto expert : plan.ready_experts)
-      routed_expert_keys_.push_back({model_id_, layer, expert, quant_abi_});
+      routed_expert_keys_.push_back(routed_->key(layer, expert));
     for (const auto expert : plan.missing_experts)
-      missing_expert_keys_.push_back({model_id_, layer, expert, quant_abi_});
+      missing_expert_keys_.push_back(routed_->key(layer, expert));
     placement_->observe_routes(routed_expert_keys_, missing_expert_keys_);
     const auto selection_count = rows * top_k_;
     const bool placement_feedback = !placement_->frozen();
@@ -1516,7 +2048,8 @@ class Qwen3NextModel final {
           // Routing scores ride the pre-freeze D2H copy only; frozen feedback
           // carries access counts, and the cache ignores non-positive scores.
           route_accesses_.push_back(
-              {{model_id_, layer, expert, quant_abi_}, route_access_counts_[expert],
+              {routed_->key(layer, expert),
+               route_access_counts_[expert],
                placement_feedback ? route_score_sums_[expert] : 0.0,
                placement_feedback ? route_score_maxima_[expert] : 0.0});
         }
@@ -1537,10 +2070,9 @@ class Qwen3NextModel final {
         for (const auto expert : experts) {
           if (expert >= experts_)
             throw std::runtime_error("router expert out of range");
-          const auto& record = expert_records_.at(
-              static_cast<std::size_t>(layer) * experts_ + expert);
+          const auto& record = expert_record(layer, expert);
           handles.push_back(
-              cache_->acquire({model_id_, layer, expert, quant_abi_}, record));
+              cache_->acquire(routed_->key(layer, expert), record));
         }
         for (std::size_t slot = 0; slot < handles.size(); ++slot) {
           if (handles[slot].wait_for(std::chrono::seconds(30)) !=
@@ -1564,10 +2096,9 @@ class Qwen3NextModel final {
       for (const auto expert : plan.missing_experts) {
         if (expert >= experts_)
           throw std::runtime_error("router expert out of range");
-        const auto& record = expert_records_.at(
-            static_cast<std::size_t>(layer) * experts_ + expert);
+        const auto& record = expert_record(layer, expert);
         auto host = cache_->try_acquire_host(
-            {model_id_, layer, expert, quant_abi_}, record, false);
+            routed_->key(layer, expert), record, false);
         if (host) {
           host_slot_by_expert.emplace(expert, host_leases.size());
           host_leases.push_back(std::move(*host));
@@ -1599,52 +2130,15 @@ class Qwen3NextModel final {
       candidates.reserve(plan.ready_experts.size() +
                          plan.missing_experts.size());
       for (const auto expert : plan.ready_experts) {
-        const auto& record = expert_records_.at(
-            static_cast<std::size_t>(layer) * experts_ + expert);
+        const auto& record = expert_record(layer, expert);
         candidates.push_back({expert, route_access_counts_[expert],
                               record.stored_bytes, true, false, true});
       }
       for (const auto expert : plan.missing_experts) {
-        const auto& record = expert_records_.at(
-            static_cast<std::size_t>(layer) * experts_ + expert);
-        const auto host_available = host_slot_by_expert.contains(expert);
-        // The CPU executor decodes int8-per-row records only; FP4 packs send
-        // every miss to the GPU uploader instead, bypassing the admission
-        // heuristics that would otherwise pin overflow selections on the CPU.
-        const bool fp4 = quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32;
-        auto cpu_available = host_available &&
-            quant_abi_ == expert::runtime::kExpertQuantAbiInt8PerRow;
-        auto gpu_available = !host_available || fp4;
-        if (host_available && may_upload_from_ram && !fp4) {
-          bool admit = false;
-          if (!frozen_route_feedback) {
-            admit = cache_->vram_admission_would_improve(
-                {model_id_, layer, expert, quant_abi_}, record);
-          } else {
-            // W4 router-aware re-promotion: the per-forward stale-victim
-            // budget bounds promotions to displacing residents that have not
-            // been routed for a long stretch. A repeating route whose working
-            // set exceeds the VRAM budget keeps its overflow on the CPU
-            // executor (no resident is stale), while a conversation that
-            // moved on heals its placement over dead topics' residents.
-            const auto need = record.device_bytes == 0
-                                  ? record.stored_bytes
-                                  : record.device_bytes;
-            admit = frozen_stale_budget_bytes_ >= need;
-            if (admit) {
-              frozen_stale_budget_bytes_ -= need;
-              ++phase_.frozen_promotions;
-              phase_.frozen_promotion_bytes += record.stored_bytes;
-            }
-          }
-          if (admit) {
-            gpu_available = true;
-            if (frozen_route_feedback) cpu_available = false;
-          }
-        }
+        const auto& record = expert_record(layer, expert);
         candidates.push_back(
             {expert, route_access_counts_[expert], record.stored_bytes, false,
-             cpu_available, gpu_available});
+             false, true});
       }
       const auto dispatch_plan = dispatch_->plan(candidates);
       status_check(dispatch_plan.status);
@@ -1665,9 +2159,8 @@ class Qwen3NextModel final {
           uploads_are_ram_resident =
               uploads_are_ram_resident && host_available;
           if (host_available) {
-            observed_upload_bytes += expert_records_.at(
-                static_cast<std::size_t>(layer) * experts_ +
-                decision.expert).stored_bytes;
+            observed_upload_bytes +=
+                expert_record(layer, decision.expert).stored_bytes;
           }
         }
       }
@@ -1755,13 +2248,11 @@ class Qwen3NextModel final {
     phase_.dense_router_ns += attention_ns + shared_ns + router_ns;
     phase_.expert_cache_wait_ns += elapsed_ns(cache_started);
     const auto expert_started = std::chrono::steady_clock::now();
-    cuda_check(cudaEventRecord(expert_start_events_[layer]),
+    cuda_check(cudaEventRecord(expert_start_events_[logical_layer]),
                "record expert lane start");
-    // FP4 packs always take the selection-batch path: the plain batch kernels
-    // have no packed-FP4 dispatch, while the selection kernels share the
-    // DeepSeek-proven dp4a GEMVs.
-    if (quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32)
-      split_execution = true;
+    // FP4 packs always take the selection-batch path, whose kernels consume
+    // the packed E2M1 payload directly through the shared dp4a GEMVs.
+    split_execution = true;
     if (!split_execution) {
         status_check(expert::runtime::cuda::launch_moe_batch({
             normalized_, nullptr, nullptr, nullptr, nullptr, routing_scores_,
@@ -1769,8 +2260,8 @@ class Qwen3NextModel final {
             expert_width_, top_k_, experts_, nullptr,
             directory_->device_entries(), layer}));
         phase_.gpu_expert_selections += selection_count;
-        gpu_selections_by_layer_[layer] = selection_count;
-        cuda_check(cudaEventRecord(expert_done_events_[layer]),
+        gpu_selections_by_layer_[logical_layer] = selection_count;
+        cuda_check(cudaEventRecord(expert_done_events_[logical_layer]),
                    "record expert lane done");
       } else {
         if (route_pin_id != 0U) {
@@ -1782,13 +2273,13 @@ class Qwen3NextModel final {
               moe_q8_intermediate_scales_, rows, hidden_, expert_width_,
               top_k_, experts_, nullptr, directory_->device_entries(), layer,
               0.0F, false,
-              quant_abi_ == expert::runtime::kExpertQuantAbiFp4Block32}));
+              true}));
         }
         phase_.gpu_expert_selections +=
             selection_count - compact_cpu_selection_count;
-        gpu_selections_by_layer_[layer] =
+        gpu_selections_by_layer_[logical_layer] =
             selection_count - compact_cpu_selection_count;
-        cuda_check(cudaEventRecord(expert_done_events_[layer]),
+        cuda_check(cudaEventRecord(expert_done_events_[logical_layer]),
                    "record expert lane done");
         if (!cpu_groups.empty()) {
           const auto cpu_started = std::chrono::steady_clock::now();
@@ -1834,10 +2325,10 @@ class Qwen3NextModel final {
     }
       status_check(expert::runtime::cuda::add_in_place(
           moe_output_, shared_output_, rows * hidden_, nullptr));
-      if (moe_trace_ && moe_trace_->selected(layer))
-        moe_trace_->append(layer, normalized_, moe_output_, routing_indices_,
-                           routing_scores_, positions, state_slots,
-                           trace_sequence_ids_);
+      if (moe_trace_ && moe_trace_->selected(logical_layer))
+        moe_trace_->append(logical_layer, normalized_, moe_output_,
+                           routing_indices_, routing_scores_, positions,
+                           state_slots, trace_sequence_ids_);
       status_check(expert::runtime::cuda::add_in_place(
           hidden_state_, moe_output_, rows * hidden_, nullptr));
       if (route_pin_id != 0U) {
@@ -1850,10 +2341,9 @@ class Qwen3NextModel final {
       if (!placement_->frozen()) {
         for (std::size_t index = 0; index < cpu_groups.size(); ++index) {
           const auto expert = cpu_group_expert.at(index);
-          const auto& record = expert_records_.at(
-              static_cast<std::size_t>(layer) * experts_ + expert);
+          const auto& record = expert_record(layer, expert);
           placement_->consider(
-              {model_id_, layer, expert, quant_abi_}, record,
+              routed_->key(layer, expert), record,
               static_cast<std::uint32_t>(cpu_groups[index].selections.size()),
               route_score_sums_[expert]);
         }
@@ -1866,12 +2356,15 @@ class Qwen3NextModel final {
   std::uint32_t prefill_chunk_tokens_{}, workspace_rows_{};
   std::uint32_t hidden_{}, expert_width_{}, vocab_{}, layers_{};
   std::uint32_t query_heads_{}, kv_heads_{}, head_dim_{}, experts_{}, top_k_{};
-  std::uint32_t full_interval_{}, conv_kernel_{}, key_head_dim_{},
-      value_head_dim_{}, key_heads_{}, value_heads_{}, shared_width_{},
-      rotary_dim_{};
+  std::uint32_t conv_kernel_{}, key_head_dim_{}, value_head_dim_{}, key_heads_{},
+      value_heads_{}, shared_width_{}, rotary_dim_{}, shared_experts_{};
   float epsilon_{}, rope_theta_{};
-  std::uint64_t model_id_{0x51334e4558540001ULL};
-  std::uint32_t quant_abi_{expert::runtime::kExpertQuantAbiInt8PerRow};
+  std::uint64_t model_id_{};
+  expert::runtime::Sha256Digest model_hash_{};
+  expert::runtime::ModelArtifact artifact_;
+  expert::runtime::ModelDescriptor model_descriptor_;
+  expert::runtime::CompiledModelProgram compiled_program_;
+  std::uint32_t encoding_abi_{expert::runtime::kExpertEncodingAbiFp4Block32};
   std::uint64_t total_pack_bytes_{}, dense_read_bytes_{},
       max_expert_record_bytes_{};
   std::uint64_t ram_cache_bytes_{}, vram_cache_bytes_{}, kv_cache_bytes_{},
@@ -1885,9 +2378,18 @@ class Qwen3NextModel final {
   std::uint64_t frozen_stale_budget_bytes_{};
   bool frozen_stale_budget_valid_{};
   PhaseTelemetry phase_;
-  DevicePack dense_pack_;
+  std::unordered_map<std::string, DevicePack> dense_packs_;
   std::unordered_map<std::string, Tensor> tensors_;
-  std::vector<expert::runtime::PayloadRecord> expert_records_;
+  std::unordered_map<std::string, expert::runtime::ArtifactDenseTensor>
+      tensor_entries_;
+  std::shared_ptr<const void> dense_lifetime_{
+      this, [](const void*) noexcept {}};
+  std::shared_ptr<const void> workspace_lifetime_{
+      this, [](const void*) noexcept {}};
+  std::mutex provider_slot_mutex_;
+  std::vector<bool> provider_slots_;
+  const expert::runtime::ExpertCatalog* catalog_{};
+  std::vector<LayerOperations> layer_operations_;
   std::vector<std::uint32_t> route_access_counts_;
   std::vector<double> route_score_sums_, route_score_maxima_;
   std::vector<expert::runtime::ExpertAccess> route_accesses_;
@@ -1900,6 +2402,7 @@ class Qwen3NextModel final {
       plan_workspace_;
   std::shared_ptr<expert::runtime::FixedBufferPool> buffers_;
   std::unique_ptr<expert::runtime::ExpertCache> cache_;
+  std::unique_ptr<expert::runtime::RoutedExpertRuntime> routed_;
   std::unique_ptr<expert::runtime::cpu::ExpertExecutor> cpu_executor_;
   std::unique_ptr<expert::runtime::AdaptivePlacementPlanner> placement_;
   std::unique_ptr<expert::runtime::HybridDispatchPlanner> dispatch_;
@@ -1915,7 +2418,7 @@ class Qwen3NextModel final {
       *cpu_slot_by_selection_{};
   std::uint8_t* gpu_selection_mask_{};
   // FP4 block-32 packs run the dp4a GEMVs, which read q8-quantized
-  // activations; these buffers hold them when quant_abi_ is 3.
+  // activations; these buffers hold that transient representation.
   std::int8_t *moe_q8_input_{}, *moe_q8_intermediate_{};
   float *moe_q8_input_scales_{}, *moe_q8_intermediate_scales_{};
   void** device_kv_page_table_{};
@@ -2042,8 +2545,31 @@ int worker_loop(Qwen3NextModel& model, std::uint32_t settle_after_steps) {
     std::cerr << "worker placement settled after " << decode_steps
               << " decode steps\n";
   };
-  std::cout << "{\"type\":\"ready\",\"protocol\":5,\"capacity\":"
+  const auto& descriptor = model.descriptor();
+  const auto& routed_component = descriptor.routed_components.front();
+  std::cout << "{\"type\":\"ready\",\"protocol\":6,\"capacity\":"
             << model.capacity()
+            << ",\"architecture_id\":\""
+            << sanitize_error(descriptor.architecture_id) << '"'
+            << ",\"vocab_size\":" << descriptor.vocab_size
+            << ",\"max_context_tokens\":"
+            << descriptor.max_context_tokens
+            << ",\"routed_layers\":" << routed_component.layer_count
+            << ",\"experts_per_layer\":"
+            << routed_component.experts_per_layer
+            << ",\"route_width\":" << routed_component.route_width
+            << ",\"expert_encoding\":\""
+            << sanitize_error(routed_component.encoding) << '"'
+            << ",\"operation_capabilities\":[";
+  for (std::size_t index = 0U; index < descriptor.required_kernels.size();
+       ++index) {
+    if (index != 0U) std::cout << ',';
+    std::cout << '"'
+              << sanitize_error(
+                     descriptor.required_kernels[index].capability)
+              << '"';
+  }
+  std::cout << ']'
             << ",\"prefill_mode\":\"causal_chunked\""
             << ",\"prefill_chunk_tokens\":"
             << model.prefill_chunk_tokens()
@@ -2328,7 +2854,7 @@ int worker_loop(Qwen3NextModel& model, std::uint32_t settle_after_steps) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
+int expert_vm_hybrid_delta_moe_provider_main(int argc, char** argv) {
   try {
     if (argc >= 3 && std::string_view(argv[2]) == "--trace-moe") {
       if (argc < 5 || argc > 10)
@@ -2650,32 +3176,35 @@ int main(int argc, char** argv) {
       return interleaving_match && chunked_prefill_match ? 0 : 2;
     }
     if (argc >= 3 && std::string_view(argv[2]) == "--worker") {
-      if (argc > 12)
-        throw std::runtime_error(
-            "worker usage: <container> --worker [max-context] [ram-gib] "
-            "[vram-gib] [capacity] [kv-cache-mib] [kv-page-tokens] "
-            "[placement-profile] [prefill-chunk-tokens] "
-            "[settle-after-decode-steps]");
-      const auto max_context = argc >= 4
-          ? static_cast<std::uint32_t>(std::stoul(argv[3])) : 4096U;
-      const auto ram_gib = argc >= 5 ? std::stoull(argv[4]) : 48ULL;
-      const auto vram_gib = argc >= 6 ? std::stoull(argv[5]) : 14ULL;
-      const auto capacity = argc >= 7
-          ? static_cast<std::uint32_t>(std::stoul(argv[6])) : 1U;
-      const auto kv_cache_mib = argc >= 8 ? std::stoull(argv[7]) : 2048ULL;
-      const auto kv_page_tokens = argc >= 9
-          ? static_cast<std::uint32_t>(std::stoul(argv[8])) : 256U;
-      const std::string_view placement_profile =
-          argc >= 10 ? argv[9] : "balanced";
-      const auto prefill_chunk_tokens = argc >= 11
-          ? static_cast<std::uint32_t>(std::stoul(argv[10])) : 0U;
+      std::vector<std::string_view> raw_options;
+      raw_options.reserve(static_cast<std::size_t>(argc - 3));
+      for (int index = 3; index < argc; ++index)
+        raw_options.emplace_back(argv[index]);
+      auto parsed =
+          expert::runtime::parse_worker_launch_options(raw_options);
+      if (!parsed.status.ok())
+        throw std::runtime_error(std::string(parsed.status.message()));
+      auto options = std::move(parsed.options);
+      if (!options.extensions.empty())
+        throw std::runtime_error("execution provider does not support requested extension");
+      if (options.ram_cache_gib >
+              (std::numeric_limits<std::uint64_t>::max() >> 30U) ||
+          options.vram_cache_gib >
+              (std::numeric_limits<std::uint64_t>::max() >> 30U) ||
+          options.kv_cache_mib >
+              (std::numeric_limits<std::uint64_t>::max() >> 20U))
+        throw std::runtime_error("worker resource bytes overflow");
+      const auto prefill_chunk_tokens =
+          options.prefill_chunk_limit.value_or(0U);
       // Warmup boundary for the one-time placement freeze in worker mode;
       // 0 keeps placement adaptive forever (benchmarking).
-      const auto settle_after_steps = argc >= 12
-          ? static_cast<std::uint32_t>(std::stoul(argv[11])) : 8U;
-      Qwen3NextModel model(argv[1], max_context, ram_gib << 30U,
-                           vram_gib << 30U, capacity, kv_cache_mib << 20U,
-                           kv_page_tokens, placement_profile,
+      const auto settle_after_steps =
+          options.placement_settle_steps.value_or(8U);
+      Qwen3NextModel model(argv[1], options.max_context,
+                           options.ram_cache_gib << 30U,
+                           options.vram_cache_gib << 30U, options.capacity,
+                           options.kv_cache_mib << 20U,
+                           options.kv_page_tokens, options.placement_profile,
                            prefill_chunk_tokens);
       return worker_loop(model, settle_after_steps);
     }
@@ -2841,3 +3370,58 @@ int main(int argc, char** argv) {
     return 1;
   }
 }
+
+expert::runtime::WorkerProviderDefinition
+make_sm86_hybrid_delta_moe_provider() {
+  return {"sm86-hybrid-delta-moe", 100U, provider_capabilities(),
+          &expert_vm_hybrid_delta_moe_provider_main};
+}
+
+expert::runtime::CreateExecutionProviderModuleResult
+make_sm86_hybrid_delta_moe_callable_provider(
+    const std::filesystem::path& artifact_root, std::uint32_t max_context,
+    std::uint32_t capacity, std::uint64_t ram_cache_bytes,
+    std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
+    std::uint32_t kv_page_tokens, std::string_view placement_profile) {
+  try {
+    auto implementation = std::make_shared<Qwen3NextModel>(
+        artifact_root, max_context, ram_cache_bytes, vram_cache_bytes,
+        capacity, kv_cache_bytes, kv_page_tokens, placement_profile, 1U);
+    expert::runtime::ExecutionProviderModule module;
+    module.definition = {"sm86-hybrid-delta-moe", 100U,
+                         provider_capabilities(), implementation};
+    module.tensor_store = implementation;
+    module.service = {
+        "causal_sequential", 1U, true, "per_request_nonblocking", "artifact",
+        "fp16", "paged_on_demand", implementation->kv_page_tokens(),
+        implementation->kv_page_bytes(), implementation->kv_page_capacity(),
+        "budgeted", implementation->placement_profile(), ram_cache_bytes,
+        vram_cache_bytes, implementation->placement_prefetch_enabled(),
+        implementation->placement_prefetch_enabled() ? "ready" : "disabled",
+        implementation->placement_minimum_observations(), false, false, false,
+        true, true};
+    module.telemetry = [implementation] {
+      const auto cache = implementation->telemetry();
+      const auto phase = implementation->phase_telemetry();
+      return std::map<std::string, std::uint64_t, std::less<>>{
+          {"cache_vram_hits", cache.acquire_vram_hits},
+          {"cache_ram_hits", cache.acquire_ram_hits},
+          {"cache_ssd_misses", cache.acquire_ssd_misses},
+          {"cache_read_bytes", cache.read_bytes},
+          {"cache_uploaded_bytes", cache.uploaded_bytes},
+          {"cache_storage_wait_ns", cache.storage_wait_ns},
+          {"cache_upload_wait_ns", cache.upload_wait_ns},
+          {"forward_calls", phase.forward_calls},
+          {"forward_wall_ns", phase.forward_wall_ns}};
+    };
+    return {expert::runtime::Status::success(), std::move(module)};
+  } catch (const std::exception& error) {
+    return {{expert::runtime::ErrorCode::invalid_argument, error.what()}, {}};
+  }
+}
+
+#ifndef EXPERT_VM_PROVIDER_LIBRARY
+int main(int argc, char** argv) {
+  return expert_vm_hybrid_delta_moe_provider_main(argc, argv);
+}
+#endif

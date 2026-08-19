@@ -7,6 +7,7 @@ construction live in ``compile.py`` so this module remains a small ABI surface.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import struct
 from dataclasses import dataclass
@@ -53,25 +54,52 @@ def _pad_to(
     write_zeros(handle, absolute_target - current, digest)
 
 
-def _shape4(shape: tuple[int, ...]) -> tuple[int, int, int, int]:
-    padded = shape + (0,) * (4 - len(shape))
-    if len(padded) != 4:
+def _shape5(shape: tuple[int, ...]) -> tuple[int, int, int, int, int]:
+    padded = shape + (0,) * (5 - len(shape))
+    if len(padded) != 5:
         raise ValueError(f"tensor rank exceeds dense header capacity: {shape}")
     return padded
 
 
-def dense_is_quantized(info: TensorInfo) -> bool:
-    # Router logits define expert selection and remain FP32 in profile v1.
-    # Norms are rank one and likewise remain FP32. Other matrices are INT8.
-    return len(info.shape) == 2 and not info.name.endswith(".mlp.gate.weight")
+def dense_is_quantized(
+    info: TensorInfo, preserve_float32: bool = False
+) -> bool:
+    # Semantic roles come from the architecture adapter. Tensor paths are not
+    # a stable cross-model ABI and must not decide whether a router is lossy.
+    # Rank-one norms/biases remain FP32; other matrices default to INT8.
+    return len(info.shape) == 2 and not preserve_float32
 
 
-def dense_record_size(info: TensorInfo, alignment: int = PACK_ALIGNMENT) -> int:
+def dense_record_size(
+    info: TensorInfo,
+    alignment: int = PACK_ALIGNMENT,
+    preserve_float32: bool = False,
+    quant_abi: int = QUANT_ABI_ID,
+) -> int:
     elements = 1
     for dimension in info.shape:
         elements *= dimension
-    data_bytes = elements if dense_is_quantized(info) else elements * 4
-    scale_bytes = info.shape[0] * 4 if dense_is_quantized(info) else 0
+    quantized = (
+        not preserve_float32
+        and (
+            quant_abi == FP4_QUANT_ABI_ID
+            or dense_is_quantized(info, preserve_float32)
+        )
+    )
+    if quantized and quant_abi == FP4_QUANT_ABI_ID:
+        rows = math.prod(info.shape[:-1]) if len(info.shape) > 1 else 1
+        columns = info.shape[-1]
+        padded_columns = align_up(columns, FP4_QUANT_GROUP_SIZE)
+        data_bytes = rows * padded_columns // 2
+        scale_bytes = rows * padded_columns // FP4_QUANT_GROUP_SIZE
+    elif quantized and quant_abi == QUANT_ABI_ID:
+        data_bytes = elements
+        scale_bytes = info.shape[0] * 4
+    elif quantized:
+        raise ValueError(f"unsupported dense quant ABI {quant_abi}")
+    else:
+        data_bytes = elements * 4
+        scale_bytes = 0
     cursor = HEADER_BYTES + data_bytes
     if scale_bytes:
         cursor = align_up(cursor, SECTION_ALIGNMENT) + scale_bytes
@@ -121,6 +149,8 @@ def write_dense_record(
     info: TensorInfo,
     pack_name: str,
     alignment: int = PACK_ALIGNMENT,
+    preserve_float32: bool = False,
+    quant_abi: int = QUANT_ABI_ID,
 ) -> RecordResult:
     start = handle.tell()
     if start % alignment:
@@ -128,12 +158,27 @@ def write_dense_record(
     write_zeros(handle, HEADER_BYTES)
     digest = hashlib.sha256()
     data_offset = HEADER_BYTES
-    quantized = dense_is_quantized(info)
+    quantized = (
+        not preserve_float32
+        and (
+            quant_abi == FP4_QUANT_ABI_ID
+            or dense_is_quantized(info, preserve_float32)
+        )
+    )
 
     with checkpoint.open_tensor(info.name) as view:
         if quantized:
-            scales = write_int8_rows(view, handle, digest)
-            data_bytes = info.nbytes // (2 if info.dtype in {"F16", "BF16"} else 4)
+            if quant_abi == FP4_QUANT_ABI_ID:
+                before = handle.tell()
+                scales = write_fp4_block32_rows(view, handle, digest)
+                data_bytes = handle.tell() - before
+            elif quant_abi == QUANT_ABI_ID:
+                scales = write_int8_rows(view, handle, digest)
+                data_bytes = info.nbytes // (
+                    2 if info.dtype in {"F16", "BF16"} else 4
+                )
+            else:
+                raise ValueError(f"unsupported dense quant ABI {quant_abi}")
         else:
             data_bytes = write_float32(view, handle, digest)
             scales = b""
@@ -151,24 +196,27 @@ def write_dense_record(
     _pad_to(handle, start + record_bytes, digest)
     payload_hash = digest.digest()
     flags = FLAG_ROW_MAJOR
-    quant_abi = 0
+    stored_quant_abi = 0
     stored_dtype = "F32"
     layout = "row-major-f32"
     if quantized:
         flags |= FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
-        quant_abi = QUANT_ABI_ID
-        stored_dtype = "I8"
-        layout = "output-major-row-contiguous-int8"
-    dimensions = _shape4(info.shape)
+        stored_quant_abi = quant_abi
+        if quant_abi == FP4_QUANT_ABI_ID:
+            stored_dtype = "FP4_E2M1"
+            layout = "row-major-fp4-e2m1-ue8m0-block32-padded"
+        else:
+            stored_dtype = "I8"
+            layout = "output-major-row-contiguous-int8"
+    dimensions = _shape5(info.shape)
     header = DENSE_HEADER_STRUCT.pack(
         DENSE_MAGIC,
         FORMAT_VERSION,
         HEADER_BYTES,
         flags,
-        quant_abi,
+        stored_quant_abi,
         len(info.shape),
         *dimensions,
-        0,
         record_bytes,
         data_offset,
         data_bytes,
@@ -196,7 +244,7 @@ def write_dense_record(
         "source_shape": list(info.shape),
         "stored_dtype": stored_dtype,
         "layout": layout,
-        "quant_abi": quant_abi,
+        "quant_abi": stored_quant_abi,
         "payload_sha256": payload_hash.hex(),
         "sections": {
             "data": {"offset": data_offset, "bytes": data_bytes},
@@ -348,4 +396,3 @@ def truncate_to(path: Path, size: int) -> None:
     with path.open("r+b") as handle:
         handle.truncate(size)
         fsync_file(handle)
-

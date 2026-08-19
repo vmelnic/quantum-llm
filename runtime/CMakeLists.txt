@@ -8,6 +8,7 @@ option(EXPERT_RUNTIME_ENABLE_CUDA_PINNED "Use cudaHostAlloc for the fixed host p
 option(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE "Build SM86 Expert Pack kernels" OFF)
 
 add_library(expert_runtime STATIC
+  src/active_expert_executor.cpp
   src/adaptive_placement.cpp
   src/buffer_pool.cpp
   src/cache_state.cpp
@@ -17,17 +18,27 @@ add_library(expert_runtime STATIC
   src/deepseek_artifacts.cpp
   src/deepseek_expert.cpp
   src/expert_cache.cpp
+  src/expert_catalog.cpp
+  src/execution_provider.cpp
   src/expert_record.cpp
   src/expert_store.cpp
   src/gather_storage.cpp
   src/hybrid_dispatch.cpp
+  src/model_artifact.cpp
+  src/model_descriptor.cpp
+  src/model_tensor_store.cpp
+  src/moe_virtual_machine.cpp
   src/placement_profile.cpp
+  src/program_executor.cpp
   src/resident_expert_set.cpp
   src/resource_governor.cpp
   src/route_census.cpp
+  src/routed_expert_runtime.cpp
   src/scheduler.cpp
   src/sha256.cpp
   src/telemetry.cpp
+  src/worker_contract.cpp
+  src/worker_provider.cpp
 )
 
 target_compile_features(expert_runtime PUBLIC cxx_std_20)
@@ -43,6 +54,13 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(expert_runtime PUBLIC Threads::Threads)
+if(TARGET expert_core)
+  target_link_libraries(expert_runtime PUBLIC expert_core)
+endif()
+
+add_executable(expert-fp4-cpu-profile tools/fp4_cpu_profile.cpp)
+target_compile_features(expert-fp4-cpu-profile PRIVATE cxx_std_20)
+target_link_libraries(expert-fp4-cpu-profile PRIVATE expert_runtime)
 
 if(MSVC)
   set_source_files_properties(
@@ -116,6 +134,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   add_executable(expert-qwen3-next-cuda-smoke tools/qwen3_next_cuda_smoke.cpp)
   target_compile_features(expert-qwen3-next-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-qwen3-next-cuda-smoke PRIVATE expert_runtime CUDA::cudart)
+  add_executable(expert-dense-fp4-cuda-smoke
+    tools/dense_fp4_cuda_smoke.cpp)
+  target_compile_features(expert-dense-fp4-cuda-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-dense-fp4-cuda-smoke PRIVATE
+    expert_runtime CUDA::cudart)
   add_executable(expert-deepseek-admission-smoke
     tools/deepseek_admission_smoke.cpp)
   target_compile_features(expert-deepseek-admission-smoke PRIVATE cxx_std_20)
@@ -165,7 +188,15 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     add_executable(expert-deepseek-worker tools/deepseek_worker.cpp)
     target_compile_features(expert-deepseek-worker PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-worker PRIVATE
-      expert_runtime CUDA::cudart)
+      expert_runtime expert_core CUDA::cudart)
+    add_library(expert-sm86-compressed-sparse-moe-provider OBJECT
+      tools/deepseek_worker.cpp)
+    target_compile_features(expert-sm86-compressed-sparse-moe-provider PRIVATE
+      cxx_std_20)
+    target_compile_definitions(expert-sm86-compressed-sparse-moe-provider PRIVATE
+      EXPERT_VM_PROVIDER_LIBRARY=1)
+    target_link_libraries(expert-sm86-compressed-sparse-moe-provider PRIVATE
+      expert_runtime expert_core CUDA::cudart)
     add_executable(expert-deepseek-csa-smoke tools/deepseek_csa_smoke.cpp)
     target_compile_features(expert-deepseek-csa-smoke PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-csa-smoke PRIVATE
@@ -182,6 +213,45 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   add_executable(expert-olmoe-runner tools/olmoe_runner.cpp)
   target_compile_features(expert-olmoe-runner PRIVATE cxx_std_20)
   target_link_libraries(expert-olmoe-runner PRIVATE expert_runtime expert_core CUDA::cudart)
+  add_library(expert-sm86-dense-moe-provider OBJECT tools/olmoe_runner.cpp)
+  target_compile_features(expert-sm86-dense-moe-provider PRIVATE cxx_std_20)
+  target_compile_definitions(expert-sm86-dense-moe-provider PRIVATE
+    EXPERT_VM_PROVIDER_LIBRARY=1)
+  target_link_libraries(expert-sm86-dense-moe-provider PRIVATE
+    expert_runtime expert_core CUDA::cudart)
+  add_library(expert-sm86-hybrid-delta-moe-provider OBJECT
+    tools/qwen3_next_runner.cpp)
+  target_compile_features(expert-sm86-hybrid-delta-moe-provider PRIVATE
+    cxx_std_20)
+  target_compile_definitions(expert-sm86-hybrid-delta-moe-provider PRIVATE
+    EXPERT_VM_PROVIDER_LIBRARY=1)
+  target_link_libraries(expert-sm86-hybrid-delta-moe-provider PRIVATE
+    expert_runtime expert_core CUDA::cudart)
+  add_library(expert-sm86-dense-fp4-provider OBJECT
+    tools/dense_fp4_provider.cpp)
+  target_compile_features(expert-sm86-dense-fp4-provider PRIVATE cxx_std_20)
+  target_link_libraries(expert-sm86-dense-fp4-provider PRIVATE
+    expert_runtime expert_core CUDA::cudart)
+  add_executable(expert-moe-vm-runner
+    tools/moe_vm_runner.cpp
+    $<TARGET_OBJECTS:expert-sm86-dense-moe-provider>
+    $<TARGET_OBJECTS:expert-sm86-hybrid-delta-moe-provider>
+    $<TARGET_OBJECTS:expert-sm86-dense-fp4-provider>)
+  if(TARGET expert-sm86-compressed-sparse-moe-provider)
+    target_sources(expert-moe-vm-runner PRIVATE
+      $<TARGET_OBJECTS:expert-sm86-compressed-sparse-moe-provider>)
+    target_compile_definitions(expert-moe-vm-runner PRIVATE
+      EXPERT_VM_HAS_DEEPSEEK_PROVIDER=1)
+  endif()
+  target_compile_features(expert-moe-vm-runner PRIVATE cxx_std_20)
+  target_link_libraries(expert-moe-vm-runner PRIVATE expert_runtime expert_core CUDA::cudart)
+  add_executable(expert-callable-vm-smoke
+    tools/callable_vm_smoke.cpp
+    $<TARGET_OBJECTS:expert-sm86-dense-moe-provider>
+    $<TARGET_OBJECTS:expert-sm86-hybrid-delta-moe-provider>)
+  target_compile_features(expert-callable-vm-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-callable-vm-smoke PRIVATE
+    expert_runtime expert_core CUDA::cudart)
 endif()
 
 if(EXPERT_RUNTIME_BUILD_TESTS)
@@ -195,5 +265,9 @@ if(EXPERT_RUNTIME_BUILD_TESTS)
   if(TARGET expert-qwen3-next-cuda-smoke)
     add_test(NAME expert-qwen3-next-cuda-smoke
       COMMAND expert-qwen3-next-cuda-smoke)
+  endif()
+  if(TARGET expert-dense-fp4-cuda-smoke)
+    add_test(NAME expert-dense-fp4-cuda-smoke
+      COMMAND expert-dense-fp4-cuda-smoke)
   endif()
 endif()

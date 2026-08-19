@@ -3,7 +3,7 @@ param(
     [string]$Tokenizer = "",
     [string]$Runner = "",
     [string]$Python = "",
-    [string]$ModelId = "qwen3-next-80b-a3b-expert-pack-int8",
+    [string]$ModelId = "",
     [string]$HostAddress = "127.0.0.1",
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
@@ -16,8 +16,11 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
-    [bool]$ProfileGpuPhases = $false,
-    [switch]$EnableMtp,
+    [switch]$ProfileGpuPhases,
+    [switch]$DisableRetainedRoute,
+    [switch]$EnableCpuHybrid,
+    [string]$WorkerRouteTraceFile = "",
+    [ValidateRange(1, 65536)][int]$WorkerRouteTraceMaxSteps = 4096,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -31,13 +34,9 @@ param(
 . (Join-Path $PSScriptRoot "Common.ps1")
 Initialize-ExperimentDirectories
 
-if (-not $Container) {
-    $Container = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
-}
-if (-not $Runner) {
-    $Runner = Join-Path $script:RepoRoot `
-        "out\build\windows-msvc-release\runtime\Release\expert-qwen3-next-runner.exe"
-}
+if (-not $Container) { throw "Container is required" }
+if (-not $Runner) { throw "Runner is required" }
+if (-not $ModelId) { throw "ModelId is required" }
 if (-not $Tokenizer) { $Tokenizer = Join-Path $Container "tokenizer" }
 if (-not $LogFile) { $LogFile = Join-Path $script:RepoRoot "logs\expert-server.jsonl" }
 
@@ -76,7 +75,18 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
 [string[]]$profileArguments = if ($ProfileGpuPhases) {
     "--profile-gpu-phases"
 } else { @() }
-[string[]]$mtpArguments = if ($EnableMtp) { "--enable-mtp" } else { @() }
+[string[]]$retainedRouteArguments = if ($DisableRetainedRoute) {
+    "--disable-worker-retained-route"
+} else { @() }
+[string[]]$cpuHybridArguments = if ($EnableCpuHybrid) {
+    "--enable-worker-cpu-hybrid"
+} else { @() }
+[string[]]$routeTraceArguments = if ($WorkerRouteTraceFile) {
+    @(
+        "--worker-route-trace-file", ([System.IO.Path]::GetFullPath($WorkerRouteTraceFile)),
+        "--worker-route-trace-max-steps", [string]$WorkerRouteTraceMaxSteps
+    )
+} else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -95,7 +105,9 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
     @profileArguments `
-    @mtpArguments `
+    @retainedRouteArguments `
+    @cpuHybridArguments `
+    @routeTraceArguments `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `

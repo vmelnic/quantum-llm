@@ -23,7 +23,11 @@ Status ResidentExpertSet::load(ExpertCache& cache,
   ResidentExpertSet candidate;
   candidate.leases_.reserve(specs.size());
   for (const auto& spec : specs) {
-    auto acquired = cache.acquire(spec.key, spec.record).get();
+    auto acquired = cache.acquire(
+        spec.key, spec.record,
+        ExpertAcquireOptions{ExpertRequestPriority::demand, false, false,
+                             true})
+                        .get();
     if (!acquired.status.ok()) {
       candidate.clear();
       static_cast<void>(cache.trim());

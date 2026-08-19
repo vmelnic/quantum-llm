@@ -1,10 +1,10 @@
 #pragma once
 
 #include "expert/runtime/cuda/deepseek_decode.hpp"
-#include "expert/runtime/deepseek_catalog.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/route_census.hpp"
+#include "expert/runtime/routed_expert_runtime.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -22,14 +22,13 @@ enum class DeepSeekScheduledState : std::uint8_t {
 };
 
 struct DeepSeekDecodeSchedulerConfig final {
-  std::uint64_t model_id{};
   std::size_t maximum_requests{};
   std::size_t maximum_inflight_acquires{};
   std::size_t maximum_layer_advances_per_poll{};
   std::size_t maximum_inflight_prefetch{1U};
   std::size_t transition_predictions_per_layer{1U};
-  // Retain the most recent six routed experts for every layer and controller.
-  // This deterministic working set is bounded by 6 * layer count.
+  // Retain the most recent routed row for every layer and controller. The
+  // descriptor supplies both row width and layer count.
   bool retain_previous_route{};
 };
 
@@ -92,8 +91,7 @@ struct DeepSeekHybridSchedulerDependencies final {
 class DeepSeekDecodeScheduler final {
  public:
   DeepSeekDecodeScheduler(DeepSeekDecodeSchedulerConfig config,
-                          ExpertCache& cache,
-                          const DeepSeekExpertCatalog& catalog,
+                          RoutedExpertRuntime& routed,
                           DeepSeekHybridSchedulerDependencies hybrid = {});
   ~DeepSeekDecodeScheduler();
   DeepSeekDecodeScheduler(const DeepSeekDecodeScheduler&) = delete;

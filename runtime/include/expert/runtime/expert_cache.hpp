@@ -86,6 +86,11 @@ struct CachePlacementConfig final {
   std::uint64_t vram_shared_burst_bytes{};
   // Optional protected streaming ring. Zero keeps one LFU-admitted pool.
   std::uint64_t vram_transient_bytes{};
+  // Optional protected RAM segment for explicit census/session evidence.
+  // The remaining RAM is a probationary LFU segment for ordinary demand.
+  // Repeated demand raises eviction temperature but does not permanently
+  // invade the census reservation.
+  std::uint64_t ram_protected_bytes{};
 };
 
 struct ExpertCacheConfig final {
@@ -98,10 +103,35 @@ struct ExpertCacheConfig final {
   bool trusted_immutable_source{false};
   // Minimum access frequency before a record earns its pageable RAM copy at
   // upload time. One (the default) retains every record on first upload;
-  // higher values leave first-touch records pack-resident on the immutable
-  // source and skip the retention memcpy until demand repeats. Appended last
-  // to keep positional aggregate initializers source-compatible.
+  // zero is for schedulers that publish route access only after execution,
+  // while higher values leave first-touch records pack-resident on the
+  // immutable source and skip the retention memcpy until demand repeats.
+  // Appended last to keep positional aggregate initializers source-compatible.
   std::uint32_t ram_retention_minimum_frequency{1};
+};
+
+enum class ExpertRequestPriority : std::uint8_t {
+  warm,
+  prefetch,
+  demand,
+};
+
+struct ExpertAcquireOptions final {
+  ExpertRequestPriority priority{ExpertRequestPriority::demand};
+  // Some schedulers observe the complete route separately. Disabling this
+  // touch prevents a miss plus its route observation from looking like reuse.
+  bool record_access{true};
+  bool allow_host_retention{true};
+  bool protect_vram{};
+  // Placement-aware callers with another exact executor may request an
+  // immediate backpressure result when device admission cannot make progress.
+  // The default preserves the cache's wait-for-capacity contract.
+  bool fail_fast_on_device_admission{};
+};
+
+struct HostPreloadOptions final {
+  ExpertRequestPriority priority{ExpertRequestPriority::warm};
+  bool protect_ram{true};
 };
 
 class ExpertLease final {
@@ -192,12 +222,46 @@ class AcquireHandle final {
   std::function<void()> cancel_;
 };
 
+struct HostPreloadResult final {
+  Status status;
+  bool retained{};
+};
+
+class HostPreloadHandle final {
+ public:
+  HostPreloadHandle() = default;
+  HostPreloadHandle(const HostPreloadHandle&) = delete;
+  HostPreloadHandle& operator=(const HostPreloadHandle&) = delete;
+  HostPreloadHandle(HostPreloadHandle&&) noexcept = default;
+  HostPreloadHandle& operator=(HostPreloadHandle&&) noexcept = default;
+  ~HostPreloadHandle();
+
+  [[nodiscard]] bool valid() const noexcept { return future_.valid(); }
+  [[nodiscard]] HostPreloadResult get() { return future_.get(); }
+  [[nodiscard]] std::future_status wait_for(
+      std::chrono::milliseconds timeout) {
+    return future_.wait_for(timeout);
+  }
+  void cancel() noexcept;
+
+ private:
+  friend class ExpertCache;
+  friend struct ExpertCacheCore;
+  HostPreloadHandle(std::future<HostPreloadResult> future,
+                    std::function<void()> cancel) noexcept;
+
+  std::future<HostPreloadResult> future_;
+  std::function<void()> cancel_;
+};
+
 struct CacheEntrySnapshot final {
   CacheState state{CacheState::absent};
   std::uint64_t reference_count{};
   std::uint64_t waiter_count{};
   bool has_host_copy{};
   bool has_device_copy{};
+  bool ram_protected{};
+  bool vram_resident{};
   std::uint32_t frequency{};
   std::uint64_t routing_score_mass_q20{};
   std::uint32_t routing_score_peak_q20{};
@@ -231,18 +295,31 @@ class ExpertCache final {
 
   [[nodiscard]] AcquireHandle acquire(const ExpertKey& key,
                                       const PayloadRecord& record);
+  [[nodiscard]] AcquireHandle acquire(const ExpertKey& key,
+                                      const PayloadRecord& record,
+                                      ExpertAcquireOptions options);
+  // Asynchronously admits an immutable record into pageable RAM without
+  // reserving or uploading VRAM. A concurrent device demand joins the same
+  // disk read and upgrades the entry after host validation completes.
+  [[nodiscard]] HostPreloadHandle preload_host(
+      const ExpertKey& key, const PayloadRecord& record,
+      HostPreloadOptions options = {});
   // Non-blocking RAM-tier lookup. Cold entries continue through acquire(); the
   // scheduler can therefore add CPU-local execution without changing SSD
   // failure semantics in the first vertical slice.
   [[nodiscard]] std::optional<HostExpertLease> try_acquire_host(
       const ExpertKey& key, const PayloadRecord& record,
-      bool record_access = true);
+      bool record_access = true,
+      ExpertRequestPriority priority = ExpertRequestPriority::demand);
   // The device directory bypasses acquire() on a hit. Feed routed selections
   // back into the LFU index so placement reflects GPU and CPU use equally.
   [[nodiscard]] bool record_access(const ExpertKey& key,
                                    std::uint32_t count = 1);
   [[nodiscard]] std::uint64_t record_accesses(
       std::span<const ExpertAccess> accesses);
+  // Promote existing copies into the bounded protected segments. This is a
+  // placement hint, not a lease: protected entries remain evictable.
+  [[nodiscard]] bool protect(const ExpertKey& key, bool ram, bool vram);
   // Requires the caller to hold leases for device entries used by the current
   // route. Returns true only when this RAM entry can displace strictly colder,
   // currently unreferenced VRAM entries (or unused VRAM already exists).

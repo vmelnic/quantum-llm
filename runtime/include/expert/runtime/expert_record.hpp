@@ -12,16 +12,30 @@ namespace expert::runtime {
 inline constexpr std::uint16_t kExpertPackVersion = 1;
 inline constexpr std::uint32_t kExpertHeaderBytes = 256;
 inline constexpr std::uint32_t kExpertPackAlignment = 4096;
-inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow = 1;
-inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 = 2;
+inline constexpr std::uint32_t kExpertEncodingAbiInt8PerRow = 1;
+inline constexpr std::uint32_t kExpertEncodingAbiFp4Block32 = 2;
+// On-record quantization ABI IDs used by the Expert Pack v1 header.
+inline constexpr std::uint32_t kExpertRecordAbiInt8PerRow = 1;
+inline constexpr std::uint32_t kExpertRecordAbiFp4Block32 = 3;
+// Compatibility names for existing artifact adapters. New common code uses
+// encoding ABI, source ABI, and record ABI as separate fields.
+inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow =
+    kExpertEncodingAbiInt8PerRow;
+inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 =
+    kExpertEncodingAbiFp4Block32;
 // FP4-E2M1 packed nibbles with one UE8M0 scale per 32-value block along each
 // output row, stored in a standard EPEXPR01 record. Shares the DeepSeek
-// compact device format (DeviceExpertFormat::deepseek_fp4_block32).
-inline constexpr std::uint32_t kExpertQuantAbiFp4Block32 = 3;
+// compact device format (DeviceExpertFormat::fp4_e2m1_ue8m0_block32).
+inline constexpr std::uint32_t kExpertQuantAbiFp4Block32 =
+    kExpertRecordAbiFp4Block32;
 inline constexpr std::uint32_t kExpertFp4BlockSize = 32;
 inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
-inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 = 2;
-inline constexpr std::uint32_t kExpertSourceAbiDeepSeekFp8Block128V1 = 3;
+inline constexpr std::uint32_t kExpertSourceAbiSplitFp4Block32V1 = 2;
+inline constexpr std::uint32_t kExpertSourceAbiSplitFp8Block128V1 = 3;
+inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 =
+    kExpertSourceAbiSplitFp4Block32V1;
+inline constexpr std::uint32_t kExpertSourceAbiDeepSeekFp8Block128V1 =
+    kExpertSourceAbiSplitFp8Block128V1;
 
 struct ExpertSections final {
   std::uint32_t hidden{};
@@ -42,7 +56,7 @@ struct ValidatedExpertRecord final {
   std::span<const std::byte> payload;
 };
 
-struct DeepSeekCompactSections final {
+struct SplitExpertSections final {
   std::uint64_t w1_weight_offset{};
   std::uint64_t w1_weight_bytes{};
   std::uint64_t w1_scale_offset{};
@@ -56,6 +70,8 @@ struct DeepSeekCompactSections final {
   std::uint64_t w2_scale_offset{};
   std::uint64_t w2_scale_bytes{};
 };
+
+using DeepSeekCompactSections = SplitExpertSections;
 
 struct ExpertAdmissionValidation final {
   Status status;

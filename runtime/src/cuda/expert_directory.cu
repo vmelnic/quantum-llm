@@ -153,7 +153,7 @@ __global__ void try_retire_entry(DeviceExpertEntry* entry,
 
 struct CudaExpertDirectory::Impl final {
   std::uint64_t model_id{};
-  std::uint32_t quant_abi{};
+  std::uint32_t encoding_abi{};
   std::uint32_t layers{};
   std::uint32_t experts{};
   std::uint32_t maximum_selections{};
@@ -250,7 +250,7 @@ CudaDirectoryPlanWorkspace::CudaDirectoryPlanWorkspace(
 CudaDirectoryPlanWorkspace::~CudaDirectoryPlanWorkspace() = default;
 
 CudaExpertDirectory::CudaExpertDirectory(
-    std::uint64_t model_id, std::uint32_t quant_abi, std::uint32_t layers,
+    std::uint64_t model_id, std::uint32_t encoding_abi, std::uint32_t layers,
     std::uint32_t experts_per_layer, std::uint32_t maximum_selections,
     std::uint32_t maximum_active_pins)
     : impl_(std::make_unique<Impl>()) {
@@ -259,7 +259,7 @@ CudaExpertDirectory::CudaExpertDirectory(
     throw std::invalid_argument("invalid CUDA expert directory geometry");
   }
   impl_->model_id = model_id;
-  impl_->quant_abi = quant_abi;
+  impl_->encoding_abi = encoding_abi;
   impl_->layers = layers;
   impl_->experts = experts_per_layer;
   impl_->maximum_selections = maximum_selections;
@@ -635,7 +635,8 @@ Status CudaExpertDirectory::wait_plan_async(
 Status CudaExpertDirectory::publish(
     const ExpertKey& key, std::shared_ptr<IDeviceAllocation> allocation) {
   std::lock_guard lock(impl_->mutex);
-  if (key.model_id != impl_->model_id || key.quant_abi != impl_->quant_abi ||
+  if (key.model_id != impl_->model_id ||
+      key.encoding_abi != impl_->encoding_abi ||
       key.layer >= impl_->layers || key.expert >= impl_->experts) {
     return Status(ErrorCode::invalid_argument,
                   "expert key is outside CUDA directory");
@@ -652,7 +653,7 @@ Status CudaExpertDirectory::publish(
                      key.expert;
   DeviceExpertEntry entry{};
   if (cuda_allocation) {
-    if (key.quant_abi == kExpertQuantAbiFp4Block32) {
+    if (cuda_allocation->packed_fp4()) {
       // Expert Pack FP4 record: the contiguous device buffer holds
       // [gate rows][up rows][gate/up UE8M0 scales][down rows][down scales],
       // so the w1/w3/w2 views are plain offsets into the same sections.
@@ -677,7 +678,7 @@ Status CudaExpertDirectory::publish(
       entry.w2_ue8m0 = reinterpret_cast<const std::uint8_t*>(
           cuda_allocation->down_scales());
       entry.format = static_cast<std::uint32_t>(
-          DeviceExpertFormat::deepseek_fp4_block32);
+          DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
     } else {
       entry.gate_up = cuda_allocation->gate_up();
       entry.gate_up_scales = cuda_allocation->gate_up_scales();
@@ -696,7 +697,7 @@ Status CudaExpertDirectory::publish(
     entry.w2_fp4 = base + sections.w2_weight_offset;
     entry.w2_ue8m0 = base + sections.w2_scale_offset;
     entry.format = static_cast<std::uint32_t>(
-        DeviceExpertFormat::deepseek_fp4_block32);
+        DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
   }
   entry.generation = ++impl_->generations[index];
   entry.state = static_cast<std::uint32_t>(DeviceExpertState::ready);
@@ -707,7 +708,7 @@ Status CudaExpertDirectory::publish(
 
 void CudaExpertDirectory::retire(const ExpertKey& key) noexcept {
   if (!impl_ || key.model_id != impl_->model_id ||
-      key.quant_abi != impl_->quant_abi || key.layer >= impl_->layers ||
+      key.encoding_abi != impl_->encoding_abi || key.layer >= impl_->layers ||
       key.expert >= impl_->experts) {
     return;
   }
@@ -729,7 +730,7 @@ void CudaExpertDirectory::retire(const ExpertKey& key) noexcept {
 
 bool CudaExpertDirectory::try_retire(const ExpertKey& key) noexcept {
   if (!impl_ || key.model_id != impl_->model_id ||
-      key.quant_abi != impl_->quant_abi || key.layer >= impl_->layers ||
+      key.encoding_abi != impl_->encoding_abi || key.layer >= impl_->layers ||
       key.expert >= impl_->experts) {
     return true;
   }
@@ -759,7 +760,7 @@ bool CudaExpertDirectory::try_retire(const ExpertKey& key) noexcept {
 
 bool CudaExpertDirectory::route_pinned(const ExpertKey& key) const noexcept {
   if (!impl_ || key.model_id != impl_->model_id ||
-      key.quant_abi != impl_->quant_abi || key.layer >= impl_->layers ||
+      key.encoding_abi != impl_->encoding_abi || key.layer >= impl_->layers ||
       key.expert >= impl_->experts) {
     return false;
   }

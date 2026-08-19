@@ -149,8 +149,8 @@ if ($completed -ne 3 -or $generated -ne $expectedRows -or
     $rows -lt 3 -or $rows -gt $generated -or
     [int]$afterInfo.active_requests -ne 0 -or
     [int]$afterInfo.worker_kv.reserved_pages -ne $retainedPages -or
-    [int]$afterInfo.worker_kv.allocated_pages -ne
-        ($retainedSessions * $pagesPerRequest)) {
+    [int]$afterInfo.worker_kv.allocated_pages -ne $retainedPages -or
+    $retainedPages -gt ($retainedSessions * $pagesPerRequest)) {
     throw "DeepSeek request resources or counters did not settle"
 }
 

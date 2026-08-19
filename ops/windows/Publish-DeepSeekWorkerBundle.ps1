@@ -43,6 +43,10 @@ $partial = $destination + ".partial"
 
 foreach ($path in @(
     (Join-Path $source "model.safetensors.index.json"),
+    (Join-Path $source "config.json"),
+    (Join-Path $source "tokenizer.json"),
+    (Join-Path $source "tokenizer_config.json"),
+    (Join-Path $source "encoding\encoding_dsv4.py"),
     (Join-Path $descriptors "dense\dense-set.tsv"),
     (Join-Path $descriptors "typed\typed-set.tsv"),
     (Join-Path $descriptors "shared\shared-set.tsv"),
@@ -51,6 +55,32 @@ foreach ($path in @(
 )) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "DeepSeek bundle dependency missing: $path"
+    }
+}
+$config = Get-Content -LiteralPath (Join-Path $source "config.json") -Raw |
+    ConvertFrom-Json
+$layers = [int]$config.num_hidden_layers
+$hiddenSize = [int]$config.hidden_size
+$vocabSize = [int]$config.vocab_size
+$maximumContext = [int64]$config.max_position_embeddings
+$expertsPerLayer = [int]$config.n_routed_experts
+$activeExperts = [int]$config.num_experts_per_tok
+$sharedExperts = [int]$config.n_shared_experts
+$expertIntermediate = [int]$config.moe_intermediate_size
+$hashLayers = [int]$config.num_hash_layers
+$mtpLayers = [int]$config.num_nextn_predict_layers
+$compressionRatios = @($config.compress_ratios | ForEach-Object { [int]$_ })
+if ($layers -le 0 -or $hiddenSize -le 0 -or $vocabSize -le 0 -or
+    $maximumContext -le 0 -or $expertsPerLayer -le 0 -or
+    $activeExperts -le 0 -or $activeExperts -gt $expertsPerLayer -or
+    $sharedExperts -lt 0 -or $expertIntermediate -le 0 -or
+    $hashLayers -lt 0 -or $hashLayers -gt $layers -or
+    $compressionRatios.Count -lt $layers) {
+    throw "DeepSeek source config has invalid or incomplete VM geometry"
+}
+foreach ($ratio in $compressionRatios[0..($layers - 1)]) {
+    if ($ratio -notin @(0, 4, 128)) {
+        throw "DeepSeek source config declares an unsupported compression ratio"
     }
 }
 if ($mtp) {
@@ -69,8 +99,8 @@ if ($mtp) {
     $mtpManifest = Get-Content -LiteralPath (Join-Path $mtp "manifest.json") `
         -Raw | ConvertFrom-Json
     if ($mtpManifest.format -ne "deepseek-mtp-resource-set-v1" -or
-        [int]$mtpManifest.layers -ne 1 -or
-        [int]$mtpManifest.routed_experts -ne 256) {
+        [int]$mtpManifest.layers -ne $mtpLayers -or
+        [int]$mtpManifest.routed_experts -ne $expertsPerLayer) {
         throw "Unsupported DeepSeek MTP resource set"
     }
     foreach ($path in @(
@@ -85,12 +115,13 @@ if ($mtp) {
     $mtpPackManifest = Get-Content -LiteralPath `
         (Join-Path $mtpRouted "manifest.json") -Raw | ConvertFrom-Json
     if ($mtpPackManifest.format -ne "deepseek-routed-compact-pack-v1" -or
-        [int]$mtpPackManifest.layers -ne 1 -or
-        [int]$mtpPackManifest.expert_count -ne 256 -or
+        [int]$mtpPackManifest.layers -ne $mtpLayers -or
+        [int]$mtpPackManifest.expert_count -ne
+            ($mtpLayers * $expertsPerLayer) -or
         @(Get-ChildItem -LiteralPath $mtpRouted -Filter "experts-*.dsc" `
-            -File).Count -ne 1 -or
+            -File).Count -ne $mtpLayers -or
         @(Get-ChildItem -LiteralPath $mtpRouted `
-            -Filter "experts-*.dsc.commit.json" -File).Count -ne 1) {
+            -Filter "experts-*.dsc.commit.json" -File).Count -ne $mtpLayers) {
         throw "Unsupported or incomplete DeepSeek MTP routed pack"
     }
 }
@@ -106,19 +137,31 @@ if (-not $packed -and $catalogHeader -ne "deepseek-routed-catalog-v1") {
     throw "Unsupported DeepSeek routed catalog"
 }
 if ($packed) {
-    if (-not (Test-Path -LiteralPath (Join-Path $routed "manifest.json") `
+    $routedManifestPath = Join-Path $routed "manifest.json"
+    if (-not (Test-Path -LiteralPath $routedManifestPath `
             -PathType Leaf) -or
         @(Get-ChildItem -LiteralPath $routed -Filter "experts-*.dsc" `
-            -File).Count -ne 43 -or
+            -File).Count -ne $layers -or
         @(Get-ChildItem -LiteralPath $routed `
-            -Filter "experts-*.dsc.commit.json" -File).Count -ne 43) {
+            -Filter "experts-*.dsc.commit.json" -File).Count -ne $layers) {
         throw "DeepSeek compact pack is not atomically complete"
+    }
+    $routedManifest = Get-Content -LiteralPath $routedManifestPath -Raw |
+        ConvertFrom-Json
+    if ([int]$routedManifest.layers -ne $layers -or
+        [int]$routedManifest.experts_per_layer -ne $expertsPerLayer -or
+        [int64]$routedManifest.expert_count -ne
+            ([int64]$layers * $expertsPerLayer)) {
+        throw "DeepSeek compact pack disagrees with source config"
     }
 }
 
 $modelHash = (Get-FileHash -LiteralPath `
     (Join-Path $source "model.safetensors.index.json") `
     -Algorithm SHA256).Hash.ToLowerInvariant()
+$mainNamespace = [Convert]::ToUInt64($modelHash.Substring(0, 15), 16)
+if ($mainNamespace -eq 0) { $mainNamespace = 1 }
+$mtpNamespace = $mainNamespace + 1
 $denseHash = (Get-FileHash -LiteralPath `
     (Join-Path $descriptors "dense\dense-set.tsv") `
     -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -145,10 +188,33 @@ try {
         Copy-Item -LiteralPath $mtp -Destination (Join-Path $partial "mtp") `
             -Recurse
     }
+    $tokenizerRoot = Join-Path $partial "tokenizer"
+    $tokenizerEncoding = Join-Path $tokenizerRoot "encoding"
+    New-Item -ItemType Directory -Path $tokenizerEncoding -Force | Out-Null
+    foreach ($name in @("config.json", "tokenizer.json", "tokenizer_config.json")) {
+        Copy-Item -LiteralPath (Join-Path $source $name) `
+            -Destination (Join-Path $tokenizerRoot $name)
+    }
+    Copy-Item -LiteralPath (Join-Path $source "encoding\encoding_dsv4.py") `
+        -Destination (Join-Path $tokenizerEncoding "encoding_dsv4.py")
+    $tokenizerEntries = foreach ($relative in @(
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "encoding/encoding_dsv4.py"
+    )) {
+        $path = Join-Path $tokenizerRoot ($relative -replace '/', '\')
+        [ordered]@{
+            path = $relative
+            bytes = (Get-Item -LiteralPath $path).Length
+            sha256 = (Get-FileHash -LiteralPath $path `
+                -Algorithm SHA256).Hash.ToLowerInvariant()
+        }
+    }
     New-Item -ItemType Directory -Path $state -Force | Out-Null
     $runtimeLines = @(
         "deepseek-worker-bundle-v$bundleVersion",
-        "model_id`t17",
+        "model_id`t$mainNamespace",
         "model_sha256`t$modelHash",
         "checkpoint`t$source",
         "dense`tdense",
@@ -167,6 +233,182 @@ try {
     $runtimeText = ($runtimeLines -join "`n") + "`n"
     Write-Utf8NoBom -Path (Join-Path $partial "runtime.tsv") `
         -Value $runtimeText
+    $modelProgramLines = @(
+        "expert-runtime-model-v1",
+        "model`t3`t$($config.model_type)`t$vocabSize`t$maximumContext`t$hiddenSize",
+        "program_input`ttoken_ids`trequest.token_ids`tbatch.token-id.u32.host.v1",
+        "program_input`tpositions`trequest.positions`tbatch.position.u32.host.v1",
+        "program_output`tnext_token_ids`tresponse.token_ids`tbatch.token-id.u32.host.v1",
+        "kernel`tembedding.lookup.int8-row.v1`t1",
+        "kernel`tblock.compressed-sparse-attention.hca.v1`t1",
+        "kernel`trouter.deepseek.v4.topk.v1`t1",
+        "kernel`tmoe.swiglu.routed.v1`t1",
+        "kernel`thead.rmsnorm.argmax.int8-row.v1`t1"
+    )
+    if ($mtp) {
+        $modelProgramLines += "kernel`tdecode.speculative.verify.v1`t1"
+        $modelProgramLines += "exact_decode`tdecode.speculative.verify.v1`t1`t2"
+        $modelProgramLines += "exact_decode_parameter`ttarget_component_index`t0"
+        $modelProgramLines += "exact_decode_parameter`tdraft_component_index`t1"
+    }
+    $modelProgramLines += (
+        "component`tdecoder`t0`t$layers`t$expertsPerLayer`t$activeExperts" +
+        "`t$sharedExperts`t$hiddenSize`t$expertIntermediate" +
+        "`tmoe.swiglu.routed.v1`t1`t2`t2" +
+        "`tfp4.e2m1.ue8m0.block32"
+    )
+    $modelProgramLines += "router`tdecoder`trouter.deepseek.v4.topk.v1`t1"
+    $modelProgramLines += "router_parameter`tdecoder`tnormalize`t1"
+    $modelProgramLines += "router_parameter`tdecoder`thash_layers`t$hashLayers"
+    if ($mtp) {
+        $modelProgramLines += (
+            "component`tdraft`t1`t$mtpLayers`t$expertsPerLayer`t$activeExperts" +
+            "`t$sharedExperts`t$hiddenSize`t$expertIntermediate" +
+            "`tmoe.swiglu.routed.v1`t1`t2`t2" +
+            "`tfp4.e2m1.ue8m0.block32"
+        )
+        $modelProgramLines += "router`tdraft`trouter.deepseek.v4.topk.v1`t1"
+        $modelProgramLines += "router_parameter`tdraft`tnormalize`t1"
+    }
+    $operation = 0
+    $modelProgramLines += (
+        "operation`t$operation`t-" +
+        "`tembedding.lookup.int8-row.v1`t1`t-`t0"
+    )
+    $modelProgramLines += (
+        "operation_input`t$operation`ttoken_ids" +
+        "`trequest.token_ids`tbatch.token-id.u32.host.v1"
+    )
+    $modelProgramLines += (
+        "operation_output`t$operation`thidden" +
+        "`thidden.0`tbatch.hca4.hidden.f32.cuda.v1"
+    )
+    $operation += 1
+    foreach ($layer in 0..($layers - 1)) {
+        $ratio = $compressionRatios[$layer]
+        $blockHidden = "layer.$layer.after_attention"
+        $expertInput = "layer.$layer.expert_input"
+        $routeIndices = "layer.$layer.route_indices"
+        $routeWeights = "layer.$layer.route_weights"
+        $residual = "layer.$layer.residual"
+        $modelProgramLines += (
+            "layer`t$layer`tblock.compressed-sparse-attention.hca.v1" +
+            "`t1`tdecoder`t$layer"
+        )
+        $modelProgramLines += "layer_parameter`t$layer`tcompression_ratio`t$ratio"
+        $modelProgramLines += (
+            "operation`t$operation`t$layer" +
+            "`tblock.compressed-sparse-attention.hca.v1`t1`t-`t0"
+        )
+        $modelProgramLines += "operation_parameter`t$operation`tcompression_ratio`t$ratio"
+        $modelProgramLines += (
+            "operation_input`t$operation`thidden`thidden.$layer" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`tpositions`trequest.positions" +
+            "`tbatch.position.u32.host.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`thidden`t$blockHidden" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $operation += 1
+        $modelProgramLines += (
+            "operation`t$operation`t$layer" +
+            "`trouter.deepseek.v4.topk.v1`t1`tdecoder`t$layer"
+        )
+        if ($layer + 1 -lt $layers) {
+            $modelProgramLines += (
+                "operation_parameter`t$operation" +
+                "`tprefetch_target_component_layer`t$($layer + 1)"
+            )
+        }
+        $modelProgramLines += (
+            "operation_input`t$operation`thidden`t$blockHidden" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`ttoken_ids`trequest.token_ids" +
+            "`tbatch.token-id.u32.host.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`texpert_input`t$expertInput" +
+            "`tbatch.hidden.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`troute_indices`t$routeIndices" +
+            "`tbatch.route-index.u32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`troute_weights`t$routeWeights" +
+            "`tbatch.route-weight.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`tresidual`t$residual" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $operation += 1
+        $modelProgramLines += (
+            "operation`t$operation`t$layer" +
+            "`tmoe.swiglu.routed.v1`t1`tdecoder`t$layer"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`texpert_input`t$expertInput" +
+            "`tbatch.hidden.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`troute_indices`t$routeIndices" +
+            "`tbatch.route-index.u32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`troute_weights`t$routeWeights" +
+            "`tbatch.route-weight.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_input`t$operation`tresidual`t$residual" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $modelProgramLines += (
+            "operation_output`t$operation`thidden`thidden.$($layer + 1)" +
+            "`tbatch.hca4.hidden.f32.cuda.v1"
+        )
+        $operation += 1
+    }
+    $modelProgramLines += (
+        "operation`t$operation`t-" +
+        "`thead.rmsnorm.argmax.int8-row.v1`t1`t-`t0"
+    )
+    $modelProgramLines += (
+        "operation_input`t$operation`thidden`thidden.$layers" +
+        "`tbatch.hca4.hidden.f32.cuda.v1"
+    )
+    $modelProgramLines += (
+        "operation_output`t$operation`ttoken_ids`tresponse.token_ids" +
+        "`tbatch.token-id.u32.host.v1"
+    )
+    $prefetchTargets = @($modelProgramLines | ForEach-Object {
+        $fields = @($_ -split "`t")
+        if ($fields.Count -eq 4 -and
+            $fields[0] -eq "operation_parameter" -and
+            $fields[2] -eq "prefetch_target_component_layer") {
+            [int]$fields[3]
+        }
+    })
+    if ($prefetchTargets.Count -ne $layers - 1) {
+        throw "DeepSeek program does not declare every cross-layer prefetch edge"
+    }
+    for ($index = 0; $index -lt $prefetchTargets.Count; $index += 1) {
+        if ($prefetchTargets[$index] -ne $index + 1) {
+            throw "DeepSeek program has a non-canonical prefetch target"
+        }
+    }
+    $modelProgramText = ($modelProgramLines -join "`n") + "`n"
+    $modelProgramPath = Join-Path $partial "runtime-model.tsv"
+    Write-Utf8NoBom -Path $modelProgramPath -Value $modelProgramText
+    $modelProgramHash = (Get-FileHash -LiteralPath $modelProgramPath `
+        -Algorithm SHA256).Hash.ToLowerInvariant()
+    $modelProgramBytes = (Get-Item -LiteralPath $modelProgramPath).Length
     $runtimeHash = (Get-FileHash -LiteralPath `
         (Join-Path $partial "runtime.tsv") -Algorithm SHA256).Hash.ToLowerInvariant()
     $manifest = [ordered]@{
@@ -188,16 +430,37 @@ try {
             routed = "fp4-e2m1-ue8m0-block32-direct"
         }
         architecture = [ordered]@{
-            model_type = "deepseek_v4_flash"
-            layers = 43
-            hidden_size = 4096
-            experts_per_layer = 256
-            active_experts = 6
-            multi_token_prediction_layers = if ($mtp) { 1 } else { 0 }
+            model_type = [string]$config.model_type
+            layers = $layers
+            hidden_size = $hiddenSize
+            vocab_size = $vocabSize
+            max_position_embeddings = $maximumContext
+            expert_intermediate_size = $expertIntermediate
+            experts_per_layer = $expertsPerLayer
+            active_experts = $activeExperts
+            shared_experts_per_layer = $sharedExperts
+            namespace_id = $mainNamespace
+            mtp_namespace_id = $mtpNamespace
+            hash_layers = $hashLayers
+            compression_ratios = @($compressionRatios[0..($layers - 1)])
+            cross_layer_prefetch_targets = @($prefetchTargets)
+            multi_token_prediction_layers = if ($mtp) { $mtpLayers } else { 0 }
+        }
+        model_program = [ordered]@{
+            format = "expert-runtime-model-v1"
+            path = "runtime-model.tsv"
+            bytes = $modelProgramBytes
+            sha256 = $modelProgramHash
+        }
+        tokenizer = [ordered]@{
+            path = "tokenizer"
+            files = @($tokenizerEntries)
         }
         masses = [ordered]@{
-            routed_payload_bytes = 147169738752
-            routed_shards = if ($packed) { 43 } else { 0 }
+            routed_payload_bytes = if ($packed) {
+                [int64]$routedManifest.pack_bytes
+            } else { 0 }
+            routed_shards = if ($packed) { [int]$routedManifest.shards } else { 0 }
             mtp_source_bytes = if ($mtp) { [long]$mtpManifest.source_bytes } else { 0 }
         }
         indexes = [ordered]@{

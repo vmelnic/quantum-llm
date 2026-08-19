@@ -1,5 +1,9 @@
 # Expert Runtime v1 contract
 
+Status: current runtime contract as of 2026-08-11. It includes the generic
+artifact/control-plane boundary; complete per-operation executor composition is
+still pending in [the MoE VM handoff](moe-vm-next.md).
+
 This document defines invariants between the portable core, Windows storage,
 heterogeneous cache/scheduler, CUDA backend, model runner, and HTTP service.
 The current backend target is Windows + RTX 3090 (SM86).
@@ -22,6 +26,13 @@ exact router → device dispatch plan → expert-centric scheduler
 
 Core contracts expose IDs, byte budgets, state and interfaces. Win32 handles
 and CUDA types remain behind backend boundaries.
+
+`runtime-model.tsv` schema 2 supplies model topology, routed components,
+router programs, ordered operations, tensor-role bindings and provider-owned
+numeric parameters. The common parser and capability registries do not inspect
+the artifact's architecture name. At present, however, the serving runner
+selects one complete worker provider for the operation set; compiled
+per-operation provider bindings are not yet the active model loop.
 
 ## Container lifecycle
 
@@ -59,11 +70,20 @@ Rules:
 - RAM cache, pinned staging, VRAM resident/transient, workspace and KV budgets
   are independent.
 
+Acquisitions carry `demand`, `prefetch` or `warm` priority. Demand is serviced
+ahead of speculative work, and an exact demand can upgrade an existing waiter.
+`preload_host` authenticates SSD bytes into bounded RAM without requiring a
+VRAM allocation. Optional protected RAM and transient VRAM segments separate
+census/session evidence from one-shot demand while remaining evictable under
+their declared budgets.
+
 `stored_bytes` and `device_bytes` are separate capacity claims. Zero
-`device_bytes` preserves the legacy equal-size path. Expanding admissions such
-as compact DeepSeek FP4 → SM86 INT8 must declare the exact hot allocation before
-I/O begins; the cache reserves that larger value and refuses work that cannot
-fit. Upload completion may shrink a reservation but may never exceed it.
+`device_bytes` preserves the legacy equal-size path. Any expanding admission
+must declare the exact hot allocation before I/O begins; the cache reserves
+that value and refuses work that cannot fit. Upload completion may shrink a
+reservation but may never exceed it. Current routed DeepSeek records remain
+13,369,344-byte FP4 records through SSD, RAM and VRAM; they are not expanded
+into the obsolete 25,198,592-byte INT8 slot.
 
 `source_abi` and the key's target `quant_abi` form a fail-closed pair. Expert
 Pack v1 records continue through their existing validator and uploader; the
@@ -72,9 +92,9 @@ block-32), and ABI 3 records stay packed through storage and residency and are
 consumed directly by the `__dp4a` selection-batch kernels — no expansion into
 INT8 slots.
 DeepSeek compact records are SHA-256 checked as complete 13,369,344-byte
-staging payloads, decoded only inside the CUDA uploader, and published as exact
-25,198,592-byte SM86 slots. Compact source bytes are never exposed through the
-host INT8 executor.
+staging payloads and published in compact form for the packed SM86 `__dp4a`
+kernels. Compact source bytes are never exposed through the legacy host INT8
+executor.
 
 FP8 shared experts use a separate source ABI with 128×128 block scales but
 converge on the same SM86 slot. Source ABI therefore selects decoding semantics;
@@ -98,7 +118,9 @@ serially through one maximum-sized pinned slot, and publishes the collection
 only after all matrices succeed. Hot paths bind matrix pointers once during
 model construction; string lookup is not part of token execution.
 
-The key is `(model_content_hash, layer, expert, quant_abi)`.
+The key is `(artifact-derived namespace, component layer, expert,
+encoding_abi)`. The namespace prevents equal local coordinates from colliding
+across artifacts or routed components.
 
 ## Heterogeneous execution
 
@@ -130,12 +152,14 @@ outer scheduler acquires the exact missing experts. Resume replans the complete
 top-k, executes only when every dependency is available, and releases the
 request's directory pin after the FFN stream completes.
 
-The immutable DeepSeek routed catalog contains exactly 43 × 256 records in
-layer-major order. Each record reconstructs one `PayloadRecord` from six
-exact-cover SafeTensors extents and declares both compact FP4 source bytes and
-expanded SM86 bytes. Lookup does not parse files, allocate, or hash in the hot
-path. Catalog generation hashes the authoritative source once; normal cache
-admission verifies the selected expert again before publication.
+The current immutable DeepSeek routed catalog contains 43 × 256 records in
+layer-major order because that is what the artifact declares. A record may
+resolve to six authenticated checkpoint extents or one compact-pack extent and
+declares compact FP4 source/device bytes. Lookup does not parse files, allocate,
+or hash in the hot path. Catalog generation hashes the authoritative source
+once; normal cache admission verifies the selected expert again before
+publication. Common catalog/VM code does not assume 43 layers or 256 experts;
+the current numeric provider still validates the geometry it supports.
 
 The DeepSeek outer scheduler converts controller misses into catalog-backed
 `ExpertCache::acquire` handles. Its independent credits bound active requests,
@@ -229,17 +253,19 @@ remain independent operator inputs.
 - useful, requested, physical-read and overfetch bytes are measured separately;
 - EOF, short completion, checksum mismatch and device removal fail closed.
 
-DeepSeek ingestion uses an exact-cover gather descriptor. Six buffered,
-overlapped SafeTensors reads target disjoint offsets in one pinned staging
-buffer, then a whole-payload checksum gates CUDA admission. Buffered children
-are intentional because tensor offsets need not satisfy sector alignment;
+Legacy DeepSeek source-catalog ingestion uses an exact-cover gather descriptor:
+six buffered, overlapped SafeTensors reads target disjoint offsets in one
+pinned staging buffer, then a whole-payload checksum gates CUDA admission.
+Compact-pack ingestion resolves one aligned extent. Buffered children are
+intentional because source tensor offsets need not satisfy sector alignment;
 unbuffered aligned reads remain the contiguous-pack path. No full checkpoint or
-per-expert payload copy is created.
+extra per-expert payload copy is created.
 
 ## CUDA ABI
 
-`expert-pack-sm86-int8-row-v1` consumes symmetric per-row INT8 expert weights
-and FP32 scales. `expert-pack-sm86-fp4-block32-v1` consumes packed FP4-E2M1
+`expert-pack-sm86-int8-row-v1` is the retained generic legacy ABI for symmetric
+per-row INT8 weights and FP32 scales.
+`expert-pack-sm86-fp4-block32-v1` consumes packed FP4-E2M1
 expert weights with one UE8M0 scale per 32-value block. Expert function:
 
 ```text
@@ -254,9 +280,9 @@ The straightforward FP32-activation kernel is the numerical oracle, not the
 performance contract. Optimized kernels may change internal tiling/dtype only
 behind a versioned kernel ABI and correctness tolerance.
 
-## Qwen3-Next runtime
+## Native provider state
 
-The runner implements full-attention GQA with partial RoPE/output gate and
+The Qwen provider implements full-attention GQA with partial RoPE/output gate and
 Gated DeltaNet with persistent Conv/recurrent state. Dense projection, routed
 expert grouping and aggregation operate on a microbatch. KV/Conv/DeltaNet state
 is isolated by worker slot; weights/cache are shared.
@@ -271,6 +297,11 @@ KV is reserved in 256-token, 6 MiB superpages spanning all twelve full-attention
 layers. Page credits are acquired per request, physical pages are allocated on
 first use, and released pages enter a bounded reuse pool. Online-softmax
 attention does not allocate a score array proportional to context length.
+
+DeepSeek and LFM own their distinct attention/recurrent and dense-prefix state
+behind their operation capability sets. They share the common service,
+artifact program and expert-page contracts, but their complete request loops
+have not yet been replaced by the common operation interpreter.
 
 Only 4096 context with capacity four has completed the historical
 qualification. The reference lifecycle currently advertises 65,536 tokens and
@@ -327,6 +358,12 @@ The runtime distinguishes SSD misses, RAM hits, VRAM hits, useful/read/uploaded
 bytes, cache high-water marks, executor time, batch rows, TTFT and inter-token
 latency. Metrics windows are bounded. A benchmark must identify cold/warm/frozen
 placement and cannot infer hot-path throughput from configuration alone.
+
+Cache attribution is split by demand/prefetch/warm priority and includes
+storage/upload/wait time, reload count, reread bytes, host-preload usefulness
+and waste, priority upgrades, protected/probationary RAM, transient/protected
+VRAM and staging high-water marks. These counters are the gate for any renewed
+placement optimization; configured cache size is not evidence of a hit rate.
 
 Expert-lane telemetry distinguishes CPU and resident-GPU selections and time,
 reports nanoseconds per selection, and accounts separately for compact CPU

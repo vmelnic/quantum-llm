@@ -54,6 +54,15 @@ bool valid_section(std::uint64_t offset, std::uint64_t bytes,
          bytes <= record_bytes && offset <= record_bytes - bytes;
 }
 
+bool align_up(std::uint64_t value, std::uint64_t alignment,
+              std::uint64_t& result) noexcept {
+  if (alignment == 0U || value >
+      std::numeric_limits<std::uint64_t>::max() - (alignment - 1U))
+    return false;
+  result = (value + alignment - 1U) / alignment * alignment;
+  return true;
+}
+
 }  // namespace
 
 ExpertRecordValidation validate_expert_record(
@@ -75,7 +84,7 @@ ExpertRecordValidation validate_expert_record(
   const auto version = read_le<std::uint16_t>(raw + 8);
   const auto header_bytes = read_le<std::uint16_t>(raw + 10);
   const auto flags = read_le<std::uint32_t>(raw + 12);
-  const auto quant_abi = read_le<std::uint32_t>(raw + 16);
+  const auto record_abi = read_le<std::uint32_t>(raw + 16);
   const auto layer = read_le<std::int32_t>(raw + 20);
   const auto expert = read_le<std::int32_t>(raw + 24);
   const auto hidden = read_le<std::uint32_t>(raw + 28);
@@ -86,9 +95,13 @@ ExpertRecordValidation validate_expert_record(
 
   if (version != kExpertPackVersion || header_bytes != kExpertHeaderBytes ||
       flags != kRequiredFlags ||
-      (quant_abi != kExpertQuantAbiInt8PerRow &&
-       quant_abi != kExpertQuantAbiFp4Block32) ||
-      quant_abi != key.quant_abi || reserved != 0 ||
+      (record_abi != kExpertRecordAbiInt8PerRow &&
+       record_abi != kExpertRecordAbiFp4Block32) ||
+      (expected.record_abi != 0U && record_abi != expected.record_abi) ||
+      (record_abi == kExpertRecordAbiFp4Block32
+           ? kExpertEncodingAbiFp4Block32
+           : kExpertEncodingAbiInt8PerRow) != key.encoding_abi ||
+      reserved != 0 ||
       layer < 0 || expert < 0 || static_cast<std::uint32_t>(layer) != key.layer ||
       static_cast<std::uint32_t>(expert) != key.expert ||
       record_bytes != expected.stored_bytes || hidden == 0 || intermediate == 0 ||
@@ -96,7 +109,7 @@ ExpertRecordValidation validate_expert_record(
     return failure(ErrorCode::checksum_mismatch,
                    "expert header/manifest ABI mismatch");
   }
-  const bool fp4 = quant_abi == kExpertQuantAbiFp4Block32;
+  const bool fp4 = record_abi == kExpertRecordAbiFp4Block32;
   if (fp4 && (hidden % kExpertFp4BlockSize != 0 ||
               intermediate % kExpertFp4BlockSize != 0)) {
     return failure(ErrorCode::checksum_mismatch,
@@ -203,13 +216,13 @@ ExpertRecordValidation validate_expert_record(
 ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& key,
     const PayloadRecord& expected, bool verify_payload_sha256) noexcept {
-  if ((key.quant_abi == kExpertQuantAbiInt8PerRow ||
-       key.quant_abi == kExpertQuantAbiFp4Block32) &&
+  if ((key.encoding_abi == kExpertEncodingAbiInt8PerRow ||
+       key.encoding_abi == kExpertEncodingAbiFp4Block32) &&
       expected.source_abi == kExpertSourceAbiExpertPackV1) {
     const auto validated = validate_expert_record(bytes, key, expected);
     return {validated.status, validated.record.sections, {}};
   }
-  if (key.quant_abi != kExpertQuantAbiDeepSeekSm86 ||
+  if (key.encoding_abi != kExpertEncodingAbiFp4Block32 ||
       (expected.source_abi != kExpertSourceAbiDeepSeekCompactV1 &&
        expected.source_abi != kExpertSourceAbiDeepSeekFp8Block128V1)) {
     return admission_failure(ErrorCode::invalid_argument,
@@ -217,17 +230,51 @@ ExpertAdmissionValidation validate_expert_admission(
   }
   const bool fp8 =
       expected.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1;
-  // FP8 shared experts expand into the int8 SM86 slot on device; compact
-  // routed experts execute directly from the packed FP4 record, so their
-  // device footprint equals the stored bytes.
-  const std::uint64_t device_bytes = fp8 ? 25'198'592U : 13'369'344U;
-  const std::uint64_t weight_bytes = fp8 ? 8'388'608U : 4'194'304U;
-  const std::uint64_t scale_bytes = fp8 ? 512U : 262'144U;
-  const std::uint64_t source_bytes =
-      fp8 ? 25'167'360U : 13'369'344U;
+  const auto hidden = expected.hidden == 0U ? 4096U : expected.hidden;
+  const auto intermediate =
+      expected.intermediate == 0U ? 2048U : expected.intermediate;
+  const auto block = expected.quant_block_size == 0U
+                         ? (fp8 ? 128U : kExpertFp4BlockSize)
+                         : expected.quant_block_size;
+  std::uint64_t elements = 0U;
+  if (!multiply(hidden, intermediate, elements) ||
+      (fp8 && (block != 128U || hidden % block != 0U ||
+               intermediate % block != 0U)) ||
+      (!fp8 && (block != kExpertFp4BlockSize || hidden % block != 0U ||
+                intermediate % block != 0U)))
+    return admission_failure(ErrorCode::checksum_mismatch,
+                             "split expert source geometry is invalid");
+  const std::uint64_t weight_bytes = fp8 ? elements : elements / 2U;
+  const std::uint64_t scale_bytes =
+      fp8 ? static_cast<std::uint64_t>(hidden / block) *
+                (intermediate / block)
+          : elements / block;
+  const std::uint64_t source_bytes = 3U * (weight_bytes + scale_bytes);
+  std::uint64_t gate_up_scale_offset = 0U;
+  std::uint64_t down_offset = 0U;
+  std::uint64_t down_scale_offset = 0U;
+  std::uint64_t hot_bytes = 0U;
+  const auto gate_up_bytes = 2U * elements;
+  const auto gate_up_scale_bytes =
+      2ULL * intermediate * sizeof(float);
+  const auto down_bytes = elements;
+  const auto down_scale_bytes = static_cast<std::uint64_t>(hidden) * sizeof(float);
+  if (!align_up(gate_up_bytes, kSectionAlignment, gate_up_scale_offset) ||
+      !align_up(gate_up_scale_offset + gate_up_scale_bytes,
+                kSectionAlignment, down_offset) ||
+      !align_up(down_offset + down_bytes, kSectionAlignment,
+                down_scale_offset) ||
+      !align_up(down_scale_offset + down_scale_bytes, kSectionAlignment,
+                hot_bytes))
+    return admission_failure(ErrorCode::checksum_mismatch,
+                             "split expert target geometry overflows");
+  // FP8 source records expand to INT8-per-row. FP4 source records execute
+  // directly from the packed bytes, but target section metadata still
+  // describes the optional expanded view.
+  const std::uint64_t device_bytes = fp8 ? hot_bytes : source_bytes;
   if (expected.stored_bytes != source_bytes || bytes.size() != source_bytes ||
       expected.device_bytes != device_bytes || expected.header_bytes != 0U ||
-      expected.decoded_bytes != 3ULL * 4096U * 2048U * sizeof(float)) {
+      expected.decoded_bytes != 3ULL * elements * sizeof(float)) {
     return admission_failure(ErrorCode::checksum_mismatch,
                              "DeepSeek compact admission geometry mismatch");
   }
@@ -265,16 +312,16 @@ ExpertAdmissionValidation validate_expert_admission(
     }
   }
   ExpertSections target{};
-  target.hidden = 4096U;
-  target.intermediate = 2048U;
+  target.hidden = hidden;
+  target.intermediate = intermediate;
   target.gate_up_q_offset = 0U;
-  target.gate_up_q_bytes = 16'777'216U;
-  target.gate_up_scale_offset = 16'777'216U;
-  target.gate_up_scale_bytes = 16'384U;
-  target.down_q_offset = 16'793'600U;
-  target.down_q_bytes = 8'388'608U;
-  target.down_scale_offset = 25'182'208U;
-  target.down_scale_bytes = 16'384U;
+  target.gate_up_q_bytes = gate_up_bytes;
+  target.gate_up_scale_offset = gate_up_scale_offset;
+  target.gate_up_scale_bytes = gate_up_scale_bytes;
+  target.down_q_offset = down_offset;
+  target.down_q_bytes = down_bytes;
+  target.down_scale_offset = down_scale_offset;
+  target.down_scale_bytes = down_scale_bytes;
   return {Status::success(), target, compact};
 }
 

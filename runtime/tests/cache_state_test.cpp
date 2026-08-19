@@ -1,21 +1,29 @@
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
+#include "expert/runtime/expert_catalog.hpp"
 #include "expert/runtime/expert_store.hpp"
+#include "expert/runtime/execution_provider.hpp"
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/hybrid_dispatch.hpp"
+#include "expert/runtime/model_descriptor.hpp"
+#include "expert/runtime/moe_virtual_machine.hpp"
 #include "expert/runtime/placement_profile.hpp"
+#include "expert/runtime/program_executor.hpp"
 #include "expert/runtime/resource_governor.hpp"
 #include "expert/runtime/route_census.hpp"
+#include "expert/runtime/routed_expert_runtime.hpp"
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
+#include "expert/runtime/worker_contract.hpp"
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -90,6 +98,9 @@ void test_deepseek_compact_admission_validation() {
   record.stored_bytes = bytes.size();
   record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
   record.device_bytes = 13'369'344U;
+  record.hidden = 4096U;
+  record.intermediate = 2048U;
+  record.quant_block_size = 32U;
   record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
   record.header_bytes = 0U;
   record.alignment = 1U;
@@ -109,6 +120,968 @@ void test_deepseek_compact_admission_validation() {
           "trusted DeepSeek compact admission accepted a UE8M0 NaN");
 }
 
+void test_headerless_fp4_admission_is_geometry_driven() {
+  constexpr std::uint32_t hidden = 64U;
+  constexpr std::uint32_t intermediate = 32U;
+  constexpr std::uint64_t elements =
+      static_cast<std::uint64_t>(hidden) * intermediate;
+  constexpr std::uint64_t matrix_bytes = elements / 2U;
+  constexpr std::uint64_t scale_bytes = elements / 32U;
+  std::vector<std::byte> bytes(3U * (matrix_bytes + scale_bytes),
+                               std::byte{1});
+  er::PayloadRecord record;
+  record.stored_bytes = bytes.size();
+  record.decoded_bytes = 3U * elements * sizeof(float);
+  record.device_bytes = bytes.size();
+  record.hidden = hidden;
+  record.intermediate = intermediate;
+  record.quant_block_size = 32U;
+  record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
+  record.header_bytes = 0U;
+  record.alignment = 1U;
+  record.payload_sha256 = er::sha256(bytes);
+  const er::ExpertKey key{0xfeedbeefU, 0U, 0U,
+                          er::kExpertEncodingAbiFp4Block32};
+  const auto result = er::validate_expert_admission(bytes, key, record);
+  require(result.status.ok() && result.target.hidden == hidden &&
+              result.target.intermediate == intermediate &&
+              result.compact.w1_scale_offset == matrix_bytes &&
+              result.compact.w3_weight_offset == matrix_bytes + scale_bytes &&
+              result.compact.w2_scale_offset ==
+                  3U * matrix_bytes + 2U * scale_bytes,
+          "headerless FP4 admission ignored descriptor geometry");
+}
+
+void test_universal_model_descriptor_negotiates_capabilities() {
+  er::ModelDescriptor descriptor;
+  descriptor.architecture_id = "fixture.sparse-transformer";
+  descriptor.vocab_size = 32000U;
+  descriptor.max_context_tokens = 131072U;
+  descriptor.hidden_size = 4096U;
+  descriptor.attributes.emplace("attention_heads", 32U);
+  descriptor.routed_components.push_back(
+      {"decoder", 0x101U, 91U, 1024U, 8U, 1U, 4096U, 1536U,
+       "moe.fixture.vendor-fp4", 7U, 77U, 91U,
+       "fp4.fixture.group64", {{"group_size", 64U}}, {}});
+  descriptor.required_kernels = {
+      {"attention.fixture.v1", 1U}, {"moe.fixture.vendor-fp4", 7U}};
+  for (std::uint32_t layer = 0U; layer < 96U; ++layer) {
+    descriptor.layer_program.push_back(
+        {layer, "attention.fixture.v1", 1U,
+         layer < 5U ? "" : "decoder", layer < 5U ? 0U : layer - 5U,
+         {{"window", layer < 8U ? 4096U : 0U}}});
+  }
+  require(er::validate_model_descriptor(descriptor).ok() &&
+              er::expert_table_entries(descriptor.routed_components.front()) ==
+                  91ULL * 1024U,
+          "universal descriptor rejected a valid sparse topology");
+  const std::array supported{
+      er::KernelCapability{"attention.fixture.v1", 1U, 1U},
+      er::KernelCapability{
+          "moe.fixture.vendor-fp4", 6U, 9U,
+          [](const er::ModelDescriptor& candidate) {
+            const auto* component =
+                er::find_routed_component(candidate, "decoder");
+            if (component == nullptr ||
+                component->encoding != "fp4.fixture.group64" ||
+                !component->attributes.contains("group_size") ||
+                component->attributes.at("group_size") != 64U)
+              return er::Status(er::ErrorCode::invalid_argument,
+                                "fixture provider rejected numeric encoding");
+            return er::Status::success();
+          }}};
+  require(er::provider_supports_model(descriptor, supported).ok(),
+          "provider capability negotiation rejected supported operation ABIs");
+  const auto compiled = er::compile_model_program(descriptor, supported);
+  require(compiled.status.ok() && compiled.program.layers.size() == 96U &&
+              compiled.program.kernels.size() == 2U &&
+              !compiled.program.layers[4U].routed_component_index &&
+              compiled.program.layers[73U].component_layer == 68U &&
+              compiled.program.layers[73U].routed_component_index == 0U,
+          "universal descriptor did not compile to numeric provider bindings");
+  auto unsupported_encoding = descriptor;
+  unsupported_encoding.routed_components.front().attributes["group_size"] =
+      32U;
+  require(!er::compile_model_program(unsupported_encoding, supported)
+               .status.ok(),
+          "provider-specific constraints leaked out of capability validation");
+  const std::array incomplete{
+      er::KernelCapability{"moe.fixture.vendor-fp4", 6U, 9U}};
+  require(!er::provider_supports_model(descriptor, incomplete).ok(),
+          "provider capability negotiation accepted a missing attention ABI");
+  auto malformed = descriptor;
+  malformed.layer_program.back().logical_layer = 97U;
+  require(!er::validate_model_descriptor(malformed).ok(),
+          "universal descriptor accepted a non-contiguous layer program");
+}
+
+void test_serialized_model_program_is_provider_neutral() {
+  constexpr std::string_view artifact =
+      "expert-runtime-model-v1\n"
+      "model\t1\tfixture.hybrid.sparse\t64001\t262144\t6144\n"
+      "attribute\tattention_heads\t48\n"
+      "kernel\tblock.fixture.dense-prefix.v2\t2\n"
+      "kernel\tblock.fixture.windowed.v3\t3\n"
+      "kernel\tmoe.fixture.fp4-group64.v5\t5\n"
+      "component\tdecoder\t0\t2\t1000\t7\t2\t6144\t1792\t"
+      "moe.fixture.fp4-group64.v5\t5\t91\t42\t"
+      "fp4.fixture.e2m1.group64\n"
+      "component_attribute\tdecoder\tgroup_size\t64\n"
+      "layer\t0\tblock.fixture.dense-prefix.v2\t2\t-\t0\n"
+      "layer_parameter\t0\twindow\t8192\n"
+      "layer\t1\tblock.fixture.windowed.v3\t3\tdecoder\t0\n"
+      "layer_parameter\t1\twindow\t4096\n"
+      "layer\t2\tblock.fixture.windowed.v3\t3\tdecoder\t1\n";
+  er::Sha256Digest content_hash{};
+  content_hash[0] = std::byte{0xa5};
+  const auto parsed =
+      er::parse_model_descriptor_artifact(artifact, content_hash, 0x9000U);
+  require(parsed.status.ok() &&
+              parsed.descriptor.architecture_id ==
+                  "fixture.hybrid.sparse" &&
+              parsed.descriptor.routed_components.size() == 1U &&
+              parsed.descriptor.routed_components.front().namespace_id ==
+                  0x9000U &&
+              parsed.descriptor.routed_components.front().experts_per_layer ==
+                  1000U &&
+              parsed.descriptor.routed_components.front().encoding ==
+                  "fp4.fixture.e2m1.group64" &&
+              parsed.descriptor.layer_program.front().routed_component.empty() &&
+              parsed.descriptor.layer_program.back().component_layer == 1U,
+          "serialized model program retained provider/model assumptions");
+  const auto root = std::filesystem::temp_directory_path() /
+                    "expert-runtime-model-program";
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+  std::filesystem::create_directories(root);
+  const auto path = root / "runtime-model.tsv";
+  {
+    std::ofstream output(path, std::ios::binary);
+    output.write(artifact.data(), static_cast<std::streamsize>(artifact.size()));
+  }
+  const auto artifact_bytes = std::as_bytes(
+      std::span<const char>(artifact.data(), artifact.size()));
+  const auto loaded = er::load_model_descriptor_artifact(
+      path, artifact.size(), er::sha256(artifact_bytes), content_hash, 0x9000U);
+  require(loaded.status.ok() &&
+              loaded.descriptor.layer_program.size() == 3U,
+          "model program file did not pass its size/SHA binding");
+  auto wrong_sha = er::sha256(artifact_bytes);
+  wrong_sha[0] ^= std::byte{1};
+  require(!er::load_model_descriptor_artifact(
+               path, artifact.size(), wrong_sha, content_hash, 0x9000U)
+               .status.ok(),
+          "model program file accepted the wrong artifact SHA");
+  const auto duplicate = std::string(artifact) +
+                         "layer_parameter\t1\twindow\t2048\n";
+  require(!er::parse_model_descriptor_artifact(duplicate, content_hash,
+                                                0x9000U)
+               .status.ok(),
+          "serialized model program accepted duplicate parameters");
+  require(!er::parse_model_descriptor_artifact(artifact, content_hash, 0U)
+               .status.ok(),
+          "serialized model program accepted an unbound namespace");
+  std::filesystem::remove_all(root, cleanup_error);
+}
+
+void test_schema_v2_artifact_binds_unknown_model_without_architecture_branch() {
+  constexpr std::string_view artifact =
+      "expert-runtime-model-v1\n"
+      "model\t2\tunknown.vendor.fp4.moe\t70001\t524288\t5120\n"
+      "model_tensor\ttoken_embedding\tmodel.embed.weight\n"
+      "kernel\tblock.vendor.windowed.v4\t4\n"
+      "kernel\trouter.vendor.grouped-topk.v3\t3\n"
+      "kernel\tmoe.vendor.fp4-block64.v8\t8\n"
+      "component\tdecoder\t0\t1\t513\t9\t1\t5120\t1664\t"
+      "moe.vendor.fp4-block64.v8\t8\t77\t91\t"
+      "fp4.vendor.e2m1.block64\n"
+      "component_attribute\tdecoder\tgroup_size\t64\n"
+      "router\tdecoder\trouter.vendor.grouped-topk.v3\t3\n"
+      "router_parameter\tdecoder\tnormalize\t1\n"
+      "router_parameter\tdecoder\tgroups\t8\n"
+      "layer\t0\tblock.vendor.windowed.v4\t4\tdecoder\t0\n"
+      "layer_parameter\t0\twindow\t16384\n"
+      "operation\t0\t0\tblock.vendor.windowed.v4\t4\t-\t0\n"
+      "operation_parameter\t0\twindow\t16384\n"
+      "operation_tensor\t0\tinput_norm\tmodel.layers.0.norm.weight\n"
+      "operation\t1\t0\trouter.vendor.grouped-topk.v3\t3\tdecoder\t0\n"
+      "operation\t2\t0\tmoe.vendor.fp4-block64.v8\t8\tdecoder\t0\n";
+  er::Sha256Digest content_hash{};
+  content_hash[0] = std::byte{0x5a};
+  auto parsed =
+      er::parse_model_descriptor_artifact(artifact, content_hash, 0x4100U);
+  require(parsed.status.ok() && parsed.descriptor.schema_version == 2U &&
+              parsed.descriptor.routed_components.front()
+                      .router.parameters.at("groups") == 8U &&
+              parsed.descriptor.tensor_bindings.at("token_embedding") ==
+                  "model.embed.weight" &&
+              parsed.descriptor.operation_program.front()
+                      .tensor_bindings.at("input_norm") ==
+                  "model.layers.0.norm.weight" &&
+              parsed.descriptor.operation_program.size() == 3U,
+          "schema v2 artifact did not preserve router and operation IR");
+
+  er::ExecutionProviderRegistry registry;
+  require(registry
+              .add({"incomplete-high-priority", 100U,
+                    {er::KernelCapability{"block.vendor.windowed.v4", 4U,
+                                          4U},
+                     er::KernelCapability{"moe.vendor.fp4-block64.v8", 8U,
+                                          8U}}})
+              .ok(),
+          "provider registry rejected an internally valid partial provider");
+  require(registry
+              .add({"generic-sm86-fp4", 10U,
+                    {er::KernelCapability{"block.vendor.windowed.v4", 4U,
+                                          4U},
+                     er::KernelCapability{"router.vendor.grouped-topk.v3", 3U,
+                                          3U},
+                     er::KernelCapability{
+                         "moe.vendor.fp4-block64.v8", 8U, 8U,
+                         [](const er::ModelDescriptor& descriptor) {
+                           const auto* component =
+                               er::find_routed_component(descriptor, "decoder");
+                           return component != nullptr &&
+                                          component->encoding ==
+                                              "fp4.vendor.e2m1.block64"
+                                      ? er::Status::success()
+                                      : er::Status(
+                                            er::ErrorCode::invalid_argument,
+                                            "unsupported fixture encoding");
+                         }}}})
+              .ok(),
+          "provider registry rejected the complete generic provider");
+  const auto bound = registry.bind(parsed.descriptor);
+  require(bound.status.ok() && bound.provider.providers.size() == 2U &&
+              bound.provider.providers[0U].name ==
+                  "incomplete-high-priority" &&
+              bound.provider.providers[1U].name == "generic-sm86-fp4" &&
+              bound.provider.program.operations.size() == 3U &&
+              bound.provider.program.operations[1U].logical_layer == 0U &&
+              bound.provider.program.operations.front()
+                      .tensor_bindings.at("input_norm") ==
+                  "model.layers.0.norm.weight" &&
+              bound.provider.program.operations[1U]
+                      .routed_component_index == 0U,
+          "unknown artifact was not composed solely by operation capabilities");
+
+  auto incomplete_ir = parsed.descriptor;
+  incomplete_ir.operation_program.pop_back();
+  require(!registry.bind(incomplete_ir).status.ok(),
+          "VM accepted a routed layer without its expert operation");
+  const auto duplicate_binding = std::string(artifact) +
+      "operation_tensor\t0\tinput_norm\tmodel.other.weight\n";
+  require(!er::parse_model_descriptor_artifact(
+               duplicate_binding, content_hash, 0x4100U)
+               .status.ok(),
+          "VM artifact accepted a duplicate operation tensor role");
+}
+
+er::ExecutionValue fixture_scalar(
+    std::uint64_t value,
+    std::string abi = "fixture.scalar.u64.v1") {
+  auto owner = std::make_shared<std::uint64_t>(value);
+  return {std::move(abi), "host.fixture", owner,
+          reinterpret_cast<const std::byte*>(owner.get()), sizeof(value)};
+}
+
+std::uint64_t fixture_scalar_value(const er::ExecutionValue& value) {
+  std::uint64_t result{};
+  require(value.valid() && value.bytes == sizeof(result),
+          "fixture execution value is not a scalar");
+  std::memcpy(&result, value.data, sizeof(result));
+  return result;
+}
+
+class FixtureModelTensorStore final : public er::IModelTensorStore {
+ public:
+  FixtureModelTensorStore() {
+    auto tensor = std::make_shared<er::ImmutableModelTensor>();
+    tensor->name = "fixture.bias";
+    tensor->encoding = "fixture.u64";
+    tensor->quant_abi = 1U;
+    tensor->shape = {1U};
+    tensor->value = fixture_scalar(7U, "fixture.tensor.u64.v1");
+    tensor_ = std::move(tensor);
+  }
+
+  er::ResolveModelTensorResult resolve(std::string_view name) override {
+    ++resolves;
+    if (name != tensor_->name)
+      return {{er::ErrorCode::invalid_argument,
+               "fixture tensor does not exist"},
+              {}};
+    return {er::Status::success(), tensor_};
+  }
+
+  std::uint32_t resolves{};
+
+ private:
+  std::shared_ptr<const er::ImmutableModelTensor> tensor_;
+};
+
+struct FixtureOperationProviderControl final {
+  std::map<std::uint32_t, std::uint32_t> prepared;
+  std::map<std::uint32_t, std::uint32_t> executed;
+  std::optional<std::uint32_t> delayed_operation;
+  std::optional<std::uint32_t> failed_operation;
+  std::optional<std::uint32_t> wrong_abi_operation;
+  std::uint32_t states_created{};
+  std::uint32_t states_destroyed{};
+  std::uint32_t states_alive{};
+  std::uint32_t cancellations{};
+  std::uint32_t exact_prepared{};
+  std::uint32_t exact_synchronizations{};
+  std::uint32_t exact_executions{};
+};
+
+class FixtureOperationRequestState final
+    : public er::IOperationProviderRequestState {
+ public:
+  explicit FixtureOperationRequestState(
+      std::shared_ptr<FixtureOperationProviderControl> control)
+      : control_(std::move(control)) {
+    ++control_->states_alive;
+  }
+  ~FixtureOperationRequestState() override {
+    --control_->states_alive;
+    ++control_->states_destroyed;
+  }
+
+ private:
+  std::shared_ptr<FixtureOperationProviderControl> control_;
+};
+
+class FixturePreparedOperation final : public er::IPreparedOperation {
+ public:
+  std::uint32_t logical_operation{};
+  std::uint64_t add{};
+  std::string output_abi;
+};
+
+class FixturePreparedExactDecode final : public er::IPreparedOperation {};
+
+class FixtureCallableOperationProvider final : public er::IOperationProvider {
+ public:
+  explicit FixtureCallableOperationProvider(
+      std::shared_ptr<FixtureOperationProviderControl> control)
+      : control_(std::move(control)) {}
+
+  er::PrepareOperationResult prepare(
+      const er::OperationPreparationContext& context) override {
+    if (context.operation.output_bindings.size() != 1U)
+      return {{er::ErrorCode::invalid_argument,
+               "fixture operation requires one output"},
+              {}};
+    auto prepared = std::make_shared<FixturePreparedOperation>();
+    prepared->logical_operation = context.operation.logical_operation;
+    const auto parameter = context.operation.parameters.find("add");
+    if (parameter != context.operation.parameters.end())
+      prepared->add = parameter->second;
+    for (const auto& tensor : context.tensors) {
+      if (tensor.role != "bias" || !tensor.tensor)
+        return {{er::ErrorCode::invalid_argument,
+                 "fixture tensor binding is invalid"},
+                {}};
+      prepared->add += fixture_scalar_value(tensor.tensor->value);
+    }
+    prepared->output_abi =
+        context.operation.output_bindings.begin()->second.abi;
+    ++control_->prepared[prepared->logical_operation];
+    return {er::Status::success(), std::move(prepared)};
+  }
+
+  er::CreateOperationRequestStateResult create_request_state(
+      const er::ProgramRequestContext&) override {
+    ++control_->states_created;
+    return {er::Status::success(),
+            std::make_shared<FixtureOperationRequestState>(control_)};
+  }
+
+  er::OperationExecutionHandle execute(
+      const er::IPreparedOperation& operation,
+      const std::shared_ptr<er::IOperationProviderRequestState>& request_state,
+      const er::OperationInvocation& invocation) override {
+    const auto* prepared =
+        dynamic_cast<const FixturePreparedOperation*>(&operation);
+    if (prepared == nullptr || !request_state || invocation.inputs.size() != 1U)
+      return {};
+    ++control_->executed[prepared->logical_operation];
+    struct InvocationState final {
+      std::shared_ptr<FixtureOperationProviderControl> control;
+      std::shared_ptr<er::IOperationProviderRequestState> request_state;
+      std::uint32_t logical_operation{};
+      std::uint64_t value{};
+      std::string output_abi;
+      std::uint32_t polls{};
+      bool terminal{};
+    };
+    auto state = std::make_shared<InvocationState>();
+    state->control = control_;
+    state->request_state = request_state;
+    state->logical_operation = prepared->logical_operation;
+    state->value = fixture_scalar_value(invocation.inputs.front()) +
+                   prepared->add;
+    state->output_abi = prepared->output_abi;
+    return er::OperationExecutionHandle::from_callbacks(
+        [state]() -> std::optional<er::OperationExecutionResult> {
+          if (state->terminal) return std::nullopt;
+          if (state->control->delayed_operation ==
+                  state->logical_operation &&
+              state->polls++ == 0U)
+            return std::nullopt;
+          state->terminal = true;
+          if (state->control->failed_operation == state->logical_operation)
+            return er::OperationExecutionResult{
+                {er::ErrorCode::internal, "fixture operation failed"}, {}};
+          auto abi = state->output_abi;
+          if (state->control->wrong_abi_operation ==
+              state->logical_operation)
+            abi = "fixture.wrong-abi.v1";
+          return er::OperationExecutionResult{
+              er::Status::success(),
+              {fixture_scalar(state->value, std::move(abi))}};
+        },
+        [state] {
+          if (state->terminal) return;
+          state->terminal = true;
+          ++state->control->cancellations;
+        });
+  }
+
+  er::PrepareOperationResult prepare_exact_decode(
+      const er::ExactDecodePreparationContext& context) override {
+    if (context.compiled.maximum_emitted_tokens != 2U ||
+        context.tensors.size() != 1U ||
+        context.tensors.front().role != "bias" ||
+        !context.tensors.front().tensor ||
+        context.tensors.front().tensor->name != "fixture.bias")
+      return {{er::ErrorCode::invalid_argument,
+               "fixture exact decode binding is invalid"},
+              {}};
+    ++control_->exact_prepared;
+    return {er::Status::success(),
+            std::make_shared<FixturePreparedExactDecode>()};
+  }
+
+  er::Status synchronize_exact_decode(
+      const er::IPreparedOperation& operation,
+      const std::shared_ptr<er::IOperationProviderRequestState>& request_state,
+      const er::ExactDecodeSynchronization&) override {
+    if (dynamic_cast<const FixturePreparedExactDecode*>(&operation) == nullptr ||
+        !request_state)
+      return {er::ErrorCode::invalid_argument,
+              "fixture exact decode synchronization is invalid"};
+    ++control_->exact_synchronizations;
+    return er::Status::success();
+  }
+
+  er::ExactDecodeExecutionHandle execute_exact_decode(
+      const er::IPreparedOperation& operation,
+      const std::shared_ptr<er::IOperationProviderRequestState>& request_state,
+      const er::ExactDecodeInvocation& invocation) override {
+    if (dynamic_cast<const FixturePreparedExactDecode*>(&operation) == nullptr ||
+        !request_state)
+      return {};
+    ++control_->exact_executions;
+    struct State final {
+      er::ExactDecodeExecutionResult result;
+      bool terminal{};
+    };
+    auto state = std::make_shared<State>();
+    state->result = {er::Status::success(),
+                     {invocation.guaranteed_token,
+                      invocation.guaranteed_token + 1U},
+                     invocation.guaranteed_token + 2U, 2U};
+    return er::ExactDecodeExecutionHandle::from_callbacks(
+        [state]() -> std::optional<er::ExactDecodeExecutionResult> {
+          if (state->terminal) return std::nullopt;
+          state->terminal = true;
+          return std::move(state->result);
+        },
+        [state] { state->terminal = true; });
+  }
+
+ private:
+  std::shared_ptr<FixtureOperationProviderControl> control_;
+};
+
+void test_schema_v3_callable_program_is_exact_and_family_neutral() {
+  constexpr std::string_view artifact =
+      "expert-runtime-model-v1\n"
+      "model\t3\tunknown.future.architecture\t8192\t4096\t64\n"
+      "model_tensor\tbias\tfixture.bias\n"
+      "program_input\ttoken\trequest.token\tfixture.scalar.u64.v1\n"
+      "program_output\tnext_token\tresponse.token\tfixture.scalar.u64.v1\n"
+      "kernel\tfixture.embed.v7\t7\n"
+      "kernel\tfixture.transform.v11\t11\n"
+      "kernel\tfixture.head.v3\t3\n"
+      "kernel\tfixture.exact-decode.v1\t1\n"
+      "exact_decode\tfixture.exact-decode.v1\t1\t2\n"
+      "exact_decode_parameter\tdraft_component_index\t0\n"
+      "exact_decode_tensor\tbias\tfixture.bias\n"
+      "layer\t0\tfixture.transform.v11\t11\t-\t0\n"
+      "operation\t0\t-\tfixture.embed.v7\t7\t-\t0\n"
+      "operation_parameter\t0\tadd\t1\n"
+      "operation_input\t0\ttoken\trequest.token\tfixture.scalar.u64.v1\n"
+      "operation_output\t0\thidden\tembedded.hidden\tfixture.scalar.u64.v1\n"
+      "operation\t1\t0\tfixture.transform.v11\t11\t-\t0\n"
+      "operation_tensor\t1\tbias\tfixture.bias\n"
+      "operation_input\t1\thidden\tembedded.hidden\tfixture.scalar.u64.v1\n"
+      "operation_output\t1\thidden\ttransformed.hidden\tfixture.scalar.u64.v1\n"
+      "operation\t2\t-\tfixture.head.v3\t3\t-\t0\n"
+      "operation_parameter\t2\tadd\t100\n"
+      "operation_input\t2\thidden\ttransformed.hidden\tfixture.scalar.u64.v1\n"
+      "operation_output\t2\ttoken\tresponse.token\tfixture.scalar.u64.v1\n";
+  er::Sha256Digest content_hash{};
+  content_hash[0] = std::byte{0x93};
+  auto parsed =
+      er::parse_model_descriptor_artifact(artifact, content_hash, 0x9300U);
+  require(parsed.status.ok() && parsed.descriptor.schema_version == 3U &&
+              parsed.descriptor.operation_program.front().logical_layer ==
+                  er::kModelLevelOperationLayer &&
+              parsed.descriptor.operation_program.back().logical_layer ==
+                  er::kModelLevelOperationLayer,
+          "schema v3 parser lost model-level operations or SSA endpoints");
+
+  auto unavailable = parsed.descriptor;
+  unavailable.operation_program[1U].input_bindings.at("hidden").value =
+      "future.hidden";
+  require(!er::validate_model_descriptor(unavailable).ok(),
+          "schema v3 accepted use-before-produce data flow");
+  auto duplicate = parsed.descriptor;
+  duplicate.operation_program[1U].output_bindings.at("hidden").value =
+      "embedded.hidden";
+  require(!er::validate_model_descriptor(duplicate).ok(),
+          "schema v3 accepted two producers for one SSA value");
+  auto wrong_input_abi = parsed.descriptor;
+  wrong_input_abi.operation_program[1U].input_bindings.at("hidden").abi =
+      "fixture.scalar.u32.v1";
+  require(!er::validate_model_descriptor(wrong_input_abi).ok(),
+          "schema v3 accepted an operation input ABI mismatch");
+  auto missing_exact_kernel = parsed.descriptor;
+  missing_exact_kernel.required_kernels.pop_back();
+  require(!er::validate_model_descriptor(missing_exact_kernel).ok(),
+          "schema v3 accepted an unbound exact decode program");
+  auto scalar_exact = parsed.descriptor;
+  scalar_exact.exact_decode_program->maximum_emitted_tokens = 1U;
+  require(!er::validate_model_descriptor(scalar_exact).ok(),
+          "schema v3 accepted a scalar exact decode service");
+
+  auto first_control = std::make_shared<FixtureOperationProviderControl>();
+  auto second_control = std::make_shared<FixtureOperationProviderControl>();
+  auto first_provider =
+      std::make_shared<FixtureCallableOperationProvider>(first_control);
+  auto second_provider =
+      std::make_shared<FixtureCallableOperationProvider>(second_control);
+  er::ExecutionProviderRegistry registry;
+  require(registry
+              .add({"metadata-only-high-priority", 100U,
+                    {er::KernelCapability{"fixture.embed.v7", 7U, 7U},
+                     er::KernelCapability{"fixture.transform.v11", 11U, 11U},
+                     er::KernelCapability{"fixture.head.v3", 3U, 3U},
+                     er::KernelCapability{"fixture.exact-decode.v1", 1U,
+                                          1U}}})
+              .ok() &&
+              registry
+                  .add({"callable-edges", 20U,
+                        {er::KernelCapability{"fixture.embed.v7", 7U, 7U},
+                         er::KernelCapability{"fixture.head.v3", 3U, 3U},
+                         er::KernelCapability{"fixture.exact-decode.v1", 1U,
+                                              1U}},
+                        first_provider})
+                  .ok() &&
+              registry
+                  .add({"callable-transform", 10U,
+                        {er::KernelCapability{"fixture.transform.v11", 11U,
+                                              11U}},
+                        second_provider})
+                  .ok(),
+          "schema v3 fixture provider registration failed");
+  const auto metadata = registry.bind(parsed.descriptor);
+  require(metadata.status.ok() && metadata.provider.providers.size() == 1U &&
+              !metadata.provider.providers.front().implementation,
+          "metadata binding unexpectedly required a callable provider");
+  const auto executable = registry.bind(
+      parsed.descriptor, er::ExecutionProviderBindingMode::executable);
+  require(executable.status.ok() &&
+              executable.provider.providers.size() == 2U &&
+              executable.provider.program.values.size() == 4U &&
+              executable.provider.program.inputs.size() == 1U &&
+              executable.provider.program.outputs.size() == 1U &&
+              executable.provider.program.exact_decode.has_value(),
+          "executable binding did not compile the capability-composed SSA plan");
+
+  er::MoeProgramExecutor rejected_metadata;
+  require(!er::MoeProgramExecutor::create(
+               parsed.descriptor, metadata.provider, nullptr,
+               rejected_metadata)
+               .ok(),
+          "callable interpreter accepted a metadata-only provider plan");
+  er::MoeProgramExecutor rejected_tensorless;
+  require(!er::MoeProgramExecutor::create(
+               parsed.descriptor, executable.provider, nullptr,
+               rejected_tensorless)
+               .ok(),
+          "callable interpreter let a provider reopen an undeclared tensor");
+
+  FixtureModelTensorStore tensor_store;
+  er::MoeProgramExecutor executor;
+  require(er::MoeProgramExecutor::create(
+              parsed.descriptor, executable.provider, &tensor_store, executor)
+              .ok() &&
+              executor.valid() && tensor_store.resolves == 1U,
+          "schema v3 callable program preparation failed");
+  first_control->delayed_operation = std::nullopt;
+  second_control->delayed_operation = 1U;
+  er::ProgramExecutionRequest request;
+  request.context.request_id = 17U;
+  request.inputs.emplace("token", fixture_scalar(5U));
+  auto started = executor.execute(std::move(request));
+  require(started.status.ok() && started.handle.valid(),
+          "schema v3 callable request was rejected");
+  require(!started.handle.poll(),
+          "asynchronous provider was not polled by the common interpreter");
+  const auto completed = started.handle.poll();
+  require(completed && completed->status.ok() &&
+              completed->outputs.size() == 1U &&
+              fixture_scalar_value(completed->outputs.at("next_token")) ==
+                  113U &&
+              first_control->executed[0U] == 1U &&
+              second_control->executed[1U] == 1U &&
+              first_control->executed[2U] == 1U &&
+              first_control->states_created == 1U &&
+              second_control->states_created == 1U &&
+              first_control->states_alive == 0U &&
+              second_control->states_alive == 0U,
+          "common interpreter lost exact values, order, or request state lifecycle");
+
+  second_control->delayed_operation = std::nullopt;
+  second_control->failed_operation = 1U;
+  er::ProgramExecutionRequest failing_request;
+  failing_request.context.request_id = 18U;
+  failing_request.inputs.emplace("token", fixture_scalar(8U));
+  auto failing = executor.execute(std::move(failing_request));
+  const auto head_before_failure = first_control->executed[2U];
+  const auto failed = failing.handle.poll();
+  require(failing.status.ok() && failed && !failed->status.ok() &&
+              failed->outputs.empty() &&
+              first_control->executed[2U] == head_before_failure,
+          "operation failure published partial output or ran downstream work");
+
+  second_control->failed_operation = std::nullopt;
+  second_control->wrong_abi_operation = 1U;
+  er::ProgramExecutionRequest wrong_abi_request;
+  wrong_abi_request.context.request_id = 19U;
+  wrong_abi_request.inputs.emplace("token", fixture_scalar(8U));
+  auto wrong_abi = executor.execute(std::move(wrong_abi_request));
+  const auto head_before_wrong_abi = first_control->executed[2U];
+  const auto rejected_output = wrong_abi.handle.poll();
+  require(wrong_abi.status.ok() && rejected_output &&
+              !rejected_output->status.ok() &&
+              rejected_output->outputs.empty() &&
+              first_control->executed[2U] == head_before_wrong_abi,
+          "interpreter accepted a provider output with the wrong ABI");
+
+  second_control->wrong_abi_operation = std::nullopt;
+  second_control->delayed_operation = 1U;
+  er::ProgramExecutionRequest cancelled_request;
+  cancelled_request.context.request_id = 20U;
+  cancelled_request.inputs.emplace("token", fixture_scalar(9U));
+  auto cancelled = executor.execute(std::move(cancelled_request));
+  const auto head_before_cancel = first_control->executed[2U];
+  require(cancelled.status.ok() && !cancelled.handle.poll(),
+          "cancellation fixture did not reach its asynchronous operation");
+  cancelled.handle.cancel();
+  cancelled.handle.cancel();
+  require(second_control->cancellations == 1U &&
+              first_control->executed[2U] == head_before_cancel &&
+              first_control->states_alive == 0U &&
+              second_control->states_alive == 0U,
+          "program cancellation was not idempotent or leaked provider state");
+
+  er::ProgramExecutionRequest extra_input;
+  extra_input.context.request_id = 21U;
+  extra_input.inputs.emplace("token", fixture_scalar(1U));
+  extra_input.inputs.emplace("implicit.hidden", fixture_scalar(2U));
+  require(!executor.execute(std::move(extra_input)).status.ok(),
+          "interpreter accepted a family-specific implicit input");
+
+  second_control->delayed_operation = std::nullopt;
+  const auto first_states_before_session = first_control->states_created;
+  const auto second_states_before_session = second_control->states_created;
+  er::ProgramRequestContext session_context;
+  session_context.request_id = 30U;
+  session_context.parameters.emplace("reserved_context_tokens", 128U);
+  auto begun = executor.begin_session(std::move(session_context));
+  require(begun.status.ok() && begun.session.valid() &&
+              first_control->states_created ==
+                  first_states_before_session + 1U &&
+              second_control->states_created ==
+                  second_states_before_session + 1U &&
+              first_control->states_alive == 1U &&
+              second_control->states_alive == 1U,
+          "persistent VM session did not create one state per provider");
+  for (const auto [input, expected] :
+       std::array<std::pair<std::uint64_t, std::uint64_t>, 2U>{
+           {{1U, 109U}, {2U, 110U}}}) {
+    std::map<std::string, er::ExecutionValue, std::less<>> inputs;
+    inputs.emplace("token", fixture_scalar(input));
+    auto step = begun.session.execute(std::move(inputs));
+    auto result = step.handle.poll();
+    require(step.status.ok() && result && result->status.ok() &&
+                fixture_scalar_value(result->outputs.at("next_token")) ==
+                    expected &&
+                first_control->states_created ==
+                    first_states_before_session + 1U &&
+                second_control->states_created ==
+                    second_states_before_session + 1U &&
+                first_control->states_alive == 1U &&
+                second_control->states_alive == 1U,
+            "VM session recreated or destroyed provider state between steps");
+  }
+  require(begun.session.exact_decode_available(),
+          "artifact-declared exact decode service is unavailable");
+  const auto synchronized =
+      begun.session.synchronize_exact_decode(110U, 1U, true);
+  auto exact = begun.session.execute_exact_decode(110U, 2U, 128U);
+  const auto exact_result = exact.handle.poll();
+  require(synchronized.ok() && exact.status.ok() && exact_result &&
+              exact_result->status.ok() &&
+              exact_result->emitted_tokens ==
+                  std::vector<std::uint32_t>({110U, 111U}) &&
+              exact_result->next_token == 112U &&
+              exact_result->positions_advanced == 2U &&
+              first_control->exact_prepared == 1U &&
+              first_control->exact_synchronizations == 1U &&
+              first_control->exact_executions == 1U,
+          "exact decode binding lost synchronization or token semantics");
+  begun.session.cancel();
+  require(first_control->states_alive == 0U &&
+              second_control->states_alive == 0U &&
+              !begun.session.valid(),
+          "closing a VM session leaked persistent provider state");
+
+  second_control->delayed_operation = 1U;
+  er::ProgramRequestContext active_context;
+  active_context.request_id = 31U;
+  auto active_session = executor.begin_session(std::move(active_context));
+  std::map<std::string, er::ExecutionValue, std::less<>> active_inputs;
+  active_inputs.emplace("token", fixture_scalar(3U));
+  auto active_step = active_session.session.execute(std::move(active_inputs));
+  require(active_session.status.ok() && active_step.status.ok() &&
+              !active_step.handle.poll(),
+          "persistent cancellation fixture did not become asynchronous");
+  active_session.session.cancel();
+  const auto active_cancelled = active_step.handle.poll();
+  require(active_cancelled && !active_cancelled->status.ok() &&
+              active_cancelled->status.code() == er::ErrorCode::cancelled &&
+              first_control->states_alive == 0U &&
+              second_control->states_alive == 0U,
+          "session cancellation did not terminate its active step and state");
+}
+
+void test_schema_v2_expresses_model_derived_hybrid_moe_topology() {
+  constexpr std::string_view convolution =
+      "block.causal-short-conv.gated.v1";
+  constexpr std::string_view attention =
+      "block.full-attention.gqa.qk-norm.v1";
+  constexpr std::string_view dense_ffn = "ffn.swiglu.dense.v1";
+  constexpr std::string_view router = "router.sigmoid-bias.topk.v1";
+  constexpr std::string_view routed_ffn = "moe.swiglu.routed.v1";
+  constexpr std::array attention_layers{2U, 6U, 10U, 14U, 18U, 21U};
+
+  er::ModelDescriptor descriptor;
+  descriptor.schema_version = 2U;
+  descriptor.architecture_id = "unseen.hybrid.moe";
+  descriptor.content_hash[0] = std::byte{0x4c};
+  descriptor.vocab_size = 65'536U;
+  descriptor.max_context_tokens = 128'000U;
+  descriptor.hidden_size = 2'048U;
+  descriptor.attributes = {
+      {"attention_heads", 32U},
+      {"kv_heads", 8U},
+      {"conv_cache_length", 3U},
+      {"dense_prefix_layers", 2U},
+  };
+
+  er::RoutedExpertComponentDescriptor component;
+  component.name = "decoder";
+  component.namespace_id = 0x4c464d32U;
+  component.layer_count = 22U;
+  component.experts_per_layer = 32U;
+  component.route_width = 4U;
+  component.shared_experts_per_layer = 0U;
+  component.hidden_size = 2'048U;
+  component.intermediate_size = 1'792U;
+  component.execution_capability = routed_ffn;
+  component.execution_abi = 1U;
+  component.source_abi = er::kExpertSourceAbiExpertPackV1;
+  component.encoding_abi = er::kExpertEncodingAbiInt8PerRow;
+  component.encoding = "int8.symmetric.per-row";
+  component.router.capability = router;
+  component.router.abi_version = 1U;
+  component.router.parameters = {
+      {"normalize", 1U},
+      {"use_expert_bias", 1U},
+  };
+  descriptor.routed_components.push_back(component);
+  descriptor.required_kernels = {
+      {std::string(convolution), 1U},
+      {std::string(attention), 1U},
+      {std::string(dense_ffn), 1U},
+      {std::string(router), 1U},
+      {std::string(routed_ffn), 1U},
+  };
+
+  std::uint32_t logical_operation = 0U;
+  for (std::uint32_t layer = 0U; layer < 24U; ++layer) {
+    const bool uses_attention =
+        std::find(attention_layers.begin(), attention_layers.end(), layer) !=
+        attention_layers.end();
+    const auto block = uses_attention ? attention : convolution;
+    const bool dense = layer < 2U;
+    descriptor.layer_program.push_back(
+        {layer, std::string(block), 1U, dense ? "" : "decoder",
+         dense ? 0U : layer - 2U, {}});
+    descriptor.operation_program.push_back(
+        {logical_operation++, layer, std::string(block), 1U, "", 0U, {}});
+    if (dense) {
+      descriptor.operation_program.push_back(
+          {logical_operation++, layer, std::string(dense_ffn), 1U, "", 0U,
+           {}});
+      continue;
+    }
+    descriptor.operation_program.push_back(
+        {logical_operation++, layer, std::string(router), 1U, "decoder",
+         layer - 2U, {}});
+    descriptor.operation_program.push_back(
+        {logical_operation++, layer, std::string(routed_ffn), 1U, "decoder",
+         layer - 2U, {}});
+  }
+  require(logical_operation == 70U &&
+              er::validate_model_descriptor(descriptor).ok(),
+          "model-derived hybrid MoE descriptor is not valid schema-v2 IR");
+
+  er::ExecutionProviderRegistry registry;
+  require(registry
+              .add({"legacy-attention-moe", 100U,
+                    {er::KernelCapability{std::string(attention), 1U, 1U},
+                     er::KernelCapability{std::string(routed_ffn), 1U,
+                                          1U}}})
+              .ok(),
+          "hybrid fixture rejected the incomplete legacy provider");
+  require(!registry.bind(descriptor).status.ok(),
+          "hybrid model bound without convolution, dense FFN, and router");
+
+  const auto validate_geometry = [](const er::ModelDescriptor& candidate) {
+    const auto* decoder = er::find_routed_component(candidate, "decoder");
+    if (decoder == nullptr || decoder->layer_count != 22U ||
+        decoder->experts_per_layer != 32U || decoder->route_width != 4U ||
+        decoder->hidden_size != 2'048U ||
+        decoder->intermediate_size != 1'792U ||
+        decoder->source_abi != er::kExpertSourceAbiExpertPackV1 ||
+        decoder->encoding_abi != er::kExpertEncodingAbiInt8PerRow ||
+        decoder->router.parameters.at("normalize") != 1U ||
+        decoder->router.parameters.at("use_expert_bias") != 1U)
+      return er::Status(er::ErrorCode::invalid_argument,
+                        "unsupported hybrid MoE geometry");
+    return er::Status::success();
+  };
+  require(registry
+              .add({"generic-hybrid-sm86", 10U,
+                    {er::KernelCapability{std::string(convolution), 1U, 1U},
+                     er::KernelCapability{std::string(attention), 1U, 1U},
+                     er::KernelCapability{std::string(dense_ffn), 1U, 1U},
+                     er::KernelCapability{std::string(router), 1U, 1U},
+                     er::KernelCapability{std::string(routed_ffn), 1U, 1U,
+                                          validate_geometry}}})
+              .ok(),
+          "hybrid fixture rejected the complete capability provider");
+  const auto bound = registry.bind(descriptor);
+  require(bound.status.ok() && bound.provider.providers.size() == 2U &&
+              bound.provider.providers[0U].name ==
+                  "legacy-attention-moe" &&
+              bound.provider.providers[1U].name == "generic-hybrid-sm86" &&
+              bound.provider.program.layers.size() == 24U &&
+              bound.provider.program.operations.size() == 70U &&
+              !bound.provider.program.layers[1U].routed_component_index &&
+              bound.provider.program.layers[2U].routed_component_index == 0U &&
+              bound.provider.program.layers[23U].component_layer == 21U &&
+              bound.provider.program.operations[5U]
+                      .routed_component_index == 0U &&
+              bound.provider.program.operations.back().component_layer == 21U,
+          "capability-only binding lost the hybrid model operation topology");
+}
+
+void test_generic_expert_catalog_uses_descriptor_cardinality() {
+  const auto root = std::filesystem::temp_directory_path() /
+                    "expert-runtime-generic-catalog";
+  std::error_code cleanup_error;
+  std::filesystem::remove_all(root, cleanup_error);
+  std::filesystem::create_directories(root);
+  {
+    std::ofstream extents(root / "extents.tsv", std::ios::binary);
+    extents << "fixture-extents-v1\n";
+    for (std::uint32_t index = 0U; index < 6U; ++index)
+      extents << "0\t4\t" << index * 4U << "\tpack.bin\n";
+  }
+  {
+    std::ofstream catalog(root / "catalog.tsv", std::ios::binary);
+    catalog << "fixture-catalog-v1\n";
+    const std::string hash(64U, '0');
+    for (std::uint32_t layer = 0U; layer < 2U; ++layer) {
+      for (std::uint32_t expert = 0U; expert < 3U; ++expert) {
+        const auto index = layer * 3U + expert;
+        catalog << layer << '\t' << expert << "\t4\t" << hash << '\t'
+                << index << "\t1\n";
+      }
+    }
+  }
+  er::ExpertCatalog catalog;
+  er::ExpertCatalogConfig config{
+      root, root, 2U, 3U, 64U, 32U, 32U, 4U,
+      3ULL * 64U * 32U * sizeof(float), 4U,
+      er::kExpertSourceAbiSplitFp4Block32V1, 0U, 0U, 1U,
+      {{"fixture-extents-v1", "fixture-catalog-v1", 1U, true}}};
+  const auto loaded = er::ExpertCatalog::load(config, catalog);
+  const auto* record = catalog.find(1U, 2U);
+  require(loaded.ok() && catalog.layer_count() == 2U &&
+              catalog.experts_per_layer() == 3U && catalog.size() == 6U &&
+              record != nullptr && record->hidden == 64U &&
+              record->intermediate == 32U &&
+              record->extents.front().source_offset == 20U,
+          "generic expert catalog retained model-specific cardinality");
+  std::filesystem::remove_all(root, cleanup_error);
+}
+
+void test_universal_worker_launch_preserves_provider_extensions() {
+  constexpr std::array arguments{
+      std::string_view{"--max-context=131072"},
+      std::string_view{"--ram-cache-gib=96"},
+      std::string_view{"--vram-cache-gib=18"},
+      std::string_view{"--capacity=3"},
+      std::string_view{"--kv-cache-mib=3072"},
+      std::string_view{"--kv-page-tokens=128"},
+      std::string_view{"--placement-profile=balanced"},
+      std::string_view{"--prefill-chunk-limit=512"},
+      std::string_view{"--provider-fp4-pipeline=vendor-x"},
+      std::string_view{"--provider-background-compile"}};
+  const auto parsed = er::parse_worker_launch_options(arguments);
+  require(parsed.status.ok() && parsed.options.max_context == 131072U &&
+              parsed.options.capacity == 3U &&
+              parsed.options.prefill_chunk_limit == 512U &&
+              parsed.options.extensions.at("provider-fp4-pipeline") ==
+                  "vendor-x" &&
+              !parsed.options.extensions.at("provider-background-compile"),
+          "universal worker launch lost an opaque provider extension");
+  constexpr std::array duplicate{
+      std::string_view{"--max-context=1"},
+      std::string_view{"--max-context=2"}};
+  require(!er::parse_worker_launch_options(duplicate).status.ok(),
+          "universal worker launch accepted duplicate options");
+}
+
 void test_deepseek_fp8_shared_admission_validation() {
   std::vector<std::byte> bytes(25'167'360U);
   for (std::size_t index = 0; index < bytes.size(); ++index) {
@@ -118,6 +1091,9 @@ void test_deepseek_fp8_shared_admission_validation() {
   record.stored_bytes = bytes.size();
   record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
   record.device_bytes = 25'198'592U;
+  record.hidden = 4096U;
+  record.intermediate = 2048U;
+  record.quant_block_size = 128U;
   record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
   record.header_bytes = 0U;
   record.alignment = 1U;
@@ -200,7 +1176,7 @@ FixtureRecord make_fp4_record(std::uint32_t expert_id,
   // Block-32 aligned FP4-E2M1/UE8M0 record: hidden 32, intermediate 32.
   FixtureRecord result;
   result.key = {0x0123456789abcdefULL, layer, expert_id,
-                er::kExpertQuantAbiFp4Block32};
+                er::kExpertEncodingAbiFp4Block32};
   result.bytes.resize(er::kExpertPackAlignment);
   for (std::size_t index = er::kExpertHeaderBytes; index < result.bytes.size();
        ++index) {
@@ -220,7 +1196,7 @@ FixtureRecord make_fp4_record(std::uint32_t expert_id,
   write_le<std::uint16_t>(header + 8, er::kExpertPackVersion);
   write_le<std::uint16_t>(header + 10, er::kExpertHeaderBytes);
   write_le<std::uint32_t>(header + 12, 0x0fU);
-  write_le<std::uint32_t>(header + 16, er::kExpertQuantAbiFp4Block32);
+  write_le<std::uint32_t>(header + 16, er::kExpertRecordAbiFp4Block32);
   write_le<std::int32_t>(header + 20, static_cast<std::int32_t>(layer));
   write_le<std::int32_t>(header + 24, static_cast<std::int32_t>(expert_id));
   write_le<std::uint32_t>(header + 28, 32);
@@ -247,6 +1223,7 @@ FixtureRecord make_fp4_record(std::uint32_t expert_id,
   result.record.header_bytes = er::kExpertHeaderBytes;
   result.record.alignment = er::kExpertPackAlignment;
   result.record.source_abi = er::kExpertSourceAbiExpertPackV1;
+  result.record.record_abi = er::kExpertRecordAbiFp4Block32;
   result.record.payload_sha256 = digest;
   return result;
 }
@@ -285,7 +1262,7 @@ void test_fp4_block32_admission_validation() {
   }
 
   auto abi_mismatch = make_fp4_record(7);
-  abi_mismatch.key.quant_abi = er::kExpertQuantAbiInt8PerRow;
+  abi_mismatch.key.encoding_abi = er::kExpertQuantAbiInt8PerRow;
   require(!er::validate_expert_admission(abi_mismatch.bytes, abi_mismatch.key,
                                          abi_mismatch.record)
                .status.ok(),
@@ -435,10 +1412,14 @@ class ControlledUploader final : public er::IDeviceUploader {
 
   er::OperationId upload(er::UploadRequest request,
                          er::UploadCompletion completion) override {
-    std::lock_guard lock(mutex_);
-    const auto id = next_id_++;
-    pending_.push_back({id, request, std::move(completion)});
-    ++upload_count_;
+    er::OperationId id{};
+    {
+      std::lock_guard lock(mutex_);
+      id = next_id_++;
+      pending_.push_back({id, request, std::move(completion)});
+      ++upload_count_;
+    }
+    condition_.notify_all();
     return id;
   }
 
@@ -482,16 +1463,25 @@ class ControlledUploader final : public er::IDeviceUploader {
     return pending_.size();
   }
 
+  [[nodiscard]] bool wait_for_pending(std::size_t count) const {
+    std::unique_lock lock(mutex_);
+    return condition_.wait_for(lock, 1s,
+                               [&] { return pending_.size() >= count; });
+  }
+
  private:
   Pending take_one() {
-    std::lock_guard lock(mutex_);
-    require(!pending_.empty(), "no pending upload operation");
+    std::unique_lock lock(mutex_);
+    require(condition_.wait_for(lock, 1s,
+                                [&] { return !pending_.empty(); }),
+            "no pending upload operation");
     auto pending = std::move(pending_.front());
     pending_.pop_front();
     return pending;
   }
 
   mutable std::mutex mutex_;
+  mutable std::condition_variable condition_;
   std::deque<Pending> pending_;
   er::OperationId next_id_{1};
   std::size_t upload_count_{};
@@ -579,6 +1569,503 @@ void test_expert_store_resolves_complete_ordered_union() {
               host_resolved->experts[0].host_lease &&
               !host_resolved->experts[0].device_lease,
           "expert store did not publish a retained host placement");
+
+  const auto cold = make_record(33, 2U * er::kExpertPackAlignment);
+  const std::array cold_host_request = {
+      er::ExpertResolveRequest{
+          cold.key, cold.record, er::ExpertResolveTarget::host,
+          er::ExpertAcquireOptions{er::ExpertRequestPriority::demand, false,
+                                   true, false}}};
+  const auto uploads_before_host_resolve = harness.uploader->upload_count();
+  auto cold_host_batch = store.resolve(cold_host_request);
+  require(cold_host_batch.valid() && !cold_host_batch.poll(),
+          "cold host resolve did not remain asynchronous");
+  harness.storage->complete_success(cold.bytes);
+  std::optional<er::ExpertResolveResult> cold_host_resolved;
+  const auto host_deadline = std::chrono::steady_clock::now() + 1s;
+  while (!cold_host_resolved &&
+         std::chrono::steady_clock::now() < host_deadline) {
+    cold_host_resolved = cold_host_batch.poll();
+    if (!cold_host_resolved) std::this_thread::yield();
+  }
+  require(cold_host_resolved && cold_host_resolved->status.ok() &&
+              cold_host_resolved->experts.size() == 1U &&
+              cold_host_resolved->experts[0].key == cold.key &&
+              cold_host_resolved->experts[0].placement ==
+                  er::ExpertPlacementKind::host &&
+              cold_host_resolved->experts[0].host_lease &&
+              !cold_host_resolved->experts[0].device_lease &&
+              harness.uploader->upload_count() == uploads_before_host_resolve,
+          "cold host resolve uploaded weights or lost exact host ownership");
+}
+
+class FixtureRemoteLease final : public er::IRemoteExpertLease {
+ public:
+  FixtureRemoteLease() {
+    identity_.model_content_hash[0] = std::byte{0x77};
+    identity_.key = {0x7000U, 0U, 0U, 91U};
+    identity_.capability = "moe.fixture.remote.v1";
+    identity_.execution_abi = 1U;
+    identity_.source_abi = 77U;
+  }
+  [[nodiscard]] std::string_view owner() const noexcept override {
+    return "fixture-node-7";
+  }
+  [[nodiscard]] const er::ActiveExpertIdentity& identity()
+      const noexcept override {
+    return identity_;
+  }
+  [[nodiscard]] er::ActiveExpertExecutionHandle execute(
+      er::ActiveExpertInvocation) override {
+    return {};
+  }
+
+ private:
+  er::ActiveExpertIdentity identity_;
+};
+
+class FixtureRemoteStore final : public er::IExpertStore {
+ public:
+  [[nodiscard]] er::ExpertResolveHandle resolve(
+      std::span<const er::ExpertResolveRequest> requests) override {
+    struct State final {
+      std::vector<er::ExpertKey> keys;
+      bool terminal{};
+    };
+    if (requests.empty() ||
+        std::any_of(requests.begin(), requests.end(), [](const auto& request) {
+          return request.target != er::ExpertResolveTarget::remote &&
+                 request.target != er::ExpertResolveTarget::automatic;
+        }))
+      return {};
+    auto state = std::make_shared<State>();
+    for (const auto& request : requests) state->keys.push_back(request.key);
+    return er::ExpertResolveHandle::from_callbacks(
+        [state]() -> std::optional<er::ExpertResolveResult> {
+          if (state->terminal) return std::nullopt;
+          state->terminal = true;
+          er::ExpertResolveResult result;
+          result.status = er::Status::success();
+          for (const auto& key : state->keys) {
+            result.experts.push_back(
+                {key, er::ExpertPlacementKind::remote, {}, {},
+                 std::make_shared<FixtureRemoteLease>()});
+          }
+          return result;
+        },
+        [state] { state->terminal = true; }, requests.size());
+  }
+};
+
+struct FixtureActiveExpertControl final {
+  std::uint32_t executions{};
+  std::uint32_t cancellations{};
+  bool delay{};
+};
+
+class FixtureActiveExpertExecutor final : public er::IActiveExpertExecutor {
+ public:
+  explicit FixtureActiveExpertExecutor(
+      std::shared_ptr<FixtureActiveExpertControl> control)
+      : control_(std::move(control)) {}
+
+  [[nodiscard]] std::string_view owner() const noexcept override {
+    return "fixture-local-owner";
+  }
+  [[nodiscard]] bool remote() const noexcept override { return false; }
+  [[nodiscard]] er::ActiveExpertExecutorTelemetry telemetry()
+      const noexcept override {
+    return {};
+  }
+  [[nodiscard]] er::ActiveExpertExecutionHandle execute(
+      er::ActiveExpertExecutionRequest request) override {
+    if (!request.invocation.input.valid() ||
+        request.invocation.input.bytes != sizeof(std::uint64_t))
+      return {};
+    ++control_->executions;
+    struct State final {
+      std::shared_ptr<FixtureActiveExpertControl> control;
+      er::ActiveExpertExecutionRequest request;
+      std::uint32_t polls{};
+      bool terminal{};
+    };
+    auto state = std::make_shared<State>();
+    state->control = control_;
+    state->request = std::move(request);
+    return er::ActiveExpertExecutionHandle::from_callbacks(
+        [state]() -> std::optional<er::ActiveExpertExecutionResult> {
+          if (state->terminal) return std::nullopt;
+          if (state->control->delay && state->polls++ == 0U)
+            return std::nullopt;
+          state->terminal = true;
+          std::uint64_t input{};
+          std::memcpy(&input, state->request.invocation.input.data,
+                      sizeof(input));
+          auto output = std::make_shared<std::uint64_t>(
+              input + state->request.identity.key.expert + 100U);
+          er::ActiveExpertExecutionResult result;
+          result.status = er::Status::success();
+          result.identity = state->request.identity;
+          result.request_id = state->request.invocation.request_id;
+          result.invocation_id = state->request.invocation.invocation_id;
+          result.selection_index =
+              state->request.invocation.selection_index;
+          result.output = {state->request.invocation.output_abi, "host",
+                           output,
+                           reinterpret_cast<const std::byte*>(output.get()),
+                           sizeof(*output)};
+          result.evidence.owner_weight_read_bytes = 13'369'344U;
+          result.evidence.owner_vram_read_bytes = 13'369'344U;
+          result.evidence.owner_execution_ns = 777U;
+          return result;
+        },
+        [state] {
+          if (state->terminal) return;
+          state->terminal = true;
+          ++state->control->cancellations;
+        });
+  }
+
+ private:
+  std::shared_ptr<FixtureActiveExpertControl> control_;
+};
+
+class FixtureActiveExpertTransport final : public er::IActiveExpertTransport {
+ public:
+  explicit FixtureActiveExpertTransport(
+      std::shared_ptr<er::ActiveExpertWireEndpoint> endpoint)
+      : endpoint_(std::move(endpoint)) {}
+
+  [[nodiscard]] er::ActiveExpertWireHandle submit(
+      std::string_view owner, std::vector<std::byte> frame,
+      std::chrono::steady_clock::time_point) override {
+    if (owner != "fixture-remote-owner" || !endpoint_) return {};
+    ++submissions;
+    last_request_frame = frame;
+    struct State final {
+      FixtureActiveExpertTransport* transport{};
+      er::ActiveExpertWireHandle inner;
+      bool corrupt{};
+      bool terminal{};
+    };
+    auto state = std::make_shared<State>();
+    state->transport = this;
+    state->inner = endpoint_->submit(std::move(frame));
+    state->corrupt = std::exchange(corrupt_next_response, false);
+    return er::ActiveExpertWireHandle::from_callbacks(
+        [state]() -> std::optional<er::ActiveExpertWireResult> {
+          if (state->terminal) return std::nullopt;
+          auto result = state->inner.poll();
+          if (!result) return std::nullopt;
+          state->terminal = true;
+          if (state->corrupt && result->frame.size() > 40U)
+            result->frame[40U] ^= std::byte{1};
+          return result;
+        },
+        [state] {
+          if (state->terminal) return;
+          state->inner.cancel();
+          state->terminal = true;
+          ++state->transport->cancellations;
+        });
+  }
+
+  std::uint32_t submissions{};
+  std::uint32_t cancellations{};
+  bool corrupt_next_response{};
+  std::vector<std::byte> last_request_frame;
+
+ private:
+  std::shared_ptr<er::ActiveExpertWireEndpoint> endpoint_;
+};
+
+er::ActiveExpertExecutionRequest fixture_active_expert_request(
+    std::uint64_t request_id, std::uint64_t invocation_id,
+    std::chrono::steady_clock::time_point deadline) {
+  er::ActiveExpertExecutionRequest request;
+  request.identity.model_content_hash[0] = std::byte{0xa7};
+  request.identity.key = {0xa700U, 12U, 37U, 2U};
+  request.identity.capability = "moe.fixture.fp4.swiglu.v1";
+  request.identity.execution_abi = 1U;
+  request.identity.source_abi = 2U;
+  request.invocation.request_id = request_id;
+  request.invocation.invocation_id = invocation_id;
+  request.invocation.selection_index = 4U;
+  request.invocation.route_width = 6U;
+  request.invocation.deadline = deadline;
+  auto input = std::make_shared<std::uint64_t>(9U);
+  request.invocation.input = {
+      "activation.hidden.f32.fixture.v1", "host.pinned", input,
+      reinterpret_cast<const std::byte*>(input.get()), sizeof(*input)};
+  request.invocation.output_abi = "activation.expert.f32.fixture.v1";
+  request.invocation.output_bytes = sizeof(std::uint64_t);
+  return request;
+}
+
+void test_active_expert_wire_moves_only_exact_activations() {
+  auto control = std::make_shared<FixtureActiveExpertControl>();
+  auto local = std::make_shared<FixtureActiveExpertExecutor>(control);
+  er::ActiveExpertExecutorRegistry registry;
+  require(registry
+              .add({"fixture-fp4-owner", "moe.fixture.fp4.swiglu.v1", 1U,
+                    1U, 10U,
+                    [](const er::ActiveExpertIdentity& identity) {
+                      return identity.key.encoding_abi == 2U &&
+                                     identity.source_abi == 2U
+                                 ? er::Status::success()
+                                 : er::Status(
+                                       er::ErrorCode::invalid_argument,
+                                       "fixture owner rejected encoding");
+                    },
+                    local})
+              .ok(),
+          "active-expert registry rejected a local ABI provider");
+  auto endpoint = std::make_shared<er::ActiveExpertWireEndpoint>(
+      std::move(registry));
+  auto transport =
+      std::make_shared<FixtureActiveExpertTransport>(endpoint);
+  auto remote = std::make_shared<er::RemoteActiveExpertExecutor>(
+      "fixture-remote-owner", transport);
+
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::minutes(1);
+  auto request = fixture_active_expert_request(71U, 9001U, deadline);
+  auto encoded = er::encode_active_expert_request(request);
+  require(encoded.status.ok() && encoded.frame.size() < 1024U,
+          "activation-only request unexpectedly contains an expert payload");
+  const auto decoded = er::decode_active_expert_request(encoded.frame);
+  require(decoded.status.ok() &&
+              decoded.request.identity == request.identity &&
+              decoded.request.invocation.selection_index == 4U &&
+              decoded.request.invocation.route_width == 6U &&
+              decoded.request.invocation.input.bytes == sizeof(std::uint64_t),
+          "active-expert request wire contract lost exact identity or top-k order");
+  auto corrupt_request = encoded.frame;
+  corrupt_request[40U] ^= std::byte{1};
+  require(er::decode_active_expert_request(corrupt_request).status.code() ==
+              er::ErrorCode::checksum_mismatch,
+          "active-expert wire accepted a corrupt request");
+
+  control->delay = true;
+  auto execution = remote->execute(request);
+  require(execution.valid() && !execution.poll(),
+          "remote active-expert execution did not preserve async polling");
+  auto completed = execution.poll();
+  require(completed && completed->status.ok() &&
+              completed->identity == request.identity &&
+              completed->request_id == 71U &&
+              completed->invocation_id == 9001U &&
+              completed->selection_index == 4U &&
+              fixture_scalar_value({completed->output.abi,
+                                    completed->output.memory_domain,
+                                    completed->output.owner,
+                                    completed->output.data,
+                                    completed->output.bytes}) == 146U &&
+              completed->evidence.activation_input_bytes == 8U &&
+              completed->evidence.activation_output_bytes == 8U &&
+              completed->evidence.weight_transport_bytes == 0U &&
+              completed->evidence.owner_weight_read_bytes == 13'369'344U &&
+              completed->evidence.owner_vram_read_bytes == 13'369'344U &&
+              completed->evidence.wire_request_bytes ==
+                  transport->last_request_frame.size() &&
+              completed->evidence.wire_response_bytes > 8U,
+          "remote active-expert result lost exact output or traffic evidence");
+  const auto client_telemetry = remote->telemetry();
+  const auto owner_telemetry = endpoint->telemetry();
+  require(client_telemetry.requests == 1U &&
+              client_telemetry.completed == 1U &&
+              client_telemetry.activation_input_bytes == 8U &&
+              client_telemetry.activation_output_bytes == 8U &&
+              client_telemetry.weight_transport_bytes == 0U &&
+              owner_telemetry.requests == 1U &&
+              owner_telemetry.completed == 1U &&
+              owner_telemetry.weight_transport_bytes == 0U,
+          "active-expert local/remote telemetry is not exact");
+
+  auto cancelled = remote->execute(
+      fixture_active_expert_request(72U, 9002U, deadline));
+  require(cancelled.valid() && !cancelled.poll(),
+          "active-expert cancellation fixture did not become pending");
+  cancelled.cancel();
+  cancelled.cancel();
+  require(control->cancellations == 1U &&
+              transport->cancellations == 1U &&
+              remote->telemetry().cancelled == 1U &&
+              endpoint->telemetry().cancelled == 1U,
+          "active-expert cancellation was not propagated exactly once");
+
+  auto expired = remote->execute(fixture_active_expert_request(
+      73U, 9003U, std::chrono::steady_clock::now() - 1ms));
+  auto expired_result = expired.poll();
+  require(expired_result &&
+              expired_result->status.code() ==
+                  er::ErrorCode::deadline_exceeded &&
+              transport->submissions == 2U,
+          "expired active-expert work reached the transport");
+
+  control->delay = false;
+  transport->corrupt_next_response = true;
+  auto corrupt = remote->execute(
+      fixture_active_expert_request(74U, 9004U, deadline));
+  auto corrupt_result = corrupt.poll();
+  require(corrupt_result &&
+              corrupt_result->status.code() ==
+                  er::ErrorCode::checksum_mismatch &&
+              remote->telemetry().checksum_failures == 1U,
+          "remote active-expert executor accepted a corrupt response");
+
+  er::ActiveExpertOwnerDirectory owners;
+  require(owners
+              .add({0xa700U, 0U, 43U, 0U, 256U, remote})
+              .ok() &&
+              !owners
+                   .add({0xa700U, 12U, 1U, 37U, 1U, remote})
+                   .ok(),
+          "active-expert owner directory accepted overlapping ownership");
+  er::ActiveExpertComponentContract component;
+  component.model_content_hash = request.identity.model_content_hash;
+  component.namespace_id = 0xa700U;
+  component.layer_count = 43U;
+  component.experts_per_layer = 256U;
+  component.encoding_abi = 2U;
+  component.execution_capability = "moe.fixture.fp4.swiglu.v1";
+  component.execution_abi = 1U;
+  component.source_abi = 2U;
+  er::RemoteExpertStore remote_store(component, std::move(owners));
+  er::PayloadRecord record;
+  record.stored_bytes = 13'369'344U;
+  record.source_abi = 2U;
+  const std::array resolve_requests{er::ExpertResolveRequest{
+      request.identity.key, record, er::ExpertResolveTarget::automatic}};
+  auto resolved = remote_store.resolve(resolve_requests);
+  auto placement = resolved.poll();
+  require(placement && placement->status.ok() &&
+              placement->experts.size() == 1U &&
+              placement->experts.front().placement ==
+                  er::ExpertPlacementKind::remote &&
+              placement->experts.front().remote_lease &&
+              placement->experts.front().remote_lease->identity() ==
+                  request.identity &&
+              placement->experts.front().remote_lease->owner() ==
+                  "fixture-remote-owner",
+          "remote expert store did not bind artifact identity to its owner");
+  auto lease_invocation = fixture_active_expert_request(
+                              75U, 9005U, deadline)
+                              .invocation;
+  auto leased = placement->experts.front().remote_lease->execute(
+      std::move(lease_invocation));
+  auto leased_result = leased.poll();
+  require(leased_result && leased_result->status.ok() &&
+              leased_result->identity == request.identity &&
+              leased_result->evidence.weight_transport_bytes == 0U,
+          "remote expert lease did not execute through the activation contract");
+}
+
+void test_routed_runtime_accepts_injected_remote_store() {
+  Harness harness(16'384, 2, 16'384);
+  std::vector<er::PayloadRecord> records(3U);
+  for (auto& record : records) {
+    record.stored_bytes = 4U;
+    record.hidden = 64U;
+    record.intermediate = 32U;
+    record.source_abi = 77U;
+  }
+  er::ExpertCatalog catalog;
+  require(er::ExpertCatalog::from_records(1U, 3U, std::move(records), catalog)
+              .ok(),
+          "remote-store fixture catalog is invalid");
+  er::RoutedExpertComponentDescriptor component;
+  component.name = "decoder";
+  component.namespace_id = 0x7000U;
+  component.layer_count = 1U;
+  component.experts_per_layer = 3U;
+  component.route_width = 2U;
+  component.hidden_size = 64U;
+  component.intermediate_size = 32U;
+  component.execution_capability = "moe.fixture.remote.v1";
+  component.source_abi = 77U;
+  component.encoding_abi = 91U;
+  component.encoding = "fp4.fixture.block64";
+  component.router = {"router.fixture.topk.v1", 1U,
+                      {{"normalize", 1U}}};
+  FixtureRemoteStore store;
+  er::Sha256Digest content_hash{};
+  content_hash[0] = std::byte{0x77};
+  er::RoutedExpertRuntime routed(
+      component, content_hash, catalog, harness.cache, store);
+  auto draft_component = component;
+  draft_component.name = "draft";
+  draft_component.namespace_id = component.namespace_id + 1U;
+  er::RoutedExpertRuntime draft_routed(
+      draft_component, content_hash, catalog, harness.cache, store);
+  er::ModelDescriptor descriptor;
+  descriptor.schema_version = 2U;
+  descriptor.architecture_id = "never-seen-before.fp4.sparse";
+  descriptor.content_hash = content_hash;
+  descriptor.vocab_size = 8192U;
+  descriptor.max_context_tokens = 65536U;
+  descriptor.hidden_size = 64U;
+  descriptor.routed_components.push_back(component);
+  descriptor.routed_components.push_back(draft_component);
+  descriptor.required_kernels = {
+      {"block.fixture.causal.v1", 1U},
+      {"router.fixture.topk.v1", 1U},
+      {"moe.fixture.remote.v1", 1U}};
+  descriptor.layer_program.push_back(
+      {0U, "block.fixture.causal.v1", 1U, "decoder", 0U, {}});
+  descriptor.operation_program = {
+      {0U, 0U, "block.fixture.causal.v1", 1U, "", 0U, {}},
+      {1U, 0U, "router.fixture.topk.v1", 1U, "decoder", 0U, {}},
+      {2U, 0U, "moe.fixture.remote.v1", 1U, "decoder", 0U, {}},
+      {3U, 0U, "moe.fixture.remote.v1", 1U, "draft", 0U, {}}};
+  er::ExecutionProviderRegistry registry;
+  require(registry
+              .add({"fixture-capability-provider", 1U,
+                    {er::KernelCapability{"block.fixture.causal.v1", 1U,
+                                          1U},
+                     er::KernelCapability{"router.fixture.topk.v1", 1U,
+                                          1U},
+                     er::KernelCapability{"moe.fixture.remote.v1", 1U,
+                                          1U}}})
+              .ok(),
+          "VM fixture provider registration failed");
+  auto bound = registry.bind(descriptor);
+  require(bound.status.ok(), "VM fixture provider binding failed");
+  er::MoeVirtualMachine vm;
+  const std::array bindings{
+      er::MoeVmComponentBinding{"decoder", &routed},
+      er::MoeVmComponentBinding{"draft", &draft_routed}};
+  require(er::MoeVirtualMachine::create(
+              descriptor, std::move(bound.provider), bindings, vm)
+              .ok() &&
+              vm.operations(0U).size() == 4U,
+          "artifact-driven VM creation lost its operation program");
+  constexpr std::array route{2U, 0U};
+  require(routed.validate_route(0U, route).ok() &&
+              !routed.validate_route(0U, std::span(route).first(1U)).ok(),
+          "routed runtime did not enforce artifact top-k cardinality");
+  auto resolved =
+      vm.resolve_route(0U, route, er::ExpertResolveTarget::remote);
+  require(resolved.status.ok(), "VM rejected an exact artifact top-k route");
+  auto result = resolved.handle.poll();
+  require(result && result->status.ok() && result->experts.size() == 2U &&
+              result->experts[0].key.expert == 2U &&
+              result->experts[1].key.expert == 0U &&
+              result->experts[0].placement ==
+                  er::ExpertPlacementKind::remote &&
+              result->experts[0].remote_lease &&
+              result->experts[0].remote_lease->owner() == "fixture-node-7",
+          "injected remote store lost exact route order or ownership");
+  auto draft_resolved = vm.resolve_operation_route(
+      3U, route, er::ExpertResolveTarget::remote);
+  require(draft_resolved.status.ok(),
+          "VM failed to resolve the second sparse component on one layer");
+  auto draft_result = draft_resolved.handle.poll();
+  require(draft_result && draft_result->status.ok() &&
+              draft_result->experts.size() == 2U &&
+              draft_result->experts[0].key.model_id ==
+                  draft_component.namespace_id,
+          "operation routing silently fell back to the layer component");
 }
 
 class TestMemoryTier final : public er::ITrimmableMemoryTier {
@@ -667,6 +2154,247 @@ void test_state_machine_and_sha256() {
           "streaming SHA-256 differs from one-shot digest");
   require(er::constant_time_equal(digest, streaming.finalize()),
           "streaming SHA-256 finalize is not idempotent");
+}
+
+void test_buffer_pool_reserves_demand_capacity_globally() {
+  er::FixedBufferPool pool(
+      8U, er::kExpertPackAlignment, er::kExpertPackAlignment,
+      std::make_shared<er::AlignedHostAllocator>(), 6U);
+  std::vector<std::shared_ptr<er::FixedBufferPool::Lease>> background;
+  for (std::size_t slot = 0; slot < 2U; ++slot) {
+    auto lease = pool.try_acquire(er::kExpertPackAlignment,
+                                  er::BufferPoolClass::background);
+    require(static_cast<bool>(lease),
+            "background staging stopped before its global limit");
+    background.push_back(std::move(lease));
+  }
+  require(!pool.try_acquire(er::kExpertPackAlignment,
+                            er::BufferPoolClass::background),
+          "background staging consumed a demand-reserved slot");
+
+  std::vector<std::shared_ptr<er::FixedBufferPool::Lease>> demand;
+  for (std::size_t slot = 0; slot < 6U; ++slot) {
+    auto lease = pool.try_acquire(er::kExpertPackAlignment,
+                                  er::BufferPoolClass::demand);
+    require(static_cast<bool>(lease),
+            "demand could not consume its globally reserved capacity");
+    demand.push_back(std::move(lease));
+  }
+  require(!pool.try_acquire(er::kExpertPackAlignment,
+                            er::BufferPoolClass::demand),
+          "staging pool overcommitted its physical slot count");
+  const auto snapshot = pool.snapshot();
+  require(snapshot.slots_in_use == 8U &&
+              snapshot.demand_slots_in_use == 6U &&
+              snapshot.background_slots_in_use == 2U &&
+              snapshot.high_water_slots == 8U &&
+              snapshot.background_high_water_slots == 2U &&
+              snapshot.demand_acquires == 6U &&
+              snapshot.background_acquires == 2U &&
+              snapshot.demand_stalls == 1U &&
+              snapshot.background_stalls == 1U,
+          "global staging class telemetry is incomplete");
+}
+
+void test_host_preload_stays_in_ram_and_upgrades_without_reread() {
+  Harness harness(8192, 2, 8192, {1, 1, 0, 0, 0, 4096});
+  const auto fixture = make_record(62);
+  auto preload = harness.cache.preload_host(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::warm, true});
+  require(harness.storage->pending_count() == 1U &&
+              harness.uploader->pending_count() == 0U,
+          "host-only preload did not start exactly one disk read");
+  harness.storage->complete_success(fixture.bytes);
+  const auto preloaded = preload.get();
+  require(preloaded.status.ok() && preloaded.retained &&
+              harness.uploader->upload_count() == 0U,
+          "host-only preload reserved or uploaded VRAM");
+  const auto host_ready = harness.cache.inspect(fixture.key);
+  require(host_ready && host_ready->state == er::CacheState::ram_ready &&
+              host_ready->has_host_copy && !host_ready->has_device_copy &&
+              host_ready->ram_protected,
+          "host-only preload did not publish in protected RAM");
+
+  auto demand = harness.cache.acquire(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::demand, false, true, false});
+  require(harness.storage->read_count() == 1U,
+          "device demand reread a host-preloaded expert from disk");
+  harness.uploader->complete_success(er::kExpertPackAlignment);
+  auto acquired = demand.get();
+  require(acquired.status.ok() && acquired.lease,
+          "host-preloaded expert did not upgrade to device residency");
+  const auto metrics = harness.cache.telemetry();
+  constexpr auto warm = static_cast<std::size_t>(
+      er::ExpertRequestPriority::warm);
+  constexpr auto demand_priority = static_cast<std::size_t>(
+      er::ExpertRequestPriority::demand);
+  require(metrics.host_preloads_requested == 1U &&
+              metrics.host_preloads_completed == 1U &&
+              metrics.preloaded_host_useful == 1U &&
+              metrics.preloaded_host_useful_bytes ==
+                  er::kExpertPackAlignment &&
+              metrics.reads_started_by_priority[warm] == 1U &&
+              metrics.reads_completed_by_priority[warm] == 1U &&
+              metrics.uploads_started_by_priority[demand_priority] == 1U &&
+              metrics.uploads_completed_by_priority[demand_priority] == 1U,
+          "host preload attribution did not cover disk, RAM, and upload");
+}
+
+void test_warm_device_admission_uses_protected_ram_without_reread() {
+  Harness harness(8192, 2, 12288, {1, 1, 0, 0, 4096, 4096});
+  const auto fixture = make_record(71);
+  auto preload = harness.cache.preload_host(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::warm, true});
+  harness.storage->complete_success(fixture.bytes);
+  require(preload.get().status.ok(),
+          "warm-device fixture did not finish host preload");
+
+  auto warm = harness.cache.acquire(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::warm, false, true, true});
+  require(harness.storage->read_count() == 1U &&
+              harness.uploader->pending_count() == 1U,
+          "warm device admission reread disk or skipped the RAM upload");
+  harness.uploader->complete_success(er::kExpertPackAlignment);
+  auto acquired = warm.get();
+  require(acquired.status.ok() && acquired.lease,
+          "warm device admission did not publish a lease");
+  const auto ready = harness.cache.inspect(fixture.key);
+  const auto metrics = harness.cache.telemetry();
+  constexpr auto warm_priority = static_cast<std::size_t>(
+      er::ExpertRequestPriority::warm);
+  require(ready && ready->has_host_copy && ready->has_device_copy &&
+              ready->ram_protected && ready->vram_resident &&
+              metrics.device_requests[warm_priority] == 1U &&
+              metrics.ram_hits_by_priority[warm_priority] == 1U &&
+              metrics.uploads_started_by_priority[warm_priority] == 1U &&
+              metrics.uploads_completed_by_priority[warm_priority] == 1U &&
+              metrics.read_bytes == er::kExpertPackAlignment,
+          "warm device admission lost its protected placement or attribution");
+}
+
+void test_inflight_warm_read_is_upgraded_by_device_demand() {
+  Harness harness(8192, 2, 8192, {1, 1, 0, 0, 0, 4096});
+  const auto fixture = make_record(63);
+  auto preload = harness.cache.preload_host(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::warm, true});
+  auto demand = harness.cache.acquire(
+      fixture.key, fixture.record,
+      {er::ExpertRequestPriority::demand, false, true, false});
+  require(harness.storage->read_count() == 1U,
+          "concurrent warm and demand requests issued duplicate reads");
+  harness.storage->complete_success(fixture.bytes);
+  require(preload.get().status.ok(),
+          "joined host waiter did not receive the validated RAM copy");
+  harness.uploader->complete_success(er::kExpertPackAlignment);
+  require(demand.get().status.ok(),
+          "joined demand waiter did not receive the device copy");
+  const auto metrics = harness.cache.telemetry();
+  constexpr auto demand_priority = static_cast<std::size_t>(
+      er::ExpertRequestPriority::demand);
+  require(metrics.priority_upgrades == 1U && metrics.load_started == 1U &&
+              metrics.uploads_started_by_priority[demand_priority] == 1U &&
+              metrics.device_requests[demand_priority] == 1U,
+          "in-flight priority upgrade was not attributed to device demand");
+}
+
+void test_reload_and_reread_bytes_are_attributed() {
+  Harness harness(4096, 1, 4096);
+  const auto fixture = make_record(64);
+  auto first = harness.cache.acquire(fixture.key, fixture.record);
+  auto first_result = harness.finish(first, fixture);
+  first_result.lease = {};
+  const auto released = harness.cache.trim();
+  require(released != 0U &&
+              harness.cache.inspect(fixture.key)->state ==
+                  er::CacheState::absent,
+          "reload fixture did not evict the complete first residency");
+
+  auto second = harness.cache.acquire(fixture.key, fixture.record);
+  auto second_result = harness.finish(second, fixture);
+  require(second_result.status.ok() && second_result.lease,
+          "reloaded expert did not republish");
+  const auto metrics = harness.cache.telemetry();
+  require(metrics.reload_count == 1U &&
+              metrics.reread_bytes == er::kExpertPackAlignment &&
+              metrics.read_bytes == 2U * er::kExpertPackAlignment,
+          "reload telemetry did not attribute repeated disk traffic");
+}
+
+void test_protected_ram_survives_probationary_churn() {
+  Harness harness(8192, 2, 12288, {1, 1, 0, 0, 0, 4096});
+  const auto protected_record = make_record(65, 0);
+  const auto probationary = make_record(66, 4096);
+  const auto incoming = make_record(67, 8192);
+
+  auto warm = harness.cache.preload_host(
+      protected_record.key, protected_record.record,
+      {er::ExpertRequestPriority::warm, true});
+  harness.storage->complete_success(protected_record.bytes);
+  require(warm.get().status.ok(),
+          "protected RAM fixture did not finish host preload");
+
+  auto probationary_handle =
+      harness.cache.acquire(probationary.key, probationary.record);
+  auto probationary_result =
+      harness.finish(probationary_handle, probationary);
+  probationary_result.lease = {};
+  auto incoming_handle = harness.cache.acquire(incoming.key, incoming.record);
+  auto incoming_result = harness.finish(incoming_handle, incoming);
+  require(incoming_result.status.ok() && incoming_result.lease,
+          "probationary churn fixture did not admit the replacement");
+
+  const auto protected_after = harness.cache.inspect(protected_record.key);
+  const auto probationary_after = harness.cache.inspect(probationary.key);
+  const auto metrics = harness.cache.telemetry();
+  require(protected_after && protected_after->has_host_copy &&
+              protected_after->ram_protected && probationary_after &&
+              !probationary_after->has_host_copy &&
+              metrics.ram_evictions_by_class[0] == 1U &&
+              metrics.ram_evictions_by_class[1] == 0U &&
+              metrics.ram_evicted_bytes_by_class[0] ==
+                  er::kExpertPackAlignment,
+          "probationary churn evicted census-protected RAM");
+}
+
+void test_reuse_does_not_invade_census_protected_ram() {
+  Harness harness(12288, 2, 12288, {1, 1, 0, 0, 0, 4096});
+  const auto census = make_record(68, 0);
+  const auto first = make_record(69, 4096);
+  const auto second = make_record(70, 8192);
+
+  auto warm = harness.cache.preload_host(
+      census.key, census.record, {er::ExpertRequestPriority::warm, true});
+  harness.storage->complete_success(census.bytes);
+  require(warm.get().status.ok(), "census fixture did not preload");
+
+  auto first_handle = harness.cache.acquire(first.key, first.record);
+  auto first_result = harness.finish(first_handle, first);
+  first_result.lease = {};
+  require(harness.cache.record_access(first.key),
+          "reuse fixture did not record its second access");
+  auto second_handle = harness.cache.acquire(second.key, second.record);
+  auto second_result = harness.finish(second_handle, second);
+  require(second_result.status.ok() && second_result.lease,
+          "second probationary fixture did not publish");
+
+  const auto census_after = harness.cache.inspect(census.key);
+  const auto first_after = harness.cache.inspect(first.key);
+  const auto second_after = harness.cache.inspect(second.key);
+  const auto metrics = harness.cache.telemetry();
+  require(census_after && census_after->has_host_copy &&
+              census_after->ram_protected && first_after &&
+              first_after->has_host_copy && !first_after->ram_protected &&
+              second_after && second_after->has_host_copy &&
+              !second_after->ram_protected &&
+              metrics.ram_protected_bytes == 4096U &&
+              metrics.ram_probationary_bytes == 8192U &&
+              metrics.ram_promotions == 0U,
+          "ordinary reuse invaded the census-protected RAM reservation");
 }
 
 void test_expanding_admission_reserves_exact_device_bytes() {
@@ -763,7 +2491,8 @@ void test_concurrent_load_dedup_and_visibility() {
   }
 
   harness.storage->complete_success(fixture.bytes);
-  require(harness.uploader->upload_count() == 1,
+  require(harness.uploader->wait_for_pending(1U) &&
+              harness.uploader->upload_count() == 1,
           "deduplicated load issued multiple uploads");
   const auto uploading = harness.cache.inspect(fixture.key);
   require(uploading && uploading->state == er::CacheState::gpu_uploading &&
@@ -833,6 +2562,55 @@ void test_budget_eviction_refcount_and_cancellation() {
   require(metrics.stalled_by_budget != 0 && metrics.cancellation_count == 1 &&
               metrics.eviction_count != 0,
           "budget/cancel/eviction telemetry missing");
+  require(metrics.eviction_scan_calls != 0 &&
+              metrics.eviction_scan_candidates >=
+                  metrics.eviction_scan_calls &&
+              metrics.task_selection_calls != 0 &&
+              metrics.task_selection_candidates != 0 &&
+              metrics.mutex_acquisitions != 0,
+          "eviction/task-selection/mutex telemetry missing");
+}
+
+void test_device_admission_can_fail_fast_without_changing_default_waiting() {
+  Harness harness(16'384, 4, 8192);
+  const auto first = make_record(70, 0);
+  const auto second = make_record(71, 4096);
+  const auto incoming = make_record(72, 8192);
+
+  const auto load_full_page = [&](const FixtureRecord& fixture) {
+    auto handle = harness.cache.acquire(fixture.key, fixture.record);
+    harness.storage->complete_success(fixture.bytes);
+    harness.uploader->complete_success(er::kExpertPackAlignment);
+    auto result = handle.get();
+    require(result.status.ok() && result.lease,
+            "device-admission fixture did not publish a full page");
+    return result;
+  };
+  auto first_result = load_full_page(first);
+  auto second_result = load_full_page(second);
+
+  auto rejected = harness.cache.acquire(
+      incoming.key, incoming.record,
+      er::ExpertAcquireOptions{er::ExpertRequestPriority::demand, false, true,
+                               false, true});
+  require(rejected.wait_for(0ms) == std::future_status::ready,
+          "placement-aware admission remained pending without a victim");
+  auto rejected_result = rejected.get();
+  require(rejected_result.status.code() == er::ErrorCode::backpressure &&
+              !rejected_result.lease && harness.storage->pending_count() == 0,
+          "fail-fast admission read storage or returned device ownership");
+
+  auto waiting = harness.cache.acquire(incoming.key, incoming.record);
+  require(waiting.wait_for(0ms) == std::future_status::timeout &&
+              harness.storage->pending_count() == 0,
+          "default admission stopped waiting for releasable capacity");
+  first_result.lease = {};
+  require(harness.storage->pending_count() == 1,
+          "default waiter did not resume after device capacity was released");
+  auto admitted = harness.finish(waiting, incoming);
+  require(admitted.status.ok() && admitted.lease && second_result.lease &&
+              harness.cache.telemetry().device_admission_rejections == 1,
+          "device admission rejection was not isolated or attributed");
 }
 
 void test_short_read_checksum_and_upload_fail_closed() {
@@ -1245,6 +3023,11 @@ void test_vram_replacement_requires_a_strictly_colder_victim() {
   require(harness.cache.vram_admission_would_improve(candidate.key,
                                                       candidate.record),
           "hot RAM candidate did not outrank a colder VRAM resident");
+  const auto admission_metrics = harness.cache.telemetry();
+  require(admission_metrics.vram_admission_scan_calls == 2U &&
+              admission_metrics.vram_admission_scan_candidates != 0U &&
+              admission_metrics.mutex_acquisitions != 0U,
+          "VRAM admission scan/mutex telemetry missing");
   er::AdaptivePlacementConfig placement_config;
   placement_config.enable_prefetch = true;
   placement_config.minimum_recent_observations = 1;
@@ -1476,10 +3259,29 @@ void test_route_census_is_bounded_ranked_and_recoverable() {
 
   auto loaded = er::RouteCensus::load(prefix, config);
   require(loaded.status.ok() && loaded.census &&
+              !loaded.namespace_rebound &&
               loaded.census->snapshot().generation == 2U &&
               loaded.census->snapshot().completed_routes == 3U &&
               loaded.census->predict_next(0U, first, 2U).size() == 1U,
           "route census did not load its newest valid generation");
+  auto relocated = config;
+  relocated.model_id = 0x570116270568999ULL;
+  auto rebound = er::RouteCensus::load(prefix, relocated);
+  const auto rebound_warm = rebound.census
+      ? rebound.census->stable_warm_set(1U, 1U)
+      : std::vector<er::RouteCensusWarmEntry>{};
+  const auto relocated_prefix = root / "relocated-routes";
+  require(rebound.status.ok() && rebound.census &&
+              rebound.namespace_rebound && rebound_warm.size() == 1U &&
+              rebound_warm.front().key.model_id == relocated.model_id &&
+              rebound.census->save(relocated_prefix).ok(),
+          "route census did not safely rebind a runtime namespace");
+  auto rebound_persisted =
+      er::RouteCensus::load(relocated_prefix, relocated);
+  require(rebound_persisted.status.ok() && rebound_persisted.census &&
+              !rebound_persisted.namespace_rebound &&
+              rebound_persisted.census->snapshot().generation == 3U,
+          "route census namespace rebind was not persisted");
   auto mismatch = config;
   mismatch.model_content_hash[0] ^= std::byte{1};
   require(!er::RouteCensus::load(prefix, mismatch).status.ok(),
@@ -1541,16 +3343,34 @@ int main() {
   try {
     test_deepseek_compact_and_sm86_hot_abi();
     test_deepseek_compact_admission_validation();
+    test_headerless_fp4_admission_is_geometry_driven();
+    test_universal_model_descriptor_negotiates_capabilities();
+    test_serialized_model_program_is_provider_neutral();
+    test_schema_v2_artifact_binds_unknown_model_without_architecture_branch();
+    test_schema_v3_callable_program_is_exact_and_family_neutral();
+    test_schema_v2_expresses_model_derived_hybrid_moe_topology();
+    test_generic_expert_catalog_uses_descriptor_cardinality();
+    test_universal_worker_launch_preserves_provider_extensions();
     test_deepseek_fp8_shared_admission_validation();
     test_fp4_block32_admission_validation();
     test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
+    test_buffer_pool_reserves_demand_capacity_globally();
+    test_host_preload_stays_in_ram_and_upgrades_without_reread();
+    test_warm_device_admission_uses_protected_ram_without_reread();
+    test_inflight_warm_read_is_upgraded_by_device_demand();
+    test_reload_and_reread_bytes_are_attributed();
+    test_protected_ram_survives_probationary_churn();
+    test_reuse_does_not_invade_census_protected_ram();
     test_expanding_admission_reserves_exact_device_bytes();
     test_expert_store_resolves_complete_ordered_union();
+    test_active_expert_wire_moves_only_exact_activations();
+    test_routed_runtime_accepts_injected_remote_store();
     test_resource_governor_trims_before_reserving();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();
+    test_device_admission_can_fail_fast_without_changing_default_waiting();
     test_short_read_checksum_and_upload_fail_closed();
     test_ram_hit_reuploads_after_vram_eviction();
     test_host_lease_protects_validated_ram_copy();

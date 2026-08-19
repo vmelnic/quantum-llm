@@ -1,5 +1,8 @@
 # OpenAI-compatible HTTP API
 
+Status: current public pilot contract as of 2026-08-11. All supported artifacts
+use this same service; unsupported API features still fail explicitly.
+
 This document is the public contract of the local Expert Runtime service. The
 implementation targets wire compatibility with OpenAI clients for deterministic
 text generation. It does not silently emulate capabilities that the model
@@ -7,8 +10,9 @@ runner does not have: unsupported sampling, multimodal, tool, logprob and
 server-side state options return a structured `400` error.
 
 The canonical loopback deployment listens on `http://127.0.0.1:8080/v1`. It
-serves exactly one selected model at a time: Qwen3-Next 80B or
-DeepSeek-V4-Flash.
+serves exactly one selected artifact at a time through the common MoE VM
+runner. Qwen3-Next 80B FP4, DeepSeek-V4-Flash and LFM2-8B-A1B FP4 have passed
+the real `hi` lifecycle gate.
 
 ## Endpoints
 
@@ -95,7 +99,7 @@ from openai import OpenAI
 client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
 
 response = client.responses.create(
-    model="qwen3-next-80b-a3b-expert-pack-int8",
+    model="qwen3-next-80b-a3b-expert-pack-fp4",
     instructions="Answer briefly.",
     input="Why is the sky blue?",
     max_output_tokens=64,
@@ -106,7 +110,7 @@ print(response.output_text)
 
 ```python
 stream = client.chat.completions.create(
-    model="qwen3-next-80b-a3b-expert-pack-int8",
+    model="qwen3-next-80b-a3b-expert-pack-fp4",
     messages=[{"role": "user", "content": "Write one sentence."}],
     max_completion_tokens=64,
     temperature=0,
@@ -203,7 +207,8 @@ context and at most 8,192 generated tokens. Prompt plus requested output must
 fit the context. The request body limit is 1 MiB.
 
 Those configured ceilings are distinct from qualification and checkpoint
-metadata. Qwen advertises 262K positions and DeepSeek-V4-Flash advertises 1M;
+metadata. For example, Qwen advertises 262K positions and DeepSeek-V4-Flash
+advertises 1M;
 the only completed long-context correctness gate remains 4,096. The 65,536
 DeepSeek setting fits its capacity-one 2 GiB logical KV budget, but long-prompt
 quality and performance remain unqualified. Model metadata is therefore not
@@ -220,11 +225,12 @@ tokens per chunk.
 `/model-info.worker_execution` distinguishes an authenticated MTP resource from
 an active speculative path. `mtp_resource_available` means descriptors exist;
 `mtp_runtime_ready` means the worker also loaded the tensor state, compact pack,
-shared expert, cache and directory. Either may be true while `mtp_enabled`
-remains false unless the operator explicitly enables it; clients must never
-infer speculative generation from bundle contents or startup residency alone.
-When enabled, the internal protocol may return a verified bonus token, but the
-HTTP streaming contracts remain one ordered text delta at a time.
+shared expert, cache and directory. MTP activation is derived from the
+artifact's draft/verify operation program and provider readiness; there is no
+model-launcher `EnableMtp` switch in the current common path. Clients must not
+infer speculative generation from bundle contents alone. When active, the
+internal protocol may return a verified bonus token, but HTTP streaming remains
+one ordered text delta at a time.
 
 `/model-info.worker_placement` is the authoritative effective placement
 contract. It returns the selected `profile`, exact RAM/VRAM cache bytes,

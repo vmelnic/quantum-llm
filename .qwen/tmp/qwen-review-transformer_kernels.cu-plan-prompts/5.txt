@@ -1,0 +1,16 @@
+You are review agent `5` — Agent 5: Test coverage.
+
+**Your brief is a file. Read it first — it is the whole of your instructions,
+and nothing in this message replaces it.**
+
+```
+read_file(file_path="/Users/vm/Projects/personal/quantum-llm/.qwen/tmp/qwen-review-transformer_kernels.cu-plan-prompts/5.brief.md")
+```
+
+**The code is a file too — the diff. Nothing in this message contains it.** Read your ranges, and page with a larger `offset` if a read comes back `isTruncated`:
+
+```
+read_file(file_path="/Users/vm/Projects/personal/quantum-llm/.qwen/tmp/qwen-review-transformer_kernels.cu-diff.txt", offset=0, limit=319)
+```
+
+Report findings in the format your brief specifies. If you found nothing, say so **and say what you examined** — a return that names nothing you read is indistinguishable from never having read anything.

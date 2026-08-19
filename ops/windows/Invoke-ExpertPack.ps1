@@ -1,9 +1,10 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Compile", "Validate")]
+    [ValidateSet("Compile", "Validate", "RefreshModelProgram")]
     [string]$Action,
     [Parameter(Mandatory = $true)]
     [string]$Path,
+    [string]$Source = "",
     [string]$Output,
     [string]$SourceId = "local-checkpoint",
     [string]$SourceRevision = "local",
@@ -40,6 +41,21 @@ try {
         )
         if ($Resume) { $arguments += "--resume" }
         if ($ReclaimSourceShards) { $arguments += "--reclaim-source-shards" }
+    }
+    elseif ($Action -eq "RefreshModelProgram") {
+        if ([string]::IsNullOrWhiteSpace($Output) -or
+            [string]::IsNullOrWhiteSpace($Source)) {
+            throw "-Output and -Source are required for RefreshModelProgram"
+        }
+        $resolvedOutput = [System.IO.Path]::GetFullPath($Output)
+        $resolvedSource = [System.IO.Path]::GetFullPath($Source)
+        $arguments = @(
+            "-m", "compiler", "refresh-model-program",
+            "--container", $resolvedPath,
+            "--output", $resolvedOutput,
+            "--source", $resolvedSource,
+            "--adapter", $Adapter
+        )
     }
     else {
         $arguments = @("-m", "compiler", "validate", $resolvedPath)

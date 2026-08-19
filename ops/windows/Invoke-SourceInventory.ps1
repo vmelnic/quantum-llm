@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Snapshot,
     [switch]$TensorGroups,
+    [string]$Adapter,
     [ValidateSet("deepseek_v4")][string]$Contract,
     [switch]$EstimateRepresentations
 )
@@ -20,6 +21,7 @@ Push-Location $script:RepoRoot
 try {
     $arguments = @("-m", "compiler", "inspect-source", "--source", $source)
     if ($TensorGroups) { $arguments += "--tensor-groups" }
+    if ($Adapter) { $arguments += @("--adapter", $Adapter) }
     if ($Contract) { $arguments += @("--contract", $Contract) }
     if ($EstimateRepresentations) { $arguments += "--estimate-representations" }
     & $python.Source @arguments

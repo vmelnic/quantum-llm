@@ -1,8 +1,12 @@
 # Path to ±30 tok/s on the 3090 host — hypotheses and solutions
 
-Status: executed, 2026-08-09 (v4 — W0–W5 landed, measured outcomes in §8).
+Status: executed, 2026-08-11 (v5 — W0–W5 and the DeepSeek tier-separation
+follow-on landed; current measurements are in §10).
+This is a historical execution record, not the active backlog. Resume current
+work from [MoE VM current state and remaining work](moe-vm-next.md).
 Follow-on work (FP4 routed experts S1a–S1c landed and measured 2026-08-10;
-S2/S3 pending) is tracked in docs/inference-scaling-next.md. Line references
+the model-specific S2/S3 items were left unexecuted) is recorded in
+docs/inference-scaling-next.md. Line references
 below were taken at audit time; the named symbols are the stable anchors.
 Inputs: code audit of the serving path (runtime/, ops/python/,
 ops/windows/), docs/benchmarks.md measured numbers, and published results
@@ -48,12 +52,14 @@ Bytes that must move per generated token on the critical path:
   [vLLM recipes](https://recipes.vllm.ai/deepseek-ai/DeepSeek-V4-Flash)):
   43 × 6 records ≈ **3.21 GiB/token**. 30 tok/s would need ~96 GiB/s of
   routed-expert bandwidth — beyond this host's RAM even fully resident.
-  **30 tok/s for DeepSeek-V4-Flash on this box is physically infeasible;
-  the realistic ceiling is ~8–15 tok/s**, and that only after fixing the
-  supply pipeline (W3) and enabling MTP (2–3× on eligible spans).
-  Post-execution correction (§8): W3 landed and MTP was measured
-  throughput-neutral in this regime, so even the 8–15 tok/s ceiling is
-  unreachable; the 3.21 GiB/token arithmetic wall stands.
+  **30 tok/s for DeepSeek-V4-Flash on this box is physically infeasible.**
+  The original 8–15 tok/s estimate assumed a much higher routed-byte hit rate
+  and a 2–3× MTP gain; neither assumption held in the measured workload.
+  Post-execution correction (§8, superseded by §10): MTP was measured
+  throughput-neutral while CPU hybrid dispatch and expert movement dominated.
+  Tier separation plus GPU-only routed execution later reached 4.41–4.56 tok/s
+  on a settled route. The 3.21 GiB/token arithmetic wall still rules out
+  30 tok/s on this host.
 - Consequence for future models (Kimi K3): the deciding spec is **active
   parameters per token**, not total. ~3B active fits the 30 tok/s envelope
   on this host; ~13B active does not. Gate every candidate model on
@@ -102,15 +108,6 @@ is memcpy'd for RAM retention before first upload
 (`runtime/src/expert_cache.cpp`); eviction does linear scans under
 one mutex; spin-yield scheduler loop.
 
-**R5 — Byte-at-a-time INT8 GEMV on the hot GPU path (Qwen ceiling).**
-`gemv_batch` (including batch 1) dispatches the non-vectorized
-`int8_gemv_batch_kernel` — one byte per thread per iteration — while
-`char4`/`float4` vectorized kernels exist in the same file but are only
-reachable via other entry points
-(`runtime/src/cuda/transformer_kernels.cu`).
-~4× weight-read amplification on every resident-expert GEMV; invisible at
-1 tok/s, decisive at 30.
-
 No CUDA graphs anywhere. INT8 dequant is fused in the GEMV kernels.
 
 ## 4. External landscape (measured on the same wall)
@@ -132,11 +129,10 @@ No CUDA graphs anywhere. INT8 dequant is fused in the GEMV kernels.
   4090 + naive CPU offload ≈ 2.7–3.3 tok/s
   ([genesis-kernel](https://github.com/Anuar81/genesis-kernel)). Naive
   offload ≈ 1 tok/s; resident/cached working set ≈ tens of tok/s.
-- **MTP speculative decoding** (DeepSeek bundle v3 already ships MTP;
-  `EnableMtp` off by default): 2–3× on eligible spans; mandatory for even
-  15 tok/s on DeepSeek. Post-execution: measured throughput-neutral in
-  this bandwidth-bound regime (§8 W5); kept on because it is correct and
-  self-suppressing.
+- **MTP speculative decoding** (DeepSeek bundle v3 ships MTP and production
+  enables it): the original expectation was 2–3× on eligible spans.
+  Post-execution it was throughput-neutral in this bandwidth-bound regime
+  (§8 W5); it is kept on because it is correct and self-suppressing.
 - **moe-stream ([GOBA-AI-Labs/moe-stream](https://github.com/GOBA-AI-Labs/moe-stream)):
   same rejected SSD-streaming class, but its entropy-based dynamic-K
   (fewer experts per token when the router is confident) is a legitimate
@@ -201,8 +197,9 @@ bytes/token directly.
 Done when: resident-hit rate ≥ 0.8 across the benchmarks.md chat traces
 and Qwen sustains ~30 tok/s on typical chats.
 
-**W5 — DeepSeek reality.** W3 applied, MTP enabled (`EnableMtp`, plus the
-reserve bug in R4), documented target re-baselined at 8–15 tok/s.
+**W5 — DeepSeek reality.** W3 applied; MTP is selected from the immutable VM
+program when draft/verify operations are present (including the reserve fix in
+R4), and the documented target is re-baselined at 8–15 tok/s.
 
 Re-run the docs/benchmarks.md suite after every item against the pre-fix
 baseline.
@@ -212,12 +209,12 @@ baseline.
 - **Qwen3-Next-80B: 30 tok/s conditionally feasible.** Conditions: W1+W2
   (serving path stops losing 40×) then W3+W4 (working set stays resident).
   The 47.67 tok/s hot-native number proves the compute side already can.
-- **DeepSeek-V4-Flash: 8–15 tok/s realistic, 30 infeasible here** — 3.21
-  GiB/token fails bandwidth arithmetic before any code is written. For 30
-  with a DeepSeek-class model: fewer active parameters or a second GPU.
-  Post-execution (§8 W5): the 8–15 band proved unreachable too; measured
-  ~0.5 tok/s with MTP on. No further runtime investment is justified on
-  this host.
+- **DeepSeek-V4-Flash: 30 tok/s is infeasible here.** The older 8–15 tok/s
+  estimate was not demonstrated; the current settled-route result is
+  4.41–4.56 tok/s (§10). Further runtime work is justified only when it
+  measurably reduces SSD first touches or RAM-to-VRAM bytes, not as generic
+  scheduler tuning. For 30 tok/s with a DeepSeek-class model: fewer active
+  parameters, substantially more routed VRAM, or multiple GPUs.
 - **Future Kimi K3 (or any candidate):** gate adoption on active
   params/token and MTP/speculative support; ~3B active fits this host,
   ~13B does not.
@@ -258,7 +255,8 @@ baseline.
   and revisits past the 48 GiB RAM tier re-read from disk. Two aggressive
   variants measured and discarded (ping-pong churn).
 - **W5 (DeepSeek MTP):** landed; verdict: **MTP is throughput-neutral in
-  this regime, 8–15 tok/s confirmed unreachable.** Acceptance 73–77%, but
+  this regime and W5 did not reach the 8–15 tok/s estimate.** Acceptance
+  73–77%, but
   a verify pair pays the union of two adjacent routes through the same
   bandwidth-bound pipe (reads slightly more), so accepted drafts amortize
   only the fixed per-step cost, which is not the bottleneck at ~2 s/token.
@@ -267,9 +265,199 @@ baseline.
   speculative-bonus poisoning of retained sessions (new STEP "hold" mode).
   Deployment keeps MTP on: correct, neutral, self-suppressing.
 
-**Final state.** Qwen3-Next-80B meets the target on the resident route
-(~27–29 tok/s); non-resident chat is SATA-first-touch-bound (~3 tok/s).
-DeepSeek-V4-Flash stays ~0.5 tok/s; no runtime change beats 3.21
-GiB/token over this host's bandwidth. For 30 tok/s with a
-DeepSeek-class model: fewer active bytes/token or faster storage/RAM —
-not more scheduler work.
+**State at the end of W5.** Qwen3-Next-80B met the target on the resident
+route (~27–29 tok/s); non-resident chat remained SATA-first-touch-bound
+(~3 tok/s). DeepSeek-V4-Flash was ~0.5 tok/s at this point. This paragraph
+is historical; the later tier-separation and GPU-only measurements are in
+§10.
+
+## 9. DeepSeek tier-separation follow-on (implemented, 2026-08-10)
+
+The S1-DeepSeek result later reached roughly 3.5 tok/s on settled turns but
+still showed SATA first-touch and RAM/VRAM churn on new topics. A subsequent
+code audit found that prediction could only move RAM-resident records to VRAM,
+the census warm path was bounded by VRAM, the existing VRAM transient class was
+disabled, MTP misses were acquired serially, and the cache did not attribute
+reloads or work by request priority. The following structural changes are now
+implemented:
+
+- `ExpertCache` has distinct demand, prefetch, and warm priorities; demand is
+  scheduled first, and the shared eight-slot staging pool reserves six slots
+  globally for demand across the main and MTP caches.
+- A host-only preload API admits authenticated records from storage into a
+  bounded RAM tier without reserving or uploading VRAM. Device demand still
+  reserves VRAM before starting its own I/O; demand joining an in-flight warm
+  read upgrades that same read and reserves VRAM at upload admission.
+- RAM is split into bounded probationary and protected classes. First-touch
+  DeepSeek demand is retained in probationary RAM and reuse raises its bounded
+  eviction temperature. The census warms at most 32 experts per layer into
+  protected RAM (1,376 records, about 17.1 GiB for the current compact record
+  geometry) after the worker publishes ready. Warm production stops while
+  demand is active and is capped at two staging slots.
+- The existing VRAM transient/resident mechanism is active. The transient ring
+  is sized from the retained-route bound, census/session-hot records can be
+  protected, route feedback now reaches the cache for every completed layer,
+  and eviction skips every route-pinned or asynchronously busy victim before
+  considering the next candidate.
+- Prompt routes are counted during prefill and the top six per layer are
+  promoted, within the bounded class budgets, for the following decode span.
+  MTP launches all exact draft misses before waiting instead of serializing
+  acquire/wait pairs. The main verify scheduler admits up to the 12-expert pair
+  union in one acquisition round, subject to the physical staging bound.
+- The cancelled-prefetch requeue bug is fixed. Transition prediction remains
+  RAM-to-VRAM only: speculative disk-to-RAM prediction is intentionally off
+  until the new byte and wait telemetry proves that its saved demand wait is
+  larger than its added SATA traffic.
+
+Instrumentation now covers the complete SSD -> staging -> validation/copy ->
+RAM -> upload -> VRAM path: tier hits and misses by priority, waiter and stage
+latency, bytes, reload/reread traffic, useful/wasted preload, RAM/VRAM class
+occupancy and eviction, references/pins, every cache-state transition, global
+staging arbitration, warm-loop behavior, prefill placement, task selection,
+eviction/admission scan cost, mutex wait, and a separate MTP cache breakdown.
+An opt-in bounded exact-route JSONL trace records ordinary and verify-pair
+routes plus the initial RAM/VRAM seed; `deepseek_route_oracle.py` simulates LRU
+and offline Belady bounds without changing serving. The server includes all
+cumulative counters in per-request deltas; occupancy and high-water values
+remain gauges.
+
+This design is budget-driven, not total-model-size-driven: a 1 TB model uses
+the same mechanisms, while its configured RAM/VRAM budgets determine which
+working set is resident. It does not imply that a 1 TB pack fits this host or
+that arbitrary first touches avoid storage.
+
+Verification gate: the complete Release MSVC/CUDA build passed on the RTX 3090
+host, all four CTest targets passed, and all 54 compiler/server Python tests
+passed. The service benchmarks for this follow-on are recorded below.
+
+## 10. DeepSeek measured result and remaining limits (2026-08-11)
+
+The deployed configuration is a demand-streamed model, not a whole-model
+load: the 11,008 routed records remain in the pack and each layer requests its
+exact top six. The 48 GiB RAM and 13 GiB routed-VRAM budgets are cache tiers.
+After ready, the census validates 1,376 records (about 17.1 GiB) into protected
+RAM and promotes the hottest 658 (about 8.2 GiB) into resident VRAM. A 1 TB
+model uses the same mechanism; only the hit rate and first-touch frequency
+change as its pack grows.
+
+The largest measured improvement came from disabling DeepSeek CPU hybrid
+dispatch. GPU phase instrumentation showed that the planner selected CPU
+execution 4,187 times and accumulated 41.22 s of synchronous CPU compute; the
+planner assumed overlap that the actual scheduler cannot provide after exact
+GPU acquisition. GPU-only dispatch reduced the settled identical-prompt wall
+time from about 21.8 s to 10.1–9.7 s and raised decode from about 2.1 tok/s to
+4.41–4.56 tok/s (roughly 2.1x). It is now the production default; profiling is
+off and CPU hybrid remains an explicit diagnostic option.
+
+The existing `work/fp4-s1/fp4_bench_probe.py` produced the following results
+after a fresh start and completed census warm-up:
+
+| Mode | Decode result | TTFT | Storage and transfer evidence |
+| --- | ---: | ---: | --- |
+| `resident`, four identical prompts, 24 output tokens | 0.47, 1.46, 4.41, **4.56 tok/s** | 47.47, 5.55, 4.88, **4.69 s** | Requests 3–4 read 0 bytes from SSD but uploaded 49.8/48.4 GB RAM-to-VRAM. |
+| `novel`, eight unrelated prompts, 12 output tokens | **0.38–0.69 tok/s** (mean 0.57) | 14.75–38.00 s | 8.2–16.8 GiB SSD and 31.0–47.1 GiB H2D per request. |
+| `suite`, six retained conversation turns, 12 output tokens | **0.59–0.86 tok/s** (mean 0.73) | 26.94–47.86 s | Turns 2–6 resumed the retained KV prefix, but still read 10.3–14.0 GiB SSD and uploaded 36.0–40.5 GiB H2D. |
+
+The probe's legacy `storage_read_gib` annotation does not recognize the newer
+`cache_read_bytes` key and prints zero. The byte figures above come from the
+matching server `request_telemetry` records, not that stale annotation.
+
+At the pre-index checkpoint, the settled-route bottleneck was no longer SATA
+or CPU. Request 4 read
+zero storage bytes, uploaded 48.38 GB over 40 model steps, and spent 6.29 s of
+its 9.72 s wall time in scheduler expert wait (5.28 s in upload wait). That is
+about 1.21 GB H2D per model step even after cache hits. At the measured 12.46
+GiB/s pinned-H2D ceiling, the same byte rate alone bounds execution near 11
+model steps/s before compute and control overhead; the observed end-to-end
+rate was 4.56 tok/s. Reaching 30 tok/s would allow only about 0.42 GiB H2D per
+token against 3.21 GiB of active routed weights, requiring at least about 87%
+of routed bytes to hit VRAM before counting compute. The current hot trace is
+approximately 65% by that arithmetic, and the 13 GiB routed cache cannot hold
+arbitrary routes from the roughly 147 GB (137 GiB) routed pack.
+
+### Indexed supply and exact-route follow-up
+
+Task-selection instrumentation found a software bottleneck hidden inside the
+expert wait: `next_task_locked` inspected about 342 million map entries and
+spent about 4.0 s per settled request while looking for a few actionable
+reads/uploads. The cache now maintains exact priority-ordered read and upload
+key sets under the existing mutex. It preserves demand/prefetch/warm ordering
+and admission policy while reducing the settled request to about 3,600 task
+candidates and 0.79 s of inclusive task-selection time.
+
+The matched service results are:
+
+| Probe | Before task indexes | With task indexes | Evidence |
+| --- | ---: | ---: | --- |
+| Settled identical prompt, 24 output tokens | 4.41--4.56 tok/s | **6.54--6.69 tok/s** | Zero SSD in both arms; about 47.8 GB H2D per request remains. |
+| Eight fixed novel prompts, 12 output tokens | 358.78 s total | **321.47 s total** | Read/reread/H2D stayed exactly 97.156/58.558/315.102 GiB, proving that the speedup did not change cache policy. |
+
+This is roughly a 46--51% settled decode improvement and a 10.4% novel-suite
+wall-time improvement. Eviction still scans roughly 49 million map candidates
+and costs about 0.96 s per settled request. Two residency-index implementations
+did not beat the deterministic map scan and were removed; only the validated
+task indexes remain.
+
+The exact trace contains 97,111 routed accesses over 365 captured steps. With
+the real initial seed, the RAM oracle reports 9,978 LRU misses versus 6,383
+offline-Belady misses; VRAM reports 43,928 versus 26,848. These are upper
+bounds from future knowledge, not implementable throughput claims, but they
+prove that policy headroom remains. Two direct approximations were rejected:
+
+- frequency-based promotion of probationary demand into protected RAM caused
+  1,001 promotions and 13.16 GiB of protected eviction on one novel request at
+  threshold two; threshold 16 still increased a matched resident cold request
+  from 95.5 s/30.9 GiB read to 124.2 s/41.7 GiB;
+- widening exact prefill protection improved offline decode coverage from
+  17.24% at top six to 21.45% at top eight and 28.26% at top twelve, but top
+  twelve caused sustained late-suite churn. Top eight reduced bytes slightly
+  yet regressed the matched novel total from 321.47 s to 328.91 s and raised
+  storage wait from 385.1 s to 416.2 s. Production therefore remains top six.
+
+Remaining work, ordered by the measured dependency:
+
+1. Replace generic recency only with a policy that distinguishes prefill and
+   verify multiplicity from future decode value. The top-eight/top-twelve and
+   frequency-promotion experiments above show that a wider hit-count window is
+   insufficient even when its raw coverage is higher. Any next policy must be
+   evaluated first in the exact oracle and then reduce both bytes and wait in
+   the matched service suite.
+2. Add budgeted transition prefetch from disk to protected RAM for absent
+   experts. It addresses the 8–17 GiB first touches in `novel`; cancel it on
+   exact demand and automatically disable it when speculative read bytes rise
+   without a corresponding storage-wait reduction. The current hot trace has
+   about 1,702 incorrect of 3,440 predictions and schedules zero promotions
+   once admission is saturated, so turning those predictions directly into
+   SATA reads is not yet safe. NVMe helps this cold path but cannot improve the
+   zero-SSD resident result.
+3. Expose a cross-layer prediction handoff before current-layer FFN completion,
+   then pipeline only RAM-resident next-layer uploads during that FFN. The
+   current scheduler receives a ready route at `layer_complete`, after the
+   overlap window has closed; merely increasing queue depth cannot create this
+   overlap. Demand remains strictly prioritary, and the gate is lower
+   `scheduler_expert_wait_ns` with no extra uploaded bytes.
+4. Eliminate the failed `BEGIN` round trip for an unrelated new request by
+   proactively evicting one unmatched retained worker slot. Reactive LRU
+   eviction and retry already work; this is only a correctness-preserving
+   control-path cleanup, not a tok/s lever.
+5. Keep the validated exact task indexes. `evict_one_locked` still scans the
+   full entry map under one mutex, but the measured residual is about 0.96 s per
+   settled request; replace it only with a deterministic priority structure
+   that beats that number. The attempted set/pointer residency indexes did not
+   and were removed. This remains more important for packs much larger than the
+   current 11,008 records.
+6. Revisit MTP only after expert movement falls. In the current traces it
+   usually launches three drafts and accepts zero or one; warming a distinct
+   speculative future-route set may help, but the two attempted request-local
+   gates increased SSD reads and were reverted.
+Dynamic top-K is excluded from this plan because changing routed capacity can
+reduce answer quality and increase hallucination. Smaller routed quantization
+would likewise require a separate quality gate and is not part of these
+cache/scheduler changes.
+
+More RAM can eliminate cold SATA only if it holds the useful routed working
+set (roughly 192 GB host RAM would hold this pack with operating headroom).
+More routed VRAM or another GPU attacks the settled H2D bottleneck directly.
+For larger models, including a 1 TB pack, no whole-model-fit assumption is
+required, but arbitrary novel routes become slower unless their working set is
+predictable or the storage/RAM tiers grow with it.

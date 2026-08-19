@@ -169,7 +169,9 @@ def _fp4_pack_nibbles(indices: list[int], signs: list[int]) -> bytes:
 def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: object) -> bytes:
     """Write FP4-E2M1 packed rows and return UE8M0 block scales.
 
-    Each output row is encoded independently: every block of
+    Each flattened output row is encoded independently. The last source
+    dimension is zero-padded to a complete block in storage; the original
+    shape remains authoritative in the tensor index. Every block of
     ``FP4_QUANT_GROUP_SIZE`` values shares one UE8M0 scale chosen as the
     smallest power of two covering the block maximum, values round to the
     nearest E2M1 level (ties to the even level index), and nibbles pack
@@ -177,13 +179,25 @@ def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: obje
     their bytes are identical.
     """
 
-    rows, columns, row_bytes = _row_geometry(view)
-    if columns % FP4_QUANT_GROUP_SIZE:
+    shape = view.info.shape
+    if not shape or len(shape) > 5:
         raise SourceFormatError(
-            f"FP4 block-{FP4_QUANT_GROUP_SIZE} requires a multiple of "
-            f"{FP4_QUANT_GROUP_SIZE} columns, got {columns} for {view.info.name}"
+            f"FP4 dense storage accepts rank 1-5 tensors, got {shape} "
+            f"for {view.info.name}"
         )
-    blocks = columns // FP4_QUANT_GROUP_SIZE
+    if view.info.dtype not in SUPPORTED_FLOAT_DTYPES:
+        raise SourceFormatError(
+            f"FP4 dense storage accepts BF16/F16/F32, got "
+            f"{view.info.dtype} for {view.info.name}"
+        )
+    rows = math.prod(shape[:-1]) if len(shape) > 1 else 1
+    columns = shape[-1]
+    padded_columns = (
+        (columns + FP4_QUANT_GROUP_SIZE - 1) // FP4_QUANT_GROUP_SIZE
+    ) * FP4_QUANT_GROUP_SIZE
+    element_bytes = {"BF16": 2, "F16": 2, "F32": 4}[view.info.dtype]
+    row_bytes = columns * element_bytes
+    blocks = padded_columns // FP4_QUANT_GROUP_SIZE
     scales = bytearray()
     for row in range(rows):
         start = row * row_bytes
@@ -194,6 +208,8 @@ def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: obje
                 raise SourceFormatError(f"short decoded row in {view.info.name}")
             if not bool(_np.isfinite(numeric).all()):
                 raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
+            if padded_columns != columns:
+                numeric = _np.pad(numeric, (0, padded_columns - columns))
             grid = numeric.reshape(blocks, FP4_QUANT_GROUP_SIZE)
             maxima = _np.max(_np.abs(grid), axis=1)
             codes = _np.array(
@@ -230,6 +246,7 @@ def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: obje
             materialized.append(scalar)
         if len(materialized) != columns:
             raise SourceFormatError(f"short decoded row in {view.info.name}")
+        materialized.extend([0.0] * (padded_columns - columns))
         for block in range(blocks):
             chunk = materialized[
                 block * FP4_QUANT_GROUP_SIZE : (block + 1) * FP4_QUANT_GROUP_SIZE

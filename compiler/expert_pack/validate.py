@@ -108,7 +108,7 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
         dim1,
         dim2,
         dim3,
-        reserved,
+        dim4,
         record_bytes,
         data_offset,
         data_bytes,
@@ -118,11 +118,13 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
         payload_hash,
     ) = DENSE_HEADER_STRUCT.unpack(raw[: DENSE_HEADER_STRUCT.size])
     _require(magic == DENSE_MAGIC and version == FORMAT_VERSION, "unknown dense record ABI")
-    _require(header_bytes == HEADER_BYTES and reserved == 0, "invalid dense header fields")
+    _require(header_bytes == HEADER_BYTES, "invalid dense header fields")
     _require(record_bytes == stored_bytes, "dense record/manifest size mismatch")
     _require(flags & FLAG_ROW_MAJOR, "dense record is not row-major")
-    _require(1 <= rank <= 4, "invalid dense rank")
-    dimensions = (dim0, dim1, dim2, dim3)[:rank]
+    _require(1 <= rank <= 5, "invalid dense rank")
+    dimensions = (dim0, dim1, dim2, dim3, dim4)[:rank]
+    if rank < 5:
+        _require(dim4 == 0, "invalid dense rank padding")
     _require(list(dimensions) == entry.get("source_shape"), "dense shape mismatch")
     name = entry.get("name")
     _require(isinstance(name, str), "dense record has no name")
@@ -144,10 +146,33 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
     if quant_abi == QUANT_ABI_ID:
         required = FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
         _require(flags & required == required, "INT8 dense flags are incomplete")
+        _require(rank == 2, "INT8 dense storage requires a matrix")
         _require(scale_offset % SECTION_ALIGNMENT == 0, "unaligned dense scales")
         _require(scale_bytes == dimensions[0] * 4, "dense scale count mismatch")
         _require(data_bytes == elements, "INT8 dense data byte count mismatch")
         _validate_scales(path, offset + scale_offset, scale_bytes, "dense")
+    elif quant_abi == FP4_QUANT_ABI_ID:
+        required = FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+        _require(flags & required == required, "FP4 dense flags are incomplete")
+        rows = math.prod(dimensions[:-1]) if rank > 1 else 1
+        columns = dimensions[-1]
+        padded_columns = (
+            (columns + FP4_QUANT_GROUP_SIZE - 1)
+            // FP4_QUANT_GROUP_SIZE
+            * FP4_QUANT_GROUP_SIZE
+        )
+        _require(scale_offset % SECTION_ALIGNMENT == 0, "unaligned dense scales")
+        _require(
+            data_bytes == rows * padded_columns // 2,
+            "FP4 dense data byte count mismatch",
+        )
+        _require(
+            scale_bytes == rows * padded_columns // FP4_QUANT_GROUP_SIZE,
+            "FP4 dense scale count mismatch",
+        )
+        _validate_ue8m0_scales(
+            path, offset + scale_offset, scale_bytes, "dense"
+        )
     else:
         _require(quant_abi == 0 and scale_offset == 0 and scale_bytes == 0, "unknown dense quant ABI")
         _require(data_bytes == elements * 4, "FP32 dense data byte count mismatch")
@@ -261,6 +286,38 @@ def _manifest_content_hash(manifest: dict[str, Any]) -> str:
     return sha256_bytes(canonical_json_bytes(copied))
 
 
+def _routed_component_cardinality(path: Path) -> tuple[int, int] | None:
+    components: list[tuple[int, int]] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise ValidationError(
+            f"cannot read runtime model program: {error}"
+        ) from error
+    for line in lines:
+        fields = line.split("\t")
+        if not fields or fields[0] != "component":
+            continue
+        _require(len(fields) == 14, "invalid routed component record")
+        try:
+            layer_count = int(fields[3])
+            expert_count = int(fields[4])
+        except ValueError as error:
+            raise ValidationError(
+                "non-integer routed component cardinality"
+            ) from error
+        _require(
+            layer_count > 0 and expert_count > 0,
+            "invalid routed component cardinality",
+        )
+        components.append((layer_count, expert_count))
+    _require(
+        len(components) <= 1,
+        "Expert Pack v1 indexes at most one routed component",
+    )
+    return components[0] if components else None
+
+
 def validate_container(root: Path | str) -> dict[str, Any]:
     root = Path(root)
     _require(root.is_dir(), f"container directory does not exist: {root}")
@@ -276,6 +333,7 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         "compatibility",
         "source",
         "architecture",
+        "model_program",
         "quantization",
         "kernel_abi",
         "alignment",
@@ -319,6 +377,26 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         and marker.get("format_version") == FORMAT_VERSION,
         "invalid completion marker schema",
     )
+
+    model_program = manifest.get("model_program")
+    _require(
+        isinstance(model_program, dict)
+        and set(model_program) == {"format", "path", "bytes", "sha256"}
+        and model_program.get("format") == "expert-runtime-model-v1",
+        "invalid runtime model program metadata",
+    )
+    model_program_path = _safe_child(root, model_program["path"])
+    _require(model_program_path.is_file(), "runtime model program is missing")
+    _require(
+        model_program_path.stat().st_size == model_program.get("bytes")
+        and sha256_file(model_program_path) == model_program.get("sha256"),
+        "runtime model program checksum mismatch",
+    )
+    with model_program_path.open("rb") as handle:
+        _require(
+            handle.readline() == b"expert-runtime-model-v1\n",
+            "unknown runtime model program format",
+        )
 
     dense = manifest.get("tensors")
     experts = manifest.get("experts")
@@ -370,10 +448,15 @@ def validate_container(root: Path | str) -> dict[str, Any]:
 
     architecture = manifest.get("architecture")
     _require(isinstance(architecture, dict), "architecture block missing")
-    layer_count = architecture.get("num_hidden_layers")
-    expert_count = architecture.get("num_experts")
-    _require(isinstance(layer_count, int) and isinstance(expert_count, int), "expert dimensions absent")
-    expected_keys = {(layer, expert) for layer in range(layer_count) for expert in range(expert_count)}
+    cardinality = _routed_component_cardinality(model_program_path)
+    expected_keys = set()
+    if cardinality is not None:
+        layer_count, expert_count = cardinality
+        expected_keys = {
+            (layer, expert)
+            for layer in range(layer_count)
+            for expert in range(expert_count)
+        }
     _require(expert_keys == expected_keys, "expert index is incomplete")
 
     for pack_name, records in records_by_pack.items():

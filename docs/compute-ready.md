@@ -1,5 +1,8 @@
 # Compute-ready representations
 
+Status: current representation contract as of 2026-08-11. Physical-container
+unification is not complete; see [the MoE VM handoff](moe-vm-next.md).
+
 `Compute-ready` is a contract between stored bytes and one concrete kernel. It
 does not merely mean "quantized" or "packed into one file". A record is
 compute-ready only when the selected kernel can consume it without a full
@@ -41,10 +44,9 @@ an interpretation from tensor dimensions.
 
 ## Current project formats
 
-Expert Pack v1 is compute-ready for the existing INT8-per-row Qwen/OLMoE
-kernels. Its cost is size: converting lower-bit source weights to INT8 can
-roughly double routed-weight traffic. Since 2026-08 the same container also
-carries an FP4-E2M1/UE8M0 block-32 profile (quant ABI 3, kernel ABI
+The supported Qwen and LFM Expert Pack v1 artifacts carry an
+FP4-E2M1/UE8M0 block-32 routed-expert profile
+(quant ABI 3, kernel ABI
 `expert-pack-sm86-fp4-block32-v1`) consumed directly by packed `__dp4a`
 selection-batch kernels; the measured FP4 Qwen pack halves routed bytes per
 token (0.7 GiB vs 1.41 GiB) and reached 39.6–45.6 tok/s on resident routes
@@ -60,14 +62,16 @@ Dense and shared tensors currently use their own admitted device ABIs. Their
 resident representation consumes VRAM that could otherwise retain routed
 experts.
 
-## The smaller representation direction
+Both formats now bind a checksummed `runtime-model.tsv` program. This unifies
+the execution description, not the physical payload container: DeepSeek still
+enters through the worker-bundle/compact-pack storage adapter.
 
-The proposed next representation is not "compress a file and decompress it
-before every token". It must remain compressed through storage, RAM and VRAM,
-then be consumed directly by a fast kernel. Candidate work includes:
+## Performance direction
 
-- 2--3-bit or mixed-bit routed weights with separately gated quality loss;
-- compact scale encodings and larger or adaptive quantization blocks;
+Any future representation must remain compressed through storage, RAM and
+VRAM, then be consumed directly by a fast kernel. Current work does not include
+a lower-bit or reduced-quality conversion. Representation work is limited to:
+
 - offline tile/swizzle layout matching the selected CUDA MMA kernel;
 - fused dequantization inside grouped GEMM, amortized over several rows;
 - a distinct ABI per hardware/kernel family when layouts genuinely differ.
@@ -76,8 +80,9 @@ For DeepSeek, routed experts are already FP4. Merely repacking the same four-bit
 values cannot provide the missing order-of-magnitude bandwidth. A materially
 smaller ABI, better route residency, or row batching must accompany the kernel.
 At the measured roughly 3.45 GB of arbitrary routed weights per token, 30 tok/s
-would require more than 100 GB/s of weight delivery. Even halving the record to
-two bits still requires roughly 52 GB/s if every selected expert is cold.
+would require more than 100 GB/s of weight delivery when every selected expert
+is cold. The current plan therefore focuses on exact working-set reuse,
+placement and direct execution rather than trading away model quality.
 
 Therefore compute-ready is necessary but not sufficient. The production goal
 is: smaller bytes, direct fast execution, and enough reuse/batching that those

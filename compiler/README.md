@@ -222,6 +222,18 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m compiler validate C:\path\to\model.expert-pack
 ```
 
+Every newly compiled container includes `runtime-model.tsv` schema 2. This is
+the provider-neutral execution contract: model dimensions, routed-component
+geometry, opaque weight encoding/source ABIs, provider-owned router programs,
+required operation capabilities, and the ordered block/router/expert
+instruction stream. `manifest.json.model_program` binds the file by byte
+length and SHA-256. The runtime negotiates providers by capability and ABI,
+not by `architecture_id`; a new model using existing numerical capabilities
+therefore needs an artifact adapter but no cache, catalog, worker-launch, or
+server model-name branch. A new operation, encoding, or unsupported geometry
+still requires a provider and independent numerical qualification. Schema 1
+containers remain readable through the legacy layer-program compiler.
+
 Output is written to `<output>.partial` and becomes the final directory only
 after packs, manifest, hashes, and `COMPLETED` validate. Interrupted conversion
 can resume only with identical source bytes and options:

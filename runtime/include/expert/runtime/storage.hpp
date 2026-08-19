@@ -17,6 +17,7 @@ namespace expert::runtime {
 enum class ErrorCode : std::uint8_t {
   ok,
   cancelled,
+  deadline_exceeded,
   backpressure,
   invalid_argument,
   open_failed,
@@ -68,9 +69,17 @@ struct PayloadRecord final {
   // Exact device allocation produced by admission. Zero preserves the legacy
   // invariant that stored bytes and device bytes are equal.
   std::uint64_t device_bytes{};
+  // Logical expert matrix geometry. Required for headerless records; a
+  // self-describing record must agree with these values when they are nonzero.
+  std::uint32_t hidden{};
+  std::uint32_t intermediate{};
+  std::uint32_t quant_block_size{};
   // Source payload ABI. One is Expert Pack v1; two is the compact DeepSeek
   // staging order validated before CUDA admission.
   std::uint32_t source_abi{1};
+  // Quantization/layout ID stored inside a self-describing record. Headerless
+  // source ABIs leave this zero and are interpreted by their source adapter.
+  std::uint32_t record_abi{};
   std::uint32_t header_bytes{256};
   std::uint32_t alignment{4096};
   Sha256Digest payload_sha256{};

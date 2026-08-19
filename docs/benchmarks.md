@@ -1,5 +1,10 @@
 # Performance evidence
 
+Status: current evidence index as of 2026-08-17. Dated W/S sections preserve
+their original configurations and remain valid historical measurements. The
+active implementation backlog is [MoE VM current state and remaining
+work](moe-vm-next.md), not a benchmark section below.
+
 ## How to read the numbers
 
 The project reports four different quantities and does not substitute one for
@@ -13,6 +18,26 @@ another:
 Cold and warm results are always separate. “Warm” is route-specific: an expert
 set warmed by one prompt does not make arbitrary future conversations hot.
 
+## Common MoE VM functional acceptance (2026-08-17)
+
+The final common-path gate used the same `hi` input through `ops/model.sh`, the
+`QuantumLLM-ExpertVm` task, the OpenAI-compatible service and
+`expert-moe-vm-runner.exe`. The Windows/CUDA build passed four CTest targets
+and 59 Python tests before the gate.
+
+| Artifact | TTFT | Total wall | Post-first-token | Result |
+|---|---:|---:|---:|---|
+| Qwen3-Next 80B FP4 | 11.755 s | 21.449 s | 1.13 tok/s | coherent greeting |
+| DeepSeek-V4-Flash | 8.901 s | 15.728 s | 1.32 tok/s | coherent greeting |
+| LFM2-8B-A1B FP4 | 7.508 s | 12.141 s | 2.37 tok/s | coherent greeting |
+
+This is a lifecycle and functional-equivalence gate, not a throughput suite:
+the outputs have different token counts and the services were cold/restarted.
+It proves the shared public path, but it demonstrates no tok/s gain from the VM
+refactor. This gate ran after moving the project, packs and build tree to the
+Windows D: NVMe; Hugging Face source snapshots remained on C:. The
+worker/service were stopped after the gate.
+
 ## Qwen3-Next 80B
 
 Reference configuration:
@@ -20,7 +45,7 @@ Reference configuration:
 - model: `Qwen/Qwen3-Next-80B-A3B-Instruct`;
 - source revision: `9c7f2fbe84465e40164a94cc16cd30b6999b0cc7`;
 - source checkpoint: 162,659,161,528 bytes;
-- Expert Pack v1 INT8: 81,903,198,208 bytes;
+- historical Expert Pack v1 INT8 comparison artifact: 81,903,198,208 bytes;
 - dense pack: 4,191,133,696 bytes;
 - RTX 3090 24 GB, approximately 64 GB RAM, local SATA SSD;
 - 48 GiB RAM expert budget and 18 GiB VRAM expert budget.
@@ -206,8 +231,8 @@ RAM on the CPU executor once placement is frozen).
 
 Landed changes: uploads in `CudaExpertUploader` complete through per-upload
 CUDA events consumed by a dedicated completion thread instead of
-`cudaStreamSynchronize` under the pool lock (all three paths: Qwen INT8
-sections, DeepSeek direct compact, DeepSeek compact expansion) — neither the
+`cudaStreamSynchronize` under the pool lock (Expert Pack sections, DeepSeek
+direct compact, DeepSeek compact expansion) — neither the
 decode thread nor a storage callback pays a stream-wide sync on the hot path;
 the DeepSeek scheduler no longer suspends prefetch while a demand acquire is
 in flight and runs 4 in-flight prefetches with 2 transition predictions per
@@ -437,8 +462,9 @@ final numbers above):
   45.2 s baseline, turn wall 155.9 s vs 87.6 s) because the retained session
   included the unemitted bonus token and matched no follow-up prompt.
 
-The deployment keeps MTP enabled (`ops/model.sh` already passes
-`-EnableMtp`): with the hold-step fix it is correct, retention-compatible and
+The deployment keeps MTP enabled because the artifact declares draft/verify
+operations; no model-specific launcher flag is required. With the hold-step
+fix it is correct, retention-compatible and
 self-suppressing when unprofitable, at a small extra read cost on cold turns
 (+3.5% on turn 1). The full build/ctest/Python suite (48 tests, including
 `test_hold_step_maps_to_worker_flag_2` and
@@ -449,10 +475,11 @@ self-suppressing when unprofitable, at a small extra read cost on cold turns
 ## DeepSeek-V4-Flash
 
 The 284B-class DeepSeek backend is functionally complete enough for greedy API
-generation on the same host, but not performance-ready. Representative
-end-to-end decode remains roughly 0.4–0.6 tok/s depending on route/cache state
-(W3/W5 measurements, MTP enabled), improved to ~3.5 tok/s on settled turns by
-the S1-DeepSeek accounting fix (see below).
+generation on the same host, but not performance-ready. W3/W5 measured roughly
+0.4–0.6 tok/s and S1-DeepSeek reached ~3.5 tok/s on settled turns. The later
+priority/tier and indexed-supply follow-on below reached 6.54–6.69 tok/s only
+on its settled identical-prompt workload; changing prompts remained much
+slower.
 
 ### S1-DeepSeek: FP4 device accounting + warm-set recalibration (2026-08-10)
 
@@ -485,7 +512,8 @@ decode = generated/(wall - TTFT)):
 | 2 | 0.52 | 2.00 | 19.7 GiB |
 | 3 | 0.47 | 3.50 | 10.1 GiB |
 
-~7.4x on turn 3. MTP ablation (same build, `-EnableMtp` removed): decode
+~7.4x on turn 3. Historical MTP ablation (same build, the then-current
+`-EnableMtp` launcher option removed): decode
 1.31/0.91/0.96 with identical ~5 GiB/token reads — MTP no longer costs
 supply (the W5 "neutral" verdict was measured in the int8-slot regime);
 drafts 3/turn accepted 2/3, so MTP stays on and is now a 2-3.5x decode
@@ -499,7 +527,7 @@ structural eviction fix from `40f595f` also proved itself here: a
 another stream) — the victim was skipped and the request completed;
 pre-fix that interleaving was a server hang.
 
-Paths toward ~10 tok/s, by leverage, no quality-risky steps:
+At the S1 checkpoint, the hardware paths toward ~10 tok/s were:
 
 - NVMe tier for the pack: the SATA miss path (0.47 GiB/s measured) is the
   dominant wait; NVMe (~5 GB/s) is ~10x on exactly that term and shortens
@@ -524,6 +552,34 @@ Measurements established:
 No DeepSeek result in this repository should be described as a 30 tok/s model
 or chat result.
 
+### Priority tiers and indexed supply (2026-08-11)
+
+The follow-on activated demand/prefetch/warm priority, host-only preload,
+protected/probationary RAM, transient/protected VRAM, census warm-up,
+prefill-route placement and parallel MTP acquisition. The complete cache path
+now reports priority-attributed tier hits, waits, bytes, reload/reread traffic,
+preload usefulness, occupancy, pins, staging and task-selection cost. A bounded
+exact-route trace drives an offline LRU/Belady oracle.
+
+Disabling synchronous DeepSeek CPU hybrid raised the settled identical-prompt
+result from about 2.1 to 4.41–4.56 tok/s. Replacing full-map task discovery
+(about 342 million inspected entries and ~4.0 s/request) with exact
+priority-ordered read/upload key sets then produced:
+
+| Probe | Result | Movement evidence |
+|---|---:|---|
+| settled identical prompt, 24 output tokens | 6.54–6.69 tok/s | zero SSD; about 47.8 GB H2D/request |
+| eight fixed novel prompts, 12 output tokens | 321.47 s total, 10.4% faster | read/reread/H2D unchanged at 97.156/58.558/315.102 GiB |
+| novel prompts before task indexing | 0.38–0.69 tok/s, mean 0.57 | 8.2–16.8 GiB SSD/request |
+| retained six-turn suite before task indexing | 0.59–0.86 tok/s, mean 0.73 | 10.3–14.0 GiB SSD on turns 2–6 |
+
+The task-index speedup therefore changed control overhead, not placement
+policy. Eviction still spends about 0.96 s per settled request scanning the
+entry map; two attempted residency indexes were slower and removed. Wider
+prefill protection and frequency promotion also regressed the matched novel
+suite and were removed. Full implementation detail and rejected variants are
+preserved in [the executed 30 tok/s plan](inference-30toks-plan.md#indexed-supply-and-exact-route-follow-up).
+
 ## Context and output limits
 
 The deployed API advertises 65,536 context tokens and up to 8,192 output tokens.
@@ -536,15 +592,18 @@ Claims at 8K–65K require separate numerical, memory, TTFT and decode evidence.
 ## Current performance verdict
 
 - Qwen native hot paths exceed 30 tok/s.
-- Qwen repeated-route API decode reaches 27–29 tok/s int8 (W4) and
-  39.6–45.6 tok/s with the FP4 pack (§S1b).
-- Qwen novel-route chat is SATA first-touch bound: ~2.4–4.2 tok/s int8,
-  5.3–16.9 tok/s FP4. The 30 tok/s SLO is met on resident routes only.
-- DeepSeek chat was ~0.4–0.6 tok/s (W3/W5); S1-DeepSeek accounting brings
-  settled turns to ~3.5 tok/s with MTP on (§S1-DeepSeek). The next levers
-  are hardware (NVMe tier, RAM >= 192 GB); the SLO stays out of reach on
-  this host as shipped.
+- Qwen repeated-route API decode reaches 39.6–45.6 tok/s with the FP4 pack
+  (§S1b).
+- Qwen novel-route chat is SATA first-touch bound at 5.3–16.9 tok/s FP4. The
+  30 tok/s SLO is met on resident routes only.
+- DeepSeek progressed from ~0.4–0.6 tok/s (W3/W5), through ~3.5 tok/s at
+  S1-DeepSeek, to 6.54–6.69 tok/s on a settled identical-prompt workload after
+  tier separation and indexed supply. Novel/retained suites remain below one
+  tok/s in the cited matched probes, so the SLO stays out of reach.
 - `ready=true` means healthy/admitting, not warmed or SLO-compliant.
+- The 2026-08-11 three-model VM gate above is the newest lifecycle evidence,
+  but it did not rerun the controlled performance suites and does not supersede
+  their scoped numbers.
 
 The acceptance target remains at least 30 useful output tok/s for a declared
 workload. Any future claim must state model, prompt/history distribution,

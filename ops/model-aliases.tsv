@@ -1,0 +1,6 @@
+model-aliases-v1
+deepseek	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3
+deepseek-v4-flash	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3
+qwen	qwen3-next-80b-a3b-expert-pack-fp4	qwen3-next-80b-expert-pack-fp4
+qwen3-next	qwen3-next-80b-a3b-expert-pack-fp4	qwen3-next-80b-expert-pack-fp4
+qwen3-next-80b-a3b-expert-pack-fp4	qwen3-next-80b-a3b-expert-pack-fp4	qwen3-next-80b-expert-pack-fp4

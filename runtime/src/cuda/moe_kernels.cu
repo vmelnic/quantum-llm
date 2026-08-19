@@ -304,7 +304,7 @@ __global__ void gate_up_silu_selection_batch(
   float gate_sum = 0.0F;
   float up_sum = 0.0F;
   if (entry.format == static_cast<std::uint32_t>(
-                          DeviceExpertFormat::deepseek_fp4_block32)) {
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32)) {
     const auto* q = quantized_input +
                     static_cast<std::size_t>(request_row) * hidden;
     gate_sum = packed_fp4_q8_dot(entry.w1_fp4, entry.w1_ue8m0, q,
@@ -360,7 +360,7 @@ __global__ void down_selection_batch(
       intermediate + static_cast<std::size_t>(selection) * width;
   float partial = 0.0F;
   if (entry.format == static_cast<std::uint32_t>(
-                          DeviceExpertFormat::deepseek_fp4_block32)) {
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32)) {
     const auto* q = quantized_intermediate +
                     static_cast<std::size_t>(selection) * width;
     partial = packed_fp4_q8_dot(

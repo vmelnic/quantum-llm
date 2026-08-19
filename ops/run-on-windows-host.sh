@@ -10,9 +10,13 @@ if [[ "${script_name}" == */* || "${script_name}" != *.ps1 ]]; then
 fi
 
 remote_host="${QUANTUM_LLM_REMOTE:-}"
-remote_root="${QUANTUM_LLM_REMOTE_ROOT:-C:/quantum-llm}"
+remote_root="${QUANTUM_LLM_REMOTE_ROOT:-}"
 if [[ -z "${remote_host}" ]]; then
   echo "Set QUANTUM_LLM_REMOTE=user@host" >&2
+  exit 2
+fi
+if [[ -z "${remote_root}" ]]; then
+  echo "Set QUANTUM_LLM_REMOTE_ROOT to the remote project root" >&2
   exit 2
 fi
 

@@ -1,178 +1,25 @@
 # Roadmap
 
-This is the current backlog. Completed experiments and rejected approaches are
-kept in [Engineering history](history.md); measured results are in
-[Performance evidence](benchmarks.md).
+Status: superseded on 2026-08-11.
 
-## P0 — truthful chat behavior
+The active, dependency-ordered implementation backlog is
+[MoE VM current state and remaining work](moe-vm-next.md). Start the next work
+session there. This file remains as a stable link for older documents.
 
-1. Expose Qwen request-level expert telemetry through `/model-info`, logs and
-   metrics: SSD bytes, RAM/VRAM hits, H2D bytes, CPU/GPU selections and time.
-2. Distinguish lifecycle states `ready`, `warming` and workload-qualified `hot`.
-   Readiness alone must never imply the throughput SLO.
-3. Add a repeatable chat workload with changing prompts and growing history.
-   Report cold/warm, TTFT, post-first-token and end-to-end rates separately.
+The previous P0–P7 roadmap mixed several distinct programs: serving speed,
+long-context qualification, service hardening, platform portability,
+distributed experts, trillion-parameter scaling and external knowledge. Their
+durable results are preserved in [Engineering history](history.md), and their
+measurements are preserved in [Performance evidence](benchmarks.md).
 
-Completed in the W0–W5 serving campaign (see
-[Performance evidence](benchmarks.md) and
-[Engineering history](history.md#serving-path-campaign-w0w5)):
+Current tracks are intentionally separated:
 
-- retained conversation sessions (protocol v5 `BEGIN … RESUME` /
-  `END … RETAIN`), so every turn no longer re-prefills the entire unchanged
-  history;
-- decoupled prefill chunking (default 256 tokens, independent of the decode
-  batch capacity);
-- async directory planning, frozen placement with router feedback, the
-  event-driven uploader, and the W4 bounded router-aware re-promotion.
+1. finish the universal physical artifact and composable operation executor;
+2. onboard a fourth compatible FP4 MoE without common-path code changes;
+3. optimize representative chat only after it runs through that generic path;
+4. qualify long context and production failure handling independently;
+5. consider CPU/distributed/remote expert owners only after exact local
+   placement, cancellation and resource contracts are complete.
 
-Acceptance: at least 30 useful output tok/s for a documented single-chat
-workload, with bounded memory and no omitted experts. Aggregate throughput is a
-separate SLO. Current standing against it: resident routes meet the target
-(27–29 tok/s int8, 39.6–45.6 tok/s FP4); representative novel-route chat does
-not (~2.4–4.2 tok/s int8, 5.3–16.9 tok/s FP4, SATA first-touch bound), so P0
-remains open.
-
-## P1 — DeepSeek working-set performance
-
-Status 2026-08-10: largely executed or closed. Items 2 and 4 landed (compact
-FP4 records stay packed through storage/residency; W3 overlapped acquisition
-with ready work), item 5 is confirmed by measurement, and item 6 was executed
-in W5 — MTP measured throughput-neutral (0.47–0.54 → 0.49–0.59 tok/s) because
-a verify pair pays the union of two adjacent routes through the same
-bandwidth-bound pipe. Audit verdict: with 3.21 GiB/token over a 12.46 GiB/s
-H2D / 0.47 GiB/s SATA host, no further runtime investment is justified on
-this host; MTP stays on (correct, retention-compatible, self-suppressing).
-The remaining items stand only if work resumes on different hardware.
-
-1. Attribute every token wall-time segment to dense/attention, routing,
-   acquisition, storage, H2D, expert compute, aggregation and output head.
-2. Keep routed FP4 records compact through storage and residency; create only
-   bounded compute-ready tiles/slots.
-3. Replace per-expert launch/compute paths with grouped or fused SM86 kernels
-   where measurements show a win.
-4. Overlap cold acquisition with ready work without blocking or evicting live
-   request leases.
-5. Use CPU expert compute only when measured completion beats local GPU load
-   plus compute; the tested forced desktop-CPU split was slower.
-6. Evaluate MTP by accepted useful output tokens/s, including verification and
-   rejected drafts, never by draft rows alone.
-
-Acceptance: representative DeepSeek multi-turn output improves monotonically
-with exact token equality; no synthetic microbenchmark may replace API evidence.
-
-## P2 — long-context qualification
-
-The API ceiling is currently configurable to 65,536, but only 4,096 has passed
-the historical qualification gates.
-
-1. ~~Decouple causal prefill chunk size from request concurrency.~~ Done in
-   W1(b): `prefill_chunk_tokens` is an independent worker setting (default
-   256), no longer tied to the decode batch capacity.
-2. Add adaptive/grouped prefill and an efficient full-attention kernel.
-3. Gate 8K, 16K, 32K and 64K sequentially for numerical equality, memory high
-   water, cancellation, TTFT and decode.
-4. Test mixed context lengths against the aggregate KV credit budget.
-5. Advertise a qualified context separately from the configured hard ceiling.
-
-## P3 — service hardening
-
-1. Native Windows service or equivalent non-interactive supervisor.
-2. Log rotation, external metrics, request correlation, tracing and alerts.
-3. TLS/auth/rate-limiting reference edge; keep the built-in server loopback.
-4. 24-hour soak plus cancellation, overload, short-read, corrupt-pack, disk-full,
-   CUDA OOM/reset and worker-restart campaigns.
-5. Self-hosted SM86 CI, pinned toolchain/driver and signed release artifacts.
-
-## P4 — platform-neutral core and Metal
-
-Keep manifests, request state, placement, scheduler and cache policy independent
-of CUDA/Windows. Add macOS asynchronous storage and a Metal backend after the
-single-host contracts are stable. Unified memory removes some copies but does
-not turn another Mac's RAM into local memory, and fanless/thermal constraints
-remain explicit.
-
-RTX 3090/CUDA remains the first performance backend. Metal is an adaptation,
-not a reason to weaken the current acceptance gates.
-
-## P5 — distributed expert workers
-
-Do not stream whole expert weights over ordinary network links per token. Move
-activation compute to the node that already owns the expert:
-
-```text
-coordinator: dense + attention + exact router
-       │ activations, expert IDs, routing weights
-       ▼
-expert worker: local RAM/SSD/accelerator → gate/up/down
-       │ strict outputs or weighted partials
-       ▼
-coordinator: stable aggregation
-```
-
-The future application protocol includes:
-
-- persistent TCP first, including IP over Thunderbolt Bridge;
-- separate control and data planes;
-- binary framing with bounded payloads and checksums;
-- model manifest and quant/kernel ABI negotiation;
-- credits for queue, staging, compute rows and cache bytes;
-- operation IDs, connection epochs, cancellation and idempotent retry;
-- exact failure when any selected expert has no local/remote replica.
-
-Use standard transport reliability and cryptography; do not invent TCP or TLS.
-Remote placement is admitted only when measured remote completion beats local
-load plus compute.
-
-## P6 — hundreds of billions to one trillion parameters
-
-- shard packs/indexes across storage and workers;
-- bound metadata independently of total parameter count;
-- window the device directory and compute-ready slots;
-- replicate hot experts based on observed demand;
-- optimize single-stream and aggregate workloads separately;
-- preserve exact routing and explicit failures under partial node loss.
-
-The durable rule is: weights remain near their storage/compute tier;
-activations move instead of whole experts per token.
-
-## P7 — production external knowledge
-
-The Memory Expert experiment moved to the standalone public `memory-expert`
-project, where the KV-attach architecture (native-attention read of a
-prefilled record K/V prefix, plus a small LoRA reader) validated its first
-two milestones and superseded the rank-16 gate Plan A below. The remaining
-items describe what production knowledge would require for integration into
-this runtime; the mechanism work itself continues there.
-
-The synthetic Memory Expert PoW proved channel causality only. Generic immutable
-ingestion and a pinned multilingual dense index are implemented; the Romanian
-legal document reached rank-1 retrieval for 5/5 questions. The first
-multilingual capability benchmark was invalidated by shortcuts and its legal
-run was unusable. Production knowledge therefore remains incomplete:
-
-1. complete Plan A without changing the architecture: train the independent
-   adapter for complete deterministic epochs, validate and checkpoint per
-   epoch, report example visits/microsteps/optimizer updates separately, then
-   run untouched causal and held-out gates; do not tune against only the three
-   failed examples. Reproduce TokenMem only as Plan B if this adequate run
-   still fails;
-2. extend the implemented immutable record generations, language and ACL
-   contract with temporal selection and deletion/tombstone semantics;
-3. extend the pinned BGE-M3 exact sharded scan to calibrated routed
-   ANN/full-text or sparse shards while retaining an explicit no-evidence result;
-4. expose bounded memory admission, citations and verbatim evidence through the
-   serving API without placing records in the conversation context;
-5. cache only hot JIT memory states under independent RAM/VRAM budgets;
-6. add a general copy mechanism only if natural-corpus evidence shows it is
-   required; do not restore a benchmark-specific continuation heuristic;
-7. evaluate Moldovan/Romanian/Russian legislation and structured order data for
-   temporal correctness, ACL isolation, injection resistance, updates, exact
-   quotes and abstention;
-8. test Romanian/Russian transfer only after the English causal and held-out
-   gates pass; never retrain merely because records were ingested;
-9. port the interface—not the Qwen3-4B weights—to larger Qwen and DeepSeek
-   backbones only after the small-model real-data gate passes.
-
-Acceptance: unseen ingests become queryable without weight updates; unsupported
-questions abstain; every factual answer carries authorized immutable evidence;
-memory, latency and cache growth remain bounded as corpus size increases.
+The external Memory Expert/KV-attach experiment is owned by the standalone
+`../memory-expert` project and is not part of this runtime roadmap.

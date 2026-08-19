@@ -77,6 +77,13 @@ __global__ void pair_route_layout_kernel(
   }
 }
 
+__global__ void routed_selection_mask_kernel(std::uint8_t* mask,
+                                             std::uint64_t bits) {
+  const auto slot = static_cast<std::uint32_t>(threadIdx.x);
+  if (slot < kTopK)
+    mask[slot] = static_cast<std::uint8_t>((bits >> slot) & 1U);
+}
+
 }  // namespace
 
 DeepSeekFfnState::DeepSeekFfnState(void* allocation, std::uint64_t bytes,
@@ -85,6 +92,24 @@ DeepSeekFfnState::DeepSeekFfnState(void* allocation, std::uint64_t bytes,
 
 DeepSeekFfnState::~DeepSeekFfnState() {
   if (allocation_) static_cast<void>(cudaFree(allocation_));
+}
+
+DeepSeekRoutePredictionState::DeepSeekRoutePredictionState(
+    void* allocation, std::uint64_t bytes) noexcept
+    : allocation_(allocation), bytes_(bytes) {
+  map(allocation);
+}
+
+DeepSeekRoutePredictionState::~DeepSeekRoutePredictionState() {
+  if (allocation_) static_cast<void>(cudaFree(allocation_));
+}
+
+void DeepSeekRoutePredictionState::map(void* raw_base) noexcept {
+  Arena arena{static_cast<std::byte*>(raw_base)};
+  router_logits_ = arena.take<float>(256U);
+  routing_weights_ = arena.take<float>(kTopK);
+  expert_indices_ = arena.take<std::uint32_t>(kTopK);
+  bytes_ = align_up(arena.cursor);
 }
 
 DeepSeekFfnPairWorkspace::DeepSeekFfnPairWorkspace(
@@ -145,6 +170,7 @@ void DeepSeekFfnState::map(void* raw_base) noexcept {
   routed_q_intermediate_ =
       arena.take<std::int8_t>(kTopK * kIntermediate);
   routed_q_intermediate_scales_ = arena.take<float>(kTopK);
+  routed_selection_mask_ = arena.take<std::uint8_t>(kTopK);
   shared_intermediate_ = arena.take<float>(kIntermediate);
   shared_output_ = arena.take<float>(kHidden);
   bytes_ = align_up(arena.cursor);
@@ -152,13 +178,18 @@ void DeepSeekFfnState::map(void* raw_base) noexcept {
 
 DeepSeekFfnHybridWorkspace::DeepSeekFfnHybridWorkspace(
     void* device_allocation, std::uint64_t device_bytes,
-    void* host_allocation, std::uint64_t host_bytes) noexcept
+    void* host_allocation, std::uint64_t host_bytes,
+    void* input_ready_event) noexcept
     : device_allocation_(device_allocation), host_allocation_(host_allocation),
-      device_bytes_(device_bytes), host_bytes_(host_bytes) {
+      device_bytes_(device_bytes), host_bytes_(host_bytes),
+      input_ready_event_(input_ready_event) {
   map();
 }
 
 DeepSeekFfnHybridWorkspace::~DeepSeekFfnHybridWorkspace() {
+  if (input_ready_event_)
+    static_cast<void>(cudaEventDestroy(
+        static_cast<cudaEvent_t>(input_ready_event_)));
   if (host_allocation_) static_cast<void>(cudaFreeHost(host_allocation_));
   if (device_allocation_) static_cast<void>(cudaFree(device_allocation_));
 }
@@ -177,7 +208,7 @@ void DeepSeekFfnHybridWorkspace::map() noexcept {
 
 DeepSeekFfnHybridWorkspaceResult create_deepseek_ffn_hybrid_workspace()
     noexcept {
-  DeepSeekFfnHybridWorkspace sizing(nullptr, 0U, nullptr, 0U);
+  DeepSeekFfnHybridWorkspace sizing(nullptr, 0U, nullptr, 0U, nullptr);
   void* device = nullptr;
   auto error = cudaMalloc(&device, sizing.device_bytes());
   if (error != cudaSuccess)
@@ -189,16 +220,21 @@ DeepSeekFfnHybridWorkspaceResult create_deepseek_ffn_hybrid_workspace()
     static_cast<void>(cudaFree(device));
     return {failure(error, "allocate DeepSeek hybrid pinned workspace"), {}};
   }
+  cudaEvent_t input_ready = nullptr;
+  error = cudaEventCreateWithFlags(&input_ready, cudaEventDisableTiming);
+  if (error != cudaSuccess) {
+    static_cast<void>(cudaFreeHost(host));
+    static_cast<void>(cudaFree(device));
+    return {failure(error, "create DeepSeek hybrid input event"), {}};
+  }
   return {Status::success(), std::shared_ptr<DeepSeekFfnHybridWorkspace>(
       new DeepSeekFfnHybridWorkspace(device, sizing.device_bytes(), host,
-                                     sizing.pinned_host_bytes()))};
+                                     sizing.pinned_host_bytes(),
+                                     input_ready))};
 }
 
 DeepSeekFfnStateResult create_deepseek_ffn_state(
     std::uint32_t layer) noexcept {
-  if (layer >= 43U)
-    return {{ErrorCode::invalid_argument, "invalid DeepSeek FFN state layer"},
-            {}};
   DeepSeekFfnState sizing(nullptr, 0U, layer);
   sizing.map(nullptr);
   void* allocation = nullptr;
@@ -220,6 +256,48 @@ DeepSeekFfnStateResult create_deepseek_ffn_state(
   if (error != cudaSuccess)
     return {failure(error, "DeepSeek FFN state initialization"), {}};
   return {Status::success(), std::move(state)};
+}
+
+std::uint64_t deepseek_route_prediction_state_size() noexcept {
+  DeepSeekRoutePredictionState sizing(nullptr, 0U);
+  return sizing.bytes();
+}
+
+DeepSeekRoutePredictionStateResult
+create_deepseek_route_prediction_state() noexcept {
+  const auto bytes = deepseek_route_prediction_state_size();
+  void* allocation = nullptr;
+  const auto error = cudaMalloc(&allocation, bytes);
+  if (error != cudaSuccess)
+    return {failure(error, "allocate DeepSeek route prediction state"), {}};
+  auto state = std::shared_ptr<DeepSeekRoutePredictionState>(
+      new DeepSeekRoutePredictionState(allocation, bytes));
+  return {Status::success(), std::move(state)};
+}
+
+Status deepseek_predict_route(
+    const DeepSeekRoutePredictionLaunch& launch) noexcept {
+  if (!launch.target_weights || !launch.state ||
+      !launch.preceding_gate_input)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek route prediction launch"};
+  const auto& weights = *launch.target_weights;
+  auto& state = *launch.state;
+  if (!weights.router_weight ||
+      (weights.hash_router && (!weights.token_experts || weights.router_bias)) ||
+      (!weights.hash_router && (!weights.router_bias || weights.token_experts)))
+    return {ErrorCode::invalid_argument,
+            "incomplete DeepSeek prediction router binding"};
+  if (weights.hash_router) {
+    return deepseek_router_hash(
+        launch.preceding_gate_input, weights.router_weight,
+        weights.token_experts, launch.token_id, state.router_logits_,
+        state.routing_weights_, state.expert_indices_, 1.5F, launch.stream);
+  }
+  return deepseek_router_learned(
+      launch.preceding_gate_input, weights.router_weight, weights.router_bias,
+      state.router_logits_, state.routing_weights_, state.expert_indices_,
+      1.5F, launch.stream);
 }
 
 std::uint64_t deepseek_ffn_state_size() noexcept {
@@ -503,6 +581,94 @@ Status deepseek_ffn_execute(const DeepSeekFfnExecuteLaunch& launch) noexcept {
                            launch.stream);
 }
 
+Status deepseek_ffn_execute_selections(
+    const DeepSeekFfnSelectionExecuteLaunch& launch) noexcept {
+  constexpr auto kAllSelections = (std::uint64_t{1U} << kTopK) - 1U;
+  if (!launch.weights || !launch.state || !launch.directory_entries ||
+      launch.selection_mask == 0U ||
+      (launch.selection_mask & ~kAllSelections) != 0U ||
+      launch.experts_per_layer != 257U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek selection FFN execute launch"};
+  auto status = check_binding(*launch.weights, *launch.state);
+  if (!status.ok()) return status;
+  auto& state = *launch.state;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  routed_selection_mask_kernel<<<1U, 32U, 0, stream>>>(
+      state.routed_selection_mask_, launch.selection_mask);
+  const auto mask_error = cudaPeekAtLastError();
+  if (mask_error != cudaSuccess)
+    return failure(mask_error, "publish DeepSeek routed selection mask");
+  return launch_moe_selection_batch({
+      state.ffn_input_, state.routing_weights_, state.expert_indices_,
+      state.routed_selection_mask_, state.routed_intermediate_,
+      state.routed_selection_outputs_, state.routed_q_input_,
+      state.routed_q_input_scales_, state.routed_q_intermediate_,
+      state.routed_q_intermediate_scales_, 1U, kHidden, kIntermediate, kTopK,
+      launch.experts_per_layer, launch.stream, launch.directory_entries,
+      launch.weights->layer, 10.0F, true, true});
+}
+
+Status deepseek_ffn_import_selection_output(
+    const DeepSeekFfnSelectionImportLaunch& launch) noexcept {
+  if (!launch.state || !launch.host_output ||
+      launch.selection_index >= kTopK ||
+      launch.host_output_bytes != kHidden * sizeof(float))
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek remote selection output"};
+  auto& state = *launch.state;
+  const auto error = cudaMemcpyAsync(
+      state.routed_selection_outputs_ +
+          static_cast<std::size_t>(launch.selection_index) * kHidden,
+      launch.host_output, launch.host_output_bytes, cudaMemcpyHostToDevice,
+      static_cast<cudaStream_t>(launch.stream));
+  return error == cudaSuccess
+             ? Status::success()
+             : failure(error, "import DeepSeek remote selection output");
+}
+
+Status deepseek_ffn_finalize(const DeepSeekFfnFinalizeLaunch& launch) noexcept {
+  if (!launch.weights || !launch.state || !launch.directory_entries ||
+      !launch.streams || !launch.updated_streams ||
+      launch.experts_per_layer != 257U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek FFN finalize launch"};
+  auto status = check_binding(*launch.weights, *launch.state);
+  if (!status.ok()) return status;
+  auto& state = *launch.state;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  status = launch_moe_aggregate({
+      state.routed_selection_outputs_, nullptr, nullptr, nullptr,
+      state.routing_weights_, state.routed_output_, 0U, 1U, kHidden, kTopK,
+      launch.stream});
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->aggregate_stop : nullptr,
+      stream, "record DeepSeek incremental aggregate stop");
+  if (!status.ok()) return status;
+  status = launch_moe_single_token({
+      state.ffn_input_, nullptr, nullptr, nullptr, nullptr,
+      state.routing_weights_ + kTopK, state.expert_indices_ + kTopK,
+      state.shared_intermediate_, state.shared_output_, kHidden,
+      kIntermediate, 1U, launch.experts_per_layer, launch.stream,
+      launch.directory_entries, launch.weights->layer, 10.0F, true});
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->shared_stop : nullptr,
+      stream, "record DeepSeek incremental shared FFN stop");
+  if (!status.ok()) return status;
+  status = add_in_place(state.routed_output_, state.shared_output_, kHidden,
+                        launch.stream);
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->merge_stop : nullptr,
+      stream, "record DeepSeek incremental merge stop");
+  if (!status.ok()) return status;
+  return deepseek_hca_post(state.routed_output_, launch.streams, state.post_,
+                           state.comb_, launch.updated_streams, kHidden,
+                           launch.stream);
+}
+
 Status deepseek_ffn_execute_hybrid(
     const DeepSeekFfnHybridExecuteLaunch& launch) noexcept {
   if (!launch.weights || !launch.state || !launch.directory_entries ||
@@ -544,10 +710,12 @@ Status deepseek_ffn_execute_hybrid(
   auto& state = *launch.state;
   auto& workspace = *launch.workspace;
   const auto stream = static_cast<cudaStream_t>(launch.stream);
+  const auto input_ready =
+      static_cast<cudaEvent_t>(workspace.input_ready_event_);
   auto error = cudaMemcpyAsync(workspace.host_input_, state.ffn_input_,
                                kHidden * sizeof(float),
                                cudaMemcpyDeviceToHost, stream);
-  if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
+  if (error == cudaSuccess) error = cudaEventRecord(input_ready, stream);
   if (error != cudaSuccess)
     return failure(error, "stage DeepSeek hybrid CPU input");
   error = cudaMemcpyAsync(workspace.selection_mask_, primary_mask.data(),
@@ -576,6 +744,12 @@ Status deepseek_ffn_execute_hybrid(
       stream, "record DeepSeek hybrid routed FFN stop");
   if (!status.ok()) return status;
 
+  // The event is recorded immediately after the activation D2H. CUDA work
+  // for the resident selections is already queued behind it, so waiting for
+  // only this event starts the CPU lane while the GPU lane is executing.
+  error = cudaEventSynchronize(input_ready);
+  if (error != cudaSuccess)
+    return failure(error, "wait for DeepSeek hybrid CPU input");
   status = launch.cpu_executor->execute(
       launch.cpu_groups,
       std::span<const float>(workspace.host_input_, kHidden), 1U, kTopK,
@@ -590,9 +764,11 @@ Status deepseek_ffn_execute_hybrid(
                           static_cast<std::size_t>(alternate_count) * kHidden *
                               sizeof(float),
                           cudaMemcpyHostToDevice, stream);
-  if (error == cudaSuccess) error = cudaStreamSynchronize(stream);
   if (error != cudaSuccess)
     return failure(error, "upload DeepSeek hybrid CPU outputs");
+  // The compact result upload and every dependent CUDA operation use the same
+  // stream. Do not block the host here; the next hybrid invocation's input
+  // event naturally waits for this layer before reusing the pinned buffers.
   status = launch_moe_aggregate({
       state.routed_selection_outputs_, workspace.alternate_outputs_,
       workspace.selection_mask_, workspace.alternate_slot_by_selection_,

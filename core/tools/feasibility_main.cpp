@@ -28,9 +28,25 @@ expert::core::ManifestResources ParseManifest(std::string_view text) {
     auto& root = document.AsObject("manifest");
     RequireExactKeys(root,
         {"schema", "format", "compatibility", "source", "architecture",
-         "quantization", "kernel_abi", "alignment", "tensors", "experts",
-         "packs", "indexes", "masses", "requirements", "tokenizer", "integrity"},
+         "model_program", "quantization", "kernel_abi", "alignment",
+         "tensors", "experts", "packs", "indexes", "masses",
+         "requirements", "tokenizer", "integrity"},
         {}, "manifest");
+    const auto& model_program = Required(root, "model_program", "manifest")
+                                    .AsObject("manifest.model_program");
+    RequireExactKeys(model_program, {"format", "path", "bytes", "sha256"},
+                     {}, "manifest.model_program");
+    if (Required(model_program, "format", "manifest.model_program")
+            .AsString("manifest.model_program.format") !=
+            "expert-runtime-model-v1" ||
+        Required(model_program, "path", "manifest.model_program")
+            .AsString("manifest.model_program.path").empty() ||
+        Required(model_program, "bytes", "manifest.model_program")
+                .AsU64("manifest.model_program.bytes") == 0U ||
+        Required(model_program, "sha256", "manifest.model_program")
+                .AsString("manifest.model_program.sha256").size() != 64U) {
+        throw Error("manifest.model_program is invalid");
+    }
     const auto& masses = Required(root, "masses", "manifest")
                              .AsObject("manifest.masses");
     RequireExactKeys(masses,

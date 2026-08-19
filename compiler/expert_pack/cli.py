@@ -5,7 +5,12 @@ import json
 from pathlib import Path
 from typing import Sequence
 
-from .compile import CompileOptions, compile_checkpoint
+from .adapters import ADAPTERS, adapt_checkpoint
+from .compile import (
+    CompileOptions,
+    compile_checkpoint,
+    refresh_runtime_model_program,
+)
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE, QUANT_PROFILES
 from .deepseek_v4 import (
     estimate_deepseek_v4_representations,
@@ -45,7 +50,9 @@ def _parser() -> argparse.ArgumentParser:
     compile_parser = commands.add_parser("compile", help="compile a local SafeTensors checkpoint")
     compile_parser.add_argument("--source", type=Path, required=True)
     compile_parser.add_argument("--output", type=Path, required=True)
-    compile_parser.add_argument("--adapter", choices=("olmoe", "qwen3_next"), default="olmoe")
+    compile_parser.add_argument(
+        "--adapter", choices=tuple(sorted(ADAPTERS)), default="olmoe"
+    )
     compile_parser.add_argument("--quant-profile", choices=QUANT_PROFILES, default=QUANT_PROFILE)
     compile_parser.add_argument("--alignment", type=int, default=PACK_ALIGNMENT)
     compile_parser.add_argument("--max-expert-pack-bytes", type=int, default=2 * 1024**3)
@@ -60,6 +67,17 @@ def _parser() -> argparse.ArgumentParser:
     validate_parser = commands.add_parser("validate", help="independently validate a completed container")
     validate_parser.add_argument("container", type=Path)
 
+    refresh_parser = commands.add_parser(
+        "refresh-model-program",
+        help="clone a valid container and recompile only its VM metadata",
+    )
+    refresh_parser.add_argument("--container", type=Path, required=True)
+    refresh_parser.add_argument("--output", type=Path, required=True)
+    refresh_parser.add_argument("--source", type=Path, required=True)
+    refresh_parser.add_argument(
+        "--adapter", choices=tuple(sorted(ADAPTERS)), required=True
+    )
+
     inspect_parser = commands.add_parser(
         "inspect-source",
         help="validate all SafeTensors headers and report a read-only source inventory",
@@ -69,6 +87,11 @@ def _parser() -> argparse.ArgumentParser:
         "--tensor-groups",
         action="store_true",
         help="include metadata grouped by tensor name pattern, dtype, and shape",
+    )
+    inspect_parser.add_argument(
+        "--adapter",
+        choices=tuple(sorted(ADAPTERS)),
+        help="apply a strict architecture adapter without writing a pack",
     )
     inspect_parser.add_argument(
         "--contract",
@@ -249,12 +272,43 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "validate":
             result = validate_container(args.container)
+        elif args.command == "refresh-model-program":
+            result = refresh_runtime_model_program(
+                args.container, args.output, args.source, args.adapter
+            )
         elif args.command == "inspect-source":
             checkpoint = SafeTensorCheckpoint(args.source)
             result = inspect_source(
                 checkpoint,
                 include_tensor_groups=args.tensor_groups,
             )
+            if args.adapter:
+                adapted = adapt_checkpoint(checkpoint, args.adapter)
+                topology = adapted.runtime_topology
+                result["adapter"] = {
+                    "name": args.adapter,
+                    "dense_tensor_count": len(adapted.dense),
+                    "expert_record_count": len(adapted.experts),
+                    "source_tensor_count": adapted.source_tensor_count,
+                    "architecture_id": topology.architecture_id,
+                    "logical_layer_count": len(topology.layers),
+                    "operation_count": len(topology.operations),
+                    "required_kernels": [
+                        {"capability": capability, "abi": abi}
+                        for capability, abi in topology.required_kernels
+                    ],
+                    "routed_components": [
+                        {
+                            "name": component.name,
+                            "layer_count": component.layer_count,
+                            "experts_per_layer": component.experts_per_layer,
+                            "route_width": component.route_width,
+                            "hidden_size": component.hidden_size,
+                            "intermediate_size": component.intermediate_size,
+                        }
+                        for component in topology.components
+                    ],
+                }
             if args.contract == "deepseek_v4":
                 result["contract"] = validate_deepseek_v4_source(checkpoint)
             if args.estimate_representations:

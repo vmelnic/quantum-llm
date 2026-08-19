@@ -198,24 +198,39 @@ class CudaWorker:
                  ram_cache_gib: int, vram_cache_gib: int,
                  kv_cache_mib: int, kv_page_tokens: int,
                  placement_profile: str, profile_gpu_phases: bool,
-                 enable_mtp: bool, prefill_chunk_tokens: int = 0,
-                 placement_settle_steps: int | None = None) -> None:
+                 prefill_chunk_tokens: int = 0,
+                 placement_settle_steps: int | None = None,
+                 retain_previous_route: bool | None = None,
+                 enable_cpu_hybrid: bool | None = None,
+                 route_trace_file: Path | None = None,
+                 route_trace_max_steps: int = 4096) -> None:
         command = [
-            str(executable), str(container), "--worker", str(max_context),
-            str(ram_cache_gib), str(vram_cache_gib), str(requested_capacity),
-            str(kv_cache_mib), str(kv_page_tokens), placement_profile,
+            str(executable), str(container), "--worker",
+            f"--max-context={max_context}",
+            f"--ram-cache-gib={ram_cache_gib}",
+            f"--vram-cache-gib={vram_cache_gib}",
+            f"--capacity={requested_capacity}",
+            f"--kv-cache-mib={kv_cache_mib}",
+            f"--kv-page-tokens={kv_page_tokens}",
+            f"--placement-profile={placement_profile}",
         ]
         if prefill_chunk_tokens:
-            command.append(str(prefill_chunk_tokens))
+            command.append(f"--prefill-chunk-limit={prefill_chunk_tokens}")
         if placement_settle_steps is not None:
-            # The settle-steps slot is positional after the prefill chunk.
-            if not prefill_chunk_tokens:
-                command.append("0")
-            command.append(str(placement_settle_steps))
+            command.append(
+                f"--placement-settle-steps={placement_settle_steps}"
+            )
         if profile_gpu_phases:
             command.append("--profile-gpu-phases")
-        if enable_mtp:
-            command.append("--enable-mtp")
+        if retain_previous_route is False:
+            command.append("--no-retain-previous-route")
+        if enable_cpu_hybrid:
+            command.append("--cpu-hybrid")
+        if route_trace_file is not None:
+            command.extend((
+                f"--route-trace-file={route_trace_file}",
+                f"--route-trace-max-steps={route_trace_max_steps}",
+            ))
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -243,6 +258,20 @@ class CudaWorker:
             )
         self.protocol = int(response.get("protocol", 1))
         self.capacity = int(response.get("capacity", 1))
+        self.architecture_id = str(response.get("architecture_id", ""))
+        self.vocab_size = int(response.get("vocab_size", 0))
+        self.model_max_context_tokens = int(
+            response.get("max_context_tokens", 0)
+        )
+        self.routed_layers = int(response.get("routed_layers", 0))
+        self.experts_per_layer = int(response.get("experts_per_layer", 0))
+        self.route_width = int(response.get("route_width", 0))
+        self.expert_encoding = str(response.get("expert_encoding", ""))
+        raw_capabilities = response.get("operation_capabilities", [])
+        self.operation_capabilities = (
+            tuple(raw_capabilities) if isinstance(raw_capabilities, list)
+            else ()
+        )
         self.prefill_mode = str(response.get("prefill_mode", ""))
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
         self.session_retention = bool(response.get("session_retention", False))
@@ -255,12 +284,27 @@ class CudaWorker:
         )
         self.mtp_runtime_ready = bool(response.get("mtp_runtime_ready", False))
         self.mtp_enabled = bool(response.get("mtp_enabled", False))
+        self.retain_previous_route = bool(
+            response.get("retain_previous_route", True)
+        )
+        self.cpu_hybrid_enabled = bool(
+            response.get("cpu_hybrid_enabled", False)
+        )
         if self.mtp_runtime_ready and not self.mtp_resource_available:
             self.process.kill()
             raise WorkerError("MTP runtime cannot be ready without resources")
-        if self.mtp_enabled != enable_mtp:
+        if (retain_previous_route is not None and
+                self.retain_previous_route != retain_previous_route):
             self.process.kill()
-            raise WorkerError("CUDA worker MTP mode does not match the request")
+            raise WorkerError(
+                "CUDA worker retained-route mode does not match the request"
+            )
+        if (enable_cpu_hybrid is not None and
+                self.cpu_hybrid_enabled != enable_cpu_hybrid):
+            self.process.kill()
+            raise WorkerError(
+                "CUDA worker CPU-hybrid mode does not match the request"
+            )
         self.rope_mode = str(response.get("rope_mode", "per_step_upload"))
         self.kv_dtype = str(response.get("kv_dtype", ""))
         self.kv_allocation = str(response.get("kv_allocation", ""))
@@ -268,6 +312,7 @@ class CudaWorker:
         self.kv_page_bytes = int(response.get("kv_page_bytes", 0))
         self.kv_page_capacity = int(response.get("kv_page_capacity", 0))
         self.placement_profile = str(response.get("placement_profile", ""))
+        self.placement_mode = str(response.get("placement_mode", "budgeted"))
         self.ram_cache_bytes = int(response.get("ram_cache_bytes", 0))
         self.vram_cache_bytes = int(response.get("vram_cache_bytes", 0))
         self.placement_prefetch_enabled = bool(
@@ -286,25 +331,80 @@ class CudaWorker:
             response.get("placement_minimum_observations", 0)
         )
         expected_observations = 1 if placement_profile == "latency" else 2
-        if (self.protocol < 4 or self.capacity != requested_capacity or
+        placement_invalid = (
+            (
+                self.placement_mode == "budgeted" and
+                (
+                    self.placement_profile != placement_profile or
+                    self.ram_cache_bytes != ram_cache_gib << 30 or
+                    self.vram_cache_bytes != vram_cache_gib << 30 or
+                    self.placement_prefetch_state not in
+                        {"disabled", "observing", "ready"} or
+                    self.placement_prefetch_enabled !=
+                        (self.placement_prefetch_state == "ready") or
+                    (placement_profile == "capacity" and
+                     self.placement_prefetch_state != "disabled") or
+                    self.placement_minimum_observations !=
+                        expected_observations
+                )
+            ) or
+            (
+                self.placement_mode == "resident" and
+                (
+                    self.placement_profile != "resident" or
+                    self.ram_cache_bytes != 0 or
+                    self.vram_cache_bytes <= 0 or
+                    self.placement_prefetch_enabled or
+                    self.placement_prefetch_state != "disabled" or
+                    self.placement_minimum_observations != 0
+                )
+            ) or
+            self.placement_mode not in {"budgeted", "resident"}
+        )
+        routed_descriptor_present = (
+            self.routed_layers != 0 or self.experts_per_layer != 0 or
+            self.route_width != 0 or bool(self.expert_encoding)
+        )
+        routed_descriptor_invalid = (
+            (
+                routed_descriptor_present and
+                (
+                    self.routed_layers <= 0 or self.experts_per_layer <= 0 or
+                    not 1 <= self.route_width <= self.experts_per_layer or
+                    not self.expert_encoding
+                )
+            ) or
+            (
+                not routed_descriptor_present and
+                (
+                    self.routed_layers != 0 or self.experts_per_layer != 0 or
+                    self.route_width != 0 or bool(self.expert_encoding)
+                )
+            )
+        )
+        descriptor_invalid = self.protocol >= 6 and (
+            not self.architecture_id or self.vocab_size <= 0 or
+            self.model_max_context_tokens < max_context or
+            routed_descriptor_invalid or not self.operation_capabilities or
+            len(set(self.operation_capabilities)) !=
+                len(self.operation_capabilities) or
+            any(not isinstance(capability, str) or not capability
+                for capability in self.operation_capabilities)
+        )
+        if (self.protocol < 4 or descriptor_invalid or
+                self.capacity != requested_capacity or
                 self.prefill_mode not in {"causal_chunked", "causal_sequential"} or
                 not 1 <= self.prefill_chunk_tokens <= max_context or
                 (prefill_chunk_tokens and
-                 self.prefill_chunk_tokens != prefill_chunk_tokens) or
-                self.kv_dtype not in {"fp16", "bf16"} or
+                 self.prefill_chunk_tokens > prefill_chunk_tokens) or
+                self.kv_dtype not in {
+                    "fp16", "bf16", "fp32",
+                    "fp4-e2m1-ue8m0-block32",
+                } or
                 self.kv_allocation not in {"paged_on_demand", "preallocated"} or
                 self.kv_page_tokens != kv_page_tokens or
                 self.kv_page_bytes <= 0 or self.kv_page_capacity <= 0 or
-                self.placement_profile != placement_profile or
-                self.ram_cache_bytes != ram_cache_gib << 30 or
-                self.vram_cache_bytes != vram_cache_gib << 30 or
-                self.placement_prefetch_state not in
-                    {"disabled", "observing", "ready"} or
-                self.placement_prefetch_enabled !=
-                    (self.placement_prefetch_state == "ready") or
-                (placement_profile == "capacity" and
-                 self.placement_prefetch_state != "disabled") or
-                self.placement_minimum_observations != expected_observations):
+                placement_invalid):
             self.process.kill()
             raise WorkerError(
                 "CUDA worker does not support requested runtime contract"
@@ -563,7 +663,8 @@ class Application:
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
         )
         self.checkpoint_chat_encoder: Callable[..., str] | None = None
-        if args.model == "deepseek-v4-flash" and not self.tokenizer.chat_template:
+        if (not self.tokenizer.chat_template and
+                (args.tokenizer / "encoding" / "encoding_dsv4.py").is_file()):
             self.checkpoint_chat_encoder = _load_deepseek_chat_encoder(
                 args.tokenizer
             )
@@ -574,16 +675,6 @@ class Application:
             self.eos_token_ids = {eos}
         else:
             self.eos_token_ids = {int(token) for token in eos}
-        # The DeepSeek worker prefills sequentially (chunk 1) and rejects extra
-        # positional arguments; only the Qwen runner takes a prefill chunk.
-        prefill_chunk = (
-            0 if args.model == "deepseek-v4-flash"
-            else args.worker_prefill_chunk_tokens
-        )
-        settle_steps = (
-            None if args.model == "deepseek-v4-flash"
-            else args.worker_placement_settle_steps
-        )
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
                                  args.startup_timeout, args.worker_capacity,
                                  args.worker_ram_cache_gib,
@@ -592,8 +683,13 @@ class Application:
                                  args.worker_kv_page_tokens,
                                  args.placement_profile,
                                  args.profile_gpu_phases,
-                                 args.enable_mtp, prefill_chunk,
-                                 settle_steps)
+                                 args.worker_prefill_chunk_tokens,
+                                 args.worker_placement_settle_steps,
+                                 (False if args.disable_worker_retained_route
+                                  else None),
+                                 True if args.enable_worker_cpu_hybrid else None,
+                                 args.worker_route_trace_file,
+                                 args.worker_route_trace_max_steps)
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
@@ -762,8 +858,14 @@ class Application:
                                 maximum: int) -> RequestContext | None:
         session = self.checkout_session(prompt_ids)
         # One extra position covers the non-final trailing decode step that
-        # retained turns require.
-        total_pages = self._context_pages(len(prompt_ids) + maximum + 1)
+        # retained turns require. At the model context boundary generate()
+        # disables retention, so admission must not reserve an impossible
+        # position beyond the advertised context window.
+        context_tokens = len(prompt_ids) + maximum
+        retain_headroom = int(
+            self.retention_enabled() and context_tokens < self.args.max_context
+        )
+        total_pages = self._context_pages(context_tokens + retain_headroom)
         base_pages = session.pages if session is not None else 0
         needed = max(0, total_pages - base_pages)
         while needed > 0 and not self._acquire_pages(needed):
@@ -1046,11 +1148,127 @@ class Application:
         "cache_uploaded_bytes", "cache_storage_wait_ns",
         "cache_upload_wait_ns", "worker_model_steps", "worker_model_step_ns",
         "frozen_promotions", "frozen_promotion_bytes",
+        "worker_model_rows", "worker_embed_rope_submit_ns",
         "worker_scheduler_poll_ns", "worker_output_head_ns",
-        "scheduler_expert_wait_ns", "worker_mtp_drafts",
+        "worker_attention_route_submit_ns", "worker_directory_plan_ns",
+        "worker_ffn_submit_ns", "worker_directory_release_ns",
+        "worker_gpu_attention_route_plan_ns", "worker_gpu_ffn_release_ns",
+        "worker_gpu_attention_ns", "worker_gpu_route_ns",
+        "worker_gpu_directory_plan_ns", "worker_gpu_ffn_ns",
+        "worker_gpu_directory_release_ns",
+        "worker_gpu_attention_hca_pre_norm_ns",
+        "worker_gpu_attention_projection_ns",
+        "worker_gpu_sparse_attention_ns",
+        "worker_gpu_attention_output_projection_ns",
+        "worker_gpu_attention_hca_post_ns", "worker_gpu_ffn_routed_ns",
+        "worker_gpu_ffn_aggregate_ns", "worker_gpu_ffn_shared_ns",
+        "worker_gpu_ffn_merge_ns", "worker_gpu_ffn_hca_post_ns",
+        "scheduler_layer_advances", "scheduler_cuda_pending_polls",
+        "scheduler_cuda_waits", "scheduler_cuda_wait_ns",
+        "scheduler_expert_suspensions", "scheduler_acquires_started",
+        "scheduler_acquires_completed", "scheduler_host_resolves",
+        "scheduler_cpu_placements", "scheduler_hybrid_layers",
+        "scheduler_controller_advance_ns", "scheduler_expert_wait_ns",
+        "scheduler_poll_ns", "scheduler_prefetch_predictions",
+        "scheduler_prefetch_scheduled", "scheduler_prefetch_completed",
+        "scheduler_prefetch_useful", "scheduler_prefetch_late",
+        "scheduler_prefetch_incorrect", "scheduler_prefetch_cancelled",
+        "scheduler_prefetch_evicted_before_use", "cpu_execute_calls",
+        "cpu_selections",
+        "cpu_source_weight_bytes", "cpu_compute_ns", "planner_plans",
+        "planner_candidates", "planner_cpu_cost_wins",
+        "planner_gpu_cost_wins", "uploader_device_allocations",
+        "uploader_recycled_acquires", "uploader_staging_allocations",
+        "uploader_compact_h2d_bytes", "uploader_compact_cache_hits",
+        "uploader_compact_cache_misses", "worker_mtp_drafts",
         "worker_mtp_accepted", "worker_mtp_rejected", "worker_verify_pairs",
-        "worker_mtp_suppressions",
+        "worker_mtp_suppressions", "worker_mtp_acquire_batches",
+        "worker_mtp_acquires_launched", "worker_mtp_acquire_wait_ns",
+        "mtp_cache_vram_hits", "mtp_cache_ram_hits", "mtp_cache_ssd_misses",
+        "mtp_cache_loads_started", "mtp_cache_loads_deduplicated",
+        "mtp_cache_loads_completed", "mtp_cache_reload_count",
+        "mtp_cache_reread_bytes", "mtp_cache_read_bytes",
+        "mtp_cache_storage_wait_ns", "mtp_cache_host_validation_ns",
+        "mtp_cache_host_copy_bytes", "mtp_cache_uploads_started",
+        "mtp_cache_uploads_completed", "mtp_cache_uploaded_bytes",
+        "mtp_cache_upload_wait_ns", "mtp_cache_evictions",
+        "mtp_cache_stalled_by_budget", "mtp_cache_cancellations",
+        "mtp_cache_io_errors", "mtp_cache_upload_errors",
+        "worker_warm_start_loaded", "worker_warm_start_failed",
+        "worker_warm_start_cancelled", "worker_warm_start_demand_pauses",
+        "worker_warm_start_loop_errors",
+        "worker_warm_start_bytes", "worker_warm_start_ns",
+        "worker_warm_vram_loaded", "worker_warm_vram_failed",
+        "worker_warm_vram_cancelled", "worker_warm_vram_demand_pauses",
+        "worker_warm_vram_bytes", "worker_warm_vram_ns",
+        "worker_prefill_protection_candidates",
+        "worker_prefill_protection_promoted", "cache_loads_started",
+        "cache_loads_deduplicated", "cache_loads_completed",
+        "cache_uploads_started", "cache_uploads_completed",
+        "cache_record_validations", "cache_validated_ram_reuses",
+        "cache_requested_bytes", "cache_useful_bytes", "cache_reload_count",
+        "cache_reread_bytes", "cache_priority_upgrades",
+        "cache_host_preloads_requested", "cache_host_preloads_completed",
+        "cache_host_validation_ns", "cache_host_validation_failures",
+        "cache_host_copy_bytes", "cache_preloaded_host_useful",
+        "cache_preloaded_host_useful_bytes", "cache_preloaded_host_wasted",
+        "cache_preloaded_host_wasted_bytes", "cache_ram_promotions",
+        "cache_vram_promotions", "cache_ram_promotion_failures",
+        "cache_vram_promotion_failures", "cache_ram_probationary_evictions",
+        "cache_ram_protected_evictions",
+        "cache_ram_probationary_evicted_bytes",
+        "cache_ram_protected_evicted_bytes",
+        "cache_vram_transient_evictions", "cache_vram_resident_evictions",
+        "cache_vram_transient_evicted_bytes",
+        "cache_vram_resident_evicted_bytes", "cache_evictions",
+        "cache_eviction_scan_calls", "cache_eviction_scan_candidates",
+        "cache_eviction_scan_ns", "cache_eviction_retire_retries",
+        "cache_vram_admission_scan_calls",
+        "cache_vram_admission_scan_candidates",
+        "cache_vram_admission_scan_ns", "cache_task_selection_calls",
+        "cache_task_selection_candidates", "cache_task_selection_ns",
+        "cache_mutex_acquisitions",
+        "cache_mutex_wait_ns", "cache_mutex_wait_max_ns",
+        "cache_same_partition_evictions", "cache_over_quota_evictions",
+        "cache_stalled_by_budget", "cache_cancellations",
+        "cache_short_read_errors", "cache_checksum_errors",
+        "cache_io_errors", "cache_upload_errors", "staging_demand_acquires",
+        "staging_background_acquires", "staging_demand_stalls",
+        "staging_background_stalls",
+    ) + tuple(
+        f"cache_{priority}_{metric}"
+        for priority in ("warm", "prefetch", "demand")
+        for metric in (
+            "device_requests", "host_requests", "vram_hits", "ram_hits",
+            "ssd_misses", "host_lookup_misses", "reads_started",
+            "reads_completed", "read_bytes", "storage_wait_ns",
+            "host_validation_ns", "host_copy_bytes",
+            "ram_retention_copy_ns", "uploads_started",
+            "uploads_completed", "uploaded_bytes", "upload_wait_ns",
+            "completed_waiters", "waiter_wait_ns", "cancellations",
+            "failed_waiters", "io_errors", "validation_errors",
+            "upload_errors", "staging_stalls",
+        )
+    ) + tuple(
+        f"cache_transition_{source}_to_{target}"
+        for source in (
+            "absent", "ssd_loading", "ram_ready", "gpu_uploading",
+            "vram_ready", "failed",
+        )
+        for target in (
+            "absent", "ssd_loading", "ram_ready", "gpu_uploading",
+            "vram_ready", "failed",
+        )
     )
+
+    # Protocol 7 providers own their counter vocabulary. Request attribution
+    # therefore consumes every monotonic numeric counter returned by STATS
+    # instead of requiring a server edit for each execution provider. Only
+    # instantaneous resource gauges are excluded from deltas.
+    _TELEMETRY_GAUGE_KEYS = frozenset({
+        "active_requests", "retained_sessions", "allocated_pages",
+        "reserved_pages", "kv_allocated_pages", "kv_reserved_pages",
+    })
 
     @staticmethod
     def _capacity_error(error: Exception) -> bool:
@@ -1186,8 +1404,13 @@ class Application:
             stats_after = self.worker_stats()
             deltas = {
                 key: stats_after[key] - stats_before[key]
-                for key in self._TELEMETRY_DELTA_KEYS
-                if key in stats_before and key in stats_after
+                for key in stats_before.keys() & stats_after.keys()
+                if key not in self._TELEMETRY_GAUGE_KEYS and
+                isinstance(stats_before[key], int) and
+                not isinstance(stats_before[key], bool) and
+                isinstance(stats_after[key], int) and
+                not isinstance(stats_after[key], bool) and
+                stats_after[key] >= stats_before[key]
             }
             log("request_telemetry", request_id=request_id, resumed=resumed,
                 prefill_tokens=prefill_tokens,
@@ -1225,7 +1448,28 @@ class Application:
             "maximum_queue": self.args.maximum_queue,
             "worker_capacity": self.args.worker_capacity,
             "worker_protocol": self.worker.protocol,
+            "worker_model_descriptor": {
+                "architecture_id": getattr(
+                    self.worker, "architecture_id", ""
+                ),
+                "vocab_size": getattr(self.worker, "vocab_size", 0),
+                "max_context_tokens": getattr(
+                    self.worker, "model_max_context_tokens", 0
+                ),
+                "routed_layers": getattr(self.worker, "routed_layers", 0),
+                "experts_per_layer": getattr(
+                    self.worker, "experts_per_layer", 0
+                ),
+                "route_width": getattr(self.worker, "route_width", 0),
+                "expert_encoding": getattr(
+                    self.worker, "expert_encoding", ""
+                ),
+                "operation_capabilities": list(getattr(
+                    self.worker, "operation_capabilities", ()
+                )),
+            },
             "worker_placement": {
+                "mode": self.worker.placement_mode,
                 "profile": self.worker.placement_profile,
                 "ram_cache_bytes": self.worker.ram_cache_bytes,
                 "vram_cache_bytes": self.worker.vram_cache_bytes,
@@ -1246,6 +1490,8 @@ class Application:
                 "mtp_resource_available": self.worker.mtp_resource_available,
                 "mtp_runtime_ready": self.worker.mtp_runtime_ready,
                 "mtp_enabled": self.worker.mtp_enabled,
+                "retain_previous_route": self.worker.retain_previous_route,
+                "cpu_hybrid_enabled": self.worker.cpu_hybrid_enabled,
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,
@@ -1718,7 +1964,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--container", required=True, type=Path)
     parser.add_argument("--tokenizer", required=True, type=Path)
     parser.add_argument(
-        "--model", default="qwen3-next-80b-a3b-expert-pack-int8"
+        "--model", default="expert-moe-vm"
     )
     parser.add_argument("--build-id", default=os.environ.get("EXPERT_BUILD_ID", "development"))
     parser.add_argument("--host", default="127.0.0.1")
@@ -1729,7 +1975,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-queue", type=int, default=8)
     parser.add_argument("--worker-capacity", type=int, default=1)
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
-    parser.add_argument("--worker-vram-cache-gib", type=int, default=14)
+    parser.add_argument("--worker-vram-cache-gib", type=int, default=13)
     parser.add_argument(
         "--placement-profile", choices=("latency", "balanced", "capacity"),
         default="balanced",
@@ -1745,7 +1991,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--disable-session-retention", action="store_true")
     parser.add_argument("--session-idle-seconds", type=float, default=1800.0)
     parser.add_argument("--profile-gpu-phases", action="store_true")
-    parser.add_argument("--enable-mtp", action="store_true")
+    parser.add_argument(
+        "--disable-worker-retained-route", action="store_true",
+        help="disable DeepSeek previous-route VRAM leases for placement sweeps",
+    )
+    parser.add_argument(
+        "--enable-worker-cpu-hybrid", action="store_true",
+        help="allow a provider to execute routed misses on CPU",
+    )
+    parser.add_argument(
+        "--worker-route-trace-file", type=Path,
+        help="write bounded exact DeepSeek route traces as JSONL",
+    )
+    parser.add_argument(
+        "--worker-route-trace-max-steps", type=int, default=4096,
+        help="maximum exact model steps retained per request turn",
+    )
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)
@@ -1760,6 +2021,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     global LOG_FILE
     args = parse_args()
+    if args.worker_route_trace_max_steps < 1:
+        raise SystemExit("--worker-route-trace-max-steps must be positive")
     if (args.maximum_queue < 0 or args.max_context < 2 or
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or

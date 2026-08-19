@@ -1,5 +1,8 @@
 # Operations runbook
 
+Status: current day-two lifecycle as of 2026-08-11. The implementation resume
+point is [the MoE VM handoff](moe-vm-next.md).
+
 Use [Install, configure and use](deployment.md) for initial setup. This page is
 the short day-two runbook.
 
@@ -9,9 +12,9 @@ the short day-two runbook.
 ./ops/model.sh install            # after clone or requirements changes
 ./ops/model.sh config             # resolved non-secret local configuration
 ./ops/model.sh start              # CHAT_MODEL from .env
-./ops/model.sh start qwen         # explicit switch
-./ops/model.sh start qwen-fp4     # Qwen FP4 pack (ABI 3)
+./ops/model.sh start qwen         # Qwen FP4 pack (ABI 3)
 ./ops/model.sh start deepseek
+./ops/model.sh start lfm2-8b-a1b-expert-pack-fp4
 ./ops/model.sh status
 ./ops/model.sh chat               # resolves the actually deployed model
 ./ops/model.sh stop
@@ -20,8 +23,9 @@ the short day-two runbook.
 ```
 
 `start` synchronizes by default, performs a read-only dependency preflight
-before disrupting the current service, stops both competing tasks, installs the
-selected task, waits for readiness and verifies model/context/output/deadline.
+before disrupting the current service, stops the common task and any retired
+task names, installs the selected artifact, waits for readiness and verifies
+model/context/output/deadline.
 
 Only one model owns the GPU and loopback API port. Task Scheduler is a pilot
 supervisor. The repository stop command kills the complete Python/worker
@@ -50,8 +54,8 @@ confirm `model.sh status`. A listening port alone is not proof of identity.
 | `MODEL_GENERATION_TIMEOUT_SECONDS` | `600` | request execution deadline |
 | `MODEL_READY_TIMEOUT` | `600` | lifecycle wait deadline |
 
-Qwen uses four worker slots/eight queued requests; DeepSeek uses one worker
-slot/four queued requests in the current profile. KV credits are aggregate.
+The current universal `.env` profile uses one worker slot and four queued
+requests for every artifact. KV credits are aggregate.
 Overload or insufficient context credits returns bounded HTTP errors rather
 than allocating unbounded memory.
 
@@ -108,4 +112,7 @@ Never publish one unqualified “tok/s” number. Record:
 
 An identical repeated Qwen prompt can reach 27–29 tok/s after the first token
 (39.6–45.6 with the FP4 pack), while changing multi-turn chat remains
-storage-bound at a few tok/s. Both facts must remain visible.
+storage-bound. Those are dated performance-suite results, not the latest
+common-path `hi` gate. The VM gate proved lifecycle compatibility for Qwen,
+DeepSeek and LFM but did not demonstrate a speed increase. Both facts must
+remain visible.

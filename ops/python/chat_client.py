@@ -131,7 +131,7 @@ def _print_info(base_url: str) -> None:
 
 
 def _chat(base_url: str, model: str, messages: list[dict[str, str]],
-          maximum: int) -> tuple[str, TurnStats]:
+          maximum: int, request_timeout: float) -> tuple[str, TurnStats]:
     body = json.dumps({
         "model": model,
         "messages": messages,
@@ -150,7 +150,7 @@ def _chat(base_url: str, model: str, messages: list[dict[str, str]],
     started = time.perf_counter()
     first_content_at: float | None = None
     try:
-        with urllib.request.urlopen(request, timeout=600) as response:
+        with urllib.request.urlopen(request, timeout=request_timeout) as response:
             print("assistant> ", end="", flush=True)
             for event in _events(response):
                 if event.get("error"):
@@ -207,10 +207,13 @@ def main() -> int:
     parser.add_argument("--local-port", type=int, default=18080)
     parser.add_argument("--remote-port", type=int, default=8080)
     parser.add_argument("--ready-timeout", type=float, default=30.0)
+    parser.add_argument("--request-timeout", type=float, default=660.0)
     parser.add_argument("--show-stats", action=argparse.BooleanOptionalAction,
                         default=True)
     args = parser.parse_args()
-    if args.max_tokens < 1 or not 1 <= args.local_port <= 65535 or not 1 <= args.remote_port <= 65535:
+    if (args.max_tokens < 1 or args.request_timeout <= 0 or
+            not 1 <= args.local_port <= 65535 or
+            not 1 <= args.remote_port <= 65535):
         parser.error("token and port values must be positive and valid")
 
     tunnel: subprocess.Popen[bytes] | None = None
@@ -254,7 +257,8 @@ def main() -> int:
             messages.append({"role": "user", "content": prompt})
             try:
                 answer, last_stats = _chat(
-                    base_url, model, messages, args.max_tokens
+                    base_url, model, messages, args.max_tokens,
+                    args.request_timeout,
                 )
             except RuntimeError as error:
                 messages.pop()

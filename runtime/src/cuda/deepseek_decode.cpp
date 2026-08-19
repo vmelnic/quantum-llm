@@ -117,10 +117,12 @@ void DeepSeekDecodeController::clear_cpu_placements() noexcept {
 
 Status DeepSeekDecodeController::begin(
     const DeepSeekDecodeBegin& launch) noexcept {
+  const auto layer_limit =
+      launch.layer_limit == 0U ? request_->layer_count() : launch.layer_limit;
   if (active_ || !launch.input_streams ||
       launch.position >= request_->max_context_tokens() ||
-      launch.first_layer >= launch.layer_limit ||
-      launch.layer_limit > kDeepSeekLayers || !launch.rope.base_cosine ||
+      launch.first_layer >= layer_limit ||
+      layer_limit > request_->layer_count() || !launch.rope.base_cosine ||
       !launch.rope.base_sine || !launch.rope.compressed_cosine ||
       !launch.rope.compressed_sine) {
     return {ErrorCode::invalid_argument, "invalid DeepSeek decode begin"};
@@ -138,7 +140,7 @@ Status DeepSeekDecodeController::begin(
   position_ = launch.position;
   token_id_ = launch.token_id;
   current_layer_ = launch.first_layer;
-  layer_limit_ = launch.layer_limit;
+  layer_limit_ = layer_limit;
   route_trace_.clear();
   route_trace_.reserve(layer_limit_ - current_layer_);
   waiting_for_experts_ = false;
@@ -151,10 +153,12 @@ Status DeepSeekDecodeController::begin(
 
 Status DeepSeekDecodeController::begin_verify_pair(
     const DeepSeekVerifyBegin& launch) noexcept {
+  const auto layer_limit =
+      launch.layer_limit == 0U ? request_->layer_count() : launch.layer_limit;
   if (active_ || !verify_ || launch.positions[1] != launch.positions[0] + 1U ||
       launch.positions[1] >= request_->max_context_tokens() ||
-      launch.first_layer >= launch.layer_limit ||
-      launch.layer_limit > kDeepSeekLayers) {
+      launch.first_layer >= layer_limit ||
+      layer_limit > request_->layer_count()) {
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek pair verification begin"};
   }
@@ -170,7 +174,7 @@ Status DeepSeekDecodeController::begin_verify_pair(
   pair_positions_ = launch.positions;
   pair_token_ids_ = launch.token_ids;
   current_layer_ = launch.first_layer;
-  layer_limit_ = launch.layer_limit;
+  layer_limit_ = layer_limit;
   route_trace_.clear();
   route_trace_.reserve(2U * (layer_limit_ - current_layer_));
   waiting_for_experts_ = false;

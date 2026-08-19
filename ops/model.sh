@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|qwen-fp4|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -43,52 +43,67 @@ action="${1:-status}"
 selection_explicit=0
 if (( $# >= 2 )); then selection_explicit=1; fi
 selection="${2:-${CHAT_MODEL:-deepseek-v4-flash}}"
-case "${selection}" in
-  deepseek|deepseek-v4-flash)
-    model_alias="deepseek"
-    model_id="deepseek-v4-flash"
-    task_name="QuantumLLM-DeepSeekV4Flash"
-    ;;
-  qwen|qwen3-next|qwen3-next-80b-a3b-expert-pack-int8)
-    model_alias="qwen"
-    model_id="qwen3-next-80b-a3b-expert-pack-int8"
-    task_name="QuantumLLM-P6ExpertServer"
-    ;;
-  qwen-fp4|qwen3-next-fp4|qwen3-next-80b-a3b-expert-pack-fp4)
-    model_alias="qwen"
-    model_id="qwen3-next-80b-a3b-expert-pack-fp4"
-    task_name="QuantumLLM-P6ExpertServer"
-    ;;
-  all)
-    model_alias="all"
-    model_id=""
-    task_name=""
-    ;;
-  *) die "unsupported model '${selection}'; use deepseek, qwen or qwen-fp4" ;;
-esac
+model_id="${selection}"
+artifact_name="${selection}"
+task_name="QuantumLLM-ExpertVm"
+if [[ "${selection}" == all ]]; then
+  model_id=""
+  artifact_name=""
+  task_name=""
+else
+  [[ "${selection}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "model selector must contain only letters, digits, dot, underscore or dash"
+  alias_file="${MODEL_ALIAS_FILE:-${script_dir}/model-aliases.tsv}"
+  [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
+  while IFS=$'\t' read -r alias advertised_model artifact extra; do
+    [[ "${alias}" != model-aliases-v1 && -n "${alias}" ]] || continue
+    [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" ]] ||
+      die "invalid model alias registry row for '${alias}'"
+    if [[ "${alias}" == "${selection}" ]]; then
+      model_id="${advertised_model}"
+      artifact_name="${artifact}"
+      break
+    fi
+  done < "${alias_file}"
+  [[ "${artifact_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
+    die "model alias resolves outside MODEL_ROOT"
+fi
 
 remote_host="${QUANTUM_LLM_REMOTE:-${CHAT_SSH:-}}"
-remote_root="${QUANTUM_LLM_REMOTE_ROOT:-C:/quantum-llm}"
+remote_root="${QUANTUM_LLM_REMOTE_ROOT:-}"
+model_root="${MODEL_ROOT:-}"
 port="${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
 max_context="${MODEL_MAX_CONTEXT:-65536}"
 max_output="${MODEL_MAX_OUTPUT_TOKENS:-8192}"
 ready_timeout="${MODEL_READY_TIMEOUT:-600}"
 generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
-deepseek_bundle="${MODEL_DEEPSEEK_BUNDLE:-C:/quantum-llm/work/models/deepseek-v4-flash/worker-bundle-v3}"
-qwen_container="${MODEL_QWEN_CONTAINER:-C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-int8}"
-# The FP4 selection has its own container variable so MODEL_QWEN_CONTAINER
-# keeps steering the int8 selection only.
-qwen_fp4_container="${MODEL_QWEN_FP4_CONTAINER:-C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-fp4}"
-if [[ "${model_id}" == qwen3-next-80b-a3b-expert-pack-fp4 ]]; then
-  qwen_container="${qwen_fp4_container}"
-fi
+ram_cache_gib="${MODEL_RAM_CACHE_GIB:-48}"
+vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-13}"
+worker_capacity="${MODEL_WORKER_CAPACITY:-1}"
+maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
+kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
+kv_page_tokens="${MODEL_KV_PAGE_TOKENS:-256}"
+placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
+[[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
+[[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
+container="${model_root}/${artifact_name}"
+vm_runner="${MODEL_VM_RUNNER:-${remote_root}/out/build/windows-msvc-release/runtime/Release/expert-moe-vm-runner.exe}"
 
 require_uint MODEL_PORT "${port}"
 require_uint MODEL_MAX_CONTEXT "${max_context}"
 require_uint MODEL_MAX_OUTPUT_TOKENS "${max_output}"
 require_uint MODEL_READY_TIMEOUT "${ready_timeout}"
 require_uint MODEL_GENERATION_TIMEOUT_SECONDS "${generation_timeout}"
+require_uint MODEL_RAM_CACHE_GIB "${ram_cache_gib}"
+require_uint MODEL_VRAM_CACHE_GIB "${vram_cache_gib}"
+require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
+require_uint MODEL_MAXIMUM_QUEUE "${maximum_queue}"
+require_uint MODEL_KV_CACHE_MIB "${kv_cache_mib}"
+require_uint MODEL_KV_PAGE_TOKENS "${kv_page_tokens}"
+[[ "${placement_profile}" == latency || "${placement_profile}" == balanced ||
+   "${placement_profile}" == capacity ]] ||
+  die "MODEL_PLACEMENT_PROFILE must be latency, balanced, or capacity"
 (( max_output < max_context )) || die "MODEL_MAX_OUTPUT_TOKENS must be smaller than MODEL_MAX_CONTEXT"
 
 export QUANTUM_LLM_REMOTE="${remote_host}"
@@ -113,8 +128,7 @@ stop_task() {
 }
 
 stop_all() {
-  stop_task QuantumLLM-DeepSeekV4Flash
-  stop_task QuantumLLM-P6ExpertServer
+  stop_task QuantumLLM-ExpertVm
 }
 
 print_config() {
@@ -122,19 +136,25 @@ print_config() {
     "model=${model_id:-all}" \
     "remote=${remote_host:-<unset>}" \
     "remote_root=${remote_root}" \
+    "model_root=${model_root}" \
     "port=${port}" \
     "max_context=${max_context}" \
     "max_output_tokens=${max_output}" \
     "generation_timeout_seconds=${generation_timeout}" \
     "sync_on_start=${sync_on_start}"
-  case "${model_alias}" in
-    deepseek) printf 'bundle=%s\n' "${deepseek_bundle}" ;;
-    qwen) printf 'container=%s\n' "${qwen_container}" ;;
-  esac
+  [[ -z "${model_id}" ]] || printf '%s\n' \
+    "container=${container}" \
+    "runner=${vm_runner}" \
+    "ram_cache_gib=${ram_cache_gib}" \
+    "vram_cache_gib=${vram_cache_gib}" \
+    "worker_capacity=${worker_capacity}" \
+    "kv_cache_mib=${kv_cache_mib}" \
+    "kv_page_tokens=${kv_page_tokens}" \
+    "placement_profile=${placement_profile}"
 }
 
 start_model() {
-  [[ "${model_alias}" != all ]] || die "start requires deepseek or qwen"
+  [[ -n "${model_id}" ]] || die "start requires one model"
   if is_true "${sync_on_start}"; then
     sync_remote
   fi
@@ -142,45 +162,34 @@ start_model() {
   stop_all
 
   local build_id
-  build_id="$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || printf development)"
+  build_id="${MODEL_BUILD_ID:-$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || printf development)}"
   local common=(
     -TaskName "${task_name}"
     -Port "${port}"
     -MaximumContext "${max_context}"
     -MaximumNewTokens "${max_output}"
-    -WorkerKvCacheMiB 2048
-    -WorkerKvPageTokens 256
-    -PlacementProfile balanced
+    -WorkerKvCacheMiB "${kv_cache_mib}"
+    -WorkerKvPageTokens "${kv_page_tokens}"
+    -PlacementProfile "${placement_profile}"
     -GenerationTimeoutSeconds "${generation_timeout}"
     -StartupTimeoutSeconds 600
     -BuildId "${build_id}"
     -Start
   )
-  if [[ "${model_alias}" == deepseek ]]; then
-    run_remote Install-ExpertServerTask.ps1 \
-      -Profile DeepSeekV4Flash \
-      -Bundle "${deepseek_bundle}" \
-      -MaximumQueue 4 \
-      -WorkerCapacity 1 \
-      -WorkerRamCacheGiB 40 \
-      -WorkerVramCacheGiB 12 \
-      -EnableMtp \
-      "${common[@]}"
-  else
-    run_remote Install-ExpertServerTask.ps1 \
-      -Profile P6 \
-      -Container "${qwen_container}" \
-      -ModelId "${model_id}" \
-      -MaximumQueue 8 \
-      -WorkerCapacity 4 \
-      -WorkerRamCacheGiB 48 \
-      -WorkerVramCacheGiB 18 \
-      "${common[@]}"
-  fi
+  run_remote Install-ExpertServerTask.ps1 \
+    -Container "${container}" \
+    -Runner "${vm_runner}" \
+    -ModelId "${model_id}" \
+    -MaximumQueue "${maximum_queue}" \
+    -WorkerCapacity "${worker_capacity}" \
+    -WorkerRamCacheGiB "${ram_cache_gib}" \
+    -WorkerVramCacheGiB "${vram_cache_gib}" \
+    "${common[@]}"
   run_remote Get-ExpertServerStatus.ps1 \
     -Port "${port}" \
     -WaitSeconds "${ready_timeout}" \
     -ExpectedModel "${model_id}" \
+    -ExpectedTaskName "${task_name}" \
     -ExpectedContext "${max_context}" \
     -ExpectedMaximumNewTokens "${max_output}" \
     -ExpectedGenerationTimeoutSeconds "${generation_timeout}"
@@ -198,10 +207,10 @@ case "${action}" in
     start_model
     ;;
   stop)
-    if [[ "${model_alias}" == all ]]; then stop_all; else stop_task "${task_name}"; fi
+    if [[ -z "${model_id}" ]]; then stop_all; else stop_task "${task_name}"; fi
     ;;
   restart)
-    [[ "${model_alias}" != all ]] || die "restart requires deepseek or qwen"
+    [[ -n "${model_id}" ]] || die "restart requires one model"
     stop_task "${task_name}"
     start_model
     ;;
@@ -209,7 +218,7 @@ case "${action}" in
     run_remote Get-ExpertServerStatus.ps1 -Port "${port}"
     ;;
   chat)
-    [[ "${model_alias}" != all ]] || die "chat requires deepseek or qwen"
+    [[ -n "${model_id}" ]] || die "chat requires one model"
     if (( selection_explicit )); then
       exec "${script_dir}/chat.sh" --model "${model_id}"
     else

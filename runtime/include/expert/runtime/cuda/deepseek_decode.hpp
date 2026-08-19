@@ -29,10 +29,10 @@ struct DeepSeekDecodeBegin final {
   DeepSeekDecodeRope rope;
   std::uint32_t position{};
   std::uint32_t token_id{};
-  // Half-open range. Full-model decode uses [0, 43); a strict subrange is
+  // Half-open range. Zero selects the artifact-declared layer count; a strict subrange is
   // useful for pipeline ownership and independently qualified slices.
   std::uint32_t first_layer{};
-  std::uint32_t layer_limit{kDeepSeekLayers};
+  std::uint32_t layer_limit{};
 };
 
 struct DeepSeekVerifyBegin final {
@@ -40,7 +40,7 @@ struct DeepSeekVerifyBegin final {
   std::array<std::uint32_t, 2U> positions{};
   std::array<std::uint32_t, 2U> token_ids{};
   std::uint32_t first_layer{};
-  std::uint32_t layer_limit{kDeepSeekLayers};
+  std::uint32_t layer_limit{};
 };
 
 enum class DeepSeekDecodeProgress : std::uint8_t {

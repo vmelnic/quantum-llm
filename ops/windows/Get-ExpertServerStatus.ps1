@@ -2,6 +2,7 @@ param(
     [int]$Port = 8080,
     [ValidateRange(0, 3600)][int]$WaitSeconds = 0,
     [string]$ExpectedModel = "",
+    [string]$ExpectedTaskName = "",
     [int]$ExpectedContext = 0,
     [int]$ExpectedMaximumNewTokens = 0,
     [double]$ExpectedGenerationTimeoutSeconds = 0
@@ -11,11 +12,9 @@ $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
 $ready = $false
 $lastError = ""
 $modelInfo = $null
-$expectedTaskName = if ($ExpectedModel -eq "deepseek-v4-flash") {
-    "QuantumLLM-DeepSeekV4Flash"
-} elseif ($ExpectedModel -eq "qwen3-next-80b-a3b-expert-pack-int8") {
-    "QuantumLLM-P6ExpertServer"
-} else { "" }
+$expectedTaskName = if ($ExpectedTaskName) {
+    $ExpectedTaskName
+} elseif ($ExpectedModel) { "QuantumLLM-ExpertVm" } else { "" }
 $waitStarted = [DateTime]::Now
 do {
     try {
@@ -49,10 +48,7 @@ do {
     Start-Sleep -Milliseconds 500
 } while ($true)
 
-$tasks = foreach ($name in @(
-    "QuantumLLM-DeepSeekV4Flash",
-    "QuantumLLM-P6ExpertServer"
-)) {
+$tasks = foreach ($name in @("QuantumLLM-ExpertVm")) {
     $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
     if ($null -ne $task) {
         $taskInfo = Get-ScheduledTaskInfo -TaskName $name

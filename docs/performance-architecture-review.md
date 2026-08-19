@@ -11,6 +11,8 @@ sessions, decoupled prefill, async directory planning, frozen placement,
 vectorized GEMV dispatch, event-driven uploads, the widened DeepSeek pipeline,
 and immediate dispatch of a lone decode request. This document remains the
 design record; measured results are in [Performance evidence](benchmarks.md).
+It is not the current implementation plan; the next session starts from
+[MoE VM current state and remaining work](moe-vm-next.md).
 
 ## Reference system and objective
 

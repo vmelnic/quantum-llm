@@ -1,0 +1,56 @@
+{
+  "diffPath": ".qwen/tmp/qwen-review-transformer_kernels.cu-diff.txt",
+  "diffPathAbsolute": "/Users/vm/Projects/personal/quantum-llm/.qwen/tmp/qwen-review-transformer_kernels.cu-diff.txt",
+  "diffLines": 319,
+  "diffChars": 14819,
+  "srcDiffLines": 319,
+  "testDiffLines": 0,
+  "docsDiffLines": 0,
+  "generatedDiffLines": 0,
+  "chunks": [
+    {
+      "id": 1,
+      "startLine": 1,
+      "endLine": 319,
+      "lines": 319,
+      "chars": 14819,
+      "maxLineChars": 101,
+      "oversized": false,
+      "files": [
+        { "path": "runtime/src/cuda/transformer_kernels.cu", "newStart": 587, "newEnd": 1874 }
+      ]
+    }
+  ],
+  "files": [
+    {
+      "path": "runtime/src/cuda/transformer_kernels.cu",
+      "kind": "source",
+      "hunks": [
+        { "newStart": 587, "newEnd": 657 },
+        { "newStart": 933, "newEnd": 1082 },
+        { "newStart": 1625, "newEnd": 1652 },
+        { "newStart": 1749, "newEnd": 1789 },
+        { "newStart": 1855, "newEnd": 1874 }
+      ],
+      "addedLines": 280,
+      "removedLines": 0,
+      "changedLines": 280,
+      "preLines": 0,
+      "fileLines": 0,
+      "rewriteRatio": 0,
+      "heavy": false,
+      "binary": false
+    }
+  ],
+  "budget": {
+    "inlineAngles": 6,
+    "sweep": true,
+    "specialistCap": 2,
+    "verifyShard": 8,
+    "agentToolBudget": 45,
+    "reverseAuditRounds": 5
+  },
+  "untrackedFiles": [],
+  "skippedFiles": [],
+  "effort": "high"
+}

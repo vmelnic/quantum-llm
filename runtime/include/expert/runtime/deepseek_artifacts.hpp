@@ -66,6 +66,8 @@ struct DeepSeekSharedArtifactsResult final {
     const std::filesystem::path& dense_root,
     const std::filesystem::path& typed_root,
     const std::filesystem::path& shared_root,
-    const std::filesystem::path& checkpoint_root) noexcept;
+    const std::filesystem::path& checkpoint_root,
+    std::uint32_t expected_routed_layers = 43U,
+    std::uint64_t namespace_id = 17U) noexcept;
 
 }  // namespace expert::runtime

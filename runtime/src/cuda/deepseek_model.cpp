@@ -251,20 +251,16 @@ Status DeepSeekResidentModelState::load(
 Status DeepSeekResidentModelState::bind_attention(
     std::uint32_t layer, std::uint32_t compress_ratio,
     DeepSeekAttentionBinding& destination) const noexcept {
-  if (layer >= 43U)
-    return {ErrorCode::invalid_argument, "invalid DeepSeek attention layer"};
   return tensors_.bind_attention("layers." + std::to_string(layer), layer,
                                  compress_ratio, destination);
 }
 
 Status DeepSeekResidentModelState::bind_ffn(
-    std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept {
-  if (layer >= 43U)
-    return {ErrorCode::invalid_argument, "invalid DeepSeek FFN layer"};
+    std::uint32_t layer, DeepSeekRouterKind router,
+    DeepSeekFfnBinding& destination) const noexcept {
   return tensors_.bind_ffn(
       "layers." + std::to_string(layer), layer,
-      layer < 3U ? DeepSeekRouterKind::hash : DeepSeekRouterKind::learned,
-      destination);
+      router, destination);
 }
 
 Status DeepSeekResidentModelState::bind_io(

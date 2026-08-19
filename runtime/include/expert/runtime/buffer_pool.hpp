@@ -3,10 +3,28 @@
 #include "expert/runtime/storage.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <optional>
 
 namespace expert::runtime {
+
+enum class BufferPoolClass : std::uint8_t {
+  demand,
+  background,
+};
+
+struct BufferPoolSnapshot final {
+  std::size_t slots_in_use{};
+  std::size_t demand_slots_in_use{};
+  std::size_t background_slots_in_use{};
+  std::size_t high_water_slots{};
+  std::size_t background_high_water_slots{};
+  std::uint64_t demand_acquires{};
+  std::uint64_t background_acquires{};
+  std::uint64_t demand_stalls{};
+  std::uint64_t background_stalls{};
+};
 
 class IHostAllocator {
  public:
@@ -53,26 +71,31 @@ class FixedBufferPool final {
 
    private:
     friend class FixedBufferPool;
-    Lease(std::shared_ptr<SharedState> state, std::size_t slot) noexcept;
+    Lease(std::shared_ptr<SharedState> state, std::size_t slot,
+          BufferPoolClass allocation_class) noexcept;
 
     std::shared_ptr<SharedState> state_;
     std::size_t slot_{};
+    BufferPoolClass allocation_class_{BufferPoolClass::demand};
   };
 
   FixedBufferPool(std::size_t slot_count, std::size_t slot_bytes,
                   std::size_t alignment,
                   std::shared_ptr<IHostAllocator> allocator =
-                      std::make_shared<AlignedHostAllocator>());
+                      std::make_shared<AlignedHostAllocator>(),
+                  std::size_t reserved_demand_slots = 0U);
 
-  [[nodiscard]] std::shared_ptr<Lease> try_acquire(std::size_t bytes);
+  [[nodiscard]] std::shared_ptr<Lease> try_acquire(
+      std::size_t bytes,
+      BufferPoolClass allocation_class = BufferPoolClass::demand);
   [[nodiscard]] std::size_t slot_count() const noexcept;
   [[nodiscard]] std::size_t slot_bytes() const noexcept;
   [[nodiscard]] std::size_t alignment() const noexcept;
   [[nodiscard]] std::size_t bytes_in_use() const noexcept;
+  [[nodiscard]] BufferPoolSnapshot snapshot() const noexcept;
 
  private:
   std::shared_ptr<SharedState> state_;
 };
 
 }  // namespace expert::runtime
-

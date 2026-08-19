@@ -1,8 +1,11 @@
 # Install, configure, and use
 
+Status: current common lifecycle as of 2026-08-17. For implementation state
+and remaining VM work, see [the canonical handoff](moe-vm-next.md).
+
 This is the operator path for one POSIX control host and one Windows/CUDA GPU
-host. It manages both supported deployments through one local `.env` and one
-command, while keeping the large model artifacts on the Windows host.
+host. It manages every supported VM artifact through one local `.env` and one
+command, while keeping large model artifacts on the Windows host.
 
 ## What the lifecycle wrapper manages
 
@@ -21,8 +24,8 @@ needs the prerequisites in [Getting started](getting-started.md), SSH access,
 and the repository bootstrap/build:
 
 ```powershell
-git clone <repository-url> C:\quantum-llm
-cd C:\quantum-llm
+git clone <repository-url> D:\quantum-llm
+cd D:\quantum-llm
 py -m venv .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install -r requirements\server.txt
@@ -35,7 +38,8 @@ Prepare at least one immutable model artifact:
   [the compact format](deepseek-compact-pack-v1.md) and current runtime
   contracts;
 - Qwen3-Next 80B Expert Pack, as described in
-  [Getting started](getting-started.md#compile-expert-pack).
+  [Getting started](getting-started.md#compile-expert-pack);
+- LFM2-MoE Expert Pack compiled by the same generic compiler contract.
 
 The lifecycle wrapper validates the selected artifact during service startup.
 It never removes the original checkpoint or either prepared model.
@@ -44,7 +48,8 @@ Note: the DeepSeek worker bundle `runtime.tsv` stores absolute paths for
 `routed`, `mtp_routed` and `census`, captured when the bundle was generated.
 If the model store is moved to a different root, those three entries must be
 repointed to the new location or the worker exits with "bundle dependency is
-unavailable".
+unavailable". The `checkpoint` entry is independent and may continue to point
+at the Hugging Face cache on another drive.
 
 ## 2. Configure the control host
 
@@ -58,7 +63,8 @@ Edit `.env`. It is ignored by Git and may contain host-specific paths:
 
 ```dotenv
 QUANTUM_LLM_REMOTE=user@gpu-host
-QUANTUM_LLM_REMOTE_ROOT=C:/quantum-llm
+QUANTUM_LLM_REMOTE_ROOT=D:/quantum-llm
+MODEL_ROOT=D:/quantum-llm/work/models
 
 CHAT_MODEL=deepseek-v4-flash
 MODEL_MAX_CONTEXT=65536
@@ -68,9 +74,10 @@ MODEL_SYNC_ON_START=1
 MODEL_READY_TIMEOUT=600
 MODEL_GENERATION_TIMEOUT_SECONDS=600
 
-MODEL_DEEPSEEK_BUNDLE=C:/quantum-llm/work/models/deepseek-v4-flash/worker-bundle-v3
-MODEL_QWEN_CONTAINER=C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-int8
-MODEL_QWEN_FP4_CONTAINER=C:/quantum-llm/work/models/qwen3-next-80b-expert-pack-fp4
+MODEL_RAM_CACHE_GIB=48
+MODEL_VRAM_CACHE_GIB=13
+MODEL_WORKER_CAPACITY=1
+MODEL_MAXIMUM_QUEUE=4
 
 CHAT_SSH=user@gpu-host
 CHAT_BASE_URL=http://127.0.0.1:8080
@@ -87,13 +94,13 @@ The model selectors accepted by `CHAT_MODEL` are:
 | Value | Deployment |
 |---|---|
 | `deepseek-v4-flash` | DeepSeek-V4-Flash compact worker bundle |
-| `qwen3-next-80b-a3b-expert-pack-int8` | Qwen3-Next 80B Expert Pack (INT8) |
 | `qwen3-next-80b-a3b-expert-pack-fp4` | Qwen3-Next 80B Expert Pack (FP4, ABI 3) |
+| any direct child of `MODEL_ROOT` | Generic VM artifact |
 
-Short aliases `deepseek`, `qwen` and `qwen-fp4` are accepted as command
-arguments. The FP4 selection reads its container from
-`MODEL_QWEN_FP4_CONTAINER`; `MODEL_QWEN_CONTAINER` steers the INT8 selection
-only.
+Short aliases `deepseek` and `qwen` are data entries in
+`ops/model-aliases.tsv`; `qwen` resolves only to the FP4 pack. Unregistered
+selectors resolve directly below `MODEL_ROOT`, and the worker resource
+contract is common to every artifact.
 
 `MODEL_MAX_CONTEXT` covers the entire tokenized request: instructions, chat
 history, current input, and requested output. `MODEL_MAX_OUTPUT_TOKENS` is the
@@ -103,8 +110,10 @@ requests and cannot exceed the server ceiling.
 The reference 65,536/8,192 limits are operational configuration, not a claim
 that long-context correctness or latency has been qualified. A request can
 also end at `MODEL_GENERATION_TIMEOUT_SECONDS` before reaching its output
-ceiling. Increase that deadline deliberately if a slow model must be allowed
-to generate for longer.
+ceiling. The terminal client's socket timeout defaults to 60 seconds beyond
+that service deadline; `CHAT_REQUEST_TIMEOUT_SECONDS` can override it.
+Increase the service deadline deliberately if a slow model must be allowed to
+generate for longer.
 
 Inspect the resolved non-secret control configuration before changing remote
 state:
@@ -134,7 +143,7 @@ Start the model selected by `CHAT_MODEL`:
 ./ops/model.sh start
 ```
 
-Before stopping an existing model, `start` verifies that the server Python
+Before stopping the active VM task, `start` verifies that the server Python
 environment is complete. The command then returns only after `/ready` succeeds
 and `/model-info` matches the selected model, context, output ceiling, and
 generation deadline. If the scheduled task exits during startup, the command
@@ -145,7 +154,7 @@ timeout. Inspect it again at any time:
 ./ops/model.sh status
 ```
 
-A healthy DeepSeek deployment reports fields like:
+A healthy deployment reports fields like:
 
 ```json
 {
@@ -216,12 +225,13 @@ stream formats, errors, and explicit capability gaps.
 
 ## 6. Switch, restart, stop, and sync
 
-Only one model uses the GPU/API port at a time. Starting either model safely
-stops both known scheduled tasks first:
+Only one model uses the GPU/API port at a time. Starting an artifact stops the
+single common task and cleans up retired task names first:
 
 ```bash
 ./ops/model.sh start qwen
 ./ops/model.sh start deepseek
+./ops/model.sh start lfm2-8b-a1b-expert-pack-fp4
 ```
 
 Other lifecycle operations:
@@ -243,7 +253,8 @@ current `.env` values.
 
 - `model.sh: set QUANTUM_LLM_REMOTE...`: configure the SSH target in `.env`.
 - `Container missing` or `runtime bundle is missing`: correct the immutable
-  Qwen/DeepSeek artifact path; synchronization does not copy ignored models.
+  artifact path below `MODEL_ROOT`; synchronization does not copy ignored
+  models.
 - dependency preflight failure: run `./ops/model.sh install`; `start` performs
   only a read-only version/import check and does not access package indexes.
 - readiness timeout: run `./ops/model.sh status`, then inspect the remote JSONL

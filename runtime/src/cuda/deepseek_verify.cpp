@@ -2,6 +2,7 @@
 
 #include <cuda_runtime_api.h>
 
+#include <algorithm>
 #include <cstddef>
 #include <limits>
 #include <string>
@@ -10,11 +11,6 @@
 namespace expert::runtime::cuda {
 namespace {
 
-constexpr std::array<std::uint32_t, kDeepSeekLayers> kCompressionRatios = {
-    0U, 0U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U,
-    128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U,
-    4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U,
-    128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 0U};
 constexpr std::uint64_t kStreamValues = 4ULL * 4096U;
 constexpr std::uint64_t kSecondaryStreamBytes =
     2ULL * kStreamValues * sizeof(float);
@@ -33,14 +29,18 @@ Status failure(cudaError_t error, const char* operation) noexcept {
 }  // namespace
 
 DeepSeekVerifyStateSize deepseek_verify_state_size(
-    std::uint32_t max_context_tokens) noexcept {
+    std::uint32_t max_context_tokens,
+    std::span<const std::uint32_t> compression_ratios) noexcept {
+  if (compression_ratios.empty())
+    return {{ErrorCode::invalid_argument,
+             "DeepSeek verify layer program is empty"}};
   DeepSeekVerifyStateSize result{Status::success()};
   const auto ffn_bytes = deepseek_ffn_state_size();
   if (ffn_bytes > std::numeric_limits<std::uint64_t>::max() /
-                      kDeepSeekLayers)
+                      compression_ratios.size())
     return {{ErrorCode::invalid_argument,
              "DeepSeek verify FFN state size overflow"}};
-  result.secondary_ffn_bytes = ffn_bytes * kDeepSeekLayers;
+  result.secondary_ffn_bytes = ffn_bytes * compression_ratios.size();
   result.pair_ffn_bytes = deepseek_ffn_pair_workspace_size();
   const auto attention_pair =
       deepseek_attention_pair_workspace_size(max_context_tokens);
@@ -48,7 +48,7 @@ DeepSeekVerifyStateSize deepseek_verify_state_size(
   result.pair_attention_bytes = attention_pair.bytes;
   result.secondary_io_bytes = deepseek_io_state_size();
   result.secondary_stream_bytes = kSecondaryStreamBytes;
-  for (const auto ratio : kCompressionRatios) {
+  for (const auto ratio : compression_ratios) {
     if (!add_checked(deepseek_attention_speculative_checkpoint_size(ratio),
                      result.rollback_bytes))
       return {{ErrorCode::invalid_argument,
@@ -73,7 +73,7 @@ DeepSeekVerifyState::~DeepSeekVerifyState() {
 
 DeepSeekVerifyLayerStateView DeepSeekVerifyState::layer(
     std::uint32_t index) const noexcept {
-  if (!request_ || index >= kDeepSeekLayers) return {};
+  if (!request_ || index >= secondary_ffn_states_.size()) return {};
   const auto primary = request_->layer(index);
   return {primary.attention_weights, primary.attention_state,
           primary.ffn_weights,
@@ -102,16 +102,16 @@ Status DeepSeekVerifyState::begin_transaction(
   active_ = true;
   speculative_position_ = speculative_position;
   recurrent_boundary_ = (speculative_position + 1U) % 4U == 0U;
-  checkpointed_.fill(false);
+  std::fill(checkpointed_.begin(), checkpointed_.end(), false);
   return Status::success();
 }
 
 Status DeepSeekVerifyState::mark_layer_checkpointed(
     std::uint32_t index) noexcept {
-  if (!active_ || index >= kDeepSeekLayers || checkpointed_[index])
+  if (!active_ || index >= checkpointed_.size() || checkpointed_[index])
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek verification checkpoint mark"};
-  if (!recurrent_boundary_ || kCompressionRatios[index] != 4U)
+  if (!recurrent_boundary_ || request_->layer(index).compress_ratio != 4U)
     return Status::success();
   const auto view = layer(index);
   if (!view.attention_state || !view.rollback_checkpoint)
@@ -144,7 +144,7 @@ const std::uint32_t* DeepSeekVerifyState::bonus_sampled_token() const noexcept {
 
 Status DeepSeekVerifyState::restore_checkpoints(void* stream) noexcept {
   auto result = Status::success();
-  for (std::uint32_t index = 0U; index < kDeepSeekLayers; ++index) {
+  for (std::uint32_t index = 0U; index < checkpointed_.size(); ++index) {
     if (!checkpointed_[index]) continue;
     const auto view = layer(index);
     const auto restored = view.attention_state->restore_speculative_state(
@@ -168,7 +168,7 @@ Status DeepSeekVerifyState::finish_transaction(bool accept,
         static_cast<cudaStream_t>(stream));
     if (error != cudaSuccess)
       status = failure(error, "commit DeepSeek speculative streams");
-    checkpointed_.fill(false);
+    std::fill(checkpointed_.begin(), checkpointed_.end(), false);
   } else {
     status = restore_checkpoints(stream);
   }
@@ -191,8 +191,8 @@ DeepSeekVerifyStateResult create_deepseek_verify_state(
   if (!request || device_state_budget_bytes == 0U)
     return {{ErrorCode::invalid_argument,
              "DeepSeek verify state requires a request and budget"}, {}};
-  const auto estimate =
-      deepseek_verify_state_size(request->max_context_tokens());
+  const auto estimate = deepseek_verify_state_size(
+      request->max_context_tokens(), request->compression_ratios());
   if (!estimate.status.ok()) return {estimate.status, {}};
   if (estimate.total_bytes > device_state_budget_bytes)
     return {{ErrorCode::backpressure,
@@ -201,8 +201,12 @@ DeepSeekVerifyStateResult create_deepseek_verify_state(
   auto candidate = std::shared_ptr<DeepSeekVerifyState>(
       new DeepSeekVerifyState());
   candidate->request_ = std::move(request);
+  const auto layer_count = candidate->request_->layer_count();
+  candidate->secondary_ffn_states_.resize(layer_count);
+  candidate->rollback_checkpoints_.resize(layer_count);
+  candidate->checkpointed_.resize(layer_count);
   std::uint64_t actual = 0U;
-  for (std::uint32_t layer = 0U; layer < kDeepSeekLayers; ++layer) {
+  for (std::uint32_t layer = 0U; layer < layer_count; ++layer) {
     auto ffn = create_deepseek_ffn_state(layer);
     if (!ffn.status.ok()) return {ffn.status, {}};
     candidate->secondary_ffn_states_[layer] = std::move(ffn.state);
@@ -252,9 +256,9 @@ DeepSeekVerifyStateResult create_deepseek_verify_state(
     if (error != cudaSuccess)
       return {failure(error, "allocate DeepSeek verify rollback state"), {}};
     auto* cursor = static_cast<std::byte*>(candidate->rollback_allocation_);
-    for (std::uint32_t layer = 0U; layer < kDeepSeekLayers; ++layer) {
+    for (std::uint32_t layer = 0U; layer < layer_count; ++layer) {
       const auto bytes = deepseek_attention_speculative_checkpoint_size(
-          kCompressionRatios[layer]);
+          candidate->request_->layer(layer).compress_ratio);
       if (bytes == 0U) continue;
       candidate->rollback_checkpoints_[layer] = cursor;
       cursor += bytes;

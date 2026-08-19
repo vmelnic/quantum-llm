@@ -1,0 +1,19 @@
+{
+  "target": {
+    "type": "file",
+    "path": "runtime/src/cuda/transformer_kernels.cu"
+  },
+  "effort": "high",
+  "effortSource": "explicit",
+  "comment": {
+    "requested": false,
+    "effective": false
+  },
+  "fix": {
+    "requested": false,
+    "effective": false
+  },
+  "extraTokens": [],
+  "unknownFlags": [],
+  "warnings": []
+}

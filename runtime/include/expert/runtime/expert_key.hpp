@@ -6,13 +6,14 @@
 
 namespace expert::runtime {
 
-// Identifies one immutable, compute-ready expert record. model_id is derived
-// from the validated manifest hash; quant_abi prevents aliasing layouts.
+// Identifies one immutable expert weight set. model_id is derived from the
+// validated manifest hash; encoding_abi identifies the numeric weight encoding
+// independently of its source container and compute-device view.
 struct ExpertKey final {
   std::uint64_t model_id{};
   std::uint32_t layer{};
   std::uint32_t expert{};
-  std::uint32_t quant_abi{};
+  std::uint32_t encoding_abi{};
 
   friend constexpr bool operator==(const ExpertKey&, const ExpertKey&) = default;
   friend constexpr auto operator<=>(const ExpertKey&, const ExpertKey&) = default;
@@ -27,10 +28,9 @@ struct ExpertKeyHash final {
     };
     mix(key.layer);
     mix(key.expert);
-    mix(key.quant_abi);
+    mix(key.encoding_abi);
     return value;
   }
 };
 
 }  // namespace expert::runtime
-

@@ -31,7 +31,7 @@ constexpr std::size_t kFixedHeaderBytes = 124U;
                      config.experts_per_layer;
   const auto transitions = cells * config.experts_per_layer;
   return config.model_id != 0U && nonzero_digest(config.model_content_hash) &&
-         config.quant_abi != 0U && config.layer_count != 0U &&
+         config.encoding_abi != 0U && config.layer_count != 0U &&
          config.experts_per_layer != 0U && config.route_width != 0U &&
          config.route_width <= config.experts_per_layer &&
          config.decay_interval_observations != 0U && cells <= 1'000'000U &&
@@ -134,7 +134,7 @@ RouteCensusLoadResult RouteCensus::decode_file(
   std::uint32_t version{};
   std::uint64_t generation{};
   std::uint64_t model_id{};
-  std::uint32_t quant_abi{};
+  std::uint32_t encoding_abi{};
   std::uint32_t layer_count{};
   std::uint32_t experts_per_layer{};
   std::uint32_t route_width{};
@@ -147,7 +147,7 @@ RouteCensusLoadResult RouteCensus::decode_file(
   std::uint64_t cell_count{};
   if (!reader.take(magic) || !reader.take_u32(version) ||
       !reader.take_u64(generation) || !reader.take_u64(model_id) ||
-      !reader.take_u32(quant_abi) || !reader.take_u32(layer_count) ||
+      !reader.take_u32(encoding_abi) || !reader.take_u32(layer_count) ||
       !reader.take_u32(experts_per_layer) || !reader.take_u32(route_width) ||
       !reader.take_u64(decay_interval) || !reader.take(model_hash) ||
       !reader.take_u64(observation) || !reader.take_u64(completed_routes) ||
@@ -158,8 +158,8 @@ RouteCensusLoadResult RouteCensus::decode_file(
   if (magic != kMagic ||
       (version != kVersion && version != kLegacyVersion) ||
       generation == 0U ||
-      model_id != expected.model_id ||
-      quant_abi != expected.quant_abi || layer_count != expected.layer_count ||
+      encoding_abi != expected.encoding_abi ||
+      layer_count != expected.layer_count ||
       experts_per_layer != expected.experts_per_layer ||
       route_width != expected.route_width ||
       decay_interval != expected.decay_interval_observations ||
@@ -227,7 +227,8 @@ RouteCensusLoadResult RouteCensus::decode_file(
     return {{ErrorCode::io_failed,
              "route census aggregate accounting mismatch"}, {}};
   }
-  return {Status::success(), std::move(census)};
+  return {Status::success(), std::move(census),
+          model_id != expected.model_id};
 }
 
 RouteCensus::RouteCensus(RouteCensusConfig config) : config_(config) {
@@ -342,7 +343,7 @@ std::vector<RouteCensusWarmEntry> RouteCensus::stable_warm_set(
                                 config_.experts_per_layer + expert];
       if (cell.total == 0U) continue;
       candidates.push_back(
-          {ExpertKey{config_.model_id, layer, expert, config_.quant_abi},
+          {ExpertKey{config_.model_id, layer, expert, config_.encoding_abi},
            cell.total, effective_heat(cell), cell.last_seen, cell.cpu,
            cell.gpu});
     }
@@ -398,7 +399,7 @@ std::vector<RouteCensusPrediction> RouteCensus::predict_next(
                   config_.experts_per_layer + candidate]);
     if (score != 0U)
       candidates.push_back(
-          {ExpertKey{config_.model_id, layer, candidate, config_.quant_abi},
+          {ExpertKey{config_.model_id, layer, candidate, config_.encoding_abi},
            score});
   }
   std::sort(candidates.begin(), candidates.end(),
@@ -438,7 +439,7 @@ std::vector<std::byte> RouteCensus::serialize(
   append_u32(output, kVersion);
   append_u64(output, generation);
   append_u64(output, config_.model_id);
-  append_u32(output, config_.quant_abi);
+  append_u32(output, config_.encoding_abi);
   append_u32(output, config_.layer_count);
   append_u32(output, config_.experts_per_layer);
   append_u32(output, config_.route_width);
@@ -519,6 +520,7 @@ RouteCensusLoadResult RouteCensus::load(
       return {{ErrorCode::invalid_argument,
                "invalid route census load contract"}, {}};
     std::unique_ptr<RouteCensus> newest;
+    bool newest_namespace_rebound{};
     Status last_error{ErrorCode::open_failed,
                       "no route census generation exists"};
     for (std::uint64_t slot = 0U; slot < 2U; ++slot) {
@@ -530,11 +532,14 @@ RouteCensusLoadResult RouteCensus::load(
         last_error = std::move(decoded.status);
         continue;
       }
-      if (!newest || decoded.census->generation_ > newest->generation_)
+      if (!newest || decoded.census->generation_ > newest->generation_) {
+        newest_namespace_rebound = decoded.namespace_rebound;
         newest = std::move(decoded.census);
+      }
     }
     if (!newest) return {std::move(last_error), {}};
-    return {Status::success(), std::move(newest)};
+    return {Status::success(), std::move(newest),
+            newest_namespace_rebound};
   } catch (const std::exception& error) {
     return {{ErrorCode::io_failed, error.what()}, {}};
   }

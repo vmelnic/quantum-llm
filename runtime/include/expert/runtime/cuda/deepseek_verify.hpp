@@ -5,6 +5,8 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace expert::runtime::cuda {
 
@@ -20,7 +22,8 @@ struct DeepSeekVerifyStateSize final {
 };
 
 [[nodiscard]] DeepSeekVerifyStateSize deepseek_verify_state_size(
-    std::uint32_t max_context_tokens = 4096U) noexcept;
+    std::uint32_t max_context_tokens,
+    std::span<const std::uint32_t> compression_ratios) noexcept;
 
 struct DeepSeekVerifyLayerStateView final {
   const DeepSeekAttentionBinding* attention_weights{};
@@ -89,8 +92,7 @@ class DeepSeekVerifyState final {
   [[nodiscard]] Status restore_checkpoints(void* stream) noexcept;
 
   std::shared_ptr<DeepSeekRequestState> request_;
-  std::array<std::shared_ptr<DeepSeekFfnState>, kDeepSeekLayers>
-      secondary_ffn_states_{};
+  std::vector<std::shared_ptr<DeepSeekFfnState>> secondary_ffn_states_;
   std::shared_ptr<DeepSeekFfnPairWorkspace> ffn_workspace_;
   std::shared_ptr<DeepSeekAttentionPairWorkspace> attention_workspace_;
   std::shared_ptr<DeepSeekIoState> secondary_io_state_;
@@ -98,8 +100,8 @@ class DeepSeekVerifyState final {
   float* speculative_streams_a_{};
   float* speculative_streams_b_{};
   void* rollback_allocation_{};
-  std::array<void*, kDeepSeekLayers> rollback_checkpoints_{};
-  std::array<bool, kDeepSeekLayers> checkpointed_{};
+  std::vector<void*> rollback_checkpoints_;
+  std::vector<bool> checkpointed_;
   std::uint64_t bytes_{};
   std::uint32_t speculative_position_{};
   bool active_{};

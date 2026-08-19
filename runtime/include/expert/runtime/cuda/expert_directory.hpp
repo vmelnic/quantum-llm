@@ -21,7 +21,7 @@ enum class DeviceExpertFormat : std::uint32_t {
   // by the DeepSeek compact records (quant ABI 2) and Expert Pack FP4
   // records (quant ABI 3); the packed_fp4_q8_dot kernels are
   // geometry-generic, only the w1/w3/w2 views differ per source.
-  deepseek_fp4_block32 = 1,
+  fp4_e2m1_ue8m0_block32 = 1,
 };
 
 // Small compute-ready metadata entry. The full model is never materialized in
@@ -93,7 +93,7 @@ class CudaDirectoryPlanWorkspace final {
 // expert count, keeping planning bounded for very large sparse models.
 class CudaExpertDirectory final : public IDeviceResidencyDirectory {
  public:
-  CudaExpertDirectory(std::uint64_t model_id, std::uint32_t quant_abi,
+  CudaExpertDirectory(std::uint64_t model_id, std::uint32_t encoding_abi,
                       std::uint32_t layers, std::uint32_t experts_per_layer,
                       std::uint32_t maximum_selections,
                       std::uint32_t maximum_active_pins = 64U);

@@ -1,8 +1,6 @@
 param(
-    [ValidateSet("P6", "DeepSeekV4Flash")][string]$Profile = "P6",
     [string]$TaskName = "",
     [string]$Container = "",
-    [string]$Bundle = "",
     [string]$Tokenizer = "",
     [string]$Runner = "",
     [string]$Python = "",
@@ -18,7 +16,11 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
-    [switch]$EnableMtp,
+    [switch]$ProfileGpuPhases,
+    [switch]$DisableRetainedRoute,
+    [switch]$EnableCpuHybrid,
+    [string]$WorkerRouteTraceFile = "",
+    [ValidateRange(1, 65536)][int]$WorkerRouteTraceMaxSteps = 4096,
     [double]$MicrobatchWindowMs = 2.0,
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
@@ -37,22 +39,22 @@ if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1) {
     throw "Invalid service limits"
 }
-if (-not $TaskName) {
-    $TaskName = if ($Profile -eq "P6") {
-        "QuantumLLM-P6ExpertServer"
-    } else {
-        "QuantumLLM-DeepSeekV4Flash"
+if (-not $TaskName) { $TaskName = "QuantumLLM-ExpertVm" }
+if (-not $Container -or -not $Runner) {
+    throw "Artifact container and VM runner are required"
+}
+$startScript = Join-Path $PSScriptRoot "Start-ExpertServer.ps1"
+foreach ($retiredTask in @(
+    "QuantumLLM-DeepSeekV4Flash",
+    "QuantumLLM-P6ExpertServer",
+    "QuantumLLM-MoeVm"
+)) {
+    $retired = Get-ScheduledTask -TaskName $retiredTask -ErrorAction SilentlyContinue
+    if ($null -ne $retired) {
+        Stop-ScheduledTask -TaskName $retiredTask -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $retiredTask -Confirm:$false
     }
 }
-if (($Profile -eq "P6" -and $Bundle) -or
-    ($Profile -eq "DeepSeekV4Flash" -and (-not $Bundle -or $Container))) {
-    throw "Profile model input is invalid"
-}
-$startScript = Join-Path $PSScriptRoot $(if ($Profile -eq "P6") {
-    "Start-P6ExpertServer.ps1"
-} else {
-    "Start-DeepSeekExpertServer.ps1"
-})
 $existingTask = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 if ($existingTask) { Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue }
 [void](Stop-ExpertServerProcessTree -Port $Port)
@@ -86,20 +88,30 @@ $taskArguments.AddRange([string[]]@(
     "-BuildId", (Quote-TaskArgument $BuildId)
 ))
 foreach ($entry in @(
-    @{ Name = if ($Profile -eq "P6") { "Container" } else { "Bundle" };
-       Value = if ($Profile -eq "P6") { $Container } else { $Bundle } },
+    @{ Name = "Container"; Value = $Container },
     @{ Name = "Tokenizer"; Value = $Tokenizer },
     @{ Name = "Runner"; Value = $Runner },
     @{ Name = "Python"; Value = $Python },
-    @{ Name = "ModelId"; Value = $ModelId }
+    @{ Name = "ModelId"; Value = $ModelId },
+    @{ Name = "WorkerRouteTraceFile"; Value = $WorkerRouteTraceFile }
 )) {
     if ($entry.Value) {
         $taskArguments.Add("-$($entry.Name)")
         $taskArguments.Add((Quote-TaskArgument ([string]$entry.Value)))
     }
 }
-if ($Profile -eq "DeepSeekV4Flash" -and $EnableMtp) {
-    $taskArguments.Add("-EnableMtp")
+if ($ProfileGpuPhases) {
+    $taskArguments.Add("-ProfileGpuPhases")
+}
+if ($DisableRetainedRoute) {
+    $taskArguments.Add("-DisableRetainedRoute")
+}
+if ($EnableCpuHybrid) {
+    $taskArguments.Add("-EnableCpuHybrid")
+}
+if ($WorkerRouteTraceFile) {
+    $taskArguments.Add("-WorkerRouteTraceMaxSteps")
+    $taskArguments.Add([string]$WorkerRouteTraceMaxSteps)
 }
 
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
@@ -118,12 +130,18 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
 [PSCustomObject]@{
     status = "installed"
     task = $TaskName
-    profile = $Profile
+    contract = "artifact-vm"
     endpoint = "http://${HostAddress}:$Port"
     maximum_context = $MaximumContext
     maximum_new_tokens = $MaximumNewTokens
-    model_input = if ($Profile -eq "P6") { $Container } else { $Bundle }
+    model_input = $Container
     placement_profile = $PlacementProfile
-    mtp_enabled = [bool]$EnableMtp
+    profile_gpu_phases = [bool]$ProfileGpuPhases
+    retained_route_policy = if ($DisableRetainedRoute) {
+        "disabled"
+    } else {
+        "provider"
+    }
+    cpu_hybrid_requested = [bool]$EnableCpuHybrid
     started = [bool]$Start
 } | ConvertTo-Json

@@ -1,8 +1,16 @@
 # Neural CPU experiment protocol
 
+Status: completed/archived research record. It is not an active MoE VM work
+item; resume runtime work from [the canonical handoff](moe-vm-next.md).
+
 This document records the independent Kimi research proposal for testing a
 literal Neural CPU, together with the evidence produced while executing it.
 Proposed gates and measured results are labeled separately.
+
+Do not conflate this experiment with the external Memory Expert/KV-attach
+project. That work was extracted to `../memory-expert`; this document remains
+here because its negative controls and results were produced in this runtime
+repository.
 
 ## Execution status
 

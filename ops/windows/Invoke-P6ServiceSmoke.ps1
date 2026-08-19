@@ -1,6 +1,6 @@
 param(
     [string]$BaseUri = "http://127.0.0.1:8080",
-    [string]$ExpectedModel = "qwen3-next-80b-a3b-expert-pack-int8",
+    [string]$ExpectedModel = "qwen3-next-80b-a3b-expert-pack-fp4",
     [string]$ExpectedBuildId = "",
     [ValidateSet("latency", "balanced", "capacity")]
     [string]$ExpectedPlacementProfile = "balanced",

@@ -91,10 +91,186 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             worker = CudaWorker(
                 expert_server.Path("worker.exe"), expert_server.Path("pack"),
                 65536, 1, 4, 48, 18, 2048, 256, "balanced", False,
-                False,
             )
         self.assertTrue(worker.placement_prefetch_enabled)
         self.assertEqual(worker.placement_prefetch_state, "ready")
+
+    def test_worker_accepts_provider_cpu_policy_by_default(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 5, "capacity": 1,
+            "prefill_mode": "causal_sequential", "prefill_chunk_tokens": 1,
+            "kv_dtype": "bf16", "kv_allocation": "preallocated",
+            "kv_page_tokens": 256, "kv_page_bytes": 1024,
+            "kv_page_capacity": 65536, "placement_profile": "balanced",
+            "ram_cache_bytes": 48 << 30, "vram_cache_bytes": 13 << 30,
+            "placement_prefetch_enabled": True,
+            "placement_prefetch_state": "ready",
+            "placement_minimum_observations": 2,
+            "cpu_hybrid_enabled": False,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
+            worker = CudaWorker(
+                expert_server.Path("worker.exe"), expert_server.Path("pack"),
+                65536, 1, 1, 48, 13, 2048, 256, "balanced", False,
+                enable_cpu_hybrid=None,
+                route_trace_file=expert_server.Path("trace.jsonl"),
+                route_trace_max_steps=17,
+            )
+        self.assertFalse(worker.cpu_hybrid_enabled)
+        self.assertNotIn("--cpu-hybrid", popen.call_args.args[0])
+        self.assertIn("--route-trace-file=trace.jsonl", popen.call_args.args[0])
+        self.assertIn("--route-trace-max-steps=17", popen.call_args.args[0])
+
+    def test_protocol6_launch_and_descriptor_are_provider_neutral(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 6, "capacity": 2,
+            "architecture_id": "fixture.vendor.sparse",
+            "vocab_size": 64000, "max_context_tokens": 131072,
+            "routed_layers": 57, "experts_per_layer": 1024,
+            "route_width": 8, "expert_encoding": "fp4.vendor.group64",
+            "operation_capabilities": [
+                "attention.vendor.v2", "moe.vendor.fp4.v3",
+            ],
+            "prefill_mode": "causal_chunked", "prefill_chunk_tokens": 128,
+            "kv_dtype": "bf16", "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 128, "kv_page_bytes": 4096,
+            "kv_page_capacity": 4096, "placement_profile": "balanced",
+            "ram_cache_bytes": 96 << 30, "vram_cache_bytes": 18 << 30,
+            "placement_prefetch_enabled": True,
+            "placement_prefetch_state": "ready",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"), expert_server.Path("pack"),
+                65536, 1, 2, 96, 18, 2048, 128, "balanced", False,
+                prefill_chunk_tokens=256,
+            )
+        command = popen.call_args.args[0]
+        self.assertIn("--max-context=65536", command)
+        self.assertIn("--prefill-chunk-limit=256", command)
+        self.assertNotIn("65536", command)
+        self.assertEqual(worker.architecture_id, "fixture.vendor.sparse")
+        self.assertEqual(worker.operation_capabilities,
+                         ("attention.vendor.v2", "moe.vendor.fp4.v3"))
+
+    def test_protocol7_accepts_dense_only_artifact_descriptor(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 7, "capacity": 1,
+            "architecture_id": "fixture.dense", "vocab_size": 64000,
+            "max_context_tokens": 262144,
+            "routed_layers": 0, "experts_per_layer": 0,
+            "route_width": 0, "expert_encoding": "",
+            "operation_capabilities": [
+                "block.recurrent-linear-attention.v1",
+                "ffn.swiglu.dense.fp4-block32.v1",
+            ],
+            "prefill_mode": "causal_chunked", "prefill_chunk_tokens": 128,
+            "kv_dtype": "fp16", "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 128, "kv_page_bytes": 4096,
+            "kv_page_capacity": 4096, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 48 << 30, "vram_cache_bytes": 18 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"), expert_server.Path("pack"),
+                262144, 1, 1, 48, 18, 2048, 128, "balanced", False,
+            )
+        self.assertEqual(worker.routed_layers, 0)
+        self.assertEqual(worker.experts_per_layer, 0)
+        self.assertEqual(worker.route_width, 0)
+        self.assertEqual(worker.expert_encoding, "")
+
+    def test_protocol7_rejects_partial_routed_geometry(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 7, "capacity": 1,
+            "architecture_id": "fixture.invalid", "vocab_size": 64000,
+            "max_context_tokens": 262144,
+            "routed_layers": 4, "experts_per_layer": 0,
+            "route_width": 0, "expert_encoding": "",
+            "operation_capabilities": ["ffn.swiglu.dense.v1"],
+            "prefill_mode": "causal_chunked", "prefill_chunk_tokens": 128,
+            "kv_dtype": "fp16", "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 128, "kv_page_bytes": 4096,
+            "kv_page_capacity": 4096, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 48 << 30, "vram_cache_bytes": 18 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            with self.assertRaisesRegex(
+                    expert_server.WorkerError, "runtime contract"):
+                CudaWorker(
+                    expert_server.Path("provider.exe"),
+                    expert_server.Path("pack"),
+                    262144, 1, 1, 48, 18, 2048, 128, "balanced", False,
+                )
+
+    def test_protocol6_accepts_honest_resident_fp32_provider(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 6, "capacity": 1,
+            "architecture_id": "fixture.vm", "vocab_size": 32000,
+            "max_context_tokens": 8192, "routed_layers": 8,
+            "experts_per_layer": 32, "route_width": 4,
+            "expert_encoding": "int8.row",
+            "operation_capabilities": ["moe.swiglu.routed.v1"],
+            "prefill_mode": "causal_sequential", "prefill_chunk_tokens": 1,
+            "kv_dtype": "fp32", "kv_allocation": "preallocated",
+            "kv_page_tokens": 256, "kv_page_bytes": 4096,
+            "kv_page_capacity": 32, "placement_mode": "resident",
+            "placement_profile": "resident", "ram_cache_bytes": 0,
+            "vram_cache_bytes": 8 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 0,
+            "retain_previous_route": False,
+            "cpu_hybrid_enabled": False,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"), expert_server.Path("pack"),
+                4096, 1, 1, 48, 18, 2048, 256, "balanced", False,
+                enable_cpu_hybrid=False,
+            )
+        self.assertNotIn("--no-retain-previous-route",
+                         popen.call_args.args[0])
+        self.assertFalse(worker.retain_previous_route)
+        self.assertEqual(worker.placement_mode, "resident")
+        self.assertEqual(worker.kv_dtype, "fp32")
 
     def test_service_log_does_not_duplicate_to_unconsumed_stderr(self) -> None:
         previous = expert_server.LOG_FILE
@@ -338,6 +514,33 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.release_context_credits(first)
         self.assertEqual(app.acquire_context_credits(512), 2)
 
+    def test_exact_max_context_does_not_reserve_retention_position(self) -> None:
+        worker = types.SimpleNamespace(
+            session_retention=True,
+            kv_page_tokens=1,
+            kv_page_capacity=8,
+        )
+        worker.drop_session = lambda _key: None
+        app = Application.__new__(Application)
+        app.args = types.SimpleNamespace(
+            disable_session_retention=False,
+            session_idle_seconds=1800.0,
+            max_context=8,
+        )
+        app.worker = worker
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        app.session_lock = threading.Lock()
+        app.sessions = expert_server.OrderedDict()
+
+        context = app.acquire_request_context([1, 2, 3, 4, 5, 6], 2)
+
+        self.assertIsNotNone(context)
+        assert context is not None
+        self.assertEqual(context.held_pages, 8)
+        app.release_request_context(context)
+        self.assertEqual(app.kv_reserved_pages, 0)
+
     def test_model_info_reports_effective_placement_contract(self) -> None:
         app = Application.__new__(Application)
         app.args = types.SimpleNamespace(
@@ -348,6 +551,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             placement_profile="capacity", worker_kv_cache_mib=2048,
             worker_kv_page_tokens=256, microbatch_window_ms=2.0,
             profile_gpu_phases=False, worker_prefill_chunk_tokens=256,
+            enable_worker_cpu_hybrid=False,
             disable_session_retention=False, session_idle_seconds=1800.0,
             latency_window=4096, queue_timeout=1.0,
             generation_timeout=120.0,
@@ -366,8 +570,11 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             gpu_phase_timing=False,
             mtp_resource_available=True,
             mtp_runtime_ready=True, mtp_enabled=False,
+            retain_previous_route=True,
+            cpu_hybrid_enabled=True,
             kv_allocation="preallocated", kv_page_tokens=256,
             kv_page_bytes=1024, kv_page_capacity=8192,
+            placement_mode="budgeted",
             placement_profile="capacity", ram_cache_bytes=48 << 30,
             vram_cache_bytes=18 << 30, placement_prefetch_enabled=False,
             placement_prefetch_state="disabled",
@@ -387,7 +594,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "reserved_pages": 0,
         })
         self.assertEqual(info["worker_placement"], {
-            "profile": "capacity", "ram_cache_bytes": 48 << 30,
+            "mode": "budgeted", "profile": "capacity",
+            "ram_cache_bytes": 48 << 30,
             "vram_cache_bytes": 18 << 30, "prefetch_enabled": False,
             "prefetch_state": "disabled",
             "minimum_recent_observations": 2,
@@ -404,6 +612,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "mtp_resource_available": True,
             "mtp_runtime_ready": True,
             "mtp_enabled": False,
+            "retain_previous_route": True,
+            "cpu_hybrid_enabled": True,
         })
         self.assertEqual(info["worker_kv"]["dtype"], "bf16")
         self.assertEqual(info["worker_kv"]["allocation"], "preallocated")

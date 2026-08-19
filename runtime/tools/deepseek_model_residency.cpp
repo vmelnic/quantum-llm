@@ -20,6 +20,7 @@
 #include "expert/runtime/gather_storage.hpp"
 #include "expert/runtime/placement_profile.hpp"
 #include "expert/runtime/resident_expert_set.hpp"
+#include "expert/runtime/routed_expert_runtime.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 
 #include <cuda_runtime_api.h>
@@ -185,6 +186,13 @@ std::uint32_t compression_ratio(std::uint32_t layer) {
   return layer % 2U == 0U ? 4U : 128U;
 }
 
+std::vector<std::uint32_t> compression_ratios() {
+  std::vector<std::uint32_t> result(43U);
+  for (std::uint32_t layer = 0U; layer < result.size(); ++layer)
+    result[layer] = compression_ratio(layer);
+  return result;
+}
+
 std::vector<std::uint32_t> prompt_tokens(
     const std::filesystem::path& path) {
   std::ifstream input(path);
@@ -325,16 +333,18 @@ int main(int argc, char** argv) {
     require(model->dense_size() == 236U && model->typed_size() == 834U &&
                 model->bytes() == resident_bytes,
             "published model state has inconsistent ownership");
-    const auto request_size = er::cuda::deepseek_request_state_size(4096U);
+    const auto ratios = compression_ratios();
+    const auto request_size =
+        er::cuda::deepseek_request_state_size(4096U, ratios);
     require(request_size.status.ok() && request_size.total_bytes > 1U,
             std::string(request_size.status.message()));
     const auto rejected_request = er::cuda::create_deepseek_request_state(
-        model, {4096U, request_size.total_bytes - 1U});
+        model, {4096U, request_size.total_bytes - 1U, ratios, 3U});
     require(!rejected_request.status.ok() && !rejected_request.state &&
                 rejected_request.status.code() == er::ErrorCode::backpressure,
             "request state did not reject an insufficient preflight budget");
     auto request = er::cuda::create_deepseek_request_state(
-        model, {4096U, request_size.total_bytes});
+        model, {4096U, request_size.total_bytes, ratios, 3U});
     require(request.status.ok() && request.state &&
                 request.state->bytes() == request_size.total_bytes,
             std::string(request.status.message()));
@@ -383,7 +393,7 @@ int main(int argc, char** argv) {
     std::uint32_t ratio_zero_layers = 0U, ratio_four_layers = 0U;
     std::uint32_t ratio_128_layers = 0U;
     for (std::uint32_t layer = 0U;
-         layer < er::cuda::DeepSeekRequestState::layer_count(); ++layer) {
+         layer < request.state->layer_count(); ++layer) {
       const auto view = request.state->layer(layer);
       require(view.attention_weights && view.attention_state &&
                   view.ffn_weights && view.ffn_state &&
@@ -432,11 +442,13 @@ int main(int argc, char** argv) {
     bind = model->bind_attention(3U, 128U, ratio_128);
     require(bind.ok(), std::string(bind.message()));
     er::cuda::DeepSeekFfnBinding hash_ffn, learned_ffn;
-    bind = model->bind_ffn(2U, hash_ffn);
+    bind = model->bind_ffn(2U, er::cuda::DeepSeekRouterKind::hash,
+                           hash_ffn);
     require(bind.ok() && hash_ffn.hash_router && hash_ffn.token_experts &&
                 !hash_ffn.router_bias,
             "invalid hash FFN binding");
-    bind = model->bind_ffn(3U, learned_ffn);
+    bind = model->bind_ffn(3U, er::cuda::DeepSeekRouterKind::learned,
+                           learned_ffn);
     require(bind.ok() && !learned_ffn.hash_router && learned_ffn.router_bias &&
                 !learned_ffn.token_experts,
             "invalid learned FFN binding");
@@ -444,7 +456,8 @@ int main(int argc, char** argv) {
     bind = model->bind_attention(oracle_layer, oracle_ratio, oracle_attention);
     require(bind.ok(), std::string(bind.message()));
     er::cuda::DeepSeekFfnBinding oracle_ffn;
-    bind = model->bind_ffn(oracle_layer, oracle_ffn);
+    bind = model->bind_ffn(oracle_layer, er::cuda::DeepSeekRouterKind::hash,
+                           oracle_ffn);
     require(bind.ok() && oracle_ffn.hash_router,
             "attention oracle requires a hash-routed FFN layer");
     constexpr std::size_t token_stream_values = 4U * 4096U;
@@ -814,7 +827,7 @@ int main(int argc, char** argv) {
             "decode controller exceeds block oracle tolerance");
 
     auto resumed_request = er::cuda::create_deepseek_request_state(
-        model, {4096U, request_size.total_bytes});
+        model, {4096U, request_size.total_bytes, ratios, 3U});
     require(resumed_request.status.ok() && resumed_request.state,
             std::string(resumed_request.status.message()));
     const auto resumed_layer = resumed_request.state->layer(oracle_layer);
@@ -836,6 +849,16 @@ int main(int argc, char** argv) {
     er::ExpertCache resumed_cache(
         expert_config, expert_storage, expert_uploader, resumed_buffers,
         resumed_directory);
+    const er::RoutedExpertComponentDescriptor routed_component{
+        "main", 17U, routed_catalog.layer_count(),
+        routed_catalog.experts_per_layer(), 6U, 1U, 4096U, 2048U,
+        "moe.swiglu.routed.v1", 1U,
+        er::kExpertSourceAbiSplitFp4Block32V1,
+        er::kExpertEncodingAbiFp4Block32,
+        "fp4.e2m1.ue8m0.block32", {}};
+    er::RoutedExpertRuntime resumed_routed(
+        routed_component, ffn.front().record.payload_sha256, routed_catalog,
+        resumed_cache);
     {
       er::ResidentExpertSet cpu_seed;
       const auto seeded = er::ResidentExpertSet::load(
@@ -869,11 +892,9 @@ int main(int argc, char** argv) {
     auto scheduler_planner = std::make_shared<er::HybridDispatchPlanner>(
         er::HybridDispatchConfig{1.0, 1.0, 1.0, 0.125, 6U, 32U});
     auto scheduler_census = std::make_shared<er::RouteCensus>(
-        er::RouteCensusConfig{17U, ffn.front().record.payload_sha256,
-                              er::kExpertQuantAbiDeepSeekSm86, 43U, 256U, 6U,
-                              4096U});
+        resumed_routed.census_config());
     er::cuda::DeepSeekDecodeScheduler decode_scheduler(
-        {17U, 2U, 2U, 1U}, resumed_cache, routed_catalog,
+        {2U, 2U, 1U}, resumed_routed,
         {scheduler_cpu, scheduler_planner, scheduler_census});
     const auto submitted = decode_scheduler.submit(
         1U, resumed_controller.controller,
@@ -971,13 +992,16 @@ int main(int argc, char** argv) {
             routed_cache_bytes, true, 0U, true});
     er::ExpertCache full_cache(full_config, expert_storage, full_uploader,
                                full_buffers, full_directory);
+    er::RoutedExpertRuntime full_routed(
+        routed_component, ffn.front().record.payload_sha256, routed_catalog,
+        full_cache);
     er::ResidentExpertSet full_shared;
     auto full_status = er::ResidentExpertSet::load(
         full_cache, all_shared, full_shared);
     require(full_status.ok() && full_shared.size() == 43U,
             std::string(full_status.message()));
     auto full_request = er::cuda::create_deepseek_request_state(
-        model, {4096U, request_size.total_bytes});
+        model, {4096U, request_size.total_bytes, ratios, 3U});
     require(full_request.status.ok() && full_request.state,
             std::string(full_request.status.message()));
     auto full_controller = er::cuda::create_deepseek_decode_controller(
@@ -985,7 +1009,7 @@ int main(int argc, char** argv) {
     require(full_controller.status.ok() && full_controller.controller,
             std::string(full_controller.status.message()));
     er::cuda::DeepSeekDecodeScheduler full_scheduler(
-        {17U, 1U, 6U, 1U, true}, full_cache, routed_catalog);
+        {1U, 6U, 1U, 1U, 1U, true}, full_routed);
     float* full_rope = nullptr;
     check(cudaMalloc(reinterpret_cast<void**>(&full_rope),
                      8U * 32U * sizeof(float)),

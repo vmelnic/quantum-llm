@@ -14,6 +14,7 @@ namespace expert::runtime::cuda {
 struct DeepSeekFfnStateResult;
 struct DeepSeekFfnHybridWorkspaceResult;
 struct DeepSeekFfnPairWorkspaceResult;
+struct DeepSeekRoutePredictionStateResult;
 
 class DeepSeekFfnState final {
  public:
@@ -48,6 +49,12 @@ class DeepSeekFfnState final {
   friend Status deepseek_ffn_route(const struct DeepSeekFfnRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute(
       const struct DeepSeekFfnExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_selections(
+      const struct DeepSeekFfnSelectionExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_import_selection_output(
+      const struct DeepSeekFfnSelectionImportLaunch&) noexcept;
+  friend Status deepseek_ffn_finalize(
+      const struct DeepSeekFfnFinalizeLaunch&) noexcept;
   friend Status deepseek_ffn_execute_hybrid(
       const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
   friend Status deepseek_ffn_gather_pair_routes(
@@ -70,6 +77,7 @@ class DeepSeekFfnState final {
       *routed_output_{};
   std::int8_t *routed_q_input_{}, *routed_q_intermediate_{};
   float *routed_q_input_scales_{}, *routed_q_intermediate_scales_{};
+  std::uint8_t* routed_selection_mask_{};
   float *shared_intermediate_{}, *shared_output_{};
 };
 
@@ -82,6 +90,65 @@ struct DeepSeekFfnStateResult final {
 
 [[nodiscard]] DeepSeekFfnStateResult create_deepseek_ffn_state(
     std::uint32_t layer) noexcept;
+
+// Request-private scratch for an advisory cross-layer route prediction. The
+// exact router never consumes these buffers: the provider may use the copied
+// indices only to begin page movement before the authoritative next-layer
+// route is available.
+class DeepSeekRoutePredictionState final {
+ public:
+  ~DeepSeekRoutePredictionState();
+  DeepSeekRoutePredictionState(const DeepSeekRoutePredictionState&) = delete;
+  DeepSeekRoutePredictionState& operator=(
+      const DeepSeekRoutePredictionState&) = delete;
+
+  [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+  [[nodiscard]] const std::uint32_t* expert_indices() const noexcept {
+    return expert_indices_;
+  }
+  [[nodiscard]] static constexpr std::uint32_t selection_count() noexcept {
+    return 6U;
+  }
+
+ private:
+  friend std::uint64_t deepseek_route_prediction_state_size() noexcept;
+  friend DeepSeekRoutePredictionStateResult
+  create_deepseek_route_prediction_state() noexcept;
+  friend Status deepseek_predict_route(
+      const struct DeepSeekRoutePredictionLaunch&) noexcept;
+  DeepSeekRoutePredictionState(void* allocation,
+                               std::uint64_t bytes) noexcept;
+  void map(void* base) noexcept;
+
+  void* allocation_{};
+  std::uint64_t bytes_{};
+  float* router_logits_{};
+  float* routing_weights_{};
+  std::uint32_t* expert_indices_{};
+};
+
+struct DeepSeekRoutePredictionStateResult final {
+  Status status;
+  std::shared_ptr<DeepSeekRoutePredictionState> state;
+};
+
+[[nodiscard]] std::uint64_t deepseek_route_prediction_state_size() noexcept;
+
+[[nodiscard]] DeepSeekRoutePredictionStateResult
+create_deepseek_route_prediction_state() noexcept;
+
+struct DeepSeekRoutePredictionLaunch final {
+  const DeepSeekFfnBinding* target_weights{};
+  DeepSeekRoutePredictionState* state{};
+  // Normalized gate input from the preceding layer. This is advisory only;
+  // the target layer recomputes and executes its authoritative route.
+  const float* preceding_gate_input{};
+  std::uint32_t token_id{};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_predict_route(
+    const DeepSeekRoutePredictionLaunch& launch) noexcept;
 
 struct DeepSeekFfnRouteLaunch final {
   const DeepSeekFfnBinding* weights{};
@@ -124,6 +191,55 @@ struct DeepSeekFfnExecuteLaunch final {
 // Executes routed top-6 plus shared expert, then applies FFN HCA post.
 [[nodiscard]] Status deepseek_ffn_execute(
     const DeepSeekFfnExecuteLaunch& launch) noexcept;
+
+// Executes only the selected exact top-k slots and writes their independent
+// outputs into the ordinary request workspace. This allows ready expert pages
+// to execute while other exact selections are still being supplied. Calls may
+// arrive in any grouping, but every top-k slot must execute exactly once before
+// deepseek_ffn_finalize(). The final aggregation order remains unchanged.
+struct DeepSeekFfnSelectionExecuteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  DeepSeekFfnState* state{};
+  const DeviceExpertEntry* directory_entries{};
+  // Bit i selects routed top-k slot i. Bits outside selection_count() are
+  // rejected.
+  std::uint64_t selection_mask{};
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_execute_selections(
+    const DeepSeekFfnSelectionExecuteLaunch& launch) noexcept;
+
+// Imports one exact remotely executed selection into its ordinary top-k slot.
+// The host buffer contains only the expert output activation; route weights
+// remain device-resident and are applied later by deepseek_ffn_finalize().
+struct DeepSeekFfnSelectionImportLaunch final {
+  DeepSeekFfnState* state{};
+  std::uint32_t selection_index{};
+  const float* host_output{};
+  std::uint64_t host_output_bytes{};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_import_selection_output(
+    const DeepSeekFfnSelectionImportLaunch& launch) noexcept;
+
+struct DeepSeekFfnFinalizeLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  DeepSeekFfnState* state{};
+  const DeviceExpertEntry* directory_entries{};
+  const float* streams{};
+  float* updated_streams{};
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+  const DeepSeekFfnExecuteLaunch::ProfileEvents* profile_events{};
+};
+
+// Aggregates the already-computed selection outputs in stable top-k order,
+// executes the always-resident shared expert, and applies the HCA post block.
+[[nodiscard]] Status deepseek_ffn_finalize(
+    const DeepSeekFfnFinalizeLaunch& launch) noexcept;
 
 // Request-private two-row workspace. HCA/router state and compute-ready arrays
 // are produced directly here so dense and expert kernels can read each weight
@@ -242,7 +358,8 @@ class DeepSeekFfnHybridWorkspace final {
   DeepSeekFfnHybridWorkspace(void* device_allocation,
                              std::uint64_t device_bytes,
                              void* host_allocation,
-                             std::uint64_t host_bytes) noexcept;
+                             std::uint64_t host_bytes,
+                             void* input_ready_event) noexcept;
   void map() noexcept;
 
   void* device_allocation_{};
@@ -254,6 +371,7 @@ class DeepSeekFfnHybridWorkspace final {
   float* alternate_outputs_{};
   float* host_input_{};
   float* host_outputs_{};
+  void* input_ready_event_{};
 };
 
 struct DeepSeekFfnHybridWorkspaceResult final {

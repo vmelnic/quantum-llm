@@ -233,13 +233,17 @@ class Fp4Block32EncoderTests(unittest.TestCase):
             self.assertEqual(scales, bytes((127,)))
             self.assertEqual(payload, bytes(16))
 
-    def test_geometry_and_non_finite_inputs_are_rejected(self) -> None:
+    def test_unaligned_columns_are_padded_and_non_finite_inputs_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             view = _open_single_tensor(root, "w", (1, 33), [1.0] * 33)
             with view:
-                with self.assertRaises(SourceFormatError):
-                    _encode(view, use_numpy=True)
+                payload, scales, _ = _encode(view, use_numpy=True)
+            self.assertEqual(len(payload), 64 // 2)
+            self.assertEqual(len(scales), 64 // 32)
+            decoded = decode_scaled_fp4_e2m1_row(payload, scales)
+            self.assertEqual(decoded[:33], (1.0,) * 33)
+            self.assertEqual(decoded[33:], (0.0,) * 31)
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             values = [1.0] * 31 + [float("inf")]
@@ -294,6 +298,10 @@ class Fp4ExpertPackCompileTests(unittest.TestCase):
             self.assertEqual(quantization["group_size"], 32)
             self.assertEqual(quantization["scale_dtype"], "ue8m0")
             self.assertEqual(manifest["kernel_abi"]["quant_abi"], FP4_QUANT_ABI_ID)
+            model_program = (output / manifest["model_program"]["path"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn("\t1\t2\tfp4.e2m1.ue8m0.block32", model_program)
 
             expert = manifest["experts"][0]
             self.assertEqual(expert["quant_abi"], FP4_QUANT_ABI_ID)

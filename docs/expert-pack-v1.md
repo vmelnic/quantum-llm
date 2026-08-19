@@ -1,5 +1,9 @@
 # Expert Pack v1
 
+Status: current Qwen/LFM physical container contract as of 2026-08-11.
+DeepSeek still uses worker bundle v3 plus compact pack v1; the next container
+unification is tracked in [the MoE VM handoff](moe-vm-next.md).
+
 Expert Pack is a compute-ready, placement-oriented container for sparse MoE
 inference. It is not only a quantization format: dense tensors and individual
 experts are independently indexed, checksummed, aligned, and addressable from
@@ -20,6 +24,7 @@ model.expert-pack/
   manifest.json
   COMPLETED
   conversion-report.json
+  runtime-model.tsv
   dense.qpack
   experts-000.qpack
   experts-001.qpack
@@ -36,7 +41,7 @@ directory without a valid `COMPLETED` marker is not deployable.
 The strict top-level object contains exactly:
 
 ```text
-schema, format, compatibility, source, architecture,
+schema, format, compatibility, source, architecture, model_program,
 quantization, kernel_abi, alignment, tensors, experts,
 packs, indexes, masses, requirements, tokenizer, integrity
 ```
@@ -44,9 +49,13 @@ packs, indexes, masses, requirements, tokenizer, integrity
 Key responsibilities:
 
 - `source`: immutable checkpoint identity, file sizes and SHA-256;
-- `architecture`: complete OLMoE or Qwen3-Next geometry/semantics;
-- `quantization`: `int8-symmetric-per-row-v1` (quant ABI 1) or
-  `fp4-e2m1-ue8m0-block32-v1` (quant ABI 3);
+- `architecture`: complete OLMoE, Qwen3-Next or LFM2-MoE
+  geometry/semantics;
+- `model_program`: authenticated `runtime-model.tsv` schema 2 execution
+  descriptor;
+- `quantization`: current serving profile
+  `fp4-e2m1-ue8m0-block32-v1` (quant ABI 3); quant ABI 1 remains readable only
+  for legacy format/test compatibility;
 - `kernel_abi`: layout, activation, ordering, target architecture;
 - `alignment`: record, section, direct-I/O, pinned and CUDA alignment;
 - `tensors` / `experts`: complete record indexes;
@@ -112,7 +121,10 @@ The expert has all common flags (`0x0f`). Sections cannot overlap and appear in
 the declared order. Under quant ABI 3 the same section layout carries packed
 FP4-E2M1 rows (two values per byte) with UE8M0 block scales instead of I8/F32.
 
-## Quantization profile
+## Quantization profiles
+
+Current serving artifacts use FP4. The INT8 algorithm below documents generic
+legacy ABI 1 bytes that the format validator/runtime still recognizes.
 
 For each decoded FP32 row:
 
@@ -141,12 +153,17 @@ The adapter owns semantics that cannot be inferred from shapes. Examples:
 
 - OLMoE query/key normalization and tensor naming;
 - Qwen3-Next alternating full attention and Gated DeltaNet;
+- LFM2-MoE dense-prefix and sparse-layer tensor roles;
 - attention output gate and partial RoPE;
 - Qwen3-Next normalization `(1 + weight)` where specified;
 - global softmax, top-k and selected-probability renormalization;
 - explicit preservation of the auxiliary MTP tensors.
 
 An adapter must classify every source tensor. “Ignore unknown” is not allowed.
+It also emits `runtime-model.tsv`: an ordered provider-neutral operation
+program with routed components, router ABI, tensor-role bindings and numeric
+parameters. The artifact may name an architecture for provenance, but common
+provider selection never branches on that name.
 
 ## Validation
 

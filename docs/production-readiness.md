@@ -1,17 +1,22 @@
 # Production readiness
 
+Status: current pilot verdict as of 2026-08-11. VM completion work is tracked
+in [the canonical handoff](moe-vm-next.md).
+
 ## Verdict
 
-Both Qwen3-Next 80B and DeepSeek-V4-Flash can be started, queried and stopped
-through the same OpenAI-compatible service on the reference Windows/RTX 3090
-host. This is a research/pilot runtime, not a production service.
+Qwen3-Next 80B FP4, DeepSeek-V4-Flash and LFM2-8B-A1B FP4 can be started,
+queried and stopped through the same OpenAI-compatible service, task and binary
+on the reference Windows/RTX 3090 host. This is a research/pilot runtime, not a
+production service or a finished composable MoE VM.
 
-Qwen is functionally usable and its resident routes now meet the throughput
-objective (27–29 tok/s int8, 39.6–45.6 tok/s with the FP4 pack), but arbitrary
-multi-turn chat with changing routes remains storage-bound at roughly 2–4
-tok/s int8 (5.3–16.9 tok/s FP4) after the first token. DeepSeek is slower.
-The configured 65K context ceiling is not long-context-qualified. Neither
-backend meets the 30 tok/s user-facing objective for representative chat.
+Historical controlled Qwen tests reached 39.6–45.6 tok/s on FP4 resident
+routes and 5.3–16.9 tok/s on their novel-route suite. Those numbers do not
+describe every service configuration: the final common-path `hi` probes were
+0.99 tok/s Qwen, 0.37 tok/s DeepSeek and 1.80 tok/s LFM after the first token.
+That gate proved lifecycle correctness, not a performance improvement.
+The configured 65K context ceiling is not long-context-qualified. No tested
+artifact meets the 30 tok/s user-facing objective for representative chat.
 
 ## Readiness matrix
 
@@ -21,13 +26,17 @@ backend meets the 30 tok/s user-facing objective for representative chat.
 | deterministic greedy execution | pilot-ready for tested paths | native correctness gates and real API generation |
 | Qwen lifecycle | functional | install, start, identity/limit verification, chat and full stop tested |
 | DeepSeek lifecycle | functional | compact bundle, persistent worker and API generation tested |
+| LFM lifecycle | functional | FP4 Expert Pack, common worker selection and API generation tested |
+| common MoE VM control plane | functional | one launcher/task/binary and artifact-declared schema-2 program |
+| composable VM executor | missing | common binary still selects one complete worker provider; operation providers do not yet own the shared model loop |
+| unified physical container | missing | Expert Pack v1 and DeepSeek bundle/compact formats still coexist behind adapters |
 | Unicode streaming | fixed | incomplete byte-fallback sequences are held until a stable prefix exists |
 | bounded memory/admission | pilot-ready | explicit RAM/VRAM/KV/queue budgets and fail-closed credits |
 | configured context | 65,536 | enabled hard ceiling, not a quality/performance qualification |
 | qualified context | 4,096 | larger staged gates remain undone |
-| Qwen hot repeated route | capable | 27–29 tok/s int8 (W4) and 39.6–45.6 tok/s FP4 (S1b) post-first-token on a resident route |
-| Qwen representative chat | not ready | changing routes/history measured ~2.4–4.2 tok/s int8 (novel-route probe) and 5.3–16.9 tok/s FP4; SATA first-touch bound |
-| DeepSeek throughput | not ready | roughly 0.4–0.6 tok/s on the reference host |
+| Qwen hot repeated route | capable | 39.6–45.6 tok/s FP4 (S1b) post-first-token on a resident route |
+| Qwen representative chat | not ready | historical changing-route suite measured 5.3–16.9 tok/s FP4; final VM smoke was slower and was not a suite rerun |
+| DeepSeek throughput | not ready | indexed-supply follow-on reached 6.54–6.69 tok/s only on settled identical prompts; matched novel/retained suites remained below 1 tok/s; final cold/common-path `hi` measured 0.37 tok/s after first token |
 | conversation KV reuse | implemented | protocol v5 retained sessions prefill only the per-turn delta; TTFT flat 3–9 s |
 | route-aware warm state | partial | cache/prefetch exists; no general chat-hot guarantee |
 | API compatibility | partial | documented greedy text subset; no tools/multimodal/sampling/logprobs |
@@ -44,13 +53,17 @@ backend meets the 30 tok/s user-facing objective for representative chat.
 1. Meet a declared user-facing workload SLO, not only hot runner gates.
    Resident routes meet it; novel-route chat remains first-touch
    storage-bound, so the SLO is not met for representative chat.
-2. Extend workload-aware expert placement beyond the landed W4 bounded
-   re-promotion so novel and revisited routes stay resident.
+2. Improve novel-route placement beyond the landed priority tiers, protected
+   RAM/transient VRAM, census warm-up and prompt top-six protection. Wider
+   protection and raw-frequency promotion already regressed and must not be
+   repeated unchanged.
 3. Qualify context sizes sequentially up to the advertised ceiling.
 4. Add a hardened supervisor, external logging/metrics/alerts and rollback gate.
 5. Add TLS/auth/rate limiting at an edge and keep the built-in server private.
 6. Pass soak, cancellation storm, I/O corruption, disk-full, OOM and worker
    restart tests.
+7. Replace whole-worker provider selection with the compiled per-operation VM
+   executor and prove a fourth compatible FP4 MoE without common-path changes.
 
 ## Controlled pilot checklist
 

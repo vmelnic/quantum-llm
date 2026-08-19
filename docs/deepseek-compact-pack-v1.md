@@ -1,10 +1,16 @@
 # DeepSeek compact pack v1
 
+Status: current DeepSeek-specific storage format as of 2026-08-11. It is
+accepted by the common MoE VM runner through a storage adapter, but it is not
+yet the same physical container as Expert Pack v1. The unification work is in
+[the MoE VM handoff](moe-vm-next.md).
+
 DeepSeek compact pack v1 is a placement and I/O representation for routed
 experts. It preserves the checkpoint's authenticated FP4/UE8M0 bytes; it is
 not another quantization and does not contain expanded SM86 INT8 slots.
 
-The container has 43 layer shards:
+The current V4-Flash artifact declares 43 routed layers and therefore has 43
+layer shards:
 
 ```text
 manifest.json
@@ -37,7 +43,10 @@ temporary file, every source record is checked against the catalog, the shard
 is flushed, and only then is it renamed and given an atomic commit marker.
 Interrupted runs retain the `.partial` directory. `--resume` reuses only
 complete layer shards with commit markers and canonical byte size. The final
-directory is published only after all 43 layers and both catalogs are durable.
+directory is published only after every config-declared layer and both
+catalogs are durable. For the current artifact that count is 43; the publisher
+derives it from the pinned checkpoint configuration rather than a common
+runtime constant.
 A process-scoped file lock rejects overlapping pack writers while still
 releasing automatically if a process exits or crashes.
 
@@ -49,28 +58,27 @@ On Windows use:
 .\ops\windows\Invoke-DeepSeekCompactPack.ps1 `
   -ModelId "deepseek-ai/DeepSeek-V4-Flash" `
   -Revision "<pinned-revision>" `
+  -Output (Join-Path $env:MODEL_ROOT "deepseek-v4-flash/compact-pack-v1") `
   -Resume
 ```
 
-Pass the resulting directory as `-RoutedCatalog` to the model launcher. The
-loader detects the packed headers and resolves payload shards relative to the
-pack, while legacy extent catalogs still resolve against the checkpoint.
+The loader detects the packed headers and resolves payload shards relative to
+the pack, while legacy extent catalogs still resolve against the checkpoint.
+Publish the complete `worker-bundle-v3` afterward; the common launcher consumes
+that immutable artifact directory, not loose launcher arguments.
 
-For a durable asynchronous publication, choose an explicit model-store path
-outside repository `work/` and run:
+The older asynchronous `Start-DeepSeekCompactPack.ps1` wrapper still rejects
+every destination under repository `work/`, which conflicts with the current
+`MODEL_ROOT=D:/quantum-llm/work/models` convention. It is therefore not the
+documented publication path until that guard is made root-aware. The direct
+packer above remains transactional/resumable and never deletes or modifies the
+source checkpoint.
 
-```powershell
-.\ops\windows\Start-DeepSeekCompactPack.ps1 `
-  -Snapshot C:\path\to\snapshot `
-  -RoutedCatalog C:\path\to\routed-catalog `
-  -Output C:\path\to\model-store\deepseek-v4-flash\compact-pack-v1
-
-.\ops\windows\Get-DeepSeekCompactPack.ps1
-```
-
-The start command rejects a destination under scratch, verifies remaining
-space plus safety headroom, and resumes committed layer shards. It never
-deletes or modifies the source checkpoint.
+`Publish-DeepSeekWorkerBundle.ps1` binds the compact catalog, dense/shared/MTP
+resources and tokenizer into `deepseek-v4-flash/worker-bundle-v3`. Its manifest
+also authenticates `runtime-model.tsv` schema 2. The operation and compression
+schedules are derived from the pinned config; adding that program metadata did
+not rewrite the compact expert payload.
 
 ## Current compute boundary
 
@@ -80,8 +88,8 @@ for a direct compressed CUDA kernel. That kernel exists: since `05b474e`
 13,369,344-byte compact record unchanged (`CudaCompactExpertAllocation`),
 the directory publishes it as `DeviceExpertFormat::deepseek_fp4_block32`,
 and gate/up/down run the packed `__dp4a` selection-batch kernels — the same
-geometry-generic kernels the Qwen FP4 pack (ABI 3) reuses. The int8 SM86
-expansion path remains only for FP8 shared experts.
+geometry-generic kernels the Qwen FP4 pack (ABI 3) reuses. The SM86 expansion
+path remains only for FP8 shared experts.
 
 A direct-FP4 qualification prototype kept routed records compact in VRAM and
 performed FP4 dequantization inside gate/up/down. It was numerically correct,

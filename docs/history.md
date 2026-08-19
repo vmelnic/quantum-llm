@@ -4,7 +4,7 @@ This document preserves what was built, measured, rejected, and learned. It is
 historical evidence, not the current runbook. Current operation is documented
 in [Deployment](deployment.md), current performance in
 [Performance evidence](benchmarks.md), and remaining work in
-[Roadmap](roadmap.md).
+[MoE VM current state and remaining work](moe-vm-next.md).
 
 ## Qwen3-Next 80B foundation
 
@@ -55,7 +55,7 @@ Experiments that did not solve the user-visible SLO:
 
 The second backend targeted `deepseek-ai/DeepSeek-V4-Flash`, a 284B-class MoE
 with about 13B active parameters per token. It forced the runtime beyond the
-Qwen INT8 format rather than pretending a new architecture was an input alias.
+first Qwen pack rather than pretending a new architecture was an input alias.
 
 Implemented and retained:
 
@@ -98,7 +98,7 @@ Additional lifecycle behavior now retained:
 
 ## Context-window decision
 
-Both deployments currently advertise a 65,536-token operational ceiling and
+At that lifecycle milestone, both deployments advertised a 65,536-token operational ceiling and
 an 8,192-token output ceiling from `.env`. DeepSeek checkpoint metadata
 advertises 1,048,576 positions; Qwen metadata advertises 262,144.
 
@@ -434,3 +434,27 @@ fresh-topic routes (storage wait dominates wall time); the next levers
 are hardware (NVMe tier, RAM >= 192 GB for a fully RAM-resident pack),
 not runtime changes. Quality-risky options (sub-4-bit requantization,
 dynamic top-K) were considered and explicitly rejected.
+
+## Artifact-driven MoE VM control plane (2026-08-11)
+
+The Qwen, DeepSeek and LFM launch paths were collapsed into one public control
+path: `ops/model.sh`, scheduled task `QuantumLLM-ExpertVm`, server launcher
+`Start-ExpertServer.ps1` and binary `expert-moe-vm-runner.exe`. Model aliases
+moved to `ops/model-aliases.tsv`; the Qwen alias is FP4-only and any direct
+child of `MODEL_ROOT` can be selected as an artifact.
+
+Expert Pack publications and the DeepSeek worker bundle gained authenticated
+`runtime-model.tsv` schema 2 programs. They declare topology, routed
+components, router programs, tensor roles and ordered operations. Common
+descriptor parsing, per-operation capability binding, logical expert pages and
+exact union resolution landed without rewriting existing weight payloads.
+DeepSeek publication now derives its layer/compression schedules from the
+pinned config rather than a common hard-coded layer table.
+
+The same real `hi` service path completed for Qwen3-Next 80B FP4,
+DeepSeek-V4-Flash and LFM2-8B-A1B FP4 after a Windows/CUDA build that passed
+four CTest and 59 Python tests. This closed lifecycle unification only. The
+common runner still selects one complete worker provider, the physical
+DeepSeek and Expert Pack containers remain distinct, and no performance gain
+was demonstrated. Those remaining boundaries are recorded in the
+[canonical handoff](moe-vm-next.md).

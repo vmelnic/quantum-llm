@@ -10,7 +10,8 @@ param(
 Initialize-ExperimentDirectories
 
 if (-not $Output) {
-    $Output = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
+    if (-not $env:MODEL_ROOT) { throw "MODEL_ROOT is required" }
+    $Output = Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4"
 }
 if (-not $Snapshot) {
     $Snapshot = Resolve-HuggingFaceSnapshot `
@@ -46,6 +47,7 @@ $arguments = @{
     SourceId = "Qwen/Qwen3-Next-80B-A3B-Instruct"
     SourceRevision = Split-Path $snapshotPath -Leaf
     Adapter = "qwen3_next"
+    QuantProfile = "fp4-e2m1-ue8m0-block32-v1"
     MaxExpertPackBytes = 4GB
     Resume = $Resume
     ReclaimSourceShards = $reclaim

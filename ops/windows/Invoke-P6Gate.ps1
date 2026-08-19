@@ -22,7 +22,8 @@ param(
 Initialize-ExperimentDirectories
 
 if (-not $Container) {
-    $Container = Join-Path $script:RepoRoot "work\models\qwen3-next-80b-expert-pack-int8"
+    if (-not $env:MODEL_ROOT) { throw "MODEL_ROOT is required" }
+    $Container = Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4"
 }
 
 if ($NewTokens -lt 2 -or $Concurrency -lt 1 -or $RamCacheGiB -lt 1 -or

@@ -58,11 +58,31 @@ $initialCompleteShardBytes = if ($null -ne $state.PSObject.Properties[
         "initial_complete_shard_bytes"]) {
     [int64]$state.initial_complete_shard_bytes
 } else { [int64]0 }
-$downloadedThisRun = [Math]::Max([int64]0,
+$publishedThisRun = [Math]::Max([int64]0,
     $completeShardBytes - $initialCompleteShardBytes)
+$xetObservedBytes = [int64]0
+$xetLogDirectory = Join-Path $env:USERPROFILE ".cache\huggingface\xet\logs"
+$xetLog = Get-ChildItem $xetLogDirectory -Filter "xet_*.log" -File `
+    -ErrorAction SilentlyContinue |
+    Where-Object { $_.CreationTimeUtc -ge $startedUtc } |
+    Sort-Object LastWriteTimeUtc -Descending |
+    Select-Object -First 1
+if ($null -ne $xetLog) {
+    $lastProgress = Select-String -Path $xetLog.FullName `
+        -Pattern 'observed bytes sent so far = ([0-9]+)' |
+        Select-Object -Last 1
+    if ($null -ne $lastProgress -and
+        $lastProgress.Matches.Count -eq 1) {
+        $xetObservedBytes = [int64]$lastProgress.Matches[0].Groups[1].Value
+    }
+}
+$downloadedThisRun = [Math]::Max($publishedThisRun,
+    [Math]::Min([int64]$state.expected_download_bytes, $xetObservedBytes))
 $bytesPerSecond = [double]$downloadedThisRun / $elapsed
-$remaining = [Math]::Max([int64]0,
+$remainingTensorBytes = [Math]::Max([int64]0,
     [int64]$state.expected_tensor_bytes - $completeShardBytes)
+$remainingDownloadBytes = [Math]::Max([int64]0,
+    [int64]$state.expected_download_bytes - $downloadedThisRun)
 $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     $shards.Count -eq [int]$state.expected_shards -and
     $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
@@ -85,12 +105,15 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     index_tensor_bytes = $indexTensorBytes
     expected_tensor_bytes = [int64]$state.expected_tensor_bytes
     complete_shard_bytes = $completeShardBytes
-    remaining_tensor_bytes = $remaining
+    remaining_tensor_bytes = $remainingTensorBytes
     cached_blob_bytes = $blobBytes
     expected_download_bytes = [int64]$state.expected_download_bytes
+    xet_observed_bytes = $xetObservedBytes
+    downloaded_bytes_since_start = $downloadedThisRun
+    remaining_download_bytes = $remainingDownloadBytes
     bytes_per_second_since_start = $bytesPerSecond
     estimated_seconds_remaining = if ($bytesPerSecond -gt 0) {
-        [double]$remaining / $bytesPerSecond
+        [double]$remainingDownloadBytes / $bytesPerSecond
     } else { $null }
     exit_code = if ($null -ne $exit) { $exit.exit_code } else { $null }
     exit_error = if ($null -ne $exit) { $exit.error } else { $null }

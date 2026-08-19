@@ -4,7 +4,6 @@
 #include "expert/runtime/expert_store.hpp"
 
 #include <algorithm>
-#include <array>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -57,8 +56,7 @@ struct PendingPrefetch final {
   AcquireHandle handle;
 };
 
-using LayerWorkingSet =
-    std::array<std::vector<HeldLease>, kDeepSeekLayers>;
+using LayerWorkingSet = std::vector<std::vector<HeldLease>>;
 
 struct ControllerWorkingSet final {
   std::weak_ptr<DeepSeekDecodeController> controller;
@@ -85,16 +83,18 @@ struct ScheduledRequest final {
 }  // namespace
 
 struct DeepSeekDecodeScheduler::Core final {
-  Core(DeepSeekDecodeSchedulerConfig value, ExpertCache& expert_cache,
-       const DeepSeekExpertCatalog& expert_catalog,
+  Core(DeepSeekDecodeSchedulerConfig value, RoutedExpertRuntime& expert_runtime,
        DeepSeekHybridSchedulerDependencies hybrid_dependencies)
-      : config(value), cache(expert_cache), store(expert_cache),
-        catalog(expert_catalog), hybrid(std::move(hybrid_dependencies)) {}
+      : config(value), routed(expert_runtime), cache(expert_runtime.cache()),
+        store(expert_runtime.store()), catalog(expert_runtime.catalog()),
+        hybrid(std::move(hybrid_dependencies)),
+        predictions(expert_runtime.component().layer_count) {}
 
   DeepSeekDecodeSchedulerConfig config;
+  RoutedExpertRuntime& routed;
   ExpertCache& cache;
-  LocalExpertStore store;
-  const DeepSeekExpertCatalog& catalog;
+  IExpertStore& store;
+  const ExpertCatalog& catalog;
   DeepSeekHybridSchedulerDependencies hybrid;
   std::map<std::uint64_t, std::unique_ptr<ScheduledRequest>> requests;
   std::map<DeepSeekDecodeController*, ControllerWorkingSet> working_sets;
@@ -103,9 +103,23 @@ struct DeepSeekDecodeScheduler::Core final {
   std::size_t inflight_acquires{};
   std::deque<ExpertKey> prefetch_queue;
   std::vector<PendingPrefetch> pending_prefetch;
-  std::array<std::map<std::uint32_t, PredictionState>, kDeepSeekLayers>
-      predictions;
+  std::vector<std::map<std::uint32_t, PredictionState>> predictions;
   DeepSeekDecodeSchedulerSnapshot metrics;
+  std::uint64_t observed_cpu_compute_ns{};
+  std::uint64_t observed_cpu_selections{};
+
+  void refresh_cpu_cost() noexcept {
+    if (!hybrid.cpu_executor || !hybrid.planner) return;
+    const auto current = hybrid.cpu_executor->telemetry();
+    if (current.compute_ns >= observed_cpu_compute_ns &&
+        current.selections >= observed_cpu_selections) {
+      hybrid.planner->observe_cpu(
+          current.compute_ns - observed_cpu_compute_ns,
+          current.selections - observed_cpu_selections);
+    }
+    observed_cpu_compute_ns = current.compute_ns;
+    observed_cpu_selections = current.selections;
+  }
 
   void enqueue_runnable(ScheduledRequest& request) {
     if (!request.runnable_queued &&
@@ -176,7 +190,12 @@ struct DeepSeekDecodeScheduler::Core final {
     if (!config.retain_previous_route) return nullptr;
     auto [iterator, inserted] = working_sets.try_emplace(
         request.controller.get());
-    if (inserted) iterator->second.controller = request.controller;
+    if (inserted || iterator->second.controller.expired()) {
+      iterator->second.layers.clear();
+      iterator->second.layers.resize(routed.component().layer_count);
+      iterator->second.controller = request.controller;
+    }
+    if (layer >= iterator->second.layers.size()) return nullptr;
     return &iterator->second.layers[layer];
   }
 
@@ -194,9 +213,11 @@ struct DeepSeekDecodeScheduler::Core final {
       return {ErrorCode::invalid_argument,
               "DeepSeek ready expert is absent from the catalog"};
     }
-    ExpertKey key{config.model_id, layer, expert,
-                  kExpertQuantAbiDeepSeekSm86};
-    auto handle = cache.acquire(key, *record);
+    const auto key = routed.key(layer, expert);
+    auto handle = cache.acquire(
+        key, *record,
+        ExpertAcquireOptions{ExpertRequestPriority::demand, false, true,
+                             false});
     if (handle.wait_for(0ms) != std::future_status::ready) {
       handle.cancel();
       return {ErrorCode::internal,
@@ -217,14 +238,20 @@ struct DeepSeekDecodeScheduler::Core final {
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
     if ((result.route_rows != 1U && result.route_rows != 2U) ||
-        result.routed_experts.size() != 6U * result.route_rows) {
+        result.layer >= routed.component().layer_count ||
+        result.routed_experts.empty() ||
+        result.routed_experts.size() % result.route_rows != 0U ||
+        result.routed_experts.size() / result.route_rows !=
+            routed.component().route_width) {
       return {ErrorCode::internal,
               "DeepSeek scheduler received an invalid routed set"};
     }
+    const auto route_width = result.routed_experts.size() / result.route_rows;
     for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
-      const auto first = result.routed_experts.begin() + row * 6U;
-      std::set<std::uint32_t> unique(first, first + 6U);
-      if (unique.size() != 6U || *unique.rbegin() >= kDeepSeekCatalogExperts)
+      const auto first = result.routed_experts.begin() + row * route_width;
+      std::set<std::uint32_t> unique(first, first + route_width);
+      if (unique.size() != route_width ||
+          *unique.rbegin() >= catalog.experts_per_layer())
         return {ErrorCode::internal,
                 "DeepSeek scheduler received invalid routed experts"};
     }
@@ -272,8 +299,10 @@ struct DeepSeekDecodeScheduler::Core final {
       pending_prefetch[index].handle.cancel();
       const auto item = predictions[key.layer].find(key.expert);
       if (item != predictions[key.layer].end() &&
-          item->second == PredictionState::pending)
+          item->second == PredictionState::pending) {
         item->second = PredictionState::queued;
+        prefetch_queue.push_back(key);
+      }
       pending_prefetch.erase(
           pending_prefetch.begin() + static_cast<std::ptrdiff_t>(index));
       ++metrics.prefetch_cancelled;
@@ -291,8 +320,7 @@ struct DeepSeekDecodeScheduler::Core final {
         ++metrics.prefetch_incorrect;
         continue;
       }
-      const ExpertKey key{config.model_id, layer, expert,
-                          kExpertQuantAbiDeepSeekSm86};
+      const auto key = routed.key(layer, expert);
       const auto snapshot = cache.inspect(key);
       if ((state == PredictionState::ready ||
            state == PredictionState::resident) &&
@@ -365,7 +393,11 @@ struct DeepSeekDecodeScheduler::Core final {
         continue;
       }
       item->second = PredictionState::pending;
-      pending_prefetch.push_back({key, cache.acquire(key, *record)});
+      pending_prefetch.push_back(
+          {key, cache.acquire(
+                    key, *record,
+                    ExpertAcquireOptions{ExpertRequestPriority::prefetch,
+                                         false, true, false})});
       ++metrics.prefetch_scheduled;
     }
   }
@@ -373,15 +405,30 @@ struct DeepSeekDecodeScheduler::Core final {
   Status retain_completed_route(
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result) {
+    auto status = reconcile_working_set(request, result);
+    if (!status.ok()) return status;
+    std::vector<ExpertAccess> route_accesses;
+    route_accesses.reserve(result.routed_experts.size());
+    for (const auto expert : result.routed_experts) {
+      route_accesses.push_back(
+          {routed.key(result.layer, expert),
+           1U});
+    }
+    if (cache.record_accesses(route_accesses) != route_accesses.size()) {
+      return {ErrorCode::internal,
+              "DeepSeek route feedback referenced an absent cache entry"};
+    }
     if (hybrid.route_census) {
+      const auto route_width = routed.component().route_width;
       for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
-        const auto first = result.routed_experts.begin() + row * 6U;
+        const auto first = result.routed_experts.begin() + row * route_width;
         if (row == 0U)
           attribute_predictions(
               result.layer,
-              std::span<const std::uint32_t>(first, first + 6U));
+              std::span<const std::uint32_t>(first, first + route_width));
         const auto observed = hybrid.route_census->observe(
-            result.layer, std::span<const std::uint32_t>(first, first + 6U),
+            result.layer,
+            std::span<const std::uint32_t>(first, first + route_width),
             result.route_rows == 1U
                 ? std::span<const std::uint32_t>(request.cpu_experts)
                 : std::span<const std::uint32_t>());
@@ -390,7 +437,7 @@ struct DeepSeekDecodeScheduler::Core final {
         if (row + 1U == result.route_rows)
           publish_predictions(
               result.layer,
-              std::span<const std::uint32_t>(first, first + 6U));
+              std::span<const std::uint32_t>(first, first + route_width));
       }
     }
     if (!config.retain_previous_route) {
@@ -400,10 +447,12 @@ struct DeepSeekDecodeScheduler::Core final {
       request.cpu_experts.clear();
       return Status::success();
     }
-    auto status = reconcile_working_set(request, result);
-    if (!status.ok()) return status;
     auto* retained = layer_working_set(request, result.layer);
-    const auto retained_first = result.routed_experts.end() - 6U;
+    if (retained == nullptr)
+      return {ErrorCode::internal,
+              "routed working set references an invalid layer"};
+    const auto retained_first =
+        result.routed_experts.end() - routed.component().route_width;
     const auto retained_contains = [&](std::uint32_t expert) {
       return std::find(retained_first, result.routed_experts.end(), expert) !=
              result.routed_experts.end();
@@ -460,6 +509,7 @@ struct DeepSeekDecodeScheduler::Core final {
     if (result.route_rows != 1U || !hybrid.cpu_executor || !hybrid.planner ||
         !request.cpu_experts.empty())
       return Status::success();
+    refresh_cpu_cost();
     std::vector<HybridDispatchCandidate> candidates;
     candidates.reserve(result.routed_experts.size());
     for (const auto expert : result.routed_experts) {
@@ -470,8 +520,7 @@ struct DeepSeekDecodeScheduler::Core final {
       const auto ready = std::find(result.ready_experts.begin(),
                                    result.ready_experts.end(), expert) !=
                          result.ready_experts.end();
-      const ExpertKey key{config.model_id, result.layer, expert,
-                          kExpertQuantAbiDeepSeekSm86};
+      const auto key = routed.key(result.layer, expert);
       const auto snapshot = cache.inspect(key);
       const auto host_ready = snapshot && snapshot->has_host_copy;
       candidates.push_back({expert, 1U, record->stored_bytes, ready,
@@ -484,8 +533,7 @@ struct DeepSeekDecodeScheduler::Core final {
       if (decision.executor != HybridExecutor::cpu_local) continue;
       const auto* record = catalog.find(result.layer, decision.expert);
       host_requests.push_back(
-          {ExpertKey{config.model_id, result.layer, decision.expert,
-                     kExpertQuantAbiDeepSeekSm86},
+          {routed.key(result.layer, decision.expert),
            *record, ExpertResolveTarget::host_ready});
     }
     if (host_requests.empty()) return Status::success();
@@ -528,13 +576,13 @@ struct DeepSeekDecodeScheduler::Core final {
       return {ErrorCode::internal,
               "DeepSeek controller suspended without missing experts"};
     }
-    cancel_prefetch_for_exact_demand(result.layer,
-                                     result.missing_experts);
     auto status = reconcile_working_set(request, result);
     if (!status.ok()) return status;
+    cancel_prefetch_for_exact_demand(result.layer,
+                                     result.missing_experts);
     auto* retained = layer_working_set(request, result.layer);
     for (const auto expert : result.ready_experts) {
-      if (expert == kDeepSeekCatalogExperts) continue;
+      if (expert == catalog.experts_per_layer()) continue;
       if (!route_contains(result, expert)) {
         return {ErrorCode::internal,
                 "DeepSeek controller returned an unrelated ready expert"};
@@ -559,7 +607,7 @@ struct DeepSeekDecodeScheduler::Core final {
     status = plan_host_placements(request, result, cpu_selected);
     if (!status.ok()) return status;
     for (const auto expert : result.missing_experts) {
-      if (expert >= kDeepSeekCatalogExperts) {
+      if (expert >= catalog.experts_per_layer()) {
         return {ErrorCode::internal,
                 "always-resident DeepSeek shared expert is unavailable"};
       }
@@ -626,9 +674,11 @@ struct DeepSeekDecodeScheduler::Core final {
           break;
         }
         experts.push_back(expert);
-        resolves.push_back({ExpertKey{config.model_id, request.layer, expert,
-                                     kExpertQuantAbiDeepSeekSm86},
-                            *record});
+        resolves.push_back({routed.key(request.layer, expert),
+                            *record, ExpertResolveTarget::device,
+                            ExpertAcquireOptions{
+                                ExpertRequestPriority::demand, false, true,
+                                false}});
       }
       if (request.state != DeepSeekScheduledState::waiting_for_experts)
         continue;
@@ -715,12 +765,11 @@ struct DeepSeekDecodeScheduler::Core final {
 };
 
 DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
-    DeepSeekDecodeSchedulerConfig config, ExpertCache& cache,
-    const DeepSeekExpertCatalog& catalog,
+    DeepSeekDecodeSchedulerConfig config, RoutedExpertRuntime& routed,
     DeepSeekHybridSchedulerDependencies hybrid)
-    : core_(std::make_unique<Core>(config, cache, catalog,
-                                   std::move(hybrid))) {
-  if (config.model_id == 0U || config.maximum_requests == 0U ||
+    : core_(std::make_unique<Core>(config, routed, std::move(hybrid))) {
+  const auto& catalog = routed.catalog();
+  if (config.maximum_requests == 0U ||
       config.maximum_inflight_acquires == 0U ||
       config.maximum_layer_advances_per_poll == 0U ||
       (config.transition_predictions_per_layer != 0U &&
@@ -728,16 +777,18 @@ DeepSeekDecodeScheduler::DeepSeekDecodeScheduler(
       static_cast<bool>(core_->hybrid.cpu_executor) !=
           static_cast<bool>(core_->hybrid.planner) ||
       (core_->hybrid.route_census &&
-       (core_->hybrid.route_census->config().model_id != config.model_id ||
-        core_->hybrid.route_census->config().quant_abi !=
-            kExpertQuantAbiDeepSeekSm86 ||
+       (core_->hybrid.route_census->config().model_id !=
+            routed.component().namespace_id ||
+        core_->hybrid.route_census->config().encoding_abi !=
+            routed.component().encoding_abi ||
         core_->hybrid.route_census->config().layer_count !=
-            kDeepSeekCatalogLayers ||
+            catalog.layer_count() ||
         core_->hybrid.route_census->config().experts_per_layer !=
-            kDeepSeekCatalogExperts ||
-        core_->hybrid.route_census->config().route_width != 6U)) ||
-      catalog.size() != static_cast<std::size_t>(kDeepSeekCatalogLayers) *
-                            kDeepSeekCatalogExperts) {
+            catalog.experts_per_layer() ||
+        core_->hybrid.route_census->config().route_width !=
+            routed.component().route_width)) ||
+      catalog.size() != static_cast<std::size_t>(catalog.layer_count()) *
+                            catalog.experts_per_layer()) {
     throw std::invalid_argument("invalid DeepSeek decode scheduler contract");
   }
 }

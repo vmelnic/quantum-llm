@@ -149,7 +149,9 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
     const std::filesystem::path& dense_root,
     const std::filesystem::path& typed_root,
     const std::filesystem::path& shared_root,
-    const std::filesystem::path& checkpoint_root) noexcept {
+    const std::filesystem::path& checkpoint_root,
+    std::uint32_t expected_routed_layers,
+    std::uint64_t namespace_id) noexcept {
   try {
     auto loaded = load_deepseek_tensor_artifacts(
         dense_root, typed_root, checkpoint_root, 236U, 834U);
@@ -164,7 +166,7 @@ DeepSeekModelArtifactsResult load_deepseek_model_artifacts(
     result.maximum_source_record_bytes =
         loaded.artifacts.maximum_source_record_bytes;
     auto shared = load_deepseek_shared_artifacts(
-        shared_root, checkpoint_root, 43U, 17U);
+        shared_root, checkpoint_root, expected_routed_layers, namespace_id);
     if (!shared.status.ok())
       throw std::invalid_argument(std::string(shared.status.message()));
     result.shared = std::move(shared.shared);
@@ -204,6 +206,9 @@ DeepSeekSharedArtifactsResult load_deepseek_shared_artifacts(
       record.stored_bytes = bytes;
       record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
       record.device_bytes = 25'198'592ULL;
+      record.hidden = 4096U;
+      record.intermediate = 2048U;
+      record.quant_block_size = 128U;
       record.source_abi = kExpertSourceAbiDeepSeekFp8Block128V1;
       record.alignment = kExpertPackAlignment;
       record.header_bytes = 0U;

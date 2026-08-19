@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
     auto buffers = std::make_shared<er::FixedBufferPool>(
         1U, source_bytes, er::kExpertPackAlignment, allocator);
     auto directory = std::make_shared<er::cuda::CudaExpertDirectory>(
-        key.model_id, key.quant_abi, 1U, 257U, 8U);
+        key.model_id, key.encoding_abi, 1U, 257U, 8U);
     er::ExpertCacheConfig config;
     config.ram = {source_bytes * 2U, source_bytes * 2U, source_bytes};
     config.vram = {kHotBytes * 2U, kHotBytes * 2U, kHotBytes};

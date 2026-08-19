@@ -16,7 +16,7 @@ namespace expert::runtime {
 struct RouteCensusConfig final {
   std::uint64_t model_id{};
   Sha256Digest model_content_hash{};
-  std::uint32_t quant_abi{};
+  std::uint32_t encoding_abi{};
   std::uint32_t layer_count{};
   std::uint32_t experts_per_layer{};
   std::uint32_t route_width{};
@@ -123,6 +123,10 @@ class RouteCensus final {
 struct RouteCensusLoadResult final {
   Status status;
   std::unique_ptr<RouteCensus> census;
+  // Expert indices are semantic model data, while the namespace is a runtime
+  // virtual-address assignment. A persisted census may therefore be rebound
+  // when every immutable model, encoding, and geometry field still matches.
+  bool namespace_rebound{};
 };
 
 }  // namespace expert::runtime

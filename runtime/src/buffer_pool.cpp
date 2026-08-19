@@ -40,14 +40,19 @@ struct FixedBufferPool::SharedState final {
   };
 
   SharedState(std::size_t count, std::size_t bytes, std::size_t requested_alignment,
-              std::shared_ptr<IHostAllocator> host_allocator)
+              std::shared_ptr<IHostAllocator> host_allocator,
+              std::size_t demand_reserve)
       : slot_bytes(bytes),
         alignment(requested_alignment),
         allocator(std::move(host_allocator)),
-        slots(count) {
+        slots(count),
+        reserved_demand_slots(demand_reserve) {
     if (count == 0 || bytes == 0 || alignment == 0 ||
         (alignment & (alignment - 1U)) != 0 || !allocator) {
       throw std::invalid_argument("invalid fixed buffer pool configuration");
+    }
+    if (reserved_demand_slots > count) {
+      throw std::invalid_argument("invalid fixed buffer pool demand reserve");
     }
     try {
       for (auto& slot : slots) {
@@ -77,11 +82,21 @@ struct FixedBufferPool::SharedState final {
   mutable std::mutex mutex;
   std::vector<Slot> slots;
   std::size_t used{};
+  std::size_t background_used{};
+  std::size_t reserved_demand_slots{};
+  std::size_t high_water_used{};
+  std::size_t background_high_water_used{};
+  std::uint64_t demand_acquires{};
+  std::uint64_t background_acquires{};
+  std::uint64_t demand_stalls{};
+  std::uint64_t background_stalls{};
 };
 
 FixedBufferPool::Lease::Lease(std::shared_ptr<SharedState> state,
-                              std::size_t slot) noexcept
-    : state_(std::move(state)), slot_(slot) {}
+                              std::size_t slot,
+                              BufferPoolClass allocation_class) noexcept
+    : state_(std::move(state)), slot_(slot),
+      allocation_class_(allocation_class) {}
 
 FixedBufferPool::Lease::~Lease() {
   if (!state_) {
@@ -91,6 +106,9 @@ FixedBufferPool::Lease::~Lease() {
   auto& slot = state_->slots.at(slot_);
   slot.used = false;
   --state_->used;
+  if (allocation_class_ == BufferPoolClass::background) {
+    --state_->background_used;
+  }
 }
 
 MutableBuffer FixedBufferPool::Lease::buffer() const noexcept {
@@ -105,23 +123,48 @@ bool FixedBufferPool::Lease::page_locked() const noexcept {
 FixedBufferPool::FixedBufferPool(std::size_t slot_count,
                                  std::size_t slot_bytes,
                                  std::size_t alignment,
-                                 std::shared_ptr<IHostAllocator> allocator)
+                                 std::shared_ptr<IHostAllocator> allocator,
+                                 std::size_t reserved_demand_slots)
     : state_(std::make_shared<SharedState>(slot_count, slot_bytes, alignment,
-                                           std::move(allocator))) {}
+                                           std::move(allocator),
+                                           reserved_demand_slots)) {}
 
 std::shared_ptr<FixedBufferPool::Lease> FixedBufferPool::try_acquire(
-    std::size_t bytes) {
+    std::size_t bytes, BufferPoolClass allocation_class) {
   if (bytes > state_->slot_bytes) {
     return {};
   }
   std::lock_guard lock(state_->mutex);
+  const auto background_limit =
+      state_->slots.size() - state_->reserved_demand_slots;
+  if (allocation_class == BufferPoolClass::background &&
+      state_->background_used >= background_limit) {
+    ++state_->background_stalls;
+    return {};
+  }
   for (std::size_t index = 0; index < state_->slots.size(); ++index) {
     if (!state_->slots[index].used) {
       state_->slots[index].used = true;
       ++state_->used;
-      return std::shared_ptr<Lease>(new Lease(state_, index));
+      if (allocation_class == BufferPoolClass::background) {
+        ++state_->background_used;
+        ++state_->background_acquires;
+        state_->background_high_water_used =
+            std::max(state_->background_high_water_used,
+                     state_->background_used);
+      } else {
+        ++state_->demand_acquires;
+      }
+      state_->high_water_used =
+          std::max(state_->high_water_used, state_->used);
+      return std::shared_ptr<Lease>(
+          new Lease(state_, index, allocation_class));
     }
   }
+  if (allocation_class == BufferPoolClass::background)
+    ++state_->background_stalls;
+  else
+    ++state_->demand_stalls;
   return {};
 }
 
@@ -142,5 +185,17 @@ std::size_t FixedBufferPool::bytes_in_use() const noexcept {
   return state_->used * state_->slot_bytes;
 }
 
-}  // namespace expert::runtime
+BufferPoolSnapshot FixedBufferPool::snapshot() const noexcept {
+  std::lock_guard lock(state_->mutex);
+  return {state_->used,
+          state_->used - state_->background_used,
+          state_->background_used,
+          state_->high_water_used,
+          state_->background_high_water_used,
+          state_->demand_acquires,
+          state_->background_acquires,
+          state_->demand_stalls,
+          state_->background_stalls};
+}
 
+}  // namespace expert::runtime

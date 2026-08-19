@@ -2,7 +2,6 @@
 
 #include <cuda_runtime_api.h>
 
-#include <array>
 #include <limits>
 #include <memory>
 #include <string>
@@ -11,11 +10,6 @@
 namespace expert::runtime::cuda {
 namespace {
 
-constexpr std::array<std::uint32_t, kDeepSeekLayers> kCompressionRatios = {
-    0U, 0U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U,
-    128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U,
-    4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U,
-    128U, 4U, 128U, 4U, 128U, 4U, 128U, 4U, 128U, 0U};
 constexpr std::uint64_t kStreamValues = 4ULL * 4096U;
 constexpr std::uint64_t kStreamBytes = 2ULL * kStreamValues * sizeof(float);
 
@@ -28,10 +22,14 @@ bool add_checked(std::uint64_t value, std::uint64_t& total) noexcept {
 }  // namespace
 
 DeepSeekRequestStateSize deepseek_request_state_size(
-    std::uint32_t max_context_tokens) noexcept {
+    std::uint32_t max_context_tokens,
+    std::span<const std::uint32_t> compression_ratios) noexcept {
+  if (compression_ratios.empty())
+    return {{ErrorCode::invalid_argument,
+             "DeepSeek layer program is empty"}, 0U, 0U, 0U, 0U, 0U};
   DeepSeekRequestStateSize result{Status::success(), 0U, 0U,
                                   deepseek_io_state_size(), kStreamBytes, 0U};
-  for (const auto ratio : kCompressionRatios) {
+  for (const auto ratio : compression_ratios) {
     const auto size = deepseek_attention_state_size(ratio, max_context_tokens);
     if (!size.status.ok()) return {size.status, 0U, 0U, 0U, 0U, 0U};
     if (!add_checked(size.bytes, result.attention_bytes)) {
@@ -42,11 +40,11 @@ DeepSeekRequestStateSize deepseek_request_state_size(
   }
   const auto ffn_layer_bytes = deepseek_ffn_state_size();
   if (ffn_layer_bytes > std::numeric_limits<std::uint64_t>::max() /
-                             kDeepSeekLayers) {
+                             compression_ratios.size()) {
     return {{ErrorCode::invalid_argument, "DeepSeek FFN state size overflow"},
             0U, 0U, 0U, 0U, 0U};
   }
-  result.ffn_bytes = ffn_layer_bytes * kDeepSeekLayers;
+  result.ffn_bytes = ffn_layer_bytes * compression_ratios.size();
   result.total_bytes = result.attention_bytes;
   if (!add_checked(result.ffn_bytes, result.total_bytes)) {
     return {{ErrorCode::invalid_argument, "DeepSeek request state size overflow"},
@@ -69,10 +67,10 @@ DeepSeekRequestState::~DeepSeekRequestState() {
 
 DeepSeekLayerStateView DeepSeekRequestState::layer(
     std::uint32_t index) const noexcept {
-  if (index >= kDeepSeekLayers) return {};
+  if (index >= attention_weights_.size()) return {};
   return {&attention_weights_[index], attention_states_[index].get(),
           &ffn_weights_[index], ffn_states_[index].get(),
-          kCompressionRatios[index]};
+          compression_ratios_[index]};
 }
 
 Status DeepSeekRequestState::embed(std::uint32_t token,
@@ -94,7 +92,8 @@ DeepSeekRequestStateResult create_deepseek_request_state(
              "DeepSeek request state requires a model and a nonzero budget"},
             {}};
   }
-  const auto estimate = deepseek_request_state_size(config.max_context_tokens);
+  const auto estimate = deepseek_request_state_size(
+      config.max_context_tokens, config.compression_ratios);
   if (!estimate.status.ok()) return {estimate.status, {}};
   if (estimate.total_bytes > config.device_state_budget_bytes) {
     return {{ErrorCode::backpressure,
@@ -105,6 +104,12 @@ DeepSeekRequestStateResult create_deepseek_request_state(
       new DeepSeekRequestState());
   candidate->model_ = std::move(model);
   candidate->max_context_tokens_ = config.max_context_tokens;
+  candidate->compression_ratios_.assign(config.compression_ratios.begin(),
+                                        config.compression_ratios.end());
+  candidate->attention_weights_.resize(config.compression_ratios.size());
+  candidate->ffn_weights_.resize(config.compression_ratios.size());
+  candidate->attention_states_.resize(config.compression_ratios.size());
+  candidate->ffn_states_.resize(config.compression_ratios.size());
   std::uint64_t actual_bytes = 0U;
   auto status = candidate->model_->bind_io(candidate->io_weights_);
   if (!status.ok()) return {status, {}};
@@ -115,17 +120,22 @@ DeepSeekRequestStateResult create_deepseek_request_state(
     return {{ErrorCode::internal,
              "DeepSeek allocated I/O state size overflow"}, {}};
   }
-  for (std::uint32_t layer = 0U; layer < kDeepSeekLayers; ++layer) {
+  for (std::uint32_t layer = 0U;
+       layer < config.compression_ratios.size(); ++layer) {
     status = candidate->model_->bind_attention(
-        layer, kCompressionRatios[layer],
+        layer, config.compression_ratios[layer],
         candidate->attention_weights_[layer]);
     if (!status.ok()) return {status, {}};
-    status = candidate->model_->bind_ffn(layer,
+    status = candidate->model_->bind_ffn(
+                                         layer,
+                                         layer < config.hash_router_layers
+                                             ? DeepSeekRouterKind::hash
+                                             : DeepSeekRouterKind::learned,
                                          candidate->ffn_weights_[layer]);
     if (!status.ok()) return {status, {}};
 
     auto attention = create_deepseek_attention_state(
-        kCompressionRatios[layer], config.max_context_tokens);
+        config.compression_ratios[layer], config.max_context_tokens);
     if (!attention.status.ok()) return {attention.status, {}};
     auto ffn = create_deepseek_ffn_state(layer);
     if (!ffn.status.ok()) return {ffn.status, {}};

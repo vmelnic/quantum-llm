@@ -206,10 +206,10 @@ CudaExpertAllocation::CudaExpertAllocation(
     const std::int8_t* gate_up,
     const float* gate_up_scales, const std::int8_t* down,
     const float* down_scales, std::uint32_t hidden,
-    std::uint32_t intermediate) noexcept
+    std::uint32_t intermediate, bool packed_fp4) noexcept
     : pool_(std::move(pool)), storage_(storage), bytes_(bytes), gate_up_(gate_up),
       gate_up_scales_(gate_up_scales), down_(down), down_scales_(down_scales),
-      hidden_(hidden), intermediate_(intermediate) {}
+      hidden_(hidden), intermediate_(intermediate), packed_fp4_(packed_fp4) {}
 
 CudaExpertAllocation::~CudaExpertAllocation() {
   if (storage_ != nullptr && pool_) {
@@ -224,6 +224,7 @@ const std::int8_t* CudaExpertAllocation::down() const noexcept { return down_; }
 const float* CudaExpertAllocation::down_scales() const noexcept { return down_scales_; }
 std::uint32_t CudaExpertAllocation::hidden() const noexcept { return hidden_; }
 std::uint32_t CudaExpertAllocation::intermediate() const noexcept { return intermediate_; }
+bool CudaExpertAllocation::packed_fp4() const noexcept { return packed_fp4_; }
 
 CudaCompactExpertAllocation::CudaCompactExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
@@ -331,7 +332,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
     allocation.reset();
     completion({admission, {}, 0});
   };
-  if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86 &&
+  if (request.key.encoding_abi == kExpertEncodingAbiFp4Block32 &&
       request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
       pool_->direct_compact_execution) {
     const auto compact_bytes = request.complete_record.size();
@@ -371,7 +372,8 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   cursor += sections.down_q_bytes;
   auto* down_scales = reinterpret_cast<float*>(cursor);
   const auto source = request.complete_record.data();
-  if (request.key.quant_abi == kExpertQuantAbiDeepSeekSm86) {
+  if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1 ||
+      request.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1) {
     void* compact_raw = nullptr;
     bool compact_cached = false;
     const auto compact_bytes = request.complete_record.size();
@@ -463,11 +465,14 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
     };
     if (admission.ok()) {
       launch(request.compact.w1_weight_offset, request.compact.w1_scale_offset,
-             gate, gate_scales, 2048U, 4096U);
+             gate, gate_scales, sections.intermediate, sections.hidden);
       launch(request.compact.w3_weight_offset, request.compact.w3_scale_offset,
-             gate + 2048ULL * 4096U, gate_scales + 2048U, 2048U, 4096U);
+             gate + static_cast<std::uint64_t>(sections.intermediate) *
+                        sections.hidden,
+             gate_scales + sections.intermediate, sections.intermediate,
+             sections.hidden);
       launch(request.compact.w2_weight_offset, request.compact.w2_scale_offset,
-             down, down_scales, 4096U, 2048U);
+             down, down_scales, sections.hidden, sections.intermediate);
     }
     if (compact_raw != nullptr) {
       if (!compact_cached && !pool_->persistent_staging) {
@@ -505,12 +510,13 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   }
   finish_async(std::make_shared<CudaExpertAllocation>(
                    pool_, raw, total, gate, gate_scales, down, down_scales,
-                   request.key.quant_abi == kExpertQuantAbiFp4Block32
+                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32
                        ? sections.hidden
                        : 0U,
-                   request.key.quant_abi == kExpertQuantAbiFp4Block32
+                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32
                        ? sections.intermediate
-                       : 0U),
+                       : 0U,
+                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32),
                total, Status::success());
   return operation;
 }

@@ -1,5 +1,9 @@
 # Architecture
 
+Status: current architecture as of 2026-08-11. The generic control plane is
+implemented; the remaining gap to a fully composable MoE VM is tracked in
+[MoE VM current state and remaining work](moe-vm-next.md).
+
 ## Objective
 
 Run sparse MoE checkpoints larger than local VRAM and RAM without transferring
@@ -12,9 +16,9 @@ experts selected by the router enter the placement and execution pipeline.
                        compile time
 SafeTensors ───────────────────────────────────────────────────────────┐
     │ strict architecture adapter                                     │
-    │ row-streaming INT8 quantization                                  │
+    │ declared source/FP4 encoding + runtime-model.tsv                 │
     ▼                                                                 │
-Qwen Expert Pack / DeepSeek compact bundle                            │
+Expert Pack v1 or DeepSeek bundle/compact-pack adapter                │
     ├── manifest + checksums                                           │
     ├── dense/shared state ────────────────────────┐                   │
     └── indexed expert records ────────┐           │                   │
@@ -166,13 +170,19 @@ worker and benchmark tools from developing separate metadata interpretations.
 
 ### Native model backends
 
-The Qwen3-Next backend implements alternating full attention and Gated
+The Qwen3-Next numeric provider implements alternating full attention and Gated
 DeltaNet, output-gated attention, partial RoPE, shared and routed experts, and
-isolated KV/Conv/DeltaNet state per slot; its routed experts are consumed as
-INT8 per-row records (quant ABI 1) or FP4-E2M1/UE8M0 block-32 records (quant
-ABI 3) through packed `__dp4a` kernels. The DeepSeek-V4-Flash backend
+isolated KV/Conv/DeltaNet state per slot. The supported Qwen artifact consumes
+FP4-E2M1/UE8M0 block-32 routed records (quant ABI 3) through packed `__dp4a`
+kernels. The DeepSeek-V4-Flash numeric provider
 implements its native attention/CSA/HCA, routing, shared/routed FFN, compact
-FP4 expert path, and persistent request state. CUDA is compiled for SM86.
+FP4 expert path, MTP draft/verify operations, and persistent request state.
+The LFM2-MoE numeric provider implements its declared dense prefix and sparse
+layers from the same Expert Pack/program boundary. CUDA is compiled for SM86.
+
+These remain complete worker implementations internally. The common VM runner
+selects one of them by the artifact's complete capability set; it does not yet
+execute a model by composing individual operation providers.
 
 ### HTTP service
 
@@ -311,10 +321,49 @@ distributed coordinator, expert worker, placement protocol
 Distributed execution will move activations to the node that owns an expert,
 not pretend that remote RAM is local memory.
 
-DeepSeek's compact-source and derived SM86-cache boundary is specified by the
+## MoE virtual machine boundary
+
+`runtime-model.tsv` schema 2 is the immutable program consumed by the sparse
+runtime. It declares model and routed-component topology, opaque expert
+encoding/source ABIs, provider-owned router programs, and an ordered stream of
+block, router, expert, and optional draft operations. Capability names, ABI
+versions, and numeric parameters are bound once at startup; model-family names
+do not participate in provider selection or the per-token path. Schema 1 stays
+read-compatible and is compiled into its legacy one-block-per-layer program.
+
+`ExecutionProviderRegistry` can bind every required operation independently
+and compiles provider indices into the numeric program. This is implemented
+control-plane infrastructure. The serving entry point does not yet drive those
+per-operation bindings: `expert-moe-vm-runner` currently selects one
+`WorkerProviderDefinition` that covers the complete artifact and then enters
+that provider's existing model loop. A previously unseen architecture can use
+the common lifecycle without a model-name branch only when one registered
+complete worker covers its operation set. A new attention algorithm, expert
+encoding, or unsupported numeric geometry still requires provider work; the
+descriptor is an execution contract, not a kernel generator.
+
+`MoeVirtualMachine` owns the bound numeric program and maps each routed
+component to an injected `IExpertStore`. An expert is addressed as a logical
+page by `(namespace, component layer, expert)` and can resolve to a device,
+validated host buffer, or an opaque remote lease. The local store preserves
+the existing SSD-to-host-to-device cache path, while external stores can
+implement CPU or distributed placement through the same asynchronous,
+all-or-nothing union contract. Every resolve verifies the artifact-declared
+route width, layer range, and expert range before publishing a lease, so exact
+top-k is preserved and partial routes fail closed.
+
+This boundary virtualizes the sparse control plane and expert placement. The
+current DeepSeek SM86 provider reads the layer/compression schedule from the
+artifact but still validates the hidden size, expert count, route width and
+other geometry it actually implements. Removing those provider constraints
+requires parameterized kernels and independent numerical qualification; it is
+not claimed by the VM control-plane refactor.
+
+DeepSeek's compact-source and direct compact SM86-cache boundary is specified by the
 [DeepSeek compact pack](deepseek-compact-pack-v1.md) and
 [runtime contract](expert-runtime.md). It deliberately does not reinterpret
-the Expert Pack v1 ABI used by the Qwen/OLMoE backend.
+the Expert Pack v1 ABI used by the Qwen/LFM providers. The two physical
+containers are still separate storage formats behind `ModelArtifact` adapters.
 Its resident dense and dtype-preserving tensors are published as one model
 transaction. Layer construction resolves and geometry-checks names once, then
 execution consumes stable pointer bindings rather than performing string
@@ -328,13 +377,14 @@ model's native attention; it does not place source text in the request
 context and does not alter MoE expert placement.
 
 One `DeepSeekRequestState` owns the mutable attention, FFN, HC-head/logits, and
-four-stream state for all 43 layers and retains the immutable model object that
-its bindings reference. The
+four-stream state for the artifact-declared layer schedule and retains the
+immutable model object that its bindings reference. The
 factory first computes the exact complete CUDA footprint, checks a caller-owned
 per-request budget, binds every layer, and only then publishes a fully built
 request. Partial allocation or a missing layer never becomes schedulable. The
-compression schedule is explicit: three pure sliding-window layers, twenty
-ratio-four layers, and twenty ratio-128 layers.
+current V4-Flash artifact declares 43 layers and its checkpoint-derived
+compression ratios in `runtime-model.tsv`; common code does not synthesize
+that schedule.
 
 `DeepSeekDecodeController` advances one layer at a time. It composes attention,
 exact routing, directory planning, routed/shared execution, and pin release. A

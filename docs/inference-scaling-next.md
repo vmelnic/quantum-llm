@@ -1,7 +1,9 @@
 # Scaling MoE serving beyond the 30 tok/s wall — next steps
 
-Status: research synthesis, 2026-08-09; updated 2026-08-10 with measured
-host bandwidth (§3) and S1a/S1c code status (§4). Inputs: internal
+Status: historical research synthesis, 2026-08-09; last measured update
+2026-08-10. S1 completed; S2/S3 were not completed as model-specific work and
+are superseded by the generic performance gate in
+[the MoE VM handoff](moe-vm-next.md). Inputs: internal
 pack-format audit, measured W0–W5 results (docs/inference-30toks-plan.md
 §8, docs/benchmarks.md), and published low-bit MoE evidence.
 
@@ -13,7 +15,7 @@ it fits in RAM"; every step helps at any model scale.
 
 ## 1. What the internal audit found (pack format, file:line)
 
-- Quant today: `int8-symmetric-per-row-v1`, ABI 1
+- Quant at audit time: `int8-symmetric-per-row-v1`, ABI 1
   (`compiler/expert_pack/constants.py:22-24`), one FP32 scale per output
   row (`compiler/expert_pack/quant.py:77-120`). Since 032cccd the runtime
   validator accepts ABI 1 and ABI 3
@@ -83,7 +85,7 @@ Implied per-token ceilings (bandwidth ÷ bytes/token):
 | RAM (over measured H2D) | 8.8 tok/s | 17.8 tok/s |
 | VRAM-resident (hot native) | 47.7 tok/s | ≥47.7 expected |
 
-Today (int8): SATA floor ~0.35-3 tok/s (real chat lives here), RAM tier
+At audit time (int8): SATA floor ~0.35-3 tok/s (real chat lived here), RAM tier
 capped at ~8.8 by the bus, VRAM-resident 27-47.
 
 - **S1 FP4 routed experts**: 0.7 GiB/token. Every tier doubles: SATA
@@ -110,11 +112,9 @@ capped at ~8.8 by the bus, VRAM-resident 27-47.
   the RAM/VRAM tier boundary before decode starts. No learning, no model
   change, scales to any model size.
 
-Optional later, only if measured supportive: top-K 10->8 with
-renormalization (-20% bytes), 2-3-bit cold experts with high-bit
-down_proj (-2x more), external-draft verification over K coherent
-positions (union-of-routes amortization; contradicts W5 only if route
-overlap over K>2 proves high — unmeasured today).
+Quality-changing top-k reduction and sub-FP4 expert quantization were considered
+and rejected from the current work direction. External-draft verification over
+multiple coherent positions remains only an unmeasured historical hypothesis.
 
 ## 4. Work list
 
@@ -138,13 +138,17 @@ Flat list, dependency order, each step gated on measured before/after:
    directory, packed `__dp4a` selection-batch kernels for Qwen packs,
    cache-state tests (364 lines). Gate passed by S1b: resident route
    39.6–45.6 tok/s (≥27), close to the 47.67 hot-native ceiling.
-4. **S2 — route predictor**: tap gate inputs per layer in
+4. **S2 — route predictor (not executed here)**: tap gate inputs per layer in
    `qwen3_next_runner.cpp`, predict next-layer routes, prefetch from the
    RAM tier through the existing event-driven uploader. Measure hit rate
    (target >90%) and novel-route tok/s; revert if churn reappears.
-5. **S3 — prefill-touch pinning**: record experts touched during prefill,
+5. **S3 — prefill-touch pinning (not executed here)**: record experts touched during prefill,
    pin them for the decode span, release at turn end. Measure settled
    vs novel turn tok/s on the W4 long-session probe.
+
+Do not implement items 4–5 as Qwen-only branches. Their reusable ideas are
+carried forward only as artifact/provider-neutral performance work after the
+composable VM executor exists.
 
 Not to do: spec-decode on DeepSeek-class bandwidth-bound regimes was
 measured neutral in the int8-slot regime (W5) — note the S1-DeepSeek

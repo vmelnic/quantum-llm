@@ -2,39 +2,14 @@
 
 The experiment has two levels. Only the second can produce a viability result:
 
-1. `screen.py` and `branch_screen.py` are cheap NCPU-0 mechanism controls on
-   one exact packed expert and synthetic activations.
+1. `branch_screen.py` is a cheap NCPU-0 mechanism control on synthetic
+   activations.
 2. `make_prompts.py`, the runner's `--trace-moe` mode, `validate_trace.py`, and
    `experiment.py` implement the NCPU-1 boundary experiment on authenticated
    activations from exact Qwen inference. The full NCPU-1 decision additionally
    requires the in-model splice and free-running gates in the protocol.
 
-`screen.py` is the immediate NCPU-0 falsification screen. It reads one real
-Qwen Expert Pack record, evaluates that expert as the teacher, and compares:
-
-- one fixed hard register program executed for 1--32 ticks;
-- a static surrogate with a comparable persistent parameter count;
-- the hard program with its instruction order shuffled.
-
-The constant pool is unchanged across the tick sweep. A result is `go` only if
-additional ticks continue to reduce held-out error, the program beats the
-static baseline, and instruction order materially affects the result.
-
-Example:
-
-```powershell
-python experiments/neural_cpu/screen.py `
-  --container work/models/qwen3-next-80b-expert-pack-int8 `
-  --layer 20 `
-  --expert 0 `
-  --threads 12 `
-  --output work/neural-cpu/screen.json
-```
-
-This screen uses deterministic RMS-normalized synthetic activations to produce
-an immediate answer about the time-for-space mechanism. It does not establish
-real-chat quality or full-model viability. The complete real-activation and
-downstream-splice protocol is documented in
+The complete real-activation and downstream-splice protocol is documented in
 [`docs/neural-cpu-experiment.md`](../../docs/neural-cpu-experiment.md).
 
 ## Real-activation pipeline
@@ -43,7 +18,7 @@ Generate tokenized, document-level train/validation/test splits:
 
 ```powershell
 python experiments/neural_cpu/make_prompts.py `
-  --tokenizer work/models/qwen3-next-80b-expert-pack-int8/tokenizer `
+  --tokenizer "$env:MODEL_ROOT/qwen3-next-80b-expert-pack-fp4/tokenizer" `
   --repo . `
   --output work/neural-cpu/prompts `
   --max-tokens 128 `
@@ -55,7 +30,7 @@ existing trace unless `-ReplaceOutput` is explicit:
 
 ```powershell
 ops/windows/Invoke-NeuralCpuTrace.ps1 `
-  -Container work/models/qwen3-next-80b-expert-pack-int8 `
+  -Container "$env:MODEL_ROOT/qwen3-next-80b-expert-pack-fp4" `
   -PromptFile work/neural-cpu/prompts/prompts.csv `
   -OutputDirectory work/neural-cpu/trace
 ```

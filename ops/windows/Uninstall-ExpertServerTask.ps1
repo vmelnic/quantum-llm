@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "QuantumLLM-P6ExpertServer",
+    [string]$TaskName = "QuantumLLM-ExpertVm",
     [int]$Port = 8080
 )
 

@@ -16,7 +16,7 @@ MANIFEST_SCHEMA = "expert-pack-manifest-v1"
 PACK_ALIGNMENT = 4096
 SECTION_ALIGNMENT = 256
 HEADER_BYTES = 256
-MAX_TENSOR_RANK = 4
+MAX_TENSOR_RANK = 5
 
 HASH_ALGORITHM = "sha256"
 QUANT_PROFILE = "int8-symmetric-per-row-v1"
@@ -91,6 +91,7 @@ MODEL_CONFIG_FILES = (
 )
 
 TOKENIZER_FILES = (
+    "chat_template.jinja",
     "tokenizer.json",
     "tokenizer_config.json",
     "special_tokens_map.json",

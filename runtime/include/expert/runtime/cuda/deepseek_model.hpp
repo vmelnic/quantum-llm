@@ -123,7 +123,8 @@ class DeepSeekResidentModelState final {
       std::uint32_t layer, std::uint32_t compress_ratio,
       DeepSeekAttentionBinding& destination) const noexcept;
   [[nodiscard]] Status bind_ffn(
-      std::uint32_t layer, DeepSeekFfnBinding& destination) const noexcept;
+      std::uint32_t layer, DeepSeekRouterKind router,
+      DeepSeekFfnBinding& destination) const noexcept;
   [[nodiscard]] Status bind_io(
       DeepSeekIoBinding& destination) const noexcept;
 

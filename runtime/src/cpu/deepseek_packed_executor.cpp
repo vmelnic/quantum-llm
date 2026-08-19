@@ -41,7 +41,7 @@ float decode_ue8m0(std::uint8_t code) noexcept {
   return std::bit_cast<float>(bits);
 }
 
-std::int8_t decode_fp4_twice(std::uint8_t code) noexcept {
+[[maybe_unused]] std::int8_t decode_fp4_twice(std::uint8_t code) noexcept {
   const auto index = code & 0x07U;
   const auto magnitude = index <= 4U ? static_cast<int>(index)
                          : index == 5U ? 6
@@ -52,36 +52,36 @@ std::int8_t decode_fp4_twice(std::uint8_t code) noexcept {
 }
 
 #if EXPERT_RUNTIME_X86_AVX2
-std::int32_t horizontal_sum_i32(__m256i value) noexcept {
-  alignas(32) std::int32_t lanes[8];
-  _mm256_store_si256(reinterpret_cast<__m256i*>(lanes), value);
-  std::int32_t sum = 0;
-  for (const auto lane : lanes) sum += lane;
-  return sum;
+float horizontal_sum_f32(__m256 value) noexcept {
+  auto lanes = _mm_add_ps(_mm256_castps256_ps128(value),
+                          _mm256_extractf128_ps(value, 1));
+  lanes = _mm_hadd_ps(lanes, lanes);
+  lanes = _mm_hadd_ps(lanes, lanes);
+  return _mm_cvtss_f32(lanes);
 }
 
-std::int32_t dot_fp4_q8_block(const std::uint8_t* packed,
-                              const std::int8_t* activation) noexcept {
-  alignas(32) std::int8_t decoded[kBlockColumns];
-  for (std::uint32_t index = 0U; index < kBlockColumns / 2U; ++index) {
-    decoded[index * 2U] = decode_fp4_twice(packed[index] & 0x0fU);
-    decoded[index * 2U + 1U] = decode_fp4_twice(packed[index] >> 4U);
-  }
-  const auto weights = _mm256_load_si256(
-      reinterpret_cast<const __m256i*>(decoded));
+__m256i dot_fp4_q8_lanes(const std::uint8_t* packed,
+                         const std::int8_t* activation) noexcept {
+  const auto source = _mm_loadu_si128(
+      reinterpret_cast<const __m128i*>(packed));
+  const auto nibble_mask = _mm_set1_epi8(0x0f);
+  const auto low = _mm_and_si128(source, nibble_mask);
+  const auto high = _mm_and_si128(_mm_srli_epi16(source, 4), nibble_mask);
+  const auto indices = _mm256_set_m128i(_mm_unpackhi_epi8(low, high),
+                                        _mm_unpacklo_epi8(low, high));
+  const auto decode_table = _mm256_broadcastsi128_si256(_mm_setr_epi8(
+      0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12));
+  const auto weights = _mm256_shuffle_epi8(decode_table, indices);
   const auto activations = _mm256_loadu_si256(
       reinterpret_cast<const __m256i*>(activation));
-  const auto weights_low = _mm256_cvtepi8_epi16(
-      _mm256_castsi256_si128(weights));
-  const auto weights_high = _mm256_cvtepi8_epi16(
-      _mm256_extracti128_si256(weights, 1));
-  const auto activation_low = _mm256_cvtepi8_epi16(
-      _mm256_castsi256_si128(activations));
-  const auto activation_high = _mm256_cvtepi8_epi16(
-      _mm256_extracti128_si256(activations, 1));
-  return horizontal_sum_i32(_mm256_madd_epi16(weights_low, activation_low)) +
-         horizontal_sum_i32(_mm256_madd_epi16(weights_high,
-                                               activation_high));
+  // vpmaddubsw accepts unsigned*signed bytes. Move the activation sign onto
+  // the signed FP4 value and multiply its unsigned magnitude. Q8 is clamped
+  // to [-127, 127], and a pair is bounded by 2*12*127, so the i16 pair sum
+  // cannot saturate. The resulting i32 dot is bit-exact to the scalar path.
+  const auto signed_weights = _mm256_sign_epi8(weights, activations);
+  const auto magnitudes = _mm256_abs_epi8(activations);
+  const auto pairs = _mm256_maddubs_epi16(magnitudes, signed_weights);
+  return _mm256_madd_epi16(pairs, _mm256_set1_epi16(1));
 }
 #else
 std::int32_t dot_fp4_q8_block(const std::uint8_t* packed,
@@ -104,6 +104,23 @@ float packed_dot(const std::uint8_t* weights, const std::uint8_t* scales,
   const auto* row_weights =
       weights + static_cast<std::size_t>(row) * (columns / 2U);
   const auto* row_scales = scales + static_cast<std::size_t>(row) * blocks;
+#if EXPERT_RUNTIME_X86_AVX2
+  // Keep the eight partial lanes live across scale blocks and reduce once per
+  // row. The old path performed three horizontal reductions for every
+  // 32-value block, which serialized the hottest loop. Each i32 lane is
+  // converted before applying its block's UE8M0 power-of-two scale, so the
+  // quantization ABI and the mathematical dot product remain unchanged.
+  auto lanes = _mm256_setzero_ps();
+  for (std::uint32_t block = 0; block < blocks; ++block) {
+    const auto products = dot_fp4_q8_lanes(
+        row_weights + static_cast<std::size_t>(block) * 16U,
+        activation + static_cast<std::size_t>(block) * 32U);
+    const auto scale = _mm256_set1_ps(decode_ue8m0(row_scales[block]));
+    lanes = _mm256_add_ps(
+        lanes, _mm256_mul_ps(_mm256_cvtepi32_ps(products), scale));
+  }
+  const auto total = horizontal_sum_f32(lanes);
+#else
   float total = 0.0F;
   for (std::uint32_t block = 0; block < blocks; ++block) {
     total += static_cast<float>(dot_fp4_q8_block(
@@ -111,6 +128,7 @@ float packed_dot(const std::uint8_t* weights, const std::uint8_t* scales,
                  activation + static_cast<std::size_t>(block) * 32U)) *
              decode_ue8m0(row_scales[block]);
   }
+#endif
   return total * activation_scale * 0.5F;
 }
 
@@ -385,12 +403,13 @@ struct DeepSeekPackedExecutor::Impl final {
       return {ErrorCode::invalid_argument,
               "invalid packed DeepSeek CPU batch"};
     std::lock_guard execution_lock(execution_mutex);
-    Batch batch;
+    auto& batch = scratch;
     batch.groups = groups;
     batch.inputs = inputs.data();
     batch.outputs = outputs.data();
     batch.rows = rows;
     batch.top_k = top_k;
+    batch.offsets.clear();
     const auto hidden = groups.front().hidden;
     const auto intermediate_width = groups.front().intermediate;
     std::vector<bool> claimed(outputs.size() / hidden, false);
@@ -479,6 +498,7 @@ struct DeepSeekPackedExecutor::Impl final {
   std::uint32_t remaining_workers{};
   std::uint64_t generation{};
   std::atomic<std::uint64_t> worker_mask{};
+  Batch scratch;
   bool stopping{};
 };
 

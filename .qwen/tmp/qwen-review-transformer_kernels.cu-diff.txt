@@ -1,0 +1,319 @@
+diff --git a/runtime/src/cuda/transformer_kernels.cu b/runtime/src/cuda/transformer_kernels.cu
+index d646c51..0762c0b 100644
+--- a/runtime/src/cuda/transformer_kernels.cu
++++ b/runtime/src/cuda/transformer_kernels.cu
+@@ -587,6 +587,71 @@ __global__ void router_select_batch_kernel(
+   }
+ }
+ 
++__global__ void sigmoid_bias_router_select_batch_kernel(
++    const float* logits, const float* expert_bias, std::uint32_t experts,
++    std::uint32_t top_k, float normalization_epsilon,
++    float routed_scaling_factor, float* scores, std::uint32_t* indices) {
++  const auto request = static_cast<std::uint32_t>(blockIdx.x);
++  logits += static_cast<std::size_t>(request) * experts;
++  scores += static_cast<std::size_t>(request) * top_k;
++  indices += static_cast<std::size_t>(request) * top_k;
++  __shared__ float candidate_values[kThreads];
++  __shared__ std::uint32_t candidate_indices[kThreads];
++  __shared__ float selected_weights[kMaximumRouterTopK];
++  __shared__ std::uint32_t selected_indices[kMaximumRouterTopK];
++  for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++    float best = kNegativeInfinity;
++    std::uint32_t best_index = 0xffffffffU;
++    for (std::uint32_t expert = threadIdx.x; expert < experts;
++         expert += blockDim.x) {
++      bool used = false;
++      for (std::uint32_t previous = 0; previous < slot; ++previous)
++        used |= selected_indices[previous] == expert;
++      const float unbiased = 1.0F / (1.0F + expf(-logits[expert]));
++      const float selection = unbiased + expert_bias[expert];
++      if (!used &&
++          (selection > best ||
++           (selection == best && expert < best_index))) {
++        best = selection;
++        best_index = expert;
++      }
++    }
++    candidate_values[threadIdx.x] = best;
++    candidate_indices[threadIdx.x] = best_index;
++    __syncthreads();
++    for (unsigned stride = blockDim.x / 2; stride; stride >>= 1U) {
++      if (threadIdx.x < stride) {
++        const auto other_value = candidate_values[threadIdx.x + stride];
++        const auto other_index = candidate_indices[threadIdx.x + stride];
++        if (other_value > candidate_values[threadIdx.x] ||
++            (other_value == candidate_values[threadIdx.x] &&
++             other_index < candidate_indices[threadIdx.x])) {
++          candidate_values[threadIdx.x] = other_value;
++          candidate_indices[threadIdx.x] = other_index;
++        }
++      }
++      __syncthreads();
++    }
++    if (threadIdx.x == 0) {
++      const auto selected = candidate_indices[0];
++      selected_indices[slot] = selected;
++      selected_weights[slot] =
++          1.0F / (1.0F + expf(-logits[selected]));
++    }
++    __syncthreads();
++  }
++  if (threadIdx.x == 0) {
++    float denominator = normalization_epsilon;
++    for (std::uint32_t slot = 0; slot < top_k; ++slot)
++      denominator += selected_weights[slot];
++    const float multiplier = routed_scaling_factor / denominator;
++    for (std::uint32_t slot = 0; slot < top_k; ++slot) {
++      indices[slot] = selected_indices[slot];
++      scores[slot] = selected_weights[slot] * multiplier;
++    }
++  }
++}
++
+ __device__ float deepseek_route_score(float logit) {
+   const float softplus = logit > 20.0F ? logit : log1pf(expf(logit));
+   return sqrtf(softplus);
+@@ -868,6 +933,150 @@ __global__ void qwen_attention_kernel(
+   }
+ }
+ 
++__global__ void gqa_qkv_rope_kernel(
++    float* query, float* key, const float* value,
++    const float* q_weight, const float* k_weight, float* key_cache,
++    float* value_cache, std::uint32_t position,
++    std::uint32_t query_heads, std::uint32_t kv_heads,
++    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
++    float theta) {
++  __shared__ float normalized[kThreads];
++  const auto head = static_cast<std::uint32_t>(blockIdx.x);
++  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
++  if (head < query_heads) {
++    auto* query_head =
++        query + static_cast<std::size_t>(head) * head_dim;
++    float square = dimension < head_dim
++                       ? query_head[dimension] * query_head[dimension]
++                       : 0.0F;
++    square = reduce_sum(square);
++    if (dimension < head_dim)
++      normalized[dimension] = query_head[dimension] *
++          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
++          q_weight[dimension];
++    __syncthreads();
++    if (dimension < head_dim) {
++      float final_query = normalized[dimension];
++      if (dimension < rotary_dim) {
++        const auto half = rotary_dim / 2U;
++        const auto pair = dimension % half;
++        const float angle = static_cast<float>(position) *
++            powf(theta, -2.0F * static_cast<float>(pair) /
++                             static_cast<float>(rotary_dim));
++        const float other = dimension < half
++                                ? -normalized[dimension + half]
++                                : normalized[dimension - half];
++        final_query = normalized[dimension] * cosf(angle) +
++                      other * sinf(angle);
++      }
++      query_head[dimension] = final_query;
++    }
++  }
++  __syncthreads();
++  if (head < kv_heads) {
++    auto* key_head = key + static_cast<std::size_t>(head) * head_dim;
++    float square = dimension < head_dim
++                       ? key_head[dimension] * key_head[dimension]
++                       : 0.0F;
++    square = reduce_sum(square);
++    if (dimension < head_dim)
++      normalized[dimension] = key_head[dimension] *
++          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
++          k_weight[dimension];
++    __syncthreads();
++    if (dimension < head_dim) {
++      float final_key = normalized[dimension];
++      if (dimension < rotary_dim) {
++        const auto half = rotary_dim / 2U;
++        const auto pair = dimension % half;
++        const float angle = static_cast<float>(position) *
++            powf(theta, -2.0F * static_cast<float>(pair) /
++                             static_cast<float>(rotary_dim));
++        const float other = dimension < half
++                                ? -normalized[dimension + half]
++                                : normalized[dimension - half];
++        final_key = normalized[dimension] * cosf(angle) +
++                    other * sinf(angle);
++      }
++      key_head[dimension] = final_key;
++      const auto cache =
++          (static_cast<std::size_t>(position) * kv_heads + head) * head_dim +
++          dimension;
++      key_cache[cache] = final_key;
++      value_cache[cache] =
++          value[static_cast<std::size_t>(head) * head_dim + dimension];
++    }
++  }
++}
++
++__global__ void gqa_attention_kernel(
++    const float* query, const float* key_cache, const float* value_cache,
++    float* output, std::uint32_t tokens, std::uint32_t query_heads,
++    std::uint32_t kv_heads, std::uint32_t head_dim) {
++  __shared__ float online_maximum;
++  __shared__ float online_denominator;
++  __shared__ float previous_scale;
++  __shared__ float token_scale;
++  const auto query_head = static_cast<std::uint32_t>(blockIdx.x);
++  const auto kv_head = query_head / (query_heads / kv_heads);
++  const auto* query_values =
++      query + static_cast<std::size_t>(query_head) * head_dim;
++  if (threadIdx.x == 0) {
++    online_maximum = kNegativeInfinity;
++    online_denominator = 0.0F;
++  }
++  __syncthreads();
++  float result = 0.0F;
++  for (std::uint32_t token = 0; token < tokens; ++token) {
++    const auto cache =
++        (static_cast<std::size_t>(token) * kv_heads + kv_head) * head_dim;
++    float dot = threadIdx.x < head_dim
++                    ? query_values[threadIdx.x] *
++                          key_cache[cache + threadIdx.x]
++                    : 0.0F;
++    dot = reduce_sum(dot) * rsqrtf(static_cast<float>(head_dim));
++    if (threadIdx.x == 0) {
++      const float next_maximum = fmaxf(online_maximum, dot);
++      previous_scale = expf(online_maximum - next_maximum);
++      token_scale = expf(dot - next_maximum);
++      online_denominator = online_denominator * previous_scale + token_scale;
++      online_maximum = next_maximum;
++    }
++    __syncthreads();
++    if (threadIdx.x < head_dim)
++      result = result * previous_scale + token_scale *
++          value_cache[cache + threadIdx.x];
++    __syncthreads();
++  }
++  if (threadIdx.x < head_dim)
++    output[static_cast<std::size_t>(query_head) * head_dim + threadIdx.x] =
++        result / online_denominator;
++}
++
++__global__ void causal_short_conv_decode_kernel(
++    const float* projected, const float* weights, float* state,
++    float* output, std::uint32_t hidden, std::uint32_t kernel) {
++  const auto row = static_cast<std::uint32_t>(blockIdx.y);
++  const auto channel = static_cast<std::uint32_t>(
++      blockIdx.x * blockDim.x + threadIdx.x);
++  if (channel >= hidden) return;
++  const auto projected_base = static_cast<std::size_t>(row) * 3U * hidden;
++  const float b = projected[projected_base + channel];
++  const float c = projected[projected_base + hidden + channel];
++  const float x = projected[projected_base + 2U * hidden + channel];
++  auto* channel_state = state +
++      (static_cast<std::size_t>(row) * hidden + channel) * kernel;
++  for (std::uint32_t index = 1U; index < kernel; ++index)
++    channel_state[index - 1U] = channel_state[index];
++  channel_state[kernel - 1U] = b * x;
++  const auto* channel_weights =
++      weights + static_cast<std::size_t>(channel) * kernel;
++  float convolution = 0.0F;
++  for (std::uint32_t index = 0U; index < kernel; ++index)
++    convolution += channel_state[index] * channel_weights[index];
++  output[static_cast<std::size_t>(row) * hidden + channel] = c * convolution;
++}
++
+ __global__ void qwen_qkv_rope_paged_fp16_kernel(
+     float* q_and_gate, float* key, const float* value,
+     const float* q_weight, const float* k_weight, __half* page,
+@@ -1416,6 +1625,28 @@ Status router_topk_normalized_batch(
+       logits, experts, top_k, scores, indices);
+   return checked(cudaPeekAtLastError(), "normalized batched router select");
+ }
++Status sigmoid_bias_router_topk_batch(
++    const float* input, const float* weights, const float* expert_bias,
++    std::uint32_t rows, std::uint32_t hidden, std::uint32_t experts,
++    std::uint32_t top_k, float normalization_epsilon,
++    float routed_scaling_factor, float* logits, float* scores,
++    std::uint32_t* indices, void* raw) noexcept {
++  if (!input || !weights || !expert_bias || !logits || !scores || !indices ||
++      !rows || !hidden || !experts || !top_k || top_k > experts ||
++      top_k > kMaximumRouterTopK || !(normalization_epsilon > 0.0F) ||
++      !(routed_scaling_factor > 0.0F))
++    return Status(ErrorCode::invalid_argument,
++                  "invalid sigmoid-bias batched router");
++  auto status = gemv_f32_batch(weights, experts, hidden, input, logits, rows,
++                               raw);
++  if (!status.ok()) return status;
++  sigmoid_bias_router_select_batch_kernel<<<
++      rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
++      logits, expert_bias, experts, top_k, normalization_epsilon,
++      routed_scaling_factor, scores, indices);
++  return checked(cudaPeekAtLastError(),
++                 "sigmoid-bias batched router select");
++}
+ Status deepseek_router_hash(
+     const float* input, const std::uint16_t* weights,
+     const std::int64_t* token_experts, std::uint32_t token_id,
+@@ -1518,6 +1749,41 @@ Status qwen3_next_attention_decode(
+       kv_heads, head_dim);
+   return checked(cudaPeekAtLastError(), "Qwen3-Next attention");
+ }
++Status gqa_qkv_rope_cache(
++    float* query, float* key, const float* value,
++    const float* q_norm_weight, const float* k_norm_weight, float* key_cache,
++    float* value_cache, std::uint32_t position,
++    std::uint32_t query_heads, std::uint32_t kv_heads,
++    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
++    float rope_theta, void* raw) noexcept {
++  if (!query || !key || !value || !q_norm_weight || !k_norm_weight ||
++      !key_cache || !value_cache || !query_heads || !kv_heads ||
++      query_heads % kv_heads || !head_dim || head_dim > kThreads ||
++      !rotary_dim || rotary_dim > head_dim || rotary_dim % 2U ||
++      !(epsilon > 0.0F) || !(rope_theta > 0.0F))
++    return Status(ErrorCode::invalid_argument, "invalid GQA QKV rope");
++  gqa_qkv_rope_kernel<<<query_heads, kThreads, 0,
++                        static_cast<cudaStream_t>(raw)>>>(
++      query, key, value, q_norm_weight, k_norm_weight, key_cache,
++      value_cache, position, query_heads, kv_heads, head_dim, rotary_dim,
++      epsilon, rope_theta);
++  return checked(cudaPeekAtLastError(), "GQA QKV rope");
++}
++Status gqa_attention_decode(
++    const float* query, const float* key_cache, const float* value_cache,
++    float* output, std::uint32_t context_tokens,
++    std::uint32_t query_heads, std::uint32_t kv_heads,
++    std::uint32_t head_dim, void* raw) noexcept {
++  if (!query || !key_cache || !value_cache || !output || !context_tokens ||
++      !query_heads || !kv_heads || query_heads % kv_heads || !head_dim ||
++      head_dim > kThreads)
++    return Status(ErrorCode::invalid_argument, "invalid GQA attention");
++  gqa_attention_kernel<<<query_heads, kThreads, 0,
++                         static_cast<cudaStream_t>(raw)>>>(
++      query, key_cache, value_cache, output, context_tokens, query_heads,
++      kv_heads, head_dim);
++  return checked(cudaPeekAtLastError(), "GQA attention");
++}
+ Status qwen3_next_qkv_rope_cache_paged_fp16(
+     float* q_and_gate, float* key, const float* value,
+     const float* q_norm_weight, const float* k_norm_weight, void* page,
+@@ -1589,6 +1855,20 @@ Status qwen3_next_delta_decode(const Qwen3NextDeltaLaunch& launch) noexcept {
+       launch.epsilon);
+   return checked(cudaPeekAtLastError(), "Qwen3-Next delta recurrent");
+ }
++Status causal_short_conv_decode(
++    const CausalShortConvLaunch& launch) noexcept {
++  if (!launch.projected_bcx || !launch.weights || !launch.state ||
++      !launch.output || !launch.rows || !launch.hidden || !launch.kernel ||
++      launch.kernel > 32U)
++    return Status(ErrorCode::invalid_argument,
++                  "invalid causal short-convolution launch");
++  const dim3 grid((launch.hidden + kThreads - 1U) / kThreads, launch.rows);
++  causal_short_conv_decode_kernel<<<
++      grid, kThreads, 0, static_cast<cudaStream_t>(launch.stream)>>>(
++      launch.projected_bcx, launch.weights, launch.state, launch.output,
++      launch.hidden, launch.kernel);
++  return checked(cudaPeekAtLastError(), "causal short convolution");
++}
+ Status argmax(const float* values, std::uint32_t count, std::uint32_t* output, void* raw) noexcept {
+   if (!values || !count || !output) return Status(ErrorCode::invalid_argument, "invalid argmax");
+   argmax_batch_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(values, count, output);

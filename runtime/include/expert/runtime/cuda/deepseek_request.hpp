@@ -3,19 +3,20 @@
 #include "expert/runtime/cuda/deepseek_attention.hpp"
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 
-#include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <vector>
 
 namespace expert::runtime::cuda {
-
-inline constexpr std::uint32_t kDeepSeekLayers = 43U;
 
 struct DeepSeekRequestConfig final {
   std::uint32_t max_context_tokens{};
   // Hard per-request CUDA state limit. Creation fails before allocation when
-  // the complete 43-layer state does not fit.
+  // the artifact-declared layer program does not fit.
   std::uint64_t device_state_budget_bytes{};
+  std::span<const std::uint32_t> compression_ratios;
+  std::uint32_t hash_router_layers{};
 };
 
 struct DeepSeekRequestStateSize final {
@@ -28,7 +29,8 @@ struct DeepSeekRequestStateSize final {
 };
 
 [[nodiscard]] DeepSeekRequestStateSize deepseek_request_state_size(
-    std::uint32_t max_context_tokens) noexcept;
+    std::uint32_t max_context_tokens,
+    std::span<const std::uint32_t> compression_ratios) noexcept;
 
 struct DeepSeekLayerStateView final {
   const DeepSeekAttentionBinding* attention_weights{};
@@ -41,7 +43,7 @@ struct DeepSeekLayerStateView final {
 struct DeepSeekRequestStateResult;
 struct DeepSeekVerifyStateResult;
 
-// Owns all mutable CUDA state for one request across the 43-layer schedule.
+// Owns all mutable CUDA state for one artifact-declared layer schedule.
 // It also retains the immutable resident model, so every binding remains valid
 // for the complete request lifetime.
 class DeepSeekRequestState final {
@@ -54,9 +56,11 @@ class DeepSeekRequestState final {
     return max_context_tokens_;
   }
   [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
-  [[nodiscard]] static constexpr std::uint32_t layer_count() noexcept {
-    return kDeepSeekLayers;
+  [[nodiscard]] std::uint32_t layer_count() const noexcept {
+    return static_cast<std::uint32_t>(attention_weights_.size());
   }
+  [[nodiscard]] std::span<const std::uint32_t> compression_ratios()
+      const noexcept { return compression_ratios_; }
   [[nodiscard]] DeepSeekLayerStateView layer(
       std::uint32_t index) const noexcept;
   [[nodiscard]] Status embed(std::uint32_t token,
@@ -64,6 +68,19 @@ class DeepSeekRequestState final {
   [[nodiscard]] Status project_logits(void* stream = nullptr) noexcept;
   [[nodiscard]] const float* current_streams() const noexcept {
     return streams_a_;
+  }
+  // Provider-facing execution buffers. Their roles are defined by the
+  // artifact operation ABI: embedding/routed FFN produce the primary stream
+  // set, while attention produces the intermediate stream set consumed by
+  // the router and routed FFN. Exposing the buffers keeps operation dispatch
+  // outside the request-state implementation without exposing ownership.
+  [[nodiscard]] float* primary_streams() noexcept { return streams_a_; }
+  [[nodiscard]] const float* primary_streams() const noexcept {
+    return streams_a_;
+  }
+  [[nodiscard]] float* attention_streams() noexcept { return streams_b_; }
+  [[nodiscard]] const float* attention_streams() const noexcept {
+    return streams_b_;
   }
   [[nodiscard]] const float* logits() const noexcept {
     return io_state_ ? io_state_->logits() : nullptr;
@@ -81,11 +98,11 @@ class DeepSeekRequestState final {
   DeepSeekRequestState() = default;
 
   std::shared_ptr<const DeepSeekResidentModelState> model_;
-  std::array<DeepSeekAttentionBinding, kDeepSeekLayers> attention_weights_{};
-  std::array<DeepSeekFfnBinding, kDeepSeekLayers> ffn_weights_{};
-  std::array<std::shared_ptr<DeepSeekAttentionState>, kDeepSeekLayers>
-      attention_states_{};
-  std::array<std::shared_ptr<DeepSeekFfnState>, kDeepSeekLayers> ffn_states_{};
+  std::vector<DeepSeekAttentionBinding> attention_weights_;
+  std::vector<DeepSeekFfnBinding> ffn_weights_;
+  std::vector<std::shared_ptr<DeepSeekAttentionState>> attention_states_;
+  std::vector<std::shared_ptr<DeepSeekFfnState>> ffn_states_;
+  std::vector<std::uint32_t> compression_ratios_;
   DeepSeekIoBinding io_weights_{};
   std::shared_ptr<DeepSeekIoState> io_state_;
   std::uint32_t max_context_tokens_{};

@@ -55,7 +55,8 @@ try {
     Invoke-CheckedNative -Command $python -Arguments @(
         "-m", "unittest", "-v", "tests.compiler.test_deepseek_quant",
         "tests.compiler.test_expert_pack",
-        "tests.server.test_expert_server"
+        "tests.server.test_expert_server",
+        "tests.server.test_deepseek_route_oracle"
     )
 }
 finally {

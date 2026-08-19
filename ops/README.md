@@ -29,9 +29,11 @@ before disrupting the running model. `MODEL_MAX_CONTEXT` and
 `MODEL_MAX_OUTPUT_TOKENS` become
 the advertised API limits and are checked against `/model-info` before `start`
 returns. `CHAT_MAX_TOKENS` is an optional independent per-turn ceiling; the
-reference configuration gives chat the full model output allowance. Chat uses
-the sole model returned by `/v1/models`, so an explicit model switch does not
-require rewriting `.env` before connecting.
+reference configuration gives chat the full model output allowance. The chat
+socket timeout defaults to 60 seconds beyond
+`MODEL_GENERATION_TIMEOUT_SECONDS`, and `CHAT_REQUEST_TIMEOUT_SECONDS` may
+override it explicitly. Chat uses the sole model returned by `/v1/models`, so
+an explicit model switch does not require rewriting `.env` before connecting.
 
 The sync includes only Git-visible, non-ignored files. It therefore excludes
 `.git`, models, work, logs, artifacts, and build output. It does not delete

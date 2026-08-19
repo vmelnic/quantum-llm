@@ -2,12 +2,16 @@
 set -euo pipefail
 
 remote_host="${1:-${QUANTUM_LLM_REMOTE:-}}"
-remote_root="${2:-${QUANTUM_LLM_REMOTE_ROOT:-C:/quantum-llm}}"
-remote_native="${remote_root//\//\\}"
+remote_root="${2:-${QUANTUM_LLM_REMOTE_ROOT:-}}"
 if [[ -z "${remote_host}" ]]; then
   echo "Pass user@host or set QUANTUM_LLM_REMOTE" >&2
   exit 2
 fi
+if [[ -z "${remote_root}" ]]; then
+  echo "Pass the remote project root or set QUANTUM_LLM_REMOTE_ROOT" >&2
+  exit 2
+fi
+remote_native="${remote_root//\//\\}"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
 
