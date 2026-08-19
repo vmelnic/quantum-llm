@@ -9,7 +9,9 @@ Supported strict adapters:
 
 - `olmoe` — `allenai/OLMoE-1B-7B-0125-Instruct` geometry;
 - `qwen3_next` — `Qwen/Qwen3-Next-80B-A3B-Instruct`, including explicit MTP
-  tensor preservation.
+  tensor preservation;
+- `qwen3_5` — the official dense Qwen3.5/Qwen3.8 checkpoint ABI, including
+  alternating full/linear attention and MTP metadata.
 
 Unknown, missing, or geometrically inconsistent tensors fail conversion.
 
@@ -211,9 +213,10 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m compiler compile `
   --source C:\path\to\snapshot `
   --output C:\path\to\model.expert-pack `
-  --source-id Qwen/Qwen3-Next-80B-A3B-Instruct `
+  --source-id Qwen/Qwen3.8-27B `
   --source-revision <immutable-revision> `
-  --adapter qwen3_next
+  --adapter qwen3_5 `
+  --quant-profile fp4-e2m1-ue8m0-block32-v1
 ```
 
 ## Validate
@@ -222,7 +225,8 @@ py -m venv .venv
 .\.venv\Scripts\python.exe -m compiler validate C:\path\to\model.expert-pack
 ```
 
-Every newly compiled container includes `runtime-model.tsv` schema 2. This is
+Every newly compiled container includes `runtime-model.tsv`; the current
+Qwen3.8 adapter emits schema 3. This is
 the provider-neutral execution contract: model dimensions, routed-component
 geometry, opaque weight encoding/source ABIs, provider-owned router programs,
 required operation capabilities, and the ordered block/router/expert

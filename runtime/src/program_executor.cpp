@@ -253,6 +253,10 @@ ProgramExecutionHandle ProgramExecutionHandle::from_callbacks(
 
 struct ProgramExecutionSession::Core final {
   Execute execute;
+  SequenceAvailable sequence_available;
+  ExecuteSequence execute_sequence;
+  RetentionControl checkpoint_retention;
+  RetentionControl rewind_retention;
   Rebind rebind;
   ExactDecodeAvailable exact_available;
   SynchronizeExactDecodeBatch synchronize_exact;
@@ -294,6 +298,63 @@ StartProgramExecutionResult ProgramExecutionSession::execute(
             {}};
   } catch (...) {
     return {{ErrorCode::internal, "model execution session step failed"}, {}};
+  }
+}
+
+bool ProgramExecutionSession::program_sequence_available() const noexcept {
+  if (!valid() || !core_->sequence_available) return false;
+  try {
+    return core_->sequence_available();
+  } catch (...) {
+    return false;
+  }
+}
+
+StartProgramExecutionResult ProgramExecutionSession::execute_program_sequence(
+    std::map<std::string, ExecutionValue, std::less<>> inputs) const noexcept {
+  if (!valid() || !core_->execute_sequence)
+    return {{ErrorCode::invalid_argument,
+             "model execution session has no program-sequence provider"},
+            {}};
+  try {
+    return core_->execute_sequence(std::move(inputs));
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("model program-sequence execution failed: ") +
+                 error.what()},
+            {}};
+  } catch (...) {
+    return {{ErrorCode::internal,
+             "model program-sequence execution failed"},
+            {}};
+  }
+}
+
+Status ProgramExecutionSession::checkpoint_retention(
+    std::uint32_t next_position) const noexcept {
+  if (!valid() || !core_->checkpoint_retention)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  try {
+    return core_->checkpoint_retention(next_position);
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("retention checkpoint failed: ") + error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "retention checkpoint failed"};
+  }
+}
+
+Status ProgramExecutionSession::rewind_retention(
+    std::uint32_t next_position) const noexcept {
+  if (!valid() || !core_->rewind_retention)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  try {
+    return core_->rewind_retention(next_position);
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("retention rewind failed: ") + error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "retention rewind failed"};
   }
 }
 
@@ -380,14 +441,22 @@ void ProgramExecutionSession::cancel() noexcept {
 }
 
 ProgramExecutionSession ProgramExecutionSession::from_callbacks(
-    Execute execute, Rebind rebind, ExactDecodeAvailable exact_available,
+    Execute execute, SequenceAvailable sequence_available,
+    ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
+    RetentionControl rewind_retention, Rebind rebind,
+    ExactDecodeAvailable exact_available,
     SynchronizeExactDecodeBatch synchronize_exact,
     ExecuteExactDecode execute_exact, Cancel cancel) {
-  if (!execute || !rebind || !exact_available || !synchronize_exact ||
-      !execute_exact || !cancel)
+  if (!execute || !sequence_available || !execute_sequence ||
+      !checkpoint_retention || !rewind_retention || !rebind ||
+      !exact_available || !synchronize_exact || !execute_exact || !cancel)
     return {};
   auto core = std::make_unique<Core>();
   core->execute = std::move(execute);
+  core->sequence_available = std::move(sequence_available);
+  core->execute_sequence = std::move(execute_sequence);
+  core->checkpoint_retention = std::move(checkpoint_retention);
+  core->rewind_retention = std::move(rewind_retention);
   core->rebind = std::move(rebind);
   core->exact_available = std::move(exact_available);
   core->synchronize_exact = std::move(synchronize_exact);
@@ -412,6 +481,12 @@ struct MoeProgramExecutor::Core final {
     std::uint32_t maximum_emitted_tokens{};
   };
 
+  struct PreparedSequence final {
+    std::uint32_t provider_registry_index{};
+    std::shared_ptr<IOperationProvider> provider;
+    std::vector<const IPreparedOperation*> operations;
+  };
+
   struct RequestState;
   struct ExactDecodeState;
 
@@ -430,6 +505,13 @@ struct MoeProgramExecutor::Core final {
     [[nodiscard]] StartProgramExecutionResult start(
         std::map<std::string, ExecutionValue, std::less<>> inputs,
         bool close_after_success);
+    [[nodiscard]] bool sequence_available() const noexcept;
+    [[nodiscard]] StartProgramExecutionResult start_sequence(
+        std::map<std::string, ExecutionValue, std::less<>> inputs);
+    [[nodiscard]] Status checkpoint_retention(
+        std::uint32_t next_position) noexcept;
+    [[nodiscard]] Status rewind_retention(
+        std::uint32_t next_position) noexcept;
     [[nodiscard]] bool exact_available() const noexcept;
     [[nodiscard]] Status synchronize_exact(
         std::span<const std::uint32_t> next_tokens,
@@ -457,6 +539,7 @@ struct MoeProgramExecutor::Core final {
     OperationExecutionHandle inflight;
     std::size_t next_operation{};
     bool close_after_success{};
+    bool direct_sequence{};
     bool terminal{};
     bool cancelled_result_pending{};
 
@@ -478,6 +561,41 @@ struct MoeProgramExecutor::Core final {
             {}};
       }
       if (terminal) return std::nullopt;
+      if (direct_sequence) {
+        if (std::chrono::steady_clock::now() > session->request.deadline)
+          return fail({ErrorCode::deadline_exceeded,
+                       "model program-sequence deadline expired"});
+        auto completed = inflight.poll();
+        if (!completed) return std::nullopt;
+        inflight = OperationExecutionHandle{};
+        if (!completed->status.ok())
+          return fail(copy_status(completed->status));
+        if (completed->outputs.size() !=
+            session->program->provider.program.outputs.size())
+          return fail(internal_error(
+              "program-sequence provider returned a partial or extra output set"));
+        ProgramExecutionResult result;
+        result.status = Status::success();
+        for (std::size_t index = 0U; index < completed->outputs.size();
+             ++index) {
+          auto& value = completed->outputs[index];
+          const auto& endpoint =
+              session->program->provider.program.outputs[index];
+          if (endpoint.value_index >=
+                  session->program->provider.program.values.size() ||
+              !value.valid() ||
+              value.abi != session->program->provider.program
+                               .values[endpoint.value_index]
+                               .abi)
+            return fail(internal_error(
+                "program-sequence provider returned an invalid output value"));
+          result.outputs.emplace(endpoint.role, std::move(value));
+        }
+        current_inputs.clear();
+        terminal = true;
+        session->finish(this, true);
+        return result;
+      }
       while (true) {
         if (std::chrono::steady_clock::now() > session->request.deadline)
           return fail({ErrorCode::deadline_exceeded,
@@ -623,6 +741,7 @@ struct MoeProgramExecutor::Core final {
   BoundExecutionProvider provider;
   std::vector<PreparedInstruction> prepared;
   std::optional<PreparedExactDecode> exact_decode;
+  std::optional<PreparedSequence> sequence;
 
   [[nodiscard]] static CreateSessionResult begin(
       std::shared_ptr<const Core> program,
@@ -723,6 +842,160 @@ StartProgramExecutionResult MoeProgramExecutor::Core::SessionState::start(
             {}};
   }
   return {Status::success(), std::move(handle)};
+}
+
+bool MoeProgramExecutor::Core::SessionState::sequence_available() const
+    noexcept {
+  return program && program->sequence.has_value();
+}
+
+StartProgramExecutionResult
+MoeProgramExecutor::Core::SessionState::start_sequence(
+    std::map<std::string, ExecutionValue, std::less<>> inputs) {
+  if (!program || !program->sequence ||
+      inputs.size() != program->provider.program.inputs.size())
+    return {{ErrorCode::invalid_argument,
+             "model program-sequence input role set is incomplete"},
+            {}};
+
+  auto step = std::make_shared<RequestState>();
+  step->session = shared_from_this();
+  step->direct_sequence = true;
+  step->current_inputs.reserve(program->provider.program.inputs.size());
+  for (const auto& endpoint : program->provider.program.inputs) {
+    const auto input = inputs.find(endpoint.role);
+    if (input == inputs.end() || !input->second.valid() ||
+        endpoint.value_index >= program->provider.program.values.size() ||
+        input->second.abi !=
+            program->provider.program.values[endpoint.value_index].abi)
+      return {{ErrorCode::invalid_argument,
+               "model program-sequence input is absent, invalid, or "
+               "ABI-mismatched"},
+              {}};
+    step->current_inputs.push_back(input->second);
+  }
+
+  std::shared_ptr<IOperationProviderRequestState> provider_state;
+  const auto& sequence = *program->sequence;
+  {
+    std::lock_guard lock(mutex);
+    const auto found =
+        provider_states.find(sequence.provider_registry_index);
+    if (closed)
+      return {{ErrorCode::cancelled,
+               "model execution session is closed"},
+              {}};
+    if (active)
+      return {{ErrorCode::backpressure,
+               "model execution session already has an active step"},
+              {}};
+    if (found == provider_states.end())
+      return {internal_error(
+                  "program-sequence provider request state is absent"),
+              {}};
+    active = true;
+    active_step = step;
+    provider_state = found->second;
+  }
+
+  step->inflight = sequence.provider->execute_program_sequence(
+      provider_state,
+      ProgramSequenceInvocation{request, program->provider.program,
+                                sequence.operations,
+                                step->current_inputs});
+  if (!step->inflight.valid()) {
+    step->cancel(false);
+    return {internal_error(
+                "operation provider rejected a program-sequence invocation"),
+            {}};
+  }
+
+  auto handle = ProgramExecutionHandle::from_callbacks(
+      [step] { return step->poll(); },
+      [step] { step->cancel(false); });
+  if (!handle.valid()) {
+    step->cancel(false);
+    return {{ErrorCode::internal,
+             "model program-sequence handle construction failed"},
+            {}};
+  }
+  return {Status::success(), std::move(handle)};
+}
+
+Status MoeProgramExecutor::Core::SessionState::checkpoint_retention(
+    std::uint32_t next_position) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed)
+      return {ErrorCode::cancelled, "model execution session is closed"};
+    if (active)
+      return {ErrorCode::backpressure,
+              "model execution session already has an active step"};
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      const auto implementation =
+          prepared == program->prepared.end()
+              ? program->exact_decode &&
+                        program->exact_decode->provider_registry_index ==
+                            registry_index
+                    ? program->exact_decode->provider
+                    : std::shared_ptr<IOperationProvider>{}
+              : prepared->provider;
+      if (!implementation)
+        return internal_error("retention checkpoint provider is absent");
+      const auto status =
+          implementation->checkpoint_request_state(state, next_position);
+      if (!status.ok()) return copy_status(status);
+    }
+    return Status::success();
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("retention checkpoint failed: ") + error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "retention checkpoint failed"};
+  }
+}
+
+Status MoeProgramExecutor::Core::SessionState::rewind_retention(
+    std::uint32_t next_position) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed)
+      return {ErrorCode::cancelled, "model execution session is closed"};
+    if (active)
+      return {ErrorCode::backpressure,
+              "model execution session already has an active step"};
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      const auto implementation =
+          prepared == program->prepared.end()
+              ? program->exact_decode &&
+                        program->exact_decode->provider_registry_index ==
+                            registry_index
+                    ? program->exact_decode->provider
+                    : std::shared_ptr<IOperationProvider>{}
+              : prepared->provider;
+      if (!implementation)
+        return internal_error("retention rewind provider is absent");
+      const auto status =
+          implementation->rewind_request_state(state, next_position);
+      if (!status.ok()) return copy_status(status);
+    }
+    return Status::success();
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("retention rewind failed: ") + error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "retention rewind failed"};
+  }
 }
 
 bool MoeProgramExecutor::Core::SessionState::exact_available() const noexcept {
@@ -871,7 +1144,8 @@ Status MoeProgramExecutor::Core::SessionState::rebind(
   if (active)
     return {ErrorCode::backpressure,
             "model execution session has an active step"};
-  replacement.parameters = request.parameters;
+  for (const auto& [name, value] : request.parameters)
+    replacement.parameters.try_emplace(name, value);
   request = std::move(replacement);
   return Status::success();
 }
@@ -1040,6 +1314,27 @@ Status MoeProgramExecutor::create(
       exact.operation = std::move(prepared.operation);
       core->exact_decode = std::move(exact);
     }
+    if (!core->prepared.empty()) {
+      const auto registry_index =
+          core->prepared.front().provider_registry_index;
+      const auto implementation = core->prepared.front().provider;
+      const auto common_provider = std::all_of(
+          core->prepared.begin(), core->prepared.end(),
+          [&](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index &&
+                   item.provider == implementation;
+          });
+      if (common_provider &&
+          implementation->supports_program_sequence(core->provider.program)) {
+        Core::PreparedSequence sequence;
+        sequence.provider_registry_index = registry_index;
+        sequence.provider = implementation;
+        sequence.operations.reserve(core->prepared.size());
+        for (const auto& item : core->prepared)
+          sequence.operations.push_back(item.operation.get());
+        core->sequence = std::move(sequence);
+      }
+    }
     destination = MoeProgramExecutor(std::move(core));
     return Status::success();
   } catch (const std::exception& error) {
@@ -1065,6 +1360,16 @@ BeginProgramExecutionSessionResult MoeProgramExecutor::begin_session(
   auto session = ProgramExecutionSession::from_callbacks(
       [state](std::map<std::string, ExecutionValue, std::less<>> inputs) {
         return state->start(std::move(inputs), false);
+      },
+      [state] { return state->sequence_available(); },
+      [state](std::map<std::string, ExecutionValue, std::less<>> inputs) {
+        return state->start_sequence(std::move(inputs));
+      },
+      [state](std::uint32_t position) {
+        return state->checkpoint_retention(position);
+      },
+      [state](std::uint32_t position) {
+        return state->rewind_retention(position);
       },
       [state](ProgramRequestContext request) {
         return state->rebind(std::move(request));

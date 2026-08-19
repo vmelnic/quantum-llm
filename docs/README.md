@@ -1,6 +1,6 @@
 # Documentation map
 
-Status: synchronized with the repository state on 2026-08-11.
+Status: synchronized with the Qwen3.8 production-pilot state on 2026-08-19.
 
 Start with [MoE VM current state and remaining work](moe-vm-next.md). It is the
 canonical handoff for the next implementation session. Historical plans retain
@@ -16,12 +16,13 @@ measurements and decisions, but they are not active backlogs.
 | [Operations](operations.md) | Short day-two runbook |
 | [OpenAI-compatible API](openai-api.md) | Supported HTTP/SSE contract and explicit omissions |
 | [Production readiness](production-readiness.md) | Pilot verdict, qualification matrix and release blockers |
+| [Heterogeneous organ placement](heterogeneous-placement-research.md) | Research contract for executing model/state shards directly from VRAM/GPU and RAM/CPU |
 
 ## Artifact and runtime contracts
 
 | Document | Purpose |
 |---|---|
-| [Expert Pack v1](expert-pack-v1.md) | Qwen/LFM placement container and record ABI |
+| [Expert Pack v1](expert-pack-v1.md) | FP4 placement container and record ABI |
 | [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Current DeepSeek routed-weight storage representation |
 | [Compute-ready representations](compute-ready.md) | Distinction between source, placement, compute and device layouts |
 | [Expert Runtime v1](expert-runtime.md) | Cache, placement, execution, worker protocol and telemetry invariants |
@@ -31,13 +32,15 @@ The current service has one launcher, one scheduled task and one binary:
 not yet mean one physical container or one composable numeric executor.
 Expert Pack v1 and DeepSeek worker bundle v3 still enter through separate
 storage adapters, and the common binary currently selects one complete worker
-provider for the artifact's operation set.
+provider for the artifact's operation set. Qwen3.8 is the active dense FP4
+target; DeepSeek remains the sparse demand-paged compatibility target.
 
 ## Evidence and historical records
 
 | Document | Status |
 |---|---|
 | [Performance evidence](benchmarks.md) | Measured results; current functional VM acceptance plus historical performance campaigns |
+| [Heterogeneous placement benchmark](heterogeneous-placement-benchmark.md) | Qwen3.8 manifest inventory, measured CUDA inputs and placement bounds |
 | [Engineering history](history.md) | Completed, rejected and extracted work |
 | [30 tok/s plan](inference-30toks-plan.md) | Executed historical campaign, not the active plan |
 | [Scaling follow-on](inference-scaling-next.md) | Historical FP4/performance research; partially executed |

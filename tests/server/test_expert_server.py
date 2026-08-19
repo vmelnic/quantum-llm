@@ -22,10 +22,19 @@ sys.modules.setdefault(
 
 import ops.python.expert_server as expert_server
 from ops.python.expert_server import (
-    Application, ContinuousDecodeBatcher, CudaWorker, Handler,
-    IncrementalTextDecoder, RequestError, StopFilter,
-    _text_content, _worker_response_tokens,
+    Application, AssistantStreamParser, ContinuousDecodeBatcher, CudaWorker,
+    Handler, IncrementalTextDecoder, RequestError, SamplingSettings,
+    StopFilter, _text_content, _worker_response_tokens,
 )
+from ops.python.response_protocols import install_declared_response_protocol
+
+
+def application_fixture() -> Application:
+    app = Application.__new__(Application)
+    app.checkpoint_chat_encoder = None
+    app.response_protocol = None
+    app.default_sampling = SamplingSettings(1.0, 0.95, 20, 0.0, 0)
+    return app
 
 
 class FakeWorker:
@@ -61,6 +70,24 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         with self.assertRaises(expert_server.WorkerError):
             decoder.push("different")
 
+    def test_standard_stream_events_split_reasoning_and_content(self) -> None:
+        class Parser:
+            def feed(self, delta: str) -> list[dict[str, object]]:
+                field, text = delta.split(":", 1)
+                return [{"type": "region_chunk", "field": field,
+                         "text": text, "dirty": False}]
+
+            def finalize(self) -> tuple[dict[str, object], list[dict[str, object]]]:
+                return {}, []
+
+        app = types.SimpleNamespace(response_stream_parser=lambda _request: Parser())
+        parser = AssistantStreamParser(app, object())
+        self.assertEqual(parser.feed("thinking:check assumptions"),
+                         ("check assumptions", ""))
+        self.assertEqual(parser.feed("content:final answer"),
+                         ("", "final answer"))
+        self.assertEqual(parser.finish(), ("", ""))
+
     def test_worker_tokens_accept_legacy_scalar_and_mtp_list(self) -> None:
         self.assertEqual(
             _worker_response_tokens({"token": 7}, "missing"), [7]
@@ -70,6 +97,16 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         )
         with self.assertRaises(expert_server.WorkerError):
             _worker_response_tokens({"tokens": []}, "missing")
+
+    def test_protocol8_serializes_request_sampling(self) -> None:
+        worker = CudaWorker.__new__(CudaWorker)
+        worker.sampling_supported = True
+        self.assertEqual(
+            worker._sampling_command(SamplingSettings(
+                1.0, 0.95, 20, 0.0, 1234
+            )),
+            "\tSAMPLING\t1000000\t950000\t20\t0\t1234",
+        )
 
     def test_protocol4_worker_infers_legacy_prefetch_state(self) -> None:
         ready = {
@@ -290,7 +327,16 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             def apply_chat_template(self, _messages: object, **_kwargs: object) -> list[int]:
                 return [10, 11]
 
-        app = Application.__new__(Application)
+            def parse_response(self, _text: str,
+                               **_kwargs: object) -> dict[str, object]:
+                return {"role": "assistant", "tool_calls": [{
+                    "type": "function", "function": {
+                        "name": "get_weather",
+                        "arguments": {"city": "Chisinau"},
+                    },
+                }]}
+
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             model="test-model", build_id="build", maximum_new_tokens=32,
             max_context=128, maximum_body_bytes=1 << 20, api_key="",
@@ -311,8 +357,10 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.release_request_context = lambda _context: None
         app.increment = lambda *_args, **_kwargs: None
 
+        app.generated = ("hello", " world")
+
         def generate(_prompt: list[int], maximum: int, _context: object = None):
-            for index, value in enumerate(("hello", " world")[:maximum]):
+            for index, value in enumerate(app.generated[:maximum]):
                 yield index + 1, value
 
         app.generate = generate
@@ -356,6 +404,32 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             self.assertIn('"delta":{"role":"assistant","content":""}', stream)
             self.assertIn('"choices":[],"usage":', stream)
             self.assertTrue(stream.endswith("data: [DONE]\n\n"))
+
+            app.generated = (
+                "<tool_call>\n<function=get_weather>\n"
+                "<parameter=city>\nChisinau\n</parameter>\n"
+                "</function>\n</tool_call>",
+            )
+            tool = {"type": "function", "function": {
+                "name": "get_weather", "description": "Read weather",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                }, "required": ["city"]},
+            }}
+            app.response_protocol = "fixture"
+            connection.request("POST", "/v1/chat/completions", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [tool], "tool_choice": "auto",
+                "max_completion_tokens": 2,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(payload["choices"][0]["finish_reason"], "tool_calls")
+            call = payload["choices"][0]["message"]["tool_calls"][0]
+            self.assertEqual(call["function"]["name"], "get_weather")
+            self.assertEqual(json.loads(call["function"]["arguments"]),
+                             {"city": "Chisinau"})
         finally:
             connection.close()
             server.shutdown()
@@ -368,7 +442,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                                     **_kwargs: object) -> list[int]:
                 raise ImportError("jinja2 is missing")
 
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             model="test-model", maximum_new_tokens=32, max_context=128,
             maximum_body_bytes=1 << 20, api_key="",
@@ -418,13 +492,89 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                           "input.0.content")
         self.assertEqual(raised.exception.code, "unsupported_value")
 
-    def test_responses_request_uses_chat_template_and_greedy_contract(self) -> None:
+    def test_declared_qwen_grammar_installs_standard_response_parser(self) -> None:
+        class Tokenizer:
+            chat_template = (
+                "<|im_start|>assistant <think></think> <tool_call>"
+                "<function= <parameter= </parameter> </tool_call>"
+            )
+            response_template = None
+
+            def parse_response(self, _text: str, **_kwargs: object) -> object:
+                return {}
+
+        tokenizer = Tokenizer()
+        self.assertEqual(install_declared_response_protocol(tokenizer),
+                         "xml-function-v1")
+        self.assertEqual(
+            tokenizer.response_template["fields"]["tool_calls"]["content"],
+            "xml-inline",
+        )
+
+    def test_standard_tool_schema_keyword_is_forwarded(self) -> None:
+        class Tokenizer:
+            def parse_response(self, _text: str, tools: object = None, *,
+                               prefix: object = None) -> dict[str, object]:
+                self.tools = tools
+                self.prefix = prefix
+                return {"role": "assistant", "content": "done"}
+
+        app = application_fixture()
+        app.response_protocol = "xml-function-v1"
+        app.tokenizer = Tokenizer()
+        tool = {"type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object"},
+        }}
+        request = expert_server.GenerationRequest(
+            endpoint="chat", prompt_ids=[10, 11], cache_prefix_tokens=0,
+            maximum=8, stream=False, stop=(), include_usage=False,
+            tools=(tool,),
+        )
+        parsed = app.parse_assistant_output("done", request)
+        self.assertEqual(parsed.text, "done")
+        self.assertEqual(app.tokenizer.tools, [tool])
+        self.assertEqual(app.tokenizer.prefix, [10, 11])
+
+    def test_qwen_template_receives_xhigh_and_tools(self) -> None:
+        class Tokenizer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def apply_chat_template(self, _messages: object,
+                                    **kwargs: object) -> list[int]:
+                self.calls.append(kwargs)
+                return [10, 11]
+
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            model="test-model", maximum_new_tokens=32, max_context=128,
+        )
+        app.tokenizer = Tokenizer()
+        app.response_protocol = "fixture"
+        request = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather"}],
+            "tools": [{"type": "function", "function": {
+                "name": "weather", "parameters": {"type": "object"},
+            }}],
+            "max_completion_tokens": 8,
+        }, "chat")
+        self.assertEqual(request.reasoning_effort, "xhigh")
+        self.assertEqual(request.tools[0]["function"]["name"], "weather")
+        self.assertEqual(len(app.tokenizer.calls), 2)
+        for call in app.tokenizer.calls:
+            self.assertEqual(call["reasoning_effort"], "xhigh")
+            self.assertEqual(call["tools"][0]["function"]["name"], "weather")
+            self.assertTrue(call["enable_thinking"])
+            self.assertTrue(call["preserve_thinking"])
+
+    def test_responses_request_uses_artifact_sampling_contract(self) -> None:
         class Tokenizer:
             def apply_chat_template(self, messages: object, **_kwargs: object) -> list[int]:
                 self.messages = messages
                 return [10, 11]
 
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             model="test-model", maximum_new_tokens=32, max_context=128,
         )
@@ -444,10 +594,13 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertTrue(request.include_usage)
         self.assertEqual(app.tokenizer.messages[0],
                          {"role": "system", "content": "be concise"})
-        with self.assertRaises(RequestError) as raised:
-            app.parse_request({"model": "test-model", "input": "hello",
-                               "temperature": 0.5}, "responses")
-        self.assertEqual(raised.exception.param, "temperature")
+        sampled = app.parse_request({
+            "model": "test-model", "input": "hello",
+            "temperature": 0.5, "top_p": 0.8, "top_k": 7,
+            "min_p": 0.1, "seed": 42,
+        }, "responses")
+        self.assertEqual(sampled.sampling,
+                         SamplingSettings(0.5, 0.8, 7, 0.1, 42))
 
         app.args.max_context = 9
         with self.assertRaises(RequestError) as raised:
@@ -469,7 +622,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                                     **_kwargs: object) -> list[int]:
                 raise AssertionError("generic template must not be used")
 
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.tokenizer = Tokenizer()
         seen: dict[str, object] = {}
 
@@ -502,7 +655,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             client_side.close()
 
     def test_context_credits_are_bounded_and_reusable(self) -> None:
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.worker = types.SimpleNamespace(
             kv_page_tokens=256, kv_page_capacity=3,
         )
@@ -521,7 +674,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             kv_page_capacity=8,
         )
         worker.drop_session = lambda _key: None
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             disable_session_retention=False,
             session_idle_seconds=1800.0,
@@ -542,7 +695,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(app.kv_reserved_pages, 0)
 
     def test_model_info_reports_effective_placement_contract(self) -> None:
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             model="test-model", build_id="build", maximum_queue=8,
             worker_capacity=4, host="127.0.0.1", port=8080,
@@ -554,7 +707,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             enable_worker_cpu_hybrid=False,
             disable_session_retention=False, session_idle_seconds=1800.0,
             latency_window=4096, queue_timeout=1.0,
-            generation_timeout=120.0,
+            generation_timeout=120.0, maximum_body_bytes=16 << 20,
         )
         app.manifest = {
             "source": {}, "format": {}, "quantization": {},
@@ -614,6 +767,12 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "mtp_enabled": False,
             "retain_previous_route": True,
             "cpu_hybrid_enabled": True,
+            "response_protocol": None,
+            "sampling": {
+                "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+                "min_p": 0.0,
+                "source": "tokenizer/generation_config.json",
+            },
         })
         self.assertEqual(info["worker_kv"]["dtype"], "bf16")
         self.assertEqual(info["worker_kv"]["allocation"], "preallocated")
@@ -734,7 +893,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 self.fed: dict[int, int] = {}
 
             def begin(self, request_id: int, prompt: list[int],
-                      _context_limit: int) -> None:
+                      _context_limit: int,
+                      _sampling: SamplingSettings) -> None:
                 self.active_ids.add(request_id)
                 self.fed[request_id] = len(prompt)
 
@@ -773,7 +933,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 return ",".join(str(token) for token in tokens)
 
         worker = Worker()
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             generation_timeout=60.0, disable_session_retention=False,
             session_idle_seconds=1800.0, max_context=64,
@@ -811,7 +971,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 self.active_ids: set[int] = set()
 
             def begin(self, request_id: int, _prompt: list[int],
-                      _context_limit: int) -> None:
+                      _context_limit: int,
+                      _sampling: SamplingSettings) -> None:
                 self.active_ids.add(request_id)
 
             def cancel(self, request_id: int) -> None:
@@ -826,7 +987,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             def decode(self, tokens: list[int], **_kwargs: object) -> str:
                 return ",".join(str(token) for token in tokens)
 
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(generation_timeout=10.0)
         app.request_id = lambda: 1
         app.worker = Worker()
@@ -854,13 +1015,15 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 self.begins: list[tuple[str, list[int]]] = []
 
             def begin(self, request_id: int, prompt: list[int],
-                      _context_limit: int) -> None:
+                      _context_limit: int,
+                      _sampling: SamplingSettings) -> None:
                 self.active_ids.add(request_id)
                 self.fed[request_id] = len(prompt)
                 self.begins.append(("fresh", list(prompt)))
 
             def begin_resume(self, request_id: int, session_key: int,
-                             delta: list[int], _context_limit: int) -> None:
+                             delta: list[int], _context_limit: int,
+                             _sampling: SamplingSettings) -> None:
                 assert session_key in self.retained
                 self.active_ids.add(request_id)
                 self.fed[request_id] = self.retained.pop(session_key) + len(delta)
@@ -895,7 +1058,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 return ",".join(str(token) for token in tokens)
 
         worker = Worker()
-        app = Application.__new__(Application)
+        app = application_fixture()
         app.args = types.SimpleNamespace(
             generation_timeout=60.0, disable_session_retention=False,
             session_idle_seconds=1800.0, max_context=64,

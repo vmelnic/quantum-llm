@@ -1,256 +1,181 @@
 # OpenAI-compatible HTTP API
 
-Status: current public pilot contract as of 2026-08-11. All supported artifacts
-use this same service; unsupported API features still fail explicitly.
+Status: current Qwen3.8 pilot contract as of 2026-08-19.
 
-This document is the public contract of the local Expert Runtime service. The
-implementation targets wire compatibility with OpenAI clients for deterministic
-text generation. It does not silently emulate capabilities that the model
-runner does not have: unsupported sampling, multimodal, tool, logprob and
-server-side state options return a structured `400` error.
-
-The canonical loopback deployment listens on `http://127.0.0.1:8080/v1`. It
-serves exactly one selected artifact at a time through the common MoE VM
-runner. Qwen3-Next 80B FP4, DeepSeek-V4-Flash and LFM2-8B-A1B FP4 have passed
-the real `hi` lifecycle gate.
+The service exposes one artifact at a time through the common VM runner on
+`http://127.0.0.1:8080/v1`. Request formatting, response parsing, sampling and
+tool support are enabled from artifact/tokenizer capabilities; common API code
+does not select behavior from a Qwen or DeepSeek model name.
 
 ## Endpoints
 
 | Method | Path | Contract |
 |---|---|---|
-| `POST` | `/v1/responses` | Responses API text generation, JSON or typed SSE |
+| `POST` | `/v1/responses` | Responses API text and function calls, JSON or typed SSE |
 | `POST` | `/v1/chat/completions` | Chat Completions, JSON or chunked SSE |
-| `POST` | `/v1/completions` | Legacy Completions, JSON or chunked SSE |
-| `GET` | `/v1/models` | OpenAI model list object |
-| `GET` | `/v1/models/{model}` | Retrieve the deployed model |
-| `GET` | `/health` | Process/worker liveness |
+| `POST` | `/v1/completions` | Legacy text Completions, JSON or chunked SSE |
+| `GET` | `/v1/models` | Deployed model list |
+| `GET` | `/v1/models/{model}` | Deployed model identity |
+| `GET` | `/health` | Process and worker liveness |
 | `GET` | `/ready` | Admission readiness |
-| `GET` | `/model-info` | Exact build, container hashes and runtime limits |
-| `GET` | `/metrics` | Prometheus text metrics |
+| `GET` | `/model-info` | Artifact, runtime limits and provider capabilities |
+| `GET` | `/metrics` | Prometheus metrics |
 
-Every JSON/SSE response includes `x-request-id`. Errors use the OpenAI shape:
+Every JSON/SSE response includes `x-request-id`. Unsupported values fail with
+a structured OpenAI-shaped `400`; the service never silently substitutes a
+different execution mode.
 
-```json
-{
-  "error": {
-    "message": "sampling is not implemented; omit temperature or use 0",
-    "type": "invalid_request_error",
-    "param": "temperature",
-    "code": "unsupported_value"
-  }
-}
-```
+## Authentication
 
-## Authentication and exposure
-
-Loopback deployment does not require a key. A non-loopback bind is refused by
-the launcher unless `EXPERT_API_KEY` is set; clients then send:
+Loopback deployment needs no key. A non-loopback bind is rejected unless
+`EXPERT_API_KEY` is configured, after which clients send:
 
 ```http
 Authorization: Bearer <EXPERT_API_KEY>
 ```
 
-The service has no TLS terminator. Do not expose it directly outside a trusted
-host/network; put authentication and TLS at a reverse proxy if remote access is
-required.
+The built-in service is not a public TLS edge. Use a firewall and an
+authenticated, rate-limited TLS reverse proxy for non-loopback exposure.
 
-## OpenAI SDK examples
+## Qwen3.8 prompt and response contract
 
-The normal OpenAI `base_url` override works; any non-empty placeholder key is
-enough for the loopback deployment.
+The published Qwen3.8 artifact carries the official tokenizer assets. The
+server uses the tokenizer's declared chat template and standard Transformers
+response parser. It does not invent a second tool or reasoning language.
 
-For an interactive terminal chat, including an owned SSH tunnel and streaming
-output, run from a POSIX control host:
+For Qwen3.8:
 
-```bash
-cp .env.example .env
-# Set CHAT_SSH in .env, then:
-./ops/model.sh chat
+- reasoning is enabled by default with `reasoning_effort="xhigh"`;
+- hidden reasoning is returned as `reasoning_content` by Chat Completions and
+  counted in `usage.completion_tokens_details.reasoning_tokens`;
+- `chat_template_kwargs.enable_thinking` and `preserve_thinking` are accepted;
+- function definitions are passed to the official template;
+- the declared XML response grammar is parsed into standard OpenAI tool calls;
+- assistant tool calls and following `tool` results can be sent back as normal
+  conversation history.
+
+An artifact without a compatible response grammar rejects non-empty `tools`.
+DeepSeek continues to use its pinned official encoder because its checkpoint
+does not publish a Transformers chat template.
+
+## Sampling
+
+Qwen3.8 defaults come from its immutable `generation_config.json`:
+
+```text
+do_sample=true, temperature=1.0, top_p=0.95, top_k=20
 ```
 
-The `.env` file controls the SSH target, model, service context/output limits,
-per-turn chat token limit, ports, readiness timeout, Python executable, base
-URL, and optional API key; every variable is listed in `.env.example`. CLI
-flags remain optional overrides. The client retains conversation history.
-Enter `quit` or `exit`, or press Ctrl+C, to close both the client and the tunnel
-it created. With an empty `CHAT_SSH`, it connects directly to `CHAT_BASE_URL`.
+The SM86 provider implements token selection from logits with temperature,
+top-k, top-p and min-p. `temperature=0` selects greedy decoding. The request
+may override:
 
-After readiness, the terminal client resolves the single deployed model from
-`/v1/models`. `CHAT_MODEL` remains the default selection used by lifecycle
-commands, but a preceding explicit `model.sh start qwen` does not make chat send
-the stale DeepSeek model ID. A mismatch is reported and corrected explicitly.
+| Field | Accepted values |
+|---|---|
+| `temperature` | `0.0` through `2.0` |
+| `top_p` | greater than `0.0` through `1.0` |
+| `top_k` | non-negative integer; `0` disables the filter |
+| `min_p` | `0.0` through `1.0` |
+| `seed` | integer |
 
-With `CHAT_SHOW_STATS=1`, every turn prints prompt/output token counts, TTFT,
-total request time, end-to-end tokens/s, post-first-token rate, and finish
-reason. `/info` displays the deployed build, placement profile, MTP state,
-context/output limits, capacity, current RAM/VRAM expert-cache use, KV pages,
-storage format, prefetch state, and worker protocol. `/stats` repeats the last
-turn, while `/clear` starts a new conversation without restarting the model.
+Sampling is a provider capability. Startup and `/model-info` report the actual
+provider contract; a provider that cannot sample fails the request rather than
+pretending to honor it. Sampled generation does not accept greedy MTP drafts as
+exact matches; MTP state is kept synchronized without changing the requested
+distribution.
 
-DeepSeek-V4-Flash does not publish a Transformers `chat_template`. For that
-model the service loads the pinned checkpoint's official
-`encoding/encoding_dsv4.py` and uses its `encode_messages(...,
-thinking_mode="chat")` contract for Chat Completions and Responses. Plain
-Completions continues to tokenize the supplied prompt without a chat wrapper.
+Presence/frequency penalties, logit bias and logprobs remain unsupported.
+
+## Tool calling
+
+Chat Completions and Responses accept OpenAI function tools. `tool_choice` may
+be `auto` or `none`. `required` and named-function forcing are rejected because
+the runtime does not yet implement constrained decoding.
 
 ```python
 from openai import OpenAI
 
 client = OpenAI(api_key="local", base_url="http://127.0.0.1:8080/v1")
+model = client.models.list().data[0].id
 
-response = client.responses.create(
-    model="qwen3-next-80b-a3b-expert-pack-fp4",
-    instructions="Answer briefly.",
-    input="Why is the sky blue?",
-    max_output_tokens=64,
-    temperature=0,
+response = client.chat.completions.create(
+    model=model,
+    messages=[{"role": "user", "content": "What is the weather in Chisinau?"}],
+    tools=[{
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Return current weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }],
+    tool_choice="auto",
 )
-print(response.output_text)
+print(response.choices[0].message.tool_calls)
 ```
 
-```python
-stream = client.chat.completions.create(
-    model="qwen3-next-80b-a3b-expert-pack-fp4",
-    messages=[{"role": "user", "content": "Write one sentence."}],
-    max_completion_tokens=64,
-    temperature=0,
-    stream=True,
-    stream_options={"include_usage": True},
-)
-for chunk in stream:
-    if chunk.choices and chunk.choices[0].delta.content:
-        print(chunk.choices[0].delta.content, end="")
-```
+The real Qwen3.8 gate produced `get_weather` with
+`{"city":"Chisinau"}` and, after receiving the tool result, returned the final
+natural-language answer. Tools are model-generated calls; their JSON schemas
+are prompt guidance, not a constrained grammar guarantee.
 
-The Responses API accepts a string or an array of text messages. Chat accepts
-`system`, `developer`, `user` and `assistant`; `developer` is mapped to the
-model's system role. Modern text content parts (`text`, `input_text`, and
-`output_text`) are normalized before applying the local tokenizer's chat
-template.
-
-## Supported request fields
+## Supported request surface
 
 | Field | Support |
 |---|---|
-| `model` | Must equal the model returned by `/v1/models` |
-| `input`, `messages`, `prompt` | Text and token IDs as appropriate for the endpoint |
-| `instructions` | Responses API; prepended as a system message |
-| `max_output_tokens` | Responses API, bounded by the service limit |
-| `max_completion_tokens`, `max_tokens` | Chat/Completions, bounded by the service limit |
-| `stream` | JSON response or SSE |
-| `stream_options.include_usage` | Final usage chunk for Chat/Completions |
-| `stop` | One string or up to four strings; matches may cross token boundaries |
-| `temperature` | Omitted or exactly `0` (greedy execution) |
-| `top_p` | Omitted or exactly `1` |
-| `n`, `best_of` | Omitted or exactly `1` |
-| `seed`, `user`, `metadata`, `store`, `service_tier` | Accepted; no remote persistence or tiering is performed |
-| `response_format` / `text.format` | Plain `text` only |
-| `tools`, `functions` | Empty arrays only |
-| `tool_choice` | `none` or `auto` only when no tools are supplied |
-| `presence_penalty`, `frequency_penalty` | Omitted or exactly `0` |
-| `logprobs`, `top_logprobs` | Disabled (`false`/`0`) only |
+| `model` | Must equal the deployed model |
+| `input`, `messages`, `prompt`, `instructions` | Text/token input appropriate to the endpoint |
+| `max_output_tokens`, `max_completion_tokens`, `max_tokens` | Bounded by the service limit |
+| `stream`, `stream_options.include_usage` | JSON or SSE |
+| `stop` | One string or up to four strings |
+| sampling fields | As described above |
+| `reasoning_effort` / `reasoning.effort` | `xhigh`, `medium`, or `low`; default `xhigh` |
+| `tools`, legacy `functions` | Function tools when the artifact declares a response parser |
+| `tool_choice` | `auto` or `none` |
+| `n`, `best_of` | Omitted or `1` |
+| `response_format` / `text.format` | Plain text only |
 | `modalities` | Omitted or `['text']` |
-| `truncation` | Omitted or `disabled` |
+| `metadata`, `user`, `seed` | Accepted |
 
-Unknown harmless metadata fields are tolerated. Known capability fields are
-validated so a client never believes that sampling or structured output was
-honored when it was not.
+Images, audio, JSON-schema output, logprobs, server-side conversations,
+`previous_response_id`, background mode, retrieve/cancel-by-ID and WebSocket
+mode are not implemented.
 
-## Explicitly unavailable
+## Sessions and streaming
 
-The current worker returns the selected greedy token, not a logits vector.
-Consequently the API rejects nonzero temperature, nucleus sampling, penalties,
-logit bias and logprobs. The text-only runner also rejects images, audio, files,
-tool/function calling and JSON schema output.
+The server retains bounded worker state for an append-only conversation and
+prefills only the new token suffix. The client must still resend history; this
+is an internal optimization, not remote conversation storage.
 
-The server retains worker KV/recurrent state between requests as protocol-v5
-retained sessions (LRU-bounded by worker slots and KV capacity,
-idle-expiring): a continuing conversation whose new prompt extends the
-previous turn's tokens prefills only the delta. This is an internal
-optimization, not an API feature — Responses API storage,
-`previous_response_id`, conversations, background mode, WebSocket mode
-and retrieve/cancel-by-response-ID are not implemented. A client must still
-resend conversation history.
+Chat streaming emits ordered choice deltas, including `reasoning_content`,
+visible `content`, and complete tool-call deltas. Responses streaming emits
+typed lifecycle, text and function-call events. Disconnecting a client cancels
+the active worker request before another decode step is admitted.
 
-These are inference/runtime capability gaps, not merely missing JSON fields.
-Adding them correctly requires extending the worker protocol and GPU runner.
+## Limits and performance metrics
 
-## Streaming contracts
+The reference Qwen3.8 profile is:
 
-Chat/Completions streams use `data: <json>` SSE frames, a final choice carrying
-`finish_reason`, an optional usage-only chunk, then `data: [DONE]`.
-Text deltas are stable Unicode prefixes: incomplete tokenizer byte-fallback
-sequences are held until they decode without a replacement suffix. Already
-emitted text is never replayed to repair a later prefix.
+```text
+MODEL_MAX_CONTEXT=262144
+MODEL_MAX_OUTPUT_TOKENS=8192
+MODEL_MAX_BODY_MIB=16
+MODEL_KV_CACHE_MIB=5120
+```
 
-Responses streams emit typed lifecycle events:
+Prompt plus requested output must fit the context. KV pages are allocated on
+demand; advertising 262,144 does not allocate that context for a short request.
 
-1. `response.created`
-2. `response.output_item.added`
-3. `response.content_part.added`
-4. zero or more `response.output_text.delta`
-5. `response.output_text.done`
-6. `response.content_part.done`
-7. `response.output_item.done`
-8. `response.completed`
+An actual 262,016-token prompt plus 128 generated tokens completed, proving the
+full 262,144-token capacity path. It does not prove semantic quality for every
+long document or the 30 tok/s objective. See
+[Production readiness](production-readiness.md).
 
-This follows the official distinction: Chat streaming uses incremental choice
-deltas, while Responses streaming uses typed semantic events. A disconnected
-client cancels the active worker request before another decode step is queued.
-
-## Limits and operational behavior
-
-Effective limits are returned by `/model-info.runtime_config`. Deployments made
-through `ops/model.sh` take them from `MODEL_MAX_CONTEXT` and
-`MODEL_MAX_OUTPUT_TOKENS`; the reference `.env.example` enables a 65,536-token
-context and at most 8,192 generated tokens. Prompt plus requested output must
-fit the context. The request body limit is 1 MiB.
-
-Those configured ceilings are distinct from qualification and checkpoint
-metadata. For example, Qwen advertises 262K positions and DeepSeek-V4-Flash
-advertises 1M;
-the only completed long-context correctness gate remains 4,096. The 65,536
-DeepSeek setting fits its capacity-one 2 GiB logical KV budget, but long-prompt
-quality and performance remain unqualified. Model metadata is therefore not
-exposed automatically as an operational API promise. If
-concurrent requests exhaust KV page credits, admission returns HTTP `503` with code
-`context_capacity_exhausted` before streaming starts.
-
-`/model-info.worker_kv` reports the backend dtype and allocation strategy, page
-geometry, total logical page capacity, currently reserved pages, and physical
-allocation expressed in the same page geometry. Qwen uses on-demand FP16 pages;
-DeepSeek currently uses preallocated BF16 request state.
-`/model-info.worker_prefill` reports the backend's causal prefill mode and maximum
-tokens per chunk.
-`/model-info.worker_execution` distinguishes an authenticated MTP resource from
-an active speculative path. `mtp_resource_available` means descriptors exist;
-`mtp_runtime_ready` means the worker also loaded the tensor state, compact pack,
-shared expert, cache and directory. MTP activation is derived from the
-artifact's draft/verify operation program and provider readiness; there is no
-model-launcher `EnableMtp` switch in the current common path. Clients must not
-infer speculative generation from bundle contents alone. When active, the
-internal protocol may return a verified bonus token, but HTTP streaming remains
-one ordered text delta at a time.
-
-`/model-info.worker_placement` is the authoritative effective placement
-contract. It returns the selected `profile`, exact RAM/VRAM cache bytes,
-whether speculative prefetch is enabled, and the required recent-observation
-count. `/model-info.runtime_config.placement_profile` reports the requested
-launcher value; startup fails if the worker reports a different profile or
-budget.
-
-Admission is bounded. Overload/drain returns HTTP `503` with code `overloaded`;
-it does not create an unbounded queue. Generation timeout returns `504` before
-streaming starts. After streaming begins, every endpoint emits a structured SSE
-error and terminates the stream; Chat/Completions also emit `[DONE]`.
-
-`finish_reason` is `stop` for EOS or a requested stop sequence and `length`
-when the output-token limit is reached. Usage counts are tokenizer token counts;
-the generated token that discovers a stop sequence is included even though the
-matched stop text is not returned.
-
-## Upstream references
-
-- [OpenAI Responses API reference](https://developers.openai.com/api/reference/resources/responses)
-- [OpenAI streaming Responses guide](https://developers.openai.com/api/docs/guides/streaming-responses)
-- [OpenAI migration guide: streaming consumers](https://developers.openai.com/api/docs/guides/migrate-to-responses#7-update-streaming-consumers)
+For reasoning models, do not derive decode throughput from the first visible
+content delta: hidden reasoning may precede it. The authoritative rate uses
+server `request_telemetry.ttft_seconds`, which starts at the first generated
+token, and `generated_tokens`, which includes hidden reasoning consistently.

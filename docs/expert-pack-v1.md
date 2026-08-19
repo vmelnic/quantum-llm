@@ -1,8 +1,9 @@
 # Expert Pack v1
 
-Status: current Qwen/LFM physical container contract as of 2026-08-11.
-DeepSeek still uses worker bundle v3 plus compact pack v1; the next container
-unification is tracked in [the MoE VM handoff](moe-vm-next.md).
+Status: current FP4 physical container contract as of 2026-08-19. The active
+dense deployment is Qwen3.8-27B; sparse DeepSeek still uses its compact/bundle
+adapter. Container unification is tracked in
+[the current handoff](moe-vm-next.md).
 
 Expert Pack is a compute-ready, placement-oriented container for sparse MoE
 inference. It is not only a quantization format: dense tensors and individual
@@ -49,10 +50,10 @@ packs, indexes, masses, requirements, tokenizer, integrity
 Key responsibilities:
 
 - `source`: immutable checkpoint identity, file sizes and SHA-256;
-- `architecture`: complete OLMoE, Qwen3-Next or LFM2-MoE
+- `architecture`: complete OLMoE, Qwen3-Next, Qwen3.8 or LFM2-MoE
   geometry/semantics;
-- `model_program`: authenticated `runtime-model.tsv` schema 2 execution
-  descriptor;
+- `model_program`: authenticated `runtime-model.tsv` execution descriptor;
+  the current Qwen3.8 artifact uses schema 3;
 - `quantization`: current serving profile
   `fp4-e2m1-ue8m0-block32-v1` (quant ABI 3); quant ABI 1 remains readable only
   for legacy format/test compatibility;
@@ -153,6 +154,8 @@ The adapter owns semantics that cannot be inferred from shapes. Examples:
 
 - OLMoE query/key normalization and tensor naming;
 - Qwen3-Next alternating full attention and Gated DeltaNet;
+- Qwen3.8 alternating full and gated linear attention, multimodal source
+  partition and dense MTP roles;
 - LFM2-MoE dense-prefix and sparse-layer tensor roles;
 - attention output gate and partial RoPE;
 - Qwen3-Next normalization `(1 + weight)` where specified;

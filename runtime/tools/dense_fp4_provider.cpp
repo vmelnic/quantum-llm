@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <cmath>
 #include <cstddef>
@@ -19,8 +20,10 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <span>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,12 +38,13 @@ namespace ec = expert::runtime::cuda;
 constexpr std::string_view kHiddenAbi = "batch.hidden.f32.cuda.v1";
 constexpr std::string_view kTokenAbi = "batch.token-id.u32.host.v1";
 constexpr std::string_view kPositionAbi = "batch.position.u32.host.v1";
-// Prefill uses the SM86 integer tensor-core tile, while scalar/speculative
-// decode retains the lower-latency DP4A path.
-constexpr std::uint32_t kWorkspaceRows = 64U;
+// Prefill reuses each decoded SM86 FP4 weight tile across four 128-row Tensor
+// Core tiles, while scalar/speculative decode retains the lower-latency DP4A
+// path. The provider publishes this geometry through its service contract;
+// no model-family branch selects it.
+constexpr std::uint32_t kWorkspaceRows = 512U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
-constexpr std::uint32_t kPrefillAttentionSplitTokens = 4096U;
-constexpr std::uint32_t kMinimumPrefillAttentionSplits = 8U;
+constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 
 enum class Kernel : std::uint8_t {
   embedding,
@@ -114,6 +118,110 @@ std::uint32_t align32(std::uint32_t value) {
   return (value + 31U) & ~31U;
 }
 
+std::uint64_t request_parameter(const er::ProgramRequestContext& request,
+                                std::string_view name) {
+  const auto found = request.parameters.find(name);
+  if (found == request.parameters.end())
+    throw std::runtime_error("missing request parameter " +
+                             std::string(name));
+  return found->second;
+}
+
+std::uint64_t splitmix64(std::uint64_t value) noexcept {
+  value += 0x9e3779b97f4a7c15ULL;
+  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
+  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
+  return value ^ (value >> 31U);
+}
+
+std::uint32_t sample_token(std::span<const float> logits,
+                           const er::ProgramRequestContext& request,
+                           std::uint32_t position) {
+  const auto temperature_ppm =
+      request_parameter(request, "sampling_temperature_ppm");
+  const auto top_p_ppm = request_parameter(request, "sampling_top_p_ppm");
+  const auto top_k_value = request_parameter(request, "sampling_top_k");
+  const auto min_p_ppm = request_parameter(request, "sampling_min_p_ppm");
+  const auto seed = request_parameter(request, "sampling_seed");
+  if (logits.empty() || temperature_ppm == 0U ||
+      temperature_ppm > 2'000'000U || top_p_ppm == 0U ||
+      top_p_ppm > 1'000'000U || top_k_value > logits.size() ||
+      min_p_ppm > 1'000'000U)
+    throw std::runtime_error("invalid token sampling contract");
+
+  const auto candidate_count = static_cast<std::size_t>(
+      top_k_value == 0U ? logits.size() : top_k_value);
+  std::vector<std::uint32_t> candidates(logits.size());
+  std::iota(candidates.begin(), candidates.end(), 0U);
+  const auto greater_logit = [&](std::uint32_t left, std::uint32_t right) {
+    const auto left_value = logits[left];
+    const auto right_value = logits[right];
+    if (std::isnan(left_value)) return false;
+    if (std::isnan(right_value)) return true;
+    return left_value == right_value ? left < right : left_value > right_value;
+  };
+  if (candidate_count != candidates.size()) {
+    std::partial_sort(candidates.begin(),
+                      candidates.begin() + candidate_count,
+                      candidates.end(), greater_logit);
+    candidates.resize(candidate_count);
+  } else {
+    std::sort(candidates.begin(), candidates.end(), greater_logit);
+  }
+  if (candidates.empty() || !std::isfinite(logits[candidates.front()]))
+    throw std::runtime_error("token logits contain no finite candidate");
+
+  const auto inverse_temperature =
+      1'000'000.0 / static_cast<double>(temperature_ppm);
+  const auto maximum = static_cast<double>(logits[candidates.front()]);
+  const auto minimum_relative =
+      static_cast<double>(min_p_ppm) / 1'000'000.0;
+  std::vector<double> weights;
+  weights.reserve(candidates.size());
+  std::size_t retained{};
+  double total{};
+  for (const auto token : candidates) {
+    const auto logit = static_cast<double>(logits[token]);
+    const auto weight = std::isfinite(logit)
+                            ? std::exp((logit - maximum) * inverse_temperature)
+                            : 0.0;
+    if (weight < minimum_relative) continue;
+    candidates[retained++] = token;
+    weights.push_back(weight);
+    total += weight;
+  }
+  candidates.resize(retained);
+  if (candidates.empty() || !std::isfinite(total) || !(total > 0.0))
+    throw std::runtime_error("token sampling distribution is empty");
+
+  const auto top_p = static_cast<double>(top_p_ppm) / 1'000'000.0;
+  double cumulative{};
+  std::size_t nucleus = weights.size();
+  for (std::size_t index = 0U; index < weights.size(); ++index) {
+    cumulative += weights[index] / total;
+    if (cumulative >= top_p) {
+      nucleus = index + 1U;
+      break;
+    }
+  }
+  weights.resize(nucleus);
+  candidates.resize(nucleus);
+  total = std::accumulate(weights.begin(), weights.end(), 0.0);
+
+  const auto random_bits = splitmix64(
+      seed ^ (static_cast<std::uint64_t>(position) *
+              0xd2b74407b1ce6e93ULL));
+  const auto uniform = static_cast<double>(random_bits >> 11U) *
+                       (1.0 / 9007199254740992.0);
+  const auto threshold = uniform * total;
+  cumulative = 0.0;
+  for (std::size_t index = 0U; index < weights.size(); ++index) {
+    cumulative += weights[index];
+    if (threshold < cumulative) return candidates[index];
+  }
+  return candidates.back();
+}
+
 er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
   const auto parameter = [&](std::string_view name) -> std::uint64_t {
     const auto found = model.attributes.find(name);
@@ -158,6 +266,7 @@ std::vector<er::KernelCapability> provider_capabilities() {
        validator},
       {"ffn.swiglu.dense.fp4-block32.v1", 1U, 1U, validator},
       {"head.rmsnorm.argmax.fp4-block32.v1", 1U, 1U, validator},
+      {"head.rmsnorm.token-select.fp4-block32.v1", 1U, 1U, validator},
       {"decode.mtp.dense-full-attention.fp4-block32.exact.v1", 1U, 1U,
        validator},
   };
@@ -173,7 +282,8 @@ Kernel kernel_from_capability(std::string_view capability) {
     return Kernel::recurrent_attention;
   if (capability == "ffn.swiglu.dense.fp4-block32.v1")
     return Kernel::ffn;
-  if (capability == "head.rmsnorm.argmax.fp4-block32.v1")
+  if (capability == "head.rmsnorm.argmax.fp4-block32.v1" ||
+      capability == "head.rmsnorm.token-select.fp4-block32.v1")
     return Kernel::head;
   if (capability ==
       "decode.mtp.dense-full-attention.fp4-block32.exact.v1")
@@ -366,6 +476,17 @@ class DenseFp4Provider final : public er::IOperationProvider {
       const er::IPreparedOperation& operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& state,
       const er::OperationInvocation& invocation) override;
+  [[nodiscard]] bool supports_program_sequence(
+      const er::CompiledModelProgram& program) const noexcept override;
+  er::OperationExecutionHandle execute_program_sequence(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      const er::ProgramSequenceInvocation& invocation) override;
+  er::Status checkpoint_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      std::uint32_t next_position) override;
+  er::Status rewind_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      std::uint32_t next_position) override;
   er::Status synchronize_exact_decode(
       const er::IPreparedOperation& operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& state,
@@ -398,6 +519,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_exact_sync_tokens", exact_sync_tokens_},
             {"provider_exact_calls", exact_calls_},
             {"provider_accepted_drafts", accepted_drafts_},
+            {"provider_program_sequence_batches", program_sequence_batches_},
+            {"provider_program_sequence_tokens", program_sequence_tokens_},
+            {"provider_staged_dense_weight_bytes",
+             staged_dense_weight_capacity_bytes_},
             {"provider_gpu_measured_batches", gpu_measured_batches_},
             {"provider_gpu_embedding_ns",
              gpu_phase_ns_[static_cast<std::size_t>(GpuPhase::embedding)]},
@@ -441,11 +566,33 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::uint32_t mtp_length{};
     std::uint32_t synchronized_token{};
     std::uint32_t draft_token{};
+    std::uint32_t retention_position{};
+    std::vector<float> sequence_target_hidden;
     bool draft_valid{};
+    bool retention_valid{};
 
    private:
     DenseFp4Provider& provider_;
     std::uint32_t slot_{};
+  };
+
+  struct SequenceState final {
+    std::shared_ptr<RequestState> request;
+    er::ProgramRequestContext generation;
+    std::vector<const PreparedOperation*> operations;
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::uint32_t> positions;
+    std::vector<float> hidden;
+    std::size_t next_operation{};
+    std::size_t next_row{};
+    std::uint32_t retention_position{};
+    std::atomic<bool> cancelled{};
+    bool terminal{};
+  };
+
+  struct StagedDenseWeight final {
+    const void* data{};
+    std::size_t bytes{};
   };
 
   static std::uint32_t parameter_u32(
@@ -599,6 +746,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
       er::OperationExecutionResult result) const;
   [[nodiscard]] er::ExactDecodeExecutionHandle completed_exact(
       er::ExactDecodeExecutionResult result) const;
+  [[nodiscard]] std::optional<er::OperationExecutionResult>
+  poll_program_sequence(const std::shared_ptr<SequenceState>& sequence);
+  void stage_operation_weights(const PreparedOperation& operation);
+  void activate_staged_weights(const PreparedOperation& operation);
+  void deactivate_staged_weights() noexcept;
   [[nodiscard]] const er::ExecutionValue& invocation_input(
       const PreparedOperation& operation,
       const er::OperationInvocation& invocation,
@@ -630,6 +782,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   void run_ffn(const PreparedOperation& operation, std::uint32_t rows);
   std::vector<std::uint32_t> run_head(const PreparedOperation& operation,
                                       std::uint32_t rows,
+                                      const er::ProgramRequestContext* request,
+                                      std::uint32_t sample_position,
                                       bool terminal_only = false);
   std::vector<std::uint32_t> run_target(
       std::uint32_t slot, std::span<const std::uint32_t> tokens,
@@ -681,6 +835,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t exact_sync_tokens_{};
   std::uint64_t exact_calls_{};
   std::uint64_t accepted_drafts_{};
+  std::uint64_t program_sequence_batches_{};
+  std::uint64_t program_sequence_tokens_{};
   std::array<std::uint64_t, static_cast<std::size_t>(GpuPhase::count)>
       gpu_phase_ns_{};
   std::uint64_t gpu_measured_batches_{};
@@ -698,6 +854,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::mutex mutex_;
   std::vector<bool> slot_in_use_;
   bool initialized_{};
+  const PreparedOperation* staged_operation_{};
+  std::map<const DeviceTensor*, StagedDenseWeight> staged_weight_bindings_;
+  std::map<const DeviceTensor*, StagedDenseWeight> active_staged_weights_;
+  std::size_t staged_dense_weight_capacity_bytes_{};
+  std::size_t staged_dense_input_capacity_bytes_{};
 
   // Workspace and state are declared below with the execution methods.
   float* hidden_{};
@@ -720,12 +881,19 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t* output_tokens_{};
   std::int8_t* q8_{};
   float* q8_scales_{};
+  std::uint16_t* staged_dense_weights_{};
+  std::uint16_t* staged_dense_input_{};
   float* partial_maxima_{};
   float* partial_sums_{};
   float* partial_outputs_{};
   std::uint32_t attention_maximum_splits_{};
-  std::uint32_t prefill_attention_maximum_splits_{};
-  std::uint32_t attention_scratch_splits_{};
+  std::uint16_t* staged_queries_{};
+  std::uint16_t* staged_keys_{};
+  std::uint16_t* staged_values_{};
+  float* staged_scores_{};
+  std::uint16_t* staged_probabilities_{};
+  float* staged_accumulator_{};
+  std::uint32_t staged_split_tokens_{};
   float* mtp_embedding_{};
   float* mtp_embedding_norm_{};
   float* mtp_hidden_norm_{};
@@ -736,6 +904,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::vector<float*> recurrent_matrix_state_;
   std::vector<float*> recurrent_conv_checkpoint_;
   std::vector<float*> recurrent_matrix_checkpoint_;
+  std::vector<float*> recurrent_conv_retention_checkpoint_;
+  std::vector<float*> recurrent_matrix_retention_checkpoint_;
+  float* slot_retention_last_hidden_{};
   void** device_page_table_{};
   std::vector<std::vector<void*>> slot_pages_;
   std::vector<void*> free_kv_pages_;
@@ -876,6 +1047,37 @@ void DenseFp4Provider::initialize_execution() {
       (descriptor_.exact_decode_program.has_value() && !exact_) ||
       !intermediate_size_)
     throw std::runtime_error("dense FP4 operation program is not fully prepared");
+  for (const auto& operation : prepared_target_) {
+    if (operation->kernel == Kernel::embedding ||
+        operation->kernel == Kernel::head)
+      continue;
+    std::set<const DeviceTensor*> unique;
+    std::size_t operation_bytes{};
+    for (const auto& [role, tensor] : operation->tensors) {
+      static_cast<void>(role);
+      if (!tensor || tensor->encoding != "FP4_E2M1" ||
+          tensor->shape.size() != 2U || !unique.insert(tensor).second)
+        continue;
+      const auto matrix = tensor->matrix();
+      const auto values =
+          static_cast<std::size_t>(matrix.rows) * matrix.padded_columns;
+      if (values > std::numeric_limits<std::size_t>::max() /
+                       sizeof(std::uint16_t) ||
+          operation_bytes >
+              std::numeric_limits<std::size_t>::max() -
+                  values * sizeof(std::uint16_t))
+        throw std::runtime_error("staged dense weight workspace overflows");
+      operation_bytes += values * sizeof(std::uint16_t);
+    }
+    staged_dense_weight_capacity_bytes_ =
+        std::max(staged_dense_weight_capacity_bytes_, operation_bytes);
+  }
+  const auto maximum_columns = align32(std::max(
+      {2U * hidden_size_, hidden_size_, intermediate_size_,
+       query_heads_ * head_dim_, value_heads_ * value_head_dim_}));
+  staged_dense_input_capacity_bytes_ =
+      static_cast<std::size_t>(kWorkspaceRows) * maximum_columns *
+      sizeof(std::uint16_t);
   allocate_workspace();
   allocate_state();
   initialized_ = true;
@@ -926,23 +1128,46 @@ void DenseFp4Provider::allocate_workspace() {
   q8_ = device_allocate<std::int8_t>(allocations_,
                                      kWorkspaceRows * padded_columns);
   q8_scales_ = device_allocate<float>(allocations_, kWorkspaceRows);
+  if (staged_dense_weight_capacity_bytes_ != 0U)
+    staged_dense_weights_ = device_allocate<std::uint16_t>(
+        allocations_, staged_dense_weight_capacity_bytes_ /
+                          sizeof(std::uint16_t));
+  staged_dense_input_ = device_allocate<std::uint16_t>(
+      allocations_, staged_dense_input_capacity_bytes_ /
+                        sizeof(std::uint16_t));
   attention_maximum_splits_ =
       (max_context_ + kAttentionSplitTokens - 1U) / kAttentionSplitTokens;
-  prefill_attention_maximum_splits_ =
-      (max_context_ + kPrefillAttentionSplitTokens - 1U) /
-      kPrefillAttentionSplitTokens;
-  attention_scratch_splits_ = std::max(
-      attention_maximum_splits_,
-      kWorkspaceRows * prefill_attention_maximum_splits_);
+  const auto attention_state_rows =
+      std::max(attention_maximum_splits_, kWorkspaceRows);
   partial_maxima_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_scratch_splits_) *
+      allocations_, static_cast<std::size_t>(attention_state_rows) *
                         query_heads_);
   partial_sums_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_scratch_splits_) *
+      allocations_, static_cast<std::size_t>(attention_state_rows) *
                         query_heads_);
   partial_outputs_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_scratch_splits_) *
+      allocations_, static_cast<std::size_t>(attention_maximum_splits_) *
                         query_heads_ * head_dim_);
+  staged_split_tokens_ = std::min(kStagedPrefillSplitTokens, max_context_);
+  const auto staged_query_values =
+      static_cast<std::size_t>(kWorkspaceRows) * query_heads_ * head_dim_;
+  const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
+                                staged_split_tokens_ * head_dim_;
+  const auto staged_score_values =
+      static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+      staged_split_tokens_;
+  staged_queries_ =
+      device_allocate<std::uint16_t>(allocations_, staged_query_values);
+  staged_keys_ =
+      device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+  staged_values_ =
+      device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+  staged_scores_ =
+      device_allocate<float>(allocations_, staged_score_values);
+  staged_probabilities_ =
+      device_allocate<std::uint16_t>(allocations_, staged_score_values);
+  staged_accumulator_ =
+      device_allocate<float>(allocations_, staged_query_values);
   mtp_embedding_ =
       device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
   mtp_embedding_norm_ =
@@ -959,6 +1184,8 @@ void DenseFp4Provider::allocate_workspace() {
 void DenseFp4Provider::allocate_state() {
   slot_last_hidden_ =
       device_allocate<float>(allocations_, capacity_ * hidden_size_);
+  slot_retention_last_hidden_ =
+      device_allocate<float>(allocations_, capacity_ * hidden_size_);
   const auto conv_dimension =
       2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
   const auto conv_values = static_cast<std::size_t>(conv_dimension) * conv_kernel_;
@@ -968,6 +1195,8 @@ void DenseFp4Provider::allocate_state() {
   recurrent_matrix_state_.resize(recurrent_layers_);
   recurrent_conv_checkpoint_.resize(recurrent_layers_);
   recurrent_matrix_checkpoint_.resize(recurrent_layers_);
+  recurrent_conv_retention_checkpoint_.resize(recurrent_layers_);
+  recurrent_matrix_retention_checkpoint_.resize(recurrent_layers_);
   for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
     recurrent_conv_state_[layer] =
         device_allocate<float>(allocations_, capacity_ * conv_values);
@@ -976,6 +1205,10 @@ void DenseFp4Provider::allocate_state() {
     recurrent_conv_checkpoint_[layer] =
         device_allocate<float>(allocations_, capacity_ * conv_values);
     recurrent_matrix_checkpoint_[layer] =
+        device_allocate<float>(allocations_, capacity_ * matrix_values);
+    recurrent_conv_retention_checkpoint_[layer] =
+        device_allocate<float>(allocations_, capacity_ * conv_values);
+    recurrent_matrix_retention_checkpoint_[layer] =
         device_allocate<float>(allocations_, capacity_ * matrix_values);
   }
   device_page_table_ = device_allocate<void*>(
@@ -1207,11 +1440,55 @@ void DenseFp4Provider::quantize_rows(const float* input, std::uint32_t rows,
                                      align32(columns), nullptr));
 }
 
+void DenseFp4Provider::stage_operation_weights(
+    const PreparedOperation& operation) {
+  if (staged_operation_ == &operation) return;
+  staged_weight_bindings_.clear();
+  std::set<const DeviceTensor*> unique;
+  auto* cursor = reinterpret_cast<std::byte*>(staged_dense_weights_);
+  std::size_t used{};
+  for (const auto& [role, tensor] : operation.tensors) {
+    static_cast<void>(role);
+    if (!tensor || tensor->encoding != "FP4_E2M1" ||
+        tensor->shape.size() != 2U || !unique.insert(tensor).second)
+      continue;
+    const auto matrix = tensor->matrix();
+    const auto bytes = static_cast<std::size_t>(matrix.rows) *
+                       matrix.padded_columns * sizeof(std::uint16_t);
+    if (!staged_dense_weights_ ||
+        used > staged_dense_weight_capacity_bytes_ ||
+        bytes > staged_dense_weight_capacity_bytes_ - used)
+      throw std::runtime_error("staged dense weight workspace is exhausted");
+    status_check(ec::fp4_decode_matrix_bf16(matrix, cursor, bytes, nullptr));
+    staged_weight_bindings_.emplace(
+        tensor, StagedDenseWeight{cursor, bytes});
+    cursor += bytes;
+    used += bytes;
+  }
+  staged_operation_ = &operation;
+}
+
+void DenseFp4Provider::activate_staged_weights(
+    const PreparedOperation& operation) {
+  stage_operation_weights(operation);
+  active_staged_weights_ = staged_weight_bindings_;
+}
+
+void DenseFp4Provider::deactivate_staged_weights() noexcept {
+  active_staged_weights_.clear();
+}
+
 void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
                                          float* output,
                                          std::uint32_t rows) {
   const auto matrix = weight.matrix();
-  if (rows > 8U)
+  const auto staged = active_staged_weights_.find(&weight);
+  if (rows > 8U && staged != active_staged_weights_.end())
+    status_check(ec::bf16_gemm_q8_block32(
+        matrix, staged->second.data, staged->second.bytes, q8_, q8_scales_,
+        staged_dense_input_, staged_dense_input_capacity_bytes_, output, rows,
+        nullptr));
+  else if (rows > 8U)
     status_check(ec::fp4_gemm_q8_block32(
         matrix, q8_, q8_scales_, output, rows, nullptr));
   else if (rows > 1U)
@@ -1310,18 +1587,34 @@ void DenseFp4Provider::run_full_attention(
               kv_heads_, head_dim_, kAttentionSplitTokens,
               attention_maximum_splits_, nullptr}));
     } else {
-      const auto last_context_tokens = cache_positions.front() + rows;
-      const auto adaptive_split_tokens = std::min(
-          kPrefillAttentionSplitTokens,
-          std::max(1U, (last_context_tokens +
-                        kMinimumPrefillAttentionSplits - 1U) /
-                           kMinimumPrefillAttentionSplits));
-      status_check(ec::gated_gqa_attention_prefill_paged_fp4({
+      const ec::PagedFp4GatedGqaPrefillLaunch launch{
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, rows,
           full_attention_slot, kv_page_tokens_, query_heads_, kv_heads_,
-          head_dim_, adaptive_split_tokens,
-          prefill_attention_maximum_splits_, nullptr}));
+          head_dim_, kAttentionSplitTokens,
+          attention_maximum_splits_, nullptr};
+      const auto query_values =
+          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ * head_dim_;
+      const auto kv_values = static_cast<std::size_t>(kv_heads_) *
+                             staged_split_tokens_ * head_dim_;
+      const auto score_values =
+          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+          staged_split_tokens_;
+      status_check(ec::gated_gqa_attention_staged_prefill_paged_fp4(
+          launch,
+          {staged_queries_, query_values * sizeof(std::uint16_t),
+           staged_keys_, kv_values * sizeof(std::uint16_t),
+           staged_values_, kv_values * sizeof(std::uint16_t),
+           staged_scores_, score_values * sizeof(float),
+           staged_probabilities_, score_values * sizeof(std::uint16_t),
+           staged_accumulator_, query_values * sizeof(float),
+           partial_maxima_,
+           static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+               sizeof(float),
+           partial_sums_,
+           static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+               sizeof(float),
+           staged_split_tokens_}));
     }
   }
   project(binding(operation, "output_projection"), attention_, residual_,
@@ -1418,6 +1711,7 @@ void DenseFp4Provider::run_ffn(const PreparedOperation& operation,
 
 std::vector<std::uint32_t> DenseFp4Provider::run_head(
     const PreparedOperation& operation, std::uint32_t rows,
+    const er::ProgramRequestContext* request, std::uint32_t sample_position,
     bool terminal_only) {
   const auto head_rows = terminal_only ? 1U : rows;
   const auto* head_input =
@@ -1427,6 +1721,18 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
   normalize_rows(head_input, binding(operation, "norm").f32, normalized_,
                  head_rows);
   project(binding(operation, "weight"), normalized_, logits_, head_rows);
+  if (request != nullptr &&
+      request_parameter(*request, "sampling_temperature_ppm") != 0U) {
+    if (head_rows != 1U)
+      throw std::runtime_error(
+          "sampling requires a single terminal head row");
+    std::vector<float> host_logits(vocabulary_size_);
+    cuda_check(cudaMemcpy(host_logits.data(), logits_,
+                          host_logits.size() * sizeof(host_logits[0]),
+                          cudaMemcpyDeviceToHost),
+               "copy dense FP4 sampling logits");
+    return {sample_token(host_logits, *request, sample_position)};
+  }
   status_check(ec::argmax_batch(logits_, vocabulary_size_, head_rows,
                                 output_tokens_, nullptr));
   std::vector<std::uint32_t> result(head_rows);
@@ -1492,7 +1798,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
         run_ffn(operation, rows);
         break;
       case Kernel::head:
-        result = run_head(operation, rows);
+        result = run_head(operation, rows, nullptr, positions.back());
         break;
       case Kernel::exact_decode:
         throw std::runtime_error("exact service appeared in scalar program");
@@ -1603,6 +1909,518 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
   return result;
 }
 
+bool DenseFp4Provider::supports_program_sequence(
+    const er::CompiledModelProgram& program) const noexcept {
+  try {
+    if (program.operations.size() != prepared_target_.size() ||
+        program.operations.empty() || program.inputs.size() != 2U ||
+        program.outputs.size() != 1U ||
+        std::any_of(prepared_target_.begin(), prepared_target_.end(),
+                    [](const auto& operation) { return !operation; }))
+      return false;
+
+    std::optional<std::uint32_t> token_input;
+    std::optional<std::uint32_t> position_input;
+    for (const auto& endpoint : program.inputs) {
+      if (endpoint.value_index >= program.values.size()) return false;
+      const auto& abi = program.values[endpoint.value_index].abi;
+      if (abi == kTokenAbi && !token_input)
+        token_input = endpoint.value_index;
+      else if (abi == kPositionAbi && !position_input)
+        position_input = endpoint.value_index;
+      else
+        return false;
+    }
+    if (!token_input || !position_input) return false;
+
+    const auto output_endpoint = program.outputs.front();
+    if (output_endpoint.value_index >= program.values.size() ||
+        program.values[output_endpoint.value_index].abi != kTokenAbi)
+      return false;
+
+    const auto value_for_port = [](const er::CompiledOperationProgram& op,
+                                   std::string_view port,
+                                   bool output) -> std::optional<std::uint32_t> {
+      const auto& bindings = output ? op.output_values : op.input_values;
+      const auto found = std::find_if(
+          bindings.begin(), bindings.end(),
+          [port](const auto& binding) { return binding.port == port; });
+      if (found == bindings.end()) return std::nullopt;
+      return found->value_index;
+    };
+
+    std::optional<std::uint32_t> hidden;
+    for (std::size_t index = 0U; index < program.operations.size(); ++index) {
+      const auto& compiled = program.operations[index];
+      const auto& prepared = *prepared_target_[index];
+      if (prepared.logical_operation != index) return false;
+      switch (prepared.kernel) {
+        case Kernel::embedding:
+          if (index != 0U || compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "token_ids", false) != token_input)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          if (!hidden) return false;
+          break;
+        case Kernel::full_attention:
+        case Kernel::recurrent_attention:
+          if (!hidden || compiled.input_values.size() != 2U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hidden", false) != hidden ||
+              value_for_port(compiled, "positions", false) !=
+                  position_input)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          if (!hidden) return false;
+          break;
+        case Kernel::ffn:
+          if (!hidden || compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hidden", false) != hidden)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          if (!hidden) return false;
+          break;
+        case Kernel::head:
+          if (!hidden || index + 1U != program.operations.size() ||
+              compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hidden", false) != hidden ||
+              value_for_port(compiled, "token_ids", true) !=
+                  output_endpoint.value_index)
+            return false;
+          hidden.reset();
+          break;
+        case Kernel::exact_decode:
+          return false;
+      }
+    }
+    return !hidden.has_value();
+  } catch (...) {
+    return false;
+  }
+}
+
+er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    const er::ProgramSequenceInvocation& invocation) {
+  try {
+    const auto request = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!request || !supports_program_sequence(invocation.program) ||
+        invocation.operations.size() != prepared_target_.size() ||
+        invocation.inputs.size() != invocation.program.inputs.size())
+      throw std::runtime_error("dense FP4 program-sequence contract is invalid");
+
+    auto sequence = std::make_shared<SequenceState>();
+    sequence->request = request;
+    sequence->generation = invocation.request;
+    const auto retention =
+        invocation.request.parameters.find("retention_checkpoint_position");
+    if (retention != invocation.request.parameters.end()) {
+      if (retention->second == 0U || retention->second > max_context_)
+        throw std::runtime_error(
+            "program-sequence retention checkpoint is invalid");
+      sequence->retention_position =
+          static_cast<std::uint32_t>(retention->second);
+    }
+    sequence->operations.reserve(invocation.operations.size());
+    for (std::size_t index = 0U; index < invocation.operations.size(); ++index) {
+      const auto* operation =
+          dynamic_cast<const PreparedOperation*>(invocation.operations[index]);
+      if (!operation || operation != prepared_target_[index].get())
+        throw std::runtime_error(
+            "program-sequence prepared operation order is invalid");
+      sequence->operations.push_back(operation);
+    }
+
+    const er::ExecutionValue* token_value{};
+    const er::ExecutionValue* position_value{};
+    for (std::size_t index = 0U; index < invocation.inputs.size(); ++index) {
+      const auto value_index = invocation.program.inputs[index].value_index;
+      if (value_index >= invocation.program.values.size())
+        throw std::runtime_error("program-sequence input value is invalid");
+      const auto& abi = invocation.program.values[value_index].abi;
+      if (abi == kTokenAbi)
+        token_value = &invocation.inputs[index];
+      else if (abi == kPositionAbi)
+        position_value = &invocation.inputs[index];
+    }
+    const auto copy_host_u32 = [this](const er::ExecutionValue* value,
+                                      std::string_view abi,
+                                      std::string_view description) {
+      if (!value || !value->valid() || value->abi != abi ||
+          value->memory_domain != "host" ||
+          value->bytes % sizeof(std::uint32_t) != 0U ||
+          value->bytes == 0U ||
+          value->bytes / sizeof(std::uint32_t) > max_context_ ||
+          reinterpret_cast<std::uintptr_t>(value->data) %
+                  alignof(std::uint32_t) !=
+              0U)
+        throw std::runtime_error(std::string(description) + " ABI mismatch");
+      std::vector<std::uint32_t> result(
+          static_cast<std::size_t>(value->bytes / sizeof(std::uint32_t)));
+      std::memcpy(result.data(), value->data,
+                  result.size() * sizeof(result[0]));
+      return result;
+    };
+    sequence->tokens =
+        copy_host_u32(token_value, kTokenAbi, "program-sequence token batch");
+    sequence->positions = copy_host_u32(
+        position_value, kPositionAbi, "program-sequence position batch");
+    if (sequence->tokens.size() != sequence->positions.size() ||
+        sequence->tokens.size() > max_context_ ||
+        std::any_of(sequence->tokens.begin(), sequence->tokens.end(),
+                    [this](std::uint32_t token) {
+                      return token >= vocabulary_size_;
+                    }))
+      throw std::runtime_error("program-sequence token stream is invalid");
+    for (std::size_t row = 0U; row < sequence->positions.size(); ++row) {
+      if (sequence->positions[row] >= max_context_ ||
+          (row != 0U &&
+           sequence->positions[row] != sequence->positions.front() + row))
+        throw std::runtime_error(
+            "program-sequence position stream is not contiguous");
+    }
+    if (sequence->retention_position != 0U &&
+        (sequence->retention_position <= sequence->positions.front() ||
+         sequence->retention_position > sequence->positions.back() + 1U))
+      throw std::runtime_error(
+          "program-sequence retention checkpoint is outside its positions");
+    if (request->synchronization_rows != 0U)
+      throw std::runtime_error("previous target batch was not synchronized");
+    if (sequence->tokens.size() >
+        std::numeric_limits<std::size_t>::max() / hidden_size_)
+      throw std::runtime_error("program-sequence hidden state is too large");
+    sequence->hidden.resize(sequence->tokens.size() * hidden_size_);
+
+    return er::OperationExecutionHandle::from_callbacks(
+        [this, sequence] { return poll_program_sequence(sequence); },
+        [sequence] { sequence->cancelled.store(true); });
+  } catch (const std::exception& error) {
+    return completed_operation(
+        {{er::ErrorCode::internal, error.what()}, {}});
+  }
+}
+
+er::Status DenseFp4Provider::checkpoint_request_state(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    std::uint32_t next_position) {
+  try {
+    std::lock_guard lock(mutex_);
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || next_position == 0U || next_position > max_context_ ||
+        state->synchronization_rows != 0U)
+      throw std::runtime_error("retention checkpoint position is invalid");
+    if (state->retention_position == next_position &&
+        state->current_position + 1U != next_position) {
+      state->retention_valid = true;
+      return er::Status::success();
+    }
+    if (state->current_position + 1U != next_position ||
+        (exact_ && state->mtp_length != next_position))
+      throw std::runtime_error("retention checkpoint position is invalid");
+    const auto conv_dimension =
+        2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
+    const auto conv_values =
+        static_cast<std::size_t>(conv_dimension) * conv_kernel_;
+    const auto matrix_values = static_cast<std::size_t>(value_heads_) *
+                               key_head_dim_ * value_head_dim_;
+    for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
+      cuda_check(cudaMemcpy(
+                     recurrent_conv_retention_checkpoint_[layer] +
+                         static_cast<std::size_t>(state->slot()) * conv_values,
+                     recurrent_conv(layer, state->slot()),
+                     conv_values * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "checkpoint retained recurrent convolution state");
+      cuda_check(cudaMemcpy(
+                     recurrent_matrix_retention_checkpoint_[layer] +
+                         static_cast<std::size_t>(state->slot()) *
+                             matrix_values,
+                     recurrent_matrix(layer, state->slot()),
+                     matrix_values * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "checkpoint retained recurrent matrix state");
+    }
+    cuda_check(cudaMemcpy(
+                   slot_retention_last_hidden_ +
+                       static_cast<std::size_t>(state->slot()) * hidden_size_,
+                   slot_last_hidden(state->slot()),
+                   hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
+               "checkpoint retained target hidden state");
+    state->retention_position = next_position;
+    state->retention_valid = true;
+    return er::Status::success();
+  } catch (const std::exception& error) {
+    return {er::ErrorCode::internal, error.what()};
+  }
+}
+
+er::Status DenseFp4Provider::rewind_request_state(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    std::uint32_t next_position) {
+  try {
+    std::lock_guard lock(mutex_);
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || !state->retention_valid ||
+        state->retention_position != next_position ||
+        state->synchronization_rows != 0U)
+      throw std::runtime_error("retention rewind position is invalid");
+    const auto conv_dimension =
+        2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
+    const auto conv_values =
+        static_cast<std::size_t>(conv_dimension) * conv_kernel_;
+    const auto matrix_values = static_cast<std::size_t>(value_heads_) *
+                               key_head_dim_ * value_head_dim_;
+    for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
+      cuda_check(cudaMemcpy(
+                     recurrent_conv(layer, state->slot()),
+                     recurrent_conv_retention_checkpoint_[layer] +
+                         static_cast<std::size_t>(state->slot()) * conv_values,
+                     conv_values * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "rewind retained recurrent convolution state");
+      cuda_check(cudaMemcpy(
+                     recurrent_matrix(layer, state->slot()),
+                     recurrent_matrix_retention_checkpoint_[layer] +
+                         static_cast<std::size_t>(state->slot()) *
+                             matrix_values,
+                     matrix_values * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "rewind retained recurrent matrix state");
+    }
+    cuda_check(cudaMemcpy(
+                   slot_last_hidden(state->slot()),
+                   slot_retention_last_hidden_ +
+                       static_cast<std::size_t>(state->slot()) * hidden_size_,
+                   hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
+               "rewind retained target hidden state");
+    state->current_position = next_position - 1U;
+    state->current_batch_first = next_position - 1U;
+    state->current_batch_rows = 0U;
+    state->mtp_length = next_position;
+    state->synchronization_first = 0U;
+    state->synchronization_rows = 0U;
+    state->synchronization_consumed = 0U;
+    state->draft_valid = false;
+    state->sequence_target_hidden.clear();
+    return er::Status::success();
+  } catch (const std::exception& error) {
+    return {er::ErrorCode::internal, error.what()};
+  }
+}
+
+std::optional<er::OperationExecutionResult>
+DenseFp4Provider::poll_program_sequence(
+    const std::shared_ptr<SequenceState>& sequence) {
+  if (!sequence || sequence->terminal) return std::nullopt;
+  if (sequence->cancelled.load()) {
+    sequence->terminal = true;
+    sequence->hidden.clear();
+    return er::OperationExecutionResult{
+        {er::ErrorCode::cancelled, "dense FP4 program-sequence was cancelled"},
+        {}};
+  }
+  try {
+    std::lock_guard lock(mutex_);
+    if (sequence->next_operation >= sequence->operations.size())
+      throw std::runtime_error("program-sequence advanced beyond its program");
+    const auto& operation =
+        *sequence->operations[sequence->next_operation];
+    const auto total_rows = sequence->tokens.size();
+
+    if (operation.kernel == Kernel::head) {
+      if (sequence->next_row != 0U || total_rows == 0U)
+        throw std::runtime_error("program-sequence head state is invalid");
+      const auto last_row = total_rows - 1U;
+      cuda_check(cudaMemcpy(
+                     hidden_,
+                     sequence->hidden.data() + last_row * hidden_size_,
+                     hidden_size_ * sizeof(float), cudaMemcpyHostToDevice),
+                 "upload final program-sequence hidden state");
+      const auto phase_event = begin_gpu_phase(GpuPhase::head);
+      auto predictions = run_head(operation, 1U, &sequence->generation,
+                                  sequence->positions.back(), true);
+      auto* retained_hidden = slot_target_hidden_batch_ +
+                              static_cast<std::size_t>(
+                                  sequence->request->slot()) *
+                                  kWorkspaceRows * hidden_size_;
+      cuda_check(cudaMemcpy(retained_hidden, hidden_,
+                            hidden_size_ * sizeof(float),
+                            cudaMemcpyDeviceToDevice),
+                 "retain final program-sequence target hidden state");
+      cuda_check(cudaMemcpy(slot_last_hidden(sequence->request->slot()),
+                            hidden_, hidden_size_ * sizeof(float),
+                            cudaMemcpyDeviceToDevice),
+                 "retain final program-sequence target state");
+      if (sequence->retention_position != 0U) {
+        const auto checkpoint_row = static_cast<std::size_t>(
+            sequence->retention_position - sequence->positions.front() - 1U);
+        cuda_check(cudaMemcpy(
+                       slot_retention_last_hidden_ +
+                           static_cast<std::size_t>(
+                               sequence->request->slot()) *
+                               hidden_size_,
+                       sequence->hidden.data() + checkpoint_row * hidden_size_,
+                       hidden_size_ * sizeof(float), cudaMemcpyHostToDevice),
+                   "retain program-sequence checkpoint hidden state");
+        sequence->request->retention_position =
+            sequence->retention_position;
+      }
+      end_gpu_phase(phase_event);
+      collect_gpu_phases();
+
+      sequence->request->current_batch_first =
+          sequence->positions.front();
+      sequence->request->current_batch_rows =
+          static_cast<std::uint32_t>(total_rows);
+      sequence->request->current_position = sequence->positions.back();
+      sequence->request->synchronization_first =
+          sequence->positions.front();
+      sequence->request->synchronization_rows =
+          static_cast<std::uint32_t>(total_rows);
+      sequence->request->synchronization_consumed = 0U;
+      sequence->request->sequence_target_hidden =
+          std::move(sequence->hidden);
+
+      auto owner = std::make_shared<std::vector<std::uint32_t>>(
+          std::move(predictions));
+      er::OperationExecutionResult result;
+      result.status = er::Status::success();
+      result.outputs.push_back(
+          {std::string(kTokenAbi), "host", owner,
+           reinterpret_cast<const std::byte*>(owner->data()),
+           owner->size() * sizeof((*owner)[0])});
+      program_steps_ += total_rows;
+      ++prefill_batches_;
+      prefill_tokens_ += total_rows;
+      ++program_sequence_batches_;
+      program_sequence_tokens_ += total_rows;
+      sequence->terminal = true;
+      return result;
+    }
+
+    auto chunk_rows = std::min<std::size_t>(
+        kWorkspaceRows, total_rows - sequence->next_row);
+    if (sequence->retention_position != 0U) {
+      const auto checkpoint_offset = static_cast<std::size_t>(
+          sequence->retention_position - sequence->positions.front());
+      if (sequence->next_row < checkpoint_offset &&
+          checkpoint_offset < sequence->next_row + chunk_rows)
+        chunk_rows = checkpoint_offset - sequence->next_row;
+    }
+    const auto rows = static_cast<std::uint32_t>(chunk_rows);
+    if (!rows)
+      throw std::runtime_error("program-sequence operation has no rows");
+    const auto offset = sequence->next_row;
+    const auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
+    if (operation.kernel == Kernel::embedding) {
+      cuda_check(cudaMemcpy(output_tokens_, sequence->tokens.data() + offset,
+                            rows * sizeof(std::uint32_t),
+                            cudaMemcpyHostToDevice),
+                 "upload program-sequence token chunk");
+      status_check(ec::fp4_embedding_batch(
+          binding(operation, "weight").matrix(), output_tokens_, hidden_, rows,
+          nullptr));
+    } else {
+      cuda_check(cudaMemcpy(hidden_,
+                            sequence->hidden.data() + offset * hidden_size_,
+                            static_cast<std::size_t>(rows) * hidden_size_ *
+                                sizeof(float),
+                            cudaMemcpyHostToDevice),
+                 "upload program-sequence hidden chunk");
+      activate_staged_weights(operation);
+      switch (operation.kernel) {
+        case Kernel::full_attention:
+        case Kernel::recurrent_attention: {
+          cuda_check(cudaMemcpy(residual_, hidden_,
+                                static_cast<std::size_t>(rows) * hidden_size_ *
+                                    sizeof(float),
+                                cudaMemcpyDeviceToDevice),
+                     "retain program-sequence attention residual");
+          normalize_rows(hidden_, binding(operation, "input_norm").f32,
+                         normalized_, rows);
+          const auto positions = std::span(sequence->positions)
+                                     .subspan(offset, rows);
+          if (operation.kernel == Kernel::full_attention)
+            run_full_attention(operation, sequence->request->slot(), positions,
+                               positions, rows,
+                               operation.full_attention_slot);
+          else
+            run_recurrent_attention(operation, sequence->request->slot(), rows,
+                                    false);
+          if (operation.kernel == Kernel::recurrent_attention &&
+              sequence->retention_position != 0U &&
+              offset + rows == static_cast<std::size_t>(
+                                   sequence->retention_position -
+                                   sequence->positions.front())) {
+            const auto conv_dimension =
+                2U * key_heads_ * key_head_dim_ +
+                value_heads_ * value_head_dim_;
+            const auto conv_values =
+                static_cast<std::size_t>(conv_dimension) * conv_kernel_;
+            const auto matrix_values =
+                static_cast<std::size_t>(value_heads_) * key_head_dim_ *
+                value_head_dim_;
+            cuda_check(cudaMemcpy(
+                           recurrent_conv_retention_checkpoint_[
+                               operation.recurrent_slot] +
+                               static_cast<std::size_t>(
+                                   sequence->request->slot()) *
+                                   conv_values,
+                           recurrent_conv(operation.recurrent_slot,
+                                          sequence->request->slot()),
+                           conv_values * sizeof(float),
+                           cudaMemcpyDeviceToDevice),
+                       "checkpoint layer-major recurrent convolution state");
+            cuda_check(cudaMemcpy(
+                           recurrent_matrix_retention_checkpoint_[
+                               operation.recurrent_slot] +
+                               static_cast<std::size_t>(
+                                   sequence->request->slot()) *
+                                   matrix_values,
+                           recurrent_matrix(operation.recurrent_slot,
+                                            sequence->request->slot()),
+                           matrix_values * sizeof(float),
+                           cudaMemcpyDeviceToDevice),
+                       "checkpoint layer-major recurrent matrix state");
+          }
+          status_check(ec::add_in_place(hidden_, residual_,
+                                        rows * hidden_size_, nullptr));
+          break;
+        }
+        case Kernel::ffn:
+          run_ffn(operation, rows);
+          break;
+        case Kernel::embedding:
+        case Kernel::head:
+        case Kernel::exact_decode:
+          throw std::runtime_error(
+              "invalid operation in program-sequence hidden phase");
+      }
+      deactivate_staged_weights();
+    }
+    cuda_check(cudaMemcpy(sequence->hidden.data() + offset * hidden_size_,
+                          hidden_,
+                          static_cast<std::size_t>(rows) * hidden_size_ *
+                              sizeof(float),
+                          cudaMemcpyDeviceToHost),
+               "download program-sequence hidden chunk");
+    end_gpu_phase(phase_event);
+    collect_gpu_phases();
+    sequence->next_row += rows;
+    if (sequence->next_row == total_rows) {
+      sequence->next_row = 0U;
+      ++sequence->next_operation;
+    }
+    return std::nullopt;
+  } catch (const std::exception& error) {
+    deactivate_staged_weights();
+    sequence->terminal = true;
+    sequence->hidden.clear();
+    active_gpu_events_ = 0U;
+    return er::OperationExecutionResult{
+        {er::ErrorCode::internal, error.what()}, {}};
+  }
+}
+
 er::OperationExecutionHandle DenseFp4Provider::execute(
     const er::IPreparedOperation& opaque_operation,
     const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
@@ -1708,7 +2526,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
         state->synchronization_consumed = 0U;
         auto owner =
             std::make_shared<std::vector<std::uint32_t>>(
-                run_head(*operation, rows, rows > 1U));
+                run_head(*operation, rows, &invocation.request,
+                         state->current_position, rows > 1U));
         outputs.emplace(
             "token_ids",
             er::ExecutionValue{std::string(kTokenAbi), "host", owner,
@@ -1784,11 +2603,31 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
     const auto rows =
         static_cast<std::uint32_t>(synchronization.next_tokens.size());
     const auto synchronized_row = state->synchronization_consumed;
-    const auto* previous_hidden =
+    auto* retained_hidden =
         slot_target_hidden_batch_ +
         static_cast<std::size_t>(state->slot()) * kWorkspaceRows *
-            hidden_size_ +
-        static_cast<std::size_t>(synchronized_row) * hidden_size_;
+            hidden_size_;
+    const float* previous_hidden{};
+    if (!state->sequence_target_hidden.empty()) {
+      if (state->sequence_target_hidden.size() !=
+          static_cast<std::size_t>(state->synchronization_rows) * hidden_size_)
+        throw std::runtime_error(
+            "program-sequence target hidden state is inconsistent");
+      cuda_check(cudaMemcpy(
+                     retained_hidden,
+                     state->sequence_target_hidden.data() +
+                         static_cast<std::size_t>(synchronized_row) *
+                             hidden_size_,
+                     static_cast<std::size_t>(rows) * hidden_size_ *
+                         sizeof(float),
+                     cudaMemcpyHostToDevice),
+                 "upload program-sequence target hidden chunk");
+      previous_hidden = retained_hidden;
+    } else {
+      previous_hidden =
+          retained_hidden +
+          static_cast<std::size_t>(synchronized_row) * hidden_size_;
+    }
     const auto* final_hidden =
         previous_hidden + static_cast<std::size_t>(rows - 1U) * hidden_size_;
     cuda_check(cudaMemcpy(slot_last_hidden(state->slot()), final_hidden,
@@ -1826,8 +2665,11 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
     }
     ++exact_sync_batches_;
     exact_sync_tokens_ += rows;
-    if (state->synchronization_consumed == state->synchronization_rows)
+    if (state->synchronization_consumed == state->synchronization_rows) {
       state->synchronization_rows = state->synchronization_consumed = 0U;
+      state->sequence_target_hidden.clear();
+      state->sequence_target_hidden.shrink_to_fit();
+    }
     return er::Status::success();
   } catch (const std::exception& error) {
     return {er::ErrorCode::internal, error.what()};
@@ -1947,7 +2789,7 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     module.tensor_store = std::move(tensor_store);
     const auto mtp = artifact.model().exact_decode_program.has_value();
     module.service = {
-        "causal_chunked",
+        "causal_layer_major",
         kWorkspaceRows,
         true,
         "per_request_nonblocking",
@@ -1968,7 +2810,8 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
         mtp,
         mtp,
         false,
-        false};
+        false,
+        true};
     module.telemetry = [implementation] { return implementation->telemetry(); };
     return {er::Status::success(), std::move(module)};
   } catch (const std::exception& error) {

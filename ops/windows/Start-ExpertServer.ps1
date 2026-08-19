@@ -25,6 +25,7 @@ param(
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
     [double]$GenerationTimeoutSeconds = 120.0,
+    [int]$MaximumBodyMiB = 16,
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
@@ -112,6 +113,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `
     --generation-timeout $GenerationTimeoutSeconds `
+    --maximum-body-bytes ([int64]$MaximumBodyMiB * 1MB) `
     --startup-timeout $StartupTimeoutSeconds `
     --drain-timeout $DrainTimeoutSeconds `
     --build-id $BuildId `

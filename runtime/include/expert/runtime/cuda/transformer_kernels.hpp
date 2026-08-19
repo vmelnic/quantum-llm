@@ -2,6 +2,7 @@
 
 #include "expert/runtime/storage.hpp"
 
+#include <cstddef>
 #include <cstdint>
 
 namespace expert::runtime::cuda {
@@ -46,11 +47,25 @@ struct Fp4Block32Matrix final {
     const Fp4Block32Matrix& matrix, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
     void* stream) noexcept;
-// SM80 integer tensor-core path for causal prefill. A 64x16 output tile
-// shares every decoded FP4 weight block across as many as 64 activation rows.
+// SM80 Tensor Core path for causal prefill. A CTA retains four 128x32 output
+// tiles and shares every decoded FP4 weight block across as many as 512
+// activation rows.
 [[nodiscard]] Status fp4_gemm_q8_block32(
     const Fp4Block32Matrix& matrix, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
+    void* stream) noexcept;
+
+// Layer-major prefill may decode an FP4 matrix once and reuse the exact BF16
+// operand across every prompt chunk for that artifact operation. Workspace
+// capacities are explicit; the runtime owns placement and lifetime.
+[[nodiscard]] Status fp4_decode_matrix_bf16(
+    const Fp4Block32Matrix& matrix, void* decoded_weights,
+    std::size_t decoded_weight_bytes, void* stream) noexcept;
+[[nodiscard]] Status bf16_gemm_q8_block32(
+    const Fp4Block32Matrix& matrix, const void* decoded_weights,
+    std::size_t decoded_weight_bytes, const std::int8_t* input,
+    const float* input_scales, void* decoded_input,
+    std::size_t decoded_input_bytes, float* output, std::uint32_t batch,
     void* stream) noexcept;
 
 [[nodiscard]] Status embedding(const Int8Matrix& matrix, std::uint32_t token,
@@ -336,6 +351,29 @@ struct PagedFp4GatedGqaPrefillLaunch final {
   void* stream{};
 };
 
+// Scratch for exact staged prefill attention. Q/K/V and probabilities are
+// BF16, scores and online-softmax state are FP32. Sizes are explicit so a
+// provider can budget the temporary tier without hidden CUDA allocations.
+struct PagedFp4GatedGqaStagedPrefillWorkspace final {
+  void* queries{};
+  std::size_t query_bytes{};
+  void* keys{};
+  std::size_t key_bytes{};
+  void* values{};
+  std::size_t value_bytes{};
+  float* scores{};
+  std::size_t score_bytes{};
+  void* probabilities{};
+  std::size_t probability_bytes{};
+  float* accumulator{};
+  std::size_t accumulator_bytes{};
+  float* maxima{};
+  std::size_t maxima_bytes{};
+  float* sums{};
+  std::size_t sum_bytes{};
+  std::uint32_t split_tokens{};
+};
+
 // Exact causal microbatch attention. Positions times grouped query heads must
 // fit one 16-row WMMA tile so packed K/V is shared across both dimensions.
 [[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp4_tensor_core(
@@ -345,6 +383,13 @@ struct PagedFp4GatedGqaPrefillLaunch final {
 // every decoded K/V record between up to eight adjacent query rows.
 [[nodiscard]] Status gated_gqa_attention_prefill_paged_fp4(
     const PagedFp4GatedGqaPrefillLaunch& launch) noexcept;
+
+// Exact online-softmax prefill backed by BF16 Tensor Core GEMMs. Packed K/V
+// is decoded once per split and shared by every query row/head in its GQA
+// group; no score, token, or top-k approximation is applied.
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp4(
+    const PagedFp4GatedGqaPrefillLaunch& launch,
+    const PagedFp4GatedGqaStagedPrefillWorkspace& workspace) noexcept;
 
 struct Qwen3NextDeltaLaunch final {
   const float* projected_qkvz{};  // [2*key_dim + 2*value_dim]

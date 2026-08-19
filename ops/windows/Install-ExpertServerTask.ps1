@@ -25,6 +25,7 @@ param(
     [int]$LatencyWindow = 4096,
     [double]$QueueTimeoutSeconds = 1.0,
     [double]$GenerationTimeoutSeconds = 120.0,
+    [int]$MaximumBodyMiB = 16,
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
@@ -36,7 +37,8 @@ param(
 
 if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $MaximumContext -lt 2 -or $MaximumNewTokens -lt 1 -or
-    $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1) {
+    $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1 -or
+    $MaximumBodyMiB -lt 1) {
     throw "Invalid service limits"
 }
 if (-not $TaskName) { $TaskName = "QuantumLLM-ExpertVm" }
@@ -83,6 +85,7 @@ $taskArguments.AddRange([string[]]@(
     "-LatencyWindow", [string]$LatencyWindow,
     "-QueueTimeoutSeconds", $QueueTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-GenerationTimeoutSeconds", $GenerationTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
+    "-MaximumBodyMiB", [string]$MaximumBodyMiB,
     "-StartupTimeoutSeconds", [string]$StartupTimeoutSeconds,
     "-DrainTimeoutSeconds", [string]$DrainTimeoutSeconds,
     "-BuildId", (Quote-TaskArgument $BuildId)
@@ -134,6 +137,7 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     endpoint = "http://${HostAddress}:$Port"
     maximum_context = $MaximumContext
     maximum_new_tokens = $MaximumNewTokens
+    maximum_body_mib = $MaximumBodyMiB
     model_input = $Container
     placement_profile = $PlacementProfile
     profile_gpu_phases = [bool]$ProfileGpuPhases

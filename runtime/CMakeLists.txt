@@ -115,7 +115,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
   target_compile_options(expert_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
-  target_link_libraries(expert_runtime PRIVATE CUDA::cudart)
+  target_link_libraries(expert_runtime PRIVATE CUDA::cudart CUDA::cublas)
   set_target_properties(expert_runtime PROPERTIES
     CUDA_ARCHITECTURES 86
     CUDA_STANDARD 20

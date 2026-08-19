@@ -1,6 +1,7 @@
 # Getting started
 
-Status: current Windows/CUDA setup and FP4 artifact path as of 2026-08-11.
+Status: current Windows/CUDA setup and Qwen3.8 FP4 artifact path as of
+2026-08-19.
 The resumable implementation handoff is [MoE VM current state and remaining
 work](moe-vm-next.md).
 
@@ -15,10 +16,10 @@ work](moe-vm-next.md).
 - Python 3.10 or newer;
 - enough disk for the source checkpoint, FP4 container, and safety margin.
 
-The portable core/tests build on Linux without CUDA. Complete Qwen, DeepSeek
-and LFM execution is currently Windows/CUDA only.
+The portable core/tests build on Linux without CUDA. Complete Qwen3.8 and
+DeepSeek execution is currently Windows/CUDA only.
 
-For an existing built runtime and prepared Qwen/DeepSeek/LFM artifacts, use the
+For an existing built runtime and prepared Qwen/DeepSeek artifacts, use the
 [end-to-end deployment guide](deployment.md) instead: it covers `.env`, remote
 synchronization, model switching, interactive chat, and API use through the
 single `ops/model.sh` control command.
@@ -74,11 +75,11 @@ run ad-hoc `curl`, parallel downloaders or disable Xet:
 
 ```powershell
 .\ops\windows\Start-HuggingFaceModelDownload.ps1 `
-  -ModelId "Qwen/Qwen3-Next-80B-A3B-Instruct" `
-  -Revision "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7" `
-  -ExpectedDownloadBytes VERIFIED_DOWNLOAD_BYTES `
-  -ExpectedTensorBytes 162659161528 `
-  -ExpectedShards 41
+  -ModelId "Qwen/Qwen3.8-27B" `
+  -Revision "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0" `
+  -ExpectedDownloadBytes 55615875685 `
+  -ExpectedTensorBytes 55562855904 `
+  -ExpectedShards 18
 
 .\ops\windows\Get-HuggingFaceModelDownload.ps1
 ```
@@ -86,7 +87,7 @@ run ad-hoc `curl`, parallel downloaders or disable Xet:
 The tested revision is:
 
 ```text
-9c7f2fbe84465e40164a94cc16cd30b6999b0cc7
+1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
 ```
 
 ## Compile Expert Pack
@@ -96,11 +97,12 @@ Compile through the generic wrapper and preserve every source shard:
 ```powershell
 .\ops\windows\Invoke-ExpertPack.ps1 -Action Compile `
   -Path C:\path\to\snapshot `
-  -Output (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4") `
-  -SourceId "Qwen/Qwen3-Next-80B-A3B-Instruct" `
-  -SourceRevision "9c7f2fbe84465e40164a94cc16cd30b6999b0cc7" `
-  -Adapter qwen3_next `
+  -Output (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4") `
+  -SourceId "Qwen/Qwen3.8-27B" `
+  -SourceRevision "1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0" `
+  -Adapter qwen3_5 `
   -QuantProfile fp4-e2m1-ue8m0-block32-v1 `
+  -MaxExpertPackBytes 24GB `
   -Resume
 ```
 
@@ -112,26 +114,27 @@ Validate an existing pack independently:
 
 ```powershell
 .\ops\windows\Invoke-ExpertPack.ps1 -Action Validate `
-  -Path (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4")
+  -Path (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4")
 ```
 
-The supported Qwen path always selects the FP4-E2M1/UE8M0 block-32 routed
-expert profile. The pack is validated before transactional publication below
-`MODEL_ROOT`.
+The supported Qwen path always selects FP4-E2M1/UE8M0 block-32 matrices. This
+Qwen3.8 checkpoint is dense and has no routed experts. The artifact is
+validated before transactional publication below `MODEL_ROOT`.
 
 The equivalent generic compiler invocation is:
 
 ```powershell
 .\.venv\Scripts\python.exe -m compiler compile `
   --source C:\path\to\snapshot `
-  --output (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4") `
-  --source-id Qwen/Qwen3-Next-80B-A3B-Instruct `
-  --source-revision 9c7f2fbe84465e40164a94cc16cd30b6999b0cc7 `
-  --adapter qwen3_next `
-  --quant-profile fp4-e2m1-ue8m0-block32-v1
+  --output (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4") `
+  --source-id Qwen/Qwen3.8-27B `
+  --source-revision 1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0 `
+  --adapter qwen3_5 `
+  --quant-profile fp4-e2m1-ue8m0-block32-v1 `
+  --max-expert-pack-bytes 25769803776
 
 .\ops\windows\Invoke-ExpertPack.ps1 -Action Validate `
-  -Path (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4")
+  -Path (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4")
 ```
 
 Serve it with `./ops/model.sh start qwen`; the `qwen` selector is FP4-only.
@@ -140,14 +143,15 @@ Serve it with `./ops/model.sh start qwen`; the `qwen` selector is FP4-only.
 
 ```powershell
 .\ops\windows\Start-ExpertServer.ps1 `
-  -Container (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4") `
+  -Container (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4") `
   -Runner .\out\build\windows-msvc-release\runtime\Release\expert-moe-vm-runner.exe `
-  -ModelId qwen3-next-80b-a3b-expert-pack-fp4 `
+  -ModelId qwen3.8-27b-fp4 `
   -Python .\.venv\Scripts\python.exe `
-  -MaximumContext 4096 `
-  -WorkerCapacity 4 `
+  -MaximumContext 262144 `
+  -MaximumNewTokens 8192 `
+  -WorkerCapacity 1 `
   -PlacementProfile balanced `
-  -WorkerKvCacheMiB 2048 `
+  -WorkerKvCacheMiB 5120 `
   -WorkerKvPageTokens 256 `
   -BuildId (git rev-parse --short HEAD)
 ```
@@ -172,15 +176,15 @@ changing it. The choice is visible in `/model-info.worker_placement`.
 
 ```powershell
 .\ops\windows\Install-ExpertServerTask.ps1 -Start `
-  -Container (Join-Path $env:MODEL_ROOT "qwen3-next-80b-expert-pack-fp4") `
+  -Container (Join-Path $env:MODEL_ROOT "qwen3.8-27b-fp4") `
   -Runner .\out\build\windows-msvc-release\runtime\Release\expert-moe-vm-runner.exe `
-  -ModelId qwen3-next-80b-a3b-expert-pack-fp4 `
+  -ModelId qwen3.8-27b-fp4 `
   -Python .\.venv\Scripts\python.exe `
   -BuildId (git rev-parse --short HEAD)
 
 .\ops\windows\Get-ExpertServerStatus.ps1 `
   -WaitSeconds 600 `
-  -ExpectedModel qwen3-next-80b-a3b-expert-pack-fp4
+  -ExpectedModel qwen3.8-27b-fp4
 ```
 
 Prefer `./ops/model.sh start qwen` from the control host for normal operation;
@@ -200,16 +204,13 @@ Remove registration and stop the entire process tree:
 
 ## Context configuration
 
-`MaximumContext=4096` is the historically qualified manual profile. The
-reference `.env` lifecycle currently advertises 65,536 context tokens and
-8,192 output tokens, but that larger admission ceiling is not yet qualified for
-long-prompt correctness, latency, or concurrency. Raising the limit no longer
-preallocates maximum KV for every slot, but it still requires a matching
-aggregate page budget and long-context qualification. Do not advertise the
-model's 262K architectural maximum as an operational guarantee. See
+The reference lifecycle advertises 262,144 context tokens and 8,192 output
+tokens. A real 262,016-token prompt plus 128 generated tokens completed, so the
+capacity path is qualified. That run required approximately 90 minutes to its
+first generated token and decoded at approximately 3.24 tok/s afterward; it is
+not a maximum-context performance or semantic-quality qualification. See
 [Production readiness](production-readiness.md).
 
-KV capacity is an aggregate request budget. With the tested geometry, one
-256-token page is 6 MiB. The 4096 × four-slot profile can reserve at most 64
-pages (384 MiB); the larger 2048 MiB setting leaves room to qualify higher
-contexts without changing the service interface.
+KV capacity is an aggregate request budget. The Qwen3.8 reference profile uses
+5,120 MiB and one worker slot. Physical pages are committed on demand, so short
+requests do not allocate the maximum context.

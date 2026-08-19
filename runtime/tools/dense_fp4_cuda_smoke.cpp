@@ -71,7 +71,7 @@ double numerical_check() {
   constexpr std::uint32_t rows = 67U;
   constexpr std::uint32_t columns = 100U;
   constexpr std::uint32_t padded = 128U;
-  constexpr std::uint32_t batch = 17U;
+  constexpr std::uint32_t batch = 129U;
   std::vector<std::uint8_t> packed(
       static_cast<std::size_t>(rows) * padded / 2U);
   std::vector<std::uint8_t> scales(
@@ -133,6 +133,10 @@ double numerical_check() {
       static_cast<std::size_t>(batch) * padded);
   DeviceBuffer<float> device_q8_scales(batch);
   DeviceBuffer<float> device_output(expected.size());
+  DeviceBuffer<std::uint16_t> decoded_weights(
+      static_cast<std::size_t>(rows) * padded);
+  DeviceBuffer<std::uint16_t> decoded_input(
+      static_cast<std::size_t>(batch) * padded);
   device_weights.upload(packed);
   device_scales.upload(scales);
   device_input.upload(input);
@@ -183,6 +187,25 @@ double numerical_check() {
     maximum_error = std::max(
         maximum_error,
         std::abs(static_cast<double>(tiled[index]) - expected[index]));
+  const expert::runtime::cuda::Fp4Block32Matrix matrix{
+      device_weights.get(), device_scales.get(), rows, columns, padded};
+  status_check(expert::runtime::cuda::fp4_decode_matrix_bf16(
+      matrix, decoded_weights.get(),
+      static_cast<std::size_t>(rows) * padded * sizeof(std::uint16_t),
+      nullptr));
+  status_check(expert::runtime::cuda::bf16_gemm_q8_block32(
+      matrix, decoded_weights.get(),
+      static_cast<std::size_t>(rows) * padded * sizeof(std::uint16_t),
+      device_q8.get(), device_q8_scales.get(), decoded_input.get(),
+      static_cast<std::size_t>(batch) * padded * sizeof(std::uint16_t),
+      device_output.get(), batch, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize staged BF16 Q8 smoke");
+  const auto staged = device_output.download();
+  for (std::size_t index = 0; index < staged.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(staged[index]) - expected[index]));
 
   DeviceBuffer<float> embedding(columns);
   status_check(expert::runtime::cuda::fp4_embedding(
@@ -417,6 +440,24 @@ double attention_prefill_check() {
   DeviceBuffer<float> batch_partials(
       static_cast<std::size_t>(rows) * maximum_splits * query_heads *
       head_dim);
+  DeviceBuffer<float> staged_output(
+      static_cast<std::size_t>(rows) * attention_width);
+  const auto staged_query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  const auto staged_kv_values =
+      static_cast<std::size_t>(kv_heads) * split_tokens * head_dim;
+  const auto staged_score_values =
+      static_cast<std::size_t>(rows) * query_heads * split_tokens;
+  DeviceBuffer<std::uint16_t> staged_queries(staged_query_values);
+  DeviceBuffer<std::uint16_t> staged_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> staged_values(staged_kv_values);
+  DeviceBuffer<float> staged_scores(staged_score_values);
+  DeviceBuffer<std::uint16_t> staged_probabilities(staged_score_values);
+  DeviceBuffer<float> staged_accumulator(staged_query_values);
+  DeviceBuffer<float> staged_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> staged_sums(
+      static_cast<std::size_t>(rows) * query_heads);
   status_check(
       expert::runtime::cuda::gated_gqa_qkv_rope_cache_paged_fp4_batch(
           batch_query.get(), batch_key.get(), device_value.get(),
@@ -424,13 +465,37 @@ double attention_prefill_check() {
           reinterpret_cast<const void* const*>(batch_table.get()), 0U,
           page_tokens, 0U, 0U, rows, query_heads, kv_heads, head_dim,
           rotary_dim, epsilon, theta, nullptr));
+  const expert::runtime::cuda::PagedFp4GatedGqaPrefillLaunch batch_launch{
+      batch_query.get(),
+      reinterpret_cast<const void* const*>(batch_table.get()),
+      batch_output.get(), batch_maxima.get(), batch_sums.get(),
+      batch_partials.get(), 1U, rows, 0U, page_tokens, query_heads, kv_heads,
+      head_dim, split_tokens, maximum_splits, nullptr};
   status_check(
-      expert::runtime::cuda::gated_gqa_attention_prefill_paged_fp4({
-          batch_query.get(),
-          reinterpret_cast<const void* const*>(batch_table.get()),
-          batch_output.get(), batch_maxima.get(), batch_sums.get(),
-          batch_partials.get(), 1U, rows, 0U, page_tokens, query_heads,
-          kv_heads, head_dim, split_tokens, maximum_splits, nullptr}));
+      expert::runtime::cuda::gated_gqa_attention_prefill_paged_fp4(
+          batch_launch));
+  auto staged_launch = batch_launch;
+  staged_launch.output = staged_output.get();
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_staged_prefill_paged_fp4(
+          staged_launch,
+          {staged_queries.get(),
+           staged_query_values * sizeof(std::uint16_t),
+           staged_keys.get(),
+           staged_kv_values * sizeof(std::uint16_t),
+           staged_values.get(),
+           staged_kv_values * sizeof(std::uint16_t),
+           staged_scores.get(),
+           staged_score_values * sizeof(float),
+           staged_probabilities.get(),
+           staged_score_values * sizeof(std::uint16_t),
+           staged_accumulator.get(),
+           staged_query_values * sizeof(float),
+           staged_maxima.get(),
+           static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+           staged_sums.get(),
+           static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+           split_tokens}));
   cuda_check(cudaDeviceSynchronize(), "synchronize attention prefill smoke");
 
   double maximum_error = 0.0;
@@ -445,6 +510,7 @@ double attention_prefill_check() {
   compare(scalar_query.download(), batch_query.download());
   compare(scalar_key.download(), batch_key.download());
   compare(scalar_output.download(), batch_output.download());
+  compare(scalar_output.download(), staged_output.download());
   if (scalar_page_zero.download() != batch_page_zero.download() ||
       scalar_page_one.download() != batch_page_one.download())
     maximum_error = std::max(maximum_error, 1.0);
@@ -500,10 +566,17 @@ double bandwidth_check() {
   return bytes / (static_cast<double>(milliseconds) * 1.0e6);
 }
 
-double batch_bandwidth_check() {
+struct PrefillGemmProfile final {
+  double current_effective_weight_gb_per_second{};
+  double current_milliseconds{};
+  double staged_decode_milliseconds{};
+  double staged_gemm_milliseconds{};
+};
+
+PrefillGemmProfile batch_bandwidth_check() {
   constexpr std::uint32_t rows = 17408U;
   constexpr std::uint32_t columns = 5120U;
-  constexpr std::uint32_t batch = 64U;
+  constexpr std::uint32_t batch = 512U;
   constexpr std::uint32_t iterations = 12U;
   const auto weight_bytes = static_cast<std::size_t>(rows) * columns / 2U;
   const auto scale_bytes = static_cast<std::size_t>(rows) * columns / 32U;
@@ -519,6 +592,10 @@ double batch_bandwidth_check() {
       static_cast<std::size_t>(batch) * columns);
   DeviceBuffer<float> device_q8_scales(batch);
   DeviceBuffer<float> device_output(static_cast<std::size_t>(batch) * rows);
+  DeviceBuffer<std::uint16_t> decoded_weights(
+      static_cast<std::size_t>(rows) * columns);
+  DeviceBuffer<std::uint16_t> decoded_input(
+      static_cast<std::size_t>(batch) * columns);
   device_weights.upload(weights);
   device_scales.upload(scales);
   device_input.upload(input);
@@ -548,7 +625,63 @@ double batch_bandwidth_check() {
   static_cast<void>(cudaEventDestroy(stop));
   const auto bytes = static_cast<double>(weight_bytes + scale_bytes) *
                      iterations;
-  return bytes / (static_cast<double>(milliseconds) * 1.0e6);
+  const auto current_milliseconds =
+      static_cast<double>(milliseconds) / iterations;
+
+  const expert::runtime::cuda::Fp4Block32Matrix matrix{
+      device_weights.get(), device_scales.get(), rows, columns, columns};
+  cudaEvent_t decode_start{}, decode_stop{};
+  cuda_check(cudaEventCreate(&decode_start),
+             "create staged decode start event");
+  cuda_check(cudaEventCreate(&decode_stop),
+             "create staged decode stop event");
+  cuda_check(cudaEventRecord(decode_start),
+             "record staged decode start");
+  status_check(expert::runtime::cuda::fp4_decode_matrix_bf16(
+      matrix, decoded_weights.get(),
+      static_cast<std::size_t>(rows) * columns * sizeof(std::uint16_t),
+      nullptr));
+  cuda_check(cudaEventRecord(decode_stop), "record staged decode stop");
+  cuda_check(cudaEventSynchronize(decode_stop),
+             "synchronize staged decode stop");
+  float decode_milliseconds{};
+  cuda_check(cudaEventElapsedTime(&decode_milliseconds, decode_start,
+                                  decode_stop),
+             "measure staged decode elapsed time");
+  static_cast<void>(cudaEventDestroy(decode_start));
+  static_cast<void>(cudaEventDestroy(decode_stop));
+  for (unsigned warmup = 0U; warmup < 3U; ++warmup)
+    status_check(expert::runtime::cuda::bf16_gemm_q8_block32(
+        matrix, decoded_weights.get(),
+        static_cast<std::size_t>(rows) * columns * sizeof(std::uint16_t),
+        device_q8.get(), device_q8_scales.get(), decoded_input.get(),
+        static_cast<std::size_t>(batch) * columns * sizeof(std::uint16_t),
+        device_output.get(), batch, nullptr));
+  cudaEvent_t staged_start{}, staged_stop{};
+  cuda_check(cudaEventCreate(&staged_start),
+             "create staged GEMM start event");
+  cuda_check(cudaEventCreate(&staged_stop),
+             "create staged GEMM stop event");
+  cuda_check(cudaEventRecord(staged_start), "record staged GEMM start");
+  for (unsigned iteration = 0U; iteration < iterations; ++iteration)
+    status_check(expert::runtime::cuda::bf16_gemm_q8_block32(
+        matrix, decoded_weights.get(),
+        static_cast<std::size_t>(rows) * columns * sizeof(std::uint16_t),
+        device_q8.get(), device_q8_scales.get(), decoded_input.get(),
+        static_cast<std::size_t>(batch) * columns * sizeof(std::uint16_t),
+        device_output.get(), batch, nullptr));
+  cuda_check(cudaEventRecord(staged_stop), "record staged GEMM stop");
+  cuda_check(cudaEventSynchronize(staged_stop),
+             "synchronize staged GEMM stop");
+  float staged_total_milliseconds{};
+  cuda_check(cudaEventElapsedTime(&staged_total_milliseconds, staged_start,
+                                  staged_stop),
+             "measure staged GEMM elapsed time");
+  static_cast<void>(cudaEventDestroy(staged_start));
+  static_cast<void>(cudaEventDestroy(staged_stop));
+  return {bytes / (static_cast<double>(milliseconds) * 1.0e6),
+          current_milliseconds, static_cast<double>(decode_milliseconds),
+          static_cast<double>(staged_total_milliseconds) / iterations};
 }
 
 struct DecodeBatchBandwidth {
@@ -625,6 +758,60 @@ DecodeBatchBandwidth decode_batch_bandwidth_check() {
   return {measure(false), measure(true)};
 }
 
+double wide_decode_batch_bandwidth_check() {
+  constexpr std::uint32_t rows = 5120U;
+  constexpr std::uint32_t columns = 17408U;
+  constexpr std::uint32_t batch = 2U;
+  constexpr std::uint32_t iterations = 12U;
+  const auto weight_bytes = static_cast<std::size_t>(rows) * columns / 2U;
+  const auto scale_bytes = static_cast<std::size_t>(rows) * columns / 32U;
+  std::vector<std::uint8_t> weights(weight_bytes, 0x21U);
+  std::vector<std::uint8_t> scales(scale_bytes, 127U);
+  std::vector<float> input(static_cast<std::size_t>(batch) * columns);
+  for (std::size_t index = 0U; index < input.size(); ++index)
+    input[index] = std::sin(static_cast<float>(index) * 0.013F) * 0.1F;
+  DeviceBuffer<std::uint8_t> device_weights(weight_bytes);
+  DeviceBuffer<std::uint8_t> device_scales(scale_bytes);
+  DeviceBuffer<float> device_input(input.size());
+  DeviceBuffer<std::int8_t> device_q8(
+      static_cast<std::size_t>(batch) * columns);
+  DeviceBuffer<float> device_q8_scales(batch);
+  DeviceBuffer<float> device_output(static_cast<std::size_t>(batch) * rows);
+  device_weights.upload(weights);
+  device_scales.upload(scales);
+  device_input.upload(input);
+  status_check(expert::runtime::cuda::quantize_q8_batch(
+      device_input.get(), device_q8.get(), device_q8_scales.get(), batch,
+      columns, columns, nullptr));
+  const expert::runtime::cuda::Fp4Block32Matrix matrix{
+      device_weights.get(), device_scales.get(), rows, columns, columns};
+  for (unsigned warmup = 0U; warmup < 3U; ++warmup)
+    status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
+        matrix, device_q8.get(), device_q8_scales.get(), device_output.get(),
+        batch, nullptr));
+  cudaEvent_t start{}, stop{};
+  cuda_check(cudaEventCreate(&start),
+             "create wide decode batch start event");
+  cuda_check(cudaEventCreate(&stop),
+             "create wide decode batch stop event");
+  cuda_check(cudaEventRecord(start), "record wide decode batch start");
+  for (unsigned iteration = 0U; iteration < iterations; ++iteration)
+    status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
+        matrix, device_q8.get(), device_q8_scales.get(), device_output.get(),
+        batch, nullptr));
+  cuda_check(cudaEventRecord(stop), "record wide decode batch stop");
+  cuda_check(cudaEventSynchronize(stop),
+             "synchronize wide decode batch stop");
+  float milliseconds{};
+  cuda_check(cudaEventElapsedTime(&milliseconds, start, stop),
+             "measure wide decode batch elapsed time");
+  static_cast<void>(cudaEventDestroy(start));
+  static_cast<void>(cudaEventDestroy(stop));
+  const auto bytes = static_cast<double>(weight_bytes + scale_bytes) *
+                     iterations;
+  return bytes / (static_cast<double>(milliseconds) * 1.0e6);
+}
+
 double attention_prefill_4096_milliseconds() {
   constexpr std::uint32_t rows = 64U;
   constexpr std::uint32_t query_heads = 24U;
@@ -699,6 +886,7 @@ struct LongContextAttentionProfile final {
   };
 
   double prefill_milliseconds{};
+  double prefill_maximum_absolute_difference{};
   double decode_milliseconds{};
   double decode_kv_gb_per_second{};
   double tensor_core_decode_milliseconds{};
@@ -711,7 +899,7 @@ struct LongContextAttentionProfile final {
 };
 
 LongContextAttentionProfile attention_262144_profile() {
-  constexpr std::uint32_t rows = 64U;
+  constexpr std::uint32_t rows = 512U;
   constexpr std::uint32_t query_heads = 24U;
   constexpr std::uint32_t kv_heads = 4U;
   constexpr std::uint32_t head_dim = 256U;
@@ -719,6 +907,7 @@ LongContextAttentionProfile attention_262144_profile() {
   constexpr std::uint32_t context_tokens = 262144U;
   constexpr std::uint32_t prefill_split_tokens = 4096U;
   constexpr std::uint32_t prefill_maximum_splits = 64U;
+  constexpr std::uint32_t staged_prefill_split_tokens = 8192U;
   constexpr std::array<std::uint32_t, 6U> decode_split_tokens{
       256U, 512U, 1024U, 2048U, 4096U, 8192U};
   constexpr std::uint32_t decode_maximum_splits = 1024U;
@@ -738,6 +927,24 @@ LongContextAttentionProfile attention_262144_profile() {
   DeviceBuffer<float> prefill_maxima(prefill_partial_count);
   DeviceBuffer<float> prefill_sums(prefill_partial_count);
   DeviceBuffer<float> prefill_partials(prefill_partial_count * head_dim);
+  DeviceBuffer<float> prefill_reference_output(output_values);
+  const auto staged_query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  const auto staged_kv_values = static_cast<std::size_t>(kv_heads) *
+                                staged_prefill_split_tokens * head_dim;
+  const auto staged_score_values = static_cast<std::size_t>(rows) *
+                                   query_heads *
+                                   staged_prefill_split_tokens;
+  DeviceBuffer<std::uint16_t> staged_queries(staged_query_values);
+  DeviceBuffer<std::uint16_t> staged_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> staged_values(staged_kv_values);
+  DeviceBuffer<float> staged_scores(staged_score_values);
+  DeviceBuffer<std::uint16_t> staged_probabilities(staged_score_values);
+  DeviceBuffer<float> staged_accumulator(staged_query_values);
+  DeviceBuffer<float> staged_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> staged_sums(
+      static_cast<std::size_t>(rows) * query_heads);
   DeviceBuffer<float> decode_maxima(decode_maximum_splits * query_heads);
   DeviceBuffer<float> decode_sums(decode_maximum_splits * query_heads);
   DeviceBuffer<float> decode_partials(
@@ -793,6 +1000,32 @@ LongContextAttentionProfile attention_262144_profile() {
       prefill_maximum_splits, nullptr};
   status_check(
       expert::runtime::cuda::gated_gqa_attention_prefill_paged_fp4(prefill));
+  cuda_check(cudaMemcpy(prefill_reference_output.get(), output.get(),
+                        output_values * sizeof(float),
+                        cudaMemcpyDeviceToDevice),
+             "copy long-context prefill reference");
+  const expert::runtime::cuda::PagedFp4GatedGqaStagedPrefillWorkspace
+      staged_workspace{
+          staged_queries.get(),
+          staged_query_values * sizeof(std::uint16_t),
+          staged_keys.get(),
+          staged_kv_values * sizeof(std::uint16_t),
+          staged_values.get(),
+          staged_kv_values * sizeof(std::uint16_t),
+          staged_scores.get(),
+          staged_score_values * sizeof(float),
+          staged_probabilities.get(),
+          staged_score_values * sizeof(std::uint16_t),
+          staged_accumulator.get(),
+          staged_query_values * sizeof(float),
+          staged_maxima.get(),
+          static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+          staged_sums.get(),
+          static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+          staged_prefill_split_tokens};
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_staged_prefill_paged_fp4(
+          prefill, staged_workspace));
   cudaEvent_t prefill_start{}, prefill_stop{};
   cuda_check(cudaEventCreate(&prefill_start),
              "create long-context prefill start event");
@@ -801,7 +1034,8 @@ LongContextAttentionProfile attention_262144_profile() {
   cuda_check(cudaEventRecord(prefill_start),
              "record long-context prefill start");
   status_check(
-      expert::runtime::cuda::gated_gqa_attention_prefill_paged_fp4(prefill));
+      expert::runtime::cuda::gated_gqa_attention_staged_prefill_paged_fp4(
+          prefill, staged_workspace));
   cuda_check(cudaEventRecord(prefill_stop),
              "record long-context prefill stop");
   cuda_check(cudaEventSynchronize(prefill_stop),
@@ -812,6 +1046,14 @@ LongContextAttentionProfile attention_262144_profile() {
              "measure long-context prefill elapsed time");
   static_cast<void>(cudaEventDestroy(prefill_start));
   static_cast<void>(cudaEventDestroy(prefill_stop));
+  const auto prefill_reference = prefill_reference_output.download();
+  const auto prefill_staged = output.download();
+  double prefill_maximum_absolute_difference{};
+  for (std::size_t index = 0U; index < output_values; ++index)
+    prefill_maximum_absolute_difference = std::max(
+        prefill_maximum_absolute_difference,
+        static_cast<double>(
+            std::abs(prefill_reference[index] - prefill_staged[index])));
 
   constexpr unsigned microbatch_iterations = 8U;
   const expert::runtime::cuda::PagedFp4GatedGqaPrefillLaunch two_prefill{
@@ -995,6 +1237,7 @@ LongContextAttentionProfile attention_262144_profile() {
         static_cast<double>(
             std::abs(tensor_output[index] - production_output[index])));
   return {static_cast<double>(prefill_milliseconds),
+          prefill_maximum_absolute_difference,
           production->milliseconds, production->kv_gb_per_second,
           tensor_milliseconds,
           static_cast<double>(kv_payload_bytes) /
@@ -1016,6 +1259,8 @@ int main() {
     const auto bandwidth = bandwidth_check();
     const auto batch_bandwidth = batch_bandwidth_check();
     const auto decode_batch_bandwidth = decode_batch_bandwidth_check();
+    const auto wide_decode_batch_bandwidth =
+        wide_decode_batch_bandwidth_check();
     const auto attention_milliseconds =
         attention_prefill_4096_milliseconds();
     const auto long_context_attention = attention_262144_profile();
@@ -1034,8 +1279,18 @@ int main() {
     const bool pass = error < 2.0e-4 && delta_error < 2.0e-5 &&
                       attention_error < 2.0e-4 &&
                       std::isfinite(bandwidth) && bandwidth > 0.0 &&
-                      std::isfinite(batch_bandwidth) &&
-                      batch_bandwidth > 0.0 &&
+                      std::isfinite(batch_bandwidth.
+                                        current_effective_weight_gb_per_second) &&
+                      batch_bandwidth.current_effective_weight_gb_per_second >
+                          0.0 &&
+                      std::isfinite(batch_bandwidth.current_milliseconds) &&
+                      batch_bandwidth.current_milliseconds > 0.0 &&
+                      std::isfinite(
+                          batch_bandwidth.staged_decode_milliseconds) &&
+                      batch_bandwidth.staged_decode_milliseconds > 0.0 &&
+                      std::isfinite(
+                          batch_bandwidth.staged_gemm_milliseconds) &&
+                      batch_bandwidth.staged_gemm_milliseconds > 0.0 &&
                       std::isfinite(
                           decode_batch_bandwidth.selected_gb_per_second) &&
                       decode_batch_bandwidth.selected_gb_per_second >
@@ -1044,11 +1299,16 @@ int main() {
                           decode_batch_bandwidth.tensor_core_gb_per_second) &&
                       decode_batch_bandwidth.tensor_core_gb_per_second >
                           0.0 &&
+                      std::isfinite(wide_decode_batch_bandwidth) &&
+                      wide_decode_batch_bandwidth > 0.0 &&
                       std::isfinite(attention_milliseconds) &&
                       attention_milliseconds > 0.0 &&
                       std::isfinite(
                           long_context_attention.prefill_milliseconds) &&
                       long_context_attention.prefill_milliseconds > 0.0 &&
+                      long_context_attention.
+                              prefill_maximum_absolute_difference <
+                          2.0e-4 &&
                       std::isfinite(
                           long_context_attention.decode_milliseconds) &&
                       long_context_attention.decode_milliseconds > 0.0 &&
@@ -1088,15 +1348,26 @@ int main() {
               << attention_error
               << ",\"effective_weight_gb_per_second\":" << bandwidth
               << ",\"effective_batch_weight_gb_per_second\":"
-              << batch_bandwidth
+              << batch_bandwidth.current_effective_weight_gb_per_second
+              << ",\"prefill_gemm_current_milliseconds\":"
+              << batch_bandwidth.current_milliseconds
+              << ",\"prefill_gemm_staged_decode_milliseconds\":"
+              << batch_bandwidth.staged_decode_milliseconds
+              << ",\"prefill_gemm_staged_milliseconds\":"
+              << batch_bandwidth.staged_gemm_milliseconds
               << ",\"decode_batch_selected_gb_per_second\":"
               << decode_batch_bandwidth.selected_gb_per_second
               << ",\"decode_batch_tensor_core_gb_per_second\":"
               << decode_batch_bandwidth.tensor_core_gb_per_second
+              << ",\"wide_decode_batch_selected_gb_per_second\":"
+              << wide_decode_batch_bandwidth
               << ",\"attention_prefill_4096_milliseconds\":"
               << attention_milliseconds
               << ",\"attention_prefill_262144_milliseconds\":"
               << long_context_attention.prefill_milliseconds
+              << ",\"attention_prefill_262144_maximum_absolute_difference\":"
+              << long_context_attention.
+                     prefill_maximum_absolute_difference
               << ",\"attention_decode_262144_milliseconds\":"
               << long_context_attention.decode_milliseconds
               << ",\"attention_decode_262144_kv_gb_per_second\":"

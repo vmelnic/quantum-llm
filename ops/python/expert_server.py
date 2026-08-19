@@ -26,6 +26,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import unquote, urlsplit
 
+try:
+    from .response_protocols import install_declared_response_protocol
+except ImportError:  # Direct script launch from Start-ExpertServer.ps1.
+    from response_protocols import install_declared_response_protocol
+
 from transformers import AutoTokenizer
 
 
@@ -80,9 +85,23 @@ class RequestError(ValueError):
 
 
 @dataclass(frozen=True)
+class SamplingSettings:
+    temperature: float
+    top_p: float
+    top_k: int
+    min_p: float
+    seed: int
+
+    @property
+    def enabled(self) -> bool:
+        return self.temperature > 0.0
+
+
+@dataclass(frozen=True)
 class GenerationRequest:
     endpoint: str
     prompt_ids: list[int]
+    cache_prefix_tokens: int
     maximum: int
     stream: bool
     stop: tuple[str, ...]
@@ -90,6 +109,64 @@ class GenerationRequest:
     instructions: str | None = None
     metadata: dict[str, Any] | None = None
     user: str | None = None
+    reasoning_effort: str = "xhigh"
+    enable_thinking: bool = True
+    preserve_thinking: bool = True
+    sampling: SamplingSettings = SamplingSettings(0.0, 1.0, 0, 0.0, 0)
+    tools: tuple[dict[str, Any], ...] = ()
+    tool_choice: str | dict[str, Any] = "auto"
+
+
+@dataclass(frozen=True)
+class ToolCall:
+    item_id: str
+    call_id: str
+    name: str
+    arguments: str
+
+
+@dataclass(frozen=True)
+class AssistantOutput:
+    text: str
+    reasoning: str
+    reasoning_complete: bool
+    tool_calls: tuple[ToolCall, ...]
+
+
+class AssistantStreamParser:
+    """Translate standard Transformers response events into API text deltas."""
+
+    def __init__(self, application: "Application",
+                 request: GenerationRequest) -> None:
+        self.parser = application.response_stream_parser(request)
+
+    @staticmethod
+    def _deltas(events: list[dict[str, Any]]) -> tuple[str, str]:
+        reasoning: list[str] = []
+        content: list[str] = []
+        for event in events:
+            if event.get("type") != "region_chunk" or event.get("dirty"):
+                continue
+            text = event.get("text")
+            if not isinstance(text, str) or not text:
+                continue
+            field = event.get("field")
+            if field in {"thinking", "reasoning", "reasoning_content"}:
+                reasoning.append(text)
+            elif field == "content":
+                content.append(text)
+        return "".join(reasoning), "".join(content)
+
+    def feed(self, delta: str) -> tuple[str, str]:
+        if self.parser is None:
+            return "", delta
+        return self._deltas(self.parser.feed(delta))
+
+    def finish(self) -> tuple[str, str]:
+        if self.parser is None:
+            return "", ""
+        _message, events = self.parser.finalize()
+        return self._deltas(events)
 
 
 @dataclass
@@ -279,6 +356,9 @@ class CudaWorker:
             response.get("request_stream_mode", "default")
         )
         self.gpu_phase_timing = bool(response.get("gpu_phase_timing", False))
+        self.sampling_supported = bool(
+            response.get("sampling_supported", False)
+        )
         self.mtp_resource_available = bool(
             response.get("mtp_resource_available", False)
         )
@@ -393,7 +473,11 @@ class CudaWorker:
         )
         if (self.protocol < 4 or descriptor_invalid or
                 self.capacity != requested_capacity or
-                self.prefill_mode not in {"causal_chunked", "causal_sequential"} or
+                self.prefill_mode not in {
+                    "causal_chunked",
+                    "causal_layer_major",
+                    "causal_sequential",
+                } or
                 not 1 <= self.prefill_chunk_tokens <= max_context or
                 (prefill_chunk_tokens and
                  self.prefill_chunk_tokens > prefill_chunk_tokens) or
@@ -411,6 +495,11 @@ class CudaWorker:
             )
         self.active_ids: set[int] = set()
         self.command_lock = threading.Lock()
+        self._responses: queue.Queue[Any] = queue.Queue()
+        self._response_thread = threading.Thread(
+            target=self._copy_responses, daemon=True
+        )
+        self._response_thread.start()
 
     def _copy_stderr(self) -> None:
         assert self.process.stderr
@@ -433,43 +522,110 @@ class CudaWorker:
             raise WorkerError("CUDA worker rejected the command")
         return payload
 
-    def _command(self, command: str) -> dict[str, Any]:
+    def _copy_responses(self) -> None:
+        while self.process.poll() is None:
+            try:
+                self._responses.put(self._read())
+            except Exception as error:
+                self._responses.put(error)
+                if self.process.poll() is not None:
+                    return
+
+    def _command(self, command: str,
+                 cancel_check: Callable[[], bool] | None = None,
+                 cancel_id: int | None = None,
+                 deadline: float | None = None) -> dict[str, Any]:
         with self.command_lock:
             if self.process.poll() is not None:
                 raise WorkerError("CUDA worker is not running")
             assert self.process.stdin
             self.process.stdin.write(command + "\n")
             self.process.stdin.flush()
-            return self._read()
+            interrupted = False
+            while True:
+                if not interrupted and (
+                        (cancel_check is not None and cancel_check()) or
+                        (deadline is not None and time.monotonic() > deadline)):
+                    if cancel_id is not None:
+                        self.process.stdin.write(f"CANCEL\t{cancel_id}\n")
+                        self.process.stdin.flush()
+                    interrupted = True
+                try:
+                    response = self._responses.get(timeout=0.05)
+                except queue.Empty:
+                    if self.process.poll() is not None:
+                        raise WorkerError("CUDA worker exited while awaiting response")
+                    continue
+                if isinstance(response, Exception):
+                    raise response
+                if interrupted:
+                    raise WorkerError("CUDA worker request was cancelled")
+                return response
 
-    def begin(self, request_id: int, prompt_ids: list[int], context_limit: int) -> None:
+    def begin(self, request_id: int, prompt_ids: list[int], context_limit: int,
+              sampling: SamplingSettings,
+              checkpoint_tokens: int | None = None,
+              cancel_check: Callable[[], bool] | None = None,
+              deadline: float | None = None) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
+        command = (f"BEGIN\t{request_id}\t{context_limit}\t" +
+                   ",".join(str(token) for token in prompt_ids))
+        if checkpoint_tokens is not None:
+            command += f"\tCHECKPOINT\t{checkpoint_tokens}"
+        command += self._sampling_command(sampling)
         response = self._command(
-            f"BEGIN\t{request_id}\t{context_limit}\t" +
-            ",".join(str(token) for token in prompt_ids)
+            command,
+            cancel_check=cancel_check, cancel_id=request_id,
+            deadline=deadline,
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
         self.active_ids.add(request_id)
 
     def begin_resume(self, request_id: int, session_key: int,
-                     delta_ids: list[int], context_limit: int) -> None:
+                     delta_ids: list[int], context_limit: int,
+                     sampling: SamplingSettings,
+                     checkpoint_tokens: int | None = None,
+                     cancel_check: Callable[[], bool] | None = None,
+                     deadline: float | None = None) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
         if not delta_ids:
             raise WorkerError("resume requires at least one delta token")
+        command = (f"BEGIN\t{request_id}\t{context_limit}\t" +
+                   ",".join(str(token) for token in delta_ids) +
+                   f"\tRESUME\t{session_key}")
+        if checkpoint_tokens is not None:
+            command += f"\tCHECKPOINT\t{checkpoint_tokens}"
+        command += self._sampling_command(sampling)
         response = self._command(
-            f"BEGIN\t{request_id}\t{context_limit}\t" +
-            ",".join(str(token) for token in delta_ids) +
-            f"\tRESUME\t{session_key}"
+            command, cancel_check=cancel_check,
+            cancel_id=request_id, deadline=deadline,
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
         self.active_ids.add(request_id)
 
-    def end_retain(self, request_id: int, session_key: int) -> int:
-        response = self._command(f"END\t{request_id}\tRETAIN\t{session_key}")
+    def _sampling_command(self, settings: SamplingSettings) -> str:
+        if not self.sampling_supported:
+            if settings.enabled:
+                raise WorkerError("CUDA worker does not support sampling")
+            return ""
+        return "\tSAMPLING\t{}\t{}\t{}\t{}\t{}".format(
+            round(settings.temperature * 1_000_000),
+            round(settings.top_p * 1_000_000),
+            settings.top_k,
+            round(settings.min_p * 1_000_000),
+            settings.seed,
+        )
+
+    def end_retain(self, request_id: int, session_key: int,
+                   checkpoint_tokens: int | None = None) -> int:
+        command = f"END\t{request_id}\tRETAIN\t{session_key}"
+        if checkpoint_tokens is not None:
+            command += f"\tAT\t{checkpoint_tokens}"
+        response = self._command(command)
         if response.get("type") != "ended" or response.get("id") != request_id:
             raise WorkerError("unexpected END response")
         self.active_ids.discard(request_id)
@@ -662,6 +818,30 @@ class Application:
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
         )
+        self.response_protocol = install_declared_response_protocol(
+            self.tokenizer
+        )
+        generation_config_path = args.tokenizer / "generation_config.json"
+        generation_config: dict[str, Any] = {}
+        if generation_config_path.is_file():
+            loaded_generation_config = json.loads(
+                generation_config_path.read_text(encoding="utf-8")
+            )
+            if isinstance(loaded_generation_config, dict):
+                generation_config = loaded_generation_config
+        do_sample = generation_config.get("do_sample", False)
+        if not isinstance(do_sample, bool):
+            raise RuntimeError("generation_config do_sample must be boolean")
+        self.default_sampling = SamplingSettings(
+            temperature=float(generation_config.get(
+                "temperature", 1.0 if do_sample else 0.0
+            )),
+            top_p=float(generation_config.get("top_p", 1.0)),
+            top_k=int(generation_config.get("top_k", 0)),
+            min_p=float(generation_config.get("min_p", 0.0)),
+            seed=0,
+        )
+        self._validate_sampling(self.default_sampling, "generation_config")
         self.checkpoint_chat_encoder: Callable[..., str] | None = None
         if (not self.tokenizer.chat_template and
                 (args.tokenizer / "encoding" / "encoding_dsv4.py").is_file()):
@@ -950,15 +1130,30 @@ class Application:
             lines.extend((f"# TYPE {metric} gauge", f"{metric} {value}"))
         return "\n".join(lines) + "\n"
 
-    def _chat_prompt_ids(self, messages: list[dict[str, Any]]) -> list[int]:
+    def _chat_prompt_ids(self, messages: list[dict[str, Any]],
+                         add_generation_prompt: bool = True,
+                         tools: tuple[dict[str, Any], ...] = (),
+                         reasoning_effort: str = "xhigh",
+                         enable_thinking: bool = True,
+                         preserve_thinking: bool = True) -> list[int]:
         encoder = getattr(self, "checkpoint_chat_encoder", None)
         if encoder is not None:
+            if tools:
+                raise RequestError(
+                    "the published tokenizer adapter does not declare tool calling",
+                    "tools", "unsupported_value",
+                )
             prompt = encoder(messages, thinking_mode="chat")
             return [int(token) for token in self.tokenizer.encode(
                 prompt, add_special_tokens=False
             )]
         ids = self.tokenizer.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True
+            messages, tokenize=True,
+            add_generation_prompt=add_generation_prompt,
+            tools=list(tools) if tools else None,
+            reasoning_effort=reasoning_effort,
+            enable_thinking=enable_thinking,
+            preserve_thinking=preserve_thinking,
         )
         if hasattr(ids, "input_ids"):
             ids = ids.input_ids
@@ -967,6 +1162,88 @@ class Application:
         if ids and isinstance(ids[0], list):
             ids = ids[0]
         return [int(token) for token in ids]
+
+    def response_stream_parser(self, request: GenerationRequest) -> Any:
+        if self.response_protocol is None:
+            return None
+        return self.tokenizer.get_response_parser(
+            prefix=request.prompt_ids,
+        )
+
+    def parse_assistant_output(
+            self, text: str, request: GenerationRequest) -> AssistantOutput:
+        if self.response_protocol is None:
+            return AssistantOutput(text=text, reasoning="",
+                                   reasoning_complete=True, tool_calls=())
+        try:
+            message = self.tokenizer.parse_response(
+                text, prefix=request.prompt_ids,
+                tools=list(request.tools) if request.tools else None,
+            )
+            if not isinstance(message, dict):
+                raise ValueError("response parser returned a non-object")
+            reasoning = message.get(
+                "reasoning_content",
+                message.get("reasoning", message.get("thinking", "")),
+            )
+            visible = message.get("content", "")
+            if reasoning is None:
+                reasoning = ""
+            if visible is None:
+                visible = ""
+            if not isinstance(reasoning, str) or not isinstance(visible, str):
+                raise ValueError("response parser returned non-text regions")
+            calls: list[ToolCall] = []
+            raw_calls = message.get("tool_calls", [])
+            if raw_calls is None:
+                raw_calls = []
+            if not isinstance(raw_calls, list):
+                raise ValueError("response parser returned invalid tool calls")
+            complete_tool_markup = (
+                text.count("<tool_call>") == text.count("</tool_call>") and
+                text.count("<function=") == text.count("</function>")
+            )
+            if raw_calls and not complete_tool_markup:
+                raise ValueError("model emitted an incomplete tool call")
+            for raw_call in raw_calls:
+                if not isinstance(raw_call, dict) or raw_call.get("type") != "function":
+                    raise ValueError("response parser returned an invalid tool call")
+                function = raw_call.get("function")
+                if not isinstance(function, dict):
+                    raise ValueError("parsed tool call has no function")
+                name = function.get("name")
+                arguments = function.get("arguments", {})
+                if not isinstance(name, str) or not name:
+                    raise ValueError("parsed tool call has no function name")
+                if isinstance(arguments, str):
+                    parsed_arguments = json.loads(arguments)
+                    if not isinstance(parsed_arguments, dict):
+                        raise ValueError("parsed tool arguments are not an object")
+                    arguments = parsed_arguments
+                if not isinstance(arguments, dict):
+                    raise ValueError("parsed tool arguments are not an object")
+                calls.append(ToolCall(
+                    item_id="fc_" + uuid.uuid4().hex,
+                    call_id="call_" + uuid.uuid4().hex,
+                    name=name,
+                    arguments=json.dumps(
+                        arguments, separators=(",", ":"), ensure_ascii=False
+                    ),
+                ))
+            return AssistantOutput(
+                text=visible, reasoning=reasoning,
+                reasoning_complete=True, tool_calls=tuple(calls),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            log("response_parse_failed", protocol=self.response_protocol,
+                error=str(error))
+            return AssistantOutput(text=text, reasoning="",
+                                   reasoning_complete=False, tool_calls=())
+
+    def text_token_count(self, text: str) -> int:
+        if not text:
+            return 0
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
 
     def _messages(self, raw: Any, param: str = "messages") -> list[dict[str, Any]]:
         if not isinstance(raw, list) or not raw:
@@ -979,18 +1256,234 @@ class Application:
                 continue
             if not isinstance(message, dict):
                 raise RequestError("message must be an object", item_param)
-            if message.get("type", "message") != "message":
-                raise RequestError("only message input items are supported",
+            item_type = message.get("type", "message")
+            if item_type == "function_call_output":
+                content = message.get("output")
+                if not isinstance(content, str):
+                    raise RequestError(
+                        "function_call_output requires string output",
+                        f"{item_param}.output",
+                    )
+                result.append({"role": "tool", "content": content,
+                               "tool_call_id": message.get("call_id")})
+                continue
+            if item_type == "function_call":
+                name = message.get("name")
+                arguments = message.get("arguments", "{}")
+                if not isinstance(name, str) or not name:
+                    raise RequestError("function_call requires a name",
+                                       f"{item_param}.name")
+                if not isinstance(arguments, str):
+                    raise RequestError("function_call arguments must be JSON text",
+                                       f"{item_param}.arguments")
+                try:
+                    parsed_arguments = json.loads(arguments)
+                except json.JSONDecodeError as error:
+                    raise RequestError("function_call arguments must be valid JSON",
+                                       f"{item_param}.arguments") from error
+                if not isinstance(parsed_arguments, dict):
+                    raise RequestError("function_call arguments must be a JSON object",
+                                       f"{item_param}.arguments")
+                result.append({
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"id": message.get("call_id"),
+                                    "type": "function", "function": {
+                                        "name": name,
+                                        "arguments": parsed_arguments,
+                                    }}],
+                })
+                continue
+            if item_type != "message":
+                raise RequestError("input item type is not supported",
                                    f"{item_param}.type", "unsupported_value")
             role = message.get("role")
             if role == "developer":
                 role = "system"
-            if role not in {"system", "user", "assistant"}:
+            if role not in {"system", "user", "assistant", "tool"}:
                 raise RequestError(f"message role {role!r} is not supported",
                                    f"{item_param}.role", "unsupported_value")
-            content = _text_content(message.get("content"), f"{item_param}.content")
-            result.append({"role": role, "content": content})
+            raw_content = message.get("content")
+            if raw_content is None and role == "assistant":
+                content = ""
+            else:
+                content = _text_content(raw_content, f"{item_param}.content")
+            normalized: dict[str, Any] = {"role": role, "content": content}
+            if role == "assistant":
+                reasoning = message.get("reasoning_content")
+                if reasoning is not None:
+                    if not isinstance(reasoning, str):
+                        raise RequestError("reasoning_content must be text",
+                                           f"{item_param}.reasoning_content")
+                    normalized["reasoning_content"] = reasoning
+                raw_calls = message.get("tool_calls")
+                if raw_calls is None and message.get("function_call") is not None:
+                    raw_calls = [{"type": "function",
+                                  "function": message["function_call"]}]
+                if raw_calls is not None:
+                    if not isinstance(raw_calls, list) or not raw_calls:
+                        raise RequestError("tool_calls must be a non-empty array",
+                                           f"{item_param}.tool_calls")
+                    calls: list[dict[str, Any]] = []
+                    for call_index, call in enumerate(raw_calls):
+                        call_param = f"{item_param}.tool_calls.{call_index}"
+                        if not isinstance(call, dict) or call.get("type", "function") != "function":
+                            raise RequestError("only function tool calls are supported",
+                                               call_param, "unsupported_value")
+                        function = call.get("function")
+                        if not isinstance(function, dict):
+                            raise RequestError("tool call requires a function object",
+                                               f"{call_param}.function")
+                        name = function.get("name")
+                        arguments = function.get("arguments", {})
+                        if not isinstance(name, str) or not name:
+                            raise RequestError("tool call requires a function name",
+                                               f"{call_param}.function.name")
+                        if isinstance(arguments, str):
+                            try:
+                                arguments = json.loads(arguments)
+                            except json.JSONDecodeError as error:
+                                raise RequestError(
+                                    "tool call arguments must be valid JSON",
+                                    f"{call_param}.function.arguments",
+                                ) from error
+                        if not isinstance(arguments, dict):
+                            raise RequestError(
+                                "tool call arguments must be a JSON object",
+                                f"{call_param}.function.arguments",
+                            )
+                        calls.append({"id": call.get("id"), "type": "function",
+                                      "function": {"name": name,
+                                                   "arguments": arguments}})
+                    normalized["tool_calls"] = calls
+            elif role == "tool":
+                normalized["tool_call_id"] = message.get("tool_call_id")
+            result.append(normalized)
         return result
+
+    @staticmethod
+    def _tools(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
+        raw_tools = payload.get("tools")
+        legacy = payload.get("functions")
+        if raw_tools not in (None, []) and legacy not in (None, []):
+            raise RequestError("tools and functions cannot both be supplied", "tools")
+        if legacy not in (None, []):
+            if not isinstance(legacy, list):
+                raise RequestError("functions must be an array", "functions")
+            raw_tools = [{"type": "function", "function": item}
+                         for item in legacy]
+        if raw_tools in (None, []):
+            return ()
+        if not isinstance(raw_tools, list):
+            raise RequestError("tools must be an array", "tools")
+        tools: list[dict[str, Any]] = []
+        names: set[str] = set()
+        for index, tool in enumerate(raw_tools):
+            param = f"tools.{index}"
+            if not isinstance(tool, dict) or tool.get("type") != "function":
+                raise RequestError("only function tools are supported", param,
+                                   "unsupported_value")
+            function = tool.get("function")
+            if not isinstance(function, dict):
+                raise RequestError("function tool requires a function object",
+                                   f"{param}.function")
+            name = function.get("name")
+            if not isinstance(name, str) or not name or name in names:
+                raise RequestError("function tool names must be non-empty and unique",
+                                   f"{param}.function.name")
+            description = function.get("description")
+            parameters = function.get("parameters", {"type": "object"})
+            if description is not None and not isinstance(description, str):
+                raise RequestError("function description must be text",
+                                   f"{param}.function.description")
+            if not isinstance(parameters, dict):
+                raise RequestError("function parameters must be a JSON schema object",
+                                   f"{param}.function.parameters")
+            names.add(name)
+            normalized_function: dict[str, Any] = {
+                "name": name, "parameters": parameters,
+            }
+            if description is not None:
+                normalized_function["description"] = description
+            if "strict" in function:
+                if not isinstance(function["strict"], bool):
+                    raise RequestError("function strict must be boolean",
+                                       f"{param}.function.strict")
+                normalized_function["strict"] = function["strict"]
+            tools.append({"type": "function", "function": normalized_function})
+        return tuple(tools)
+
+    @staticmethod
+    def _tool_choice(payload: dict[str, Any],
+                     tools: tuple[dict[str, Any], ...]) -> str | dict[str, Any]:
+        choice = payload.get("tool_choice", payload.get("function_call", "auto"))
+        if choice is None:
+            choice = "auto"
+        if isinstance(choice, str):
+            if choice not in {"auto", "none", "required"}:
+                if payload.get("function_call") == choice:
+                    choice = {"type": "function", "function": {"name": choice}}
+                else:
+                    raise RequestError("unsupported tool_choice", "tool_choice",
+                                       "unsupported_value")
+        elif isinstance(choice, dict):
+            function = choice.get("function")
+            if choice.get("type", "function") != "function" or not isinstance(function, dict) or \
+                    not isinstance(function.get("name"), str):
+                raise RequestError("tool_choice function selection is invalid",
+                                   "tool_choice")
+        else:
+            raise RequestError("tool_choice is invalid", "tool_choice")
+        if not tools and choice not in {"auto", "none"}:
+            raise RequestError("tool_choice requires tools", "tool_choice")
+        if isinstance(choice, dict):
+            selected = choice["function"]["name"]
+            if selected not in {tool["function"]["name"] for tool in tools}:
+                raise RequestError("tool_choice names an unknown function",
+                                   "tool_choice")
+        return choice
+
+    @staticmethod
+    def _validate_sampling(settings: SamplingSettings,
+                           parameter: str) -> None:
+        valid = (
+            0.0 <= settings.temperature <= 2.0 and
+            0.0 < settings.top_p <= 1.0 and
+            0 <= settings.top_k <= 1_000_000 and
+            0.0 <= settings.min_p <= 1.0 and
+            0 <= settings.seed <= 0x7fff_ffff_ffff_ffff
+        )
+        if not valid:
+            if parameter == "generation_config":
+                raise RuntimeError("generation_config sampling values are invalid")
+            raise RequestError("sampling parameters are outside runtime limits",
+                               parameter, "unsupported_value")
+
+    def _sampling(self, payload: dict[str, Any]) -> SamplingSettings:
+        defaults = self.default_sampling
+
+        def number(name: str, default: float) -> float:
+            value = payload.get(name, default)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                raise RequestError(f"{name} must be numeric", name)
+            return float(value)
+
+        top_k = payload.get("top_k", defaults.top_k)
+        if isinstance(top_k, bool) or not isinstance(top_k, int):
+            raise RequestError("top_k must be an integer", "top_k")
+        seed = payload.get("seed")
+        if seed is None:
+            seed = uuid.uuid4().int & 0x7fff_ffff_ffff_ffff
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise RequestError("seed must be an integer", "seed")
+        settings = SamplingSettings(
+            temperature=number("temperature", defaults.temperature),
+            top_p=number("top_p", defaults.top_p),
+            top_k=top_k,
+            min_p=number("min_p", defaults.min_p),
+            seed=seed,
+        )
+        self._validate_sampling(settings, "sampling")
+        return settings
 
     @staticmethod
     def _stop_sequences(value: Any) -> tuple[str, ...]:
@@ -1022,14 +1515,12 @@ class Application:
 
         only("n", (None, 1), "this runtime supports n=1")
         only("best_of", (None, 1), "this runtime supports best_of=1")
-        only("temperature", (None, 0, 0.0),
-             "sampling is not implemented; omit temperature or use 0")
-        only("top_p", (None, 1, 1.0),
-             "nucleus sampling is not implemented; omit top_p or use 1")
         only("presence_penalty", (None, 0, 0.0),
              "presence_penalty is not implemented")
         only("frequency_penalty", (None, 0, 0.0),
              "frequency_penalty is not implemented")
+        only("repetition_penalty", (None, 1, 1.0),
+             "repetition_penalty is not implemented")
         only("logprobs", (None, False, 0), "logprobs are not implemented")
         only("top_logprobs", (None, 0), "top_logprobs are not implemented")
         only("echo", (None, False), "echo is not implemented")
@@ -1040,25 +1531,14 @@ class Application:
 
         if payload.get("logit_bias") not in (None, {}):
             raise RequestError("logit_bias is not implemented", "logit_bias", "unsupported_value")
-        if payload.get("tools") not in (None, []):
-            raise RequestError("tool calling is not implemented", "tools", "unsupported_value")
-        if payload.get("functions") not in (None, []):
-            raise RequestError("function calling is not implemented", "functions", "unsupported_value")
         if payload.get("modalities") not in (None, ["text"]):
             raise RequestError("only text output is supported", "modalities", "unsupported_value")
         if payload.get("audio") is not None:
             raise RequestError("audio output is not supported", "audio", "unsupported_value")
         if payload.get("prediction") is not None:
             raise RequestError("predicted output is not implemented", "prediction", "unsupported_value")
-        if payload.get("reasoning") not in (None, {}):
-            raise RequestError("reasoning controls are not implemented", "reasoning", "unsupported_value")
         if payload.get("suffix") is not None:
             raise RequestError("suffix completion is not implemented", "suffix", "unsupported_value")
-
-        tools = payload.get("tools") or payload.get("functions")
-        tool_choice = payload.get("tool_choice", payload.get("function_call"))
-        if tools or tool_choice not in (None, "none", "auto"):
-            raise RequestError("tool choice is not supported", "tool_choice", "unsupported_value")
 
         response_format = payload.get("response_format")
         if response_format not in (None, {"type": "text"}):
@@ -1083,6 +1563,70 @@ class Application:
         if not isinstance(stream, bool):
             raise RequestError("stream must be boolean", "stream")
         self._validate_compatibility(payload, endpoint)
+        tools = self._tools(payload)
+        if tools and self.response_protocol is None:
+            raise RequestError(
+                "the tokenizer does not declare a supported response protocol",
+                "tools", "unsupported_value",
+            )
+        tool_choice = self._tool_choice(payload, tools)
+        if endpoint == "completion" and tools:
+            raise RequestError("tools require a chat or Responses request",
+                               "tools", "unsupported_value")
+        prompt_tools = tools
+        if tool_choice == "none":
+            prompt_tools = ()
+        elif tool_choice == "required":
+            raise RequestError(
+                "required tool choice needs constrained decoding",
+                "tool_choice", "unsupported_value",
+            )
+        elif isinstance(tool_choice, dict):
+            raise RequestError(
+                "named tool choice needs constrained decoding",
+                "tool_choice", "unsupported_value",
+            )
+        template_kwargs = payload.get("chat_template_kwargs", {})
+        if template_kwargs is None:
+            template_kwargs = {}
+        if not isinstance(template_kwargs, dict):
+            raise RequestError("chat_template_kwargs must be an object",
+                               "chat_template_kwargs")
+        unknown_template_kwargs = set(template_kwargs) - {
+            "enable_thinking", "preserve_thinking"
+        }
+        if unknown_template_kwargs:
+            raise RequestError("unsupported chat template controls",
+                               "chat_template_kwargs", "unsupported_value")
+        enable_thinking = template_kwargs.get("enable_thinking", True)
+        preserve_thinking = template_kwargs.get("preserve_thinking", True)
+        if not isinstance(enable_thinking, bool):
+            raise RequestError("enable_thinking must be boolean",
+                               "chat_template_kwargs.enable_thinking")
+        if not isinstance(preserve_thinking, bool):
+            raise RequestError("preserve_thinking must be boolean",
+                               "chat_template_kwargs.preserve_thinking")
+        sampling = self._sampling(payload)
+        reasoning_effort = payload.get("reasoning_effort")
+        reasoning = payload.get("reasoning")
+        if reasoning is not None:
+            if not isinstance(reasoning, dict):
+                raise RequestError("reasoning must be an object", "reasoning")
+            unknown = set(reasoning) - {"effort", "summary"}
+            if unknown or reasoning.get("summary") not in (None, "auto"):
+                raise RequestError("unsupported reasoning controls", "reasoning",
+                                   "unsupported_value")
+            if reasoning_effort is not None and reasoning.get("effort") is not None:
+                raise RequestError("reasoning effort was specified twice",
+                                   "reasoning_effort")
+            reasoning_effort = reasoning.get("effort", reasoning_effort)
+        if reasoning_effort is None:
+            reasoning_effort = "xhigh"
+        if reasoning_effort not in {"xhigh", "medium", "low"}:
+            raise RequestError(
+                "reasoning_effort must be xhigh, medium, or low",
+                "reasoning_effort", "unsupported_value",
+            )
 
         max_field = "max_output_tokens" if endpoint == "responses" else "max_tokens"
         maximum_value = payload.get("max_output_tokens") if endpoint == "responses" else payload.get(
@@ -1106,8 +1650,22 @@ class Application:
         if user is not None and not isinstance(user, str):
             raise RequestError("user must be a string", "user")
 
+        cache_prefix_tokens = 0
         if endpoint == "chat":
-            prompt_ids = self._chat_prompt_ids(self._messages(payload.get("messages")))
+            messages = self._messages(payload.get("messages"))
+            prompt_ids = self._chat_prompt_ids(
+                messages, tools=prompt_tools,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            )
+            stable_ids = self._chat_prompt_ids(
+                messages, add_generation_prompt=False, tools=prompt_tools,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            )
+            cache_prefix_tokens = len(stable_ids)
         elif endpoint == "responses":
             raw_input = payload.get("input")
             if isinstance(raw_input, str):
@@ -1116,7 +1674,19 @@ class Application:
                 messages = self._messages(raw_input, "input")
             if instructions:
                 messages.insert(0, {"role": "system", "content": instructions})
-            prompt_ids = self._chat_prompt_ids(messages)
+            prompt_ids = self._chat_prompt_ids(
+                messages, tools=prompt_tools,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            )
+            stable_ids = self._chat_prompt_ids(
+                messages, add_generation_prompt=False, tools=prompt_tools,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            )
+            cache_prefix_tokens = len(stable_ids)
         else:
             prompt = payload.get("prompt")
             if isinstance(prompt, str):
@@ -1128,17 +1698,27 @@ class Application:
                 prompt_ids = [int(token) for token in prompt]
             else:
                 raise RequestError("prompt must be a string or token-id array", "prompt")
+            cache_prefix_tokens = len(prompt_ids)
 
         if not prompt_ids or len(prompt_ids) >= self.args.max_context:
             raise RequestError("prompt is empty or exceeds context capacity",
                                "input" if endpoint == "responses" else "prompt")
         if len(prompt_ids) + maximum > self.args.max_context:
             raise RequestError("prompt plus output tokens exceeds context capacity", max_field)
+        if endpoint in {"chat", "responses"} and (
+                cache_prefix_tokens <= 0 or
+                cache_prefix_tokens > len(prompt_ids) or
+                prompt_ids[:cache_prefix_tokens] != stable_ids):
+            raise RequestError("chat template has no stable cache prefix", "input")
         return GenerationRequest(
-            endpoint=endpoint, prompt_ids=prompt_ids, maximum=maximum,
+            endpoint=endpoint, prompt_ids=prompt_ids,
+            cache_prefix_tokens=cache_prefix_tokens, maximum=maximum,
             stream=stream, stop=self._stop_sequences(payload.get("stop")),
             include_usage=self._stream_usage(payload), instructions=instructions,
-            metadata=metadata, user=user,
+            metadata=metadata, user=user, reasoning_effort=reasoning_effort,
+            enable_thinking=enable_thinking,
+            preserve_thinking=preserve_thinking, sampling=sampling,
+            tools=tools, tool_choice=tool_choice,
         )
 
     _TELEMETRY_DELTA_KEYS = (
@@ -1277,7 +1857,10 @@ class Application:
             "credits" in message
 
     def generate(self, prompt_ids: list[int], maximum: int,
-                 context: RequestContext | None = None
+                 context: RequestContext | None = None,
+                 cancel_check: Callable[[], bool] | None = None,
+                 cache_prefix_tokens: int | None = None,
+                 sampling: SamplingSettings | None = None,
                  ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
@@ -1300,16 +1883,38 @@ class Application:
         prefill_tokens = len(prompt_ids)
         resumed = False
         finished = False
+        deadline = started + self.args.generation_timeout
+        checkpoint_tokens = cache_prefix_tokens or len(prompt_ids)
+        effective_sampling = sampling or self.default_sampling
         while True:
             try:
                 if session is not None:
                     delta = prompt_ids[len(session.tokens):]
-                    self.worker.begin_resume(request_id, session.key, delta,
-                                             context_limit)
+                    if cancel_check is None:
+                        self.worker.begin_resume(
+                            request_id, session.key, delta, context_limit,
+                            effective_sampling,
+                        )
+                    else:
+                        self.worker.begin_resume(
+                            request_id, session.key, delta, context_limit,
+                            effective_sampling,
+                            checkpoint_tokens=checkpoint_tokens,
+                            cancel_check=cancel_check, deadline=deadline,
+                        )
                     resumed = True
                     prefill_tokens = len(delta)
                 else:
-                    self.worker.begin(request_id, prompt_ids, context_limit)
+                    if cancel_check is None:
+                        self.worker.begin(request_id, prompt_ids, context_limit,
+                                          effective_sampling)
+                    else:
+                        self.worker.begin(
+                            request_id, prompt_ids, context_limit,
+                            effective_sampling,
+                            checkpoint_tokens=checkpoint_tokens,
+                            cancel_check=cancel_check, deadline=deadline,
+                        )
                 break
             except WorkerError as error:
                 if self._capacity_error(error) and self.evict_lru_session():
@@ -1317,6 +1922,8 @@ class Application:
                 if session is not None:
                     # The retained state is gone or inconsistent; fall back
                     # to a fresh full prefill.
+                    log("session_resume_failed", key=session.key,
+                        error=str(error))
                     self._drop_worker_session(session.key)
                     session = None
                     continue
@@ -1371,9 +1978,16 @@ class Application:
                 try:
                     session_key = session.key if session is not None \
                         else self.allocate_session_key()
-                    retained_tokens = self.worker.end_retain(
-                        request_id, session_key
-                    )
+                    try:
+                        retained_tokens = self.worker.end_retain(
+                            request_id, session_key, checkpoint_tokens
+                        )
+                    except TypeError as error:
+                        if "positional" not in str(error):
+                            raise
+                        retained_tokens = self.worker.end_retain(
+                            request_id, session_key
+                        )
                     tokens = (prompt_ids + generated + buffered)[
                         :retained_tokens]
                     if 0 < retained_tokens == len(tokens):
@@ -1492,6 +2106,14 @@ class Application:
                 "mtp_enabled": self.worker.mtp_enabled,
                 "retain_previous_route": self.worker.retain_previous_route,
                 "cpu_hybrid_enabled": self.worker.cpu_hybrid_enabled,
+                "response_protocol": self.response_protocol,
+                "sampling": {
+                    "temperature": self.default_sampling.temperature,
+                    "top_p": self.default_sampling.top_p,
+                    "top_k": self.default_sampling.top_k,
+                    "min_p": self.default_sampling.min_p,
+                    "source": "tokenizer/generation_config.json",
+                },
             },
             "worker_kv": {
                 "dtype": self.worker.kv_dtype,
@@ -1529,6 +2151,7 @@ class Application:
                 "latency_window": self.args.latency_window,
                 "queue_timeout_seconds": self.args.queue_timeout,
                 "generation_timeout_seconds": self.args.generation_timeout,
+                "maximum_body_bytes": self.args.maximum_body_bytes,
             },
             "draining": self.draining.is_set(),
         }
@@ -1628,26 +2251,28 @@ class Handler(BaseHTTPRequestHandler):
         }
 
     @staticmethod
-    def _usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+    def _usage(prompt_tokens: int, completion_tokens: int,
+               reasoning_tokens: int = 0) -> dict[str, Any]:
         return {
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
             "prompt_tokens_details": {"cached_tokens": 0, "audio_tokens": 0},
             "completion_tokens_details": {
-                "reasoning_tokens": 0, "audio_tokens": 0,
+                "reasoning_tokens": reasoning_tokens, "audio_tokens": 0,
                 "accepted_prediction_tokens": 0,
                 "rejected_prediction_tokens": 0,
             },
         }
 
     @staticmethod
-    def _responses_usage(prompt_tokens: int, completion_tokens: int) -> dict[str, Any]:
+    def _responses_usage(prompt_tokens: int, completion_tokens: int,
+                         reasoning_tokens: int = 0) -> dict[str, Any]:
         return {
             "input_tokens": prompt_tokens,
             "input_tokens_details": {"cached_tokens": 0},
             "output_tokens": completion_tokens,
-            "output_tokens_details": {"reasoning_tokens": 0},
+            "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
@@ -1657,8 +2282,20 @@ class Handler(BaseHTTPRequestHandler):
         count = 0
         finish_reason = "length"
         stop_filter = StopFilter(request.stop)
-        generation = self.app.generate(request.prompt_ids, request.maximum,
-                                       context)
+        try:
+            generation = self.app.generate(
+                request.prompt_ids, request.maximum, context,
+                cancel_check=self._client_disconnected,
+                cache_prefix_tokens=request.cache_prefix_tokens,
+                sampling=request.sampling,
+            )
+        except TypeError as error:
+            if not any(name in str(error) for name in (
+                    "cancel_check", "cache_prefix_tokens", "sampling")):
+                raise
+            generation = self.app.generate(
+                request.prompt_ids, request.maximum, context
+            )
         try:
             for token, delta in generation:
                 if request.stream and self._client_disconnected():
@@ -1681,15 +2318,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def _response_object(self, request: GenerationRequest, response_id: str,
                          message_id: str, created: int, text: str,
-                         completion_tokens: int, status: str = "completed") -> dict[str, Any]:
+                         completion_tokens: int, status: str = "completed",
+                         tool_calls: tuple[ToolCall, ...] = (),
+                         reasoning_tokens: int = 0) -> dict[str, Any]:
         completed = status == "completed"
-        output = [] if not completed else [{
-            "id": message_id, "type": "message", "status": "completed",
-            "role": "assistant", "content": [{
-                "type": "output_text", "text": text, "annotations": [],
-                "logprobs": [],
-            }],
-        }]
+        output: list[dict[str, Any]] = []
+        if completed and text:
+            output.append({
+                "id": message_id, "type": "message", "status": "completed",
+                "role": "assistant", "content": [{
+                    "type": "output_text", "text": text, "annotations": [],
+                    "logprobs": [],
+                }],
+            })
+        if completed:
+            output.extend({
+                "id": call.item_id,
+                "call_id": call.call_id,
+                "type": "function_call", "status": "completed",
+                "name": call.name, "arguments": call.arguments,
+            } for call in tool_calls)
         return {
             "id": response_id, "object": "response", "created_at": created,
             "status": status, "completed_at": int(time.time()) if completed else None,
@@ -1697,12 +2345,16 @@ class Handler(BaseHTTPRequestHandler):
             "instructions": request.instructions,
             "max_output_tokens": request.maximum, "model": self.app.args.model,
             "output": output, "parallel_tool_calls": True,
-            "previous_response_id": None, "reasoning": {"effort": None, "summary": None},
-            "store": False, "temperature": 0.0,
+            "previous_response_id": None,
+            "reasoning": {"effort": request.reasoning_effort, "summary": None},
+            "store": False, "temperature": request.sampling.temperature,
             "text": {"format": {"type": "text"}},
-            "tool_choice": "none", "tools": [], "top_p": 1.0,
+            "tool_choice": request.tool_choice,
+            "tools": list(request.tools), "top_p": request.sampling.top_p,
             "truncation": "disabled",
-            "usage": self._responses_usage(len(request.prompt_ids), completion_tokens)
+            "usage": self._responses_usage(
+                len(request.prompt_ids), completion_tokens, reasoning_tokens
+            )
                      if completed else None,
             "user": request.user, "metadata": request.metadata or {},
         }
@@ -1817,49 +2469,151 @@ class Handler(BaseHTTPRequestHandler):
                     self._sse({"type": "response.created", "response": initial,
                                "sequence_number": sequence})
                     sequence += 1
-                    item = {"id": message_uuid, "type": "message", "status": "in_progress",
-                            "role": "assistant", "content": []}
-                    self._sse({"type": "response.output_item.added", "output_index": 0,
-                               "item": item, "sequence_number": sequence})
-                    sequence += 1
-                    part = {"type": "output_text", "text": "", "annotations": [],
-                            "logprobs": []}
-                    self._sse({"type": "response.content_part.added", "item_id": message_uuid,
-                               "output_index": 0, "content_index": 0, "part": part,
-                               "sequence_number": sequence})
-                    sequence += 1
-
-                    def emit_response(delta: str) -> None:
-                        nonlocal sequence
-                        if self._client_disconnected():
-                            raise BrokenPipeError("streaming client disconnected")
-                        self._sse({"type": "response.output_text.delta",
+                    calls: tuple[ToolCall, ...] = ()
+                    reasoning_text = ""
+                    if request.tools and request.tool_choice != "none":
+                        pieces: list[str] = []
+                        raw_text, completion_count, _finish_reason = self._run_generation(
+                            request, pieces.append, context
+                        )
+                        parsed = self.app.parse_assistant_output(raw_text, request)
+                        text, calls = parsed.text, parsed.tool_calls
+                        reasoning_text = parsed.reasoning
+                    else:
+                        item = {"id": message_uuid, "type": "message",
+                                "status": "in_progress", "role": "assistant",
+                                "content": []}
+                        self._sse({"type": "response.output_item.added",
+                                   "output_index": 0, "item": item,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        part = {"type": "output_text", "text": "",
+                                "annotations": [], "logprobs": []}
+                        self._sse({"type": "response.content_part.added",
                                    "item_id": message_uuid, "output_index": 0,
-                                   "content_index": 0, "delta": delta,
-                                   "logprobs": [], "sequence_number": sequence})
+                                   "content_index": 0, "part": part,
+                                   "sequence_number": sequence})
                         sequence += 1
 
-                    text, completion_count, _finish_reason = self._run_generation(
-                        request, emit_response, context
-                    )
-                    self._sse({"type": "response.output_text.done", "item_id": message_uuid,
-                               "output_index": 0, "content_index": 0, "text": text,
-                               "logprobs": [], "sequence_number": sequence})
-                    sequence += 1
-                    done_part = {"type": "output_text", "text": text,
-                                 "annotations": [], "logprobs": []}
-                    self._sse({"type": "response.content_part.done", "item_id": message_uuid,
-                               "output_index": 0, "content_index": 0, "part": done_part,
-                               "sequence_number": sequence})
-                    sequence += 1
-                    done_item = {"id": message_uuid, "type": "message",
-                                 "status": "completed", "role": "assistant",
-                                 "content": [done_part]}
-                    self._sse({"type": "response.output_item.done", "output_index": 0,
-                               "item": done_item, "sequence_number": sequence})
-                    sequence += 1
+                        reasoning_filter = AssistantStreamParser(
+                            self.app, request
+                        )
+                        visible_pieces: list[str] = []
+                        reasoning_pieces: list[str] = []
+
+                        def emit_response(delta: str) -> None:
+                            nonlocal sequence
+                            if self._client_disconnected():
+                                raise BrokenPipeError("streaming client disconnected")
+                            reasoning, visible = reasoning_filter.feed(delta)
+                            if reasoning:
+                                reasoning_pieces.append(reasoning)
+                            if visible:
+                                visible_pieces.append(visible)
+                                self._sse({"type": "response.output_text.delta",
+                                           "item_id": message_uuid,
+                                           "output_index": 0,
+                                           "content_index": 0, "delta": visible,
+                                           "logprobs": [],
+                                           "sequence_number": sequence})
+                                sequence += 1
+
+                        _raw_text, completion_count, _finish_reason = self._run_generation(
+                            request, emit_response, context
+                        )
+                        reasoning_tail, visible_tail = reasoning_filter.finish()
+                        if reasoning_tail:
+                            reasoning_pieces.append(reasoning_tail)
+                        if visible_tail:
+                            visible_pieces.append(visible_tail)
+                            self._sse({"type": "response.output_text.delta",
+                                       "item_id": message_uuid,
+                                       "output_index": 0,
+                                       "content_index": 0,
+                                       "delta": visible_tail, "logprobs": [],
+                                       "sequence_number": sequence})
+                            sequence += 1
+                        text = "".join(visible_pieces)
+                        reasoning_text = "".join(reasoning_pieces)
+
+                    output_index = 0
+                    if text or not calls:
+                        if request.tools and request.tool_choice != "none":
+                            item = {"id": message_uuid, "type": "message",
+                                    "status": "in_progress", "role": "assistant",
+                                    "content": []}
+                            self._sse({"type": "response.output_item.added",
+                                       "output_index": output_index, "item": item,
+                                       "sequence_number": sequence})
+                            sequence += 1
+                            part = {"type": "output_text", "text": "",
+                                    "annotations": [], "logprobs": []}
+                            self._sse({"type": "response.content_part.added",
+                                       "item_id": message_uuid,
+                                       "output_index": output_index,
+                                       "content_index": 0, "part": part,
+                                       "sequence_number": sequence})
+                            sequence += 1
+                            if text:
+                                self._sse({"type": "response.output_text.delta",
+                                           "item_id": message_uuid,
+                                           "output_index": output_index,
+                                           "content_index": 0, "delta": text,
+                                           "logprobs": [],
+                                           "sequence_number": sequence})
+                                sequence += 1
+                        self._sse({"type": "response.output_text.done",
+                                   "item_id": message_uuid,
+                                   "output_index": output_index,
+                                   "content_index": 0, "text": text,
+                                   "logprobs": [], "sequence_number": sequence})
+                        sequence += 1
+                        done_part = {"type": "output_text", "text": text,
+                                     "annotations": [], "logprobs": []}
+                        self._sse({"type": "response.content_part.done",
+                                   "item_id": message_uuid,
+                                   "output_index": output_index,
+                                   "content_index": 0, "part": done_part,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        done_item = {"id": message_uuid, "type": "message",
+                                     "status": "completed", "role": "assistant",
+                                     "content": [done_part]}
+                        self._sse({"type": "response.output_item.done",
+                                   "output_index": output_index, "item": done_item,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        output_index += 1
+                    for call in calls:
+                        call_item = {
+                            "id": call.item_id,
+                            "call_id": call.call_id, "type": "function_call",
+                            "status": "in_progress", "name": call.name,
+                            "arguments": "",
+                        }
+                        self._sse({"type": "response.output_item.added",
+                                   "output_index": output_index,
+                                   "item": call_item,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        self._sse({"type": "response.function_call_arguments.done",
+                                   "item_id": call_item["id"],
+                                   "output_index": output_index,
+                                   "arguments": call.arguments,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        call_item = {**call_item, "status": "completed",
+                                     "arguments": call.arguments}
+                        self._sse({"type": "response.output_item.done",
+                                   "output_index": output_index,
+                                   "item": call_item,
+                                   "sequence_number": sequence})
+                        sequence += 1
+                        output_index += 1
                     completed = self._response_object(
-                        request, request_uuid, message_uuid, created, text, completion_count
+                        request, request_uuid, message_uuid, created, text,
+                        completion_count, tool_calls=calls,
+                        reasoning_tokens=self.app.text_token_count(reasoning_text),
                     )
                     self._sse({"type": "response.completed", "response": completed,
                                "sequence_number": sequence})
@@ -1873,19 +2627,90 @@ class Handler(BaseHTTPRequestHandler):
                         self._sse({**base, "choices": [{"index": 0,
                             "delta": {"role": "assistant", "content": ""},
                             "logprobs": None, "finish_reason": None}]})
+                    reasoning_filter = AssistantStreamParser(
+                        self.app, request
+                    ) if chat else None
+                    reasoning_pieces: list[str] = []
 
                     def emit_completion(delta: str) -> None:
                         if self._client_disconnected():
                             raise BrokenPipeError("streaming client disconnected")
-                        choice: dict[str, Any] = {"index": 0, "finish_reason": None,
-                                                  "logprobs": None}
-                        choice["delta" if chat else "text"] = ({"content": delta}
-                                                                 if chat else delta)
-                        self._sse({**base, "choices": [choice]})
+                        if chat:
+                            assert reasoning_filter is not None
+                            reasoning, visible = reasoning_filter.feed(delta)
+                            if reasoning:
+                                reasoning_pieces.append(reasoning)
+                                self._sse({**base, "choices": [{
+                                    "index": 0, "finish_reason": None,
+                                    "logprobs": None,
+                                    "delta": {"reasoning_content": reasoning},
+                                }]})
+                            if visible:
+                                self._sse({**base, "choices": [{
+                                    "index": 0, "finish_reason": None,
+                                    "logprobs": None,
+                                    "delta": {"content": visible},
+                                }]})
+                        else:
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None, "text": delta,
+                            }]})
 
-                    _text, completion_count, finish_reason = self._run_generation(
-                        request, emit_completion, context
-                    )
+                    calls: tuple[ToolCall, ...] = ()
+                    if chat and request.tools and request.tool_choice != "none":
+                        pieces: list[str] = []
+                        raw_text, completion_count, finish_reason = self._run_generation(
+                            request, pieces.append, context
+                        )
+                        parsed = self.app.parse_assistant_output(raw_text, request)
+                        calls = parsed.tool_calls
+                        if parsed.reasoning:
+                            reasoning_pieces.append(parsed.reasoning)
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None,
+                                "delta": {"reasoning_content": parsed.reasoning},
+                            }]})
+                        if parsed.text:
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None,
+                                "delta": {"content": parsed.text},
+                            }]})
+                        if calls:
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None, "delta": {"tool_calls": [{
+                                    "index": index, "id": call.call_id,
+                                    "type": "function", "function": {
+                                        "name": call.name,
+                                        "arguments": call.arguments,
+                                    },
+                                } for index, call in enumerate(calls)]},
+                            }]})
+                            finish_reason = "tool_calls"
+                    else:
+                        _text, completion_count, finish_reason = self._run_generation(
+                            request, emit_completion, context
+                        )
+                        if reasoning_filter is None:
+                            reasoning_tail, visible_tail = "", ""
+                        else:
+                            reasoning_tail, visible_tail = reasoning_filter.finish()
+                        if chat and reasoning_tail:
+                            reasoning_pieces.append(reasoning_tail)
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None,
+                                "delta": {"reasoning_content": reasoning_tail},
+                            }]})
+                        if chat and visible_tail:
+                            self._sse({**base, "choices": [{
+                                "index": 0, "finish_reason": None,
+                                "logprobs": None,
+                                "delta": {"content": visible_tail},
+                            }]})
                     final_choice: dict[str, Any] = {
                         "index": 0, "finish_reason": finish_reason, "logprobs": None,
                     }
@@ -1894,16 +2719,30 @@ class Handler(BaseHTTPRequestHandler):
                     if request.include_usage:
                         self._sse({**base, "choices": [],
                                    "usage": self._usage(len(request.prompt_ids),
-                                                        completion_count)})
+                                        completion_count,
+                                        self.app.text_token_count(
+                                            "".join(reasoning_pieces)
+                                        ))})
                     self._sse("[DONE]")
             else:
                 pieces: list[str] = []
                 text, completion_count, finish_reason = self._run_generation(
                     request, pieces.append, context
                 )
+                calls: tuple[ToolCall, ...] = ()
+                reasoning = ""
+                if endpoint in {"chat", "responses"}:
+                    parsed = self.app.parse_assistant_output(text, request)
+                    text, reasoning, calls = (
+                        parsed.text, parsed.reasoning, parsed.tool_calls
+                    )
+                    if calls:
+                        finish_reason = "tool_calls"
                 if endpoint == "responses":
                     self._json(HTTPStatus.OK, self._response_object(
-                        request, request_uuid, message_uuid, created, text, completion_count
+                        request, request_uuid, message_uuid, created, text,
+                        completion_count, tool_calls=calls,
+                        reasoning_tokens=self.app.text_token_count(reasoning),
                     ))
                 else:
                     chat = endpoint == "chat"
@@ -1911,8 +2750,19 @@ class Handler(BaseHTTPRequestHandler):
                         "index": 0, "finish_reason": finish_reason, "logprobs": None,
                     }
                     if chat:
-                        choice["message"] = {"role": "assistant", "content": text,
-                                             "refusal": None, "annotations": []}
+                        message: dict[str, Any] = {
+                            "role": "assistant", "content": text or None,
+                            "refusal": None, "annotations": [],
+                        }
+                        if reasoning:
+                            message["reasoning_content"] = reasoning
+                        if calls:
+                            message["tool_calls"] = [{
+                                "id": call.call_id, "type": "function",
+                                "function": {"name": call.name,
+                                             "arguments": call.arguments},
+                            } for call in calls]
+                        choice["message"] = message
                     else:
                         choice["text"] = text
                     self._json(HTTPStatus.OK, {"id": request_uuid,
@@ -1920,7 +2770,10 @@ class Handler(BaseHTTPRequestHandler):
                         "created": created, "model": self.app.args.model,
                         "system_fingerprint": "fp_" + self.app.args.build_id,
                         "choices": [choice],
-                        "usage": self._usage(len(request.prompt_ids), completion_count),
+                        "usage": self._usage(
+                            len(request.prompt_ids), completion_count,
+                            self.app.text_token_count(reasoning),
+                        ),
                         "service_tier": "default"})
             self.app.increment("completed")
         except (BrokenPipeError, ConnectionResetError):
@@ -1982,7 +2835,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
-    parser.add_argument("--worker-prefill-chunk-tokens", type=int, default=256)
+    parser.add_argument(
+        "--worker-prefill-chunk-tokens", type=int, default=0,
+        help="maximum provider prefill chunk (0 uses the provider contract)",
+    )
     parser.add_argument(
         "--worker-placement-settle-steps", type=int, default=None,
         help="decode steps before the Qwen worker freezes adaptive placement "
@@ -2027,10 +2883,10 @@ def main() -> int:
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
         args.worker_kv_cache_mib < 1 or args.worker_kv_page_tokens < 1 or
-        args.worker_prefill_chunk_tokens < 1 or
+        args.worker_prefill_chunk_tokens < 0 or
         (args.worker_placement_settle_steps is not None and
          args.worker_placement_settle_steps < 0) or
-        args.session_idle_seconds < 0 or
+        args.session_idle_seconds < 0 or args.maximum_body_bytes < 1 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
     if (args.host not in {"127.0.0.1", "::1", "localhost"} and

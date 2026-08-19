@@ -1,6 +1,6 @@
 # Install, configure, and use
 
-Status: current common lifecycle as of 2026-08-17. For implementation state
+Status: current common lifecycle as of 2026-08-19. For implementation state
 and remaining VM work, see [the canonical handoff](moe-vm-next.md).
 
 This is the operator path for one POSIX control host and one Windows/CUDA GPU
@@ -37,9 +37,8 @@ Prepare at least one immutable model artifact:
 - DeepSeek-V4-Flash compact pack and worker bundle, as described by
   [the compact format](deepseek-compact-pack-v1.md) and current runtime
   contracts;
-- Qwen3-Next 80B Expert Pack, as described in
+- Qwen3.8-27B dense FP4 pack, as described in
   [Getting started](getting-started.md#compile-expert-pack);
-- LFM2-MoE Expert Pack compiled by the same generic compiler contract.
 
 The lifecycle wrapper validates the selected artifact during service startup.
 It never removes the original checkpoint or either prepared model.
@@ -66,18 +65,20 @@ QUANTUM_LLM_REMOTE=user@gpu-host
 QUANTUM_LLM_REMOTE_ROOT=D:/quantum-llm
 MODEL_ROOT=D:/quantum-llm/work/models
 
-CHAT_MODEL=deepseek-v4-flash
-MODEL_MAX_CONTEXT=65536
+CHAT_MODEL=qwen3.8-27b-fp4
+MODEL_MAX_CONTEXT=262144
 MODEL_MAX_OUTPUT_TOKENS=8192
 MODEL_PORT=8080
 MODEL_SYNC_ON_START=1
 MODEL_READY_TIMEOUT=600
-MODEL_GENERATION_TIMEOUT_SECONDS=600
+MODEL_GENERATION_TIMEOUT_SECONDS=14400
+MODEL_MAX_BODY_MIB=16
 
 MODEL_RAM_CACHE_GIB=48
 MODEL_VRAM_CACHE_GIB=13
 MODEL_WORKER_CAPACITY=1
 MODEL_MAXIMUM_QUEUE=4
+MODEL_KV_CACHE_MIB=5120
 
 CHAT_SSH=user@gpu-host
 CHAT_BASE_URL=http://127.0.0.1:8080
@@ -94,7 +95,7 @@ The model selectors accepted by `CHAT_MODEL` are:
 | Value | Deployment |
 |---|---|
 | `deepseek-v4-flash` | DeepSeek-V4-Flash compact worker bundle |
-| `qwen3-next-80b-a3b-expert-pack-fp4` | Qwen3-Next 80B Expert Pack (FP4, ABI 3) |
+| `qwen3.8-27b-fp4` | Qwen3.8-27B dense pack (FP4 matrices, ABI 3) |
 | any direct child of `MODEL_ROOT` | Generic VM artifact |
 
 Short aliases `deepseek` and `qwen` are data entries in
@@ -107,8 +108,9 @@ history, current input, and requested output. `MODEL_MAX_OUTPUT_TOKENS` is the
 server ceiling for one response. `CHAT_MAX_TOKENS` is what the terminal client
 requests and cannot exceed the server ceiling.
 
-The reference 65,536/8,192 limits are operational configuration, not a claim
-that long-context correctness or latency has been qualified. A request can
+The reference 262,144/8,192 limits are operational configuration. Full capacity
+has completed once, but maximum-context throughput and semantic quality remain
+release blockers. A request can
 also end at `MODEL_GENERATION_TIMEOUT_SECONDS` before reaching its output
 ceiling. The terminal client's socket timeout defaults to 60 seconds beyond
 that service deadline; `CHAT_REQUEST_TIMEOUT_SECONDS` can override it.
@@ -159,15 +161,15 @@ A healthy deployment reports fields like:
 ```json
 {
   "ready": true,
-  "model": "deepseek-v4-flash",
-  "max_context": 65536,
+  "model": "qwen3.8-27b-fp4",
+  "max_context": 262144,
   "maximum_new_tokens": 8192,
   "worker_capacity": 1,
   "active_requests": 0
 }
 ```
 
-`worker_capacity=1` means one admitted DeepSeek generation at a time;
+`worker_capacity=1` means one admitted generation at a time;
 `active_requests=0` means the service was idle when status was sampled.
 
 ## 4. Chat interactively
@@ -212,10 +214,9 @@ curl http://127.0.0.1:18080/v1/models
 curl http://127.0.0.1:18080/v1/responses \
   -H 'Content-Type: application/json' \
   -d '{
-    "model": "deepseek-v4-flash",
+    "model": "qwen3.8-27b-fp4",
     "input": "Reply briefly: what is an MoE model?",
     "max_output_tokens": 128,
-    "temperature": 0,
     "stream": true
   }'
 ```
@@ -231,7 +232,6 @@ single common task and cleans up retired task names first:
 ```bash
 ./ops/model.sh start qwen
 ./ops/model.sh start deepseek
-./ops/model.sh start lfm2-8b-a1b-expert-pack-fp4
 ```
 
 Other lifecycle operations:
@@ -264,7 +264,7 @@ current `.env` values.
 - `context_capacity_exhausted`: prompt plus output needs more KV credits than
   are currently available; shorten/clear history or lower concurrency.
 - generation timeout: raise `MODEL_GENERATION_TIMEOUT_SECONDS` only after
-  considering that one slow DeepSeek request occupies its sole worker slot.
+  considering that one long request occupies the sole worker slot.
 - `request_preprocessing_failed`: inspect the JSONL log for the tokenizer/chat
   template error; the API returns structured HTTP 500 instead of dropping the
   connection.

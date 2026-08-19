@@ -1,12 +1,15 @@
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 #include <mma.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 
 namespace expert::runtime::cuda {
@@ -17,11 +20,14 @@ constexpr unsigned kWarpSize = 32;
 constexpr unsigned kWarpsPerBlock = kThreads / kWarpSize;
 constexpr unsigned kMaximumRouterTopK = 32;
 constexpr unsigned kMaximumWeightReuseBatch = 8;
-constexpr unsigned kFp4GemmBatchTile = 64;
+constexpr unsigned kFp4GemmBatchTile = 128;
 constexpr unsigned kFp4GemmOutputTile = 32;
 constexpr unsigned kFp4GemmBlockColumns = 32;
 constexpr unsigned kFp4GemmThreads = 256;
 constexpr unsigned kFp4GemmWarps = kFp4GemmThreads / kWarpSize;
+constexpr unsigned kFp4PrefillGemmThreads = 512;
+constexpr unsigned kFp4PrefillGemmWarps =
+    kFp4PrefillGemmThreads / kWarpSize;
 constexpr unsigned kTensorCoreAttentionThreads = 512;
 // A 16-token tile keeps decoded K/V values within the default 48-KiB SM86
 // shared-memory limit. FP4 values times UE8M0 power-of-two scales are exactly
@@ -51,6 +57,21 @@ __device__ float block_sum_warps(float value, float* workspace) {
   __syncthreads();
   value = warp == 0U && lane < kWarpsPerBlock ? workspace[lane] : 0.0F;
   if (warp == 0U) value = warp_sum(value);
+  if (threadIdx.x == 0U) workspace[0] = value;
+  __syncthreads();
+  return workspace[0];
+}
+
+__device__ float block_max_warps(float value, float* workspace) {
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto warp = threadIdx.x / kWarpSize;
+  value = warp_max(value);
+  if (lane == 0U) workspace[warp] = value;
+  __syncthreads();
+  value = warp == 0U && lane < kWarpsPerBlock
+              ? workspace[lane]
+              : kNegativeInfinity;
+  if (warp == 0U) value = warp_max(value);
   if (threadIdx.x == 0U) workspace[0] = value;
   __syncthreads();
   return workspace[0];
@@ -257,7 +278,8 @@ __global__ void fp4_gemv_q8_batch_kernel(
     output[static_cast<std::size_t>(request) * rows + row] = value;
 }
 
-template <std::uint32_t Batch>
+template <std::uint32_t Batch, bool CacheAllActivations = false,
+          bool CacheActivationTiles = false>
 __global__ void fp4_gemv_q8_batch_weight_reuse_kernel(
     const std::uint8_t* weights, const std::uint8_t* weight_scales,
     const std::int8_t* input, const float* input_scales, float* output,
@@ -267,46 +289,120 @@ __global__ void fp4_gemv_q8_batch_weight_reuse_kernel(
   const auto lane = threadIdx.x % kWarpSize;
   const auto row = static_cast<std::uint32_t>(
       blockIdx.x * kWarpsPerBlock + warp);
-  if (row >= rows) return;
+  const auto active = row < rows;
   const auto blocks = padded_columns / 32U;
+  constexpr std::uint32_t kActivationWordsPerBlock = 8U;
+  static_assert(!(CacheAllActivations && CacheActivationTiles));
+  const auto activation_block_stride =
+      CacheActivationTiles
+          ? kWarpSize + 4U
+          : ((blocks + kWarpSize - 1U) / kWarpSize) * kWarpSize + 4U;
+  extern __shared__ int cached_activations[];
+  if constexpr (CacheAllActivations) {
+    static_assert(Batch == 2U);
+    const auto words_per_request = blocks * kActivationWordsPerBlock;
+    for (std::uint32_t item = threadIdx.x;
+         item < Batch * words_per_request; item += blockDim.x) {
+      const auto request = item / words_per_request;
+      const auto local = item % words_per_request;
+      const auto block = local / kActivationWordsPerBlock;
+      const auto group = local % kActivationWordsPerBlock;
+      cached_activations[
+          (request * kActivationWordsPerBlock + group) *
+              activation_block_stride +
+          block] = reinterpret_cast<const int*>(
+              input + static_cast<std::size_t>(request) * padded_columns)[
+              local];
+    }
+    __syncthreads();
+  }
+  if constexpr (!CacheActivationTiles) {
+    if (!active) return;
+  }
   const auto* row_weights = reinterpret_cast<const int4*>(
-      weights + static_cast<std::size_t>(row) * (padded_columns / 2U));
+      weights + static_cast<std::size_t>(active ? row : 0U) *
+                    (padded_columns / 2U));
   const auto* row_scales = weight_scales +
-      static_cast<std::size_t>(row) * blocks;
+      static_cast<std::size_t>(active ? row : 0U) * blocks;
   float totals[Batch]{};
   const int* activation_blocks[Batch];
 #pragma unroll
-  for (std::uint32_t request = 0U; request < Batch; ++request)
-    activation_blocks[request] = reinterpret_cast<const int*>(
-        input + static_cast<std::size_t>(request) * padded_columns);
-  for (std::uint32_t block = lane; block < blocks; block += kWarpSize) {
-    const auto packed_weights = row_weights[block];
-    const auto weight_scale = decode_ue8m0(row_scales[block]);
-    const std::uint32_t weight_words[]{
-        static_cast<std::uint32_t>(packed_weights.x),
-        static_cast<std::uint32_t>(packed_weights.y),
-        static_cast<std::uint32_t>(packed_weights.z),
-        static_cast<std::uint32_t>(packed_weights.w)};
-    int block_totals[Batch]{};
-#pragma unroll
-    for (std::uint32_t group = 0U; group < 8U; ++group) {
-      const auto pair = static_cast<std::uint16_t>(
-          weight_words[group / 2U] >> (16U * (group & 1U)));
-      const auto packed = packed_fp4x4(
-          static_cast<std::uint8_t>(pair),
-          static_cast<std::uint8_t>(pair >> 8U));
-#pragma unroll
-      for (std::uint32_t request = 0U; request < Batch; ++request) {
-        block_totals[request] =
-            __dp4a(packed, activation_blocks[request][block * 8U + group],
-                   block_totals[request]);
-      }
-    }
-#pragma unroll
-    for (std::uint32_t request = 0U; request < Batch; ++request)
-      totals[request] +=
-          static_cast<float>(block_totals[request]) * weight_scale;
+  for (std::uint32_t request = 0U; request < Batch; ++request) {
+    if constexpr (!CacheAllActivations && !CacheActivationTiles)
+      activation_blocks[request] = reinterpret_cast<const int*>(
+          input + static_cast<std::size_t>(request) * padded_columns);
   }
+  for (std::uint32_t tile_first = 0U; tile_first < blocks;
+       tile_first += kWarpSize) {
+    const auto tile_blocks = min(kWarpSize, blocks - tile_first);
+    if constexpr (CacheActivationTiles) {
+      static_assert(Batch == 2U);
+      const auto words_per_request =
+          tile_blocks * kActivationWordsPerBlock;
+      for (std::uint32_t item = threadIdx.x;
+           item < Batch * words_per_request; item += blockDim.x) {
+        const auto request = item / words_per_request;
+        const auto local = item % words_per_request;
+        const auto local_block = local / kActivationWordsPerBlock;
+        const auto group = local % kActivationWordsPerBlock;
+        const auto source = static_cast<std::size_t>(request) * blocks *
+                                kActivationWordsPerBlock +
+                            static_cast<std::size_t>(tile_first) *
+                                kActivationWordsPerBlock +
+                            local;
+        cached_activations[
+            (request * kActivationWordsPerBlock + group) *
+                activation_block_stride +
+            local_block] = reinterpret_cast<const int*>(input)[source];
+      }
+      __syncthreads();
+    }
+    const auto block = tile_first + lane;
+    if (active && block < blocks) {
+      const auto packed_weights = row_weights[block];
+      const auto weight_scale = decode_ue8m0(row_scales[block]);
+      const std::uint32_t weight_words[]{
+          static_cast<std::uint32_t>(packed_weights.x),
+          static_cast<std::uint32_t>(packed_weights.y),
+          static_cast<std::uint32_t>(packed_weights.z),
+          static_cast<std::uint32_t>(packed_weights.w)};
+      int block_totals[Batch]{};
+#pragma unroll
+      for (std::uint32_t group = 0U; group < 8U; ++group) {
+        const auto pair = static_cast<std::uint16_t>(
+            weight_words[group / 2U] >> (16U * (group & 1U)));
+        const auto packed = packed_fp4x4(
+            static_cast<std::uint8_t>(pair),
+            static_cast<std::uint8_t>(pair >> 8U));
+#pragma unroll
+        for (std::uint32_t request = 0U; request < Batch; ++request) {
+          int activation{};
+          if constexpr (CacheAllActivations) {
+            activation = cached_activations[
+                (request * kActivationWordsPerBlock + group) *
+                    activation_block_stride +
+                block];
+          } else if constexpr (CacheActivationTiles) {
+            activation = cached_activations[
+                (request * kActivationWordsPerBlock + group) *
+                    activation_block_stride +
+                lane];
+          } else {
+            activation = activation_blocks[request][
+                block * kActivationWordsPerBlock + group];
+          }
+          block_totals[request] =
+              __dp4a(packed, activation, block_totals[request]);
+        }
+      }
+#pragma unroll
+      for (std::uint32_t request = 0U; request < Batch; ++request)
+        totals[request] +=
+            static_cast<float>(block_totals[request]) * weight_scale;
+    }
+    if constexpr (CacheActivationTiles) __syncthreads();
+  }
+  if (!active) return;
 #pragma unroll
   for (std::uint32_t request = 0U; request < Batch; ++request) {
     const auto value = warp_sum(totals[request]) *
@@ -316,10 +412,11 @@ __global__ void fp4_gemv_q8_batch_weight_reuse_kernel(
   }
 }
 
-// A CTA owns [up to 64 activation rows, 32 output rows]. Q8 integers and
+// A CTA owns [up to 128 activation rows, 32 output rows]. Q8 integers and
 // FP4-twice values multiplied by their power-of-two block scales are exactly
 // representable in BF16. Baking the weight scale into the BF16 operand lets
-// each warp keep one FP32 accumulator fragment across the complete K axis;
+// each of sixteen warps keep one FP32 accumulator fragment across the
+// complete K axis;
 // the old integer path had to store, rescale, and reload a 64x32 product after
 // every K=32 block.
 __global__ void fp4_gemm_q8_block32_kernel(
@@ -328,12 +425,14 @@ __global__ void fp4_gemm_q8_block32_kernel(
     std::uint32_t output_rows, std::uint32_t padded_columns,
     std::uint32_t batch) {
   using namespace nvcuda;
+  constexpr std::uint32_t kOperandStride = kFp4GemmBlockColumns + 8U;
+  constexpr std::uint32_t kProductStride = kFp4GemmOutputTile + 4U;
   __shared__ __align__(32) __nv_bfloat16
-      activation_tile[kFp4GemmBatchTile][kFp4GemmBlockColumns];
+      activation_tile[kFp4GemmBatchTile][kOperandStride];
   __shared__ __align__(32) __nv_bfloat16
-      weight_tile[kFp4GemmOutputTile][kFp4GemmBlockColumns];
+      weight_tile[kFp4GemmOutputTile][kOperandStride];
   __shared__ __align__(32) float
-      product_tile[kFp4GemmBatchTile][kFp4GemmOutputTile];
+      product_tile[kFp4GemmBatchTile][kProductStride];
 
   const auto local_thread = static_cast<std::uint32_t>(threadIdx.x);
   const auto warp = local_thread / kWarpSize;
@@ -357,7 +456,7 @@ __global__ void fp4_gemm_q8_block32_kernel(
   for (std::uint32_t block = 0U; block < blocks; ++block) {
     for (std::uint32_t item = local_thread;
          item < kFp4GemmBatchTile * (kFp4GemmBlockColumns / 4U);
-         item += kFp4GemmThreads) {
+         item += kFp4PrefillGemmThreads) {
       const auto row = item / (kFp4GemmBlockColumns / 4U);
       const auto group = item % (kFp4GemmBlockColumns / 4U);
       const auto source_row = first_batch + row;
@@ -378,7 +477,7 @@ __global__ void fp4_gemm_q8_block32_kernel(
     }
     for (std::uint32_t item = local_thread;
          item < kFp4GemmOutputTile * (kFp4GemmBlockColumns / 8U);
-         item += kFp4GemmThreads) {
+         item += kFp4PrefillGemmThreads) {
       const auto row = item / (kFp4GemmBlockColumns / 8U);
       const auto group = item % (kFp4GemmBlockColumns / 8U);
       const auto source_row = first_output + row;
@@ -407,18 +506,18 @@ __global__ void fp4_gemm_q8_block32_kernel(
 
     wmma::load_matrix_sync(
         activation_fragment, &activation_tile[batch_warp * 16U][0],
-        kFp4GemmBlockColumns);
+        kOperandStride);
     wmma::load_matrix_sync(weight_fragment,
                            &weight_tile[output_warp * 16U][0],
-                           kFp4GemmBlockColumns);
+                           kOperandStride);
     wmma::mma_sync(product_fragment, activation_fragment, weight_fragment,
                    product_fragment);
     wmma::load_matrix_sync(
         activation_fragment, &activation_tile[batch_warp * 16U][16],
-        kFp4GemmBlockColumns);
+        kOperandStride);
     wmma::load_matrix_sync(weight_fragment,
                            &weight_tile[output_warp * 16U][16],
-                           kFp4GemmBlockColumns);
+                           kOperandStride);
     wmma::mma_sync(product_fragment, activation_fragment, weight_fragment,
                    product_fragment);
     __syncthreads();
@@ -426,14 +525,14 @@ __global__ void fp4_gemm_q8_block32_kernel(
 
   wmma::store_matrix_sync(
       &product_tile[batch_warp * 16U][output_warp * 16U],
-      product_fragment, kFp4GemmOutputTile, wmma::mem_row_major);
+      product_fragment, kProductStride, wmma::mem_row_major);
   __syncthreads();
 
   for (std::uint32_t local = 0U;
        local < kFp4GemmBatchTile * kFp4GemmOutputTile /
-                   kFp4GemmThreads;
+                   kFp4PrefillGemmThreads;
        ++local) {
-    const auto item = local_thread + local * kFp4GemmThreads;
+    const auto item = local_thread + local * kFp4PrefillGemmThreads;
     const auto batch_row = first_batch + item / kFp4GemmOutputTile;
     const auto output_row = first_output + item % kFp4GemmOutputTile;
     if (batch_row < batch && output_row < output_rows)
@@ -442,6 +541,49 @@ __global__ void fp4_gemm_q8_block32_kernel(
                       [item % kFp4GemmOutputTile] *
           input_scales[batch_row] * 0.5F;
   }
+}
+
+__global__ void fp4_decode_matrix_bf16_kernel(
+    const std::uint8_t* weights, const std::uint8_t* weight_scales,
+    __nv_bfloat16* decoded, std::uint32_t rows,
+    std::uint32_t padded_columns) {
+  const auto values = static_cast<std::size_t>(rows) * padded_columns;
+  const auto scale_stride = padded_columns / 32U;
+  const auto weight_stride = padded_columns / 2U;
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < values;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    const auto row = item / padded_columns;
+    const auto column = static_cast<std::uint32_t>(item % padded_columns);
+    const auto packed = weights[row * weight_stride + column / 2U];
+    const auto code = static_cast<std::uint8_t>(
+        (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+    const auto scale = decode_ue8m0(
+        weight_scales[row * scale_stride + column / 32U]);
+    decoded[item] = __float2bfloat16(
+        static_cast<float>(decode_fp4_twice(code)) * scale);
+  }
+}
+
+__global__ void q8_to_bf16_kernel(
+    const std::int8_t* input, __nv_bfloat16* decoded,
+    std::size_t values) {
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < values;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x)
+    decoded[item] = __float2bfloat16(static_cast<float>(input[item]));
+}
+
+__global__ void scale_bf16_q8_gemm_kernel(
+    float* output, const float* input_scales, std::uint32_t output_rows,
+    std::size_t values) {
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < values;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x)
+    output[item] *= input_scales[item / output_rows] * 0.5F;
 }
 
 __global__ void embedding_kernel(const std::int8_t* weights,
@@ -2038,7 +2180,8 @@ __global__ void gated_gqa_attention_paged_fp4_split_kernel(
 // once and reused by all heads that share the KV head. Padding the group to a
 // 16-row WMMA tile changes neither routing nor attention visibility.
 template <std::uint32_t BlockThreads, std::uint32_t HeadCapacity>
-__global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
+__device__ __forceinline__ void
+gated_gqa_attention_paged_fp4_tensor_core_split_body(
     const float* q_and_gate, const void* const* page_table,
     float* partial_maxima, float* partial_sums, float* partial_outputs,
     std::uint32_t first_context_tokens, std::uint32_t rows,
@@ -2051,19 +2194,24 @@ __global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
   constexpr std::uint32_t kQueryTile = 16U;
   constexpr std::uint32_t kKeyTile = 16U;
   constexpr std::uint32_t kBlockWarps = BlockThreads / kWarpSize;
+  constexpr std::uint32_t kBf16Stride = HeadCapacity + 8U;
+  constexpr std::uint32_t kScoreStride = kKeyTile + 4U;
+  constexpr std::uint32_t kProbabilityStride = kKeyTile + 8U;
+  constexpr std::uint32_t kProductStride = HeadCapacity + 4U;
   __shared__ __align__(32) __nv_bfloat16
-      query_values[kQueryTile][HeadCapacity];
+      query_values[kQueryTile][kBf16Stride];
   __shared__ __align__(32) __nv_bfloat16
-      key_values[kKeyTile][HeadCapacity];
+      key_values[kKeyTile][kBf16Stride];
   __shared__ __align__(32) __nv_bfloat16
-      value_values[kKeyTile][HeadCapacity];
+      value_values[kKeyTile][kBf16Stride];
   constexpr std::uint32_t kScoreWarps =
       HeadCapacity / 64U;
   __shared__ __align__(32) float
-      score_partials[kScoreWarps][kQueryTile][kKeyTile];
-  __shared__ __align__(32) __nv_bfloat16 probabilities[kQueryTile][kKeyTile];
+      score_partials[kScoreWarps][kQueryTile][kScoreStride];
+  __shared__ __align__(32) __nv_bfloat16
+      probabilities[kQueryTile][kProbabilityStride];
   __shared__ __align__(32) float
-      products[kQueryTile][HeadCapacity];
+      products[kQueryTile][kProductStride];
   __shared__ float row_maxima[kQueryTile];
   __shared__ float row_sums[kQueryTile];
   __shared__ float row_previous_scales[kQueryTile];
@@ -2111,52 +2259,75 @@ __global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
   for (std::uint32_t tile_first = first_token; tile_first < last_token;
        tile_first += kKeyTile) {
     const auto tile_tokens = min(kKeyTile, last_token - tile_first);
-    const auto blocks_per_record = head_dim / 32U;
-    const auto blocks_per_kind = tile_tokens * blocks_per_record;
-    for (std::uint32_t item = local_thread; item < 2U * blocks_per_kind;
+    constexpr std::uint32_t kPackedBytesPerThread = 8U;
+    const auto chunks_per_record =
+        head_dim / (2U * kPackedBytesPerThread);
+    const auto chunks_per_kind = tile_tokens * chunks_per_record;
+    // Each half-warp owns one complete K or V record. Consecutive lanes
+    // therefore read eight packed bytes and write sixteen BF16 values
+    // contiguously instead of hitting the same shared-memory banks at a
+    // block-32 stride.
+    for (std::uint32_t item = local_thread; item < 2U * chunks_per_kind;
          item += blockDim.x) {
-      const auto is_value = item >= blocks_per_kind;
-      const auto local_item = item - (is_value ? blocks_per_kind : 0U);
-      const auto local_token = local_item / blocks_per_record;
-      const auto block = local_item % blocks_per_record;
+      const auto is_value = item >= chunks_per_kind;
+      const auto local_item = item - (is_value ? chunks_per_kind : 0U);
+      const auto local_token = local_item / chunks_per_record;
+      const auto chunk = local_item % chunks_per_record;
       const auto token = tile_first + local_token;
-      const auto* page =
-          static_cast<const std::uint8_t*>(page_table[token / page_tokens]);
+      const auto* page = static_cast<const std::uint8_t*>(
+          page_table[token / page_tokens]);
       const auto* page_keys = page +
           static_cast<std::size_t>(full_attention_layer) * 2U *
               records_per_kind * record_bytes;
-      const auto* page_values =
-          page_keys + records_per_kind * record_bytes;
+      const auto* page_values = page_keys + records_per_kind * record_bytes;
       const auto record_index =
           static_cast<std::size_t>(token % page_tokens) * kv_heads + kv_head;
       const auto* source = (is_value ? page_values : page_keys) +
                            record_index * record_bytes;
       auto* target = is_value ? value_values[local_token]
                               : key_values[local_token];
+      const auto packed_first = chunk * kPackedBytesPerThread;
+      const auto block = packed_first / 16U;
       const auto scale =
           0.5F * decode_ue8m0(source[head_dim / 2U + block]);
-      const auto packed_first = block * 16U;
-      std::uint32_t packed_words[4]{};
+      std::uint32_t packed_words[kPackedBytesPerThread / 4U]{};
       if ((record_bytes & 3U) == 0U) {
         const auto* source_words = reinterpret_cast<const std::uint32_t*>(
             source + packed_first);
 #pragma unroll
-        for (std::uint32_t word = 0U; word < 4U; ++word)
+        for (std::uint32_t word = 0U;
+             word < kPackedBytesPerThread / 4U; ++word)
           packed_words[word] = source_words[word];
+      } else {
+#pragma unroll
+        for (std::uint32_t byte = 0U; byte < kPackedBytesPerThread; ++byte)
+          packed_words[byte / 4U] |=
+              static_cast<std::uint32_t>(source[packed_first + byte])
+              << (8U * (byte & 3U));
       }
 #pragma unroll
-      for (std::uint32_t packed_offset = 0U; packed_offset < 16U;
-           ++packed_offset) {
-        const auto packed = static_cast<std::uint8_t>(
-            (record_bytes & 3U) == 0U
-                ? packed_words[packed_offset / 4U] >>
-                      (8U * (packed_offset & 3U))
-                : source[packed_first + packed_offset]);
+      for (std::uint32_t packed_offset = 0U;
+           packed_offset < kPackedBytesPerThread;
+           packed_offset += 2U) {
+        const auto packed_pair = static_cast<std::uint16_t>(
+            packed_words[packed_offset / 4U] >>
+            (8U * (packed_offset & 3U)));
+        const auto decoded = static_cast<std::uint32_t>(packed_fp4x4(
+            static_cast<std::uint8_t>(packed_pair),
+            static_cast<std::uint8_t>(packed_pair >> 8U)));
         const auto dimension = 2U * (packed_first + packed_offset);
         *reinterpret_cast<__nv_bfloat162*>(target + dimension) =
             __floats2bfloat162_rn(
-                static_cast<float>(decode_fp4_twice(packed & 0x0fU)) * scale,
-                static_cast<float>(decode_fp4_twice(packed >> 4U)) * scale);
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 8U))) * scale);
+        *reinterpret_cast<__nv_bfloat162*>(target + dimension + 2U) =
+            __floats2bfloat162_rn(
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 16U))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 24U))) * scale);
       }
     }
     const auto trailing_tokens = kKeyTile - tile_tokens;
@@ -2189,14 +2360,14 @@ __global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
            dimension < dimension_end;
            dimension += 16U) {
         wmma::load_matrix_sync(query_fragment, &query_values[0][dimension],
-                               HeadCapacity);
+                               kBf16Stride);
         wmma::load_matrix_sync(key_fragment, &key_values[0][dimension],
-                               HeadCapacity);
+                               kBf16Stride);
         wmma::mma_sync(score_fragment, query_fragment, key_fragment,
                        score_fragment);
       }
       wmma::store_matrix_sync(&score_partials[warp][0][0], score_fragment,
-                              kKeyTile, wmma::mem_row_major);
+                              kScoreStride, wmma::mem_row_major);
     }
     __syncthreads();
 
@@ -2255,14 +2426,14 @@ __global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
           product_fragment;
       wmma::fill_fragment(product_fragment, 0.0F);
       wmma::load_matrix_sync(probability_fragment, &probabilities[0][0],
-                             kKeyTile);
+                             kProbabilityStride);
       wmma::load_matrix_sync(value_fragment,
                              &value_values[0][output_tile * 16U],
-                             HeadCapacity);
+                             kBf16Stride);
       wmma::mma_sync(product_fragment, probability_fragment, value_fragment,
                      product_fragment);
       wmma::store_matrix_sync(&products[0][output_tile * 16U],
-                              product_fragment, HeadCapacity,
+                              product_fragment, kProductStride,
                               wmma::mem_row_major);
     }
     __syncthreads();
@@ -2301,6 +2472,39 @@ __global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
     }
     partial_outputs[partial * head_dim + dimension] = results[local];
   }
+}
+
+template <std::uint32_t BlockThreads, std::uint32_t HeadCapacity>
+__global__ void gated_gqa_attention_paged_fp4_tensor_core_split_kernel(
+    const float* q_and_gate, const void* const* page_table,
+    float* partial_maxima, float* partial_sums, float* partial_outputs,
+    std::uint32_t first_context_tokens, std::uint32_t rows,
+    std::uint32_t maximum_splits, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t split_tokens) {
+  gated_gqa_attention_paged_fp4_tensor_core_split_body<BlockThreads,
+                                                        HeadCapacity>(
+      q_and_gate, page_table, partial_maxima, partial_sums, partial_outputs,
+      first_context_tokens, rows, maximum_splits, full_attention_layer,
+      page_tokens, query_heads, kv_heads, head_dim, split_tokens);
+}
+
+template <std::uint32_t BlockThreads, std::uint32_t HeadCapacity>
+__global__ __launch_bounds__(BlockThreads, 2) void
+gated_gqa_attention_paged_fp4_tensor_core_high_occupancy_split_kernel(
+    const float* q_and_gate, const void* const* page_table,
+    float* partial_maxima, float* partial_sums, float* partial_outputs,
+    std::uint32_t first_context_tokens, std::uint32_t rows,
+    std::uint32_t maximum_splits, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t split_tokens) {
+  gated_gqa_attention_paged_fp4_tensor_core_split_body<BlockThreads,
+                                                        HeadCapacity>(
+      q_and_gate, page_table, partial_maxima, partial_sums, partial_outputs,
+      first_context_tokens, rows, maximum_splits, full_attention_layer,
+      page_tokens, query_heads, kv_heads, head_dim, split_tokens);
 }
 
 __global__ void gated_gqa_attention_paged_fp4_combine_kernel(
@@ -2347,7 +2551,8 @@ __global__ void gated_gqa_attention_paged_fp4_combine_kernel(
       (result / global_sum) / (1.0F + expf(-gate));
 }
 
-__global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
+__global__ __launch_bounds__(kFp4GemmThreads, 2) void
+gated_gqa_attention_paged_fp4_prefill_split_kernel(
     const float* q_and_gate, const void* const* page_table,
     float* partial_maxima, float* partial_sums, float* partial_outputs,
     std::uint32_t first_context_tokens, std::uint32_t rows,
@@ -2358,16 +2563,24 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
   using namespace nvcuda;
   constexpr std::uint32_t kQueryTile = 16U;
   constexpr std::uint32_t kKeyTile = 16U;
+  constexpr std::uint32_t kBf16Stride = kMaximumAttentionHeadDim + 8U;
+  constexpr std::uint32_t kScoreStride = kKeyTile + 4U;
+  constexpr std::uint32_t kProbabilityStride = kKeyTile + 8U;
+  constexpr std::uint32_t kProductStride = kMaximumAttentionHeadDim + 4U;
+  constexpr std::uint32_t kScoreWarps =
+      kMaximumAttentionHeadDim / 64U;
   __shared__ __align__(32) __nv_bfloat16
-      query_values[kQueryTile][kMaximumAttentionHeadDim];
+      query_values[kQueryTile][kBf16Stride];
   __shared__ __align__(32) __nv_bfloat16
-      key_values[kKeyTile][kMaximumAttentionHeadDim];
+      key_values[kKeyTile][kBf16Stride];
   __shared__ __align__(32) __nv_bfloat16
-      value_values[kKeyTile][kMaximumAttentionHeadDim];
-  __shared__ __align__(32) float scores[kQueryTile][kKeyTile];
-  __shared__ __align__(32) __nv_bfloat16 probabilities[kQueryTile][kKeyTile];
+      value_values[kKeyTile][kBf16Stride];
   __shared__ __align__(32) float
-      products[kQueryTile][kMaximumAttentionHeadDim];
+      score_partials[kScoreWarps][kQueryTile][kScoreStride];
+  __shared__ __align__(32) __nv_bfloat16
+      probabilities[kQueryTile][kProbabilityStride];
+  __shared__ __align__(32) float
+      products[kQueryTile][kProductStride];
   __shared__ float row_maxima[kQueryTile];
   __shared__ float row_sums[kQueryTile];
   __shared__ float row_previous_scales[kQueryTile];
@@ -2408,18 +2621,24 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
     row_maxima[local_thread] = kNegativeInfinity;
     row_sums[local_thread] = 0.0F;
   }
+  if (local_thread < kQueryTile * kKeyTile)
+    probabilities[local_thread / kKeyTile][local_thread % kKeyTile] =
+        __float2bfloat16(0.0F);
   __syncthreads();
 
   for (std::uint32_t tile_first = first_token; tile_first < last_token;
        tile_first += kKeyTile) {
     const auto tile_tokens = min(kKeyTile, last_token - tile_first);
-    const auto packed_values = tile_tokens * (head_dim / 2U);
-    for (std::uint32_t item = local_thread; item < 2U * packed_values;
+    constexpr std::uint32_t kPackedBytesPerThread = 8U;
+    const auto chunks_per_record =
+        head_dim / (2U * kPackedBytesPerThread);
+    const auto chunks_per_kind = tile_tokens * chunks_per_record;
+    for (std::uint32_t item = local_thread; item < 2U * chunks_per_kind;
          item += blockDim.x) {
-      const auto is_value = item >= packed_values;
-      const auto local_item = item - (is_value ? packed_values : 0U);
-      const auto local_token = local_item / (head_dim / 2U);
-      const auto packed_dimension = local_item % (head_dim / 2U);
+      const auto is_value = item >= chunks_per_kind;
+      const auto local_item = item - (is_value ? chunks_per_kind : 0U);
+      const auto local_token = local_item / chunks_per_record;
+      const auto chunk = local_item % chunks_per_record;
       const auto token = tile_first + local_token;
       const auto* page =
           static_cast<const std::uint8_t*>(page_table[token / page_tokens]);
@@ -2434,27 +2653,66 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
                            record_index * record_bytes;
       auto* target = is_value ? value_values[local_token]
                               : key_values[local_token];
-      const auto packed = source[packed_dimension];
-      const auto scale = 0.5F * decode_ue8m0(
-          source[head_dim / 2U + packed_dimension / 16U]);
-      const auto dimension = 2U * packed_dimension;
-      target[dimension] = __float2bfloat16(
-          static_cast<float>(decode_fp4_twice(packed & 0x0fU)) * scale);
-      target[dimension + 1U] = __float2bfloat16(
-          static_cast<float>(decode_fp4_twice(packed >> 4U)) * scale);
+      const auto packed_first = chunk * kPackedBytesPerThread;
+      const auto block = packed_first / 16U;
+      const auto scale =
+          0.5F * decode_ue8m0(source[head_dim / 2U + block]);
+      std::uint32_t packed_words[kPackedBytesPerThread / 4U]{};
+      if ((record_bytes & 3U) == 0U) {
+        const auto* source_words = reinterpret_cast<const std::uint32_t*>(
+            source + packed_first);
+#pragma unroll
+        for (std::uint32_t word = 0U;
+             word < kPackedBytesPerThread / 4U; ++word)
+          packed_words[word] = source_words[word];
+      } else {
+#pragma unroll
+        for (std::uint32_t byte = 0U; byte < kPackedBytesPerThread; ++byte)
+          packed_words[byte / 4U] |=
+              static_cast<std::uint32_t>(source[packed_first + byte])
+              << (8U * (byte & 3U));
+      }
+#pragma unroll
+      for (std::uint32_t packed_offset = 0U;
+           packed_offset < kPackedBytesPerThread;
+           packed_offset += 2U) {
+        const auto packed_pair = static_cast<std::uint16_t>(
+            packed_words[packed_offset / 4U] >>
+            (8U * (packed_offset & 3U)));
+        const auto decoded = static_cast<std::uint32_t>(packed_fp4x4(
+            static_cast<std::uint8_t>(packed_pair),
+            static_cast<std::uint8_t>(packed_pair >> 8U)));
+        const auto dimension = 2U * (packed_first + packed_offset);
+        *reinterpret_cast<__nv_bfloat162*>(target + dimension) =
+            __floats2bfloat162_rn(
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 8U))) * scale);
+        *reinterpret_cast<__nv_bfloat162*>(target + dimension + 2U) =
+            __floats2bfloat162_rn(
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 16U))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 24U))) * scale);
+      }
     }
-    for (std::uint32_t item = local_thread + packed_values;
-         item < kKeyTile * (head_dim / 2U); item += blockDim.x) {
-      const auto local_token = item / (head_dim / 2U);
-      const auto dimension = 2U * (item % (head_dim / 2U));
-      key_values[local_token][dimension] = __float2bfloat16(0.0F);
-      key_values[local_token][dimension + 1U] = __float2bfloat16(0.0F);
-      value_values[local_token][dimension] = __float2bfloat16(0.0F);
-      value_values[local_token][dimension + 1U] = __float2bfloat16(0.0F);
+    const auto trailing_tokens = kKeyTile - tile_tokens;
+    for (std::uint32_t item = local_thread;
+         item < 2U * trailing_tokens * head_dim; item += blockDim.x) {
+      const auto values_per_kind = trailing_tokens * head_dim;
+      const auto is_value = item >= values_per_kind;
+      const auto local_item = item - (is_value ? values_per_kind : 0U);
+      const auto local_token = tile_tokens + local_item / head_dim;
+      const auto dimension = local_item % head_dim;
+      auto* target = is_value ? value_values[local_token]
+                              : key_values[local_token];
+      target[dimension] = __float2bfloat16(0.0F);
     }
     __syncthreads();
 
-    if (warp == 0U) {
+    const auto active_score_warps = (head_dim + 63U) / 64U;
+    if (warp < active_score_warps) {
       wmma::fragment<wmma::matrix_a, 16, 16, 16, __nv_bfloat16,
                      wmma::row_major>
           query_fragment;
@@ -2464,56 +2722,64 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
       wmma::fragment<wmma::accumulator, 16, 16, 16, float>
           score_fragment;
       wmma::fill_fragment(score_fragment, 0.0F);
-      for (std::uint32_t dimension = 0U; dimension < head_dim;
+      const auto dimension_end = min(head_dim, (warp + 1U) * 64U);
+      for (std::uint32_t dimension = warp * 64U;
+           dimension < dimension_end;
            dimension += 16U) {
         wmma::load_matrix_sync(query_fragment, &query_values[0][dimension],
-                               kMaximumAttentionHeadDim);
+                               kBf16Stride);
         wmma::load_matrix_sync(key_fragment, &key_values[0][dimension],
-                               kMaximumAttentionHeadDim);
+                               kBf16Stride);
         wmma::mma_sync(score_fragment, query_fragment, key_fragment,
                        score_fragment);
       }
-      wmma::store_matrix_sync(&scores[0][0], score_fragment, kKeyTile,
-                              wmma::mem_row_major);
+      wmma::store_matrix_sync(&score_partials[warp][0][0], score_fragment,
+                              kScoreStride, wmma::mem_row_major);
     }
     __syncthreads();
 
-    if (local_thread < kQueryTile) {
-      const auto local_row = local_thread;
+    for (std::uint32_t local_row = warp; local_row < kQueryTile;
+         local_row += kFp4GemmWarps) {
+      const auto lane = local_thread % kWarpSize;
       const auto query_row = first_query_row + local_row;
       const auto context_tokens = first_context_tokens + query_row;
-      const auto score_scale = rsqrtf(static_cast<float>(head_dim));
-      float tile_maximum = kNegativeInfinity;
-      for (std::uint32_t local_token = 0U; local_token < tile_tokens;
-           ++local_token) {
-        if (query_row < rows && tile_first + local_token < context_tokens)
-          tile_maximum = fmaxf(
-              tile_maximum, scores[local_row][local_token] * score_scale);
+      const auto active_row = query_row < rows;
+      const auto active_tile = active_row && tile_first < context_tokens;
+      if (!active_tile) {
+        if (lane < kKeyTile)
+          probabilities[local_row][lane] = __float2bfloat16(0.0F);
+        if (lane == 0U) row_previous_scales[local_row] = 1.0F;
+        continue;
       }
-      if (tile_maximum == kNegativeInfinity) {
-        row_previous_scales[local_row] = 1.0F;
-        for (std::uint32_t local_token = 0U; local_token < kKeyTile;
-             ++local_token)
-          probabilities[local_row][local_token] = __float2bfloat16(0.0F);
-      } else {
-        const auto next_maximum =
-            fmaxf(row_maxima[local_row], tile_maximum);
-        const auto previous_scale =
-            row_maxima[local_row] == kNegativeInfinity
-                ? 0.0F
-                : expf(row_maxima[local_row] - next_maximum);
-        float tile_sum = 0.0F;
-        for (std::uint32_t local_token = 0U; local_token < kKeyTile;
-             ++local_token) {
-          float probability{};
-          if (local_token < tile_tokens && query_row < rows &&
-              tile_first + local_token < context_tokens)
-            probability = expf(scores[local_row][local_token] * score_scale -
-                               next_maximum);
-          const auto quantized = __float2bfloat16(probability);
-          probabilities[local_row][local_token] = quantized;
-          tile_sum += __bfloat162float(quantized);
-        }
+      float lane_score = kNegativeInfinity;
+      if (lane < tile_tokens && tile_first + lane < context_tokens) {
+        lane_score = 0.0F;
+        for (std::uint32_t score_warp = 0U;
+             score_warp < active_score_warps; ++score_warp)
+          lane_score += score_partials[score_warp][local_row][lane];
+        lane_score *= rsqrtf(static_cast<float>(head_dim));
+      }
+      auto tile_maximum = warp_max(lane_score);
+      tile_maximum = __shfl_sync(0xffffffffU, tile_maximum, 0U);
+      float next_maximum{};
+      float previous_scale{};
+      if (lane == 0U) {
+        next_maximum = fmaxf(row_maxima[local_row], tile_maximum);
+        previous_scale = row_maxima[local_row] == kNegativeInfinity
+                             ? 0.0F
+                             : expf(row_maxima[local_row] - next_maximum);
+      }
+      next_maximum = __shfl_sync(0xffffffffU, next_maximum, 0U);
+      previous_scale = __shfl_sync(0xffffffffU, previous_scale, 0U);
+      const auto probability = lane < tile_tokens &&
+                                       tile_first + lane < context_tokens
+                                   ? expf(lane_score - next_maximum)
+                                   : 0.0F;
+      const auto quantized = __float2bfloat16(probability);
+      if (lane < kKeyTile)
+        probabilities[local_row][lane] = quantized;
+      const auto tile_sum = warp_sum(__bfloat162float(quantized));
+      if (lane == 0U) {
         row_sums[local_row] =
             row_sums[local_row] * previous_scale + tile_sum;
         row_maxima[local_row] = next_maximum;
@@ -2534,15 +2800,14 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_split_kernel(
           product_fragment;
       wmma::fill_fragment(product_fragment, 0.0F);
       wmma::load_matrix_sync(probability_fragment, &probabilities[0][0],
-                             kKeyTile);
+                             kProbabilityStride);
       wmma::load_matrix_sync(value_fragment,
                              &value_values[0][output_tile * 16U],
-                             kMaximumAttentionHeadDim);
+                             kBf16Stride);
       wmma::mma_sync(product_fragment, probability_fragment, value_fragment,
                      product_fragment);
       wmma::store_matrix_sync(&products[0][output_tile * 16U],
-                              product_fragment,
-                              kMaximumAttentionHeadDim,
+                              product_fragment, kProductStride,
                               wmma::mem_row_major);
     }
     __syncthreads();
@@ -2977,6 +3242,217 @@ __global__ void split_delta_recurrent_prefill_kernel(
   }
 }
 
+__global__ void staged_prefill_prepare_kernel(
+    const float* q_and_gate, __nv_bfloat16* queries, float* accumulator,
+    float* maxima, float* sums, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+  const auto grouped_heads = query_heads / kv_heads;
+  const auto matrix_rows = rows * grouped_heads;
+  const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < values;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    const auto dimension = static_cast<std::uint32_t>(item % head_dim);
+    const auto query = static_cast<std::uint32_t>(item / head_dim);
+    const auto row = query / query_heads;
+    const auto query_head = query % query_heads;
+    const auto kv_head = query_head / grouped_heads;
+    const auto local_head = query_head % grouped_heads;
+    const auto matrix_row = row * grouped_heads + local_head;
+    const auto packed =
+        (static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row) *
+            head_dim +
+        dimension;
+    queries[packed] = __float2bfloat16(q_and_gate[
+        (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
+            head_dim +
+        dimension]);
+    accumulator[packed] = 0.0F;
+    if (dimension == 0U) {
+      maxima[static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row] =
+          kNegativeInfinity;
+      sums[static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row] =
+          0.0F;
+    }
+  }
+}
+
+__global__ void staged_prefill_decode_kv_kernel(
+    const void* const* page_table, __nv_bfloat16* keys,
+    __nv_bfloat16* values, std::uint32_t first_token,
+    std::uint32_t tokens, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+  constexpr std::uint32_t kPackedBytesPerThread = 8U;
+  const auto chunks_per_record = head_dim / (2U * kPackedBytesPerThread);
+  const auto chunks_per_kind =
+      static_cast<std::size_t>(tokens) * kv_heads * chunks_per_record;
+  const auto total = 2U * chunks_per_kind;
+  const auto record_bytes = head_dim / 2U + head_dim / 32U;
+  const auto records_per_kind =
+      static_cast<std::size_t>(page_tokens) * kv_heads;
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < total;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    const auto is_value = item >= chunks_per_kind;
+    const auto local_item = item - (is_value ? chunks_per_kind : 0U);
+    const auto chunk = static_cast<std::uint32_t>(
+        local_item % chunks_per_record);
+    const auto record = local_item / chunks_per_record;
+    const auto kv_head = static_cast<std::uint32_t>(record % kv_heads);
+    const auto local_token = static_cast<std::uint32_t>(record / kv_heads);
+    const auto token = first_token + local_token;
+    const auto* page =
+        static_cast<const std::uint8_t*>(page_table[token / page_tokens]);
+    const auto* page_keys = page +
+        static_cast<std::size_t>(full_attention_layer) * 2U *
+            records_per_kind * record_bytes;
+    const auto* page_values = page_keys + records_per_kind * record_bytes;
+    const auto record_index =
+        static_cast<std::size_t>(token % page_tokens) * kv_heads + kv_head;
+    const auto* source = (is_value ? page_values : page_keys) +
+                         record_index * record_bytes;
+    auto* target = (is_value ? values : keys) +
+        (static_cast<std::size_t>(kv_head) * tokens + local_token) *
+            head_dim;
+    const auto packed_first = chunk * kPackedBytesPerThread;
+    const auto scale = 0.5F * decode_ue8m0(
+        source[head_dim / 2U + packed_first / 16U]);
+    std::uint32_t packed_words[kPackedBytesPerThread / 4U]{};
+    if ((record_bytes & 3U) == 0U) {
+      const auto* source_words = reinterpret_cast<const std::uint32_t*>(
+          source + packed_first);
+#pragma unroll
+      for (std::uint32_t word = 0U;
+           word < kPackedBytesPerThread / 4U; ++word)
+        packed_words[word] = source_words[word];
+    } else {
+#pragma unroll
+      for (std::uint32_t byte = 0U; byte < kPackedBytesPerThread; ++byte)
+        packed_words[byte / 4U] |=
+            static_cast<std::uint32_t>(source[packed_first + byte])
+            << (8U * (byte & 3U));
+    }
+#pragma unroll
+    for (std::uint32_t word = 0U; word < 2U; ++word) {
+      const auto packed_word = packed_words[word];
+#pragma unroll
+      for (std::uint32_t pair = 0U; pair < 2U; ++pair) {
+        const auto packed_pair = static_cast<std::uint16_t>(
+            packed_word >> (16U * pair));
+        const auto decoded = static_cast<std::uint32_t>(packed_fp4x4(
+            static_cast<std::uint8_t>(packed_pair),
+            static_cast<std::uint8_t>(packed_pair >> 8U)));
+        const auto dimension =
+            2U * (packed_first + 4U * word + 2U * pair);
+        *reinterpret_cast<__nv_bfloat162*>(target + dimension) =
+            __floats2bfloat162_rn(
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 8U))) * scale);
+        *reinterpret_cast<__nv_bfloat162*>(target + dimension + 2U) =
+            __floats2bfloat162_rn(
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 16U))) * scale,
+                static_cast<float>(static_cast<std::int8_t>(
+                    static_cast<std::uint8_t>(decoded >> 24U))) * scale);
+      }
+    }
+  }
+}
+
+__global__ void staged_prefill_softmax_kernel(
+    const float* scores, __nv_bfloat16* probabilities,
+    float* accumulator, float* maxima, float* sums,
+    std::uint32_t first_context_tokens, std::uint32_t first_token,
+    std::uint32_t tokens, std::uint32_t rows,
+    std::uint32_t grouped_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+  __shared__ float reduction[kWarpsPerBlock];
+  __shared__ float previous_scale_shared;
+  const auto matrix_rows = rows * grouped_heads;
+  const auto packed_row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto matrix_row = packed_row % matrix_rows;
+  const auto row = matrix_row / grouped_heads;
+  const auto context_tokens = first_context_tokens + row;
+  const auto* row_scores =
+      scores + static_cast<std::size_t>(packed_row) * tokens;
+  auto* row_probabilities =
+      probabilities + static_cast<std::size_t>(packed_row) * tokens;
+  float local_maximum = kNegativeInfinity;
+  for (std::uint32_t token = threadIdx.x; token < tokens;
+       token += blockDim.x) {
+    if (first_token + token < context_tokens)
+      local_maximum = fmaxf(
+          local_maximum,
+          row_scores[token] * rsqrtf(static_cast<float>(head_dim)));
+  }
+  const auto tile_maximum = block_max_warps(local_maximum, reduction);
+  const auto old_maximum = maxima[packed_row];
+  const auto next_maximum = fmaxf(old_maximum, tile_maximum);
+  float local_sum = 0.0F;
+  for (std::uint32_t token = threadIdx.x; token < tokens;
+       token += blockDim.x) {
+    float probability{};
+    if (first_token + token < context_tokens)
+      probability = expf(
+          row_scores[token] * rsqrtf(static_cast<float>(head_dim)) -
+          next_maximum);
+    const auto quantized = __float2bfloat16(probability);
+    row_probabilities[token] = quantized;
+    local_sum += __bfloat162float(quantized);
+  }
+  const auto tile_sum = block_sum_warps(local_sum, reduction);
+  if (threadIdx.x == 0U) {
+    const auto previous_scale = old_maximum == kNegativeInfinity
+                                    ? 0.0F
+                                    : expf(old_maximum - next_maximum);
+    previous_scale_shared = previous_scale;
+    maxima[packed_row] = next_maximum;
+    sums[packed_row] = sums[packed_row] * previous_scale + tile_sum;
+  }
+  __syncthreads();
+  auto* row_accumulator =
+      accumulator + static_cast<std::size_t>(packed_row) * head_dim;
+  for (std::uint32_t dimension = threadIdx.x; dimension < head_dim;
+       dimension += blockDim.x)
+    row_accumulator[dimension] *= previous_scale_shared;
+}
+
+__global__ void staged_prefill_finalize_kernel(
+    const float* q_and_gate, const float* accumulator, const float* sums,
+    float* output, std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  const auto grouped_heads = query_heads / kv_heads;
+  const auto matrix_rows = rows * grouped_heads;
+  const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < values;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    const auto dimension = static_cast<std::uint32_t>(item % head_dim);
+    const auto query = static_cast<std::uint32_t>(item / head_dim);
+    const auto row = query / query_heads;
+    const auto query_head = query % query_heads;
+    const auto kv_head = query_head / grouped_heads;
+    const auto local_head = query_head % grouped_heads;
+    const auto matrix_row = row * grouped_heads + local_head;
+    const auto packed_row =
+        static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row;
+    const auto gate = q_and_gate[
+        (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
+            head_dim +
+        head_dim + dimension];
+    output[item] =
+        (accumulator[packed_row * head_dim + dimension] / sums[packed_row]) /
+        (1.0F + expf(-gate));
+  }
+}
+
 __global__ void argmax_batch_kernel(const float* values, std::uint32_t count,
                                     std::uint32_t* output) {
   const auto request = static_cast<std::uint32_t>(blockIdx.x);
@@ -3010,6 +3486,75 @@ __global__ void argmax_batch_kernel(const float* values, std::uint32_t count,
     __syncthreads();
   }
   if (threadIdx.x == 0) output[request] = best_indices[0];
+}
+
+struct DeviceTopology final {
+  cudaError_t status{cudaSuccess};
+  int multiprocessors{};
+  int maximum_threads_per_multiprocessor{};
+  int maximum_shared_memory_per_multiprocessor{};
+};
+
+const DeviceTopology& current_device_topology() {
+  static const DeviceTopology topology = [] {
+    DeviceTopology result;
+    int device{};
+    result.status = cudaGetDevice(&device);
+    if (result.status != cudaSuccess) return result;
+    result.status = cudaDeviceGetAttribute(
+        &result.multiprocessors, cudaDevAttrMultiProcessorCount, device);
+    if (result.status != cudaSuccess) return result;
+    result.status = cudaDeviceGetAttribute(
+        &result.maximum_threads_per_multiprocessor,
+        cudaDevAttrMaxThreadsPerMultiProcessor, device);
+    if (result.status != cudaSuccess) return result;
+    result.status = cudaDeviceGetAttribute(
+        &result.maximum_shared_memory_per_multiprocessor,
+        cudaDevAttrMaxSharedMemoryPerMultiprocessor, device);
+    return result;
+  }();
+  return topology;
+}
+
+struct ThreadCublasContext final {
+  int device{-1};
+  cublasHandle_t handle{};
+
+  ~ThreadCublasContext() {
+    if (handle) static_cast<void>(cublasDestroy(handle));
+  }
+};
+
+cublasStatus_t current_cublas_handle(cudaStream_t stream,
+                                     cublasHandle_t& handle) {
+  thread_local ThreadCublasContext context;
+  int device{};
+  auto cuda_status = cudaGetDevice(&device);
+  if (cuda_status != cudaSuccess) return CUBLAS_STATUS_NOT_INITIALIZED;
+  if (!context.handle || context.device != device) {
+    if (context.handle) {
+      static_cast<void>(cublasDestroy(context.handle));
+      context.handle = nullptr;
+    }
+    const auto create_status = cublasCreate(&context.handle);
+    if (create_status != CUBLAS_STATUS_SUCCESS) return create_status;
+    context.device = device;
+    const auto math_status =
+        cublasSetMathMode(context.handle, CUBLAS_TENSOR_OP_MATH);
+    if (math_status != CUBLAS_STATUS_SUCCESS) return math_status;
+  }
+  const auto stream_status = cublasSetStream(context.handle, stream);
+  if (stream_status != CUBLAS_STATUS_SUCCESS) return stream_status;
+  handle = context.handle;
+  return CUBLAS_STATUS_SUCCESS;
+}
+
+Status checked(cublasStatus_t status, const char* name) {
+  return status == CUBLAS_STATUS_SUCCESS
+             ? Status::success()
+             : Status(ErrorCode::upload_failed,
+                      std::string(name) + ": cuBLAS status " +
+                          std::to_string(static_cast<int>(status)));
 }
 
 Status checked(cudaError_t error, const char* name) {
@@ -3097,7 +3642,47 @@ Status fp4_gemv_q8_batch_weight_reuse(
       m.padded_columns)
   switch (batch) {
     case 1U: LAUNCH_WEIGHT_REUSE(1U); break;
-    case 2U: LAUNCH_WEIGHT_REUSE(2U); break;
+    case 2U: {
+      const auto activation_blocks = m.padded_columns / 32U;
+      const auto activation_block_stride =
+          ((activation_blocks + kWarpSize - 1U) / kWarpSize) * kWarpSize +
+          4U;
+      const auto shared_bytes = static_cast<std::size_t>(2U) * 8U *
+                                activation_block_stride * sizeof(int);
+      const auto& topology = current_device_topology();
+      if (topology.status != cudaSuccess)
+        return checked(topology.status,
+                       "query FP4 weight-reuse device topology");
+      const auto maximum_thread_blocks =
+          topology.maximum_threads_per_multiprocessor /
+          static_cast<int>(kThreads);
+      const auto minimum_active_blocks =
+          std::max(1, maximum_thread_blocks - 1);
+      const auto cache_activations =
+          shared_bytes * static_cast<std::size_t>(minimum_active_blocks) <=
+          static_cast<std::size_t>(
+              topology.maximum_shared_memory_per_multiprocessor);
+      if (cache_activations) {
+        static const auto cache_status = checked(
+            cudaFuncSetCacheConfig(
+                fp4_gemv_q8_batch_weight_reuse_kernel<2U, true>,
+                cudaFuncCachePreferShared),
+            "configure FP4 Q8 activation-reuse cache");
+        if (!cache_status.ok()) return cache_status;
+        fp4_gemv_q8_batch_weight_reuse_kernel<2U, true><<<
+            grid, kThreads, shared_bytes, stream>>>(
+            m.weights, m.scales, input, input_scales, output, m.rows,
+            m.padded_columns);
+      } else {
+        constexpr std::size_t tile_shared_bytes =
+            2U * 8U * (kWarpSize + 4U) * sizeof(int);
+        fp4_gemv_q8_batch_weight_reuse_kernel<2U, false, true><<<
+            grid, kThreads, tile_shared_bytes, stream>>>(
+            m.weights, m.scales, input, input_scales, output, m.rows,
+            m.padded_columns);
+      }
+      break;
+    }
     case 3U: LAUNCH_WEIGHT_REUSE(3U); break;
     case 4U: LAUNCH_WEIGHT_REUSE(4U); break;
     case 5U: LAUNCH_WEIGHT_REUSE(5U); break;
@@ -3118,16 +3703,100 @@ Status fp4_gemm_q8_block32(const Fp4Block32Matrix& m,
       m.padded_columns % kFp4GemmBlockColumns || !batch)
     return Status(ErrorCode::invalid_argument,
                   "invalid FP4 Q8 block-32 GEMM");
+  static_assert(kFp4PrefillGemmWarps == 16U);
   const dim3 grid((m.rows + kFp4GemmOutputTile - 1U) /
                       kFp4GemmOutputTile,
                   (batch + kFp4GemmBatchTile - 1U) /
                       kFp4GemmBatchTile);
-  static_assert(kFp4GemmWarps == 8U);
-  fp4_gemm_q8_block32_kernel<<<grid, kFp4GemmThreads, 0,
+  fp4_gemm_q8_block32_kernel<<<grid, kFp4PrefillGemmThreads, 0,
                               static_cast<cudaStream_t>(raw)>>>(
       m.weights, m.scales, input, input_scales, output, m.rows,
       m.padded_columns, batch);
   return checked(cudaPeekAtLastError(), "FP4 Q8 block-32 GEMM");
+}
+
+Status fp4_decode_matrix_bf16(const Fp4Block32Matrix& m,
+                              void* decoded_weights,
+                              std::size_t decoded_weight_bytes,
+                              void* raw) noexcept {
+  if (!m.weights || !m.scales || !decoded_weights || !m.rows ||
+      !m.columns || m.padded_columns < m.columns ||
+      m.padded_columns % kFp4GemmBlockColumns)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP4 BF16 matrix decode");
+  const auto values =
+      static_cast<std::size_t>(m.rows) * m.padded_columns;
+  if (values > std::numeric_limits<std::size_t>::max() /
+                   sizeof(__nv_bfloat16) ||
+      decoded_weight_bytes < values * sizeof(__nv_bfloat16))
+    return Status(ErrorCode::invalid_argument,
+                  "FP4 BF16 matrix decode workspace is too small");
+  const auto blocks = static_cast<unsigned>(std::min<std::size_t>(
+      (values + kThreads - 1U) / kThreads, 65535U));
+  fp4_decode_matrix_bf16_kernel<<<blocks, kThreads, 0,
+                                  static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, static_cast<__nv_bfloat16*>(decoded_weights),
+      m.rows, m.padded_columns);
+  return checked(cudaPeekAtLastError(), "decode FP4 matrix to BF16");
+}
+
+Status bf16_gemm_q8_block32(
+    const Fp4Block32Matrix& m, const void* decoded_weights,
+    std::size_t decoded_weight_bytes, const std::int8_t* input,
+    const float* input_scales, void* decoded_input,
+    std::size_t decoded_input_bytes, float* output, std::uint32_t batch,
+    void* raw) noexcept {
+  if (!m.weights || !m.scales || !decoded_weights || !input ||
+      !input_scales || !decoded_input || !output || !m.rows || !m.columns ||
+      m.padded_columns < m.columns ||
+      m.padded_columns % kFp4GemmBlockColumns || !batch ||
+      m.rows > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      m.padded_columns >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      batch > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid staged BF16 Q8 GEMM");
+  const auto weight_values =
+      static_cast<std::size_t>(m.rows) * m.padded_columns;
+  const auto input_values =
+      static_cast<std::size_t>(batch) * m.padded_columns;
+  const auto output_values = static_cast<std::size_t>(batch) * m.rows;
+  if (weight_values > std::numeric_limits<std::size_t>::max() /
+                          sizeof(__nv_bfloat16) ||
+      input_values > std::numeric_limits<std::size_t>::max() /
+                         sizeof(__nv_bfloat16) ||
+      decoded_weight_bytes < weight_values * sizeof(__nv_bfloat16) ||
+      decoded_input_bytes < input_values * sizeof(__nv_bfloat16))
+    return Status(ErrorCode::invalid_argument,
+                  "staged BF16 Q8 GEMM workspace is too small");
+  const auto stream = static_cast<cudaStream_t>(raw);
+  const auto input_blocks = static_cast<unsigned>(std::min<std::size_t>(
+      (input_values + kThreads - 1U) / kThreads, 65535U));
+  q8_to_bf16_kernel<<<input_blocks, kThreads, 0, stream>>>(
+      input, static_cast<__nv_bfloat16*>(decoded_input), input_values);
+  auto status = checked(cudaPeekAtLastError(), "decode Q8 input to BF16");
+  if (!status.ok()) return status;
+
+  cublasHandle_t blas{};
+  auto blas_status = current_cublas_handle(stream, blas);
+  if (blas_status != CUBLAS_STATUS_SUCCESS)
+    return checked(blas_status, "initialize staged BF16 Q8 cuBLAS");
+  const float alpha = 1.0F;
+  const float zero = 0.0F;
+  blas_status = cublasGemmEx(
+      blas, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(m.rows),
+      static_cast<int>(batch), static_cast<int>(m.padded_columns), &alpha,
+      decoded_weights, CUDA_R_16BF, static_cast<int>(m.padded_columns),
+      decoded_input, CUDA_R_16BF, static_cast<int>(m.padded_columns), &zero,
+      output, CUDA_R_32F, static_cast<int>(m.rows), CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (blas_status != CUBLAS_STATUS_SUCCESS)
+    return checked(blas_status, "staged BF16 Q8 GEMM");
+  const auto output_blocks = static_cast<unsigned>(std::min<std::size_t>(
+      (output_values + kThreads - 1U) / kThreads, 65535U));
+  scale_bf16_q8_gemm_kernel<<<output_blocks, kThreads, 0, stream>>>(
+      output, input_scales, m.rows, output_values);
+  return checked(cudaPeekAtLastError(), "scale staged BF16 Q8 GEMM");
 }
 
 Status embedding(const Int8Matrix& m, std::uint32_t token, float* output, void* raw) noexcept {
@@ -3793,14 +4462,41 @@ Status gated_gqa_attention_microbatch_paged_fp4_tensor_core(
         launch.full_attention_layer, launch.page_tokens, launch.query_heads,
         launch.kv_heads, launch.head_dim, launch.split_tokens);
   } else {
-    gated_gqa_attention_paged_fp4_tensor_core_split_kernel<
-        kTensorCoreAttentionThreads, 256U><<<
-        producer_grid, kTensorCoreAttentionThreads, 0, stream>>>(
-        launch.q_and_gate, launch.page_table, launch.partial_maxima,
-        launch.partial_sums, launch.partial_outputs,
-        launch.first_context_tokens, launch.rows, launch.maximum_splits,
-        launch.full_attention_layer, launch.page_tokens, launch.query_heads,
-        launch.kv_heads, launch.head_dim, launch.split_tokens);
+    const auto& topology = current_device_topology();
+    if (topology.status != cudaSuccess)
+      return checked(topology.status,
+                     "query FP4 Tensor Core attention device topology");
+    const auto grid_blocks = static_cast<std::uint64_t>(producer_grid.x) *
+                             static_cast<std::uint64_t>(producer_grid.y);
+    const auto use_high_occupancy = topology.multiprocessors > 0 &&
+        grid_blocks >= 2U * static_cast<std::uint64_t>(
+                                topology.multiprocessors);
+    if (use_high_occupancy) {
+      static const auto cache_status = checked(
+          cudaFuncSetCacheConfig(
+              gated_gqa_attention_paged_fp4_tensor_core_high_occupancy_split_kernel<
+                  kTensorCoreAttentionThreads, 256U>,
+              cudaFuncCachePreferShared),
+          "configure paged FP4 Tensor Core GQA microbatch cache");
+      if (!cache_status.ok()) return cache_status;
+      gated_gqa_attention_paged_fp4_tensor_core_high_occupancy_split_kernel<
+          kTensorCoreAttentionThreads, 256U><<<
+          producer_grid, kTensorCoreAttentionThreads, 0, stream>>>(
+          launch.q_and_gate, launch.page_table, launch.partial_maxima,
+          launch.partial_sums, launch.partial_outputs,
+          launch.first_context_tokens, launch.rows, launch.maximum_splits,
+          launch.full_attention_layer, launch.page_tokens, launch.query_heads,
+          launch.kv_heads, launch.head_dim, launch.split_tokens);
+    } else {
+      gated_gqa_attention_paged_fp4_tensor_core_split_kernel<
+          kTensorCoreAttentionThreads, 256U><<<
+          producer_grid, kTensorCoreAttentionThreads, 0, stream>>>(
+          launch.q_and_gate, launch.page_table, launch.partial_maxima,
+          launch.partial_sums, launch.partial_outputs,
+          launch.first_context_tokens, launch.rows, launch.maximum_splits,
+          launch.full_attention_layer, launch.page_tokens, launch.query_heads,
+          launch.kv_heads, launch.head_dim, launch.split_tokens);
+    }
   }
   auto status = checked(
       cudaPeekAtLastError(),
@@ -3859,6 +4555,139 @@ Status gated_gqa_attention_prefill_paged_fp4(
       launch.head_dim);
   return checked(cudaPeekAtLastError(),
                  "paged FP4 gated GQA prefill combine");
+}
+Status gated_gqa_attention_staged_prefill_paged_fp4(
+    const PagedFp4GatedGqaPrefillLaunch& launch,
+    const PagedFp4GatedGqaStagedPrefillWorkspace& workspace) noexcept {
+  if (!launch.q_and_gate || !launch.page_table || !launch.output ||
+      !launch.first_context_tokens || !launch.rows || !launch.page_tokens ||
+      !launch.query_heads || !launch.kv_heads ||
+      launch.query_heads % launch.kv_heads ||
+      launch.query_heads / launch.kv_heads > 8U || !launch.head_dim ||
+      launch.head_dim > kThreads || launch.head_dim % 32U ||
+      launch.first_context_tokens > 0xffffffffU - (launch.rows - 1U) ||
+      !workspace.queries || !workspace.keys || !workspace.values ||
+      !workspace.scores || !workspace.probabilities ||
+      !workspace.accumulator || !workspace.maxima || !workspace.sums ||
+      !workspace.split_tokens)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid staged paged FP4 gated GQA prefill");
+  const auto grouped_heads = launch.query_heads / launch.kv_heads;
+  const auto matrix_rows = launch.rows * grouped_heads;
+  const auto split_tokens = std::min(
+      workspace.split_tokens,
+      launch.first_context_tokens + launch.rows - 1U);
+  const auto query_values = static_cast<std::size_t>(launch.rows) *
+                            launch.query_heads * launch.head_dim;
+  const auto state_rows =
+      static_cast<std::size_t>(launch.kv_heads) * matrix_rows;
+  const auto kv_values = static_cast<std::size_t>(launch.kv_heads) *
+                         split_tokens * launch.head_dim;
+  const auto score_values = state_rows * split_tokens;
+  const auto query_bytes = query_values * sizeof(__nv_bfloat16);
+  const auto kv_bytes = kv_values * sizeof(__nv_bfloat16);
+  const auto score_bytes = score_values * sizeof(float);
+  const auto probability_bytes = score_values * sizeof(__nv_bfloat16);
+  const auto accumulator_bytes = query_values * sizeof(float);
+  const auto state_bytes = state_rows * sizeof(float);
+  if (workspace.query_bytes < query_bytes || workspace.key_bytes < kv_bytes ||
+      workspace.value_bytes < kv_bytes ||
+      workspace.score_bytes < score_bytes ||
+      workspace.probability_bytes < probability_bytes ||
+      workspace.accumulator_bytes < accumulator_bytes ||
+      workspace.maxima_bytes < state_bytes ||
+      workspace.sum_bytes < state_bytes)
+    return Status(ErrorCode::invalid_argument,
+                  "staged paged FP4 prefill workspace is too small");
+
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  const auto prepare_blocks = static_cast<unsigned>(
+      (query_values + kThreads - 1U) / kThreads);
+  staged_prefill_prepare_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
+      launch.q_and_gate,
+      static_cast<__nv_bfloat16*>(workspace.queries),
+      workspace.accumulator, workspace.maxima, workspace.sums, launch.rows,
+      launch.query_heads, launch.kv_heads, launch.head_dim);
+  auto status = checked(cudaPeekAtLastError(),
+                        "prepare staged paged FP4 prefill");
+  if (!status.ok()) return status;
+
+  cublasHandle_t blas{};
+  auto blas_status = current_cublas_handle(stream, blas);
+  if (blas_status != CUBLAS_STATUS_SUCCESS)
+    return checked(blas_status, "initialize staged prefill cuBLAS");
+  const float alpha = 1.0F;
+  const float zero = 0.0F;
+  const float one = 1.0F;
+  const auto last_context =
+      launch.first_context_tokens + launch.rows - 1U;
+  for (std::uint32_t first_token = 0U; first_token < last_context;
+       first_token += split_tokens) {
+    const auto tokens = std::min(split_tokens, last_context - first_token);
+    const auto chunks_per_record = launch.head_dim / 16U;
+    const auto decode_items = static_cast<std::size_t>(2U) * tokens *
+                              launch.kv_heads * chunks_per_record;
+    const auto decode_blocks = static_cast<unsigned>(
+        (decode_items + kThreads - 1U) / kThreads);
+    staged_prefill_decode_kv_kernel<<<decode_blocks, kThreads, 0, stream>>>(
+        launch.page_table, static_cast<__nv_bfloat16*>(workspace.keys),
+        static_cast<__nv_bfloat16*>(workspace.values), first_token, tokens,
+        launch.full_attention_layer, launch.page_tokens, launch.kv_heads,
+        launch.head_dim);
+    status = checked(cudaPeekAtLastError(),
+                     "decode staged paged FP4 K/V");
+    if (!status.ok()) return status;
+
+    const auto query_stride = static_cast<long long>(matrix_rows) *
+                              launch.head_dim;
+    const auto kv_stride =
+        static_cast<long long>(tokens) * launch.head_dim;
+    const auto score_stride =
+        static_cast<long long>(matrix_rows) * tokens;
+    blas_status = cublasGemmStridedBatchedEx(
+        blas, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(tokens),
+        static_cast<int>(matrix_rows), static_cast<int>(launch.head_dim),
+        &alpha, workspace.keys, CUDA_R_16BF,
+        static_cast<int>(launch.head_dim), kv_stride, workspace.queries,
+        CUDA_R_16BF, static_cast<int>(launch.head_dim), query_stride, &zero,
+        workspace.scores, CUDA_R_32F, static_cast<int>(tokens), score_stride,
+        static_cast<int>(launch.kv_heads), CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (blas_status != CUBLAS_STATUS_SUCCESS)
+      return checked(blas_status, "staged paged FP4 QK GEMM");
+
+    staged_prefill_softmax_kernel<<<
+        static_cast<unsigned>(state_rows), kThreads, 0, stream>>>(
+        workspace.scores,
+        static_cast<__nv_bfloat16*>(workspace.probabilities),
+        workspace.accumulator, workspace.maxima, workspace.sums,
+        launch.first_context_tokens, first_token, tokens, launch.rows,
+        grouped_heads, launch.kv_heads, launch.head_dim);
+    status = checked(cudaPeekAtLastError(),
+                     "staged paged FP4 online softmax");
+    if (!status.ok()) return status;
+
+    const auto output_stride =
+        static_cast<long long>(matrix_rows) * launch.head_dim;
+    blas_status = cublasGemmStridedBatchedEx(
+        blas, CUBLAS_OP_N, CUBLAS_OP_N,
+        static_cast<int>(launch.head_dim), static_cast<int>(matrix_rows),
+        static_cast<int>(tokens), &alpha, workspace.values, CUDA_R_16BF,
+        static_cast<int>(launch.head_dim), kv_stride,
+        workspace.probabilities, CUDA_R_16BF, static_cast<int>(tokens),
+        score_stride, &one, workspace.accumulator, CUDA_R_32F,
+        static_cast<int>(launch.head_dim), output_stride,
+        static_cast<int>(launch.kv_heads), CUBLAS_COMPUTE_32F,
+        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+    if (blas_status != CUBLAS_STATUS_SUCCESS)
+      return checked(blas_status, "staged paged FP4 PV GEMM");
+  }
+  staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
+      launch.q_and_gate, workspace.accumulator, workspace.sums,
+      launch.output, launch.rows, launch.query_heads, launch.kv_heads,
+      launch.head_dim);
+  return checked(cudaPeekAtLastError(),
+                 "finalize staged paged FP4 prefill");
 }
 Status qwen3_next_delta_decode(const Qwen3NextDeltaLaunch& launch) noexcept {
   if (!launch.projected_qkvz || !launch.projected_ba ||

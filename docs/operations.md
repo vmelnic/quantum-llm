@@ -1,6 +1,6 @@
 # Operations runbook
 
-Status: current day-two lifecycle as of 2026-08-11. The implementation resume
+Status: current day-two lifecycle as of 2026-08-19. The implementation resume
 point is [the MoE VM handoff](moe-vm-next.md).
 
 Use [Install, configure and use](deployment.md) for initial setup. This page is
@@ -14,7 +14,6 @@ the short day-two runbook.
 ./ops/model.sh start              # CHAT_MODEL from .env
 ./ops/model.sh start qwen         # Qwen FP4 pack (ABI 3)
 ./ops/model.sh start deepseek
-./ops/model.sh start lfm2-8b-a1b-expert-pack-fp4
 ./ops/model.sh status
 ./ops/model.sh chat               # resolves the actually deployed model
 ./ops/model.sh stop
@@ -48,10 +47,10 @@ confirm `model.sh status`. A listening port alone is not proof of identity.
 
 | Variable | Reference value | Meaning |
 |---|---:|---|
-| `MODEL_MAX_CONTEXT` | `65536` | instructions + history + input + requested output |
+| `MODEL_MAX_CONTEXT` | `262144` | instructions + history + input + requested output |
 | `MODEL_MAX_OUTPUT_TOKENS` | `8192` | server ceiling for one response |
 | `CHAT_MAX_TOKENS` | `8192` | terminal client request ceiling |
-| `MODEL_GENERATION_TIMEOUT_SECONDS` | `600` | request execution deadline |
+| `MODEL_GENERATION_TIMEOUT_SECONDS` | `14400` | request execution deadline |
 | `MODEL_READY_TIMEOUT` | `600` | lifecycle wait deadline |
 
 The current universal `.env` profile uses one worker slot and four queued
@@ -59,7 +58,8 @@ requests for every artifact. KV credits are aggregate.
 Overload or insufficient context credits returns bounded HTTP errors rather
 than allocating unbounded memory.
 
-The 65K ceiling is enabled but unqualified. See
+The 262K capacity path has completed, but its speed and semantic quality remain
+unqualified for production. See
 [Performance evidence](benchmarks.md) and
 [Production readiness](production-readiness.md).
 
@@ -110,9 +110,8 @@ Never publish one unqualified “tok/s” number. Record:
 - TTFT, post-first-token and end-to-end rates;
 - cache/storage/transfer state when available.
 
-An identical repeated Qwen prompt can reach 27–29 tok/s after the first token
-(39.6–45.6 with the FP4 pack), while changing multi-turn chat remains
-storage-bound. Those are dated performance-suite results, not the latest
-common-path `hi` gate. The VM gate proved lifecycle compatibility for Qwen,
-DeepSeek and LFM but did not demonstrate a speed increase. Both facts must
-remain visible.
+The current Qwen3.8 `hi` gate measured about 32.0 tok/s after the first
+generated token. A 262,016-token populated prompt measured about 3.24 tok/s
+after the first token and approximately 90 minutes TTFT. Keep those workloads
+separate. The old client `135.91 tok/s` value is invalid because it combined
+hidden reasoning token counts with first-visible-content timing.

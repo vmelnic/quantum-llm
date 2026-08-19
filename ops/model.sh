@@ -77,6 +77,7 @@ max_context="${MODEL_MAX_CONTEXT:-65536}"
 max_output="${MODEL_MAX_OUTPUT_TOKENS:-8192}"
 ready_timeout="${MODEL_READY_TIMEOUT:-600}"
 generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
+max_body_mib="${MODEL_MAX_BODY_MIB:-16}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
 ram_cache_gib="${MODEL_RAM_CACHE_GIB:-48}"
 vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-13}"
@@ -95,6 +96,7 @@ require_uint MODEL_MAX_CONTEXT "${max_context}"
 require_uint MODEL_MAX_OUTPUT_TOKENS "${max_output}"
 require_uint MODEL_READY_TIMEOUT "${ready_timeout}"
 require_uint MODEL_GENERATION_TIMEOUT_SECONDS "${generation_timeout}"
+require_uint MODEL_MAX_BODY_MIB "${max_body_mib}"
 require_uint MODEL_RAM_CACHE_GIB "${ram_cache_gib}"
 require_uint MODEL_VRAM_CACHE_GIB "${vram_cache_gib}"
 require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
@@ -141,6 +143,7 @@ print_config() {
     "max_context=${max_context}" \
     "max_output_tokens=${max_output}" \
     "generation_timeout_seconds=${generation_timeout}" \
+    "max_body_mib=${max_body_mib}" \
     "sync_on_start=${sync_on_start}"
   [[ -z "${model_id}" ]] || printf '%s\n' \
     "container=${container}" \
@@ -172,6 +175,7 @@ start_model() {
     -WorkerKvPageTokens "${kv_page_tokens}"
     -PlacementProfile "${placement_profile}"
     -GenerationTimeoutSeconds "${generation_timeout}"
+    -MaximumBodyMiB "${max_body_mib}"
     -StartupTimeoutSeconds 600
     -BuildId "${build_id}"
     -Start
@@ -192,7 +196,8 @@ start_model() {
     -ExpectedTaskName "${task_name}" \
     -ExpectedContext "${max_context}" \
     -ExpectedMaximumNewTokens "${max_output}" \
-    -ExpectedGenerationTimeoutSeconds "${generation_timeout}"
+    -ExpectedGenerationTimeoutSeconds "${generation_timeout}" \
+    -ExpectedMaximumBodyMiB "${max_body_mib}"
 }
 
 case "${action}" in

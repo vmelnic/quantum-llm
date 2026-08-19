@@ -42,6 +42,19 @@ if (-not $CheckOnly) {
     if ($LASTEXITCODE -ne 0) { throw "Failed to install server requirements" }
 }
 
+$pins = foreach ($line in Get-Content -LiteralPath $requirements) {
+    if ($line -match '^\s*([A-Za-z0-9_.-]+)==([^\s#]+)') {
+        [PSCustomObject]@{ Name = $Matches[1]; Version = $Matches[2] }
+    }
+}
+foreach ($pin in $pins) {
+    $probeVersion = "import importlib.metadata as m; print(m.version('$($pin.Name)'))"
+    $actual = [string](& $pythonPath -c $probeVersion)
+    if ($LASTEXITCODE -ne 0 -or $actual.Trim() -ne $pin.Version) {
+        throw "Server dependency $($pin.Name) must be $($pin.Version); installed=$($actual.Trim())"
+    }
+}
+
 $probe = "import jinja2, transformers; print(jinja2.__version__); print(transformers.__version__)"
 $versionLines = @(& $pythonPath -c $probe)
 if ($LASTEXITCODE -ne 0) {

@@ -1,8 +1,8 @@
 # Expert Runtime v1 contract
 
-Status: current runtime contract as of 2026-08-11. It includes the generic
-artifact/control-plane boundary; complete per-operation executor composition is
-still pending in [the MoE VM handoff](moe-vm-next.md).
+Status: current runtime contract as of 2026-08-19. It includes the generic
+artifact/program/provider boundary described in
+[the current handoff](moe-vm-next.md).
 
 This document defines invariants between the portable core, Windows storage,
 heterogeneous cache/scheduler, CUDA backend, model runner, and HTTP service.
@@ -282,33 +282,31 @@ behind a versioned kernel ABI and correctness tolerance.
 
 ## Native provider state
 
-The Qwen provider implements full-attention GQA with partial RoPE/output gate and
-Gated DeltaNet with persistent Conv/recurrent state. Dense projection, routed
-expert grouping and aggregation operate on a microbatch. KV/Conv/DeltaNet state
-is isolated by worker slot; weights/cache are shared.
+The Qwen3.8 provider implements full-attention GQA with partial RoPE/output gate
+and gated linear attention with persistent Conv/recurrent state. Dense FP4
+projection and MLP operations run through the compiled program. KV and linear
+state are isolated by worker slot; immutable weights are shared.
 
 The KV implementation uses on-demand FP16 pages:
 
 ```text
-logical FP16 KV bytes = 24 KiB × admitted context tokens
+logical KV bytes are derived from artifact head/layer geometry × admitted tokens
 ```
 
-KV is reserved in 256-token, 6 MiB superpages spanning all twelve full-attention
+KV is reserved in 256-token pages spanning the artifact-declared full-attention
 layers. Page credits are acquired per request, physical pages are allocated on
 first use, and released pages enter a bounded reuse pool. Online-softmax
 attention does not allocate a score array proportional to context length.
 
-DeepSeek and LFM own their distinct attention/recurrent and dense-prefix state
-behind their operation capability sets. They share the common service,
-artifact program and expert-page contracts, but their complete request loops
-have not yet been replaced by the common operation interpreter.
+DeepSeek owns its distinct sparse attention/recurrent state behind its operation
+capability set. It shares the common service, artifact program and expert-page
+contracts.
 
-Only 4096 context with capacity four has completed the historical
-qualification. The reference lifecycle currently advertises 65,536 tokens and
-8,192 output tokens; Qwen allocates KV pages on demand, so short requests do
-not reserve that maximum physically. The model's 262K position metadata remains
-outside the runtime guarantee until efficient prefill and long-context gates
-pass.
+The reference Qwen3.8 lifecycle advertises 262,144 context tokens and 8,192
+output tokens. Qwen allocates KV pages on demand, so short requests do not
+reserve that maximum physically. A 262,016-token prompt plus 128 generated
+tokens completed, demonstrating physical capacity. Efficient prefill,
+maximum-context decode throughput and semantic quality remain separate gates.
 
 ## Worker protocol
 

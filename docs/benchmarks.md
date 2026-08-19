@@ -1,9 +1,15 @@
 # Performance evidence
 
-Status: current evidence index as of 2026-08-17. Dated W/S sections preserve
+Status: current evidence index as of 2026-08-19. Dated W/S sections preserve
 their original configurations and remain valid historical measurements. The
 active implementation backlog is [MoE VM current state and remaining
 work](moe-vm-next.md), not a benchmark section below.
+
+The exact Qwen3.8 organ inventory, maximum-context KV geometry, current CUDA
+kernel bandwidth inputs and heterogeneous placement bounds are recorded in
+[Heterogeneous placement benchmark](heterogeneous-placement-benchmark.md).
+That document distinguishes measured results from theoretical CPU/NVMe bounds
+and contains no implementation claim.
 
 ## How to read the numbers
 

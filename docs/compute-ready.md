@@ -1,6 +1,6 @@
 # Compute-ready representations
 
-Status: current representation contract as of 2026-08-11. Physical-container
+Status: current representation contract as of 2026-08-19. Physical-container
 unification is not complete; see [the MoE VM handoff](moe-vm-next.md).
 
 `Compute-ready` is a contract between stored bytes and one concrete kernel. It
@@ -44,13 +44,11 @@ an interpretation from tensor dimensions.
 
 ## Current project formats
 
-The supported Qwen and LFM Expert Pack v1 artifacts carry an
-FP4-E2M1/UE8M0 block-32 routed-expert profile
-(quant ABI 3, kernel ABI
-`expert-pack-sm86-fp4-block32-v1`) consumed directly by packed `__dp4a`
-selection-batch kernels; the measured FP4 Qwen pack halves routed bytes per
-token (0.7 GiB vs 1.41 GiB) and reached 39.6–45.6 tok/s on resident routes
-(docs/benchmarks.md §S1b).
+The active Qwen3.8 Expert Pack carries dense FP4-E2M1/UE8M0 block-32 matrices
+(quant ABI 3) plus separately declared raw ABI-0 records. The SM86 dense
+provider consumes those packed matrices directly; Qwen3.8 has no routed
+experts. Historical Qwen3-Next and LFM Expert Packs use the same quant ABI for
+routed records and remain performance evidence rather than the active target.
 
 DeepSeek compact pack v1 is placement-ready and preserves the checkpoint's
 13,369,344-byte FP4/UE8M0 expert records. The current SM86 DP4A path consumes
@@ -58,9 +56,9 @@ those compact records directly, so they are compute-ready for that specific
 kernel. They are not yet a high-throughput Tensor Core ABI; a naive direct FP4
 kernel was correct but too slow.
 
-Dense and shared tensors currently use their own admitted device ABIs. Their
-resident representation consumes VRAM that could otherwise retain routed
-experts.
+Dense, typed and shared tensors use their explicitly admitted device ABIs.
+Their resident representation consumes VRAM that may otherwise hold KV pages
+or sparse-model expert records.
 
 Both formats now bind a checksummed `runtime-model.tsv` program. This unifies
 the execution description, not the physical payload container: DeepSeek still

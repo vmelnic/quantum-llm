@@ -136,7 +136,6 @@ def _chat(base_url: str, model: str, messages: list[dict[str, str]],
         "model": model,
         "messages": messages,
         "max_completion_tokens": maximum,
-        "temperature": 0,
         "stream": True,
         "stream_options": {"include_usage": True},
     }).encode()

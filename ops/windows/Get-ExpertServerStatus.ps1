@@ -5,7 +5,8 @@ param(
     [string]$ExpectedTaskName = "",
     [int]$ExpectedContext = 0,
     [int]$ExpectedMaximumNewTokens = 0,
-    [double]$ExpectedGenerationTimeoutSeconds = 0
+    [double]$ExpectedGenerationTimeoutSeconds = 0,
+    [int]$ExpectedMaximumBodyMiB = 0
 )
 
 $deadline = [DateTime]::UtcNow.AddSeconds($WaitSeconds)
@@ -78,6 +79,11 @@ if ($ready -and $ExpectedGenerationTimeoutSeconds -gt 0 -and
         $ExpectedGenerationTimeoutSeconds) {
     [void]$mismatches.Add("generation timeout expected=$ExpectedGenerationTimeoutSeconds actual=$($modelInfo.runtime_config.generation_timeout_seconds)")
 }
+if ($ready -and $ExpectedMaximumBodyMiB -gt 0 -and
+    [int64]$modelInfo.runtime_config.maximum_body_bytes -ne
+        [int64]$ExpectedMaximumBodyMiB * 1MB) {
+    [void]$mismatches.Add("maximum body expected=$ExpectedMaximumBodyMiB MiB actual=$($modelInfo.runtime_config.maximum_body_bytes) bytes")
+}
 
 $result = [PSCustomObject]@{
     ready = $ready
@@ -93,6 +99,9 @@ $result = [PSCustomObject]@{
     } else { $null }
     generation_timeout_seconds = if ($null -ne $modelInfo) {
         [double]$modelInfo.runtime_config.generation_timeout_seconds
+    } else { $null }
+    maximum_body_bytes = if ($null -ne $modelInfo) {
+        [int64]$modelInfo.runtime_config.maximum_body_bytes
     } else { $null }
     worker_capacity = if ($null -ne $modelInfo) {
         [int]$modelInfo.worker_capacity

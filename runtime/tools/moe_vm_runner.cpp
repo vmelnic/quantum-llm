@@ -6,15 +6,18 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <span>
@@ -68,12 +71,26 @@ struct ServicePorts final {
   std::string token_output;
 };
 
+struct SamplingSettings final {
+  std::uint32_t temperature_ppm{};
+  std::uint32_t top_p_ppm{1000000U};
+  std::uint32_t top_k{};
+  std::uint32_t min_p_ppm{};
+  std::uint64_t seed{};
+
+  [[nodiscard]] bool enabled() const noexcept {
+    return temperature_ppm != 0U;
+  }
+};
+
 struct ActiveRequest final {
   er::ProgramExecutionSession session;
   std::uint32_t predicted{};
   std::uint32_t next_position{};
   std::uint32_t context_limit{};
+  std::uint32_t retention_position{};
   std::uint64_t reserved_pages{};
+  SamplingSettings sampling;
 };
 
 struct StartedStep final {
@@ -86,6 +103,57 @@ struct StartedExactDecode final {
   std::uint64_t request_id{};
   std::size_t item_index{};
   er::ExactDecodeExecutionHandle handle;
+};
+
+class CommandInbox final {
+ public:
+  CommandInbox() : state_(std::make_shared<State>()) {
+    std::thread([state = state_] {
+      std::string line;
+      while (std::getline(std::cin, line)) {
+        {
+          std::lock_guard lock(state->mutex);
+          state->lines.push_back(std::move(line));
+        }
+        state->ready.notify_one();
+      }
+      {
+        std::lock_guard lock(state->mutex);
+        state->closed = true;
+      }
+      state->ready.notify_all();
+    }).detach();
+  }
+
+  [[nodiscard]] std::optional<std::string> next() {
+    std::unique_lock lock(state_->mutex);
+    state_->ready.wait(lock,
+                       [this] { return state_->closed || !state_->lines.empty(); });
+    if (state_->lines.empty()) return std::nullopt;
+    auto line = std::move(state_->lines.front());
+    state_->lines.pop_front();
+    return line;
+  }
+
+  [[nodiscard]] bool take_cancel(std::uint64_t request_id) {
+    const auto expected = std::string("CANCEL\t") +
+                          std::to_string(request_id);
+    std::lock_guard lock(state_->mutex);
+    const auto found =
+        std::find(state_->lines.begin(), state_->lines.end(), expected);
+    if (found == state_->lines.end()) return false;
+    state_->lines.erase(found);
+    return true;
+  }
+
+ private:
+  struct State final {
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::string> lines;
+    bool closed{};
+  };
+  std::shared_ptr<State> state_;
 };
 
 void require(bool condition, std::string_view message) {
@@ -193,11 +261,22 @@ ServicePorts service_ports(const er::ModelDescriptor& model) {
 }
 
 er::ProgramRequestContext request_context(std::uint64_t request_id,
-                                          std::uint32_t reserved_context) {
+                                          std::uint32_t reserved_context,
+                                          std::uint32_t retention_position,
+                                          const SamplingSettings& sampling) {
   er::ProgramRequestContext result;
   result.request_id = request_id;
   result.deadline = std::chrono::steady_clock::time_point::max();
   result.parameters.emplace("reserved_context_tokens", reserved_context);
+  if (retention_position != 0U)
+    result.parameters.emplace("retention_checkpoint_position",
+                              retention_position);
+  result.parameters.emplace("sampling_temperature_ppm",
+                            sampling.temperature_ppm);
+  result.parameters.emplace("sampling_top_p_ppm", sampling.top_p_ppm);
+  result.parameters.emplace("sampling_top_k", sampling.top_k);
+  result.parameters.emplace("sampling_min_p_ppm", sampling.min_p_ppm);
+  result.parameters.emplace("sampling_seed", sampling.seed);
   return result;
 }
 
@@ -234,6 +313,27 @@ er::StartProgramExecutionResult start_prefill_batch(
   return request.session.execute(std::move(inputs));
 }
 
+er::StartProgramExecutionResult start_prefill_sequence(
+    ActiveRequest& request, const ServicePorts& ports,
+    std::span<const std::uint32_t> tokens, std::uint32_t first_position) {
+  require(!tokens.empty() &&
+              tokens.size() <=
+                  std::numeric_limits<std::uint32_t>::max() &&
+              first_position <=
+                  std::numeric_limits<std::uint32_t>::max() -
+                      static_cast<std::uint32_t>(tokens.size() - 1U),
+          "invalid prefill program-sequence");
+  std::vector<std::uint32_t> positions(tokens.size());
+  for (std::size_t index = 0U; index < positions.size(); ++index)
+    positions[index] = first_position + static_cast<std::uint32_t>(index);
+  std::map<std::string, er::ExecutionValue, std::less<>> inputs;
+  inputs.emplace(ports.token_input,
+                 host_u32_batch(tokens, std::string(kTokenAbi)));
+  inputs.emplace(ports.position_input,
+                 host_u32_batch(positions, std::string(kPositionAbi)));
+  return request.session.execute_program_sequence(std::move(inputs));
+}
+
 std::uint32_t complete_step(er::ProgramExecutionHandle& handle,
                             const ServicePorts& ports) {
   for (;;) {
@@ -247,22 +347,6 @@ std::uint32_t complete_step(er::ProgramExecutionHandle& handle,
     require(output != result->outputs.end(),
             "model program did not publish its token output");
     return read_u32(output->second);
-  }
-}
-
-std::vector<std::uint32_t> complete_prefill_batch(
-    er::ProgramExecutionHandle& handle, const ServicePorts& ports) {
-  for (;;) {
-    auto result = handle.poll();
-    if (!result) {
-      std::this_thread::yield();
-      continue;
-    }
-    require(result->status.ok(), result->status.message());
-    const auto output = result->outputs.find(ports.token_output);
-    require(output != result->outputs.end(),
-            "model program did not publish its token output");
-    return read_u32_batch(output->second);
   }
 }
 
@@ -392,7 +476,7 @@ void print_ready(const er::ModelDescriptor& descriptor,
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":7,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":8,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -420,7 +504,8 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << (service.session_retention ? "true" : "false")
             << ",\"request_stream_mode\":\""
             << service.request_stream_mode
-            << "\",\"gpu_phase_timing\":false"
+            << "\",\"gpu_phase_timing\":false,\"sampling_supported\":"
+            << (service.sampling_supported ? "true" : "false")
             << ",\"mtp_resource_available\":"
             << (service.mtp_resource_available ? "true" : "false")
             << ",\"mtp_runtime_ready\":"
@@ -464,13 +549,81 @@ int worker_loop(er::MoeProgramExecutor& executor,
   std::uint64_t exact_decode_positions{};
   std::uint64_t exact_decode_accepted_tokens{};
   std::uint64_t cancelled_requests{};
+  CommandInbox inbox;
   print_ready(descriptor, module.service, options.capacity);
 
-  const auto feed = [&](ActiveRequest& request,
+  const auto feed = [&](std::uint64_t request_id, ActiveRequest& request,
                         std::span<const std::uint32_t> tokens,
                         std::uint32_t first_position) {
+    const auto complete_prefill = [&](er::ProgramExecutionHandle& handle) {
+      for (;;) {
+        if (inbox.take_cancel(request_id)) {
+          handle.cancel();
+          request.session.cancel();
+          ++cancelled_requests;
+          throw std::runtime_error("model prefill was cancelled");
+        }
+        auto result = handle.poll();
+        if (!result) {
+          std::this_thread::yield();
+          continue;
+        }
+        require(result->status.ok(), result->status.message());
+        const auto output = result->outputs.find(ports.token_output);
+        require(output != result->outputs.end(),
+                "model program did not publish its token output");
+        return read_u32_batch(output->second);
+      }
+    };
     const auto chunk_tokens =
         std::max<std::uint32_t>(1U, module.service.prefill_chunk_tokens);
+    if (tokens.size() > 1U &&
+        request.session.program_sequence_available()) {
+      auto step =
+          start_prefill_sequence(request, ports, tokens, first_position);
+      require(step.status.ok(), step.status.message());
+      const auto started = std::chrono::steady_clock::now();
+      auto predictions = complete_prefill(step.handle);
+      require(predictions.size() == 1U,
+              "program-sequence returned an invalid prediction width");
+      request.predicted = predictions.front();
+      program_steps += tokens.size();
+      program_step_ns += static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now() - started)
+              .count());
+      if (request.session.exact_decode_available()) {
+        for (std::size_t offset = 0U; offset < tokens.size();) {
+          const auto count = std::min<std::size_t>(
+              chunk_tokens, tokens.size() - offset);
+          std::vector<std::uint32_t> successors(count);
+          for (std::size_t row = 0U; row < count; ++row) {
+            const auto index = offset + row;
+            successors[row] = index + 1U == tokens.size()
+                                  ? request.predicted
+                                  : tokens[index + 1U];
+          }
+          const auto synchronized =
+              request.session.synchronize_exact_decode_batch(
+                  successors,
+                  first_position + static_cast<std::uint32_t>(offset),
+                  offset + count == tokens.size() &&
+                      !request.sampling.enabled());
+          require(synchronized.ok(), synchronized.message());
+          offset += count;
+        }
+      }
+      request.next_position =
+          first_position + static_cast<std::uint32_t>(tokens.size());
+      const auto retention_position = request.retention_position == 0U
+                                          ? request.next_position
+                                          : request.retention_position;
+      const auto checkpoint =
+          request.session.checkpoint_retention(retention_position);
+      require(checkpoint.ok(), checkpoint.message());
+      request.retention_position = retention_position;
+      return;
+    }
     for (std::size_t offset = 0U; offset < tokens.size();) {
       const auto count = std::min<std::size_t>(
           chunk_tokens, tokens.size() - offset);
@@ -480,7 +633,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
           first_position + static_cast<std::uint32_t>(offset));
       require(step.status.ok(), step.status.message());
       const auto started = std::chrono::steady_clock::now();
-      auto predictions = complete_prefill_batch(step.handle, ports);
+      auto predictions = complete_prefill(step.handle);
       require(predictions.size() == 1U || predictions.size() == count,
               "provider returned an invalid prefill prediction width");
       request.predicted = predictions.back();
@@ -500,17 +653,25 @@ int worker_loop(er::MoeProgramExecutor& executor,
             request.session.synchronize_exact_decode_batch(
                 successors,
                 first_position + static_cast<std::uint32_t>(offset),
-                offset + count == tokens.size());
+                offset + count == tokens.size() &&
+                    !request.sampling.enabled());
         require(synchronized.ok(), synchronized.message());
       }
       offset += count;
     }
     request.next_position =
         first_position + static_cast<std::uint32_t>(tokens.size());
+    const auto retention_position = request.retention_position == 0U
+                                        ? request.next_position
+                                        : request.retention_position;
+    const auto checkpoint =
+        request.session.checkpoint_retention(retention_position);
+    require(checkpoint.ok(), checkpoint.message());
+    request.retention_position = retention_position;
   };
 
-  std::string line;
-  while (std::getline(std::cin, line)) {
+  while (auto next_line = inbox.next()) {
+    auto& line = *next_line;
     try {
       const auto fields = split_tabs(line);
       require(!fields.empty(), "empty worker command");
@@ -518,8 +679,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
         require(fields.size() == 1U, "invalid PING");
         std::cout << "{\"type\":\"pong\"}\n" << std::flush;
       } else if (fields[0] == "BEGIN") {
-        require(fields.size() == 4U || fields.size() == 6U,
-                "invalid BEGIN");
+        require(fields.size() >= 4U, "invalid BEGIN");
         const auto id = std::stoull(std::string(fields[1]));
         const auto context = std::stoull(std::string(fields[2]));
         require(id != 0U && !active.contains(id) &&
@@ -527,31 +687,86 @@ int worker_loop(er::MoeProgramExecutor& executor,
                 "invalid BEGIN request identity or context");
         const auto prompt = parse_tokens(fields[3], descriptor.vocab_size);
         require(prompt.size() < context, "prompt exhausts request context");
+        std::size_t field = 4U;
+        bool resume{};
+        std::uint64_t resume_key{};
+        if (field < fields.size() && fields[field] == "RESUME") {
+          require(field + 1U < fields.size(), "invalid BEGIN resume marker");
+          resume = true;
+          resume_key = std::stoull(std::string(fields[field + 1U]));
+          field += 2U;
+        }
+        std::uint32_t checkpoint_position{};
+        if (field < fields.size() && fields[field] == "CHECKPOINT") {
+          require(field + 1U < fields.size(),
+                  "invalid BEGIN checkpoint marker");
+          const auto parsed =
+              std::stoull(std::string(fields[field + 1U]));
+          require(parsed != 0U && parsed <= options.max_context,
+                  "invalid BEGIN checkpoint position");
+          checkpoint_position = static_cast<std::uint32_t>(parsed);
+          field += 2U;
+        }
+        SamplingSettings sampling;
+        if (field < fields.size() && fields[field] == "SAMPLING") {
+          require(field + 5U < fields.size(),
+                  "invalid BEGIN sampling marker");
+          const auto temperature =
+              std::stoull(std::string(fields[field + 1U]));
+          const auto top_p = std::stoull(std::string(fields[field + 2U]));
+          const auto top_k = std::stoull(std::string(fields[field + 3U]));
+          const auto min_p = std::stoull(std::string(fields[field + 4U]));
+          sampling.seed = std::stoull(std::string(fields[field + 5U]));
+          require(temperature <= 2000000U && top_p != 0U &&
+                      top_p <= 1000000U && top_k <= descriptor.vocab_size &&
+                      min_p <= 1000000U,
+                  "invalid BEGIN sampling values");
+          sampling.temperature_ppm =
+              static_cast<std::uint32_t>(temperature);
+          sampling.top_p_ppm = static_cast<std::uint32_t>(top_p);
+          sampling.top_k = static_cast<std::uint32_t>(top_k);
+          sampling.min_p_ppm = static_cast<std::uint32_t>(min_p);
+          field += 6U;
+        }
+        require(field == fields.size(), "unknown BEGIN request fields");
         ActiveRequest request;
-        if (fields.size() == 6U) {
-          require(fields[4] == "RESUME", "invalid BEGIN resume marker");
-          const auto key = std::stoull(std::string(fields[5]));
-          const auto found = retained.find(key);
+        if (resume) {
+          const auto found = retained.find(resume_key);
           require(found != retained.end(), "unknown retained session");
           request = std::move(found->second);
           retained.erase(found);
+          require(checkpoint_position == 0U ||
+                      (checkpoint_position > request.next_position &&
+                       checkpoint_position <=
+                           request.next_position + prompt.size()),
+                  "resumed checkpoint is outside the prompt delta");
+          if (checkpoint_position != 0U)
+            request.retention_position = checkpoint_position;
+          request.sampling = sampling;
           auto rebound = request.session.rebind_request(
-              request_context(id, options.max_context));
+              request_context(id, options.max_context,
+                              request.retention_position, request.sampling));
           require(rebound.ok(), rebound.message());
           require(request.next_position + prompt.size() <= context,
                   "resumed prompt exhausts request context");
-          feed(request, prompt, request.next_position);
+          feed(id, request, prompt, request.next_position);
         } else {
+          require(checkpoint_position == 0U ||
+                      checkpoint_position <= prompt.size(),
+                  "checkpoint is outside the prompt");
+          request.retention_position = checkpoint_position;
+          request.sampling = sampling;
           require(active.size() + retained.size() < options.capacity,
                   "callable provider capacity is exhausted");
           auto begun = executor.begin_session(
-              request_context(id, options.max_context));
+              request_context(id, options.max_context,
+                              request.retention_position, request.sampling));
           require(begun.status.ok(), begun.status.message());
           request.session = std::move(begun.session);
           request.reserved_pages = page_count(
               static_cast<std::uint32_t>(context),
               module.service.kv_page_tokens);
-          feed(request, prompt, 0U);
+          feed(id, request, prompt, 0U);
         }
         request.context_limit = static_cast<std::uint32_t>(context);
         active.emplace(id, std::move(request));
@@ -596,7 +811,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
           }
           require(request.next_position < request.context_limit,
                   "request context is exhausted");
-          if (mode == 0U && request.session.exact_decode_available() &&
+          if (mode == 0U && !request.sampling.enabled() &&
+              request.session.exact_decode_available() &&
               request.next_position + 1U < request.context_limit) {
             auto exact = request.session.execute_exact_decode(
                 request.predicted, request.next_position,
@@ -633,7 +849,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
             if (request.session.exact_decode_available()) {
               const auto synchronized =
                   request.session.synchronize_exact_decode(
-                      request.predicted, request.next_position - 1U, true);
+                  request.predicted, request.next_position - 1U,
+                  !request.sampling.enabled());
               require(synchronized.ok(), synchronized.message());
             }
             done[index] = true;
@@ -696,16 +913,39 @@ int worker_loop(er::MoeProgramExecutor& executor,
           if (mode != 1U) continue;
           active.erase(id);
         }
+      } else if (fields[0] == "CANCEL") {
+        require(fields.size() == 2U, "invalid CANCEL");
+        const auto id = std::stoull(std::string(fields[1]));
+        const auto found = active.find(id);
+        if (found != active.end()) {
+          found->second.session.cancel();
+          active.erase(found);
+          ++cancelled_requests;
+        }
       } else if (fields[0] == "END") {
-        require(fields.size() == 2U || fields.size() == 4U, "invalid END");
+        require(fields.size() == 2U || fields.size() == 4U ||
+                    fields.size() == 6U,
+                "invalid END");
         const auto id = std::stoull(std::string(fields[1]));
         const auto found = active.find(id);
         require(found != active.end(), "unknown active request");
-        if (fields.size() == 4U) {
+        if (fields.size() == 4U || fields.size() == 6U) {
           require(fields[2] == "RETAIN", "invalid END retention marker");
           const auto key = std::stoull(std::string(fields[3]));
           require(key != 0U && !retained.contains(key),
                   "duplicate retained session");
+          if (fields.size() == 6U) {
+            require(fields[4] == "AT", "invalid END checkpoint marker");
+            const auto position =
+                std::stoull(std::string(fields[5]));
+            require(position == found->second.retention_position,
+                    "retention checkpoint position mismatch");
+            const auto rewound = found->second.session.rewind_retention(
+                static_cast<std::uint32_t>(position));
+            require(rewound.ok(), rewound.message());
+            found->second.next_position =
+                static_cast<std::uint32_t>(position);
+          }
           const auto tokens = found->second.next_position;
           retained.emplace(key, std::move(found->second));
           active.erase(found);

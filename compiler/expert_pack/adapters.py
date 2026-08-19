@@ -1268,7 +1268,7 @@ class Qwen3_5Adapter:
             ))
         operations.append(RuntimeOperationTopology(
             logical_layer=None,
-            capability="head.rmsnorm.argmax.fp4-block32.v1",
+            capability="head.rmsnorm.token-select.fp4-block32.v1",
             abi=1,
             routed_component=None,
             component_layer=0,
@@ -1320,7 +1320,7 @@ class Qwen3_5Adapter:
             ("block.full-attention.output-gated.v1", 1),
             ("block.recurrent-linear-attention.split-gated-delta.v1", 1),
             ("ffn.swiglu.dense.fp4-block32.v1", 1),
-            ("head.rmsnorm.argmax.fp4-block32.v1", 1),
+            ("head.rmsnorm.token-select.fp4-block32.v1", 1),
         ]
         if exact_decode is not None:
             required_kernels.append((mtp_capability, 1))

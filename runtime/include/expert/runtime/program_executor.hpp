@@ -141,6 +141,16 @@ struct OperationInvocation final {
   std::span<const ExecutionValue> inputs;
 };
 
+// Optional whole-program prefill scheduling boundary. The compiled artifact
+// program and prepared operations remain authoritative; providers may reorder
+// evaluation only, never change declared math, tensor bindings, or output ABI.
+struct ProgramSequenceInvocation final {
+  ProgramRequestContext request;
+  const CompiledModelProgram& program;
+  std::span<const IPreparedOperation* const> operations;
+  std::span<const ExecutionValue> inputs;
+};
+
 struct ExactDecodePreparationContext final {
   const ModelDescriptor& model;
   const ExactDecodeProgramDescriptor& program;
@@ -219,6 +229,27 @@ class IOperationProvider {
       const IPreparedOperation& operation,
       const std::shared_ptr<IOperationProviderRequestState>& request_state,
       const OperationInvocation& invocation) = 0;
+  [[nodiscard]] virtual bool supports_program_sequence(
+      const CompiledModelProgram&) const noexcept {
+    return false;
+  }
+  [[nodiscard]] virtual OperationExecutionHandle execute_program_sequence(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      const ProgramSequenceInvocation&) {
+    return {};
+  }
+  [[nodiscard]] virtual Status checkpoint_request_state(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      std::uint32_t) {
+    return {ErrorCode::invalid_argument,
+            "operation provider has no retention checkpoint implementation"};
+  }
+  [[nodiscard]] virtual Status rewind_request_state(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      std::uint32_t) {
+    return {ErrorCode::invalid_argument,
+            "operation provider has no retention rewind implementation"};
+  }
   [[nodiscard]] virtual PrepareOperationResult prepare_exact_decode(
       const ExactDecodePreparationContext&) {
     return {{ErrorCode::invalid_argument,
@@ -287,6 +318,9 @@ struct ExecutionProviderModule final {
     bool mtp_enabled{};
     bool retain_previous_route{};
     bool cpu_hybrid_enabled{};
+    // True only when the selected provider implements request-scoped token
+    // sampling for the artifact's token-selection capability.
+    bool sampling_supported{};
   } service;
   ExecutionProviderDefinition definition;
   std::shared_ptr<IModelTensorStore> tensor_store;
@@ -360,6 +394,13 @@ class ProgramExecutionSession final {
   [[nodiscard]] bool valid() const noexcept;
   [[nodiscard]] StartProgramExecutionResult execute(
       std::map<std::string, ExecutionValue, std::less<>> inputs) const noexcept;
+  [[nodiscard]] bool program_sequence_available() const noexcept;
+  [[nodiscard]] StartProgramExecutionResult execute_program_sequence(
+      std::map<std::string, ExecutionValue, std::less<>> inputs) const noexcept;
+  [[nodiscard]] Status checkpoint_retention(
+      std::uint32_t next_position) const noexcept;
+  [[nodiscard]] Status rewind_retention(
+      std::uint32_t next_position) const noexcept;
   [[nodiscard]] Status rebind_request(
       ProgramRequestContext request) const noexcept;
   [[nodiscard]] bool exact_decode_available() const noexcept;
@@ -380,6 +421,9 @@ class ProgramExecutionSession final {
   friend class MoeProgramExecutor;
   using Execute = std::function<StartProgramExecutionResult(
       std::map<std::string, ExecutionValue, std::less<>>)>;
+  using SequenceAvailable = std::function<bool()>;
+  using ExecuteSequence = Execute;
+  using RetentionControl = std::function<Status(std::uint32_t)>;
   using Rebind = std::function<Status(ProgramRequestContext)>;
   using ExactDecodeAvailable = std::function<bool()>;
   using SynchronizeExactDecodeBatch = std::function<Status(
@@ -390,7 +434,10 @@ class ProgramExecutionSession final {
   struct Core;
   explicit ProgramExecutionSession(std::unique_ptr<Core> core) noexcept;
   [[nodiscard]] static ProgramExecutionSession from_callbacks(
-      Execute execute, Rebind rebind, ExactDecodeAvailable exact_available,
+      Execute execute, SequenceAvailable sequence_available,
+      ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
+      RetentionControl rewind_retention, Rebind rebind,
+      ExactDecodeAvailable exact_available,
       SynchronizeExactDecodeBatch synchronize_exact,
       ExecuteExactDecode execute_exact, Cancel cancel);
   std::unique_ptr<Core> core_;
