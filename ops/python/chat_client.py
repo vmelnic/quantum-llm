@@ -29,8 +29,10 @@ def _ready(base_url: str, timeout: float) -> None:
     last_error: Exception | None = None
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(
-                    base_url.rstrip("/") + "/ready", timeout=2) as response:
+            request = urllib.request.Request(
+                base_url.rstrip("/") + "/ready", headers=_headers(), method="GET"
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
                 payload = json.load(response)
                 if payload.get("ready") is True:
                     return
@@ -54,7 +56,8 @@ def _events(response: Any) -> Iterator[dict[str, Any]]:
 class TurnStats:
     prompt_tokens: int
     output_tokens: int
-    ttft_seconds: float
+    reasoning_tokens: int
+    first_visible_seconds: float
     total_seconds: float
     finish_reason: str
 
@@ -62,15 +65,24 @@ class TurnStats:
 def _print_stats(stats: TurnStats) -> None:
     end_to_end = (stats.output_tokens / stats.total_seconds
                   if stats.total_seconds > 0 else 0.0)
-    decode_seconds = max(0.0, stats.total_seconds - stats.ttft_seconds)
-    post_first = ((stats.output_tokens - 1) / decode_seconds
-                  if stats.output_tokens > 1 and decode_seconds > 1e-6
-                  else None)
-    decode = f"{post_first:.2f} tok/s" if post_first is not None else "n/a"
+    visible_decode_seconds = max(
+        0.0, stats.total_seconds - stats.first_visible_seconds
+    )
+    post_first = (
+        (stats.output_tokens - 1) / visible_decode_seconds
+        if stats.reasoning_tokens == 0 and stats.output_tokens > 1 and
+        visible_decode_seconds > 1e-6 else None
+    )
+    decode = (f"{post_first:.2f} tok/s" if post_first is not None else
+              "n/a (hidden reasoning precedes visible text)"
+              if stats.reasoning_tokens else "n/a")
     print(
         f"[stats] prompt={stats.prompt_tokens} tok | output={stats.output_tokens} tok | "
-        f"TTFT={stats.ttft_seconds:.3f}s | total={stats.total_seconds:.3f}s | "
-        f"end-to-end={end_to_end:.2f} tok/s | after-first={decode} | "
+        f"reasoning={stats.reasoning_tokens} tok | "
+        f"first-visible={stats.first_visible_seconds:.3f}s | "
+        f"total={stats.total_seconds:.3f}s | "
+        f"generated-end-to-end={end_to_end:.2f} tok/s | "
+        f"after-first-visible={decode} | "
         f"finish={stats.finish_reason}"
     )
 
@@ -181,10 +193,12 @@ def _chat(base_url: str, model: str, messages: list[dict[str, str]],
     finished = time.perf_counter()
     if first_content_at is None:
         raise RuntimeError("stream completed without a content token")
+    completion_details = usage.get("completion_tokens_details") or {}
     return "".join(fragments), TurnStats(
         prompt_tokens=int(usage.get("prompt_tokens", 0)),
         output_tokens=int(usage.get("completion_tokens", 0)),
-        ttft_seconds=first_content_at - started,
+        reasoning_tokens=int(completion_details.get("reasoning_tokens", 0)),
+        first_visible_seconds=first_content_at - started,
         total_seconds=finished - started,
         finish_reason=finish_reason,
     )

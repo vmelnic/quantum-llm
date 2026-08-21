@@ -2,6 +2,7 @@ param(
     [Parameter(Mandatory = $true)][string]$HfPath,
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
+    [string]$Files = "",
     [Parameter(Mandatory = $true)][int]$MaxWorkers,
     [Parameter(Mandatory = $true)][string]$StdoutPath,
     [Parameter(Mandatory = $true)][string]$StderrPath,
@@ -17,28 +18,35 @@ try {
     # High-performance mode increases concurrency without changing the Hub cache
     # layout, resumability, or Xet content verification.
     $env:HF_XET_HIGH_PERFORMANCE = "1"
-    # Publish the immutable model contract before starting large shard
-    # transfers. This keeps architecture work and source validation from
-    # depending on the Hub client's internal file ordering while retaining a
-    # single pinned, resumable Xet workflow.
-    $metadataArguments = @(
-        "download", $ModelId,
-        "config.json", "model.safetensors.index.json",
-        "--revision", $Revision,
-        "--max-workers", "1",
-        "--no-truncate"
-    )
-    $metadataStdout = "$StdoutPath.metadata"
-    $metadataStderr = "$StderrPath.metadata"
-    $metadataProcess = Start-Process -FilePath $HfPath `
-        -ArgumentList $metadataArguments -NoNewWindow -Wait -PassThru `
-        -RedirectStandardOutput $metadataStdout `
-        -RedirectStandardError $metadataStderr
-    if ([int]$metadataProcess.ExitCode -ne 0) {
-        throw "hf metadata download exited with code $($metadataProcess.ExitCode)"
+    $selectedFiles = @($Files -split ',' | Where-Object { $_ } | ForEach-Object {
+        $_.Trim().Replace('\', '/')
+    })
+    if ($selectedFiles.Count -eq 0) {
+        # Safetensors downloads publish the immutable model contract before
+        # large shard transfers. Exact-file downloads already carry their
+        # complete immutable contract in the selected path list.
+        $metadataArguments = @(
+            "download", $ModelId,
+            "config.json", "model.safetensors.index.json",
+            "--revision", $Revision,
+            "--max-workers", "1",
+            "--no-truncate"
+        )
+        $metadataStdout = "$StdoutPath.metadata"
+        $metadataStderr = "$StderrPath.metadata"
+        $metadataProcess = Start-Process -FilePath $HfPath `
+            -ArgumentList $metadataArguments -NoNewWindow -Wait -PassThru `
+            -RedirectStandardOutput $metadataStdout `
+            -RedirectStandardError $metadataStderr
+        if ([int]$metadataProcess.ExitCode -ne 0) {
+            throw "hf metadata download exited with code $($metadataProcess.ExitCode)"
+        }
     }
-    $arguments = @(
-        "download", $ModelId,
+    $arguments = @("download", $ModelId)
+    if ($selectedFiles.Count -gt 0) {
+        $arguments += $selectedFiles
+    }
+    $arguments += @(
         "--revision", $Revision,
         "--max-workers", [string]$MaxWorkers,
         "--no-truncate"
@@ -55,9 +63,10 @@ catch {
 finally {
     $temporary = "$StatusPath.tmp"
     [PSCustomObject]@{
-        schema_version = 1
+        schema_version = 2
         model_id = $ModelId
         revision = $Revision
+        files = $selectedFiles
         xet_high_performance = $true
         started_utc = $started.ToString("o")
         finished_utc = [DateTime]::UtcNow.ToString("o")

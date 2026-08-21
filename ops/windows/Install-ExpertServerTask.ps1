@@ -5,6 +5,7 @@ param(
     [string]$Runner = "",
     [string]$Python = "",
     [string]$HostAddress = "127.0.0.1",
+    [string]$ApiKey = "",
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
     [int]$MaximumContext = 4096,
@@ -16,6 +17,8 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
+    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp16")]
+    [string]$WorkerKvCacheDtype = "artifact",
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -81,6 +84,7 @@ $taskArguments.AddRange([string[]]@(
     "-PlacementProfile", (Quote-TaskArgument $PlacementProfile),
     "-WorkerKvCacheMiB", [string]$WorkerKvCacheMiB,
     "-WorkerKvPageTokens", [string]$WorkerKvPageTokens,
+    "-WorkerKvCacheDtype", (Quote-TaskArgument $WorkerKvCacheDtype),
     "-MicrobatchWindowMs", $MicrobatchWindowMs.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-LatencyWindow", [string]$LatencyWindow,
     "-QueueTimeoutSeconds", $QueueTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -96,6 +100,7 @@ foreach ($entry in @(
     @{ Name = "Runner"; Value = $Runner },
     @{ Name = "Python"; Value = $Python },
     @{ Name = "ModelId"; Value = $ModelId },
+    @{ Name = "ApiKey"; Value = $ApiKey },
     @{ Name = "WorkerRouteTraceFile"; Value = $WorkerRouteTraceFile }
 )) {
     if ($entry.Value) {
@@ -140,6 +145,7 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     maximum_body_mib = $MaximumBodyMiB
     model_input = $Container
     placement_profile = $PlacementProfile
+    worker_kv_cache_dtype = $WorkerKvCacheDtype
     profile_gpu_phases = [bool]$ProfileGpuPhases
     retained_route_policy = if ($DisableRetainedRoute) {
         "disabled"

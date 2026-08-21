@@ -3392,7 +3392,9 @@ make_sm86_hybrid_delta_moe_callable_provider(
                          provider_capabilities(), implementation};
     module.tensor_store = implementation;
     module.service = {
-        "causal_sequential", 1U, true, "per_request_nonblocking", "artifact",
+        "causal_sequential", 1U,
+        implementation->supports_request_state_retention(),
+        "per_request_nonblocking", "artifact",
         "fp16", "paged_on_demand", implementation->kv_page_tokens(),
         implementation->kv_page_bytes(), implementation->kv_page_capacity(),
         "budgeted", implementation->placement_profile(), ram_cache_bytes,

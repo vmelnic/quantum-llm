@@ -275,6 +275,7 @@ class CudaWorker:
                  ram_cache_gib: int, vram_cache_gib: int,
                  kv_cache_mib: int, kv_page_tokens: int,
                  placement_profile: str, profile_gpu_phases: bool,
+                 kv_cache_dtype: str = "artifact",
                  prefill_chunk_tokens: int = 0,
                  placement_settle_steps: int | None = None,
                  retain_previous_route: bool | None = None,
@@ -289,6 +290,7 @@ class CudaWorker:
             f"--capacity={requested_capacity}",
             f"--kv-cache-mib={kv_cache_mib}",
             f"--kv-page-tokens={kv_page_tokens}",
+            f"--kv-cache-dtype={kv_cache_dtype}",
             f"--placement-profile={placement_profile}",
         ]
         if prefill_chunk_tokens:
@@ -484,6 +486,7 @@ class CudaWorker:
                 self.kv_dtype not in {
                     "fp16", "bf16", "fp32",
                     "fp4-e2m1-ue8m0-block32",
+                    "fp8-e4m3-per-head",
                 } or
                 self.kv_allocation not in {"paged_on_demand", "preallocated"} or
                 self.kv_page_tokens != kv_page_tokens or
@@ -534,7 +537,9 @@ class CudaWorker:
     def _command(self, command: str,
                  cancel_check: Callable[[], bool] | None = None,
                  cancel_id: int | None = None,
-                 deadline: float | None = None) -> dict[str, Any]:
+                 deadline: float | None = None,
+                 progress_callback: Callable[[], None] | None = None,
+                 ) -> dict[str, Any]:
         with self.command_lock:
             if self.process.poll() is not None:
                 raise WorkerError("CUDA worker is not running")
@@ -542,6 +547,7 @@ class CudaWorker:
             self.process.stdin.write(command + "\n")
             self.process.stdin.flush()
             interrupted = False
+            progress_error: Exception | None = None
             while True:
                 if not interrupted and (
                         (cancel_check is not None and cancel_check()) or
@@ -550,6 +556,15 @@ class CudaWorker:
                         self.process.stdin.write(f"CANCEL\t{cancel_id}\n")
                         self.process.stdin.flush()
                     interrupted = True
+                if not interrupted and progress_callback is not None:
+                    try:
+                        progress_callback()
+                    except Exception as error:
+                        if cancel_id is not None:
+                            self.process.stdin.write(f"CANCEL\t{cancel_id}\n")
+                            self.process.stdin.flush()
+                        interrupted = True
+                        progress_error = error
                 try:
                     response = self._responses.get(timeout=0.05)
                 except queue.Empty:
@@ -559,6 +574,8 @@ class CudaWorker:
                 if isinstance(response, Exception):
                     raise response
                 if interrupted:
+                    if progress_error is not None:
+                        raise progress_error
                     raise WorkerError("CUDA worker request was cancelled")
                 return response
 
@@ -566,7 +583,8 @@ class CudaWorker:
               sampling: SamplingSettings,
               checkpoint_tokens: int | None = None,
               cancel_check: Callable[[], bool] | None = None,
-              deadline: float | None = None) -> None:
+              deadline: float | None = None,
+              progress_callback: Callable[[], None] | None = None) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
         command = (f"BEGIN\t{request_id}\t{context_limit}\t" +
@@ -577,7 +595,7 @@ class CudaWorker:
         response = self._command(
             command,
             cancel_check=cancel_check, cancel_id=request_id,
-            deadline=deadline,
+            deadline=deadline, progress_callback=progress_callback,
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
@@ -588,7 +606,9 @@ class CudaWorker:
                      sampling: SamplingSettings,
                      checkpoint_tokens: int | None = None,
                      cancel_check: Callable[[], bool] | None = None,
-                     deadline: float | None = None) -> None:
+                     deadline: float | None = None,
+                     progress_callback: Callable[[], None] | None = None,
+                     ) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
         if not delta_ids:
@@ -602,6 +622,7 @@ class CudaWorker:
         response = self._command(
             command, cancel_check=cancel_check,
             cancel_id=request_id, deadline=deadline,
+            progress_callback=progress_callback,
         )
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
@@ -863,6 +884,7 @@ class Application:
                                  args.worker_kv_page_tokens,
                                  args.placement_profile,
                                  args.profile_gpu_phases,
+                                 args.worker_kv_cache_dtype,
                                  args.worker_prefill_chunk_tokens,
                                  args.worker_placement_settle_steps,
                                  (False if args.disable_worker_retained_route
@@ -1361,6 +1383,337 @@ class Application:
         return result
 
     @staticmethod
+    def _anthropic_text(raw: Any, param: str) -> str:
+        if isinstance(raw, str):
+            return raw
+        if not isinstance(raw, list):
+            raise RequestError("content must be text or an array of text blocks", param)
+        pieces: list[str] = []
+        for index, block in enumerate(raw):
+            block_param = f"{param}.{index}"
+            if not isinstance(block, dict) or block.get("type") != "text":
+                raise RequestError(
+                    "only text tool-result content is supported",
+                    block_param, "unsupported_value",
+                )
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise RequestError("text block requires text", f"{block_param}.text")
+            pieces.append(text)
+        return "".join(pieces)
+
+    @classmethod
+    def _anthropic_messages(
+        cls, raw: Any
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        if not isinstance(raw, list) or not raw:
+            raise RequestError("messages must be a non-empty array", "messages")
+        normalized: list[dict[str, Any]] = []
+        cache_prefix_message_count: int | None = None
+        for message_index, message in enumerate(raw):
+            param = f"messages.{message_index}"
+            if not isinstance(message, dict):
+                raise RequestError("message must be an object", param)
+            role = message.get("role")
+            if role not in {"user", "assistant", "system"}:
+                raise RequestError(
+                    "Anthropic messages support user, assistant, and system roles",
+                    f"{param}.role", "unsupported_value",
+                )
+            content = message.get("content")
+            if role == "system":
+                if isinstance(content, str):
+                    system_text = content
+                elif isinstance(content, list) and content:
+                    system_text = cls._anthropic_text(
+                        content, f"{param}.content"
+                    )
+                else:
+                    raise RequestError(
+                        "system message content must be text or a non-empty block array",
+                        f"{param}.content",
+                    )
+                if system_text:
+                    # Historical reminders remain in Claude Code's message
+                    # history while a new dynamic reminder is appended. The
+                    # final boundary therefore advances the retained KV state
+                    # each turn and excludes only the current reminder.
+                    cache_prefix_message_count = len(normalized)
+                    # Claude Code emits dynamic system reminders inside the
+                    # message list. Qwen requires the only system role to be
+                    # first, so retain the reminder at its conversational
+                    # position as model-visible user context. Moving it into
+                    # the leading system prompt would invalidate the large
+                    # tools/system KV prefix on every turn.
+                    normalized.append({"role": "user", "content": system_text})
+                continue
+            if isinstance(content, str):
+                normalized.append({"role": role, "content": content})
+                continue
+            if not isinstance(content, list) or not content:
+                raise RequestError(
+                    "message content must be text or a non-empty block array",
+                    f"{param}.content",
+                )
+
+            if role == "assistant":
+                text: list[str] = []
+                reasoning: list[str] = []
+                calls: list[dict[str, Any]] = []
+                for block_index, block in enumerate(content):
+                    block_param = f"{param}.content.{block_index}"
+                    if not isinstance(block, dict):
+                        raise RequestError("content block must be an object", block_param)
+                    kind = block.get("type")
+                    if kind == "text":
+                        value = block.get("text")
+                        if not isinstance(value, str):
+                            raise RequestError("text block requires text",
+                                               f"{block_param}.text")
+                        text.append(value)
+                    elif kind == "thinking":
+                        value = block.get("thinking")
+                        if not isinstance(value, str):
+                            raise RequestError("thinking block requires thinking text",
+                                               f"{block_param}.thinking")
+                        reasoning.append(value)
+                    elif kind == "redacted_thinking":
+                        # Redacted thinking contains no model-visible text. Its
+                        # provider signature is intentionally not forwarded to
+                        # a different local model.
+                        continue
+                    elif kind == "tool_use":
+                        tool_id = block.get("id")
+                        name = block.get("name")
+                        arguments = block.get("input")
+                        if not isinstance(tool_id, str) or not tool_id:
+                            raise RequestError("tool_use requires an id",
+                                               f"{block_param}.id")
+                        if not isinstance(name, str) or not name:
+                            raise RequestError("tool_use requires a name",
+                                               f"{block_param}.name")
+                        if not isinstance(arguments, dict):
+                            raise RequestError("tool_use input must be an object",
+                                               f"{block_param}.input")
+                        calls.append({
+                            "id": tool_id, "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        })
+                    else:
+                        raise RequestError(
+                            f"content block type {kind!r} is not supported",
+                            f"{block_param}.type", "unsupported_value",
+                        )
+                item: dict[str, Any] = {
+                    "role": "assistant", "content": "".join(text),
+                }
+                if reasoning:
+                    item["reasoning_content"] = "".join(reasoning)
+                if calls:
+                    item["tool_calls"] = calls
+                normalized.append(item)
+                continue
+
+            tool_results: list[dict[str, Any]] = []
+            text: list[str] = []
+            for block_index, block in enumerate(content):
+                block_param = f"{param}.content.{block_index}"
+                if not isinstance(block, dict):
+                    raise RequestError("content block must be an object", block_param)
+                kind = block.get("type")
+                if kind == "tool_result":
+                    if text:
+                        raise RequestError(
+                            "tool_result blocks must precede text blocks",
+                            block_param,
+                        )
+                    tool_use_id = block.get("tool_use_id")
+                    if not isinstance(tool_use_id, str) or not tool_use_id:
+                        raise RequestError("tool_result requires tool_use_id",
+                                           f"{block_param}.tool_use_id")
+                    result_text = cls._anthropic_text(
+                        block.get("content", ""), f"{block_param}.content"
+                    )
+                    is_error = block.get("is_error", False)
+                    if not isinstance(is_error, bool):
+                        raise RequestError("is_error must be boolean",
+                                           f"{block_param}.is_error")
+                    tool_results.append({
+                        "role": "tool", "content": result_text,
+                        "tool_call_id": tool_use_id,
+                    })
+                elif kind == "text":
+                    value = block.get("text")
+                    if not isinstance(value, str):
+                        raise RequestError("text block requires text",
+                                           f"{block_param}.text")
+                    text.append(value)
+                else:
+                    raise RequestError(
+                        f"content block type {kind!r} is not supported",
+                        f"{block_param}.type", "unsupported_value",
+                    )
+            normalized.extend(tool_results)
+            if text:
+                normalized.append({"role": "user", "content": "".join(text)})
+            if not tool_results and not text:
+                raise RequestError("user content has no supported blocks",
+                                   f"{param}.content")
+        return normalized, cache_prefix_message_count
+
+    @classmethod
+    def _anthropic_system(cls, raw: Any) -> str:
+        if isinstance(raw, str):
+            return raw
+        if not isinstance(raw, list):
+            raise RequestError("system must be text or an array of text blocks",
+                               "system")
+        pieces: list[str] = []
+        for index, block in enumerate(raw):
+            param = f"system.{index}"
+            if not isinstance(block, dict) or block.get("type") != "text":
+                raise RequestError("system supports only text blocks", param,
+                                   "unsupported_value")
+            text = block.get("text")
+            if not isinstance(text, str):
+                raise RequestError("system text block requires text",
+                                   f"{param}.text")
+            pieces.append(text)
+        return "".join(pieces)
+
+    @staticmethod
+    def _anthropic_tools(raw: Any) -> list[dict[str, Any]]:
+        if raw in (None, []):
+            return []
+        if not isinstance(raw, list):
+            raise RequestError("tools must be an array", "tools")
+        result: list[dict[str, Any]] = []
+        for index, tool in enumerate(raw):
+            param = f"tools.{index}"
+            if not isinstance(tool, dict):
+                raise RequestError("tool must be an object", param)
+            if tool.get("type") not in (None, "custom"):
+                raise RequestError("server-side tools are not supported", param,
+                                   "unsupported_value")
+            name = tool.get("name")
+            description = tool.get("description")
+            schema = tool.get("input_schema")
+            if not isinstance(name, str) or not name:
+                raise RequestError("tool requires a name", f"{param}.name")
+            if description is not None and not isinstance(description, str):
+                raise RequestError("tool description must be text",
+                                   f"{param}.description")
+            if not isinstance(schema, dict):
+                raise RequestError("tool input_schema must be an object",
+                                   f"{param}.input_schema")
+            function: dict[str, Any] = {"name": name, "parameters": schema}
+            if description is not None:
+                function["description"] = description
+            result.append({"type": "function", "function": function})
+        return result
+
+    @classmethod
+    def anthropic_payload(cls, payload: dict[str, Any],
+                          count_only: bool = False) -> dict[str, Any]:
+        """Normalize Anthropic Messages input into the common chat contract."""
+        if "max_tokens" not in payload and not count_only:
+            raise RequestError("max_tokens is required", "max_tokens")
+        messages, cache_prefix_message_count = cls._anthropic_messages(
+            payload.get("messages")
+        )
+        normalized: dict[str, Any] = {
+            "model": payload.get("model"),
+            "messages": messages,
+            "max_tokens": 1 if count_only else payload.get("max_tokens"),
+            "stream": False if count_only else payload.get("stream", False),
+        }
+        if "system" in payload:
+            system = cls._anthropic_system(payload["system"])
+            if system:
+                normalized["messages"].insert(
+                    0, {"role": "system", "content": system}
+                )
+                if cache_prefix_message_count is not None:
+                    cache_prefix_message_count += 1
+        if cache_prefix_message_count is not None and \
+                cache_prefix_message_count > 0:
+            cache_messages = normalized["messages"][
+                :cache_prefix_message_count
+            ]
+            if any(message["role"] == "user" for message in cache_messages):
+                normalized["_cache_prefix_messages"] = cache_messages
+        if "stop_sequences" in payload:
+            normalized["stop"] = payload["stop_sequences"]
+        for field in ("temperature", "top_p", "top_k"):
+            if field in payload:
+                normalized[field] = payload[field]
+        tools = cls._anthropic_tools(payload.get("tools"))
+        if tools:
+            normalized["tools"] = tools
+        choice = payload.get("tool_choice")
+        if choice is not None:
+            if not isinstance(choice, dict):
+                raise RequestError("tool_choice must be an object", "tool_choice")
+            kind = choice.get("type")
+            if kind in {"auto", "none"}:
+                normalized["tool_choice"] = kind
+            elif kind == "any":
+                normalized["tool_choice"] = "required"
+            elif kind == "tool" and isinstance(choice.get("name"), str):
+                normalized["tool_choice"] = {
+                    "type": "function",
+                    "function": {"name": choice["name"]},
+                }
+            else:
+                raise RequestError("unsupported tool_choice", "tool_choice",
+                                   "unsupported_value")
+        metadata = payload.get("metadata")
+        if metadata is not None:
+            if not isinstance(metadata, dict):
+                raise RequestError("metadata must be an object", "metadata")
+            user_id = metadata.get("user_id")
+            if user_id is not None:
+                if not isinstance(user_id, str):
+                    raise RequestError("metadata.user_id must be text",
+                                       "metadata.user_id")
+                normalized["user"] = user_id
+
+        enable_thinking = True
+        thinking = payload.get("thinking")
+        if thinking is not None:
+            if not isinstance(thinking, dict):
+                raise RequestError("thinking must be an object", "thinking")
+            kind = thinking.get("type")
+            if kind == "disabled":
+                enable_thinking = False
+            elif kind not in {"enabled", "adaptive"}:
+                raise RequestError("unsupported thinking mode", "thinking.type",
+                                   "unsupported_value")
+        normalized["chat_template_kwargs"] = {
+            "enable_thinking": enable_thinking,
+            "preserve_thinking": True,
+        }
+
+        output_config = payload.get("output_config")
+        effort = None
+        if output_config is not None:
+            if not isinstance(output_config, dict):
+                raise RequestError("output_config must be an object", "output_config")
+            if output_config.get("format") is not None:
+                raise RequestError("structured output is not supported",
+                                   "output_config.format", "unsupported_value")
+            effort = output_config.get("effort")
+        if effort is not None:
+            effort_map = {"low": "low", "medium": "medium",
+                          "high": "xhigh", "xhigh": "xhigh",
+                          "max": "xhigh"}
+            if effort not in effort_map:
+                raise RequestError("unsupported output effort",
+                                   "output_config.effort", "unsupported_value")
+            normalized["reasoning_effort"] = effort_map[effort]
+        return normalized
+
+    @staticmethod
     def _tools(payload: dict[str, Any]) -> tuple[dict[str, Any], ...]:
         raw_tools = payload.get("tools")
         legacy = payload.get("functions")
@@ -1651,7 +2004,7 @@ class Application:
             raise RequestError("user must be a string", "user")
 
         cache_prefix_tokens = 0
-        if endpoint == "chat":
+        if endpoint in {"chat", "anthropic"}:
             messages = self._messages(payload.get("messages"))
             prompt_ids = self._chat_prompt_ids(
                 messages, tools=prompt_tools,
@@ -1659,8 +2012,16 @@ class Application:
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
             )
+            stable_messages = messages
+            raw_cache_messages = payload.get("_cache_prefix_messages") \
+                if endpoint == "anthropic" else None
+            if raw_cache_messages is not None:
+                stable_messages = self._messages(
+                    raw_cache_messages, "_cache_prefix_messages"
+                )
             stable_ids = self._chat_prompt_ids(
-                messages, add_generation_prompt=False, tools=prompt_tools,
+                stable_messages, add_generation_prompt=False,
+                tools=prompt_tools,
                 reasoning_effort=reasoning_effort,
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
@@ -1705,7 +2066,7 @@ class Application:
                                "input" if endpoint == "responses" else "prompt")
         if len(prompt_ids) + maximum > self.args.max_context:
             raise RequestError("prompt plus output tokens exceeds context capacity", max_field)
-        if endpoint in {"chat", "responses"} and (
+        if endpoint in {"chat", "anthropic", "responses"} and (
                 cache_prefix_tokens <= 0 or
                 cache_prefix_tokens > len(prompt_ids) or
                 prompt_ids[:cache_prefix_tokens] != stable_ids):
@@ -1861,6 +2222,7 @@ class Application:
                  cancel_check: Callable[[], bool] | None = None,
                  cache_prefix_tokens: int | None = None,
                  sampling: SamplingSettings | None = None,
+                 progress_callback: Callable[[], None] | None = None,
                  ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
@@ -1884,7 +2246,8 @@ class Application:
         resumed = False
         finished = False
         deadline = started + self.args.generation_timeout
-        checkpoint_tokens = cache_prefix_tokens or len(prompt_ids)
+        checkpoint_tokens = (cache_prefix_tokens or len(prompt_ids)) \
+            if retain else None
         effective_sampling = sampling or self.default_sampling
         while True:
             try:
@@ -1901,6 +2264,7 @@ class Application:
                             effective_sampling,
                             checkpoint_tokens=checkpoint_tokens,
                             cancel_check=cancel_check, deadline=deadline,
+                            progress_callback=progress_callback,
                         )
                     resumed = True
                     prefill_tokens = len(delta)
@@ -1914,6 +2278,7 @@ class Application:
                             effective_sampling,
                             checkpoint_tokens=checkpoint_tokens,
                             cancel_check=cancel_check, deadline=deadline,
+                            progress_callback=progress_callback,
                         )
                 break
             except WorkerError as error:
@@ -1930,6 +2295,8 @@ class Application:
                 raise
         try:
             for index in range(maximum):
+                if progress_callback is not None:
+                    progress_callback()
                 if time.monotonic() - started > self.args.generation_timeout:
                     raise TimeoutError("generation deadline exceeded")
                 # A final STEP makes the worker release the slot inline, which
@@ -1944,6 +2311,8 @@ class Application:
                     request_id, last and not retain,
                     hold=last and retain and self.worker.mtp_enabled,
                 )
+                if progress_callback is not None:
+                    progress_callback()
                 token_at = time.monotonic()
                 if previous_token_at is None:
                     first_token_seconds = token_at - started
@@ -2143,6 +2512,9 @@ class Application:
                 "placement_profile": self.args.placement_profile,
                 "worker_kv_cache_mib": self.args.worker_kv_cache_mib,
                 "worker_kv_page_tokens": self.args.worker_kv_page_tokens,
+                "worker_kv_cache_dtype": getattr(
+                    self.args, "worker_kv_cache_dtype", "artifact"
+                ),
                 "worker_prefill_chunk_tokens":
                     self.args.worker_prefill_chunk_tokens,
                 "session_retention": self.retention_enabled(),
@@ -2175,6 +2547,7 @@ class Application:
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "ExpertRuntime/2"
+    anthropic_heartbeat_seconds = 10.0
 
     @property
     def app(self) -> Application:
@@ -2187,8 +2560,10 @@ class Handler(BaseHTTPRequestHandler):
         expected = self.app.args.api_key
         if not expected:
             return True
-        supplied = self.headers.get("Authorization", "")
-        return hmac.compare_digest(supplied, f"Bearer {expected}")
+        authorization = self.headers.get("Authorization", "")
+        api_key = self.headers.get("x-api-key", "")
+        return (hmac.compare_digest(authorization, f"Bearer {expected}") or
+                hmac.compare_digest(api_key, expected))
 
     def _client_disconnected(self) -> bool:
         # A streaming response can fit in the kernel send buffer, so relying
@@ -2227,6 +2602,13 @@ class Handler(BaseHTTPRequestHandler):
             "message": message, "type": kind, "param": param, "code": code,
         }})
 
+    def _anthropic_error(self, status: int, message: str,
+                         kind: str = "invalid_request_error") -> None:
+        self._json(status, {
+            "type": "error", "error": {"type": kind, "message": message},
+            "request_id": self._request_id(),
+        })
+
     def _sse_headers(self) -> None:
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -2240,6 +2622,12 @@ class Handler(BaseHTTPRequestHandler):
             payload, separators=(",", ":")
         )
         self.wfile.write(b"data: " + encoded.encode() + b"\n\n")
+        self.wfile.flush()
+
+    def _anthropic_sse(self, event: str, payload: dict[str, Any]) -> None:
+        encoded = json.dumps(payload, separators=(",", ":")).encode()
+        self.wfile.write(b"event: " + event.encode() + b"\n")
+        self.wfile.write(b"data: " + encoded + b"\n\n")
         self.wfile.flush()
 
     def _model(self) -> dict[str, Any]:
@@ -2276,8 +2664,11 @@ class Handler(BaseHTTPRequestHandler):
             "total_tokens": prompt_tokens + completion_tokens,
         }
 
-    def _run_generation(self, request: GenerationRequest, emit: Any,
-                        context: RequestContext) -> tuple[str, int, str]:
+    def _run_generation(
+        self, request: GenerationRequest, emit: Any,
+        context: RequestContext,
+        progress_callback: Callable[[], None] | None = None,
+    ) -> tuple[str, int, str]:
         pieces: list[str] = []
         count = 0
         finish_reason = "length"
@@ -2288,10 +2679,12 @@ class Handler(BaseHTTPRequestHandler):
                 cancel_check=self._client_disconnected,
                 cache_prefix_tokens=request.cache_prefix_tokens,
                 sampling=request.sampling,
+                progress_callback=progress_callback,
             )
         except TypeError as error:
             if not any(name in str(error) for name in (
-                    "cancel_check", "cache_prefix_tokens", "sampling")):
+                    "cancel_check", "cache_prefix_tokens", "sampling",
+                    "progress_callback")):
                 raise
             generation = self.app.generate(
                 request.prompt_ids, request.maximum, context
@@ -2359,6 +2752,162 @@ class Handler(BaseHTTPRequestHandler):
             "user": request.user, "metadata": request.metadata or {},
         }
 
+    @staticmethod
+    def _anthropic_tool_id(call: ToolCall) -> str:
+        suffix = call.call_id.removeprefix("call_")
+        return "toolu_" + suffix
+
+    @staticmethod
+    def _anthropic_stop_reason(finish_reason: str,
+                               calls: tuple[ToolCall, ...]) -> str:
+        if calls:
+            return "tool_use"
+        return "max_tokens" if finish_reason == "length" else "end_turn"
+
+    def _anthropic_content(self, text: str,
+                           calls: tuple[ToolCall, ...]) -> list[dict[str, Any]]:
+        content: list[dict[str, Any]] = []
+        if text or not calls:
+            content.append({"type": "text", "text": text})
+        for call in calls:
+            content.append({
+                "type": "tool_use", "id": self._anthropic_tool_id(call),
+                "name": call.name, "input": json.loads(call.arguments),
+            })
+        return content
+
+    def _anthropic_message(self, request: GenerationRequest, message_id: str,
+                           text: str, completion_tokens: int,
+                           finish_reason: str,
+                           calls: tuple[ToolCall, ...]) -> dict[str, Any]:
+        return {
+            "id": message_id, "type": "message", "role": "assistant",
+            "model": self.app.args.model,
+            "content": self._anthropic_content(text, calls),
+            "stop_reason": self._anthropic_stop_reason(finish_reason, calls),
+            "stop_sequence": None,
+            "usage": {
+                "input_tokens": len(request.prompt_ids),
+                "output_tokens": completion_tokens,
+            },
+        }
+
+    def _serve_anthropic(self, request: GenerationRequest, message_id: str,
+                         context: RequestContext) -> None:
+        if not request.stream:
+            raw_text, completion_count, finish_reason = self._run_generation(
+                request, lambda _delta: None, context
+            )
+            parsed = self.app.parse_assistant_output(raw_text, request)
+            calls = parsed.tool_calls
+            self._json(HTTPStatus.OK, self._anthropic_message(
+                request, message_id, parsed.text, completion_count,
+                finish_reason, calls,
+            ))
+            return
+
+        self._sse_headers()
+        self._anthropic_sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": message_id, "type": "message", "role": "assistant",
+                "model": self.app.args.model, "content": [],
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": len(request.prompt_ids),
+                          "output_tokens": 0},
+            },
+        })
+        last_heartbeat = time.monotonic()
+
+        def heartbeat() -> None:
+            nonlocal last_heartbeat
+            now = time.monotonic()
+            if now - last_heartbeat < self.anthropic_heartbeat_seconds:
+                return
+            if self._client_disconnected():
+                raise BrokenPipeError("streaming client disconnected")
+            self._anthropic_sse("ping", {"type": "ping"})
+            last_heartbeat = now
+
+        if request.tools and request.tool_choice != "none":
+            raw_text, completion_count, finish_reason = self._run_generation(
+                request, lambda _delta: None, context,
+                progress_callback=heartbeat,
+            )
+            parsed = self.app.parse_assistant_output(raw_text, request)
+            text, calls = parsed.text, parsed.tool_calls
+            index = 0
+            if text or not calls:
+                self._anthropic_sse("content_block_start", {
+                    "type": "content_block_start", "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                if text:
+                    self._anthropic_sse("content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": text},
+                    })
+                self._anthropic_sse("content_block_stop", {
+                    "type": "content_block_stop", "index": index,
+                })
+                index += 1
+            for call in calls:
+                self._anthropic_sse("content_block_start", {
+                    "type": "content_block_start", "index": index,
+                    "content_block": {
+                        "type": "tool_use", "id": self._anthropic_tool_id(call),
+                        "name": call.name, "input": {},
+                    },
+                })
+                self._anthropic_sse("content_block_delta", {
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "input_json_delta",
+                              "partial_json": call.arguments},
+                })
+                self._anthropic_sse("content_block_stop", {
+                    "type": "content_block_stop", "index": index,
+                })
+                index += 1
+        else:
+            calls = ()
+            index = 0
+            self._anthropic_sse("content_block_start", {
+                "type": "content_block_start", "index": index,
+                "content_block": {"type": "text", "text": ""},
+            })
+            parser = AssistantStreamParser(self.app, request)
+
+            def emit(delta: str) -> None:
+                _reasoning, visible = parser.feed(delta)
+                if visible:
+                    self._anthropic_sse("content_block_delta", {
+                        "type": "content_block_delta", "index": index,
+                        "delta": {"type": "text_delta", "text": visible},
+                    })
+
+            _raw_text, completion_count, finish_reason = self._run_generation(
+                request, emit, context, progress_callback=heartbeat,
+            )
+            _reasoning_tail, visible_tail = parser.finish()
+            if visible_tail:
+                self._anthropic_sse("content_block_delta", {
+                    "type": "content_block_delta", "index": index,
+                    "delta": {"type": "text_delta", "text": visible_tail},
+                })
+            self._anthropic_sse("content_block_stop", {
+                "type": "content_block_stop", "index": index,
+            })
+
+        self._anthropic_sse("message_delta", {
+            "type": "message_delta",
+            "delta": {
+                "stop_reason": self._anthropic_stop_reason(finish_reason, calls),
+                "stop_sequence": None,
+            },
+            "usage": {"output_tokens": completion_count},
+        })
+        self._anthropic_sse("message_stop", {"type": "message_stop"})
+
     def do_GET(self) -> None:
         self.http_request_id = "req_" + uuid.uuid4().hex
         if not self._authorized():
@@ -2397,15 +2946,24 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self.http_request_id = "req_" + uuid.uuid4().hex
-        if not self._authorized():
-            self._error(HTTPStatus.UNAUTHORIZED, "invalid API key", "authentication_error",
-                        code="invalid_api_key")
-            return
         path = urlsplit(self.path).path
+        anthropic = path in {"/v1/messages", "/v1/messages/count_tokens"}
+        if not self._authorized():
+            if anthropic:
+                self._anthropic_error(
+                    HTTPStatus.UNAUTHORIZED, "invalid API key",
+                    "authentication_error",
+                )
+            else:
+                self._error(HTTPStatus.UNAUTHORIZED, "invalid API key",
+                            "authentication_error", code="invalid_api_key")
+            return
         endpoint = {
             "/v1/completions": "completion",
             "/v1/chat/completions": "chat",
             "/v1/responses": "responses",
+            "/v1/messages": "anthropic",
+            "/v1/messages/count_tokens": "anthropic_count",
         }.get(path)
         if endpoint is None:
             self._error(HTTPStatus.NOT_FOUND, "route not found", code="not_found")
@@ -2417,30 +2975,66 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise RequestError("request body must be an object", code="invalid_request_body")
-            request = self.app.parse_request(payload, endpoint)
+            if endpoint in {"anthropic", "anthropic_count"}:
+                normalized = self.app.anthropic_payload(
+                    payload, count_only=endpoint == "anthropic_count"
+                )
+                request = self.app.parse_request(normalized, "anthropic")
+            else:
+                request = self.app.parse_request(payload, endpoint)
         except RequestError as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error), param=error.param, code=error.code)
+            if anthropic:
+                self._anthropic_error(HTTPStatus.BAD_REQUEST, str(error))
+            else:
+                self._error(HTTPStatus.BAD_REQUEST, str(error),
+                            param=error.param, code=error.code)
             return
         except (ValueError, TypeError, json.JSONDecodeError) as error:
-            self._error(HTTPStatus.BAD_REQUEST, str(error), code="invalid_json")
+            if anthropic:
+                self._anthropic_error(HTTPStatus.BAD_REQUEST, str(error))
+            else:
+                self._error(HTTPStatus.BAD_REQUEST, str(error), code="invalid_json")
             return
         except Exception as error:
             log("request_preprocessing_failed", error=str(error), endpoint=endpoint)
-            self._error(
-                HTTPStatus.INTERNAL_SERVER_ERROR,
-                "request preprocessing failed",
-                "server_error",
-                code="request_preprocessing_failed",
-            )
+            if anthropic:
+                self._anthropic_error(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "request preprocessing failed", "api_error",
+                )
+            else:
+                self._error(
+                    HTTPStatus.INTERNAL_SERVER_ERROR,
+                    "request preprocessing failed",
+                    "server_error",
+                    code="request_preprocessing_failed",
+                )
+            return
+        if endpoint == "anthropic_count":
+            self._json(HTTPStatus.OK, {"input_tokens": len(request.prompt_ids)})
             return
         if not self.app.acquire():
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE, "service overloaded or draining",
-                        "server_error", code="overloaded")
+            if anthropic:
+                self._anthropic_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "service overloaded or draining", "overloaded_error",
+                )
+            else:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE,
+                            "service overloaded or draining",
+                            "server_error", code="overloaded")
             return
         if not self.app.acquire_worker_slot():
             self.app.release()
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE,
-                        "all model slots are busy", "server_error", code="overloaded")
+            if anthropic:
+                self._anthropic_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "all model slots are busy", "overloaded_error",
+                )
+            else:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE,
+                            "all model slots are busy", "server_error",
+                            code="overloaded")
             return
         context = self.app.acquire_request_context(
             request.prompt_ids, request.maximum
@@ -2448,16 +3042,28 @@ class Handler(BaseHTTPRequestHandler):
         if context is None:
             self.app.release_worker_slot()
             self.app.release()
-            self._error(HTTPStatus.SERVICE_UNAVAILABLE,
-                        "KV context capacity is exhausted", "server_error",
-                        code="context_capacity_exhausted")
+            if anthropic:
+                self._anthropic_error(
+                    HTTPStatus.SERVICE_UNAVAILABLE,
+                    "KV context capacity is exhausted", "overloaded_error",
+                )
+            else:
+                self._error(HTTPStatus.SERVICE_UNAVAILABLE,
+                            "KV context capacity is exhausted", "server_error",
+                            code="context_capacity_exhausted")
             return
-        prefix = {"chat": "chatcmpl-", "completion": "cmpl-", "responses": "resp_"}[endpoint]
+        prefix = {"chat": "chatcmpl-", "completion": "cmpl-",
+                  "responses": "resp_", "anthropic": "msg_"}[endpoint]
         request_uuid = prefix + uuid.uuid4().hex
         message_uuid = "msg_" + uuid.uuid4().hex
         created = int(time.time())
         stream_started = False
         try:
+            if endpoint == "anthropic":
+                stream_started = request.stream
+                self._serve_anthropic(request, request_uuid, context)
+                self.app.increment("completed")
+                return
             if request.stream:
                 self._sse_headers()
                 stream_started = True
@@ -2782,7 +3388,18 @@ class Handler(BaseHTTPRequestHandler):
         except TimeoutError as error:
             self.app.increment("failed")
             if not stream_started:
-                self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error), "timeout_error")
+                if endpoint == "anthropic":
+                    self._anthropic_error(
+                        HTTPStatus.GATEWAY_TIMEOUT, str(error), "api_error"
+                    )
+                else:
+                    self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error), "timeout_error")
+            elif endpoint == "anthropic":
+                self._anthropic_sse("error", {
+                    "type": "error", "error": {
+                        "type": "api_error", "message": str(error),
+                    },
+                })
             elif endpoint == "responses":
                 self._sse({"type": "error", "code": "generation_timeout",
                            "message": str(error), "param": None})
@@ -2795,8 +3412,20 @@ class Handler(BaseHTTPRequestHandler):
             self.app.increment("failed")
             log("request_failed", id=request_uuid, error=repr(error))
             if not stream_started:
-                self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed",
-                            "server_error", code="generation_failed")
+                if endpoint == "anthropic":
+                    self._anthropic_error(
+                        HTTPStatus.INTERNAL_SERVER_ERROR,
+                        "generation failed", "api_error",
+                    )
+                else:
+                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed",
+                                "server_error", code="generation_failed")
+            elif endpoint == "anthropic":
+                self._anthropic_sse("error", {
+                    "type": "error", "error": {
+                        "type": "api_error", "message": "generation failed",
+                    },
+                })
             elif endpoint == "responses":
                 self._sse({"type": "error", "code": "generation_failed",
                            "message": "generation failed", "param": None})
@@ -2835,6 +3464,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
+    parser.add_argument(
+        "--worker-kv-cache-dtype", default="artifact",
+        choices=("artifact", "fp8-e4m3-per-head", "fp16"),
+    )
     parser.add_argument(
         "--worker-prefill-chunk-tokens", type=int, default=0,
         help="maximum provider prefill chunk (0 uses the provider contract)",

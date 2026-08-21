@@ -43,7 +43,7 @@ make_sm86_hybrid_delta_moe_callable_provider(
 er::WorkerProviderDefinition make_sm86_dense_fp4_provider();
 er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
-    std::uint64_t, std::uint64_t, std::uint32_t);
+    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view);
 #ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
 er::WorkerProviderDefinition make_sm86_compressed_sparse_moe_provider();
 er::CreateExecutionProviderModuleResult
@@ -383,7 +383,8 @@ er::ExecutionProviderModule create_module(
            return make_sm86_dense_fp4_callable_provider(
                root, options.max_context, options.capacity,
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
-               options.kv_cache_mib << 20U, options.kv_page_tokens);
+               options.kv_cache_mib << 20U, options.kv_page_tokens,
+               options.kv_cache_dtype);
          }});
   }
   {
@@ -441,12 +442,18 @@ er::ExecutionProviderModule create_module(
 
 void validate_service_contract(
     const er::ModelDescriptor& descriptor,
-    const er::ExecutionProviderModule::ServiceContract& service,
+    const er::ExecutionProviderModule& module,
     const er::WorkerLaunchOptions& options) {
+  const auto& service = module.service;
   require(!service.prefill_mode.empty() && service.prefill_chunk_tokens != 0U &&
-              service.session_retention &&
+              module.definition.implementation != nullptr &&
+              service.session_retention ==
+                  module.definition.implementation
+                      ->supports_request_state_retention() &&
               !service.request_stream_mode.empty() &&
               !service.rope_mode.empty() && !service.kv_dtype.empty() &&
+              (options.kv_cache_dtype == "artifact" ||
+               service.kv_dtype == options.kv_cache_dtype) &&
               !service.kv_allocation.empty() &&
               service.kv_page_tokens == options.kv_page_tokens &&
               service.kv_page_bytes != 0U && service.kv_page_capacity != 0U &&
@@ -615,13 +622,15 @@ int worker_loop(er::MoeProgramExecutor& executor,
       }
       request.next_position =
           first_position + static_cast<std::uint32_t>(tokens.size());
-      const auto retention_position = request.retention_position == 0U
-                                          ? request.next_position
-                                          : request.retention_position;
-      const auto checkpoint =
-          request.session.checkpoint_retention(retention_position);
-      require(checkpoint.ok(), checkpoint.message());
-      request.retention_position = retention_position;
+      if (module.service.session_retention) {
+        const auto retention_position = request.retention_position == 0U
+                                            ? request.next_position
+                                            : request.retention_position;
+        const auto checkpoint =
+            request.session.checkpoint_retention(retention_position);
+        require(checkpoint.ok(), checkpoint.message());
+        request.retention_position = retention_position;
+      }
       return;
     }
     for (std::size_t offset = 0U; offset < tokens.size();) {
@@ -661,13 +670,15 @@ int worker_loop(er::MoeProgramExecutor& executor,
     }
     request.next_position =
         first_position + static_cast<std::uint32_t>(tokens.size());
-    const auto retention_position = request.retention_position == 0U
-                                        ? request.next_position
-                                        : request.retention_position;
-    const auto checkpoint =
-        request.session.checkpoint_retention(retention_position);
-    require(checkpoint.ok(), checkpoint.message());
-    request.retention_position = retention_position;
+    if (module.service.session_retention) {
+      const auto retention_position = request.retention_position == 0U
+                                          ? request.next_position
+                                          : request.retention_position;
+      const auto checkpoint =
+          request.session.checkpoint_retention(retention_position);
+      require(checkpoint.ok(), checkpoint.message());
+      request.retention_position = retention_position;
+    }
   };
 
   while (auto next_line = inbox.next()) {
@@ -729,6 +740,9 @@ int worker_loop(er::MoeProgramExecutor& executor,
           field += 6U;
         }
         require(field == fields.size(), "unknown BEGIN request fields");
+        require(module.service.session_retention ||
+                    (!resume && checkpoint_position == 0U),
+                "callable provider does not support session retention");
         ActiveRequest request;
         if (resume) {
           const auto found = retained.find(resume_key);
@@ -930,6 +944,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
         const auto found = active.find(id);
         require(found != active.end(), "unknown active request");
         if (fields.size() == 4U || fields.size() == 6U) {
+          require(module.service.session_retention,
+                  "callable provider does not support session retention");
           require(fields[2] == "RETAIN", "invalid END retention marker");
           const auto key = std::stoull(std::string(fields[3]));
           require(key != 0U && !retained.contains(key),
@@ -960,6 +976,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
         }
       } else if (fields[0] == "DROP") {
         require(fields.size() == 2U, "invalid DROP");
+        require(module.service.session_retention,
+                "callable provider does not support session retention");
         const auto key = std::stoull(std::string(fields[1]));
         require(retained.erase(key) == 1U, "unknown retained session");
         std::cout << "{\"type\":\"dropped\"}\n" << std::flush;
@@ -1041,8 +1059,7 @@ int main(int argc, char** argv) {
     require(artifact.model().schema_version >= 3U,
             "callable VM service requires a schema v3 artifact");
     auto module = create_module(artifact, root, parsed.options);
-    validate_service_contract(artifact.model(), module.service,
-                              parsed.options);
+    validate_service_contract(artifact.model(), module, parsed.options);
 
     er::ExecutionProviderRegistry registry;
     status = registry.add(module.definition);

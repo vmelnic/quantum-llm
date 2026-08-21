@@ -304,6 +304,28 @@ struct CausalShortConvLaunch final {
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
     float rope_theta, void* stream) noexcept;
 
+// Output-gated GQA with E4M3 K/V values and one FP16 dynamic scale per
+// [token, kv-head, K-or-V] record. The cache remains paged and token-major;
+// attention dequantizes to BF16 and accumulates Tensor Core products in FP32.
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_fp8_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_fp8_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
 struct PagedFp4GatedGqaAttentionLaunch final {
   const float* q_and_gate{};
   const void* const* page_table{};
@@ -331,6 +353,11 @@ struct PagedFp4GatedGqaAttentionLaunch final {
 // evaluated as matrix rows while retaining exact context and top-k behavior.
 [[nodiscard]] Status gated_gqa_attention_decode_paged_fp4_tensor_core(
     const PagedFp4GatedGqaAttentionLaunch& launch) noexcept;
+
+using PagedFp8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
+
+[[nodiscard]] Status gated_gqa_attention_decode_paged_fp8_tensor_core(
+    const PagedFp8GatedGqaAttentionLaunch& launch) noexcept;
 
 struct PagedFp4GatedGqaPrefillLaunch final {
   const float* q_and_gate{};  // [rows, 2 * query_heads * head_dim]
@@ -374,10 +401,17 @@ struct PagedFp4GatedGqaStagedPrefillWorkspace final {
   std::uint32_t split_tokens{};
 };
 
+using PagedFp8GatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
+using PagedFp8GatedGqaStagedPrefillWorkspace =
+    PagedFp4GatedGqaStagedPrefillWorkspace;
+
 // Exact causal microbatch attention. Positions times grouped query heads must
 // fit one 16-row WMMA tile so packed K/V is shared across both dimensions.
 [[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp4_tensor_core(
     const PagedFp4GatedGqaPrefillLaunch& launch) noexcept;
+
+[[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp8_tensor_core(
+    const PagedFp8GatedGqaPrefillLaunch& launch) noexcept;
 
 // Exact causal attention for a contiguous prefill chunk. One block shares
 // every decoded K/V record between up to eight adjacent query rows.
@@ -390,6 +424,99 @@ struct PagedFp4GatedGqaStagedPrefillWorkspace final {
 [[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp4(
     const PagedFp4GatedGqaPrefillLaunch& launch,
     const PagedFp4GatedGqaStagedPrefillWorkspace& workspace) noexcept;
+
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp8(
+    const PagedFp8GatedGqaPrefillLaunch& launch,
+    const PagedFp8GatedGqaStagedPrefillWorkspace& workspace) noexcept;
+
+// Output-gated GQA backed by an authoritative FP16 host cache. K/V remains
+// token-major in pinned host memory; the staged provider copies one bounded
+// token tile at a time and transposes it for the batched Tensor Core GEMMs.
+// retained_first_token may select an exact suffix for draft-only scoring. A
+// zero value evaluates the complete causal prefix.
+[[nodiscard]] Status gated_gqa_qkv_rope_fp16_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    void* fp16_keys, void* fp16_values, std::uint32_t first_rotary_position,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float epsilon, float rope_theta,
+    void* stream) noexcept;
+
+// Encodes already RoPE-transformed FP16 K/V rows into the compact paged
+// FP4-E2M1/UE8M0 cache. This lets a lossless authoritative cache and an
+// approximate full-context draft cache be populated by the same target pass.
+[[nodiscard]] Status pack_gqa_kv_fp16_to_paged_fp4(
+    const void* fp16_keys, const void* fp16_values,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t rows, std::uint32_t kv_heads, std::uint32_t head_dim,
+    void* stream) noexcept;
+
+struct HostFp16GatedGqaAttentionLaunch final {
+  const float* q_and_gate{};
+  const void* host_keys{};       // [cache_capacity, kv_heads, head_dim]
+  const void* host_values{};     // [cache_capacity, kv_heads, head_dim]
+  float* output{};
+  std::uint32_t cache_capacity{};
+  std::uint32_t first_context_tokens{};
+  std::uint32_t retained_first_token{};
+  std::uint32_t rows{};
+  std::uint32_t query_heads{};
+  std::uint32_t kv_heads{};
+  std::uint32_t head_dim{};
+  void* stream{};
+};
+
+struct DeviceFp16GatedGqaAttentionLaunch final {
+  const float* q_and_gate{};
+  const void* device_keys{};     // [cache_capacity, kv_heads, head_dim]
+  const void* device_values{};   // [cache_capacity, kv_heads, head_dim]
+  float* output{};
+  std::uint32_t cache_capacity{};
+  std::uint32_t first_context_tokens{};
+  std::uint32_t retained_first_token{};
+  std::uint32_t rows{};
+  std::uint32_t query_heads{};
+  std::uint32_t kv_heads{};
+  std::uint32_t head_dim{};
+  void* stream{};
+};
+
+struct HostFp16GatedGqaAttentionWorkspace final {
+  void* queries{};
+  std::size_t query_bytes{};
+  void* raw_keys{};
+  std::size_t raw_key_bytes{};
+  void* raw_values{};
+  std::size_t raw_value_bytes{};
+  void* keys{};
+  std::size_t key_bytes{};
+  void* values{};
+  std::size_t value_bytes{};
+  float* scores{};
+  std::size_t score_bytes{};
+  void* probabilities{};
+  std::size_t probability_bytes{};
+  float* accumulator{};
+  std::size_t accumulator_bytes{};
+  float* maxima{};
+  std::size_t maxima_bytes{};
+  float* sums{};
+  std::size_t sum_bytes{};
+  std::uint32_t split_tokens{};
+};
+
+[[nodiscard]] Status gated_gqa_attention_staged_host_fp16(
+    const HostFp16GatedGqaAttentionLaunch& launch,
+    const HostFp16GatedGqaAttentionWorkspace& workspace) noexcept;
+
+// Device-source variant used while a layer-major prefill owns one complete
+// layer cache in VRAM. It preserves exact FP16 KV while avoiding repeated
+// host-to-device reads of the growing prefix.
+[[nodiscard]] Status gated_gqa_attention_staged_device_fp16(
+    const DeviceFp16GatedGqaAttentionLaunch& launch,
+    const HostFp16GatedGqaAttentionWorkspace& workspace) noexcept;
 
 struct Qwen3NextDeltaLaunch final {
   const float* projected_qkvz{};  // [2*key_dim + 2*value_dim]

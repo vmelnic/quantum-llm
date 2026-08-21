@@ -15,8 +15,11 @@ measurements and decisions, but they are not active backlogs.
 | [Deployment](deployment.md) | POSIX control host to Windows/CUDA lifecycle through `ops/model.sh` |
 | [Operations](operations.md) | Short day-two runbook |
 | [OpenAI-compatible API](openai-api.md) | Supported HTTP/SSE contract and explicit omissions |
+| [Anthropic Messages API](anthropic-api.md) | Claude Code adapter, tool blocks, SSE and private-LAN configuration |
+| [WSL2 Unsloth Qwen3.8](wsl2-unsloth-qwen38.md) | External production path for Qwen3.8 GGUF, llama.cpp and Claude Code on the RTX 3090 host |
 | [Production readiness](production-readiness.md) | Pilot verdict, qualification matrix and release blockers |
 | [Heterogeneous organ placement](heterogeneous-placement-research.md) | Research contract for executing model/state shards directly from VRAM/GPU and RAM/CPU |
+| [Exact tiered tree verification](exact-tiered-tree-verification.md) | Active 262K exact-F16 decode research, equations and fail-fast gates for the 15 tok/s target |
 
 ## Artifact and runtime contracts
 

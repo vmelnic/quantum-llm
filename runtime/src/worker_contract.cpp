@@ -83,6 +83,8 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
     options.kv_cache_mib =
         unsigned_integer(required_value(raw, "kv-cache-mib"));
     options.kv_page_tokens = u32(required_value(raw, "kv-page-tokens"));
+    if (const auto found = raw.find("kv-cache-dtype"); found != raw.end())
+      options.kv_cache_dtype = required_value(raw, "kv-cache-dtype");
     options.placement_profile = required_value(raw, "placement-profile");
     if (options.ram_cache_gib == 0U || options.vram_cache_gib == 0U ||
         options.kv_cache_mib == 0U ||
@@ -103,6 +105,7 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
         "max-context",          "ram-cache-gib",
         "vram-cache-gib",      "capacity",
         "kv-cache-mib",        "kv-page-tokens",
+        "kv-cache-dtype",
         "placement-profile",   "prefill-chunk-limit",
         "placement-settle-steps"};
     for (auto& [name, value] : raw) {

@@ -68,6 +68,7 @@ MODEL_ROOT=D:/quantum-llm/work/models
 CHAT_MODEL=qwen3.8-27b-fp4
 MODEL_MAX_CONTEXT=262144
 MODEL_MAX_OUTPUT_TOKENS=8192
+MODEL_HOST=127.0.0.1
 MODEL_PORT=8080
 MODEL_SYNC_ON_START=1
 MODEL_READY_TIMEOUT=600
@@ -75,7 +76,7 @@ MODEL_GENERATION_TIMEOUT_SECONDS=14400
 MODEL_MAX_BODY_MIB=16
 
 MODEL_RAM_CACHE_GIB=48
-MODEL_VRAM_CACHE_GIB=13
+MODEL_VRAM_CACHE_GIB=12
 MODEL_WORKER_CAPACITY=1
 MODEL_MAXIMUM_QUEUE=4
 MODEL_KV_CACHE_MIB=5120
@@ -89,6 +90,11 @@ CHAT_PYTHON=python3
 CHAT_SHOW_STATS=1
 EXPERT_API_KEY=
 ```
+
+`MODEL_HOST=127.0.0.1` keeps the service behind the existing SSH tunnel. For a
+private-LAN endpoint, set `MODEL_HOST=0.0.0.0`, configure a non-empty
+`EXPERT_API_KEY`, and restrict the Windows firewall to the intended client or
+private subnet. See [Anthropic Messages and Claude Code](anthropic-api.md).
 
 The model selectors accepted by `CHAT_MODEL` are:
 
@@ -223,6 +229,10 @@ curl http://127.0.0.1:18080/v1/responses \
 
 See [OpenAI-compatible API](openai-api.md) for SDK examples, supported fields,
 stream formats, errors, and explicit capability gaps.
+
+Claude Code can instead use the service directly through the private Windows
+IP and `/v1/messages`; the exact environment is documented in
+[Anthropic Messages and Claude Code](anthropic-api.md).
 
 ## 6. Switch, restart, stop, and sync
 

@@ -1,15 +1,20 @@
 # Current state and next work
 
-Status: canonical implementation handoff, 2026-08-19.
+Status: canonical implementation handoff, revised 2026-08-21 after the
+Qwen3.8 real F16 service correction.
 
 Read this document before resuming. Historical campaigns in `docs/` remain
 evidence, not active backlogs.
 
 ## Active objective and invariants
 
-Make the official Qwen3.8-27B FP4 service usable by real coding-agent harnesses
-with populated history up to 262,144 tokens, targeting at least 30 generated
-tokens/s and preserving DeepSeek compatibility.
+The experimental FP8-KV service failed a direct factual-quality gate and the
+Claude Code deployment failed latency and agent behavior. The original F16
+comparison was invalid because it bypassed chat, sampling and EOS. The
+corrected `MODEL_KV_CACHE_DTYPE=fp16` service passed both `hi` and the original
+four-stanza prompt through `model.sh chat`; therefore the prior claim that the
+FP4 weights/runtime were rejected was unsupported. Preserve DeepSeek
+compatibility while qualifying the remaining maximum-context objective.
 
 The acceptance criteria are fixed:
 
@@ -57,9 +62,52 @@ MODEL_MAX_CONTEXT=262144
 MODEL_MAX_OUTPUT_TOKENS=8192
 MODEL_MAX_BODY_MIB=16
 MODEL_KV_CACHE_MIB=5120
+MODEL_VRAM_CACHE_GIB=12
 MODEL_WORKER_CAPACITY=1
 MODEL_GENERATION_TIMEOUT_SECONDS=14400
 ```
+
+This remains the rollback configuration. The experimental
+`fp8-e4m3-per-head` / 8,528 MiB KV profile was not promoted to `.env`.
+The corrected F16 run was also selected transiently and was not promoted.
+
+## 2026-08-21 qualification and corrected F16 evidence
+
+- Full physical FP8-KV context: 262,016 prompt + 128 generated, 1,024 pages,
+  1,168.594 s prefill and 3.064 tok/s decode.
+- Claude Code cold `hi`: 29,487 prompt tokens, 82.875 s TTFT and 88.281 s
+  wall time.
+- Claude Code four-stanza Maia Sandu request: 29,660 prompt tokens, 83.454 s
+  TTFT, 94.157 s wall time, and a fabricated biography.
+- Direct 100-token FP8 prompt: no visible answer in 320 reasoning tokens and
+  incorrect biographical claims. The 768-token F16 diagnostic is inconclusive
+  because it bypassed the real chat service, sampling and EOS handling.
+- Real F16 `model.sh chat` `hi`: 53 prompt tokens, 30 generated tokens,
+  2.125 s server TTFT, 3.079 s wall and 30.40 tok/s after the first generated
+  token.
+- Real F16 `model.sh chat` four-stanza prompt: 68 prompt tokens, 476 generated
+  tokens, 2.812 s server TTFT, 19.047 s wall and 29.26 tok/s after the first
+  generated token. It returned four stanzas without the fabricated
+  mathematician biography.
+- The terminal client's initial 85.84/60.44 post-first figures are invalid:
+  they combined total output (including hidden reasoning) with the timestamp
+  of the first visible content. Server `request_telemetry` is authoritative.
+- A cancelled resumed Claude request dropped the retained session and forced
+  the next 29,660-token cold prefill. This is a real retention bug, but fixing
+  it cannot qualify the failed model output.
+- The common-runner retention contract is now capability-driven. Dense FP4
+  implements exact checkpoint/rewind and advertises retention; the callable
+  DeepSeek provider does not and advertises `session_retention=false`. The
+  server no longer sends or executes checkpoints for non-retaining providers.
+- The post-change Qwen F16 `hi` regression recorded 53 prompt tokens, 30
+  generated tokens, 1.703 s TTFT, 2.672 s wall and 29.93 tok/s after the first
+  generated token. The DeepSeek `hi` regression recorded 5 prompt tokens, 10
+  generated tokens, 3.579 s TTFT and 10.735 s wall. Both used the common
+  artifact VM runner with a 12 GiB VRAM-cache budget.
+
+The RTX 3090 service was stopped after the final common-runner regressions. The
+latest inventory reported 25,089,277,952 of 25,769,803,776 VRAM bytes free;
+the CUDA process query contained no Python or Expert VM process.
 
 ## Implemented in the current cycle
 
@@ -148,12 +196,11 @@ KV execution only a qualification gate, not an assumed speedup.
    the provider, never a Qwen branch. Re-run the same native oracle and full
    populated request after the complete change.
 
-4. **Optimize maximum-context decode separately.** Measure the unavoidable FP4
-   weight bytes and 16-layer KV bytes per generated token against achieved
-   bandwidth. Make the existing tensor-core/online decode candidate win the
-   numerical gate and real service rate; do not infer service speed from its
-   microbenchmark. The acceptance rate is >=30 tok/s after the first generated
-   token at 262,016-token prompt length.
+4. **Qualify exact tiered tree verification.** Follow the acceptance/capacity,
+   streamed-verifier and recurrent-commit gates in the active research
+   document before extending runtime infrastructure. The acceptance rate is
+   approximately 15 tok/s after the first generated token at 262,016-token
+   prompt length with exact F16 KV semantics.
 
 5. **Qualify real harness histories.** Exercise append-only multi-turn reuse,
    large system/tool schemas, assistant tool calls and tool results near the
@@ -166,12 +213,7 @@ KV execution only a qualification gate, not an assumed speedup.
    process-tree cleanup. No failure may leak CUDA ownership or retain a corrupt
    session.
 
-7. **Requalify DeepSeek compatibility.** After the generic API/provider work is
-   frozen, run the same real `hi` lifecycle gate through `./ops/model.sh chat`
-   for Qwen FP4 and DeepSeek, then stop and verify GPU cleanup. This is required
-   before a new universal-path claim, but it is not a performance benchmark.
-
-8. **Production edge and supervision.** Keep the built-in service loopback;
+7. **Production edge and supervision.** Keep the built-in service loopback;
    add durable supervision, log/metric retention, alerts and an authenticated,
    rate-limited TLS edge for actual deployment.
 

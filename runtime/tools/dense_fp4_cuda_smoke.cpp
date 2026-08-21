@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 
 #include <cuda_runtime_api.h>
+#include <cuda_fp16.h>
 
 #include <algorithm>
 #include <array>
@@ -8,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -50,6 +52,25 @@ class DeviceBuffer final {
                "download dense FP4 smoke buffer");
     return result;
   }
+
+ private:
+  T* pointer_{};
+  std::size_t count_{};
+};
+
+template <typename T>
+class PinnedBuffer final {
+ public:
+  explicit PinnedBuffer(std::size_t count) : count_(count) {
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&pointer_),
+                             count * sizeof(T), cudaHostAllocPortable),
+               "allocate pinned dense FP4 smoke buffer");
+  }
+  ~PinnedBuffer() { static_cast<void>(cudaFreeHost(pointer_)); }
+  PinnedBuffer(const PinnedBuffer&) = delete;
+  PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+  [[nodiscard]] T* get() const noexcept { return pointer_; }
+  [[nodiscard]] std::size_t size() const noexcept { return count_; }
 
  private:
   T* pointer_{};
@@ -515,6 +536,205 @@ double attention_prefill_check() {
       scalar_page_one.download() != batch_page_one.download())
     maximum_error = std::max(maximum_error, 1.0);
   return maximum_error;
+}
+
+struct Fp8KvAttentionCheck final {
+  double query_maximum_absolute_difference{};
+  double implementation_maximum_absolute_difference{};
+  double output_maximum_absolute_difference{};
+  double output_mean_absolute_difference{};
+  double output_cosine_similarity{};
+};
+
+Fp8KvAttentionCheck fp8_kv_attention_check() {
+  constexpr std::uint32_t rows = 11U;
+  constexpr std::uint32_t query_heads = 8U;
+  constexpr std::uint32_t kv_heads = 1U;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t rotary_dim = 256U;
+  constexpr std::uint32_t page_tokens = 8U;
+  constexpr std::uint32_t split_tokens = 8U;
+  constexpr std::uint32_t query_width = 2U * query_heads * head_dim;
+  constexpr std::uint32_t kv_width = kv_heads * head_dim;
+  constexpr std::uint32_t attention_width = query_heads * head_dim;
+  constexpr std::uint32_t fp8_record_bytes =
+      head_dim + sizeof(std::uint16_t);
+  constexpr std::uint32_t page_bytes =
+      2U * page_tokens * kv_heads * fp8_record_bytes;
+  constexpr std::size_t query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  constexpr std::size_t raw_kv_values =
+      static_cast<std::size_t>(rows) * kv_heads * head_dim;
+  constexpr std::size_t staged_kv_values =
+      static_cast<std::size_t>(split_tokens) * kv_heads * head_dim;
+  constexpr std::size_t score_values =
+      static_cast<std::size_t>(rows) * query_heads * split_tokens;
+  constexpr std::size_t state_values =
+      static_cast<std::size_t>(rows) * query_heads;
+
+  std::vector<float> query(static_cast<std::size_t>(rows) * query_width);
+  std::vector<float> key(static_cast<std::size_t>(rows) * kv_width);
+  std::vector<float> value(static_cast<std::size_t>(rows) * kv_width);
+  std::vector<float> query_norm(head_dim);
+  std::vector<float> key_norm(head_dim);
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 3U) * 0.011F) *
+                   (0.15F + static_cast<float>(index % 17U) * 0.005F);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::cos(static_cast<float>(index + 5U) * 0.013F) * 0.4F;
+    value[index] =
+        std::sin(static_cast<float>(index + 7U) * 0.017F) * 0.35F;
+  }
+  for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+    query_norm[dimension] =
+        0.01F * std::sin(static_cast<float>(dimension) * 0.1F);
+    key_norm[dimension] =
+        0.01F * std::cos(static_cast<float>(dimension) * 0.1F);
+  }
+
+  DeviceBuffer<float> device_query_norm(head_dim);
+  DeviceBuffer<float> device_key_norm(head_dim);
+  DeviceBuffer<float> device_value(value.size());
+  device_query_norm.upload(query_norm);
+  device_key_norm.upload(key_norm);
+  device_value.upload(value);
+
+  DeviceBuffer<float> fp16_query(query.size());
+  DeviceBuffer<float> fp16_key(key.size());
+  DeviceBuffer<std::uint16_t> fp16_keys(raw_kv_values);
+  DeviceBuffer<std::uint16_t> fp16_values(raw_kv_values);
+  DeviceBuffer<float> fp16_output(
+      static_cast<std::size_t>(rows) * attention_width);
+  fp16_query.upload(query);
+  fp16_key.upload(key);
+  status_check(expert::runtime::cuda::gated_gqa_qkv_rope_fp16_batch(
+      fp16_query.get(), fp16_key.get(), device_value.get(),
+      device_query_norm.get(), device_key_norm.get(), fp16_keys.get(),
+      fp16_values.get(), 0U, rows, query_heads, kv_heads, head_dim,
+      rotary_dim, 1.0e-6F, 10000.0F, nullptr));
+
+  DeviceBuffer<std::uint16_t> fp16_staged_queries(query_values);
+  DeviceBuffer<std::uint16_t> fp16_raw_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> fp16_raw_values(staged_kv_values);
+  DeviceBuffer<std::uint16_t> fp16_staged_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> fp16_staged_values(staged_kv_values);
+  DeviceBuffer<float> fp16_scores(score_values);
+  DeviceBuffer<std::uint16_t> fp16_probabilities(score_values);
+  DeviceBuffer<float> fp16_accumulator(query_values);
+  DeviceBuffer<float> fp16_maxima(state_values);
+  DeviceBuffer<float> fp16_sums(state_values);
+  status_check(expert::runtime::cuda::gated_gqa_attention_staged_device_fp16(
+      {fp16_query.get(), fp16_keys.get(), fp16_values.get(),
+       fp16_output.get(), rows, 1U, 0U, rows, query_heads, kv_heads,
+       head_dim, nullptr},
+      {fp16_staged_queries.get(), query_values * sizeof(std::uint16_t),
+       fp16_raw_keys.get(), staged_kv_values * sizeof(std::uint16_t),
+       fp16_raw_values.get(), staged_kv_values * sizeof(std::uint16_t),
+       fp16_staged_keys.get(), staged_kv_values * sizeof(std::uint16_t),
+       fp16_staged_values.get(), staged_kv_values * sizeof(std::uint16_t),
+       fp16_scores.get(), score_values * sizeof(float),
+       fp16_probabilities.get(), score_values * sizeof(std::uint16_t),
+       fp16_accumulator.get(), query_values * sizeof(float),
+       fp16_maxima.get(), state_values * sizeof(float), fp16_sums.get(),
+       state_values * sizeof(float), split_tokens}));
+
+  DeviceBuffer<float> fp8_query(query.size());
+  DeviceBuffer<float> fp8_key(key.size());
+  DeviceBuffer<std::uint8_t> fp8_page_zero(page_bytes);
+  DeviceBuffer<std::uint8_t> fp8_page_one(page_bytes);
+  DeviceBuffer<void*> fp8_page_table(2U);
+  DeviceBuffer<float> fp8_output(
+      static_cast<std::size_t>(rows) * attention_width);
+  fp8_query.upload(query);
+  fp8_key.upload(key);
+  fp8_page_table.upload(
+      std::vector<void*>{fp8_page_zero.get(), fp8_page_one.get()});
+  status_check(
+      expert::runtime::cuda::gated_gqa_qkv_rope_cache_paged_fp8_batch(
+          fp8_query.get(), fp8_key.get(), device_value.get(),
+          device_query_norm.get(), device_key_norm.get(),
+          reinterpret_cast<const void* const*>(fp8_page_table.get()), 0U,
+          page_tokens, 0U, 0U, rows, query_heads, kv_heads, head_dim,
+          rotary_dim, 1.0e-6F, 10000.0F, nullptr));
+
+  DeviceBuffer<std::uint16_t> fp8_staged_queries(query_values);
+  DeviceBuffer<std::uint16_t> fp8_staged_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> fp8_staged_values(staged_kv_values);
+  DeviceBuffer<float> fp8_scores(score_values);
+  DeviceBuffer<std::uint16_t> fp8_probabilities(score_values);
+  DeviceBuffer<float> fp8_accumulator(query_values);
+  DeviceBuffer<float> fp8_maxima(state_values);
+  DeviceBuffer<float> fp8_sums(state_values);
+  const expert::runtime::cuda::PagedFp8GatedGqaPrefillLaunch fp8_launch{
+      fp8_query.get(),
+      reinterpret_cast<const void* const*>(fp8_page_table.get()),
+      fp8_output.get(), nullptr, nullptr, nullptr, 1U, rows, 0U,
+      page_tokens, query_heads, kv_heads, head_dim, split_tokens, 2U,
+      nullptr};
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_staged_prefill_paged_fp8(
+          fp8_launch,
+          {fp8_staged_queries.get(), query_values * sizeof(std::uint16_t),
+           fp8_staged_keys.get(), staged_kv_values * sizeof(std::uint16_t),
+           fp8_staged_values.get(), staged_kv_values * sizeof(std::uint16_t),
+           fp8_scores.get(), score_values * sizeof(float),
+           fp8_probabilities.get(), score_values * sizeof(std::uint16_t),
+           fp8_accumulator.get(), query_values * sizeof(float),
+           fp8_maxima.get(), state_values * sizeof(float), fp8_sums.get(),
+           state_values * sizeof(float), split_tokens}));
+  DeviceBuffer<float> fp8_decode_output(attention_width);
+  DeviceBuffer<float> fp8_decode_maxima(2U * query_heads);
+  DeviceBuffer<float> fp8_decode_sums(2U * query_heads);
+  DeviceBuffer<float> fp8_decode_partials(
+      2U * query_heads * head_dim);
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_decode_paged_fp8_tensor_core({
+          fp8_query.get() +
+              static_cast<std::size_t>(rows - 1U) * query_width,
+          reinterpret_cast<const void* const*>(fp8_page_table.get()),
+          fp8_decode_output.get(), fp8_decode_maxima.get(),
+          fp8_decode_sums.get(), fp8_decode_partials.get(), rows, 0U,
+          page_tokens, query_heads, kv_heads, head_dim, split_tokens, 2U,
+          nullptr}));
+  cuda_check(cudaDeviceSynchronize(), "synchronize FP8 KV attention check");
+
+  const auto reference_query = fp16_query.download();
+  const auto candidate_query = fp8_query.download();
+  const auto reference_output = fp16_output.download();
+  const auto candidate_output = fp8_output.download();
+  const auto decode_output = fp8_decode_output.download();
+  Fp8KvAttentionCheck result;
+  double dot{};
+  double reference_square{};
+  double candidate_square{};
+  for (std::size_t index = 0U; index < reference_query.size(); ++index)
+    result.query_maximum_absolute_difference = std::max(
+        result.query_maximum_absolute_difference,
+        std::abs(static_cast<double>(reference_query[index]) -
+                 candidate_query[index]));
+  for (std::size_t index = 0U; index < reference_output.size(); ++index) {
+    const auto reference = static_cast<double>(reference_output[index]);
+    const auto candidate = static_cast<double>(candidate_output[index]);
+    const auto difference = std::abs(reference - candidate);
+    result.output_maximum_absolute_difference =
+        std::max(result.output_maximum_absolute_difference, difference);
+    result.output_mean_absolute_difference += difference;
+    dot += reference * candidate;
+    reference_square += reference * reference;
+    candidate_square += candidate * candidate;
+  }
+  const auto final_output_offset =
+      static_cast<std::size_t>(rows - 1U) * attention_width;
+  for (std::size_t index = 0U; index < decode_output.size(); ++index)
+    result.implementation_maximum_absolute_difference = std::max(
+        result.implementation_maximum_absolute_difference,
+        std::abs(static_cast<double>(
+            candidate_output[final_output_offset + index] -
+            decode_output[index])));
+  result.output_mean_absolute_difference /= reference_output.size();
+  result.output_cosine_similarity =
+      dot / std::sqrt(reference_square * candidate_square);
+  return result;
 }
 
 double bandwidth_check() {
@@ -1249,6 +1469,300 @@ LongContextAttentionProfile attention_262144_profile() {
           std::move(decode_profiles)};
 }
 
+double host_fp16_attention_check() {
+  constexpr std::uint32_t rows = 3U;
+  constexpr std::uint32_t query_heads = 4U;
+  constexpr std::uint32_t kv_heads = 2U;
+  constexpr std::uint32_t head_dim = 32U;
+  constexpr std::uint32_t cache_capacity = 8U;
+  constexpr std::uint32_t first_context_tokens = 5U;
+  constexpr std::uint32_t split_tokens = 4U;
+  constexpr std::uint32_t grouped_heads = query_heads / kv_heads;
+  constexpr std::uint32_t matrix_rows = rows * grouped_heads;
+  constexpr std::size_t query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  constexpr std::size_t cache_values =
+      static_cast<std::size_t>(cache_capacity) * kv_heads * head_dim;
+  constexpr std::size_t staged_values =
+      static_cast<std::size_t>(split_tokens) * kv_heads * head_dim;
+  constexpr std::size_t score_values =
+      static_cast<std::size_t>(kv_heads) * matrix_rows * split_tokens;
+
+  std::vector<float> query_gate(query_values * 2U);
+  for (std::size_t index = 0U; index < query_gate.size(); ++index)
+    query_gate[index] = std::sin(static_cast<float>(index + 1U) * 0.013F) *
+                        0.35F;
+  PinnedBuffer<__half> host_keys(cache_values);
+  PinnedBuffer<__half> host_values(cache_values);
+  for (std::size_t index = 0U; index < cache_values; ++index) {
+    host_keys.get()[index] =
+        __float2half(std::cos(static_cast<float>(index + 3U) * 0.017F) *
+                     0.4F);
+    host_values.get()[index] =
+        __float2half(std::sin(static_cast<float>(index + 5U) * 0.019F) *
+                     0.3F);
+  }
+
+  DeviceBuffer<float> device_query(query_gate.size());
+  DeviceBuffer<float> output(query_values);
+  DeviceBuffer<std::uint16_t> device_cache_keys(cache_values);
+  DeviceBuffer<std::uint16_t> device_cache_values(cache_values);
+  DeviceBuffer<std::uint16_t> queries(query_values);
+  DeviceBuffer<std::uint16_t> raw_keys(staged_values);
+  DeviceBuffer<std::uint16_t> raw_values(staged_values);
+  DeviceBuffer<std::uint16_t> keys(staged_values);
+  DeviceBuffer<std::uint16_t> values(staged_values);
+  DeviceBuffer<float> scores(score_values);
+  DeviceBuffer<std::uint16_t> probabilities(score_values);
+  DeviceBuffer<float> accumulator(query_values);
+  DeviceBuffer<float> maxima(static_cast<std::size_t>(kv_heads) * matrix_rows);
+  DeviceBuffer<float> sums(static_cast<std::size_t>(kv_heads) * matrix_rows);
+  device_query.upload(query_gate);
+  cuda_check(cudaMemcpy(device_cache_keys.get(), host_keys.get(),
+                        cache_values * sizeof(std::uint16_t),
+                        cudaMemcpyHostToDevice),
+             "upload staged device FP16 keys");
+  cuda_check(cudaMemcpy(device_cache_values.get(), host_values.get(),
+                        cache_values * sizeof(std::uint16_t),
+                        cudaMemcpyHostToDevice),
+             "upload staged device FP16 values");
+  status_check(expert::runtime::cuda::gated_gqa_attention_staged_host_fp16(
+      {device_query.get(), host_keys.get(), host_values.get(), output.get(),
+       cache_capacity, first_context_tokens, 0U, rows, query_heads, kv_heads,
+       head_dim, nullptr},
+      {queries.get(), query_values * sizeof(std::uint16_t), raw_keys.get(),
+       staged_values * sizeof(std::uint16_t), raw_values.get(),
+       staged_values * sizeof(std::uint16_t), keys.get(),
+       staged_values * sizeof(std::uint16_t), values.get(),
+       staged_values * sizeof(std::uint16_t), scores.get(),
+       score_values * sizeof(float), probabilities.get(),
+       score_values * sizeof(std::uint16_t), accumulator.get(),
+       query_values * sizeof(float), maxima.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       sums.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       split_tokens}));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize staged host FP16 attention smoke");
+  const auto actual = output.download();
+  status_check(expert::runtime::cuda::gated_gqa_attention_staged_device_fp16(
+      {device_query.get(), device_cache_keys.get(), device_cache_values.get(),
+       output.get(), cache_capacity, first_context_tokens, 0U, rows,
+       query_heads, kv_heads, head_dim, nullptr},
+      {queries.get(), query_values * sizeof(std::uint16_t), raw_keys.get(),
+       staged_values * sizeof(std::uint16_t), raw_values.get(),
+       staged_values * sizeof(std::uint16_t), keys.get(),
+       staged_values * sizeof(std::uint16_t), values.get(),
+       staged_values * sizeof(std::uint16_t), scores.get(),
+       score_values * sizeof(float), probabilities.get(),
+       score_values * sizeof(std::uint16_t), accumulator.get(),
+       query_values * sizeof(float), maxima.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       sums.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       split_tokens}));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize staged device FP16 attention smoke");
+  const auto device_actual = output.download();
+
+  std::vector<float> expected(query_values);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    const auto context = first_context_tokens + row;
+    for (std::uint32_t query_head = 0U; query_head < query_heads;
+         ++query_head) {
+      const auto kv_head = query_head / grouped_heads;
+      std::vector<float> accumulated(head_dim, 0.0F);
+      float maximum = -std::numeric_limits<float>::infinity();
+      float denominator = 0.0F;
+      for (std::uint32_t first = 0U; first < context;
+           first += split_tokens) {
+        const auto count = std::min(split_tokens, context - first);
+        std::vector<float> tile_scores(count);
+        float tile_maximum = -std::numeric_limits<float>::infinity();
+        for (std::uint32_t token = 0U; token < count; ++token) {
+          float dot{};
+          for (std::uint32_t dimension = 0U; dimension < head_dim;
+               ++dimension) {
+            const auto query_index =
+                (static_cast<std::size_t>(row) * query_heads + query_head) *
+                    2U * head_dim +
+                dimension;
+            const auto key_index =
+                (static_cast<std::size_t>(first + token) * kv_heads +
+                 kv_head) *
+                    head_dim +
+                dimension;
+            dot += __half2float(__float2half(query_gate[query_index])) *
+                   __half2float(host_keys.get()[key_index]);
+          }
+          tile_scores[token] = dot / std::sqrt(static_cast<float>(head_dim));
+          tile_maximum = std::max(tile_maximum, tile_scores[token]);
+        }
+        const auto next_maximum = std::max(maximum, tile_maximum);
+        const auto previous_scale = std::isfinite(maximum)
+                                        ? std::exp(maximum - next_maximum)
+                                        : 0.0F;
+        for (auto& value : accumulated) value *= previous_scale;
+        denominator *= previous_scale;
+        for (std::uint32_t token = 0U; token < count; ++token) {
+          const auto probability = __half2float(__float2half(
+              std::exp(tile_scores[token] - next_maximum)));
+          denominator += probability;
+          for (std::uint32_t dimension = 0U; dimension < head_dim;
+               ++dimension) {
+            const auto value_index =
+                (static_cast<std::size_t>(first + token) * kv_heads +
+                 kv_head) *
+                    head_dim +
+                dimension;
+            accumulated[dimension] +=
+                probability * __half2float(host_values.get()[value_index]);
+          }
+        }
+        maximum = next_maximum;
+      }
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto query_base =
+            (static_cast<std::size_t>(row) * query_heads + query_head) *
+            2U * head_dim;
+        const auto output_index =
+            (static_cast<std::size_t>(row) * query_heads + query_head) *
+                head_dim +
+            dimension;
+        expected[output_index] =
+            (accumulated[dimension] / denominator) /
+            (1.0F + std::exp(-query_gate[query_base + head_dim + dimension]));
+      }
+    }
+  }
+  double maximum_error{};
+  for (std::size_t index = 0U; index < actual.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(actual[index] - expected[index])));
+  for (std::size_t index = 0U; index < actual.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(device_actual[index] - actual[index])));
+  return maximum_error;
+}
+
+struct ResidentFp16AttentionProfile final {
+  struct Split final {
+    std::uint32_t split_tokens{};
+    double milliseconds{};
+    double raw_kv_gb_per_second{};
+  };
+  double best_milliseconds{};
+  double best_raw_kv_gb_per_second{};
+  std::uint32_t best_split_tokens{};
+  std::vector<Split> splits;
+};
+
+ResidentFp16AttentionProfile resident_fp16_attention_262144_profile() {
+  constexpr std::uint32_t context_tokens = 262'144U;
+  constexpr std::uint32_t rows = 1U;
+  constexpr std::uint32_t query_heads = 24U;
+  constexpr std::uint32_t kv_heads = 4U;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::array<std::uint32_t, 6U> split_options{
+      2'048U, 4'096U, 8'192U, 16'384U, 32'768U, 65'536U};
+  constexpr std::uint32_t maximum_split = split_options.back();
+  constexpr std::uint32_t grouped_heads = query_heads / kv_heads;
+  constexpr std::uint32_t matrix_rows = rows * grouped_heads;
+  constexpr std::size_t query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  constexpr std::size_t cache_values =
+      static_cast<std::size_t>(context_tokens) * kv_heads * head_dim;
+  constexpr std::size_t staged_values =
+      static_cast<std::size_t>(maximum_split) * kv_heads * head_dim;
+  constexpr std::size_t score_values =
+      static_cast<std::size_t>(kv_heads) * matrix_rows * maximum_split;
+  constexpr std::uint64_t raw_kv_bytes =
+      2ULL * cache_values * sizeof(std::uint16_t);
+  constexpr unsigned iterations = 4U;
+
+  std::vector<float> query_gate(query_values * 2U);
+  for (std::size_t index = 0U; index < query_gate.size(); ++index)
+    query_gate[index] =
+        std::sin(static_cast<float>(index + 1U) * 0.0013F) * 0.2F;
+  DeviceBuffer<float> device_query(query_gate.size());
+  DeviceBuffer<float> output(query_values);
+  DeviceBuffer<std::uint16_t> cache_keys(cache_values);
+  DeviceBuffer<std::uint16_t> cache_values_buffer(cache_values);
+  DeviceBuffer<std::uint16_t> queries(query_values);
+  DeviceBuffer<std::uint16_t> keys(staged_values);
+  DeviceBuffer<std::uint16_t> values(staged_values);
+  DeviceBuffer<float> scores(score_values);
+  DeviceBuffer<std::uint16_t> probabilities(score_values);
+  DeviceBuffer<float> accumulator(query_values);
+  DeviceBuffer<float> maxima(static_cast<std::size_t>(kv_heads) * matrix_rows);
+  DeviceBuffer<float> sums(static_cast<std::size_t>(kv_heads) * matrix_rows);
+  device_query.upload(query_gate);
+  cuda_check(cudaMemset(cache_keys.get(), 0,
+                        cache_values * sizeof(std::uint16_t)),
+             "zero resident FP16 keys");
+  cuda_check(cudaMemset(cache_values_buffer.get(), 0,
+                        cache_values * sizeof(std::uint16_t)),
+             "zero resident FP16 values");
+
+  ResidentFp16AttentionProfile result;
+  result.best_milliseconds = std::numeric_limits<double>::infinity();
+  for (const auto split_tokens : split_options) {
+    const expert::runtime::cuda::HostFp16GatedGqaAttentionWorkspace workspace{
+        queries.get(), query_values * sizeof(std::uint16_t), nullptr, 0U,
+        nullptr, 0U, keys.get(), staged_values * sizeof(std::uint16_t),
+        values.get(), staged_values * sizeof(std::uint16_t), scores.get(),
+        score_values * sizeof(float), probabilities.get(),
+        score_values * sizeof(std::uint16_t), accumulator.get(),
+        query_values * sizeof(float), maxima.get(),
+        static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+        sums.get(),
+        static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+        split_tokens};
+    const expert::runtime::cuda::DeviceFp16GatedGqaAttentionLaunch launch{
+        device_query.get(), cache_keys.get(), cache_values_buffer.get(),
+        output.get(), context_tokens, context_tokens, 0U, rows, query_heads,
+        kv_heads, head_dim, nullptr};
+    status_check(
+        expert::runtime::cuda::gated_gqa_attention_staged_device_fp16(
+            launch, workspace));
+    cuda_check(cudaDeviceSynchronize(),
+               "warm resident FP16 attention profile");
+    cudaEvent_t start{}, stop{};
+    cuda_check(cudaEventCreate(&start),
+               "create resident FP16 attention start");
+    cuda_check(cudaEventCreate(&stop),
+               "create resident FP16 attention stop");
+    cuda_check(cudaEventRecord(start),
+               "record resident FP16 attention start");
+    for (unsigned iteration = 0U; iteration < iterations; ++iteration)
+      status_check(
+          expert::runtime::cuda::gated_gqa_attention_staged_device_fp16(
+              launch, workspace));
+    cuda_check(cudaEventRecord(stop),
+               "record resident FP16 attention stop");
+    cuda_check(cudaEventSynchronize(stop),
+               "synchronize resident FP16 attention stop");
+    float total_milliseconds{};
+    cuda_check(cudaEventElapsedTime(&total_milliseconds, start, stop),
+               "measure resident FP16 attention");
+    static_cast<void>(cudaEventDestroy(start));
+    static_cast<void>(cudaEventDestroy(stop));
+    const auto milliseconds =
+        static_cast<double>(total_milliseconds) / iterations;
+    const auto gb_per_second =
+        static_cast<double>(raw_kv_bytes) / (milliseconds * 1.0e6);
+    result.splits.push_back({split_tokens, milliseconds, gb_per_second});
+    if (milliseconds < result.best_milliseconds) {
+      result.best_milliseconds = milliseconds;
+      result.best_raw_kv_gb_per_second = gb_per_second;
+      result.best_split_tokens = split_tokens;
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 int main() {
@@ -1256,6 +1770,10 @@ int main() {
     const auto error = numerical_check();
     const auto delta_error = delta_prefill_check();
     const auto attention_error = attention_prefill_check();
+    const auto fp8_kv_attention = fp8_kv_attention_check();
+    const auto host_fp16_attention_error = host_fp16_attention_check();
+    const auto resident_fp16_attention =
+        resident_fp16_attention_262144_profile();
     const auto bandwidth = bandwidth_check();
     const auto batch_bandwidth = batch_bandwidth_check();
     const auto decode_batch_bandwidth = decode_batch_bandwidth_check();
@@ -1278,6 +1796,22 @@ int main() {
         });
     const bool pass = error < 2.0e-4 && delta_error < 2.0e-5 &&
                       attention_error < 2.0e-4 &&
+                      fp8_kv_attention.
+                              query_maximum_absolute_difference <
+                          1.0e-6 &&
+                      fp8_kv_attention.
+                              implementation_maximum_absolute_difference <
+                          2.0e-4 &&
+                      std::isfinite(fp8_kv_attention.
+                                        output_maximum_absolute_difference) &&
+                      std::isfinite(fp8_kv_attention.
+                                        output_mean_absolute_difference) &&
+                      std::isfinite(
+                          fp8_kv_attention.output_cosine_similarity) &&
+                      host_fp16_attention_error < 5.0e-4 &&
+                      std::isfinite(
+                          resident_fp16_attention.best_milliseconds) &&
+                      resident_fp16_attention.best_milliseconds > 0.0 &&
                       std::isfinite(bandwidth) && bandwidth > 0.0 &&
                       std::isfinite(batch_bandwidth.
                                         current_effective_weight_gb_per_second) &&
@@ -1346,6 +1880,25 @@ int main() {
               << delta_error
               << ",\"attention_prefill_maximum_absolute_error\":"
               << attention_error
+              << ",\"fp8_kv_query_maximum_absolute_difference\":"
+              << fp8_kv_attention.query_maximum_absolute_difference
+              << ",\"fp8_kv_implementation_maximum_absolute_difference\":"
+              << fp8_kv_attention.
+                     implementation_maximum_absolute_difference
+              << ",\"fp8_kv_output_maximum_absolute_difference\":"
+              << fp8_kv_attention.output_maximum_absolute_difference
+              << ",\"fp8_kv_output_mean_absolute_difference\":"
+              << fp8_kv_attention.output_mean_absolute_difference
+              << ",\"fp8_kv_output_cosine_similarity\":"
+              << fp8_kv_attention.output_cosine_similarity
+              << ",\"host_fp16_attention_maximum_absolute_error\":"
+              << host_fp16_attention_error
+              << ",\"resident_fp16_attention_262144_best_milliseconds\":"
+              << resident_fp16_attention.best_milliseconds
+              << ",\"resident_fp16_attention_262144_best_raw_kv_gb_per_second\":"
+              << resident_fp16_attention.best_raw_kv_gb_per_second
+              << ",\"resident_fp16_attention_262144_best_split_tokens\":"
+              << resident_fp16_attention.best_split_tokens
               << ",\"effective_weight_gb_per_second\":" << bandwidth
               << ",\"effective_batch_weight_gb_per_second\":"
               << batch_bandwidth.current_effective_weight_gb_per_second
@@ -1396,6 +1949,16 @@ int main() {
                 << ",\"kv_gb_per_second\":" << profile.kv_gb_per_second
                 << ",\"maximum_absolute_difference\":"
                 << profile.maximum_absolute_difference << '}';
+    }
+    std::cout << "],\"resident_fp16_attention_262144_profiles\":[";
+    for (std::size_t index = 0U;
+         index < resident_fp16_attention.splits.size(); ++index) {
+      if (index != 0U) std::cout << ',';
+      const auto& profile = resident_fp16_attention.splits[index];
+      std::cout << "{\"split_tokens\":" << profile.split_tokens
+                << ",\"milliseconds\":" << profile.milliseconds
+                << ",\"raw_kv_gb_per_second\":"
+                << profile.raw_kv_gb_per_second << '}';
     }
     std::cout << "]}\n";
     return pass ? 0 : 1;

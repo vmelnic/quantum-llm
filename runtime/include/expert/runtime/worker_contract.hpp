@@ -18,6 +18,10 @@ struct WorkerLaunchOptions final {
   std::uint32_t capacity{};
   std::uint64_t kv_cache_mib{};
   std::uint32_t kv_page_tokens{};
+  // "artifact" preserves the provider-declared default. Any explicit value
+  // is a generic execution policy and must be confirmed by the selected
+  // provider through its service contract.
+  std::string kv_cache_dtype{"artifact"};
   std::string placement_profile;
   std::optional<std::uint32_t> prefill_chunk_limit;
   std::optional<std::uint32_t> placement_settle_steps;

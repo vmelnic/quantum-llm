@@ -5,6 +5,7 @@ param(
     [string]$Python = "",
     [string]$ModelId = "",
     [string]$HostAddress = "127.0.0.1",
+    [string]$ApiKey = "",
     [int]$Port = 8080,
     [int]$MaximumQueue = 8,
     [int]$MaximumContext = 4096,
@@ -16,6 +17,8 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
+    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp16")]
+    [string]$WorkerKvCacheDtype = "artifact",
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -61,8 +64,9 @@ if ($Python) {
     if ($null -eq $pythonCommand) { $pythonCommand = Get-PythonCommand }
 }
 
+$effectiveApiKey = if ($ApiKey) { $ApiKey } else { $env:EXPERT_API_KEY }
 $loopback = $HostAddress -in @("127.0.0.1", "::1", "localhost")
-if (-not $loopback -and [string]::IsNullOrWhiteSpace($env:EXPERT_API_KEY)) {
+if (-not $loopback -and [string]::IsNullOrWhiteSpace($effectiveApiKey)) {
     throw "EXPERT_API_KEY is required for a non-loopback bind"
 }
 
@@ -88,6 +92,9 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
         "--worker-route-trace-max-steps", [string]$WorkerRouteTraceMaxSteps
     )
 } else { @() }
+[string[]]$apiKeyArguments = if ($effectiveApiKey) {
+    @("--api-key", $effectiveApiKey)
+} else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -95,6 +102,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --tokenizer $tokenizerPath `
     --model $ModelId `
     --host $HostAddress `
+    @apiKeyArguments `
     --port $Port `
     --maximum-queue $MaximumQueue `
     --max-context $MaximumContext `
@@ -105,6 +113,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --placement-profile $PlacementProfile `
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
+    --worker-kv-cache-dtype $WorkerKvCacheDtype `
     @profileArguments `
     @retainedRouteArguments `
     @cpuHybridArguments `

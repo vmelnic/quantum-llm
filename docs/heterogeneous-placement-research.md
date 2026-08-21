@@ -216,6 +216,31 @@ claim:
 - preserve inactive session state on RAM/NVMe independently of the active
   request.
 
+The executable-page experiment now establishes a sharper boundary. A dense
+FP4 SwiGLU can be partitioned exactly by intermediate channels and executed
+concurrently across resident GPU, resident CPU and a direct-I/O GPU lane. On
+the real layer-0 Qwen3.8 FFN the output error relative to the current resident
+CUDA operation was `1.1920929e-7` with cosine `1.0`, while resident weight VRAM
+fell by 33.27%.
+
+That result does not make NVMe an active dense tier. One 47.5 MB direct page
+took 18.1491 ms to read, compared with 0.236384 ms for the entire resident GPU
+SwiGLU. Even excluding the prototype's scalar integrity checks, the derived
+paged critical path was at least 23.239 ms. Therefore:
+
+- executable pages are a valid universal storage/execution primitive;
+- CPU execution can own an independently reducible shard when its measured
+  completion time balances the GPU shard;
+- NVMe pages are admissible for conditional/cold data, not unconditional dense
+  Qwen decode weights;
+- a smaller page size improves scheduling granularity but does not change the
+  dense active-byte lower bound;
+- page authentication must not perform a scalar full-page SHA twice on the
+  request critical path.
+
+The complete evidence is recorded in
+[Executable SwiGLU page experiment](heterogeneous-placement-benchmark.md#executable-swiglu-page-experiment).
+
 For DeepSeek/Kimi-class MoE, the same contract assigns complete experts to
 GPU/VRAM or CPU/RAM and applies the NVMe active-byte gate to the remaining cold
 route. No performance claim follows from total parameter sparsity alone.
@@ -240,4 +265,3 @@ route. No performance claim follows from total parameter sparsity alone.
 - [DeepSeek-V4 official model card](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/README.md)
 - [DeepSeek-V4 Flash configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Base/blob/main/config.json)
 - [Kimi K3 official report](https://github.com/MoonshotAI/Kimi-K3/blob/main/k3_tech_report.pdf)
-

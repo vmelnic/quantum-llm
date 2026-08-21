@@ -238,6 +238,10 @@ class IOperationProvider {
       const ProgramSequenceInvocation&) {
     return {};
   }
+  [[nodiscard]] virtual bool supports_request_state_retention()
+      const noexcept {
+    return false;
+  }
   [[nodiscard]] virtual Status checkpoint_request_state(
       const std::shared_ptr<IOperationProviderRequestState>&,
       std::uint32_t) {
@@ -298,6 +302,8 @@ struct ExecutionProviderModule final {
   struct ServiceContract final {
     std::string prefill_mode;
     std::uint32_t prefill_chunk_tokens{};
+    // Must mirror IOperationProvider::supports_request_state_retention().
+    // The common runner uses this capability to admit retention commands.
     bool session_retention{};
     std::string request_stream_mode;
     std::string rope_mode;

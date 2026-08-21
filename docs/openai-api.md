@@ -7,6 +7,10 @@ The service exposes one artifact at a time through the common VM runner on
 tool support are enabled from artifact/tokenizer capabilities; common API code
 does not select behavior from a Qwen or DeepSeek model name.
 
+These routes remain available alongside the independent
+[Anthropic Messages adapter](anthropic-api.md); enabling that adapter does not
+change the OpenAI request or response contract.
+
 ## Endpoints
 
 | Method | Path | Contract |

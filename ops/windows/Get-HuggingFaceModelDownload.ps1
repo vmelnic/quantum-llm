@@ -32,16 +32,27 @@ foreach ($partial in $incomplete) {
     $incompleteBytes += [int64]$partial.Length
 }
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
-$shards = @(Get-ChildItem $snapshot -Filter "model-*.safetensors" -File `
-    -ErrorAction SilentlyContinue)
+$selectedFiles = if ($null -ne $state.PSObject.Properties["files"]) {
+    @($state.files | ForEach-Object { [string]$_ })
+} else { @() }
+$missingReferencedFiles = @()
+if ($selectedFiles.Count -gt 0) {
+    $shards = @($selectedFiles | ForEach-Object {
+        $candidate = Join-Path $snapshot $_
+        if (Test-Path $candidate -PathType Leaf) { Get-Item $candidate }
+        else { $missingReferencedFiles += $_ }
+    })
+} else {
+    $shards = @(Get-ChildItem $snapshot -Filter "model-*.safetensors" -File `
+        -ErrorAction SilentlyContinue)
+}
 $completeShardBytes = [int64]0
 foreach ($shard in $shards) {
     $completeShardBytes += [int64]$shard.Length
 }
 $indexPath = Join-Path $snapshot "model.safetensors.index.json"
 $indexTensorBytes = [int64]0
-$missingReferencedFiles = @()
-if (Test-Path $indexPath -PathType Leaf) {
+if ($selectedFiles.Count -eq 0 -and (Test-Path $indexPath -PathType Leaf)) {
     $index = Get-Content $indexPath -Raw | ConvertFrom-Json
     $indexTensorBytes = [int64]$index.metadata.total_size
     $referenced = @($index.weight_map.PSObject.Properties.Value | Sort-Object -Unique)
@@ -52,6 +63,48 @@ if (Test-Path $indexPath -PathType Leaf) {
 $exit = if (Test-Path ([string]$state.exit_status) -PathType Leaf) {
     Get-Content ([string]$state.exit_status) -Raw | ConvertFrom-Json
 } else { $null }
+$selectedIntegrityChecked = $false
+$selectedMetadataMissing = @()
+$selectedSizeMismatches = @()
+$selectedHashMismatches = @()
+if ($selectedFiles.Count -gt 0 -and $null -ne $exit -and
+    [int]$exit.exit_code -eq 0 -and $null -eq $worker -and
+    -not $taskRunning -and $missingReferencedFiles.Count -eq 0 -and
+    $shards.Count -eq [int]$state.expected_shards -and
+    $completeShardBytes -eq [int64]$state.expected_tensor_bytes) {
+    $treePath = Join-Path (Join-Path $root "trees") `
+        (([string]$state.revision) + ".json")
+    if (Test-Path $treePath -PathType Leaf) {
+        $tree = Get-Content $treePath -Raw | ConvertFrom-Json
+        foreach ($relativePath in $selectedFiles) {
+            $metadataProperty = $tree.files.PSObject.Properties[$relativePath]
+            if ($null -eq $metadataProperty -or
+                $null -eq $metadataProperty.Value.PSObject.Properties[
+                    "lfs_sha256"] -or
+                $null -eq $metadataProperty.Value.PSObject.Properties[
+                    "lfs_size"]) {
+                $selectedMetadataMissing += $relativePath
+                continue
+            }
+            $candidate = Join-Path $snapshot $relativePath
+            $expectedSize = [int64]$metadataProperty.Value.lfs_size
+            $actualSize = [int64](Get-Item -LiteralPath $candidate).Length
+            if ($actualSize -ne $expectedSize) {
+                $selectedSizeMismatches += $relativePath
+                continue
+            }
+            $expectedHash = ([string]$metadataProperty.Value.lfs_sha256).ToUpperInvariant()
+            $actualHash = (Get-FileHash -LiteralPath $candidate `
+                -Algorithm SHA256).Hash.ToUpperInvariant()
+            if ($actualHash -ne $expectedHash) {
+                $selectedHashMismatches += $relativePath
+            }
+        }
+        $selectedIntegrityChecked = $true
+    } else {
+        $selectedMetadataMissing = @($selectedFiles)
+    }
+}
 $startedUtc = [DateTimeOffset]::Parse([string]$state.started_utc).UtcDateTime
 $elapsed = [Math]::Max(0.001, ([DateTime]::UtcNow - $startedUtc).TotalSeconds)
 $initialCompleteShardBytes = if ($null -ne $state.PSObject.Properties[
@@ -85,8 +138,16 @@ $remainingDownloadBytes = [Math]::Max([int64]0,
     [int64]$state.expected_download_bytes - $downloadedThisRun)
 $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     $shards.Count -eq [int]$state.expected_shards -and
-    $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
-    $missingReferencedFiles.Count -eq 0 -and $incomplete.Count -eq 0
+    (($selectedFiles.Count -gt 0 -and
+      $completeShardBytes -eq [int64]$state.expected_tensor_bytes -and
+      $selectedIntegrityChecked -and
+      $selectedMetadataMissing.Count -eq 0 -and
+      $selectedSizeMismatches.Count -eq 0 -and
+      $selectedHashMismatches.Count -eq 0) -or
+     ($selectedFiles.Count -eq 0 -and
+      $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
+      $incomplete.Count -eq 0)) -and
+    $missingReferencedFiles.Count -eq 0
 
 [PSCustomObject]@{
     model_id = $state.model_id
@@ -99,9 +160,14 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     completed = $complete
     complete_shards = $shards.Count
     expected_shards = [int]$state.expected_shards
+    files = $selectedFiles
     incomplete_transfers = $incomplete.Count
     incomplete_bytes = $incompleteBytes
     missing_referenced_files = $missingReferencedFiles.Count
+    integrity_checked = $selectedIntegrityChecked
+    metadata_missing = $selectedMetadataMissing
+    size_mismatches = $selectedSizeMismatches
+    hash_mismatches = $selectedHashMismatches
     index_tensor_bytes = $indexTensorBytes
     expected_tensor_bytes = [int64]$state.expected_tensor_bytes
     complete_shard_bytes = $completeShardBytes

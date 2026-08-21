@@ -56,6 +56,203 @@
   Loading the full model at startup is a resident-mode test and must never be
   presented as validation of paging.
 
+## Inference feasibility and failure discipline (mandatory)
+
+- The active Qwen3.8 serving acceptance target is one self-contained RTX 3090,
+  262,144 actually populated tokens, exact F16 KV semantics, and approximately
+  15 generated tokens/s on the real coding harness. Cold prefill, reused-prefix
+  prefill, and decode are separate gates; meeting one must not be reported as
+  meeting another.
+- Before proposing or implementing an inference optimization, write the
+  capacity and steady-state traffic equations for the exact requested model,
+  active context, numerical formats, hardware, and harness. At minimum account
+  for weights, recurrent state, KV, draft/MTP state, execution buffers, bytes
+  touched per accepted token, device bandwidth, interconnect bandwidth, and
+  speculative acceptance. A runtime feature cannot override a failed capacity
+  or bandwidth inequality.
+- Keep `maximum context`, `active populated context`, and `harness prompt
+  overhead` separate in every measurement and claim. A server accepting a
+  context limit does not prove that the limit was populated, that its KV was
+  resident, or that decode at that length is fast.
+- Classify the working set before designing paging. Dense weights are hot on
+  every token. Every retained K/V entry of a full-softmax-attention layer is
+  hot on every decode token. Sparse MoE experts that were not routed are cold.
+  Demand paging is valid only for data that is demonstrably not consumed on
+  the current critical path; paging all active full-attention KV or dense
+  weights is capacity recovery, not a throughput solution.
+- Do not replace the real harness gate with a tiny direct-API prompt. Report
+  cold prefill, reused-prefix prefill, decode, tool-loop wall time, populated
+  context, and residency separately. Compare against the last real harness
+  result and reject a direction that produces no material end-to-end gain.
+- Numerical fidelity is an acceptance criterion. KV quantization, attention
+  sparsification, token eviction, reduced top-k, low-rank approximation,
+  summarization, or a different model are not lossless optimizations. Do not
+  propose or implement them for an exact/fidelity-preserving goal without
+  explicit user approval and an explicit quality gate.
+- Research mechanisms must have a fail-fast quantitative gate before runtime
+  infrastructure is built. Examples: required compression ratio, accepted
+  speculative tokens per verification, exact-pruning fraction, transfer bytes
+  per accepted token, and end-to-end harness throughput. Stop the direction
+  when the measured prerequisite fails.
+- Record negative results and corrected claims in the active research document
+  so that a later session cannot repeat a disproven approach.
+- Session retention is a provider capability, not a universal runner
+  assumption. The common service must advertise it only when every selected
+  callable provider implements exact checkpoint and rewind. Dense FP4 does;
+  the current callable DeepSeek provider does not. Non-retaining requests must
+  not receive `CHECKPOINT`, `RESUME`, `RETAIN`, or `DROP` commands.
+- On the 24 GiB RTX 3090, the shared 13 GiB routed-VRAM profile fails the
+  DeepSeek preflight after fixed allocations plus the 1 GiB reserve. The
+  validated common profile is 12 GiB; do not raise it without re-running both
+  real `model.sh chat` gates and cleanup.
+
+### Qwen3.8-27B / RTX 3090 failures that must not be repeated
+
+- The repository's completed 262,016-token prompt plus 128-token generation
+  proved capacity only. It used the experimental FP4 KV representation, took
+  5,423.422 seconds to first token, and decoded at about 3.24 tok/s afterward.
+  It is neither the exact-F16 fidelity baseline nor a production-speed result.
+  The old client-side `135.91 tok/s` value combined timing phases and is
+  invalid.
+- The `UD-Q4_K_XL` payload is about 16.35 GiB, while F16 KV for the 16
+  full-attention layers at 262,144 populated tokens is 16.00 GiB. MTP adds
+  about 1.28 GiB plus draft KV, before execution buffers. Configuring
+  `--fit-ctx 262144` on a 24 GiB RTX 3090 therefore forced CPU placement; it
+  did not validate full-GPU 262K serving.
+- The Unsloth/llama.cpp path did not materially improve the real harness:
+  the prior approximately 90-second first turn became 88.4 seconds. The real
+  26,193-token Claude Code request decoded 29 tokens at 2.16 tok/s; the 6.28
+  tok/s number came from a 57-token direct request and must not be reported as
+  harness performance.
+- Claude Code contributed about 26K input tokens before relevant project code,
+  while a locally measured minimal Pi `hi` session used about 2.7K including
+  cached input. Harness choice is part of the memory and prefill equations.
+- The 2026-08-21 Claude Code qualification failed both latency and quality.
+  A cold `hi` request carried 29,487 prompt tokens, reached its first token in
+  82.875 seconds, and completed 143 generated tokens in 88.281 seconds. A
+  request asking for a four-stanza poem about Moldovan president Maia Sandu
+  carried 29,660 prompt tokens, reached its first token in 83.454 seconds, and
+  returned a fabricated mathematician biography after 94.157 seconds. Do not
+  call the current Qwen3.8 FP4 service Claude-compatible or production-ready.
+- The same Maia Sandu prompt also failed without Claude Code. With only 100
+  prompt tokens, FP8 KV consumed its 320-token output allowance entirely in
+  hidden reasoning, emitted no visible answer, and invented biographical
+  claims. The attempted F16 comparison used a direct diagnostic worker with
+  greedy fixed-length generation, no service sampling and no EOS handling; it
+  is not a `model.sh chat` result and cannot attribute the FP8 failure to the
+  weights or model execution. Never cite that diagnostic as F16 chat evidence.
+- The corrected real F16 service gate used `MODEL_KV_CACHE_DTYPE=fp16` and
+  `./ops/model.sh chat`, with no harness prefix. `hi` used 53 prompt tokens and
+  generated 30 tokens in 3.079 seconds with 2.125-second server TTFT (about
+  30.40 tok/s after the first generated token). The four-stanza Maia Sandu
+  prompt used 68 prompt tokens and generated 476 tokens in 19.047 seconds with
+  2.812-second server TTFT (about 29.26 tok/s after the first generated token)
+  and returned four stanzas without the fabricated mathematician biography.
+  This is a short-context F16 service pass, not a 262K throughput or reference
+  quality qualification. The terminal client's contemporaneous 85.84/60.44
+  figures mixed hidden reasoning counts with first-visible-content timing and
+  are invalid.
+- FP8 E4M3 per-token/per-head target KV plus FP4 MTP KV physically fit all
+  262,144 positions in 1,024 pages on the RTX 3090. The real 262,016-token
+  prompt took 1,168.594 seconds to prefill and decoded 128 non-speculative
+  tokens in 41.774 seconds (3.064 tok/s). This is capacity recovery, not the
+  15 tok/s goal, and it is not eligible for deployment promotion.
+- A cancelled resumed Anthropic request currently destroys its checked-out
+  retained worker session. In the measured failure, a request resumed with a
+  90-token delta, generated 872 tokens, disconnected, and the following
+  request cold-prefilled 29,660 tokens. Preserving an exact base checkpoint
+  would fix this latency bug, but must not be presented as a remedy for the
+  independent factual/tool-loop quality failure.
+- Moving the model from Windows DrvFS (`/mnt/d`) to native WSL ext4 fixed a
+  severe load-path problem but did not solve steady-state decode. Storage load
+  time and token-generation bandwidth are separate bottlenecks.
+- Q4 KV was proposed after fidelity had already been required. That proposal
+  was invalid: it changes cached activations and its degradation was already
+  confirmed by the user.
+- Lazy/paged F16 KV is useful only while the active KV still fits beside the
+  weights. At fully populated 262K, all 16 GiB of full-attention KV remains hot
+  per decode token; moving it through RAM/NVMe per token collapses throughput.
+- The single-token bandwidth lower bound was calculated too late. At 262K,
+  approximately 17.56 GB of encoded weights plus 17.18 GB of F16 KV are touched
+  per token. This exceeds the RTX 3090's 936 GB/s peak at 30 tok/s even before
+  kernel overhead. A valid future design must amortize work across multiple
+  accepted tokens or reduce exact bytes by a demonstrated lossless mechanism;
+  ordinary offload, another wrapper, or another server cannot satisfy it.
+- Isolated CUDA probes established useful kernel and bandwidth ceilings, but
+  the real maximum-context service remained at about 3.24 tok/s. Never promote
+  a microbenchmark ceiling, a metadata/parser smoke, or post-first-token client
+  arithmetic into an end-to-end service result.
+- CPU/GPU organ splitting cannot be valued at theoretical DDR bandwidth.
+  Whole active KV on CPU is bounded by the RAM scan and CPU attention compute;
+  whole active KV on NVMe or copied through PCIe per token is slower still.
+  Heterogeneous placement is valid only when compute stays with its shard and
+  a measured critical-path overlap beats the current service.
+- Speculative draft weights alone are not their complete memory cost. Their
+  long-context state, target-feature cache, verification tree, rollback state,
+  and CUDA workspaces must all be included before claiming that a DFlash/EAGLE
+  or MTP configuration fits beside the target and populated KV.
+- SplitZip's published 1.32x lossless ratio applies to BF16 KV, whose exponent
+  has eight bits. It is not evidence for the requested IEEE FP16 KV, whose
+  exponent has five bits. Never use the BF16 ratio in an FP16 feasibility
+  equation unless an FP16 capture from this model independently demonstrates
+  it.
+- The 25%-KV oracle rank trace was only a necessary upper bound, not evidence
+  that a causal proposer could construct the tree. The corrected real MTP
+  self-rollout gate on the 262,016-token coding prompt retained all constructed
+  prefixes (`H=32`, `N=128`) and achieved only 4.565 mean exact accepted tokens
+  per cycle, with maximum 11. The proposer itself cost 0.667 s/cycle; combined
+  with the 0.963 s missing-F16 transfer floor, its optimistic ceiling before
+  verifier compute was 2.800 tok/s. This proposer is rejected. Do not build the
+  streamed verifier behind it, repeat the invalid leaf-only accounting, or
+  present beam/horizon tuning as a route from 4.565 to the required 24.
+- A full-context FP4-KV block-Jacobi proposer also failed before the 262K run
+  was justified. With one native-MTP seed, three 32-row target corrections,
+  and at most 128 retained prefix nodes, the real RTX 3090 short-context gate
+  accepted only 3.25 tokens/cycle on average (range 0--6). Its one allowed
+  Tensor-Core correction reduced proposer time from about 1.11 to 0.972
+  seconds/cycle. Even impossible perfect 32/32 acceptance would then be capped
+  at 14.18 tok/s by proposer time plus the 1.284-second full-F16 transfer,
+  before verifier compute; the observed necessary ceiling was 1.55 tok/s.
+  Do not run this configuration at 262K, tune its iteration count, or build a
+  verifier behind it.
+- Static lossless residency also failed on the real 262,144-token F16 KV and
+  the artifact-selected FP4 target weights. Favorable per-stream KV entropy
+  was 13.5851715504 bits/value; favorable per-tensor FP4 raw/XOR/delta/order-1/
+  order-2 coding reduced 13,622,736,896 active weight bytes to an ideal
+  12,147,821,704-byte payload. Ideal weights, ideal KV, and the unavoidable
+  recurrent state still total 26,893,647,848 bytes, exceeding a 24 GiB device
+  by 1,123,844,072 bytes before every codec/runtime overhead. Do not implement
+  this static coding family. A different reversible KV transform must first
+  demonstrate at most 12.538510 bits/value plus practical allocation margin.
+- Reversible structural FP16 transforms were measured on every target K/V
+  stream and reached only 13.2659264431 bits/value; the zero-overhead capacity
+  threshold was 12.5385101959, and the threshold with observed device use plus
+  a 512 MiB runtime reserve was 11.6176117584. Do not implement or retune the
+  measured exponent/channel, temporal, palette, exception, or conditioned-byte
+  family as a full-residency codec.
+- The current staged device-resident FP16 attention provider was measured at
+  the complete 262,144-token geometry. Its one permitted split correction
+  plateaued at 5.73516 ms per layer and 187.221 GB/s with a 65,536-token split.
+  Sixteen attention layers therefore require at least 91.76256 ms, limiting
+  attention alone to 10.8977 target calls/s before all other work. Do not tune
+  this staged provider further or treat a faster attention kernel alone as a
+  capacity solution.
+- A favorable exact CPU/GPU split kept losslessly encoded K plus a V prefix on
+  the GPU and left a 5,135,630,336-byte F16 V tail for CPU `P dot V`. The full
+  AVX2/F16C working-set probe took 226.27925 ms per target call at 12 threads;
+  24 threads were slower. Even granting perfect two-token MTP amplification
+  and zero GPU/service time caps it at 8.8386 generated tok/s. Do not tune this
+  kernel or implement this placement for the 15 tok/s target.
+- Held-out raw-F16 Huffman coding required 13.7195388675 bits/value including
+  unseen-symbol literals and codebooks. zlib, Zstandard, and LZ4 were worse.
+  Basic previous-layer XOR/delta increased entropy; byte conditioning reached
+  only about 13.55--13.61 bits/value versus the practical 11.6176117584-bit
+  residency threshold. Do not build these codecs into the runtime.
+- An unlimited, zero-cost prompt n-gram oracle over the real 262,016-token
+  coding prompt achieved only 3.8485 useful tokens/cycle, maximum 17, with no
+  cycle reaching the required 24. Do not implement a prompt-copy proposer for
+  this trace.
+
 ## Universal MoE infrastructure (mandatory)
 
 - Do not add a model-family runner, scheduled task, service profile, or

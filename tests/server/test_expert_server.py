@@ -124,7 +124,8 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         process.stdout = io.StringIO(json.dumps(ready) + "\n")
         process.stderr = io.StringIO()
         with unittest.mock.patch.object(
-                expert_server.subprocess, "Popen", return_value=process):
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
             worker = CudaWorker(
                 expert_server.Path("worker.exe"), expert_server.Path("pack"),
                 65536, 1, 4, 48, 18, 2048, 256, "balanced", False,
@@ -229,11 +230,15 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         process.stdout = io.StringIO(json.dumps(ready) + "\n")
         process.stderr = io.StringIO()
         with unittest.mock.patch.object(
-                expert_server.subprocess, "Popen", return_value=process):
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
             worker = CudaWorker(
                 expert_server.Path("provider.exe"), expert_server.Path("pack"),
                 262144, 1, 1, 48, 18, 2048, 128, "balanced", False,
+                kv_cache_dtype="fp16",
             )
+        self.assertIn("--kv-cache-dtype=fp16", popen.call_args.args[0])
+        self.assertEqual(worker.kv_dtype, "fp16")
         self.assertEqual(worker.routed_layers, 0)
         self.assertEqual(worker.experts_per_layer, 0)
         self.assertEqual(worker.route_width, 0)
@@ -405,6 +410,48 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             self.assertIn('"choices":[],"usage":', stream)
             self.assertTrue(stream.endswith("data: [DONE]\n\n"))
 
+            connection.request("POST", "/v1/messages", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2, "temperature": 0,
+            }), headers={"Content-Type": "application/json",
+                         "anthropic-version": "2023-06-01"})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(response.status, 200)
+            self.assertEqual(payload["type"], "message")
+            self.assertEqual(payload["role"], "assistant")
+            self.assertEqual(payload["content"], [
+                {"type": "text", "text": "hello world"}
+            ])
+            self.assertEqual(payload["usage"], {
+                "input_tokens": 2, "output_tokens": 2,
+            })
+
+            connection.request("POST", "/v1/messages", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 2, "temperature": 0, "stream": True,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            stream = response.read().decode()
+            self.assertEqual(response.status, 200)
+            self.assertIn("event: message_start\n", stream)
+            self.assertIn('"type":"text_delta","text":"hello"', stream)
+            self.assertIn("event: message_delta\n", stream)
+            self.assertTrue(stream.endswith(
+                'event: message_stop\ndata: {"type":"message_stop"}\n\n'
+            ))
+
+            connection.request(
+                "POST", "/v1/messages/count_tokens", body=json.dumps({
+                    "model": "test-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }), headers={"Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            self.assertEqual(json.loads(response.read()), {"input_tokens": 2})
+
             app.generated = (
                 "<tool_call>\n<function=get_weather>\n"
                 "<parameter=city>\nChisinau\n</parameter>\n"
@@ -429,6 +476,26 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             call = payload["choices"][0]["message"]["tool_calls"][0]
             self.assertEqual(call["function"]["name"], "get_weather")
             self.assertEqual(json.loads(call["function"]["arguments"]),
+                             {"city": "Chisinau"})
+
+            anthropic_tool = {
+                "name": "get_weather", "description": "Read weather",
+                "input_schema": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                }, "required": ["city"]},
+            }
+            connection.request("POST", "/v1/messages", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [anthropic_tool], "tool_choice": {"type": "auto"},
+                "max_tokens": 2,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            payload = json.loads(response.read())
+            self.assertEqual(payload["stop_reason"], "tool_use")
+            self.assertEqual(payload["content"][0]["type"], "tool_use")
+            self.assertTrue(payload["content"][0]["id"].startswith("toolu_"))
+            self.assertEqual(payload["content"][0]["input"],
                              {"city": "Chisinau"})
         finally:
             connection.close()
@@ -491,6 +558,172 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             _text_content([{"type": "input_image", "image_url": "x"}],
                           "input.0.content")
         self.assertEqual(raised.exception.code, "unsupported_value")
+
+    def test_anthropic_history_and_tools_normalize_to_common_chat(self) -> None:
+        payload = Application.anthropic_payload({
+            "model": "test-model", "max_tokens": 128,
+            "system": [{"type": "text", "text": "Use tools."}],
+            "messages": [
+                {"role": "user", "content": "weather"},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Need a lookup."},
+                    {"type": "tool_use", "id": "toolu_1",
+                     "name": "get_weather", "input": {"city": "Chisinau"}},
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1",
+                     "content": [{"type": "text", "text": "18 C"}]},
+                    {"type": "text", "text": "Summarize."},
+                ]},
+            ],
+            "tools": [{
+                "name": "get_weather", "description": "Read weather",
+                "input_schema": {"type": "object"},
+                "cache_control": {"type": "ephemeral"},
+            }],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "xhigh"},
+        })
+        self.assertEqual(payload["messages"][0],
+                         {"role": "system", "content": "Use tools."})
+        self.assertEqual(payload["messages"][2]["tool_calls"][0]["id"],
+                         "toolu_1")
+        self.assertEqual(payload["messages"][3], {
+            "role": "tool", "content": "18 C", "tool_call_id": "toolu_1",
+        })
+        self.assertEqual(payload["messages"][4],
+                         {"role": "user", "content": "Summarize."})
+        self.assertEqual(payload["tools"][0]["function"]["name"],
+                         "get_weather")
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
+        self.assertTrue(payload["chat_template_kwargs"]["enable_thinking"])
+
+    def test_claude_cli_inline_system_message_joins_system_prompt(self) -> None:
+        payload = Application.anthropic_payload({
+            "model": "test-model", "max_tokens": 128,
+            "system": [
+                {"type": "text", "text": "Base instructions."},
+                {"type": "text", "text": "Tool instructions.",
+                 "cache_control": {"type": "ephemeral"}},
+            ],
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "text", "text": " there"},
+                ]},
+                {"role": "system", "content": [{
+                    "type": "text", "text": "Runtime instructions.",
+                    "cache_control": {"type": "ephemeral"},
+                }]},
+            ],
+            "thinking": {"type": "adaptive"},
+            "output_config": {"effort": "high"},
+        })
+        self.assertEqual(payload["messages"], [
+            {"role": "system",
+             "content": "Base instructions.Tool instructions."},
+            {"role": "user", "content": "hi there"},
+            {"role": "user", "content": "Runtime instructions."},
+        ])
+        self.assertEqual(payload["_cache_prefix_messages"], [
+            {"role": "system",
+             "content": "Base instructions.Tool instructions."},
+            {"role": "user", "content": "hi there"},
+        ])
+        self.assertEqual(payload["reasoning_effort"], "xhigh")
+
+    def test_anthropic_inline_system_sets_stable_kv_checkpoint(self) -> None:
+        class Tokenizer:
+            role_tokens = {"system": 10, "user": 20, "assistant": 30}
+
+            def apply_chat_template(self, messages: object,
+                                    add_generation_prompt: bool,
+                                    **_kwargs: object) -> list[int]:
+                tokens = [1]
+                for message in messages:
+                    tokens.extend((self.role_tokens[message["role"]],
+                                   len(message["content"])))
+                if add_generation_prompt:
+                    tokens.append(99)
+                return tokens
+
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            model="test-model", maximum_new_tokens=32, max_context=128,
+        )
+        app.tokenizer = Tokenizer()
+        normalized = app.anthropic_payload({
+            "model": "test-model", "max_tokens": 8,
+            "system": [{"type": "text", "text": "Stable system."}],
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "system", "content": [{
+                    "type": "text", "text": "Dynamic reminder.",
+                    "cache_control": {"type": "ephemeral"},
+                }]},
+            ],
+        })
+
+        request = app.parse_request(normalized, "anthropic")
+
+        self.assertEqual(request.prompt_ids, [1, 10, 14, 20, 2, 20, 17, 99])
+        self.assertEqual(request.cache_prefix_tokens, 5)
+        self.assertEqual(
+            request.prompt_ids[:request.cache_prefix_tokens],
+            [1, 10, 14, 20, 2],
+        )
+
+    def test_anthropic_uses_last_inline_system_cache_boundary(self) -> None:
+        payload = Application.anthropic_payload({
+            "model": "test-model", "max_tokens": 8,
+            "system": "Stable system.",
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "historical reminder"},
+                {"role": "assistant", "content": "answer"},
+                {"role": "user", "content": "second"},
+                {"role": "system", "content": "current reminder"},
+            ],
+        })
+
+        self.assertEqual(payload["_cache_prefix_messages"], [
+            {"role": "system", "content": "Stable system."},
+            {"role": "user", "content": "first"},
+            {"role": "user", "content": "historical reminder"},
+            {"role": "assistant", "content": "answer"},
+            {"role": "user", "content": "second"},
+        ])
+
+    def test_anthropic_stream_heartbeats_while_generation_is_buffered(self) -> None:
+        app = application_fixture()
+        app.args = types.SimpleNamespace(model="test-model")
+        handler = Handler.__new__(Handler)
+        handler.server = types.SimpleNamespace(app=app)
+        handler.anthropic_heartbeat_seconds = 0.0
+        events: list[str] = []
+        handler._sse_headers = lambda: None
+        handler._anthropic_sse = lambda event, _payload: events.append(event)
+        handler._client_disconnected = lambda: False
+
+        def run_generation(_request: object, _emit: object, _context: object,
+                           progress_callback: object = None
+                           ) -> tuple[str, int, str]:
+            self.assertIsNotNone(progress_callback)
+            assert callable(progress_callback)
+            progress_callback()
+            return "hello", 1, "stop"
+
+        handler._run_generation = run_generation
+        request = expert_server.GenerationRequest(
+            endpoint="anthropic", prompt_ids=[10, 11],
+            cache_prefix_tokens=2, maximum=8, stream=True, stop=(),
+            include_usage=False,
+        )
+        handler._serve_anthropic(request, "msg_test", object())
+
+        self.assertIn("ping", events)
+        self.assertLess(events.index("message_start"), events.index("ping"))
+        self.assertLess(events.index("ping"), events.index("message_stop"))
 
     def test_declared_qwen_grammar_installs_standard_response_parser(self) -> None:
         class Tokenizer:
@@ -1000,6 +1233,68 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         result = list(app.generate([3], 5))
         self.assertEqual(result, [(7, "7")])
         self.assertEqual(app.worker.active_ids, set())
+
+    def test_non_retained_generation_omits_checkpoint(self) -> None:
+        class Worker:
+            session_retention = False
+            mtp_enabled = False
+
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+                self.checkpoint_tokens: int | None = -1
+
+            def begin(self, request_id: int, _prompt: list[int],
+                      _context_limit: int, _sampling: SamplingSettings,
+                      checkpoint_tokens: int | None = None,
+                      **_kwargs: object) -> None:
+                self.checkpoint_tokens = checkpoint_tokens
+                self.active_ids.add(request_id)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+            def stats(self) -> dict[str, int]:
+                return {}
+
+        class Batcher:
+            def __init__(self, worker: Worker) -> None:
+                self.worker = worker
+
+            def step(self, request_id: int, final: bool,
+                     hold: bool = False) -> int:
+                if final:
+                    self.worker.active_ids.discard(request_id)
+                return 7
+
+            def take_buffered(self, _request_id: int) -> list[int]:
+                return []
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return ",".join(str(token) for token in tokens)
+
+        worker = Worker()
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            generation_timeout=10.0, disable_session_retention=False,
+            session_idle_seconds=1800.0, max_context=64,
+        )
+        app.request_id = lambda: 1
+        app.worker = worker
+        app.decode_batcher = Batcher(worker)
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = {7}
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+        context = types.SimpleNamespace(session=None, retained=False)
+
+        result = list(app.generate(
+            [3], 5, context, cancel_check=lambda: False,
+            cache_prefix_tokens=1,
+        ))
+
+        self.assertEqual(result, [(7, "7")])
+        self.assertIsNone(worker.checkpoint_tokens)
 
     def test_retained_session_resumes_with_delta_tokens(self) -> None:
         class Worker:

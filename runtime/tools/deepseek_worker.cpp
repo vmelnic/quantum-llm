@@ -4921,7 +4921,9 @@ make_sm86_compressed_sparse_moe_callable_provider(
     module.definition = {"sm86-compressed-sparse-moe", 100U,
                          provider_capabilities(), implementation};
     module.service = {
-        "causal_sequential", 1U, true, "per_request_nonblocking",
+        "causal_sequential", 1U,
+        implementation->supports_request_state_retention(),
+        "per_request_nonblocking",
         "resident_table", "bf16", "preallocated", kv_page_tokens,
         implementation->kv_page_bytes(), implementation->kv_page_capacity(),
         "budgeted", implementation->placement(), ram_cache_bytes,

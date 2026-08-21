@@ -62,6 +62,16 @@ add_executable(expert-fp4-cpu-profile tools/fp4_cpu_profile.cpp)
 target_compile_features(expert-fp4-cpu-profile PRIVATE cxx_std_20)
 target_link_libraries(expert-fp4-cpu-profile PRIVATE expert_runtime)
 
+add_executable(expert-fp16-cpu-value-profile
+  tools/fp16_cpu_value_profile.cpp)
+target_compile_features(expert-fp16-cpu-value-profile PRIVATE cxx_std_20)
+if(MSVC)
+  target_compile_options(expert-fp16-cpu-value-profile PRIVATE /arch:AVX2)
+else()
+  target_compile_options(expert-fp16-cpu-value-profile PRIVATE
+    -mavx2 -mf16c -mfma)
+endif()
+
 if(MSVC)
   set_source_files_properties(
     src/cpu/deepseek_packed_executor.cpp
@@ -145,6 +155,12 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_link_libraries(expert-deepseek-admission-smoke PRIVATE
     expert_runtime CUDA::cudart)
   if(WIN32)
+    add_executable(expert-executable-swiglu-page
+      tools/executable_swiglu_page.cpp)
+    target_compile_features(expert-executable-swiglu-page PRIVATE cxx_std_20)
+    target_compile_options(expert-executable-swiglu-page PRIVATE /arch:AVX2)
+    target_link_libraries(expert-executable-swiglu-page PRIVATE
+      expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-dense-smoke
       tools/deepseek_dense_smoke.cpp)
     target_compile_features(expert-deepseek-dense-smoke PRIVATE cxx_std_20)

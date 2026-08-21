@@ -674,6 +674,9 @@ void test_schema_v3_callable_program_is_exact_and_family_neutral() {
       std::make_shared<FixtureCallableOperationProvider>(first_control);
   auto second_provider =
       std::make_shared<FixtureCallableOperationProvider>(second_control);
+  require(!first_provider->supports_request_state_retention() &&
+              !second_provider->supports_request_state_retention(),
+          "callable providers claimed retention without implementing it");
   er::ExecutionProviderRegistry registry;
   require(registry
               .add({"metadata-only-high-priority", 100U,
@@ -1063,6 +1066,7 @@ void test_universal_worker_launch_preserves_provider_extensions() {
       std::string_view{"--capacity=3"},
       std::string_view{"--kv-cache-mib=3072"},
       std::string_view{"--kv-page-tokens=128"},
+      std::string_view{"--kv-cache-dtype=fp8-e4m3-per-head"},
       std::string_view{"--placement-profile=balanced"},
       std::string_view{"--prefill-chunk-limit=512"},
       std::string_view{"--provider-fp4-pipeline=vendor-x"},
@@ -1070,6 +1074,7 @@ void test_universal_worker_launch_preserves_provider_extensions() {
   const auto parsed = er::parse_worker_launch_options(arguments);
   require(parsed.status.ok() && parsed.options.max_context == 131072U &&
               parsed.options.capacity == 3U &&
+              parsed.options.kv_cache_dtype == "fp8-e4m3-per-head" &&
               parsed.options.prefill_chunk_limit == 512U &&
               parsed.options.extensions.at("provider-fp4-pipeline") ==
                   "vendor-x" &&

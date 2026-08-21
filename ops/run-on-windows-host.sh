@@ -11,6 +11,7 @@ fi
 
 remote_host="${QUANTUM_LLM_REMOTE:-}"
 remote_root="${QUANTUM_LLM_REMOTE_ROOT:-}"
+model_root="${MODEL_ROOT:-}"
 if [[ -z "${remote_host}" ]]; then
   echo "Set QUANTUM_LLM_REMOTE=user@host" >&2
   exit 2
@@ -20,5 +21,14 @@ if [[ -z "${remote_root}" ]]; then
   exit 2
 fi
 
+remote_environment=""
+if [[ -n "${model_root}" ]]; then
+  if [[ ! "${model_root}" =~ ^[A-Za-z]:[/\\][A-Za-z0-9._/\\\ -]+$ ]]; then
+    echo "MODEL_ROOT contains unsupported Windows path characters" >&2
+    exit 2
+  fi
+  remote_environment="set \"MODEL_ROOT=${model_root}\" && "
+fi
+
 ssh -o BatchMode=yes "${remote_host}" \
-  "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${remote_root}/ops/windows/${script_name}\" $*"
+  "${remote_environment}powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"${remote_root}/ops/windows/${script_name}\" $*"

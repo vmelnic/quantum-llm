@@ -1,5 +1,6 @@
 param(
     [int]$Port = 8080,
+    [string]$ApiKey = "",
     [ValidateRange(0, 3600)][int]$WaitSeconds = 0,
     [string]$ExpectedModel = "",
     [string]$ExpectedTaskName = "",
@@ -17,15 +18,17 @@ $expectedTaskName = if ($ExpectedTaskName) {
     $ExpectedTaskName
 } elseif ($ExpectedModel) { "QuantumLLM-ExpertVm" } else { "" }
 $waitStarted = [DateTime]::Now
+$headers = @{}
+if ($ApiKey) { $headers.Authorization = "Bearer $ApiKey" }
 do {
     try {
         $readyResponse = Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/ready" `
-            -TimeoutSec 5 -ErrorAction Stop
+            -Headers $headers -TimeoutSec 5 -ErrorAction Stop
         $ready = [bool]$readyResponse.ready
         if (-not $ready) { $lastError = "service reports ready=false" }
         if ($ready) {
             $modelInfo = Invoke-RestMethod -Uri "http://127.0.0.1:${Port}/model-info" `
-                -TimeoutSec 10 -ErrorAction Stop
+                -Headers $headers -TimeoutSec 10 -ErrorAction Stop
             break
         }
     } catch {

@@ -265,14 +265,15 @@ combined floor      = 16.406 ms/target call
 The theoretical improvement is only about 6%. Real CPU FP4 GEMV compute may be
 below the DDR ceiling, so KV partitioning is the stronger first candidate.
 
-For BF16 activation exchange, sending one hidden vector to the CPU and one
-partial result back for both attention and MLP over 64 layers is approximately:
+The implemented hidden-state ABI is F32, not BF16. Sending one hidden vector
+to the CPU and one partial result back for both attention and MLP over 64
+layers is approximately:
 
 ```text
-2 directions * 5,120 * 2 bytes * 64 layers * 2 organs
-  = 2.5 MiB/token
+2 directions * 5,120 * 4 bytes * 64 layers * 2 organs
+  = 5 MiB/token
 
-2.5 MiB / 12.46 GiB/s = 0.196 ms/token
+5 MiB / 12.46 GiB/s = 0.392 ms/token
 ```
 
 This byte cost is small; per-layer dispatch and synchronization still need to
@@ -328,3 +329,98 @@ This excludes all other workspaces and is not a VRAM allocation guarantee.
 The associated design and qualification gates are in
 [Heterogeneous organ placement](heterogeneous-placement-research.md).
 
+## Executable SwiGLU page experiment
+
+Measured on 2026-08-19 on the Windows RTX 3090 host using the published
+`${MODEL_ROOT}/qwen3.8-27b-fp4` artifact. The experiment selected the first
+artifact-declared `ffn.swiglu.dense.fp4-block32.v1` operation, logical
+operation 2 in layer 0. It did not inspect the architecture ID or a
+model-family tensor path.
+
+The three source matrices were repacked into an experimental executable image:
+
+```text
+D:/quantum-llm/out/experiments/executable-swiglu/qwen38-ffn.swimg
+```
+
+Each page contains a contiguous intermediate-channel range from gate/up and
+the matching down-projection columns. FP4 E2M1 nibbles and UE8M0 block-32
+scales are copied byte-for-byte. The image is 142,057,472 bytes versus
+142,049,280 source payload bytes, or 0.0058% container overhead.
+
+The operation was divided into three exact channel shards:
+
+| lane | channels | placement |
+|---|---:|---|
+| GPU resident | 5,792 | page loaded before execution |
+| CPU resident | 5,792 | packed FP4 AVX2 execution from RAM |
+| NVMe to GPU | 5,824 | 4 KiB-aligned unbuffered overlapped read, H2D, CUDA |
+
+Gate/up lanes start concurrently. Their partial intermediates use one global
+Q8 scale before the three down projections execute concurrently and partial
+hidden vectors are reduced in page order. This preserves the current dense
+provider's activation-quantization boundary rather than introducing one Q8
+scale per page.
+
+### Numerical result
+
+Reference: the existing fully resident CUDA FP4 SwiGLU path over the same real
+weights and input.
+
+| measurement | result |
+|---|---:|
+| source FP4/UE8M0 bytes preserved | yes |
+| intermediate maximum absolute error | 1.1920929e-7 |
+| intermediate cosine | 1.0 |
+| output maximum absolute error | 1.1920929e-7 |
+| output error / reference maximum | 3.2390032e-9 |
+| output RMSE | 7.7106531e-9 |
+| output cosine | 1.0 |
+
+The algebraic executable-page split is therefore validated for this real
+Qwen3.8 SwiGLU. This is a component result, not a service-speed claim.
+
+### Placement and timing result
+
+| measurement | result |
+|---|---:|
+| resident CUDA baseline | 0.236384 ms |
+| resident GPU gate/up lane | 0.5307 ms |
+| resident CPU gate/up lane | 1.8257 ms |
+| direct NVMe read | 47,525,888 bytes in 18.1491 ms |
+| measured direct-read rate | 2.619 GB/s |
+| NVMe-page H2D plus CUDA gate/up | 3.9313 ms |
+| three-lane simultaneous overlap | 0.3455 ms |
+| concurrent down wall time | 1.1586 ms |
+| measured prototype wall time | 308.0508 ms |
+
+The 306.518 ms NVMe-lane interval includes two scalar SHA-256 validations of
+the 47.5 MB page. The measured read and H2D/compute account for 22.0804 ms;
+approximately 284.438 ms is validation/control overhead in this prototype.
+Removing that prototype overhead gives a derived transport/compute critical
+path of at least 23.239 ms including the measured down phase, still about 98x
+the 0.236 ms resident operation. It is not reported as an achieved runtime.
+
+| weight working set | bytes |
+|---|---:|
+| fully resident reference VRAM | 142,049,280 |
+| paged VRAM high water | 94,789,632 |
+| resident CPU page | 47,263,744 |
+| direct-I/O staging page | 47,525,888 |
+
+The prototype releases about 47.26 MB, or 33.27%, of this FFN's resident
+weight VRAM. No inference process remained after the experiment.
+
+### Decision
+
+The experiment validates executable FP4 pages as a representation and exact
+cross-tier reduction mechanism. It rejects active per-layer NVMe weight
+streaming as a Qwen3.8 dense-decode optimization on this host: the physical
+read alone is 77x the complete resident operation. Smaller pages may improve
+pipeline occupancy but cannot reduce the total bytes required by a dense FFN.
+
+The representation remains relevant for conditionally selected MoE experts,
+inactive organs and state whose active-byte rate passes the NVMe inequality.
+Per-access scalar SHA-256 is also rejected for the hot path; an immutable image
+needs publication-time authentication plus an accelerated or asynchronous
+page-integrity design before generalization.

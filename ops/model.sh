@@ -73,6 +73,8 @@ remote_host="${QUANTUM_LLM_REMOTE:-${CHAT_SSH:-}}"
 remote_root="${QUANTUM_LLM_REMOTE_ROOT:-}"
 model_root="${MODEL_ROOT:-}"
 port="${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
+host_address="${MODEL_HOST:-127.0.0.1}"
+api_key="${EXPERT_API_KEY:-}"
 max_context="${MODEL_MAX_CONTEXT:-65536}"
 max_output="${MODEL_MAX_OUTPUT_TOKENS:-8192}"
 ready_timeout="${MODEL_READY_TIMEOUT:-600}"
@@ -80,11 +82,12 @@ generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 max_body_mib="${MODEL_MAX_BODY_MIB:-16}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
 ram_cache_gib="${MODEL_RAM_CACHE_GIB:-48}"
-vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-13}"
+vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-12}"
 worker_capacity="${MODEL_WORKER_CAPACITY:-1}"
 maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
 kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
 kv_page_tokens="${MODEL_KV_PAGE_TOKENS:-256}"
+kv_cache_dtype="${MODEL_KV_CACHE_DTYPE:-artifact}"
 placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
@@ -103,9 +106,19 @@ require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
 require_uint MODEL_MAXIMUM_QUEUE "${maximum_queue}"
 require_uint MODEL_KV_CACHE_MIB "${kv_cache_mib}"
 require_uint MODEL_KV_PAGE_TOKENS "${kv_page_tokens}"
+[[ "${host_address}" =~ ^[A-Za-z0-9:.%-]+$ ]] ||
+  die "MODEL_HOST contains unsupported characters"
+if [[ "${host_address}" != 127.0.0.1 && "${host_address}" != ::1 &&
+      "${host_address}" != localhost && -z "${api_key}" ]]; then
+  die "EXPERT_API_KEY is required when MODEL_HOST is non-loopback"
+fi
 [[ "${placement_profile}" == latency || "${placement_profile}" == balanced ||
    "${placement_profile}" == capacity ]] ||
   die "MODEL_PLACEMENT_PROFILE must be latency, balanced, or capacity"
+[[ "${kv_cache_dtype}" == artifact ||
+   "${kv_cache_dtype}" == fp8-e4m3-per-head ||
+   "${kv_cache_dtype}" == fp16 ]] ||
+  die "MODEL_KV_CACHE_DTYPE must be artifact, fp8-e4m3-per-head, or fp16"
 (( max_output < max_context )) || die "MODEL_MAX_OUTPUT_TOKENS must be smaller than MODEL_MAX_CONTEXT"
 
 export QUANTUM_LLM_REMOTE="${remote_host}"
@@ -139,12 +152,14 @@ print_config() {
     "remote=${remote_host:-<unset>}" \
     "remote_root=${remote_root}" \
     "model_root=${model_root}" \
+    "host=${host_address}" \
     "port=${port}" \
     "max_context=${max_context}" \
     "max_output_tokens=${max_output}" \
     "generation_timeout_seconds=${generation_timeout}" \
     "max_body_mib=${max_body_mib}" \
-    "sync_on_start=${sync_on_start}"
+    "sync_on_start=${sync_on_start}" \
+    "api_key_configured=$([[ -n "${api_key}" ]] && printf yes || printf no)"
   [[ -z "${model_id}" ]] || printf '%s\n' \
     "container=${container}" \
     "runner=${vm_runner}" \
@@ -153,6 +168,7 @@ print_config() {
     "worker_capacity=${worker_capacity}" \
     "kv_cache_mib=${kv_cache_mib}" \
     "kv_page_tokens=${kv_page_tokens}" \
+    "kv_cache_dtype=${kv_cache_dtype}" \
     "placement_profile=${placement_profile}"
 }
 
@@ -168,11 +184,13 @@ start_model() {
   build_id="${MODEL_BUILD_ID:-$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || printf development)}"
   local common=(
     -TaskName "${task_name}"
+    -HostAddress "${host_address}"
     -Port "${port}"
     -MaximumContext "${max_context}"
     -MaximumNewTokens "${max_output}"
     -WorkerKvCacheMiB "${kv_cache_mib}"
     -WorkerKvPageTokens "${kv_page_tokens}"
+    -WorkerKvCacheDtype "${kv_cache_dtype}"
     -PlacementProfile "${placement_profile}"
     -GenerationTimeoutSeconds "${generation_timeout}"
     -MaximumBodyMiB "${max_body_mib}"
@@ -180,6 +198,9 @@ start_model() {
     -BuildId "${build_id}"
     -Start
   )
+  if [[ -n "${api_key}" ]]; then
+    common+=(-ApiKey "${api_key}")
+  fi
   run_remote Install-ExpertServerTask.ps1 \
     -Container "${container}" \
     -Runner "${vm_runner}" \
@@ -189,15 +210,20 @@ start_model() {
     -WorkerRamCacheGiB "${ram_cache_gib}" \
     -WorkerVramCacheGiB "${vram_cache_gib}" \
     "${common[@]}"
-  run_remote Get-ExpertServerStatus.ps1 \
-    -Port "${port}" \
-    -WaitSeconds "${ready_timeout}" \
-    -ExpectedModel "${model_id}" \
-    -ExpectedTaskName "${task_name}" \
-    -ExpectedContext "${max_context}" \
-    -ExpectedMaximumNewTokens "${max_output}" \
-    -ExpectedGenerationTimeoutSeconds "${generation_timeout}" \
+  local status_args=(
+    -Port "${port}"
+    -WaitSeconds "${ready_timeout}"
+    -ExpectedModel "${model_id}"
+    -ExpectedTaskName "${task_name}"
+    -ExpectedContext "${max_context}"
+    -ExpectedMaximumNewTokens "${max_output}"
+    -ExpectedGenerationTimeoutSeconds "${generation_timeout}"
     -ExpectedMaximumBodyMiB "${max_body_mib}"
+  )
+  if [[ -n "${api_key}" ]]; then
+    status_args+=(-ApiKey "${api_key}")
+  fi
+  run_remote Get-ExpertServerStatus.ps1 "${status_args[@]}"
 }
 
 case "${action}" in
@@ -220,7 +246,11 @@ case "${action}" in
     start_model
     ;;
   status)
-    run_remote Get-ExpertServerStatus.ps1 -Port "${port}"
+    if [[ -n "${api_key}" ]]; then
+      run_remote Get-ExpertServerStatus.ps1 -Port "${port}" -ApiKey "${api_key}"
+    else
+      run_remote Get-ExpertServerStatus.ps1 -Port "${port}"
+    fi
     ;;
   chat)
     [[ -n "${model_id}" ]] || die "chat requires one model"

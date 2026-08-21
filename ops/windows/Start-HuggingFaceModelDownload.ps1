@@ -4,6 +4,7 @@ param(
     [Parameter(Mandatory = $true)][int64]$ExpectedDownloadBytes,
     [Parameter(Mandatory = $true)][int64]$ExpectedTensorBytes,
     [Parameter(Mandatory = $true)][int]$ExpectedShards,
+    [string]$Files = "",
     [int]$MaxWorkers = 4,
     [int64]$SafetyBytes = 8GB
 )
@@ -17,6 +18,19 @@ if ($ModelId -match "\s" -or $Revision -notmatch '^[0-9a-f]{40}$') {
 if ($ExpectedDownloadBytes -lt 1 -or $ExpectedTensorBytes -lt 1 -or
     $ExpectedShards -lt 1 -or $MaxWorkers -lt 1 -or $SafetyBytes -lt 1) {
     throw "Download limits must be positive"
+}
+$selectedFiles = @($Files -split ',' | Where-Object { $_ } | ForEach-Object {
+    $_.Trim().Replace('\', '/')
+})
+foreach ($file in $selectedFiles) {
+    if ([string]::IsNullOrWhiteSpace($file) -or
+        [System.IO.Path]::IsPathRooted($file) -or
+        $file -match '(^|/)\.\.(/|$)' -or $file -match '[*?\[\]]') {
+        throw "Files must contain comma-separated exact repository paths: $file"
+    }
+}
+if ($selectedFiles.Count -gt 0 -and $selectedFiles.Count -ne $ExpectedShards) {
+    throw "ExpectedShards must equal the number of exact Files"
 }
 
 $hf = Join-Path $env:USERPROFILE ".hf-cli\venv\Scripts\hf.exe"
@@ -60,16 +74,26 @@ $cacheName = "models--" + ($ModelId -replace "/", "--")
 $cacheRoot = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
 $snapshot = Join-Path (Join-Path $cacheRoot "snapshots") $Revision
 $initialShardBytes = [int64]0
-foreach ($shard in @(Get-ChildItem $snapshot -Filter "model-*.safetensors" `
-        -File -ErrorAction SilentlyContinue)) {
-    $initialShardBytes += [int64]$shard.Length
+if ($selectedFiles.Count -gt 0) {
+    foreach ($file in $selectedFiles) {
+        $candidate = Join-Path $snapshot $file
+        if (Test-Path $candidate -PathType Leaf) {
+            $initialShardBytes += [int64](Get-Item $candidate).Length
+        }
+    }
+} else {
+    foreach ($shard in @(Get-ChildItem $snapshot -Filter "model-*.safetensors" `
+            -File -ErrorAction SilentlyContinue)) {
+        $initialShardBytes += [int64]$shard.Length
+    }
 }
 $cachedBytes = [int64]0
 foreach ($blob in @(Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
         -ErrorAction SilentlyContinue)) {
     $cachedBytes += [int64]$blob.Length
 }
-$remainingBytes = [Math]::Max([int64]0, $ExpectedDownloadBytes - $cachedBytes)
+$remainingBytes = [Math]::Max([int64]0,
+    $ExpectedDownloadBytes - $initialShardBytes)
 $driveName = ([System.IO.Path]::GetPathRoot($env:USERPROFILE)).Substring(0, 1)
 $freeBytes = [int64](Get-PSDrive -Name $driveName).Free
 if ($freeBytes -lt $remainingBytes + $SafetyBytes) {
@@ -83,6 +107,7 @@ if (-not (Test-Path $worker -PathType Leaf)) {
 Remove-Item -LiteralPath $status -Force -ErrorAction SilentlyContinue
 $workerArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$worker`" " +
     "-HfPath `"$hf`" -ModelId $ModelId -Revision $Revision " +
+    "-Files `"$Files`" " +
     "-MaxWorkers $MaxWorkers -StdoutPath `"$stdout`" " +
     "-StderrPath `"$stderr`" -StatusPath `"$status`""
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $workerArguments
@@ -96,12 +121,13 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings `
     -Principal $principal -Force | Out-Null
 
 [PSCustomObject]@{
-    schema_version = 1
+    schema_version = 2
     model_id = $ModelId
     revision = $Revision
     expected_download_bytes = $ExpectedDownloadBytes
     expected_tensor_bytes = $ExpectedTensorBytes
     expected_shards = $ExpectedShards
+    files = $selectedFiles
     initial_cached_bytes = $cachedBytes
     initial_complete_shard_bytes = $initialShardBytes
     free_bytes_before = $freeBytes

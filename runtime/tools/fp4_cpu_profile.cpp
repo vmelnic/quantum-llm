@@ -64,10 +64,11 @@ er::DeepSeekCompactSections sections(std::uint32_t hidden,
 
 int main(int argc, char** argv) {
   try {
-    if (argc < 5 || argc > 8) {
+    if (argc < 5 || argc > 10) {
       std::cerr << "usage: expert-fp4-cpu-profile <record-file> <offset> "
                    "<hidden> <intermediate> [iterations] [threads] "
-                   "[expert-groups]\n";
+                   "[expert-groups] [record-stride] "
+                   "[sequential-working-set]\n";
       return 64;
     }
     const auto hidden = static_cast<std::uint32_t>(std::stoul(argv[3]));
@@ -79,8 +80,15 @@ int main(int argc, char** argv) {
     const auto threads = argc >= 7
                              ? static_cast<std::uint32_t>(std::stoul(argv[6]))
                              : std::max(1U, std::thread::hardware_concurrency());
-    const auto group_count =
-        argc == 8 ? static_cast<std::uint32_t>(std::stoul(argv[7])) : 1U;
+    const auto group_count = argc >= 8
+                                 ? static_cast<std::uint32_t>(
+                                       std::stoul(argv[7]))
+                                 : 1U;
+    const auto record_stride =
+        argc >= 9 ? std::stoull(argv[8]) : std::uint64_t{};
+    const auto sequential_working_set = argc == 10
+        ? std::stoul(argv[9]) != 0U
+        : false;
     require(hidden != 0U && intermediate != 0U && hidden % 32U == 0U &&
                 intermediate % 32U == 0U && iterations != 0U &&
                 threads != 0U && threads <= 64U && group_count != 0U &&
@@ -88,13 +96,14 @@ int main(int argc, char** argv) {
             "invalid FP4 CPU profile geometry");
     const auto layout = sections(hidden, intermediate);
     const auto record_bytes = layout.w2_scale_offset + layout.w2_scale_bytes;
+    const auto effective_stride = argc >= 9 ? record_stride : record_bytes;
     const auto first_offset = std::stoull(argv[2]);
     std::vector<std::vector<std::byte>> records;
     records.reserve(group_count);
     for (std::uint32_t group = 0U; group < group_count; ++group) {
       records.push_back(read_record(
           argv[1], first_offset + static_cast<std::uint64_t>(group) *
-                                      record_bytes,
+                                      effective_stride,
           record_bytes));
     }
     std::vector<float> inputs(hidden);
@@ -111,11 +120,26 @@ int main(int argc, char** argv) {
     std::vector<float> outputs(static_cast<std::size_t>(group_count) * hidden);
     er::cpu::DeepSeekPackedExecutor executor(
         {threads, 8U, 8U, 10.0F, true, true});
-    auto status = executor.execute(groups, inputs, 1U, group_count, outputs);
-    require(status.ok(), std::string(status.message()));
+    er::Status status;
+    if (sequential_working_set) {
+      for (std::uint32_t group = 0U; group < group_count; ++group) {
+        status = executor.execute(std::span(groups).subspan(group, 1U), inputs,
+                                  1U, group_count, outputs);
+        require(status.ok(), std::string(status.message()));
+      }
+    } else {
+      status = executor.execute(groups, inputs, 1U, group_count, outputs);
+      require(status.ok(), std::string(status.message()));
+    }
     const auto started = std::chrono::steady_clock::now();
     for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration) {
-      status = executor.execute(groups, inputs, 1U, group_count, outputs);
+      if (sequential_working_set) {
+        const auto group = iteration % group_count;
+        status = executor.execute(std::span(groups).subspan(group, 1U), inputs,
+                                  1U, group_count, outputs);
+      } else {
+        status = executor.execute(groups, inputs, 1U, group_count, outputs);
+      }
       require(status.ok(), std::string(status.message()));
     }
     const auto elapsed = std::chrono::duration<double>(
@@ -128,10 +152,11 @@ int main(int argc, char** argv) {
                   static_cast<double>((index % 101U) + 1U);
       maximum = std::max(maximum, std::abs(outputs[index]));
     }
-    const auto selections_total =
-        static_cast<double>(iterations) * group_count;
+    const auto selections_total = static_cast<double>(iterations) *
+        (sequential_working_set ? 1.0 : group_count);
     const auto seconds_per_selection = elapsed / selections_total;
     const auto seconds_per_batch = elapsed / iterations;
+    const auto records_per_batch = sequential_working_set ? 1U : group_count;
     const auto metrics = executor.telemetry();
     std::cout << std::setprecision(12)
               << "{\"schema_version\":1,\"encoding\":"
@@ -140,13 +165,16 @@ int main(int argc, char** argv) {
               << ",\"record_bytes\":" << record_bytes
               << ",\"threads\":" << threads
               << ",\"expert_groups\":" << group_count
+              << ",\"record_stride\":" << effective_stride
+              << ",\"sequential_working_set\":"
+              << (sequential_working_set ? "true" : "false")
               << ",\"iterations\":" << iterations
               << ",\"milliseconds_per_batch\":"
               << seconds_per_batch * 1000.0
               << ",\"milliseconds_per_selection\":"
               << seconds_per_selection * 1000.0
               << ",\"source_gib_per_second\":"
-              << static_cast<double>(record_bytes) * group_count /
+              << static_cast<double>(record_bytes) * records_per_batch /
                      seconds_per_batch /
                      static_cast<double>(1ULL << 30U)
               << ",\"workers_used\":" << metrics.workers_used_last

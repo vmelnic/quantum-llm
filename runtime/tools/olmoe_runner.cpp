@@ -1551,7 +1551,9 @@ make_sm86_dense_moe_callable_provider(
         ((static_cast<std::uint64_t>(max_context) + kv_page_tokens - 1U) /
          kv_page_tokens);
     module.service = {
-        "causal_sequential", 1U, true, "provider_stream", "artifact",
+        "causal_sequential", 1U,
+        implementation->supports_request_state_retention(),
+        "provider_stream", "artifact",
         "fp32", "preallocated", kv_page_tokens,
         implementation->kv_page_bytes(kv_page_tokens),
         page_capacity, "budgeted", "balanced", ram_cache_bytes,
