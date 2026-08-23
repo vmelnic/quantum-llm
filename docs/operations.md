@@ -1,140 +1,84 @@
-# Operations runbook
+# Operations
 
-Status: current day-two lifecycle as of 2026-08-19. The implementation resume
-point is [the MoE VM handoff](moe-vm-next.md).
+Status: current operator runbook, 2026-08-23.
 
-Use [Install, configure and use](deployment.md) for initial setup. This page is
-the short day-two runbook.
-
-## Lifecycle
+## Observe without blocking inference
 
 ```bash
-./ops/model.sh install            # after clone or requirements changes
-./ops/model.sh config             # resolved non-secret local configuration
-./ops/model.sh start              # CHAT_MODEL from .env
-./ops/model.sh start qwen         # Qwen FP4 pack (ABI 3)
-./ops/model.sh start deepseek
 ./ops/model.sh status
-./ops/model.sh chat               # resolves the actually deployed model
-./ops/model.sh stop
-./ops/model.sh stop all           # release every model process and VRAM
-./ops/model.sh sync               # source/docs only, without restart
 ```
 
-`start` synchronizes by default, performs a read-only dependency preflight
-before disrupting the current service, stops the common task and any retired
-task names, installs the selected artifact, waits for readiness and verifies
-model/context/output/deadline.
+The service exposes authenticated endpoints:
 
-Only one model owns the GPU and loopback API port. Task Scheduler is a pilot
-supervisor. The repository stop command kills the complete Python/worker
-descendant tree; stopping only the visible task can leave CUDA children alive.
+- `GET /health`: process and worker liveness;
+- `GET /ready`: liveness plus admission/not-draining state;
+- `GET /model-info`: artifact, limits, provider, session and KV geometry;
+- `GET /v1/models`: advertised model identity;
+- `GET /metrics`: cached Prometheus text snapshot.
 
-## Health and identity
+These endpoints use bounded cached worker state and must not wait for a long
+prefill. `ready=true` does not mean that caches are warm or a throughput target
+has been met.
 
-- `/health`: worker process is alive;
-- `/ready`: healthy and admitting, not necessarily warm;
-- `/model-info`: model/build/artifact identity, configured limits, placement,
-  KV geometry, capacity and active request count;
-- `/metrics`: bounded service counters and latency summaries.
+## Diagnose a slow request
 
-After every deploy, require `model.sh start` to return without mismatches and
-confirm `model.sh status`. A listening port alone is not proof of identity.
+Separate the phases and rates before changing code:
 
-## Limits and capacity
+1. prompt tokens, prefill time and time to first visible token;
+2. generated target tokens and post-first-token rate;
+3. reasoning tokens versus visible answer tokens;
+4. Qwen KV pages/bytes populated, staged and restored;
+5. DeepSeek VRAM/RAM/storage hits, reread bytes and storage/H2D wait;
+6. cancellation, queue and capacity outcomes.
 
-`.env` is the deployment authority:
+For DeepSeek, compare novel and settled routes separately. For Qwen, report
+actual populated context and KV dtype. Never infer a saturated-context result
+from a configured maximum.
 
-| Variable | Reference value | Meaning |
-|---|---:|---|
-| `MODEL_MAX_CONTEXT` | `262144` | instructions + history + input + requested output |
-| `MODEL_MAX_OUTPUT_TOKENS` | `8192` | server ceiling for one response |
-| `CHAT_MAX_TOKENS` | `8192` | terminal client request ceiling |
-| `MODEL_GENERATION_TIMEOUT_SECONDS` | `14400` | request execution deadline |
-| `MODEL_READY_TIMEOUT` | `600` | lifecycle wait deadline |
-| `MODEL_VRAM_CACHE_GIB` | `12` | common routed-VRAM budget validated on the 24 GiB RTX 3090 |
-| `MODEL_KV_CACHE_DTYPE` | `artifact` | provider-declared default; `fp16` requests exact target KV semantics from a capable provider |
+GPU phase profiling is diagnostic and off by default; enabling it changes the
+hot path through CUDA event collection. Keep it out of production results
+unless the result explicitly measures instrumentation overhead.
 
-The current universal `.env` profile uses one worker slot and four queued
-requests for every artifact. KV credits are aggregate.
-Overload or insufficient context credits returns bounded HTTP errors rather
-than allocating unbounded memory.
+## Sessions and cancellation
 
-The 262K capacity path has completed, but both the original FP4-KV service and
-the later FP8-KV experiment failed production qualification. See
-[Performance evidence](benchmarks.md) and
-[Production readiness](production-readiness.md).
+Retained sessions are keyed by the exact prompt/media prefix. A valid resume
+feeds only the suffix; an unchanged prefix performs a zero-delta resume. A
+failed suffix prefill rolls back to the committed checkpoint. Client
+cancellation preserves only the prompt that the client can echo on its next
+turn and discards partial assistant output.
 
-## Logs and diagnosis
+Admission is based on real parked bytes as well as slots. A session whose
+exact F16 KV grows near 262K consumes about 16 GiB before continuation state;
+several such sessions cannot be admitted merely because each declares the
+same maximum.
 
-The service JSONL is under the ignored remote `logs/` directory. It contains
-identity/readiness, HTTP summaries, startup failures, request failures and
-worker stderr without prompt content or API keys.
+## Failure handling
 
-Diagnostic order:
+- HTTP 401: use the same `EXPERT_API_KEY` in the service and client.
+- HTTP 503 overloaded: all request slots, KV capacity or queue capacity are
+  occupied; do not retry in an unbounded loop.
+- readiness timeout: inspect scheduled-task state and server logs, then run
+  `model.sh stop all` before restarting.
+- worker failure: do not reuse its in-process KV/session state; restart the
+  common service and replay from a client-owned prefix.
+- artifact failure: stop, restore the timestamped rollback directory, validate
+  it, then start and smoke it through the public API.
 
-1. `./ops/model.sh status`;
-2. confirm task state and last result;
-3. inspect the latest `service_start_failed`, `request_preprocessing_failed`,
-   `request_failed` or CUDA worker event;
-4. run the same launcher in foreground only when Task Scheduler hid a native
-   exception;
-5. fix the contract/dependency; do not extend timeouts blindly.
+## Cleanup
 
-`model.sh install` reconciles pinned server requirements. `start` only checks
-imports/versions and fails before stopping the currently running model.
+`work/`, `artifacts/`, `logs/`, `out/` and Python caches are generated and
+ignored. They may be removed only after any durable measurement has been
+summarized in [Benchmarks](benchmarks.md) or
+[Research decisions](research-decisions.md). Published model artifacts below
+`MODEL_ROOT` are not scratch space and are never deleted by normal lifecycle
+commands.
 
-## Rollback
+After any gate:
 
-1. Stop all model processes.
-2. Deploy a previously validated commit to a clean directory.
-3. Reconcile pinned requirements and build/test the native runtime.
-4. Validate the immutable pack/bundle independently.
-5. Start and require `/model-info` identity plus one real chat request.
+```bash
+./ops/model.sh stop all
+./ops/model.sh status
+```
 
-Code rollback never mutates model artifacts. Keep the original checkpoint or
-an independently validated immutable pack with hashes.
-
-## Exposure and security
-
-The default loopback bind plus SSH tunnel is the safest pilot configuration.
-`MODEL_HOST` can explicitly enable a private-LAN bind for the
-[Anthropic/Claude Code path](anthropic-api.md), but the service refuses that
-bind without `EXPERT_API_KEY`. The built-in server is not an internet edge.
-Restrict direct access with a private firewall allowlist; use a
-TLS/authenticated/rate-limited reverse proxy for broader exposure. Rotate keys
-outside the repository and restrict health/metrics/model-info separately.
-
-## Performance reporting
-
-Never publish one unqualified “tok/s” number. Record:
-
-- cold or warm and how warming was obtained;
-- single-stream or aggregate;
-- prompt/history and output token counts;
-- TTFT, post-first-token and end-to-end rates;
-- cache/storage/transfer state when available.
-
-The corrected real F16 Qwen3.8 `model.sh chat` gate measured about 30.40 tok/s
-after the first generated token for `hi` and 29.26 tok/s for the four-stanza
-prompt. These are short-context results. The terminal client must not compute
-post-first throughput from total output tokens when its timestamp is the first
-visible content after hidden reasoning. The historical direct `hi` gate
-measured about 32.0 tok/s after the
-first generated token. It did not predict Claude Code behavior: a cold Claude
-`hi` carried 29,487 prompt tokens and took 82.875 seconds to first token. The
-FP8-KV maximum-context gate populated all 262,144 positions but decoded at only
-3.064 tok/s after a 1,168.594-second prefill. Keep direct, harness and saturated
-context workloads separate. The old client `135.91 tok/s` value is invalid
-because it combined hidden reasoning token counts with first-visible-content
-timing.
-
-The 2026-08-21 common-runner regression used the validated 12 GiB routed-VRAM
-budget. Qwen3.8 F16 answered `hi`; server telemetry measured 53 prompt tokens,
-30 generated tokens, 1.703 s TTFT, 2.672 s wall and 29.93 tok/s after the first
-generated token. DeepSeek-V4-Flash also answered `hi`; it used 5 prompt tokens,
-10 generated tokens, 3.579 s TTFT and 10.735 s wall. DeepSeek advertises
-`session_retention=false` because its callable provider has no exact
-checkpoint/rewind implementation. The 13 GiB cache profile failed the RTX 3090
-preflight once fixed allocations and the 1 GiB reserve were included; do not
-restore it as the common default without new capacity evidence.
+Then inspect `nvidia-smi` on the execution host if GPU cleanup is material to
+the gate.

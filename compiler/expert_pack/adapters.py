@@ -99,6 +99,7 @@ class RuntimeModelTopology:
 TOKEN_BATCH_ABI = "batch.token-id.u32.host.v1"
 POSITION_BATCH_ABI = "batch.position.u32.host.v1"
 HIDDEN_BATCH_ABI = "batch.hidden.f32.cuda.v1"
+MULTIMODAL_BATCH_ABI = "request.multimodal.fp32.host.v1"
 ROUTE_INDEX_BATCH_ABI = "batch.route-index.u32.cuda.v1"
 ROUTE_WEIGHT_BATCH_ABI = "batch.route-weight.f32.cuda.v1"
 
@@ -1001,7 +1002,12 @@ class Qwen3_5Adapter:
         patch = _integer(vision, "patch_size")
         temporal_patch = _integer(vision, "temporal_patch_size")
         spatial_merge = _integer(vision, "spatial_merge_size")
-        if vision_hidden % vision_heads or vision_output != hidden:
+        vision_grid_side = math.isqrt(vision_positions)
+        if (
+            vision_hidden % vision_heads
+            or vision_output != hidden
+            or vision_grid_side * vision_grid_side != vision_positions
+        ):
             raise AdapterError("qwen3_5 vision/text geometry is inconsistent")
 
         expected: dict[str, tuple[int, ...]] = {}
@@ -1205,9 +1211,52 @@ class Qwen3_5Adapter:
                 component_layer=0,
                 tensor_bindings=(("weight", text_prefix + "embed_tokens.weight"),),
                 input_bindings=(("token_ids", "request.token_ids", TOKEN_BATCH_ABI),),
-                output_bindings=(("hidden", "hidden.0", HIDDEN_BATCH_ABI),),
+                output_bindings=(("hidden", "hidden.text", HIDDEN_BATCH_ABI),),
             )
         ]
+        vision_bindings: list[tuple[str, str]] = [
+            ("patch_projection", visual_prefix + "patch_embed.proj.weight"),
+            ("patch_bias", visual_prefix + "patch_embed.proj.bias"),
+            ("position_embedding", visual_prefix + "pos_embed.weight"),
+        ]
+        for layer in range(vision_depth):
+            prefix = f"{visual_prefix}blocks.{layer}."
+            role = f"block.{layer}."
+            vision_bindings.extend((
+                (role + "norm1_weight", prefix + "norm1.weight"),
+                (role + "norm1_bias", prefix + "norm1.bias"),
+                (role + "qkv_projection", prefix + "attn.qkv.weight"),
+                (role + "qkv_bias", prefix + "attn.qkv.bias"),
+                (role + "attention_projection", prefix + "attn.proj.weight"),
+                (role + "attention_bias", prefix + "attn.proj.bias"),
+                (role + "norm2_weight", prefix + "norm2.weight"),
+                (role + "norm2_bias", prefix + "norm2.bias"),
+                (role + "mlp_fc1", prefix + "mlp.linear_fc1.weight"),
+                (role + "mlp_fc1_bias", prefix + "mlp.linear_fc1.bias"),
+                (role + "mlp_fc2", prefix + "mlp.linear_fc2.weight"),
+                (role + "mlp_fc2_bias", prefix + "mlp.linear_fc2.bias"),
+            ))
+        vision_bindings.extend((
+            ("merger_norm_weight", visual_prefix + "merger.norm.weight"),
+            ("merger_norm_bias", visual_prefix + "merger.norm.bias"),
+            ("merger_fc1", visual_prefix + "merger.linear_fc1.weight"),
+            ("merger_fc1_bias", visual_prefix + "merger.linear_fc1.bias"),
+            ("merger_fc2", visual_prefix + "merger.linear_fc2.weight"),
+            ("merger_fc2_bias", visual_prefix + "merger.linear_fc2.bias"),
+        ))
+        operations.append(RuntimeOperationTopology(
+            logical_layer=None,
+            capability="vision.patch-transformer-merge.fp4-block32.v1",
+            abi=1,
+            routed_component=None,
+            component_layer=0,
+            tensor_bindings=tuple(vision_bindings),
+            input_bindings=(
+                ("hidden", "hidden.text", HIDDEN_BATCH_ABI),
+                ("media", "request.multimodal", MULTIMODAL_BATCH_ABI),
+            ),
+            output_bindings=(("hidden", "hidden.0", HIDDEN_BATCH_ABI),),
+        ))
         for layer, layer_type in enumerate(layer_types):
             prefix = f"{text_prefix}layers.{layer}."
             after_attention = f"layer.{layer}.after_attention"
@@ -1317,6 +1366,7 @@ class Qwen3_5Adapter:
             )
         required_kernels = [
             ("embedding.lookup.fp4-block32.v1", 1),
+            ("vision.patch-transformer-merge.fp4-block32.v1", 1),
             ("block.full-attention.output-gated.v1", 1),
             ("block.recurrent-linear-attention.split-gated-delta.v1", 1),
             ("ffn.swiglu.dense.fp4-block32.v1", 1),
@@ -1346,6 +1396,19 @@ class Qwen3_5Adapter:
                 ("mrope_section_0", mrope_sections[0]),
                 ("mrope_section_1", mrope_sections[1]),
                 ("mrope_section_2", mrope_sections[2]),
+                ("vision_depth", vision_depth),
+                ("vision_hidden_size", vision_hidden),
+                ("vision_intermediate_size", vision_intermediate),
+                ("vision_heads", vision_heads),
+                ("vision_position_embeddings", vision_positions),
+                ("vision_grid_side", vision_grid_side),
+                ("vision_channels", vision_channels),
+                ("vision_patch_size", patch),
+                ("vision_temporal_patch_size", temporal_patch),
+                ("vision_spatial_merge_size", spatial_merge),
+                ("vision_output_size", vision_output),
+                ("vision_norm_epsilon_f32_bits", _float32_bits(1e-6)),
+                ("vision_rope_theta_f32_bits", _float32_bits(10_000.0)),
                 ("zero_centered_norm", 1),
                 ("mtp_layers", mtp_layers),
             ),
@@ -1361,6 +1424,7 @@ class Qwen3_5Adapter:
             program_inputs=(
                 ("token_ids", "request.token_ids", TOKEN_BATCH_ABI),
                 ("positions", "request.positions", POSITION_BATCH_ABI),
+                ("multimodal", "request.multimodal", MULTIMODAL_BATCH_ABI),
             ),
             program_outputs=(
                 ("next_token_ids", "response.token_ids", TOKEN_BATCH_ABI),

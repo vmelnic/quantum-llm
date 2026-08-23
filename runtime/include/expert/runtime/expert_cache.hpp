@@ -132,6 +132,9 @@ struct ExpertAcquireOptions final {
 struct HostPreloadOptions final {
   ExpertRequestPriority priority{ExpertRequestPriority::warm};
   bool protect_ram{true};
+  // Transfer an eviction-blocking lease with completion. This closes the
+  // gap between async admission and a later non-atomic RAM lookup.
+  bool acquire_lease{};
 };
 
 class ExpertLease final {
@@ -225,6 +228,7 @@ class AcquireHandle final {
 struct HostPreloadResult final {
   Status status;
   bool retained{};
+  HostExpertLease lease;
 };
 
 class HostPreloadHandle final {

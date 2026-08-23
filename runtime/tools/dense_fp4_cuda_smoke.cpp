@@ -1763,11 +1763,30 @@ ResidentFp16AttentionProfile resident_fp16_attention_262144_profile() {
   return result;
 }
 
+bool topk_logits_check() {
+  const std::vector<float> logits{
+      1.0F, 7.0F, std::numeric_limits<float>::quiet_NaN(), 7.0F,
+      -2.0F, 4.5F, 4.5F, 9.0F, 0.0F};
+  DeviceBuffer<float> device_logits(logits.size());
+  DeviceBuffer<float> device_values(5U);
+  DeviceBuffer<std::uint32_t> device_indices(5U);
+  device_logits.upload(logits);
+  status_check(expert::runtime::cuda::topk_logits(
+      device_logits.get(), static_cast<std::uint32_t>(logits.size()), 5U,
+      device_values.get(), device_indices.get(), nullptr));
+  cuda_check(cudaDeviceSynchronize(), "synchronize top-k logits smoke");
+  const auto values = device_values.download();
+  const auto indices = device_indices.download();
+  return indices == std::vector<std::uint32_t>({7U, 1U, 3U, 5U, 6U}) &&
+         values == std::vector<float>({9.0F, 7.0F, 7.0F, 4.5F, 4.5F});
+}
+
 }  // namespace
 
 int main() {
   try {
     const auto error = numerical_check();
+    const auto topk_pass = topk_logits_check();
     const auto delta_error = delta_prefill_check();
     const auto attention_error = attention_prefill_check();
     const auto fp8_kv_attention = fp8_kv_attention_check();
@@ -1794,7 +1813,8 @@ int main() {
                  item.kv_gb_per_second > 0.0 &&
                  item.maximum_absolute_difference < 2.0e-4;
         });
-    const bool pass = error < 2.0e-4 && delta_error < 2.0e-5 &&
+    const bool pass = topk_pass && error < 2.0e-4 &&
+                      delta_error < 2.0e-5 &&
                       attention_error < 2.0e-4 &&
                       fp8_kv_attention.
                               query_maximum_absolute_difference <

@@ -11,6 +11,7 @@ import types
 import unittest
 import http.client
 import json
+from pathlib import Path
 from http.server import ThreadingHTTPServer
 
 # The batching coordinator itself has no tokenizer dependency. Keep this unit
@@ -21,9 +22,11 @@ sys.modules.setdefault(
 )
 
 import ops.python.expert_server as expert_server
+from ops.python.artifact_chat_codec import ArtifactChatCodec
 from ops.python.expert_server import (
     Application, AssistantStreamParser, ContinuousDecodeBatcher, CudaWorker,
-    Handler, IncrementalTextDecoder, RequestError, SamplingSettings,
+    Handler, IncrementalTextDecoder, IncrementalTokenDecoder, RequestError,
+    SamplingSettings,
     StopFilter, _text_content, _worker_response_tokens,
 )
 from ops.python.response_protocols import install_declared_response_protocol
@@ -31,7 +34,7 @@ from ops.python.response_protocols import install_declared_response_protocol
 
 def application_fixture() -> Application:
     app = Application.__new__(Application)
-    app.checkpoint_chat_encoder = None
+    app.artifact_chat_codec = None
     app.response_protocol = None
     app.default_sampling = SamplingSettings(1.0, 0.95, 20, 0.0, 0)
     return app
@@ -52,6 +55,99 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_artifact_codec_controls_thinking_tools_and_stable_prefix(self) -> None:
+        observed: dict[str, object] = {}
+
+        def encode_messages(messages: list[dict[str, object]],
+                            thinking_mode: str, drop_thinking: bool,
+                            reasoning_effort: str | None = None) -> str:
+            observed.update(messages=messages, thinking_mode=thinking_mode,
+                            drop_thinking=drop_thinking,
+                            reasoning_effort=reasoning_effort)
+            return "BOS:user<A><think>"
+
+        module = types.SimpleNamespace(
+            encode_messages=encode_messages,
+            parse_message_from_completion_text=lambda _text, _mode: {},
+            eos_token="<eos>", thinking_start_token="<think>",
+            thinking_end_token="</think>", ASSISTANT_SP_TOKEN="<A>",
+            dsml_token="DSML", tool_calls_block_name="tool_calls",
+        )
+        codec = ArtifactChatCodec(module, Path("fixture.py"))
+        prompt = codec.encode(
+            [{"role": "user", "content": "weather"}],
+            add_generation_prompt=False,
+            tools=({"type": "function", "function": {
+                "name": "weather", "parameters": {"type": "object"},
+            }},),
+            reasoning_effort="xhigh", enable_thinking=True,
+            preserve_thinking=True,
+        )
+        self.assertEqual(prompt, "BOS:user")
+        self.assertEqual(observed["thinking_mode"], "thinking")
+        self.assertEqual(observed["reasoning_effort"], "max")
+        self.assertFalse(observed["drop_thinking"])
+        encoded_messages = observed["messages"]
+        self.assertEqual(encoded_messages[0]["role"], "system")
+        self.assertEqual(
+            encoded_messages[0]["tools"][0]["function"]["name"],
+            "weather",
+        )
+
+    def test_artifact_codec_streams_text_and_parses_dsml_without_leak(self) -> None:
+        seen: dict[str, object] = {}
+
+        def parse_message(text: str, thinking_mode: str) -> dict[str, object]:
+            seen.update(text=text, thinking_mode=thinking_mode)
+            return {
+                "role": "assistant", "content": "answer",
+                "reasoning_content": "reason",
+                "tool_calls": [{"type": "function", "function": {
+                    "name": "lookup", "arguments": '{"q":"value"}',
+                }}],
+            }
+
+        module = types.SimpleNamespace(
+            encode_messages=lambda _messages, thinking_mode: thinking_mode,
+            parse_message_from_completion_text=parse_message,
+            eos_token="<eos>", thinking_start_token="<think>",
+            thinking_end_token="</think>", ASSISTANT_SP_TOKEN="<A>",
+            dsml_token="DSML", tool_calls_block_name="tool_calls",
+        )
+        codec = ArtifactChatCodec(module, Path("fixture.py"))
+        parser = codec.stream_parser(True)
+        events = []
+        events += parser.feed("rea")
+        events += parser.feed("son</thi")
+        events += parser.feed("nk>answer\n\n<DSMLtool_")
+        events += parser.feed("calls>private")
+        _message, tail = parser.finalize()
+        events += tail
+        self.assertEqual(
+            [(event["field"], event["text"]) for event in events],
+            [("reasoning_content", "rea"),
+             ("reasoning_content", "son"),
+             ("content", "answer")],
+        )
+
+        app = application_fixture()
+        app.artifact_chat_codec = codec
+        app.response_protocol = "artifact-chat-codec-v1"
+        request = expert_server.GenerationRequest(
+            endpoint="chat", prompt_ids=[1], cache_prefix_tokens=1,
+            maximum=8, stream=False, stop=(), include_usage=False,
+            enable_thinking=True,
+        )
+        output = app.parse_assistant_output("raw", request)
+        self.assertEqual(output.text, "answer")
+        self.assertEqual(output.reasoning, "reason")
+        self.assertEqual(output.tool_calls[0].name, "lookup")
+        self.assertEqual(json.loads(output.tool_calls[0].arguments),
+                         {"q": "value"})
+        self.assertEqual(seen, {
+            "text": "raw<eos>", "thinking_mode": "thinking",
+        })
+
     def test_incremental_decoder_holds_incomplete_unicode_without_replay(self) -> None:
         decoder = IncrementalTextDecoder()
         self.assertEqual(decoder.push("Hello! \ufffd"), "Hello! ")
@@ -69,6 +165,42 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(decoder.push("stable"), "stable")
         with self.assertRaises(expert_server.WorkerError):
             decoder.push("different")
+
+    def test_incremental_token_decoder_is_bounded_and_context_exact(self) -> None:
+        class Tokenizer:
+            maximum_seen = 0
+
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                self.maximum_seen = max(self.maximum_seen, len(tokens))
+                pieces = {1: "Hello", 2: " world", 3: "!"}
+                return "".join(pieces.get(token, chr(96 + token))
+                               for token in tokens)
+
+        tokenizer = Tokenizer()
+        decoder = IncrementalTokenDecoder(
+            tokenizer, overlap_tokens=4, maximum_window_tokens=8
+        )
+        output = "".join(decoder.push(token) for token in (
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 4, 5, 6,
+        ))
+        expected = "Hello world!defghidef"
+        self.assertEqual(output, expected)
+        self.assertLessEqual(tokenizer.maximum_seen, 8)
+
+    def test_incremental_token_decoder_holds_split_unicode(self) -> None:
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                if tokens == [1]:
+                    return "\ufffd"
+                if tokens == [1, 2]:
+                    return "😊"
+                return ""
+
+        decoder = IncrementalTokenDecoder(
+            Tokenizer(), overlap_tokens=2, maximum_window_tokens=4
+        )
+        self.assertEqual(decoder.push(1), "")
+        self.assertEqual(decoder.push(2), "😊")
 
     def test_standard_stream_events_split_reasoning_and_content(self) -> None:
         class Parser:
@@ -108,6 +240,123 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "\tSAMPLING\t1000000\t950000\t20\t0\t1234",
         )
 
+    def test_protocol9_end_retain_returns_exact_parking_accounting(self) -> None:
+        worker = CudaWorker.__new__(CudaWorker)
+        worker.session_parking = True
+        worker.kv_page_bytes = 4096
+        worker.session_park_ram_bytes = 1 << 20
+        worker.session_park_page_capacity = 64
+        worker.active_ids = {7}
+        worker._command = lambda _command: {
+            "type": "ended", "id": 7, "retained_tokens": 300,
+            "parked_pages": 2, "parked_bytes": 16384,
+        }
+
+        self.assertEqual(worker.end_retain(7, 9, 300), (300, 2, 16384))
+        self.assertNotIn(7, worker.active_ids)
+
+    def test_protocol9_resume_accepts_an_exact_same_prefix(self) -> None:
+        worker = CudaWorker.__new__(CudaWorker)
+        worker.sampling_supported = True
+        worker.active_ids = set()
+        commands: list[str] = []
+
+        def command(value: str, **_kwargs: object) -> dict[str, object]:
+            commands.append(value)
+            return {"type": "begun", "id": 7}
+
+        worker._command = command
+        worker.begin_resume(
+            7, 9, [], 1024, SamplingSettings(0.0, 1.0, 0, 0.0, 1)
+        )
+
+        self.assertEqual(
+            commands,
+            ["BEGIN\t7\t1024\t\tRESUME\t9\tSAMPLING\t0\t1000000\t0\t0\t1"],
+        )
+        self.assertIn(7, worker.active_ids)
+
+    def test_protocol9_optional_page_state_may_use_less_than_page_ceiling(
+            self) -> None:
+        worker = CudaWorker.__new__(CudaWorker)
+        worker.session_parking = True
+        worker.kv_page_bytes = 4096
+        worker.session_park_ram_bytes = 1 << 20
+        worker.session_park_page_capacity = 64
+        worker.active_ids = {7}
+        worker._command = lambda _command: {
+            "type": "ended", "id": 7, "retained_tokens": 300,
+            "parked_pages": 2, "parked_bytes": 4096,
+        }
+
+        self.assertEqual(worker.end_retain(7, 9, 300), (300, 2, 4096))
+
+    def test_protocol9_invalid_end_accounting_drops_worker_session(self) -> None:
+        worker = CudaWorker.__new__(CudaWorker)
+        worker.session_parking = True
+        worker.kv_page_bytes = 4096
+        worker.session_park_ram_bytes = 1 << 20
+        worker.session_park_page_capacity = 64
+        worker.active_ids = {7}
+        commands: list[str] = []
+
+        def command(value: str) -> dict[str, object]:
+            commands.append(value)
+            if value.startswith("END"):
+                return {
+                    "type": "ended", "id": 7, "retained_tokens": 300,
+                    "parked_pages": 2, "parked_bytes": 0,
+                }
+            return {"type": "dropped"}
+
+        worker._command = command
+        with self.assertRaises(expert_server.WorkerError):
+            worker.end_retain(7, 9, 300)
+
+        self.assertEqual(commands, ["END\t7\tRETAIN\t9\tAT\t300", "DROP\t9"])
+        self.assertNotIn(7, worker.active_ids)
+
+    def test_cached_worker_stats_do_not_query_a_busy_worker(self) -> None:
+        class Worker:
+            def stats(self) -> dict[str, int]:
+                raise AssertionError("cached stats must not query the worker")
+
+        app = application_fixture()
+        app.worker = Worker()
+        app._worker_stats_lock = threading.Lock()
+        app._worker_stats_cache = {"allocated_pages": 7}
+        app._worker_stats_updated_at = time.monotonic()
+
+        self.assertEqual(
+            app.worker_stats(refresh=False), {"allocated_pages": 7}
+        )
+        self.assertLess(app.worker_stats_age_seconds(), 1.0)
+
+    def test_parking_capacity_evicts_lru_and_retries_same_active_request(
+            self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def end_retain(self, _request_id: int, _session_key: int,
+                           _checkpoint: int) -> tuple[int, int, int]:
+                self.calls += 1
+                if self.calls == 1:
+                    raise expert_server.WorkerError(
+                        "request-state RAM parking capacity is exhausted"
+                    )
+                return 300, 2, 16384
+
+        app = application_fixture()
+        app.worker = Worker()
+        evictions: list[bool] = [True]
+        app.evict_lru_session = lambda: evictions.pop() if evictions else False
+
+        self.assertEqual(
+            app.end_retain_with_eviction(7, 9, 300), (300, 2, 16384)
+        )
+        self.assertEqual(app.worker.calls, 2)
+
     def test_protocol4_worker_infers_legacy_prefetch_state(self) -> None:
         ready = {
             "type": "ready", "protocol": 4, "capacity": 4,
@@ -132,6 +381,32 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             )
         self.assertTrue(worker.placement_prefetch_enabled)
         self.assertEqual(worker.placement_prefetch_state, "ready")
+
+    def test_budgeted_worker_reports_effective_cache_below_ceiling(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 4, "capacity": 1,
+            "prefill_mode": "causal_sequential", "prefill_chunk_tokens": 1,
+            "kv_dtype": "bf16", "kv_allocation": "preallocated",
+            "kv_page_tokens": 256, "kv_page_bytes": 1024,
+            "kv_page_capacity": 65536, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 40 << 30, "vram_cache_bytes": 11 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "observing",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            worker = CudaWorker(
+                expert_server.Path("worker.exe"), expert_server.Path("pack"),
+                65536, 1, 1, 48, 12, 2048, 256, "balanced", False,
+            )
+        self.assertEqual(worker.ram_cache_bytes, 40 << 30)
+        self.assertEqual(worker.vram_cache_bytes, 11 << 30)
 
     def test_worker_accepts_provider_cpu_policy_by_default(self) -> None:
         ready = {
@@ -559,6 +834,27 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                           "input.0.content")
         self.assertEqual(raised.exception.code, "unsupported_value")
 
+    def test_user_image_parts_are_normalized_only_for_vision_artifacts(self) -> None:
+        decoded = object()
+        with unittest.mock.patch.object(
+                expert_server, "load_image", return_value=decoded) as load:
+            content = _text_content([
+                {"type": "input_text", "text": "describe"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,AA==",
+                }},
+            ], "messages.0.content", allow_images=True, user_content=True)
+        self.assertEqual(content, [
+            {"type": "text", "text": "describe"},
+            {"type": "image", "image": decoded},
+        ])
+        load.assert_called_once_with("data:image/png;base64,AA==")
+        with self.assertRaises(RequestError) as raised:
+            _text_content([
+                {"type": "input_image", "image_url": "https://example/image.png"},
+            ], "messages.0.content", allow_images=True, user_content=False)
+        self.assertEqual(raised.exception.code, "unsupported_value")
+
     def test_anthropic_history_and_tools_normalize_to_common_chat(self) -> None:
         payload = Application.anthropic_payload({
             "model": "test-model", "max_tokens": 128,
@@ -725,6 +1021,61 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertLess(events.index("message_start"), events.index("ping"))
         self.assertLess(events.index("ping"), events.index("message_stop"))
 
+    def test_anthropic_stream_holds_tool_grammar_leading_whitespace(self) -> None:
+        class Parser:
+            def feed(self, delta: str) -> list[dict[str, object]]:
+                return [{"type": "region_chunk", "field": "content",
+                         "text": delta, "dirty": False}]
+
+            def finalize(self) -> tuple[dict[str, object],
+                                        list[dict[str, object]]]:
+                return {}, []
+
+        call = expert_server.ToolCall(
+            item_id="item_1", call_id="call_1", name="get_weather",
+            arguments='{"city":"Chisinau"}',
+        )
+        app = application_fixture()
+        app.args = types.SimpleNamespace(model="test-model")
+        app.response_stream_parser = lambda _request: Parser()
+        app.parse_assistant_output = lambda _text, _request: \
+            expert_server.AssistantOutput(
+                text="", reasoning="", reasoning_complete=True,
+                tool_calls=(call,),
+            )
+        handler = Handler.__new__(Handler)
+        handler.server = types.SimpleNamespace(app=app)
+        events: list[tuple[str, dict[str, object]]] = []
+        handler._sse_headers = lambda: None
+        handler._anthropic_sse = lambda event, payload: \
+            events.append((event, payload))
+
+        def run_generation(_request: object, emit: object, _context: object,
+                           progress_callback: object = None
+                           ) -> tuple[str, int, str]:
+            emit("\n\n")
+            return "<tool_call>...</tool_call>", 4, "stop"
+
+        handler._run_generation = run_generation
+        request = expert_server.GenerationRequest(
+            endpoint="anthropic", prompt_ids=[10], cache_prefix_tokens=1,
+            maximum=8, stream=True, stop=(), include_usage=False,
+            tools=({"type": "function"},),
+        )
+
+        handler._serve_anthropic(request, "msg_test", object())
+
+        deltas = [payload["delta"] for event, payload in events
+                  if event == "content_block_delta"]
+        self.assertEqual(deltas, [{
+            "type": "input_json_delta",
+            "partial_json": '{"city":"Chisinau"}',
+        }])
+        starts = [payload["content_block"] for event, payload in events
+                  if event == "content_block_start"]
+        self.assertEqual(starts[0]["type"], "tool_use")
+        self.assertEqual(events[-1][0], "message_stop")
+
     def test_declared_qwen_grammar_installs_standard_response_parser(self) -> None:
         class Tokenizer:
             chat_template = (
@@ -788,12 +1139,17 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "model": "test-model",
             "messages": [{"role": "user", "content": "weather"}],
             "tools": [{"type": "function", "function": {
-                "name": "weather", "parameters": {"type": "object"},
+                "name": "weather", "description": "Current weather",
+                "parameters": {"type": "object"}, "strict": False,
             }}],
             "max_completion_tokens": 8,
         }, "chat")
         self.assertEqual(request.reasoning_effort, "xhigh")
         self.assertEqual(request.tools[0]["function"]["name"], "weather")
+        self.assertEqual(
+            list(request.tools[0]["function"]),
+            ["name", "description", "parameters", "strict"],
+        )
         self.assertEqual(len(app.tokenizer.calls), 2)
         for call in app.tokenizer.calls:
             self.assertEqual(call["reasoning_effort"], "xhigh")
@@ -844,7 +1200,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(raised.exception.param, "max_output_tokens")
         self.assertIn("exceeds context capacity", str(raised.exception))
 
-    def test_deepseek_checkpoint_encoder_fills_missing_chat_template(self) -> None:
+    def test_artifact_encoder_fills_missing_chat_template(self) -> None:
         class Tokenizer:
             def encode(self, prompt: str, **kwargs: object) -> list[int]:
                 self.prompt = prompt
@@ -864,12 +1220,15 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             seen["kwargs"] = kwargs
             return "official prompt"
 
-        app.checkpoint_chat_encoder = encode_messages
+        app.artifact_chat_codec = ArtifactChatCodec(
+            types.SimpleNamespace(encode_messages=encode_messages),
+            Path("fixture.py"),
+        )
         messages = [{"role": "user", "content": "Hi"}]
         self.assertEqual(app._chat_prompt_ids(messages),
                          [0, 128803, 23166, 128804, 128822])
         self.assertEqual(seen, {
-            "messages": messages, "kwargs": {"thinking_mode": "chat"},
+            "messages": messages, "kwargs": {"thinking_mode": "thinking"},
         })
         self.assertEqual(app.tokenizer.prompt, "official prompt")
         self.assertEqual(app.tokenizer.kwargs,
@@ -900,6 +1259,34 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.release_context_credits(first)
         self.assertEqual(app.acquire_context_credits(512), 2)
 
+    def test_parked_sessions_use_host_capacity_not_gpu_page_capacity(
+            self) -> None:
+        app = application_fixture()
+        app.worker = types.SimpleNamespace(
+            kv_page_tokens=256, kv_page_capacity=2,
+            session_parking=True, session_park_page_capacity=12,
+        )
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+
+        self.assertEqual(app.acquire_context_credits(1024), 4)
+        self.assertEqual(app.kv_reserved_pages, 4)
+
+    def test_request_context_credits_shrink_to_populated_pages(self) -> None:
+        app = application_fixture()
+        app.worker = types.SimpleNamespace(
+            kv_page_tokens=4, kv_page_capacity=4,
+            session_parking=True, session_park_page_capacity=16,
+        )
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        context = expert_server.RequestContext(session=None, held_pages=0)
+
+        self.assertTrue(app.resize_request_context(context, 9))
+        self.assertEqual((context.held_pages, app.kv_reserved_pages), (9, 9))
+        self.assertTrue(app.resize_request_context(context, 3))
+        self.assertEqual((context.held_pages, app.kv_reserved_pages), (3, 3))
+
     def test_exact_max_context_does_not_reserve_retention_position(self) -> None:
         worker = types.SimpleNamespace(
             session_retention=True,
@@ -923,7 +1310,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
         self.assertIsNotNone(context)
         assert context is not None
-        self.assertEqual(context.held_pages, 8)
+        self.assertEqual(context.held_pages, 0)
         app.release_request_context(context)
         self.assertEqual(app.kv_reserved_pages, 0)
 
@@ -973,11 +1360,17 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.draining = threading.Event()
         app.session_lock = threading.Lock()
         app.sessions = {}
+        app._worker_stats_lock = threading.Lock()
+        app._worker_stats_cache = {}
+        app._worker_stats_updated_at = 0.0
+        app.worker_stats(refresh=True)
 
         info = app.info()
         self.assertEqual(info["worker_sessions"], {
-            "enabled": False, "retained": 0, "retained_tokens": 0,
-            "reserved_pages": 0,
+            "enabled": False, "parking_enabled": False,
+            "park_ram_bytes": 0, "park_page_capacity": 0,
+            "retained": 0, "retained_tokens": 0,
+            "reserved_pages": 0, "parked_bytes": 0,
         })
         self.assertEqual(info["worker_placement"], {
             "mode": "budgeted", "profile": "capacity",
@@ -1375,7 +1768,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertIsNotNone(context)
         assert context is not None
         self.assertIsNone(context.session)
-        self.assertEqual(context.held_pages, 2)
+        self.assertEqual(context.held_pages, 0)
         self.assertEqual(len(list(app.generate([10, 11, 12], 2, context))), 2)
         app.release_request_context(context)
         self.assertTrue(context.retained)
@@ -1387,7 +1780,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertIsNotNone(context)
         assert context is not None
         self.assertIsNotNone(context.session)
-        self.assertEqual(context.held_pages, 3)
+        self.assertEqual(context.held_pages, 2)
         self.assertEqual(len(list(app.generate(followup, 2, context))), 1)
         app.release_request_context(context)
         self.assertTrue(context.retained)
@@ -1397,12 +1790,87 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         ])
         session = next(iter(app.sessions.values()))
         self.assertEqual(session.tokens, followup + [22])
-        self.assertEqual(session.pages, 3)
-        self.assertEqual(app.kv_reserved_pages, 3)
+        self.assertEqual(session.pages, 2)
+        self.assertEqual(app.kv_reserved_pages, 2)
 
         self.assertTrue(app.evict_lru_session())
         self.assertEqual(worker.retained, {})
         self.assertEqual(app.kv_reserved_pages, 0)
+
+    def test_cancelled_decode_retains_only_the_prompt_checkpoint(self) -> None:
+        class Worker:
+            session_retention = True
+            mtp_enabled = False
+            kv_page_tokens = 4
+            kv_page_capacity = 64
+
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+                self.retained: dict[int, int] = {}
+
+            def begin(self, request_id: int, _prompt: list[int],
+                      _context_limit: int,
+                      _sampling: SamplingSettings,
+                      **_kwargs: object) -> None:
+                self.active_ids.add(request_id)
+
+            def end_retain(self, request_id: int, session_key: int,
+                           checkpoint_tokens: int) -> tuple[int, int, int]:
+                self.active_ids.discard(request_id)
+                self.retained[session_key] = checkpoint_tokens
+                return checkpoint_tokens, 1, 4096
+
+            def drop_session(self, session_key: int) -> None:
+                self.retained.pop(session_key, None)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+            def stats(self) -> dict[str, int]:
+                return {}
+
+        class Batcher:
+            def step(self, _request_id: int, _final: bool,
+                     hold: bool = False) -> int:
+                return 9
+
+            def take_buffered(self, _request_id: int) -> list[int]:
+                return []
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return "".join(str(token) for token in tokens)
+
+        worker = Worker()
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            generation_timeout=10.0, disable_session_retention=False,
+            session_idle_seconds=1800.0, max_context=64,
+        )
+        app.request_id = lambda: 1
+        app.worker = worker
+        app.decode_batcher = Batcher()
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = set()
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+        app.worker_stats = lambda refresh=True: {}
+        app.kv_credit_lock = threading.Lock()
+        app.kv_reserved_pages = 0
+        app.session_lock = threading.Lock()
+        app.sessions = expert_server.OrderedDict()
+        app.next_session_key = 1
+        app.id_lock = threading.Lock()
+        context = expert_server.RequestContext(session=None, held_pages=0)
+
+        stream = app.generate([1, 2, 3], 8, context=context)
+        self.assertEqual(next(stream), (9, "9"))
+        stream.close()
+
+        self.assertTrue(context.retained)
+        self.assertEqual(list(app.sessions.values())[0].tokens, [1, 2, 3])
+        self.assertEqual(worker.retained, {1: 3})
+        self.assertEqual(worker.active_ids, set())
 
 
 if __name__ == "__main__":

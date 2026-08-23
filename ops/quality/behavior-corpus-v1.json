@@ -1,0 +1,67 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "exact-instruction",
+      "messages": [
+        {"role": "user", "content": "Reply with exactly ALPHA-17 and no other text."}
+      ],
+      "enable_thinking": false,
+      "reasoning_effort": "low",
+      "maximum_new_tokens": 16,
+      "expected": {"kind": "exact_text", "value": "ALPHA-17"}
+    },
+    {
+      "id": "arithmetic-reasoning",
+      "messages": [
+        {"role": "user", "content": "Compute 37 * 19. Return only the decimal result."}
+      ],
+      "enable_thinking": true,
+      "reasoning_effort": "xhigh",
+      "maximum_new_tokens": 96,
+      "expected": {"kind": "exact_text", "value": "703"}
+    },
+    {
+      "id": "coding-semantics",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Read this Python function:\n\ndef clamp(value, low, high):\n    return min(high, max(low, value))\n\nReturn only a JSON array containing clamp(-3, 0, 10), clamp(4, 0, 10), and clamp(14, 0, 10), in that order."
+        }
+      ],
+      "enable_thinking": true,
+      "reasoning_effort": "xhigh",
+      "maximum_new_tokens": 192,
+      "expected": {"kind": "json_equal", "value": [0, 4, 10]}
+    },
+    {
+      "id": "tool-selection",
+      "messages": [
+        {"role": "user", "content": "Use the available tool to get the current weather for Chisinau."}
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "get_weather",
+            "description": "Get current weather for a city.",
+            "parameters": {
+              "type": "object",
+              "properties": {"city": {"type": "string"}},
+              "required": ["city"],
+              "additionalProperties": false
+            }
+          }
+        }
+      ],
+      "enable_thinking": true,
+      "reasoning_effort": "xhigh",
+      "maximum_new_tokens": 128,
+      "expected": {
+        "kind": "tool_call",
+        "name": "get_weather",
+        "arguments": {"city": "Chisinau"}
+      }
+    }
+  ]
+}

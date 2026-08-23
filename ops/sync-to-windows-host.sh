@@ -22,7 +22,9 @@ ssh -o BatchMode=yes "${remote_host}" \
   cd "${repo_root}"
   git ls-files -z --cached --others --exclude-standard |
     while IFS= read -r -d '' path; do
-      [[ -e "${path}" ]] && printf '%s\0' "${path}"
+      if [[ -e "${path}" ]]; then
+        printf '%s\0' "${path}"
+      fi
     done
 ) | COPYFILE_DISABLE=1 tar \
   --format=ustar \

@@ -3,3 +3,6 @@ transformers==5.15.0
 # Transformers chat templates import Jinja lazily, so it is not guaranteed to
 # arrive with the tokenizer package itself.
 Jinja2==3.1.6
+# Official multimodal preprocessing uses the Pillow backend so the serving
+# environment remains independent of PyTorch/torchvision.
+Pillow==11.3.0

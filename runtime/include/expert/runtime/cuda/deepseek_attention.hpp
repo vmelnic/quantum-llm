@@ -34,6 +34,16 @@ class DeepSeekAttentionState final {
       void* destination, void* stream) const noexcept;
   [[nodiscard]] Status restore_speculative_state(
       const void* source, void* stream) noexcept;
+  // Retained-session checkpoints live in pinned host RAM. Explicit KV slots
+  // are position-addressed and are overwritten by replay; only the ratio-four
+  // recurrent compressor boundary must be copied to make rewind exact.
+  [[nodiscard]] std::uint64_t retention_checkpoint_bytes() const noexcept {
+    return speculative_checkpoint_bytes();
+  }
+  [[nodiscard]] Status checkpoint_retention_state(
+      void* host_destination, void* stream) const noexcept;
+  [[nodiscard]] Status restore_retention_state(
+      const void* host_source, void* stream) noexcept;
 
  private:
   friend DeepSeekAttentionStateResult create_deepseek_attention_state(

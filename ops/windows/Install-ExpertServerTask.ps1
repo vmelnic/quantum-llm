@@ -29,6 +29,8 @@ param(
     [double]$QueueTimeoutSeconds = 1.0,
     [double]$GenerationTimeoutSeconds = 120.0,
     [int]$MaximumBodyMiB = 16,
+    [ValidateRange(65536, 16777216)][int]$MaximumImagePixels = 2097152,
+    [ValidateRange(256, 32768)][int]$MaximumImagePatchTokens = 4096,
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
@@ -41,7 +43,8 @@ param(
 if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $MaximumContext -lt 2 -or $MaximumNewTokens -lt 1 -or
     $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1 -or
-    $MaximumBodyMiB -lt 1) {
+    $MaximumBodyMiB -lt 1 -or $MaximumImagePixels -lt 65536 -or
+    $MaximumImagePatchTokens -lt 256) {
     throw "Invalid service limits"
 }
 if (-not $TaskName) { $TaskName = "QuantumLLM-ExpertVm" }
@@ -90,6 +93,8 @@ $taskArguments.AddRange([string[]]@(
     "-QueueTimeoutSeconds", $QueueTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-GenerationTimeoutSeconds", $GenerationTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-MaximumBodyMiB", [string]$MaximumBodyMiB,
+    "-MaximumImagePixels", [string]$MaximumImagePixels,
+    "-MaximumImagePatchTokens", [string]$MaximumImagePatchTokens,
     "-StartupTimeoutSeconds", [string]$StartupTimeoutSeconds,
     "-DrainTimeoutSeconds", [string]$DrainTimeoutSeconds,
     "-BuildId", (Quote-TaskArgument $BuildId)
@@ -143,6 +148,8 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     maximum_context = $MaximumContext
     maximum_new_tokens = $MaximumNewTokens
     maximum_body_mib = $MaximumBodyMiB
+    maximum_image_pixels = $MaximumImagePixels
+    maximum_image_patch_tokens = $MaximumImagePatchTokens
     model_input = $Container
     placement_profile = $PlacementProfile
     worker_kv_cache_dtype = $WorkerKvCacheDtype

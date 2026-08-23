@@ -1,124 +1,148 @@
-# Expert Runtime
+# Quantum LLM
 
-Virtual memory for huge MoE models. Expert Runtime is an experimental
-Windows/CUDA inference engine for Mixture of Experts models whose checkpoints
-do not fit in GPU memory—and may not fit in system RAM. It tiers experts at
-record granularity across VRAM, RAM, and SSD with packed FP4 `__dp4a`
-kernels, keeping dense weights on the GPU.
+Quantum LLM is a native Windows/CUDA research runtime for exact inference when
+one model's useful state must be placed across GPU memory, system memory and
+NVMe. It is built for a self-contained RTX 3090 host and currently executes
+two materially different workloads through one artifact-driven VM:
 
-Two native backends run on a single RTX 3090: Qwen3-Next 80B from an Expert
-Pack (81.9 GB INT8, or the recommended 45.4 GB FP4 variant) and
-DeepSeek-V4-Flash from its authenticated mixed-FP4/FP8 compact bundle. Both
-expose the same local HTTP API and lifecycle commands.
+- **Qwen3.8-27B FP4:** dense/hybrid weights in VRAM, recurrent state on the
+  GPU and progressively allocated exact F16 long-context KV in host RAM;
+- **DeepSeek-V4-Flash:** resident dense/shared organs plus exact top-6 routed
+  experts demand-paged through NVMe → RAM → VRAM.
 
-Measured on the reference host (docs/benchmarks.md): Qwen FP4 serves
-39.6–45.6 tok/s on resident routes and 5.3–16.9 tok/s on novel routes
-(~3–6x over int8 in the same configuration); DeepSeek decodes 4.41–4.56 tok/s
-on settled turns with GPU-only routed execution. The three-tier
-VRAM/RAM/disk hierarchy behind these numbers is documented in
-[Architecture](docs/architecture.md#serving-memory-hierarchy-measured).
+The project exists to control and measure *where each model organ lives and
+where its operation executes*. It does not pretend that generic weight
+offload makes a dense model fast, and it never reduces top-k or silently swaps
+exact F16 KV for a smaller representation.
 
-> **Project status:** research-quality runtime with a controlled pre-production
-> pilot profile. It is not a general production inference server yet. The
-> reference deployment accepts up to 65,536 context tokens and 8,192 output
-> tokens, but only 4,096 context tokens have completed the historical
-> long-context qualification gates. See
+> **Current status:** functional research/pilot software, not yet
+> production-ready for the 262K coding target. Qwen short-context service
+> works, but an exact-F16 262,001-token prefill measured 2,183.815 seconds.
+> DeepSeek works beyond RAM+VRAM through exact expert paging, but currently
+> measures about 0.89 end-to-end tok/s on the reference host. See
+> [Benchmarks](docs/benchmarks.md) and
 > [Production readiness](docs/production-readiness.md).
 
-## Why this exists
+## Why this architecture exists
 
-Conventional runtimes usually assume that all weights fit in GPU memory, unified
-memory, or RAM. Sparse MoE models activate only a fraction of their experts for
-each token. Expert Runtime exploits that sparsity:
+An LLM is not one uniform byte array. Its organs have different access
+patterns:
+
+```text
+                              every target call
+ dense matrices / recurrent state ───────────────────────────► GPU
+
+ Qwen full-attention KV       request-owned, every position ─► RAM today
+                                  bounded staging + compute ─► GPU
+
+ DeepSeek router/shared state every routed layer ────────────► GPU
+ routed expert pages          selected top-6 only ─► NVMe ⇄ RAM ⇄ GPU
+```
+
+Streaming every dense layer from disk only solves capacity and usually
+destroys tokens/second. Conversely, requiring every MoE expert in GPU memory
+wastes the sparsity that makes a trillion-parameter checkpoint executable.
+Quantum LLM makes those policies explicit in an authenticated artifact:
 
 ```text
 SafeTensors checkpoint
-        │ architecture-specific compiler
+        │ strict source adapter
         ▼
-Qwen Expert Pack / DeepSeek compact bundle
-        ├── dense + shared state ───────────────► persistent GPU residency
-        └── independently indexed experts ─► SSD/RAM/VRAM placement
-                                                       │
-OpenAI-compatible API ─► exact router ─► active experts ─┴─► stable aggregation
+transactional artifact below ${MODEL_ROOT}
+  manifest + hashes + tokenizer/processor assets
+  compute-ready QPack or authenticated expert records
+  runtime-model.tsv: operations, geometry, encodings, capabilities
+        │
+        ▼
+common HTTP service ─► common native VM ─► capability providers
+        │                                      │
+ session/admission                    per-organ placement and telemetry
+        └──────────────────────────────────────┘
 ```
 
-The runtime validates every manifest, pack, record ABI, size, and checksum
-before readiness. Missing experts fail the request; they are never silently
-dropped.
+The common service and VM do not branch on Qwen, DeepSeek, layer counts or
+family tensor paths. A source adapter understands an upstream checkpoint's
+names; the published program then drives execution. New mathematics or a new
+encoding needs a provider and numerical qualification, not a second server,
+task or deployment path.
 
-## What works
+## What it provides today
 
-- deterministic Qwen FP4 Expert Pack and DeepSeek compact-bundle
-  conversion;
-- strict adapters for OLMoE, Qwen3-Next, and DeepSeek-V4-Flash;
-- Windows IOCP storage, bounded RAM/VRAM caches, pinned staging, and CUDA SM86;
-- native Qwen3-Next and DeepSeek-V4-Flash greedy inference with packed
-  `__dp4a` FP4 expert kernels;
-- paged FP16 KV with per-request credits and constant-memory online attention;
-- retained sessions with prefill-delta reuse across turns;
-- continuous decode batching with isolated request state;
-- Responses, Chat Completions, and legacy Completions HTTP APIs;
-- SSE streaming, usage, cancellation, overload handling, health and metrics;
-- reproducible Windows build, correctness gates, and Task Scheduler deployment.
+- source-pinned, transactionally published Qwen FP4 and DeepSeek artifacts;
+- one capability-driven model program and native runner for both models;
+- packed FP4 E2M1/UE8M0 SM86 kernels and exact format reporting;
+- Windows IOCP, bounded staging and protected RAM/VRAM expert caches;
+- exact DeepSeek top-k with per-tier hits, reloads, bytes and wait telemetry;
+- progressive exact-F16 Qwen KV, retained sessions, transactional resume,
+  rewind and cancellation;
+- OpenAI and Anthropic-compatible local APIs, tools, thinking and Qwen image
+  input (not image generation);
+- Pi integration, lifecycle automation and fail-closed artifact validation.
 
-A separate KV-attach Memory Expert experiment — attaching newly ingested
-evidence to a frozen model without prompt stuffing or per-ingest retraining —
-was validated here and extracted into the standalone public project at
-`../memory-expert`.
+It does **not** yet provide fast exact 262K Qwen decode, true parallel Qwen
+agents, heterogeneous multi-GPU execution, broad model coverage or a hardened
+public-network edge.
+
+## How it compares
+
+| Project | Its strength | Why Quantum LLM is different |
+|---|---|---|
+| [Ollama](https://github.com/ollama/ollama) | simple local model acquisition and lifecycle on top of a broadly supported backend | Quantum LLM is not a desktop model manager; it exposes artifact ABIs, exact tier traffic and per-organ placement for two controlled research targets |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | portable GGUF inference, many quantizations/backends, CPU+GPU offload and a mature [server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | llama.cpp is the better general local runtime; Quantum LLM trades breadth for compute-ready records, native Windows expert paging and exact placement/accounting experiments |
+| [vLLM](https://docs.vllm.ai/) | high-throughput GPU serving, continuous batching, PagedAttention and tensor/pipeline parallelism | vLLM is the better resident/distributed production server; Quantum LLM targets a single host where sparse weights may exceed RAM+VRAM and storage traffic is part of the execution contract |
+| [SGLang](https://docs.sglang.io/) / [TensorRT-LLM](https://docs.nvidia.com/tensorrt-llm/) | production scheduling, prefix reuse, optimized attention and multi-GPU kernels | Quantum LLM has a far smaller serving surface; its focus is exact heterogeneous state ownership and old/new GPU organ placement, not replacing these schedulers |
+| [KTransformers](https://github.com/kvcache-ai/ktransformers) | optimized CPU/GPU heterogeneous MoE execution with hot experts on GPU | Quantum LLM adds an explicit NVMe tier, immutable logical expert pages and Windows IOCP, but is currently slower and narrower |
+| [AirLLM](https://github.com/lyogavin/airllm) | running oversized dense models by loading layers sequentially | Quantum LLM rejects per-token dense-layer streaming as its speed path; it pages only sparse routed experts and treats dense/KV organs separately |
+| [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | the closest overlap: expert offload/prefetch, activation caching, batching and multi-GPU MoE serving | SSD expert offload alone is therefore not a novelty claim. Quantum LLM's distinct work is its fail-closed compute-ready artifact/program ABI, exact byte/tier attribution and Qwen exact-KV plus Pascal/3090 organ-placement research |
+
+The honest advantage is not “faster than everything.” It is a controlled
+system in which a huge sparse model can execute exactly beyond RAM+VRAM and
+every representation, placement decision and transfer can be verified. The
+active research question is whether the same artifact VM can bind organs to an
+RTX 3090 plus Pascal HBM devices and turn that control into a demonstrated
+throughput advantage. Until the gates in [Roadmap](docs/roadmap.md) pass, that
+remains a target rather than a result.
 
 ## Quick start
 
-Read [Install, configure and use](docs/deployment.md) before downloading model
-artifacts. After the Windows/CUDA runtime and at least one model are prepared,
-copy the public configuration template on the POSIX control host:
+Read [Getting started](docs/getting-started.md) before downloading or
+converting a checkpoint. With a validated artifact already below `MODEL_ROOT`:
 
 ```bash
 cp .env.example .env
-# Set the remote host and model artifact paths in .env.
+# Set QUANTUM_LLM_REMOTE, QUANTUM_LLM_REMOTE_ROOT, MODEL_ROOT and API key.
 ./ops/model.sh install
-./ops/model.sh start              # CHAT_MODEL from .env
-./ops/model.sh chat
-```
-
-Switch models or release all GPU memory with the same command:
-
-```bash
 ./ops/model.sh start qwen
-./ops/model.sh start deepseek
+./ops/model.sh chat qwen
 ./ops/model.sh stop all
 ```
 
-End-to-end reproduction — platform, build, model download, FP4 pack
-compilation, first run, and service install — is covered by
-[Getting started](docs/getting-started.md); lifecycle and API usage by
-[Install, configure and use](docs/deployment.md).
+The same public path selects DeepSeek:
 
-## Documentation
+```bash
+./ops/model.sh start deepseek
+./ops/model.sh chat deepseek
+./ops/model.sh stop all
+```
 
-- [Architecture](docs/architecture.md)
-- [Getting started](docs/getting-started.md)
-- [Install, configure and use](docs/deployment.md)
-- [Expert Pack v1](docs/expert-pack-v1.md)
-- [DeepSeek compact pack v1](docs/deepseek-compact-pack-v1.md)
-- [Compute-ready representations](docs/compute-ready.md)
-- [Runtime contract](docs/expert-runtime.md)
-- [OpenAI-compatible API](docs/openai-api.md)
-- [Operations](docs/operations.md)
-- [Benchmarks and evidence](docs/benchmarks.md)
-- [Performance architecture review](docs/performance-architecture-review.md)
-- [Engineering history](docs/history.md)
-- [Production readiness](docs/production-readiness.md)
-- [Roadmap](docs/roadmap.md)
+For a coding harness, see [Pi CLI](docs/pi-cli.md). For the complete supported
+surface, start at the [documentation index](docs/README.md).
 
-## Scope boundaries
+## Repository map
 
-This project is not llama.cpp, Colibri, or a wrapper around either. It uses a
-compute-ready expert format and a GPU-driven heterogeneous placement runtime.
-Metal and distributed expert workers are design targets, not current backends.
+| Path | Responsibility |
+|---|---|
+| `compiler/` | strict checkpoint inspection, QPack compilation, DeepSeek descriptors/oracles and validation |
+| `core/` | platform-neutral artifact and feasibility contracts |
+| `runtime/` | common VM, caches, providers, worker protocol and CUDA kernels |
+| `ops/` | sync, build, download, publication, service and client workflows |
+| `schemas/` | active external request schemas only; executable artifacts use the compiler/native fail-closed validators |
+| `tests/` | compiler, API, behavior and integration contracts |
+| `docs/` | current architecture, evidence, interfaces, decisions and roadmap |
 
-Model weights are not included. Users are responsible for the model's license
-and for complying with its terms.
+Generated `work/`, `artifacts/`, `logs/`, `out/` and caches are not source.
+The former KV-attach Memory Expert experiment lives in the standalone sibling
+project `../memory-expert`.
 
-## License
-
-The source code is licensed under the [Apache License 2.0](LICENSE).
+Model weights are not included. Users are responsible for model licenses and
+their terms. Source code is licensed under the [Apache License 2.0](LICENSE).

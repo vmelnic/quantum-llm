@@ -302,7 +302,7 @@ def _make_qwen3_5_fixture(root: Path) -> None:
         "hidden_size": 32,
         "intermediate_size": 48,
         "num_heads": 2,
-        "num_position_embeddings": 8,
+        "num_position_embeddings": 16,
         "out_hidden_size": 32,
         "in_channels": 3,
         "patch_size": 2,
@@ -835,7 +835,7 @@ class ExpertPackTests(unittest.TestCase):
             self.assertEqual(adapted.experts, ())
             self.assertEqual(adapted.runtime_topology.components, ())
             self.assertEqual(len(adapted.runtime_topology.layers), 4)
-            self.assertEqual(len(adapted.runtime_topology.operations), 10)
+            self.assertEqual(len(adapted.runtime_topology.operations), 11)
             self.assertIsNotNone(adapted.runtime_topology.exact_decode)
             self.assertEqual(
                 adapted.runtime_topology.exact_decode.maximum_emitted_tokens,
@@ -907,6 +907,14 @@ class ExpertPackTests(unittest.TestCase):
                 program,
             )
             self.assertIn("ffn.swiglu.dense.fp4-block32.v1", program)
+            self.assertIn(
+                "vision.patch-transformer-merge.fp4-block32.v1", program
+            )
+            self.assertIn(
+                "input\tmultimodal\trequest.multimodal\t"
+                "request.multimodal.fp32.host.v1",
+                program,
+            )
             self.assertIn(
                 "exact_decode\t"
                 "decode.mtp.dense-full-attention.fp4-block32.exact.v1\t1\t2",

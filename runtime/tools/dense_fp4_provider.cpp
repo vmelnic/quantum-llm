@@ -11,14 +11,13 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#include <cstdlib>
 #include <filesystem>
-#include <fstream>
-#include <iomanip>
+#include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
@@ -30,6 +29,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -41,11 +41,15 @@ namespace ec = expert::runtime::cuda;
 constexpr std::string_view kHiddenAbi = "batch.hidden.f32.cuda.v1";
 constexpr std::string_view kTokenAbi = "batch.token-id.u32.host.v1";
 constexpr std::string_view kPositionAbi = "batch.position.u32.host.v1";
+constexpr std::string_view kMultimodalAbi =
+    "request.multimodal.fp32.host.v1";
 // Prefill reuses each decoded SM86 FP4 weight tile across four 128-row Tensor
 // Core tiles, while scalar/speculative decode retains the lower-latency DP4A
 // path. The provider publishes this geometry through its service contract;
 // no model-family branch selects it.
 constexpr std::uint32_t kWorkspaceRows = 512U;
+constexpr std::uint32_t kMaximumVisionPatches = 4096U;
+constexpr std::uint32_t kMaximumGpuSamplingTopK = 64U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
 constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 
@@ -63,223 +67,9 @@ TargetKvEncoding target_kv_encoding(std::string_view value) {
   throw std::runtime_error("unsupported target KV cache dtype");
 }
 
-struct ExactTierGateConfig final {
-  std::filesystem::path output;
-  std::filesystem::path kv_profile_output;
-  std::vector<std::uint32_t> fractions_ppm;
-  std::filesystem::path tree_output;
-  std::uint32_t tree_horizon{};
-  std::uint32_t tree_beam_width{};
-  std::uint32_t block_jacobi_iterations{};
-
-  [[nodiscard]] bool enabled() const noexcept {
-    return !output.empty() || !tree_output.empty() ||
-           !kv_profile_output.empty();
-  }
-  [[nodiscard]] bool tree_enabled() const noexcept {
-    return !tree_output.empty();
-  }
-  [[nodiscard]] bool full_context_fp4_draft() const noexcept {
-    return block_jacobi_iterations != 0U;
-  }
-};
-
-ExactTierGateConfig exact_tier_gate_from_environment() {
-  ExactTierGateConfig result;
-  const auto* output = std::getenv("QUANTUM_LLM_EXACT_TIER_GATE_OUTPUT");
-  const auto* tree_output =
-      std::getenv("QUANTUM_LLM_EXACT_TIER_TREE_OUTPUT");
-  const auto* kv_profile_output =
-      std::getenv("QUANTUM_LLM_EXACT_KV_PROFILE_OUTPUT");
-  const auto has_output = output != nullptr && *output != '\0';
-  const auto has_tree = tree_output != nullptr && *tree_output != '\0';
-  const auto has_kv_profile =
-      kv_profile_output != nullptr && *kv_profile_output != '\0';
-  if (!has_output && !has_tree && !has_kv_profile) return result;
-  if (has_kv_profile) result.kv_profile_output = kv_profile_output;
-  if (has_output) {
-    const auto* fractions =
-        std::getenv("QUANTUM_LLM_EXACT_TIER_GATE_FRACTIONS_PPM");
-    if (fractions == nullptr || *fractions == '\0')
-      throw std::runtime_error(
-          "exact-tier gate fractions are required when its output is set");
-    result.output = output;
-    std::string_view remaining(fractions);
-    while (!remaining.empty()) {
-      const auto separator = remaining.find(',');
-      const auto field = remaining.substr(0U, separator);
-      std::size_t consumed{};
-      const auto value = std::stoul(std::string(field), &consumed);
-      if (consumed != field.size() || value == 0U || value >= 1'000'000U)
-        throw std::runtime_error("invalid exact-tier gate fraction");
-      result.fractions_ppm.push_back(static_cast<std::uint32_t>(value));
-      if (separator == std::string_view::npos) break;
-      remaining.remove_prefix(separator + 1U);
-    }
-    std::sort(result.fractions_ppm.begin(), result.fractions_ppm.end());
-    if (std::adjacent_find(result.fractions_ppm.begin(),
-                           result.fractions_ppm.end()) !=
-        result.fractions_ppm.end())
-      throw std::runtime_error("exact-tier gate fraction is duplicated");
-  }
-  if (has_tree) {
-    const auto parse_tree_parameter = [](const char* name) {
-      const auto* text = std::getenv(name);
-      if (text == nullptr || *text == '\0')
-        throw std::runtime_error(std::string(name) + " is required");
-      std::size_t consumed{};
-      const auto value = std::stoul(text, &consumed);
-      if (consumed != std::strlen(text) || value == 0U ||
-          value > std::numeric_limits<std::uint32_t>::max())
-        throw std::runtime_error(std::string(name) + " is invalid");
-      return static_cast<std::uint32_t>(value);
-    };
-    result.tree_output = tree_output;
-    result.tree_horizon = parse_tree_parameter(
-        "QUANTUM_LLM_EXACT_TIER_TREE_HORIZON");
-    result.tree_beam_width = parse_tree_parameter(
-        "QUANTUM_LLM_EXACT_TIER_TREE_BEAM_WIDTH");
-    if (result.tree_horizon > kWorkspaceRows ||
-        static_cast<std::uint64_t>(result.tree_horizon) *
-                result.tree_beam_width >
-            128U)
-      throw std::runtime_error(
-          "exact-tier tree exceeds the bounded node contract");
-    const auto* iterations =
-        std::getenv("QUANTUM_LLM_EXACT_TIER_BLOCK_JACOBI_ITERATIONS");
-    if (iterations != nullptr && *iterations != '\0') {
-      std::size_t consumed{};
-      const auto value = std::stoul(iterations, &consumed);
-      if (consumed != std::strlen(iterations) || value == 0U ||
-          value > std::numeric_limits<std::uint32_t>::max())
-        throw std::runtime_error(
-            "QUANTUM_LLM_EXACT_TIER_BLOCK_JACOBI_ITERATIONS is invalid");
-      result.block_jacobi_iterations = static_cast<std::uint32_t>(value);
-      if (result.tree_beam_width != 1U ||
-          static_cast<std::uint64_t>(result.tree_horizon) *
-                  (result.block_jacobi_iterations + 1U) >
-              128U)
-        throw std::runtime_error(
-            "block-Jacobi trajectories exceed the bounded node contract");
-    }
-  }
-  return result;
-}
-
-struct Fp16EntropyProfile final {
-  std::uint64_t sampled_values{};
-  double raw_h0_bits{};
-  double token_xor_h0_bits{};
-  double token_delta_h0_bits{};
-  double channel_xor_h0_bits{};
-  double best_predictor_h0_bits{};
-};
-
-double histogram_entropy_bits(std::span<const std::uint64_t> histogram,
-                              std::uint64_t total) {
-  if (!total) return 0.0;
-  long double weighted_log{};
-  for (const auto count : histogram)
-    if (count)
-      weighted_log += static_cast<long double>(count) *
-                      std::log2(static_cast<long double>(count));
-  return static_cast<double>(
-      std::log2(static_cast<long double>(total)) - weighted_log / total);
-}
-
-Fp16EntropyProfile profile_fp16_sequence(const std::uint16_t* values,
-                                          std::uint32_t tokens,
-                                          std::uint32_t channels) {
-  if (!values || !tokens || !channels)
-    throw std::runtime_error("invalid FP16 entropy profile input");
-  constexpr std::uint32_t kMaximumSampleTokens = 1'024U;
-  constexpr std::size_t kHistogramBins = 65'536U;
-  const auto sampled_tokens = std::min(tokens, kMaximumSampleTokens);
-  // Four 64K histograms exceed the default Windows worker stack. Keep this
-  // diagnostic state on the heap so END cannot terminate the worker.
-  std::vector<std::uint64_t> histograms(4U * kHistogramBins);
-  const auto raw = std::span(histograms).subspan(0U, kHistogramBins);
-  const auto token_xor =
-      std::span(histograms).subspan(kHistogramBins, kHistogramBins);
-  const auto token_delta =
-      std::span(histograms).subspan(2U * kHistogramBins, kHistogramBins);
-  const auto channel_xor =
-      std::span(histograms).subspan(3U * kHistogramBins, kHistogramBins);
-  for (std::uint32_t sample = 0U; sample < sampled_tokens; ++sample) {
-    const auto token = sampled_tokens == 1U
-        ? 0U
-        : static_cast<std::uint32_t>(
-              static_cast<std::uint64_t>(sample) * (tokens - 1U) /
-              (sampled_tokens - 1U));
-    const auto row = static_cast<std::size_t>(token) * channels;
-    const auto previous_row = token == 0U ? row : row - channels;
-    for (std::uint32_t channel = 0U; channel < channels; ++channel) {
-      const auto value = values[row + channel];
-      const auto previous_token = values[previous_row + channel];
-      const auto previous_channel =
-          channel == 0U ? value : values[row + channel - 1U];
-      ++raw[value];
-      ++token_xor[value ^ previous_token];
-      ++token_delta[static_cast<std::uint16_t>(value - previous_token)];
-      ++channel_xor[value ^ previous_channel];
-    }
-  }
-  Fp16EntropyProfile result;
-  result.sampled_values =
-      static_cast<std::uint64_t>(sampled_tokens) * channels;
-  result.raw_h0_bits = histogram_entropy_bits(raw, result.sampled_values);
-  result.token_xor_h0_bits =
-      histogram_entropy_bits(token_xor, result.sampled_values);
-  result.token_delta_h0_bits =
-      histogram_entropy_bits(token_delta, result.sampled_values);
-  result.channel_xor_h0_bits =
-      histogram_entropy_bits(channel_xor, result.sampled_values);
-  result.best_predictor_h0_bits = std::min(
-      {result.raw_h0_bits, result.token_xor_h0_bits,
-       result.token_delta_h0_bits, result.channel_xor_h0_bits});
-  return result;
-}
-
-constexpr std::uint32_t kMaximumKvSampleTokens = 1'024U;
-
-std::uint32_t kv_sample_token(std::uint32_t sample,
-                              std::uint32_t sampled_tokens,
-                              std::uint32_t populated_tokens) {
-  return sampled_tokens == 1U
-             ? 0U
-             : static_cast<std::uint32_t>(
-                   static_cast<std::uint64_t>(sample) *
-                   (populated_tokens - 1U) / (sampled_tokens - 1U));
-}
-
-void write_u32(std::ofstream& output, std::uint32_t value) {
-  const std::array<char, 4U> bytes{
-      static_cast<char>(value & 0xffU),
-      static_cast<char>((value >> 8U) & 0xffU),
-      static_cast<char>((value >> 16U) & 0xffU),
-      static_cast<char>((value >> 24U) & 0xffU)};
-  output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-}
-
-void write_fp16_sample_stream(std::ofstream& output,
-                              const std::uint16_t* values,
-                              std::uint32_t populated_tokens,
-                              std::uint32_t sampled_tokens,
-                              std::uint32_t channels) {
-  for (std::uint32_t sample = 0U; sample < sampled_tokens; ++sample) {
-    const auto token =
-        kv_sample_token(sample, sampled_tokens, populated_tokens);
-    const auto current = static_cast<std::size_t>(token) * channels;
-    const auto previous = token == 0U ? current : current - channels;
-    output.write(reinterpret_cast<const char*>(values + current),
-                 static_cast<std::streamsize>(channels * sizeof(std::uint16_t)));
-    output.write(reinterpret_cast<const char*>(values + previous),
-                 static_cast<std::streamsize>(channels * sizeof(std::uint16_t)));
-  }
-}
-
 enum class Kernel : std::uint8_t {
   embedding,
+  vision,
   full_attention,
   recurrent_attention,
   ffn,
@@ -289,6 +79,7 @@ enum class Kernel : std::uint8_t {
 
 enum class GpuPhase : std::uint8_t {
   embedding,
+  vision,
   full_attention,
   recurrent_attention,
   ffn,
@@ -320,6 +111,146 @@ std::span<const std::uint32_t> host_u32_batch(
     throw std::runtime_error(std::string(description) + " ABI mismatch");
   return {reinterpret_cast<const std::uint32_t*>(value.data),
           static_cast<std::size_t>(value.bytes / sizeof(std::uint32_t))};
+}
+
+struct MediaImage final {
+  std::uint32_t prompt_offset{};
+  std::uint32_t merged_tokens{};
+  std::uint32_t temporal{};
+  std::uint32_t height{};
+  std::uint32_t width{};
+  std::uint32_t patch_offset{};
+};
+
+struct MediaPayload final {
+  std::vector<std::uint32_t> positions_thw;
+  std::vector<MediaImage> images;
+  std::vector<float> pixels;
+  std::uint32_t patch_dimension{};
+  std::uint32_t patch_count{};
+  std::int32_t rope_delta{};
+
+  [[nodiscard]] bool empty() const noexcept { return images.empty(); }
+};
+
+template <typename T>
+T media_field(const std::byte* data, std::size_t bytes,
+              std::size_t offset) {
+  static_assert(std::is_trivially_copyable_v<T>);
+  if (!data || offset > bytes || sizeof(T) > bytes - offset)
+    throw std::runtime_error("multimodal packet is truncated");
+  T result{};
+  std::memcpy(&result, data + offset, sizeof(result));
+  return result;
+}
+
+MediaPayload parse_media_payload(const er::ExecutionValue& value,
+                                 std::uint32_t prompt_tokens,
+                                 std::uint32_t expected_patch_dimension,
+                                 std::uint32_t spatial_merge) {
+  constexpr std::size_t kHeaderBytes = 40U;
+  constexpr std::size_t kImageBytes = 24U;
+  constexpr std::array<std::byte, 8U> kMagic{
+      std::byte{'Q'}, std::byte{'L'}, std::byte{'M'}, std::byte{'M'},
+      std::byte{'E'}, std::byte{'D'}, std::byte{'I'}, std::byte{'A'}};
+  if (!value.valid() || value.abi != kMultimodalAbi ||
+      value.memory_domain != "host" || value.bytes < kHeaderBytes ||
+      value.bytes > (128U << 20U))
+    throw std::runtime_error("multimodal request ABI mismatch");
+  const auto* data = value.data;
+  if (!std::equal(kMagic.begin(), kMagic.end(), data))
+    throw std::runtime_error("multimodal request magic is invalid");
+  const auto version = media_field<std::uint32_t>(data, value.bytes, 8U);
+  const auto flags = media_field<std::uint32_t>(data, value.bytes, 12U);
+  const auto packet_tokens =
+      media_field<std::uint32_t>(data, value.bytes, 16U);
+  const auto image_count =
+      media_field<std::uint32_t>(data, value.bytes, 20U);
+  const auto patch_dimension =
+      media_field<std::uint32_t>(data, value.bytes, 24U);
+  const auto patch_count =
+      media_field<std::uint32_t>(data, value.bytes, 28U);
+  const auto rope_delta =
+      media_field<std::int32_t>(data, value.bytes, 32U);
+  const auto reserved = media_field<std::uint32_t>(data, value.bytes, 36U);
+  if (version != 1U || reserved != 0U)
+    throw std::runtime_error("multimodal request version is unsupported");
+  if (image_count == 0U) {
+    if (flags != 0U || packet_tokens != 0U || patch_dimension != 0U ||
+        patch_count != 0U || rope_delta != 0 || value.bytes != kHeaderBytes)
+      throw std::runtime_error("empty multimodal request is malformed");
+    return {};
+  }
+  if (flags != 3U || !prompt_tokens || packet_tokens != prompt_tokens ||
+      !expected_patch_dimension || patch_dimension != expected_patch_dimension ||
+      !spatial_merge || image_count > 64U || !patch_count ||
+      patch_count > kMaximumVisionPatches)
+    throw std::runtime_error("multimodal request geometry is invalid");
+  const auto position_values = static_cast<std::uint64_t>(prompt_tokens) * 3U;
+  const auto descriptor_bytes =
+      static_cast<std::uint64_t>(image_count) * kImageBytes;
+  const auto pixel_values = static_cast<std::uint64_t>(patch_count) *
+                            patch_dimension;
+  const auto expected_bytes = static_cast<std::uint64_t>(kHeaderBytes) +
+      position_values * sizeof(std::uint32_t) + descriptor_bytes +
+      pixel_values * sizeof(float);
+  if (expected_bytes != value.bytes ||
+      position_values > std::numeric_limits<std::size_t>::max() ||
+      pixel_values > std::numeric_limits<std::size_t>::max())
+    throw std::runtime_error("multimodal request size is inconsistent");
+  MediaPayload result;
+  result.patch_dimension = patch_dimension;
+  result.patch_count = patch_count;
+  result.rope_delta = rope_delta;
+  result.positions_thw.resize(static_cast<std::size_t>(position_values));
+  std::size_t cursor = kHeaderBytes;
+  std::memcpy(result.positions_thw.data(), data + cursor,
+              result.positions_thw.size() * sizeof(std::uint32_t));
+  cursor += result.positions_thw.size() * sizeof(std::uint32_t);
+  result.images.reserve(image_count);
+  std::uint32_t next_patch{};
+  std::uint32_t previous_prompt_end{};
+  for (std::uint32_t index = 0U; index < image_count; ++index) {
+    MediaImage image;
+    image.prompt_offset = media_field<std::uint32_t>(data, value.bytes,
+                                                     cursor + 0U);
+    image.merged_tokens = media_field<std::uint32_t>(data, value.bytes,
+                                                     cursor + 4U);
+    image.temporal = media_field<std::uint32_t>(data, value.bytes,
+                                                cursor + 8U);
+    image.height = media_field<std::uint32_t>(data, value.bytes,
+                                              cursor + 12U);
+    image.width = media_field<std::uint32_t>(data, value.bytes,
+                                             cursor + 16U);
+    image.patch_offset = media_field<std::uint32_t>(data, value.bytes,
+                                                    cursor + 20U);
+    cursor += kImageBytes;
+    const auto patches = static_cast<std::uint64_t>(image.temporal) *
+                         image.height * image.width;
+    const auto merge_area = static_cast<std::uint64_t>(spatial_merge) *
+                            spatial_merge;
+    if (!image.temporal || !image.height || !image.width ||
+        image.height % spatial_merge || image.width % spatial_merge ||
+        patches / merge_area != image.merged_tokens ||
+        image.patch_offset != next_patch ||
+        patches > patch_count - next_patch || !image.merged_tokens ||
+        image.prompt_offset < previous_prompt_end ||
+        image.prompt_offset > prompt_tokens ||
+        image.merged_tokens > prompt_tokens - image.prompt_offset)
+      throw std::runtime_error("multimodal image descriptor is invalid");
+    next_patch += static_cast<std::uint32_t>(patches);
+    previous_prompt_end = image.prompt_offset + image.merged_tokens;
+    result.images.push_back(image);
+  }
+  if (next_patch != patch_count)
+    throw std::runtime_error("multimodal patch coverage is incomplete");
+  result.pixels.resize(static_cast<std::size_t>(pixel_values));
+  std::memcpy(result.pixels.data(), data + cursor,
+              result.pixels.size() * sizeof(float));
+  if (std::any_of(result.pixels.begin(), result.pixels.end(),
+                  [](float value) { return !std::isfinite(value); }))
+    throw std::runtime_error("multimodal pixels contain non-finite values");
+  return result;
 }
 
 template <typename T>
@@ -366,21 +297,80 @@ std::uint64_t splitmix64(std::uint64_t value) noexcept {
   return value ^ (value >> 31U);
 }
 
-std::uint32_t sample_token(std::span<const float> logits,
-                           const er::ProgramRequestContext& request,
-                           std::uint32_t position) {
+std::uint32_t sample_sorted_candidates(
+    std::span<const float> logits, std::span<const std::uint32_t> candidates,
+    const er::ProgramRequestContext& request, std::uint32_t position) {
   const auto temperature_ppm =
       request_parameter(request, "sampling_temperature_ppm");
   const auto top_p_ppm = request_parameter(request, "sampling_top_p_ppm");
-  const auto top_k_value = request_parameter(request, "sampling_top_k");
   const auto min_p_ppm = request_parameter(request, "sampling_min_p_ppm");
   const auto seed = request_parameter(request, "sampling_seed");
-  if (logits.empty() || temperature_ppm == 0U ||
+  if (logits.empty() || logits.size() != candidates.size() ||
+      temperature_ppm == 0U ||
       temperature_ppm > 2'000'000U || top_p_ppm == 0U ||
-      top_p_ppm > 1'000'000U || top_k_value > logits.size() ||
-      min_p_ppm > 1'000'000U)
+      top_p_ppm > 1'000'000U || min_p_ppm > 1'000'000U ||
+      !std::isfinite(logits.front()))
     throw std::runtime_error("invalid token sampling contract");
 
+  const auto inverse_temperature =
+      1'000'000.0 / static_cast<double>(temperature_ppm);
+  const auto maximum = static_cast<double>(logits.front());
+  const auto minimum_relative =
+      static_cast<double>(min_p_ppm) / 1'000'000.0;
+  std::vector<double> weights;
+  weights.reserve(candidates.size());
+  std::vector<std::uint32_t> retained_candidates;
+  retained_candidates.reserve(candidates.size());
+  std::size_t retained{};
+  double total{};
+  for (std::size_t index = 0U; index < candidates.size(); ++index) {
+    const auto logit = static_cast<double>(logits[index]);
+    const auto weight = std::isfinite(logit)
+                            ? std::exp((logit - maximum) * inverse_temperature)
+                            : 0.0;
+    if (weight < minimum_relative) continue;
+    retained_candidates.push_back(candidates[index]);
+    ++retained;
+    weights.push_back(weight);
+    total += weight;
+  }
+  if (!retained || !std::isfinite(total) || !(total > 0.0))
+    throw std::runtime_error("token sampling distribution is empty");
+
+  const auto top_p = static_cast<double>(top_p_ppm) / 1'000'000.0;
+  double cumulative{};
+  std::size_t nucleus = weights.size();
+  for (std::size_t index = 0U; index < weights.size(); ++index) {
+    cumulative += weights[index] / total;
+    if (cumulative >= top_p) {
+      nucleus = index + 1U;
+      break;
+    }
+  }
+  weights.resize(nucleus);
+  retained_candidates.resize(nucleus);
+  total = std::accumulate(weights.begin(), weights.end(), 0.0);
+
+  const auto random_bits = splitmix64(
+      seed ^ (static_cast<std::uint64_t>(position) *
+              0xd2b74407b1ce6e93ULL));
+  const auto uniform = static_cast<double>(random_bits >> 11U) *
+                       (1.0 / 9007199254740992.0);
+  const auto threshold = uniform * total;
+  cumulative = 0.0;
+  for (std::size_t index = 0U; index < weights.size(); ++index) {
+    cumulative += weights[index];
+    if (threshold < cumulative) return retained_candidates[index];
+  }
+  return retained_candidates.back();
+}
+
+std::uint32_t sample_token(std::span<const float> logits,
+                           const er::ProgramRequestContext& request,
+                           std::uint32_t position) {
+  const auto top_k_value = request_parameter(request, "sampling_top_k");
+  if (logits.empty() || top_k_value > logits.size())
+    throw std::runtime_error("invalid token sampling contract");
   const auto candidate_count = static_cast<std::size_t>(
       top_k_value == 0U ? logits.size() : top_k_value);
   std::vector<std::uint32_t> candidates(logits.size());
@@ -400,58 +390,12 @@ std::uint32_t sample_token(std::span<const float> logits,
   } else {
     std::sort(candidates.begin(), candidates.end(), greater_logit);
   }
-  if (candidates.empty() || !std::isfinite(logits[candidates.front()]))
-    throw std::runtime_error("token logits contain no finite candidate");
-
-  const auto inverse_temperature =
-      1'000'000.0 / static_cast<double>(temperature_ppm);
-  const auto maximum = static_cast<double>(logits[candidates.front()]);
-  const auto minimum_relative =
-      static_cast<double>(min_p_ppm) / 1'000'000.0;
-  std::vector<double> weights;
-  weights.reserve(candidates.size());
-  std::size_t retained{};
-  double total{};
-  for (const auto token : candidates) {
-    const auto logit = static_cast<double>(logits[token]);
-    const auto weight = std::isfinite(logit)
-                            ? std::exp((logit - maximum) * inverse_temperature)
-                            : 0.0;
-    if (weight < minimum_relative) continue;
-    candidates[retained++] = token;
-    weights.push_back(weight);
-    total += weight;
-  }
-  candidates.resize(retained);
-  if (candidates.empty() || !std::isfinite(total) || !(total > 0.0))
-    throw std::runtime_error("token sampling distribution is empty");
-
-  const auto top_p = static_cast<double>(top_p_ppm) / 1'000'000.0;
-  double cumulative{};
-  std::size_t nucleus = weights.size();
-  for (std::size_t index = 0U; index < weights.size(); ++index) {
-    cumulative += weights[index] / total;
-    if (cumulative >= top_p) {
-      nucleus = index + 1U;
-      break;
-    }
-  }
-  weights.resize(nucleus);
-  candidates.resize(nucleus);
-  total = std::accumulate(weights.begin(), weights.end(), 0.0);
-
-  const auto random_bits = splitmix64(
-      seed ^ (static_cast<std::uint64_t>(position) *
-              0xd2b74407b1ce6e93ULL));
-  const auto uniform = static_cast<double>(random_bits >> 11U) *
-                       (1.0 / 9007199254740992.0);
-  const auto threshold = uniform * total;
-  cumulative = 0.0;
-  for (std::size_t index = 0U; index < weights.size(); ++index) {
-    cumulative += weights[index];
-    if (threshold < cumulative) return candidates[index];
-  }
-  return candidates.back();
+  std::vector<float> sorted_logits;
+  sorted_logits.reserve(candidates.size());
+  for (const auto candidate : candidates)
+    sorted_logits.push_back(logits[candidate]);
+  return sample_sorted_candidates(sorted_logits, candidates, request,
+                                  position);
 }
 
 er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
@@ -474,6 +418,12 @@ er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
   const auto value_dim = parameter("linear_value_head_dim");
   const auto conv = parameter("linear_conv_kernel");
   const auto mtp = parameter("mtp_layers");
+  const auto vision = std::any_of(
+      model.operation_program.begin(), model.operation_program.end(),
+      [](const auto& operation) {
+        return operation.capability ==
+               "vision.patch-transformer-merge.fp4-block32.v1";
+      });
   if (!query_heads || !kv_heads || query_heads % kv_heads ||
       query_heads / kv_heads > 8U || !head_dim || head_dim > 256U ||
       head_dim % 32U || !rotary || rotary > head_dim || rotary % 2U ||
@@ -484,6 +434,30 @@ er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
       (!model.exact_decode_program.has_value() && mtp != 0U))
     return {er::ErrorCode::invalid_argument,
             "dense FP4 descriptor exceeds the SM86 provider geometry"};
+  if (vision) {
+    const auto vision_hidden = parameter("vision_hidden_size");
+    const auto vision_heads = parameter("vision_heads");
+    const auto vision_merge = parameter("vision_spatial_merge_size");
+    const auto positions = parameter("vision_position_embeddings");
+    const auto grid = parameter("vision_grid_side");
+    const auto section_zero = parameter("mrope_section_0");
+    const auto section_one = parameter("mrope_section_1");
+    const auto section_two = parameter("mrope_section_2");
+    if (!parameter("vision_depth") || !vision_hidden || !vision_heads ||
+        vision_hidden % vision_heads || vision_hidden / vision_heads > 256U ||
+        (vision_hidden / vision_heads) % 4U ||
+        !parameter("vision_intermediate_size") ||
+        !parameter("vision_channels") ||
+        !parameter("vision_patch_size") ||
+        !parameter("vision_temporal_patch_size") || !vision_merge ||
+        vision_merge > 4U || parameter("vision_output_size") !=
+                               model.hidden_size ||
+        !positions || !grid || grid * grid != positions ||
+        !section_zero || !section_one || !section_two ||
+        section_zero + section_one + section_two != rotary / 2U)
+      return {er::ErrorCode::invalid_argument,
+              "vision descriptor exceeds the SM86 provider geometry"};
+  }
   return er::Status::success();
 }
 
@@ -493,6 +467,8 @@ std::vector<er::KernelCapability> provider_capabilities() {
   };
   return {
       {"embedding.lookup.fp4-block32.v1", 1U, 1U, validator},
+      {"vision.patch-transformer-merge.fp4-block32.v1", 1U, 1U,
+       validator},
       {"block.full-attention.output-gated.v1", 1U, 1U, validator},
       {"block.recurrent-linear-attention.split-gated-delta.v1", 1U, 1U,
        validator},
@@ -507,6 +483,8 @@ std::vector<er::KernelCapability> provider_capabilities() {
 Kernel kernel_from_capability(std::string_view capability) {
   if (capability == "embedding.lookup.fp4-block32.v1")
     return Kernel::embedding;
+  if (capability == "vision.patch-transformer-merge.fp4-block32.v1")
+    return Kernel::vision;
   if (capability == "block.full-attention.output-gated.v1")
     return Kernel::full_attention;
   if (capability ==
@@ -541,6 +519,18 @@ struct DeviceTensor final {
       throw std::runtime_error(name + " is not a rank-2 FP4 matrix");
     return {fp4_data, fp4_scales, shape[0], shape[1], align32(shape[1])};
   }
+
+  [[nodiscard]] ec::Fp4Block32Matrix flattened_matrix() const {
+    if (encoding != "FP4_E2M1" || shape.size() < 2U || !fp4_data ||
+        !fp4_scales)
+      throw std::runtime_error(name + " is not an FP4 tensor matrix");
+    const auto columns = checked_product(std::span(shape).subspan(1U));
+    if (columns > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error(name + " flattened matrix is too wide");
+    return {fp4_data, fp4_scales, shape[0],
+            static_cast<std::uint32_t>(columns),
+            align32(static_cast<std::uint32_t>(columns))};
+  }
 };
 
 struct PreparedOperation final : er::IPreparedOperation {
@@ -563,13 +553,14 @@ class DenseFp4Provider final : public er::IOperationProvider {
                    std::uint64_t vram_cache_bytes,
                    std::uint64_t kv_cache_bytes,
                    std::uint32_t kv_page_tokens,
-                   std::string_view kv_cache_dtype)
+                   std::string_view kv_cache_dtype,
+                   bool profile_gpu_phases)
       : descriptor_(std::move(descriptor)), tensor_store_(std::move(tensor_store)),
         max_context_(max_context), capacity_(capacity),
         ram_cache_bytes_(ram_cache_bytes), vram_cache_bytes_(vram_cache_bytes),
         kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens),
         target_kv_encoding_(target_kv_encoding(kv_cache_dtype)),
-        exact_tier_gate_(exact_tier_gate_from_environment()),
+        profile_gpu_phases_(profile_gpu_phases),
         device_lifetime_(std::make_shared<std::uint8_t>(0U)) {
     status_check(validate_dense_fp4_descriptor(descriptor_));
     if (!tensor_store_ || !tensor_store_->valid() || !capacity_ ||
@@ -590,6 +581,43 @@ class DenseFp4Provider final : public er::IOperationProvider {
     epsilon_ = attribute_f32("norm_epsilon_f32_bits");
     rope_theta_ = attribute_f32("rope_theta_f32_bits");
     mtp_layers_ = attribute_u32("mtp_layers");
+    vision_enabled_ = std::any_of(
+        descriptor_.operation_program.begin(),
+        descriptor_.operation_program.end(), [](const auto& operation) {
+          return operation.capability ==
+                 "vision.patch-transformer-merge.fp4-block32.v1";
+        });
+    if (vision_enabled_) {
+      mrope_sections_ = {attribute_u32("mrope_section_0"),
+                         attribute_u32("mrope_section_1"),
+                         attribute_u32("mrope_section_2")};
+      vision_depth_ = attribute_u32("vision_depth");
+      vision_hidden_size_ = attribute_u32("vision_hidden_size");
+      vision_intermediate_size_ =
+          attribute_u32("vision_intermediate_size");
+      vision_heads_ = attribute_u32("vision_heads");
+      vision_head_dim_ = vision_hidden_size_ / vision_heads_;
+      vision_position_embeddings_ =
+          attribute_u32("vision_position_embeddings");
+      vision_grid_side_ = attribute_u32("vision_grid_side");
+      vision_channels_ = attribute_u32("vision_channels");
+      vision_patch_size_ = attribute_u32("vision_patch_size");
+      vision_temporal_patch_size_ =
+          attribute_u32("vision_temporal_patch_size");
+      vision_spatial_merge_size_ =
+          attribute_u32("vision_spatial_merge_size");
+      vision_output_size_ = attribute_u32("vision_output_size");
+      vision_epsilon_ = attribute_f32("vision_norm_epsilon_f32_bits");
+      vision_rope_theta_ = attribute_f32("vision_rope_theta_f32_bits");
+      const auto patch_dimension = static_cast<std::uint64_t>(vision_channels_) *
+          vision_temporal_patch_size_ * vision_patch_size_ *
+          vision_patch_size_;
+      if (patch_dimension > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("vision patch dimension overflows");
+      vision_patch_dimension_ = static_cast<std::uint32_t>(patch_dimension);
+      vision_merged_width_ = vision_hidden_size_ *
+          vision_spatial_merge_size_ * vision_spatial_merge_size_;
+    }
     full_attention_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
     recurrent_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
     for (const auto& operation : descriptor_.operation_program) {
@@ -607,19 +635,6 @@ class DenseFp4Provider final : public er::IOperationProvider {
         target_full_layers_ + mtp_layers_ >
             std::numeric_limits<std::uint32_t>::max())
       throw std::runtime_error("full-attention topology is inconsistent");
-    if (exact_tier_gate_.enabled() && !descriptor_.exact_decode_program)
-      throw std::runtime_error(
-          "exact-tier gate requires an artifact-declared exact decoder");
-    if (exact_tier_gate_.enabled() &&
-        target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head)
-      throw std::runtime_error(
-          "exact-tier F16 gate cannot override FP8 KV");
-    if (exact_tier_gate_.tree_enabled() && capacity_ != 1U)
-      throw std::runtime_error(
-          "exact-tier tree capture requires worker capacity one");
-    if (!exact_tier_gate_.kv_profile_output.empty() && capacity_ != 1U)
-      throw std::runtime_error(
-          "exact FP16 KV profiling requires worker capacity one");
     const auto fp4_record_bytes = static_cast<std::uint64_t>(
         head_dim_ / 2U + head_dim_ / 32U);
     const auto fp4_layer_page_bytes =
@@ -640,10 +655,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     } else {
       const auto target_device_layers =
-          authoritative_fp16_kv() &&
-                  !exact_tier_gate_.full_context_fp4_draft()
-              ? 0U
-              : target_full_layers_;
+          authoritative_fp16_kv() ? 0U : target_full_layers_;
       target_kv_page_bytes_ =
           static_cast<std::uint64_t>(target_device_layers) *
           fp4_layer_page_bytes;
@@ -668,48 +680,25 @@ class DenseFp4Provider final : public er::IOperationProvider {
     service_kv_page_bytes_ = authoritative_fp16_kv()
         ? fp16_target_page_bytes + mtp_kv_page_bytes_
         : kv_page_bytes_;
-    service_kv_page_capacity_ = kv_page_capacity_;
-    if (authoritative_fp16_kv()) {
-      const auto required = fp16_target_page_bytes *
-                            static_cast<std::uint64_t>(maximum_pages_per_slot_) *
-                            capacity_;
-      if (required > ram_cache_bytes_)
-        throw std::runtime_error(
-            "exact-tier authoritative FP16 KV exceeds the RAM budget");
-      if (!exact_tier_gate_.output.empty()) {
-        gate_output_.open(exact_tier_gate_.output,
-                          std::ios::out | std::ios::trunc);
-        if (!gate_output_)
-          throw std::runtime_error("cannot create exact-tier gate output");
-        gate_output_ << "position\tfraction_ppm\tretained_first_token\t"
-                        "exact_token\tapprox_token\trank\n";
-      }
-      if (exact_tier_gate_.tree_enabled()) {
-        tree_output_.open(exact_tier_gate_.tree_output,
-                          std::ios::out | std::ios::trunc);
-        if (!tree_output_)
-          throw std::runtime_error(
-              "cannot create exact-tier tree output");
-        tree_output_ << "start_position\thorizon\tbeam_width\tnodes\t"
-                        "proposer_ns\tpeak_host_bytes\taccepted_depth\t"
-                        "termination\n";
-      }
-    }
+    service_kv_page_capacity_ = authoritative_fp16_kv()
+        ? ram_cache_bytes_ / service_kv_page_bytes_
+        : kv_page_capacity_;
+    if (!service_kv_page_capacity_)
+      throw std::runtime_error("KV RAM budget fits no service page");
     prepared_target_.resize(descriptor_.operation_program.size());
     slot_in_use_.assign(capacity_, false);
+    slot_rope_deltas_.assign(capacity_, 0);
   }
 
   ~DenseFp4Provider() override {
+    if (parking_stream_)
+      static_cast<void>(cudaStreamDestroy(parking_stream_));
     for (auto& event : gpu_event_pool_) {
       if (event.start) static_cast<void>(cudaEventDestroy(event.start));
       if (event.stop) static_cast<void>(cudaEventDestroy(event.stop));
     }
     for (auto* page : all_kv_pages_)
       if (page) static_cast<void>(cudaFree(page));
-    for (auto& slot : host_kv_)
-      for (auto& layer : slot)
-        if (layer.allocation)
-          static_cast<void>(cudaFreeHost(layer.allocation));
     for (auto* allocation : allocations_)
       if (allocation) static_cast<void>(cudaFree(allocation));
   }
@@ -806,6 +795,16 @@ class DenseFp4Provider final : public er::IOperationProvider {
   er::Status rewind_request_state(
       const std::shared_ptr<er::IOperationProviderRequestState>& state,
       std::uint32_t next_position) override;
+  [[nodiscard]] bool supports_request_state_parking()
+      const noexcept override {
+    return true;
+  }
+  er::RequestStateParkingResult park_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      std::uint32_t next_position) override;
+  er::RequestStateParkingResult restore_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state)
+      override;
   er::Status synchronize_exact_decode(
       const er::IPreparedOperation& operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& state,
@@ -829,8 +828,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
     return kv_page_tokens_;
   }
   [[nodiscard]] bool authoritative_fp16_kv() const noexcept {
-    return exact_tier_gate_.enabled() ||
-           target_kv_encoding_ == TargetKvEncoding::fp16;
+    return target_kv_encoding_ == TargetKvEncoding::fp16;
   }
   [[nodiscard]] std::string_view target_kv_dtype() const noexcept {
     if (authoritative_fp16_kv()) return "fp16";
@@ -840,6 +838,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
   }
   [[nodiscard]] std::map<std::string, std::uint64_t, std::less<>> telemetry()
       const {
+    std::uint64_t resident_pages{};
+    for (const auto& slot : slot_pages_)
+      resident_pages += static_cast<std::uint64_t>(std::count_if(
+          slot.begin(), slot.end(), [](const void* page) { return page; }));
     return {{"resident_tensor_bytes", uploaded_tensor_bytes_},
             {"provider_program_steps", program_steps_},
             {"provider_prefill_batches", prefill_batches_},
@@ -850,11 +852,26 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_accepted_drafts", accepted_drafts_},
             {"provider_program_sequence_batches", program_sequence_batches_},
             {"provider_program_sequence_tokens", program_sequence_tokens_},
+            {"provider_program_sequence_tiles", program_sequence_tiles_},
+            {"provider_program_sequence_device_bytes",
+             program_sequence_device_bytes_},
+            {"provider_program_sequence_host_bytes",
+             program_sequence_host_bytes_},
+            {"provider_program_sequence_tile_rows", sequence_tile_rows_},
+            {"provider_sampling_gpu_calls", sampling_gpu_calls_},
+            {"provider_sampling_host_calls", sampling_host_calls_},
+            {"provider_sampling_logit_transfer_bytes",
+             sampling_logit_transfer_bytes_},
             {"provider_staged_dense_weight_bytes",
              staged_dense_weight_capacity_bytes_},
             {"provider_gpu_measured_batches", gpu_measured_batches_},
             {"provider_gpu_embedding_ns",
              gpu_phase_ns_[static_cast<std::size_t>(GpuPhase::embedding)]},
+            {"provider_gpu_vision_ns",
+             gpu_phase_ns_[static_cast<std::size_t>(GpuPhase::vision)]},
+            {"provider_vision_batches", vision_batches_},
+            {"provider_vision_images", vision_images_},
+            {"provider_vision_patches", vision_patches_},
             {"provider_gpu_full_attention_ns",
              gpu_phase_ns_[static_cast<std::size_t>(
                  GpuPhase::full_attention)]},
@@ -868,26 +885,64 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_gpu_mtp_ns",
              gpu_phase_ns_[static_cast<std::size_t>(GpuPhase::mtp)]},
             {"provider_authoritative_fp16_kv_bytes", host_kv_bytes_},
+            {"provider_parked_request_bytes", parked_session_bytes_},
+            {"provider_request_park_calls", park_calls_},
+            {"provider_request_restore_calls", restore_calls_},
+            {"provider_park_device_to_host_bytes",
+             park_device_to_host_bytes_},
+            {"provider_restore_host_to_device_bytes",
+             restore_host_to_device_bytes_},
             {"provider_target_kv_page_bytes", target_kv_page_bytes_},
             {"provider_mtp_kv_page_bytes", mtp_kv_page_bytes_},
-            {"provider_exact_tier_gate_records", gate_records_},
-            {"provider_exact_tier_tree_cycles", tree_cycles_},
-            {"provider_exact_tier_tree_nodes", tree_nodes_},
-            {"provider_exact_tier_tree_proposer_ns", tree_proposer_ns_},
-            {"provider_exact_tier_tree_accepted_tokens",
-             tree_accepted_tokens_},
-            {"provider_exact_tier_tree_peak_host_bytes",
-             tree_peak_host_bytes_},
-            {"provider_exact_tier_block_jacobi_passes",
-             block_jacobi_passes_},
-            {"provider_exact_tier_block_jacobi_ns",
-             block_jacobi_ns_},
-            {"kv_allocated_pages", all_kv_pages_.size()}};
+            {"kv_allocated_pages", resident_pages},
+            {"kv_physical_pages", all_kv_pages_.size()}};
   }
 
  private:
   static constexpr std::uint32_t kNoSlot =
       std::numeric_limits<std::uint32_t>::max();
+
+  struct PinnedHostBuffer final {
+    PinnedHostBuffer() = default;
+    PinnedHostBuffer(const PinnedHostBuffer&) = delete;
+    PinnedHostBuffer& operator=(const PinnedHostBuffer&) = delete;
+    PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
+        : data(std::exchange(other.data, nullptr)),
+          bytes(std::exchange(other.bytes, 0U)) {}
+    PinnedHostBuffer& operator=(PinnedHostBuffer&& other) noexcept {
+      if (this == &other) return *this;
+      if (data) static_cast<void>(cudaFreeHost(data));
+      data = std::exchange(other.data, nullptr);
+      bytes = std::exchange(other.bytes, 0U);
+      return *this;
+    }
+    ~PinnedHostBuffer() {
+      if (data) static_cast<void>(cudaFreeHost(data));
+    }
+    void allocate(std::size_t size) {
+      if (!size || data) throw std::runtime_error("invalid pinned allocation");
+      void* allocation{};
+      cuda_check(cudaHostAlloc(&allocation, size, cudaHostAllocPortable),
+                 "allocate parked request blob");
+      data = static_cast<std::byte*>(allocation);
+      bytes = size;
+    }
+    std::byte* data{};
+    std::size_t bytes{};
+  };
+
+  struct ParkedRequestState final {
+    PinnedHostBuffer payload;
+    std::vector<std::uint32_t> page_indices;
+    std::uint32_t logical_pages{};
+    std::uint64_t page_payload_bytes{};
+    std::uint64_t bytes{};
+    std::uint64_t reported_bytes{};
+  };
+
+  struct HostKvPage final {
+    std::uint16_t* allocation{};
+  };
 
   struct GpuEventPair final {
     cudaEvent_t start{};
@@ -899,8 +954,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
    public:
     RequestState(DenseFp4Provider& provider, std::uint32_t slot) noexcept
         : provider_(provider), slot_(slot) {}
-    ~RequestState() override { provider_.release_slot(slot_); }
+    ~RequestState() override { provider_.release_request_state(*this); }
     [[nodiscard]] std::uint32_t slot() const noexcept { return slot_; }
+    [[nodiscard]] bool parked() const noexcept {
+      return parked_state.has_value();
+    }
     std::uint32_t current_position{};
     std::uint32_t current_batch_first{};
     std::uint32_t current_batch_rows{};
@@ -911,11 +969,19 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::uint32_t synchronized_token{};
     std::uint32_t draft_token{};
     std::uint32_t retention_position{};
+    std::int32_t rope_delta{};
+    std::vector<std::uint32_t> prompt_mrope_positions;
     std::vector<float> sequence_target_hidden;
     bool draft_valid{};
     bool retention_valid{};
+    bool exact_decode_enabled{};
+    std::vector<HostKvPage> host_kv_pages;
+    std::uint32_t host_kv_populated_tokens{};
+    std::uint64_t host_kv_bytes{};
+    std::optional<ParkedRequestState> parked_state;
 
    private:
+    friend class DenseFp4Provider;
     DenseFp4Provider& provider_;
     std::uint32_t slot_{};
   };
@@ -926,11 +992,17 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::vector<const PreparedOperation*> operations;
     std::vector<std::uint32_t> tokens;
     std::vector<std::uint32_t> positions;
+    // Allocated only when exact decode needs every target hidden row after
+    // prefill. Sampling keeps the working tile exclusively on the GPU.
     std::vector<float> hidden;
+    MediaPayload media;
+    std::size_t tile_first{};
+    std::size_t tile_rows{};
     std::size_t next_operation{};
     std::size_t next_row{};
     std::uint32_t retention_position{};
     std::atomic<bool> cancelled{};
+    bool vision_prepared{};
     bool terminal{};
   };
 
@@ -1012,7 +1084,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
           reinterpret_cast<const std::uint8_t*>(tensor->allocation);
       tensor->fp4_scales = reinterpret_cast<const std::uint8_t*>(
           tensor->allocation + source.data_bytes);
-      if (source.shape.size() == 3U) {
+      if (source.shape.size() >= 3U) {
         const auto row_count = checked_product(
             std::span(source.shape).first(source.shape.size() - 1U));
         const auto columns = source.shape.back();
@@ -1059,6 +1131,18 @@ class DenseFp4Provider final : public er::IOperationProvider {
     if (!tensors_.emplace(source.name, std::move(tensor)).second)
       throw std::runtime_error("duplicate dense tensor upload");
     uploaded_tensor_bytes_ += source.data_bytes + source.scale_bytes;
+    ++uploaded_tensor_count_;
+    if (uploaded_tensor_bytes_ >= next_upload_progress_bytes_) {
+      const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now() - tensor_upload_started_);
+      std::cerr << "startup_phase=tensor_upload_progress tensors="
+                << uploaded_tensor_count_ << " bytes=" << uploaded_tensor_bytes_
+                << " elapsed_ms=" << elapsed.count() << '\n'
+                << std::flush;
+      do {
+        next_upload_progress_bytes_ += 1ULL << 30U;
+      } while (uploaded_tensor_bytes_ >= next_upload_progress_bytes_);
+    }
     return *result;
   }
 
@@ -1083,6 +1167,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   void initialize_execution();
   void allocate_workspace();
   void allocate_state();
+  void release_request_state(RequestState& state) noexcept;
   void release_slot(std::uint32_t slot) noexcept;
   [[nodiscard]] er::ExecutionValue device_hidden_value(
       std::uint32_t rows) const;
@@ -1113,16 +1198,27 @@ class DenseFp4Provider final : public er::IOperationProvider {
                          std::uint32_t rows);
   void project(const DeviceTensor& weight, const float* input, float* output,
                std::uint32_t rows);
+  void project_vision(const DeviceTensor& weight, const float* input,
+                      float* output, std::uint32_t rows);
+  void run_vision(const PreparedOperation& operation,
+                  const MediaPayload& media, float* tile_hidden,
+                  std::uint32_t prompt_rows, std::uint32_t tile_first,
+                  std::uint32_t tile_rows, bool prepare);
   void ensure_page(std::uint32_t slot, std::uint32_t cache_position);
-  void allocate_host_kv(std::uint32_t slot, std::uint32_t context_tokens);
-  void release_host_kv(std::uint32_t slot) noexcept;
-  void write_kv_profile(std::uint32_t slot);
+  void ensure_host_kv_page(RequestState& state, std::uint32_t cache_position);
+  void trim_host_kv(RequestState& state, std::uint32_t populated_tokens)
+      noexcept;
+  void release_host_kv(RequestState& state) noexcept;
+  [[nodiscard]] std::pair<std::uint16_t*, std::uint16_t*> host_kv_layer_page(
+      const RequestState& state, std::uint32_t full_attention_slot,
+      std::uint32_t page_index) const;
   void run_full_attention(const PreparedOperation& operation,
-                          std::uint32_t slot,
+                          RequestState& state,
                           std::span<const std::uint32_t> cache_positions,
                           std::span<const std::uint32_t> rotary_positions,
                           std::uint32_t rows,
-                          std::uint32_t full_attention_slot);
+                          std::uint32_t full_attention_slot,
+                          std::span<const std::uint32_t> mrope_positions = {});
   void run_recurrent_attention(const PreparedOperation& operation,
                                std::uint32_t slot, std::uint32_t rows,
                                bool checkpoint_after_first);
@@ -1133,7 +1229,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
                                       std::uint32_t sample_position,
                                       bool terminal_only = false);
   std::vector<std::uint32_t> run_target(
-      std::uint32_t slot, std::span<const std::uint32_t> tokens,
+      RequestState& state, std::span<const std::uint32_t> tokens,
       std::span<const std::uint32_t> positions, bool transactional_second);
   std::vector<std::uint32_t> run_mtp(
       RequestState& state, std::span<const std::uint32_t> tokens,
@@ -1141,13 +1237,6 @@ class DenseFp4Provider final : public er::IOperationProvider {
       std::span<const std::uint32_t> rotary_positions, bool produce_logits);
   void restore_recurrent_checkpoint(std::uint32_t slot);
   void checkpoint_recurrent_state(std::uint32_t slot);
-  void build_mtp_tree(RequestState& state, std::uint32_t position,
-                      std::uint32_t context_limit);
-  void refine_tree_with_block_jacobi(RequestState& state,
-                                     std::uint32_t position,
-                                     std::uint32_t context_limit);
-  void observe_mtp_tree(std::uint32_t exact_token);
-  void finish_mtp_tree(std::string_view termination);
   float* slot_last_hidden(std::uint32_t slot) const;
   float* recurrent_conv(std::uint32_t recurrent_slot,
                         std::uint32_t request_slot) const;
@@ -1178,6 +1267,24 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t target_full_layers_{};
   std::uint32_t recurrent_layers_{};
   std::uint32_t intermediate_size_{};
+  bool vision_enabled_{};
+  std::array<std::uint32_t, 3U> mrope_sections_{};
+  std::uint32_t vision_depth_{};
+  std::uint32_t vision_hidden_size_{};
+  std::uint32_t vision_intermediate_size_{};
+  std::uint32_t vision_heads_{};
+  std::uint32_t vision_head_dim_{};
+  std::uint32_t vision_position_embeddings_{};
+  std::uint32_t vision_grid_side_{};
+  std::uint32_t vision_channels_{};
+  std::uint32_t vision_patch_size_{};
+  std::uint32_t vision_temporal_patch_size_{};
+  std::uint32_t vision_spatial_merge_size_{};
+  std::uint32_t vision_output_size_{};
+  std::uint32_t vision_patch_dimension_{};
+  std::uint32_t vision_merged_width_{};
+  float vision_epsilon_{};
+  float vision_rope_theta_{};
   float epsilon_{};
   float rope_theta_{};
   std::uint64_t kv_page_bytes_{};
@@ -1188,25 +1295,21 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t maximum_pages_per_slot_{};
   std::uint64_t kv_page_capacity_{};
   std::uint64_t service_kv_page_capacity_{};
-  ExactTierGateConfig exact_tier_gate_;
-  std::ofstream gate_output_;
-  std::ofstream tree_output_;
-  std::uint32_t active_gate_fraction_ppm_{};
-  bool active_full_context_fp4_draft_{};
   std::uint64_t host_kv_bytes_{};
-  std::uint64_t gate_records_{};
-  std::uint64_t tree_cycles_{};
-  std::uint64_t tree_nodes_{};
-  std::uint64_t tree_proposer_ns_{};
-  std::uint64_t tree_accepted_tokens_{};
-  std::uint64_t tree_peak_host_bytes_{};
-  std::uint64_t block_jacobi_passes_{};
-  std::uint64_t block_jacobi_ns_{};
-  bool kv_profile_written_{};
-  std::uint32_t gate_device_slot_{kNoSlot};
-  std::uint32_t gate_device_layer_{kNoSlot};
-  std::uint32_t gate_device_context_{};
+  std::uint64_t parked_request_bytes_{};
+  std::uint64_t parked_session_bytes_{};
+  std::uint64_t park_calls_{};
+  std::uint64_t restore_calls_{};
+  std::uint64_t park_device_to_host_bytes_{};
+  std::uint64_t restore_host_to_device_bytes_{};
+  std::uint32_t staged_device_slot_{kNoSlot};
+  std::uint32_t staged_device_layer_{kNoSlot};
+  std::uint32_t staged_device_context_{};
   std::uint64_t uploaded_tensor_bytes_{};
+  std::uint64_t uploaded_tensor_count_{};
+  std::uint64_t next_upload_progress_bytes_{1ULL << 30U};
+  std::chrono::steady_clock::time_point tensor_upload_started_{
+      std::chrono::steady_clock::now()};
   std::uint64_t program_steps_{};
   std::uint64_t prefill_batches_{};
   std::uint64_t prefill_tokens_{};
@@ -1216,9 +1319,19 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t accepted_drafts_{};
   std::uint64_t program_sequence_batches_{};
   std::uint64_t program_sequence_tokens_{};
+  std::uint64_t program_sequence_tiles_{};
+  std::uint64_t program_sequence_device_bytes_{};
+  std::uint64_t program_sequence_host_bytes_{};
+  std::uint64_t sampling_gpu_calls_{};
+  std::uint64_t sampling_host_calls_{};
+  std::uint64_t sampling_logit_transfer_bytes_{};
+  std::uint64_t vision_batches_{};
+  std::uint64_t vision_images_{};
+  std::uint64_t vision_patches_{};
   std::array<std::uint64_t, static_cast<std::size_t>(GpuPhase::count)>
       gpu_phase_ns_{};
   std::uint64_t gpu_measured_batches_{};
+  bool profile_gpu_phases_{};
   std::vector<GpuEventPair> gpu_event_pool_;
   std::size_t active_gpu_events_{};
   std::vector<std::uint32_t> full_attention_slots_;
@@ -1232,6 +1345,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::shared_ptr<const void> device_lifetime_;
   std::mutex mutex_;
   std::vector<bool> slot_in_use_;
+  std::vector<std::int32_t> slot_rope_deltas_;
   bool initialized_{};
   const PreparedOperation* staged_operation_{};
   std::map<const DeviceTensor*, StagedDenseWeight> staged_weight_bindings_;
@@ -1241,6 +1355,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
 
   // Workspace and state are declared below with the execution methods.
   float* hidden_{};
+  float* sequence_hidden_{};
+  std::uint32_t sequence_tile_rows_{};
   float* normalized_{};
   float* residual_{};
   float* query_gate_{};
@@ -1257,7 +1373,22 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float* up_{};
   float* intermediate_{};
   float* logits_{};
+  float* vision_pixels_{};
+  float* vision_hidden_{};
+  float* vision_normalized_{};
+  float* vision_qkv_{};
+  float* vision_attention_{};
+  float* vision_intermediate_{};
+  float* vision_merger_{};
+  float* vision_output_{};
+  std::uint32_t* vision_positions_{};
+  std::uint32_t* vision_segment_first_{};
+  std::uint32_t* vision_segment_last_{};
+  std::uint32_t* vision_interpolation_indices_{};
+  float* vision_interpolation_weights_{};
   std::uint32_t* output_tokens_{};
+  float* sampling_top_logits_{};
+  std::uint32_t* sampling_top_tokens_{};
   std::int8_t* q8_{};
   float* q8_scales_{};
   std::uint16_t* staged_dense_weights_{};
@@ -1269,8 +1400,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint16_t* staged_queries_{};
   std::uint16_t* staged_raw_keys_{};
   std::uint16_t* staged_raw_values_{};
-  std::uint16_t* gate_device_keys_{};
-  std::uint16_t* gate_device_values_{};
+  std::uint16_t* staged_device_keys_{};
+  std::uint16_t* staged_device_values_{};
   std::uint16_t* staged_keys_{};
   std::uint16_t* staged_values_{};
   float* staged_scores_{};
@@ -1297,35 +1428,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::vector<std::vector<void*>> slot_pages_;
   std::vector<void*> free_kv_pages_;
   std::vector<void*> all_kv_pages_;
-  struct HostKvLayer final {
-    std::uint16_t* allocation{};
-    std::uint16_t* keys{};
-    std::uint16_t* values{};
-  };
-  std::vector<std::vector<HostKvLayer>> host_kv_;
-  std::vector<std::uint32_t> host_kv_contexts_;
-  std::vector<std::uint32_t> host_kv_populated_tokens_;
-  struct MtpTreeNode final {
-    std::int32_t parent{-1};
-    std::uint32_t token{};
-    std::uint32_t depth{};
-    double score{};
-    std::vector<std::uint8_t> kv_record;
-    std::vector<float> hidden;
-  };
-  struct MtpTreeProposal final {
-    std::uint32_t start_position{};
-    std::uint32_t horizon{};
-    std::uint32_t nodes{};
-    std::uint64_t proposer_ns{};
-    std::uint64_t peak_host_bytes{};
-    std::uint32_t compared_depth{};
-    std::uint32_t accepted_depth{};
-    bool block_refined{};
-    std::vector<std::vector<std::uint32_t>> paths;
-    std::vector<bool> surviving;
-  };
-  std::optional<MtpTreeProposal> mtp_tree_;
+  cudaStream_t parking_stream_{};
 };
 
 void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
@@ -1334,6 +1437,63 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
       expect_shape(binding(operation, "weight"),
                    {vocabulary_size_, hidden_size_}, "FP4_E2M1");
       break;
+    case Kernel::vision: {
+      if (!vision_enabled_ ||
+          operation.logical_layer != er::kModelLevelOperationLayer)
+        throw std::runtime_error("vision operation has no artifact geometry");
+      expect_shape(binding(operation, "patch_projection"),
+                   {vision_hidden_size_, vision_channels_,
+                    vision_temporal_patch_size_, vision_patch_size_,
+                    vision_patch_size_}, "FP4_E2M1");
+      if (!binding(operation, "patch_projection").dequantized)
+        throw std::runtime_error("vision patch projection was not decoded");
+      expect_shape(binding(operation, "patch_bias"),
+                   {vision_hidden_size_}, "F32");
+      expect_shape(binding(operation, "position_embedding"),
+                   {vision_position_embeddings_, vision_hidden_size_},
+                   "FP4_E2M1");
+      for (std::uint32_t layer = 0U; layer < vision_depth_; ++layer) {
+        const auto role = [layer](std::string_view suffix) {
+          return std::string("block.") + std::to_string(layer) + "." +
+                 std::string(suffix);
+        };
+        for (const auto suffix : {"norm1_weight", "norm1_bias",
+                                  "norm2_weight", "norm2_bias"})
+          expect_shape(binding(operation, role(suffix)),
+                       {vision_hidden_size_}, "F32");
+        expect_shape(binding(operation, role("qkv_projection")),
+                     {3U * vision_hidden_size_, vision_hidden_size_},
+                     "FP4_E2M1");
+        expect_shape(binding(operation, role("qkv_bias")),
+                     {3U * vision_hidden_size_}, "F32");
+        expect_shape(binding(operation, role("attention_projection")),
+                     {vision_hidden_size_, vision_hidden_size_},
+                     "FP4_E2M1");
+        expect_shape(binding(operation, role("attention_bias")),
+                     {vision_hidden_size_}, "F32");
+        expect_shape(binding(operation, role("mlp_fc1")),
+                     {vision_intermediate_size_, vision_hidden_size_},
+                     "FP4_E2M1");
+        expect_shape(binding(operation, role("mlp_fc1_bias")),
+                     {vision_intermediate_size_}, "F32");
+        expect_shape(binding(operation, role("mlp_fc2")),
+                     {vision_hidden_size_, vision_intermediate_size_},
+                     "FP4_E2M1");
+        expect_shape(binding(operation, role("mlp_fc2_bias")),
+                     {vision_hidden_size_}, "F32");
+      }
+      for (const auto suffix : {"merger_norm_weight", "merger_norm_bias"})
+        expect_shape(binding(operation, suffix), {vision_hidden_size_}, "F32");
+      expect_shape(binding(operation, "merger_fc1"),
+                   {vision_merged_width_, vision_merged_width_}, "FP4_E2M1");
+      expect_shape(binding(operation, "merger_fc1_bias"),
+                   {vision_merged_width_}, "F32");
+      expect_shape(binding(operation, "merger_fc2"),
+                   {vision_output_size_, vision_merged_width_}, "FP4_E2M1");
+      expect_shape(binding(operation, "merger_fc2_bias"),
+                   {vision_output_size_}, "F32");
+      break;
+    }
     case Kernel::full_attention:
       if (operation.full_attention_slot == kNoSlot)
         throw std::runtime_error("full attention has no artifact slot");
@@ -1441,10 +1601,7 @@ void DenseFp4Provider::validate_exact(PreparedOperation& operation) {
   mtp_attention_ = std::make_shared<PreparedOperation>();
   mtp_attention_->kernel = Kernel::full_attention;
   mtp_attention_->full_attention_slot =
-      authoritative_fp16_kv() &&
-              !exact_tier_gate_.full_context_fp4_draft()
-          ? 0U
-          : target_full_layers_;
+      authoritative_fp16_kv() ? 0U : target_full_layers_;
   for (const auto suffix : {"input_norm", "query_projection",
                             "key_projection", "value_projection",
                             "output_projection", "query_norm", "key_norm"})
@@ -1468,6 +1625,7 @@ void DenseFp4Provider::initialize_execution() {
     throw std::runtime_error("dense FP4 operation program is not fully prepared");
   for (const auto& operation : prepared_target_) {
     if (operation->kernel == Kernel::embedding ||
+        operation->kernel == Kernel::vision ||
         operation->kernel == Kernel::head)
       continue;
     std::set<const DeviceTensor*> unique;
@@ -1493,7 +1651,9 @@ void DenseFp4Provider::initialize_execution() {
   }
   const auto maximum_columns = align32(std::max(
       {2U * hidden_size_, hidden_size_, intermediate_size_,
-       query_heads_ * head_dim_, value_heads_ * value_head_dim_}));
+       query_heads_ * head_dim_, value_heads_ * value_head_dim_,
+       vision_patch_dimension_, vision_hidden_size_,
+       vision_intermediate_size_, vision_merged_width_}));
   staged_dense_input_capacity_bytes_ =
       static_cast<std::size_t>(kWorkspaceRows) * maximum_columns *
       sizeof(std::uint16_t);
@@ -1511,9 +1671,27 @@ void DenseFp4Provider::allocate_workspace() {
   const auto conv_dimension = 2U * key_dimension + value_dimension;
   const auto maximum_columns = std::max(
       {2U * hidden_size_, hidden_size_, intermediate_size_, attention_width,
-       value_dimension});
+       value_dimension, vision_patch_dimension_, vision_hidden_size_,
+       vision_intermediate_size_, vision_merged_width_});
   const auto padded_columns = align32(maximum_columns);
   hidden_ = device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+  const auto hidden_row_bytes =
+      static_cast<std::uint64_t>(hidden_size_) * sizeof(float);
+  const auto minimum_sequence_bytes =
+      static_cast<std::uint64_t>(capacity_) * kWorkspaceRows *
+      hidden_row_bytes;
+  const auto desired_sequence_bytes = std::max<std::uint64_t>(
+      minimum_sequence_bytes,
+      std::min<std::uint64_t>(128ULL << 20U, vram_cache_bytes_ / 64U));
+  auto rows_per_slot = desired_sequence_bytes /
+      (static_cast<std::uint64_t>(capacity_) * hidden_row_bytes);
+  rows_per_slot = std::max<std::uint64_t>(kWorkspaceRows, rows_per_slot);
+  rows_per_slot -= rows_per_slot % kWorkspaceRows;
+  sequence_tile_rows_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+      rows_per_slot, std::numeric_limits<std::uint32_t>::max()));
+  sequence_hidden_ = device_allocate<float>(
+      allocations_, static_cast<std::size_t>(capacity_) *
+                        sequence_tile_rows_ * hidden_size_);
   normalized_ =
       device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
   residual_ = device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
@@ -1544,9 +1722,51 @@ void DenseFp4Provider::allocate_workspace() {
       device_allocate<float>(allocations_, kWorkspaceRows * vocabulary_size_);
   output_tokens_ =
       device_allocate<std::uint32_t>(allocations_, kWorkspaceRows);
+  sampling_top_logits_ = device_allocate<float>(
+      allocations_, kMaximumGpuSamplingTopK);
+  sampling_top_tokens_ = device_allocate<std::uint32_t>(
+      allocations_, kMaximumGpuSamplingTopK);
   q8_ = device_allocate<std::int8_t>(allocations_,
                                      kWorkspaceRows * padded_columns);
   q8_scales_ = device_allocate<float>(allocations_, kWorkspaceRows);
+  if (vision_enabled_) {
+    const auto maximum_merged_rows = kMaximumVisionPatches /
+        (vision_spatial_merge_size_ * vision_spatial_merge_size_);
+    vision_pixels_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) *
+                          vision_patch_dimension_);
+    vision_hidden_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) *
+                          vision_hidden_size_);
+    vision_normalized_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) *
+                          vision_hidden_size_);
+    vision_qkv_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) * 3U *
+                          vision_hidden_size_);
+    vision_attention_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) *
+                          vision_hidden_size_);
+    vision_intermediate_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumVisionPatches) *
+                          vision_intermediate_size_);
+    vision_merger_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(maximum_merged_rows) *
+                          vision_merged_width_);
+    vision_output_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(maximum_merged_rows) *
+                          vision_output_size_);
+    vision_positions_ = device_allocate<std::uint32_t>(
+        allocations_, 2U * kMaximumVisionPatches);
+    vision_segment_first_ = device_allocate<std::uint32_t>(
+        allocations_, kMaximumVisionPatches);
+    vision_segment_last_ = device_allocate<std::uint32_t>(
+        allocations_, kMaximumVisionPatches);
+    vision_interpolation_indices_ = device_allocate<std::uint32_t>(
+        allocations_, 4U * kMaximumVisionPatches);
+    vision_interpolation_weights_ = device_allocate<float>(
+        allocations_, 4U * kMaximumVisionPatches);
+  }
   if (staged_dense_weight_capacity_bytes_ != 0U)
     staged_dense_weights_ = device_allocate<std::uint16_t>(
         allocations_, staged_dense_weight_capacity_bytes_ /
@@ -1582,12 +1802,12 @@ void DenseFp4Provider::allocate_workspace() {
         device_allocate<std::uint16_t>(allocations_, staged_kv_values);
     staged_raw_values_ =
         device_allocate<std::uint16_t>(allocations_, staged_kv_values);
-    const auto gate_layer_values = static_cast<std::size_t>(max_context_) *
-                                   kv_heads_ * head_dim_;
-    gate_device_keys_ =
-        device_allocate<std::uint16_t>(allocations_, gate_layer_values);
-    gate_device_values_ =
-        device_allocate<std::uint16_t>(allocations_, gate_layer_values);
+    const auto staged_layer_values = static_cast<std::size_t>(max_context_) *
+                                     kv_heads_ * head_dim_;
+    staged_device_keys_ =
+        device_allocate<std::uint16_t>(allocations_, staged_layer_values);
+    staged_device_values_ =
+        device_allocate<std::uint16_t>(allocations_, staged_layer_values);
   }
   staged_keys_ =
       device_allocate<std::uint16_t>(allocations_, staged_kv_values);
@@ -1613,6 +1833,8 @@ void DenseFp4Provider::allocate_workspace() {
 }
 
 void DenseFp4Provider::allocate_state() {
+  cuda_check(cudaStreamCreateWithFlags(&parking_stream_, cudaStreamNonBlocking),
+             "create request parking stream");
   slot_last_hidden_ =
       device_allocate<float>(allocations_, capacity_ * hidden_size_);
   slot_mtp_last_hidden_ =
@@ -1667,10 +1889,6 @@ void DenseFp4Provider::allocate_state() {
   }
   slot_pages_.assign(capacity_,
                      std::vector<void*>(maximum_pages_per_slot_, nullptr));
-  host_kv_.assign(capacity_,
-                  std::vector<HostKvLayer>(target_full_layers_));
-  host_kv_contexts_.assign(capacity_, 0U);
-  host_kv_populated_tokens_.assign(capacity_, 0U);
 }
 
 float* DenseFp4Provider::slot_last_hidden(std::uint32_t slot) const {
@@ -1692,19 +1910,29 @@ float* DenseFp4Provider::recurrent_matrix(std::uint32_t recurrent_slot,
   return recurrent_matrix_state_.at(recurrent_slot) + request_slot * values;
 }
 
+void DenseFp4Provider::release_request_state(RequestState& state) noexcept {
+  try {
+    if (!state.parked())
+      release_slot(state.slot());
+    std::lock_guard lock(mutex_);
+    if (state.parked()) {
+      const auto bytes = state.parked_state->bytes;
+      const auto reported = state.parked_state->reported_bytes;
+      if (bytes <= parked_request_bytes_) parked_request_bytes_ -= bytes;
+      if (reported <= parked_session_bytes_)
+        parked_session_bytes_ -= reported;
+    }
+    state.parked_state.reset();
+    release_host_kv(state);
+    state.slot_ = kNoSlot;
+  } catch (...) {
+  }
+}
+
 void DenseFp4Provider::release_slot(std::uint32_t slot) noexcept {
   try {
     std::lock_guard lock(mutex_);
     if (slot >= slot_in_use_.size() || !slot_in_use_[slot]) return;
-    if (mtp_tree_) finish_mtp_tree("request_end");
-    if (!exact_tier_gate_.kv_profile_output.empty() && !kv_profile_written_) {
-      try {
-        write_kv_profile(slot);
-      } catch (...) {
-        // Profiling is a diagnostic gate. Its failure is reported by the
-        // missing transactional output, but must never leak request state.
-      }
-    }
     if (slot < slot_pages_.size()) {
       for (std::uint32_t page_index = 0U;
            page_index < slot_pages_[slot].size(); ++page_index) {
@@ -1726,7 +1954,7 @@ void DenseFp4Provider::release_slot(std::uint32_t slot) noexcept {
               &empty, sizeof(empty), cudaMemcpyHostToDevice));
       }
     }
-    release_host_kv(slot);
+    if (slot < slot_rope_deltas_.size()) slot_rope_deltas_[slot] = 0;
     slot_in_use_[slot] = false;
   } catch (...) {
   }
@@ -1748,12 +1976,6 @@ er::CreateOperationRequestStateResult DenseFp4Provider::create_request_state(
               {}};
     const auto slot = static_cast<std::uint32_t>(free - slot_in_use_.begin());
     *free = true;
-    try {
-      allocate_host_kv(slot, static_cast<std::uint32_t>(context->second));
-    } catch (...) {
-      *free = false;
-      throw;
-    }
     const auto conv_dimension =
         2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
     const auto conv_bytes = static_cast<std::size_t>(conv_dimension) *
@@ -1842,6 +2064,8 @@ GpuPhase DenseFp4Provider::gpu_phase(Kernel kernel) {
   switch (kernel) {
     case Kernel::embedding:
       return GpuPhase::embedding;
+    case Kernel::vision:
+      return GpuPhase::vision;
     case Kernel::full_attention:
       return GpuPhase::full_attention;
     case Kernel::recurrent_attention:
@@ -1857,6 +2081,8 @@ GpuPhase DenseFp4Provider::gpu_phase(Kernel kernel) {
 }
 
 std::size_t DenseFp4Provider::begin_gpu_phase(GpuPhase phase) {
+  if (!profile_gpu_phases_)
+    return std::numeric_limits<std::size_t>::max();
   if (active_gpu_events_ == gpu_event_pool_.size()) {
     GpuEventPair event;
     cuda_check(cudaEventCreate(&event.start), "create GPU phase start event");
@@ -1876,6 +2102,7 @@ std::size_t DenseFp4Provider::begin_gpu_phase(GpuPhase phase) {
 }
 
 void DenseFp4Provider::end_gpu_phase(std::size_t index) {
+  if (!profile_gpu_phases_) return;
   if (index >= active_gpu_events_)
     throw std::runtime_error("GPU phase event index is invalid");
   cuda_check(cudaEventRecord(gpu_event_pool_[index].stop),
@@ -1883,6 +2110,7 @@ void DenseFp4Provider::end_gpu_phase(std::size_t index) {
 }
 
 void DenseFp4Provider::collect_gpu_phases() {
+  if (!profile_gpu_phases_) return;
   if (!active_gpu_events_) return;
   cuda_check(cudaEventSynchronize(gpu_event_pool_[active_gpu_events_ - 1U].stop),
              "synchronize GPU phase events");
@@ -1979,6 +2207,248 @@ void DenseFp4Provider::project(const DeviceTensor& weight, const float* input,
   project_quantized(weight, output, rows);
 }
 
+void DenseFp4Provider::project_vision(const DeviceTensor& weight,
+                                      const float* input, float* output,
+                                      std::uint32_t rows) {
+  if (!rows || rows > kMaximumVisionPatches)
+    throw std::runtime_error("vision projection row count is invalid");
+  const auto matrix = weight.matrix();
+  for (std::uint32_t first = 0U; first < rows; first += kWorkspaceRows) {
+    const auto chunk = std::min(kWorkspaceRows, rows - first);
+    project(weight, input + static_cast<std::size_t>(first) * matrix.columns,
+            output + static_cast<std::size_t>(first) * matrix.rows, chunk);
+  }
+}
+
+void DenseFp4Provider::run_vision(const PreparedOperation& operation,
+                                  const MediaPayload& media,
+                                  float* tile_hidden,
+                                  std::uint32_t prompt_rows,
+                                  std::uint32_t tile_first,
+                                  std::uint32_t tile_rows, bool prepare) {
+  if (operation.kernel != Kernel::vision || !vision_enabled_ || media.empty())
+    return;
+  if (media.patch_count > kMaximumVisionPatches ||
+      media.patch_dimension != vision_patch_dimension_ ||
+      !tile_hidden || !prompt_rows || !tile_rows ||
+      tile_first > prompt_rows || tile_rows > prompt_rows - tile_first)
+    throw std::runtime_error("vision execution geometry is invalid");
+  const auto merge_area = vision_spatial_merge_size_ *
+                          vision_spatial_merge_size_;
+  if (media.patch_count % merge_area)
+    throw std::runtime_error("vision patches do not form merge groups");
+  const auto merged_rows = media.patch_count / merge_area;
+
+  if (prepare) {
+  std::vector<std::uint32_t> row_positions(2U * media.patch_count);
+  std::vector<std::uint32_t> segment_first(media.patch_count);
+  std::vector<std::uint32_t> segment_last(media.patch_count);
+  std::vector<std::uint32_t> interpolation_indices(4U * media.patch_count);
+  std::vector<float> interpolation_weights(4U * media.patch_count);
+  for (const auto& image : media.images) {
+    const auto patches = image.temporal * image.height * image.width;
+    const auto image_last = image.patch_offset + patches;
+    const auto blocks_w = image.width / vision_spatial_merge_size_;
+    for (std::uint32_t local = 0U; local < patches; ++local) {
+      const auto patch = image.patch_offset + local;
+      const auto spatial = local % (image.height * image.width);
+      const auto in_column = spatial % vision_spatial_merge_size_;
+      const auto in_row = (spatial / vision_spatial_merge_size_) %
+                          vision_spatial_merge_size_;
+      const auto block_column =
+          (spatial / merge_area) % blocks_w;
+      const auto block_row = spatial / (merge_area * blocks_w);
+      const auto row = block_row * vision_spatial_merge_size_ + in_row;
+      const auto column =
+          block_column * vision_spatial_merge_size_ + in_column;
+      row_positions[2U * patch] = row;
+      row_positions[2U * patch + 1U] = column;
+      segment_first[patch] = image.patch_offset;
+      segment_last[patch] = image_last;
+
+      const auto axis_taps = [this](std::uint32_t index,
+                                    std::uint32_t size) {
+        const auto coordinate = size <= 1U
+            ? 0.0F
+            : static_cast<float>(index) *
+                  static_cast<float>(vision_grid_side_ - 1U) /
+                  static_cast<float>(size - 1U);
+        const auto low = static_cast<std::uint32_t>(std::floor(coordinate));
+        const auto high = std::min(low + 1U, vision_grid_side_ - 1U);
+        const auto high_weight = coordinate - static_cast<float>(low);
+        return std::array<std::pair<std::uint32_t, float>, 2U>{
+            std::pair{low, 1.0F - high_weight},
+            std::pair{high, high_weight}};
+      };
+      const auto row_taps = axis_taps(row, image.height);
+      const auto column_taps = axis_taps(column, image.width);
+      std::uint32_t tap{};
+      for (const auto& [source_row, row_weight] : row_taps) {
+        for (const auto& [source_column, column_weight] : column_taps) {
+          interpolation_indices[4U * patch + tap] =
+              source_row * vision_grid_side_ + source_column;
+          interpolation_weights[4U * patch + tap] =
+              row_weight * column_weight;
+          ++tap;
+        }
+      }
+    }
+  }
+
+  cuda_check(cudaMemcpy(vision_pixels_, media.pixels.data(),
+                        media.pixels.size() * sizeof(float),
+                        cudaMemcpyHostToDevice),
+             "upload vision pixels");
+  cuda_check(cudaMemcpy(vision_positions_, row_positions.data(),
+                        row_positions.size() * sizeof(std::uint32_t),
+                        cudaMemcpyHostToDevice),
+             "upload vision positions");
+  cuda_check(cudaMemcpy(vision_segment_first_, segment_first.data(),
+                        segment_first.size() * sizeof(std::uint32_t),
+                        cudaMemcpyHostToDevice),
+             "upload vision segment starts");
+  cuda_check(cudaMemcpy(vision_segment_last_, segment_last.data(),
+                        segment_last.size() * sizeof(std::uint32_t),
+                        cudaMemcpyHostToDevice),
+             "upload vision segment ends");
+  cuda_check(cudaMemcpy(vision_interpolation_indices_,
+                        interpolation_indices.data(),
+                        interpolation_indices.size() * sizeof(std::uint32_t),
+                        cudaMemcpyHostToDevice),
+             "upload vision interpolation indices");
+  cuda_check(cudaMemcpy(vision_interpolation_weights_,
+                        interpolation_weights.data(),
+                        interpolation_weights.size() * sizeof(float),
+                        cudaMemcpyHostToDevice),
+             "upload vision interpolation weights");
+
+  const auto& patch = binding(operation, "patch_projection");
+  for (std::uint32_t first = 0U; first < media.patch_count;
+       first += kWorkspaceRows) {
+    const auto rows = std::min(kWorkspaceRows, media.patch_count - first);
+    status_check(ec::gemv_f32_batch(
+        patch.dequantized, vision_hidden_size_, vision_patch_dimension_,
+        vision_pixels_ + static_cast<std::size_t>(first) *
+                             vision_patch_dimension_,
+        vision_hidden_ + static_cast<std::size_t>(first) *
+                             vision_hidden_size_,
+        rows, nullptr));
+  }
+  status_check(ec::add_bias_in_place(
+      vision_hidden_, binding(operation, "patch_bias").f32,
+      media.patch_count, vision_hidden_size_, nullptr));
+  status_check(ec::add_fp4_position_interpolation(
+      vision_hidden_, binding(operation, "position_embedding").matrix(),
+      vision_interpolation_indices_, vision_interpolation_weights_,
+      media.patch_count, nullptr));
+
+  const auto role = [](std::uint32_t layer, std::string_view suffix) {
+    return std::string("block.") + std::to_string(layer) + "." +
+           std::string(suffix);
+  };
+  for (std::uint32_t layer = 0U; layer < vision_depth_; ++layer) {
+    status_check(ec::layer_norm_batch(
+        vision_hidden_, binding(operation, role(layer, "norm1_weight")).f32,
+        binding(operation, role(layer, "norm1_bias")).f32,
+        vision_normalized_, media.patch_count, vision_hidden_size_,
+        vision_epsilon_, nullptr));
+    project_vision(binding(operation, role(layer, "qkv_projection")),
+                   vision_normalized_, vision_qkv_, media.patch_count);
+    status_check(ec::add_bias_in_place(
+        vision_qkv_, binding(operation, role(layer, "qkv_bias")).f32,
+        media.patch_count, 3U * vision_hidden_size_, nullptr));
+    status_check(ec::vision_qkv_rope_in_place(
+        vision_qkv_, vision_positions_, media.patch_count, vision_heads_,
+        vision_head_dim_, vision_rope_theta_, nullptr));
+    status_check(ec::vision_segment_attention(
+        vision_qkv_, vision_segment_first_, vision_segment_last_,
+        vision_attention_, media.patch_count, vision_heads_,
+        vision_head_dim_, nullptr));
+    project_vision(binding(operation, role(layer, "attention_projection")),
+                   vision_attention_, vision_normalized_, media.patch_count);
+    status_check(ec::add_bias_in_place(
+        vision_normalized_,
+        binding(operation, role(layer, "attention_bias")).f32,
+        media.patch_count, vision_hidden_size_, nullptr));
+    status_check(ec::add_in_place(
+        vision_hidden_, vision_normalized_,
+        media.patch_count * vision_hidden_size_, nullptr));
+
+    status_check(ec::layer_norm_batch(
+        vision_hidden_, binding(operation, role(layer, "norm2_weight")).f32,
+        binding(operation, role(layer, "norm2_bias")).f32,
+        vision_normalized_, media.patch_count, vision_hidden_size_,
+        vision_epsilon_, nullptr));
+    project_vision(binding(operation, role(layer, "mlp_fc1")),
+                   vision_normalized_, vision_intermediate_,
+                   media.patch_count);
+    status_check(ec::add_bias_in_place(
+        vision_intermediate_,
+        binding(operation, role(layer, "mlp_fc1_bias")).f32,
+        media.patch_count, vision_intermediate_size_, nullptr));
+    status_check(ec::gelu_tanh_in_place(
+        vision_intermediate_,
+        media.patch_count * vision_intermediate_size_, nullptr));
+    project_vision(binding(operation, role(layer, "mlp_fc2")),
+                   vision_intermediate_, vision_normalized_,
+                   media.patch_count);
+    status_check(ec::add_bias_in_place(
+        vision_normalized_,
+        binding(operation, role(layer, "mlp_fc2_bias")).f32,
+        media.patch_count, vision_hidden_size_, nullptr));
+    status_check(ec::add_in_place(
+        vision_hidden_, vision_normalized_,
+        media.patch_count * vision_hidden_size_, nullptr));
+  }
+
+  status_check(ec::layer_norm_batch(
+      vision_hidden_, binding(operation, "merger_norm_weight").f32,
+      binding(operation, "merger_norm_bias").f32, vision_normalized_,
+      media.patch_count, vision_hidden_size_, vision_epsilon_, nullptr));
+  project_vision(binding(operation, "merger_fc1"), vision_normalized_,
+                 vision_merger_, merged_rows);
+  status_check(ec::add_bias_in_place(
+      vision_merger_, binding(operation, "merger_fc1_bias").f32,
+      merged_rows, vision_merged_width_, nullptr));
+  status_check(ec::gelu_exact_in_place(
+      vision_merger_, merged_rows * vision_merged_width_, nullptr));
+  project_vision(binding(operation, "merger_fc2"), vision_merger_,
+                 vision_output_, merged_rows);
+  status_check(ec::add_bias_in_place(
+      vision_output_, binding(operation, "merger_fc2_bias").f32,
+      merged_rows, vision_output_size_, nullptr));
+  ++vision_batches_;
+  vision_images_ += media.images.size();
+  vision_patches_ += media.patch_count;
+  }
+
+  const auto tile_last = tile_first + tile_rows;
+  for (const auto& image : media.images) {
+    if (image.prompt_offset + image.merged_tokens > prompt_rows)
+      throw std::runtime_error("visual embedding target exceeds prompt");
+    const auto image_first = image.prompt_offset;
+    const auto image_last = image.prompt_offset + image.merged_tokens;
+    const auto copy_first = std::max(image_first, tile_first);
+    const auto copy_last = std::min(image_last, tile_last);
+    if (copy_first >= copy_last) continue;
+    const auto output_offset = image.patch_offset / merge_area;
+    const auto image_row_offset = copy_first - image_first;
+    const auto tile_row_offset = copy_first - tile_first;
+    const auto copy_rows = copy_last - copy_first;
+    cuda_check(cudaMemcpy(
+                   tile_hidden + static_cast<std::size_t>(tile_row_offset) *
+                                     hidden_size_,
+                   vision_output_ +
+                       static_cast<std::size_t>(output_offset +
+                                                image_row_offset) *
+                           hidden_size_,
+                   static_cast<std::size_t>(copy_rows) * hidden_size_ *
+                       sizeof(float),
+                   cudaMemcpyDeviceToDevice),
+               "apply visual embeddings to sequence tile");
+  }
+}
+
 void DenseFp4Provider::ensure_page(std::uint32_t slot,
                                    std::uint32_t cache_position) {
   if (slot >= capacity_ || cache_position >= max_context_)
@@ -2015,267 +2485,188 @@ void DenseFp4Provider::ensure_page(std::uint32_t slot,
   }
 }
 
-void DenseFp4Provider::allocate_host_kv(std::uint32_t slot,
-                                        std::uint32_t context_tokens) {
+void DenseFp4Provider::ensure_host_kv_page(
+    RequestState& state, std::uint32_t cache_position) {
   if (!authoritative_fp16_kv()) return;
-  if (slot >= host_kv_.size() || !context_tokens ||
-      context_tokens > max_context_ || host_kv_contexts_[slot] != 0U)
-    throw std::runtime_error("invalid authoritative FP16 KV reservation");
-  const auto values = static_cast<std::uint64_t>(context_tokens) *
-                      kv_heads_ * head_dim_;
-  const auto bytes = values * sizeof(std::uint16_t);
-  if (values > std::numeric_limits<std::size_t>::max() /
-                   sizeof(std::uint16_t) ||
-      bytes > std::numeric_limits<std::size_t>::max() / 2U)
-    throw std::runtime_error("authoritative FP16 KV reservation overflows");
-  try {
-    for (auto& layer : host_kv_[slot]) {
-      void* allocation{};
-      cuda_check(cudaHostAlloc(&allocation, static_cast<std::size_t>(2U * bytes),
-                               cudaHostAllocPortable),
-                 "allocate authoritative FP16 KV");
-      layer.allocation = static_cast<std::uint16_t*>(allocation);
-      layer.keys = layer.allocation;
-      layer.values = layer.allocation + values;
-      host_kv_bytes_ += 2U * bytes;
-    }
-    host_kv_contexts_[slot] = context_tokens;
-    host_kv_populated_tokens_[slot] = 0U;
-  } catch (...) {
-    release_host_kv(slot);
-    throw;
+  if (cache_position >= max_context_)
+    throw std::runtime_error("authoritative FP16 KV position is invalid");
+  const auto page_index = cache_position / kv_page_tokens_;
+  while (state.host_kv_pages.size() <= page_index) {
+    const auto page_values = static_cast<std::uint64_t>(kv_page_tokens_) *
+                             kv_heads_ * head_dim_;
+    const auto page_bytes = static_cast<std::uint64_t>(target_full_layers_) *
+                            2U * page_values * sizeof(std::uint16_t);
+    if (!page_bytes ||
+        page_bytes > std::numeric_limits<std::size_t>::max() ||
+        page_bytes > ram_cache_bytes_ ||
+        host_kv_bytes_ + parked_request_bytes_ >
+            ram_cache_bytes_ - page_bytes)
+      throw std::runtime_error(
+          "authoritative FP16 KV RAM capacity is exhausted");
+    void* allocation{};
+    cuda_check(cudaHostAlloc(&allocation, static_cast<std::size_t>(page_bytes),
+                             cudaHostAllocPortable),
+               "allocate progressive authoritative FP16 KV page");
+    state.host_kv_pages.push_back(
+        {static_cast<std::uint16_t*>(allocation)});
+    state.host_kv_bytes += page_bytes;
+    host_kv_bytes_ += page_bytes;
   }
 }
 
-void DenseFp4Provider::release_host_kv(std::uint32_t slot) noexcept {
-  if (slot >= host_kv_.size()) return;
-  for (auto& layer : host_kv_[slot]) {
-    if (!layer.allocation) continue;
-    const auto status = cudaFreeHost(layer.allocation);
-    static_cast<void>(status);
-    layer = {};
+void DenseFp4Provider::release_host_kv(RequestState& state) noexcept {
+  for (auto& page : state.host_kv_pages) {
+    if (!page.allocation) continue;
+    static_cast<void>(cudaFreeHost(page.allocation));
+    page.allocation = nullptr;
   }
-  host_kv_contexts_[slot] = 0U;
-  if (slot < host_kv_populated_tokens_.size())
-    host_kv_populated_tokens_[slot] = 0U;
-  host_kv_bytes_ = 0U;
-  for (const auto& retained_slot : host_kv_)
-    for (const auto& layer : retained_slot)
-      if (layer.allocation && layer.values > layer.keys)
-        host_kv_bytes_ += static_cast<std::uint64_t>(layer.values - layer.keys) *
-                          2U * sizeof(std::uint16_t);
+  if (state.host_kv_bytes <= host_kv_bytes_)
+    host_kv_bytes_ -= state.host_kv_bytes;
+  state.host_kv_pages.clear();
+  state.host_kv_bytes = 0U;
+  state.host_kv_populated_tokens = 0U;
 }
 
-void DenseFp4Provider::write_kv_profile(std::uint32_t slot) {
-  if (slot >= host_kv_.size() || slot >= host_kv_populated_tokens_.size() ||
-      !host_kv_populated_tokens_[slot] || kv_profile_written_)
-    throw std::runtime_error("exact FP16 KV profile has no populated state");
-  cuda_check(cudaDeviceSynchronize(), "synchronize exact FP16 KV profile");
-  const auto tokens = host_kv_populated_tokens_[slot];
-  const auto channels = kv_heads_ * head_dim_;
-  const auto total_values = static_cast<std::uint64_t>(tokens) * channels *
-                            target_full_layers_ * 2U;
-  const auto raw_bytes = total_values * sizeof(std::uint16_t);
-  std::uint64_t sampled_values{};
-  long double raw_bits{};
-  long double token_xor_bits{};
-  long double token_delta_bits{};
-  long double channel_xor_bits{};
-  long double best_bits{};
-  const auto sampled_tokens = std::min(tokens, kMaximumKvSampleTokens);
-  auto sample_path = exact_tier_gate_.kv_profile_output;
-  sample_path += ".samples.bin";
-  auto sample_temporary = sample_path;
-  sample_temporary += ".tmp";
-  std::ofstream samples(sample_temporary,
-                        std::ios::out | std::ios::binary | std::ios::trunc);
-  if (!samples) throw std::runtime_error("cannot create FP16 KV samples");
-  constexpr std::array<char, 8U> kSampleMagic{
-      'Q', 'K', 'V', 'F', '1', '6', 'S', '1'};
-  samples.write(kSampleMagic.data(),
-                static_cast<std::streamsize>(kSampleMagic.size()));
-  write_u32(samples, 1U);
-  write_u32(samples, target_full_layers_ * 2U);
-  write_u32(samples, sampled_tokens);
-  write_u32(samples, channels);
-  write_u32(samples, tokens);
-  write_u32(samples, kv_heads_);
-  write_u32(samples, head_dim_);
-  write_u32(samples, 2U);
-  auto temporary = exact_tier_gate_.kv_profile_output;
-  temporary += ".tmp";
-  std::ofstream output(temporary, std::ios::out | std::ios::trunc);
-  if (!output) throw std::runtime_error("cannot create FP16 KV profile");
-  output << std::setprecision(12)
-         << "{\n  \"schema_version\": 1,\n"
-            "  \"format\": \"fp16-kv-lossless-profile-v1\",\n"
-         << "  \"populated_tokens\": " << tokens << ",\n"
-         << "  \"full_attention_layers\": " << target_full_layers_ << ",\n"
-         << "  \"channels_per_k_or_v\": " << channels << ",\n"
-         << "  \"raw_fp16_bytes\": " << raw_bytes << ",\n"
-            "  \"streams\": [\n";
-  bool first = true;
-  for (std::uint32_t layer = 0U; layer < target_full_layers_; ++layer) {
-    const auto& host = host_kv_[slot][layer];
-    for (std::uint32_t kind = 0U; kind < 2U; ++kind) {
-      const auto* sequence = kind == 0U ? host.keys : host.values;
-      const auto profile = profile_fp16_sequence(sequence, tokens, channels);
-      write_fp16_sample_stream(samples, sequence, tokens, sampled_tokens,
-                               channels);
-      sampled_values += profile.sampled_values;
-      raw_bits += profile.raw_h0_bits;
-      token_xor_bits += profile.token_xor_h0_bits;
-      token_delta_bits += profile.token_delta_h0_bits;
-      channel_xor_bits += profile.channel_xor_h0_bits;
-      best_bits += profile.best_predictor_h0_bits;
-      if (!first) output << ",\n";
-      first = false;
-      output << "    {\"layer\": " << layer << ", \"kind\": \""
-             << (kind == 0U ? "key" : "value")
-             << "\", \"sampled_values\": " << profile.sampled_values
-             << ", \"raw_h0_bits_per_value\": " << profile.raw_h0_bits
-             << ", \"token_xor_h0_bits_per_value\": "
-             << profile.token_xor_h0_bits
-             << ", \"token_delta_h0_bits_per_value\": "
-             << profile.token_delta_h0_bits
-             << ", \"channel_xor_h0_bits_per_value\": "
-             << profile.channel_xor_h0_bits
-             << ", \"best_predictor_h0_bits_per_value\": "
-             << profile.best_predictor_h0_bits << "}";
-    }
+void DenseFp4Provider::trim_host_kv(
+    RequestState& state, std::uint32_t populated_tokens) noexcept {
+  const auto pages = populated_tokens == 0U
+      ? 0U
+      : (populated_tokens + kv_page_tokens_ - 1U) / kv_page_tokens_;
+  const auto page_bytes = static_cast<std::uint64_t>(target_full_layers_) *
+                          2U * kv_page_tokens_ * kv_heads_ * head_dim_ *
+                          sizeof(std::uint16_t);
+  while (state.host_kv_pages.size() > pages) {
+    auto& page = state.host_kv_pages.back();
+    if (page.allocation) static_cast<void>(cudaFreeHost(page.allocation));
+    state.host_kv_pages.pop_back();
+    if (page_bytes <= state.host_kv_bytes)
+      state.host_kv_bytes -= page_bytes;
+    if (page_bytes <= host_kv_bytes_) host_kv_bytes_ -= page_bytes;
   }
-  const auto streams = static_cast<long double>(target_full_layers_) * 2.0L;
-  const auto average_best = static_cast<double>(best_bits / streams);
-  const auto ideal_bytes = static_cast<std::uint64_t>(
-      std::ceil(static_cast<long double>(total_values) * average_best / 8.0L));
-  output << "\n  ],\n"
-         << "  \"sampled_values\": " << sampled_values << ",\n"
-         << "  \"sampled_tokens_per_stream\": " << sampled_tokens << ",\n"
-         << "  \"kv_heads\": " << kv_heads_ << ",\n"
-         << "  \"head_dim\": " << head_dim_ << ",\n"
-         << "  \"sample_file\": \"" << sample_path.filename().string()
-         << "\",\n"
-         << "  \"average_raw_h0_bits_per_value\": "
-         << static_cast<double>(raw_bits / streams) << ",\n"
-         << "  \"average_token_xor_h0_bits_per_value\": "
-         << static_cast<double>(token_xor_bits / streams) << ",\n"
-         << "  \"average_token_delta_h0_bits_per_value\": "
-         << static_cast<double>(token_delta_bits / streams) << ",\n"
-         << "  \"average_channel_xor_h0_bits_per_value\": "
-         << static_cast<double>(channel_xor_bits / streams) << ",\n"
-         << "  \"best_predictor_h0_bits_per_value\": " << average_best
-         << ",\n"
-         << "  \"ideal_entropy_payload_bytes\": " << ideal_bytes << ",\n"
-         << "  \"ideal_entropy_compression_ratio\": "
-         << (16.0 / average_best) << ",\n"
-            "  \"interpretation\": \"Optimistic zero-overhead entropy for independent per-layer K/V static coders; this is not an executable codec result.\"\n"
-            "}\n";
-  output.close();
-  samples.close();
-  if (!output) throw std::runtime_error("cannot finalize FP16 KV profile");
-  if (!samples) throw std::runtime_error("cannot finalize FP16 KV samples");
-  std::error_code error;
-  std::filesystem::remove(sample_path, error);
-  error.clear();
-  std::filesystem::rename(sample_temporary, sample_path, error);
-  if (error) throw std::runtime_error("cannot publish FP16 KV samples");
-  error.clear();
-  std::filesystem::remove(exact_tier_gate_.kv_profile_output, error);
-  error.clear();
-  std::filesystem::rename(temporary, exact_tier_gate_.kv_profile_output, error);
-  if (error) throw std::runtime_error("cannot publish FP16 KV profile");
-  kv_profile_written_ = true;
+  state.host_kv_populated_tokens = populated_tokens;
+}
+
+std::pair<std::uint16_t*, std::uint16_t*>
+DenseFp4Provider::host_kv_layer_page(
+    const RequestState& state, std::uint32_t full_attention_slot,
+    std::uint32_t page_index) const {
+  if (full_attention_slot >= target_full_layers_ ||
+      page_index >= state.host_kv_pages.size() ||
+      !state.host_kv_pages[page_index].allocation)
+    throw std::runtime_error("authoritative FP16 KV page is absent");
+  const auto page_values = static_cast<std::size_t>(kv_page_tokens_) *
+                           kv_heads_ * head_dim_;
+  auto* keys = state.host_kv_pages[page_index].allocation +
+               static_cast<std::size_t>(full_attention_slot) *
+                   2U * page_values;
+  return {keys, keys + page_values};
 }
 
 void DenseFp4Provider::run_full_attention(
-    const PreparedOperation& operation, std::uint32_t slot,
+    const PreparedOperation& operation, RequestState& state,
     std::span<const std::uint32_t> cache_positions,
     std::span<const std::uint32_t> rotary_positions, std::uint32_t rows,
-    std::uint32_t full_attention_slot) {
+    std::uint32_t full_attention_slot,
+    std::span<const std::uint32_t> mrope_positions) {
+  const auto slot = state.slot();
   if (!rows || rows > kWorkspaceRows || cache_positions.size() != rows ||
-      rotary_positions.size() != rows)
+      rotary_positions.size() != rows ||
+      (!mrope_positions.empty() && mrope_positions.size() != 3U * rows))
     throw std::runtime_error("invalid full-attention microbatch");
   for (std::uint32_t row = 1U; row < rows; ++row)
     if (cache_positions[row] != cache_positions.front() + row ||
-        rotary_positions[row] != rotary_positions.front() + row)
+        (mrope_positions.empty() &&
+         rotary_positions[row] != rotary_positions.front() + row))
       throw std::runtime_error(
           "full-attention microbatch positions are not contiguous");
   quantize_rows(normalized_, rows, hidden_size_);
   project_quantized(binding(operation, "query_projection"), query_gate_, rows);
   project_quantized(binding(operation, "key_projection"), key_, rows);
   project_quantized(binding(operation, "value_projection"), value_, rows);
+  if (!mrope_positions.empty()) {
+    if (!vision_positions_)
+      throw std::runtime_error("mRoPE workspace is absent");
+    cuda_check(cudaMemcpy(vision_positions_, mrope_positions.data(),
+                          mrope_positions.size_bytes(),
+                          cudaMemcpyHostToDevice),
+               "upload three-axis rotary positions");
+    status_check(ec::gated_gqa_qk_norm_mrope_batch(
+        query_gate_, key_, binding(operation, "query_norm").f32,
+        binding(operation, "key_norm").f32, vision_positions_, rows,
+        query_heads_, kv_heads_, head_dim_, rotary_dimension_,
+        mrope_sections_[0], mrope_sections_[1], mrope_sections_[2], epsilon_,
+        rope_theta_, nullptr));
+  }
   const auto authoritative = authoritative_fp16_kv() &&
-                             mtp_attention_.get() != &operation &&
-                             !active_full_context_fp4_draft_;
+                             mtp_attention_.get() != &operation;
   if (authoritative) {
-    if (slot >= host_kv_.size() ||
-        full_attention_slot >= target_full_layers_ ||
-        host_kv_contexts_[slot] == 0U ||
-        cache_positions.front() >= host_kv_contexts_[slot] ||
-        rows > host_kv_contexts_[slot] - cache_positions.front())
+    if (full_attention_slot >= target_full_layers_ ||
+        cache_positions.back() >= max_context_)
       throw std::runtime_error("invalid authoritative FP16 attention state");
-    status_check(ec::gated_gqa_qkv_rope_fp16_batch(
-        query_gate_, key_, value_, binding(operation, "query_norm").f32,
-        binding(operation, "key_norm").f32, staged_raw_keys_,
-        staged_raw_values_, rotary_positions.front(), rows, query_heads_,
-        kv_heads_, head_dim_, rotary_dimension_, epsilon_, rope_theta_,
-        nullptr));
-    if (exact_tier_gate_.full_context_fp4_draft()) {
-      for (const auto cache_position : cache_positions)
-        ensure_page(slot, cache_position);
-      const auto* page_table = reinterpret_cast<const void* const*>(
-          device_page_table_ + static_cast<std::size_t>(slot) *
-                                   maximum_pages_per_slot_);
-      status_check(ec::pack_gqa_kv_fp16_to_paged_fp4(
-          staged_raw_keys_, staged_raw_values_, page_table,
-          full_attention_slot, kv_page_tokens_, cache_positions.front(), rows,
-          kv_heads_, head_dim_, nullptr));
-    }
+    ensure_host_kv_page(state, cache_positions.back());
+    if (mrope_positions.empty())
+      status_check(ec::gated_gqa_qkv_rope_fp16_batch(
+          query_gate_, key_, value_, binding(operation, "query_norm").f32,
+          binding(operation, "key_norm").f32, staged_raw_keys_,
+          staged_raw_values_, rotary_positions.front(), rows, query_heads_,
+          kv_heads_, head_dim_, rotary_dimension_, epsilon_, rope_theta_,
+          nullptr));
+    else
+      status_check(ec::store_gqa_kv_fp16_batch(
+          key_, value_, staged_raw_keys_, staged_raw_values_, rows, kv_heads_,
+          head_dim_, nullptr));
     const auto row_values = static_cast<std::size_t>(kv_heads_) * head_dim_;
-    const auto copy_values = static_cast<std::size_t>(rows) * row_values;
-    const auto offset = static_cast<std::size_t>(cache_positions.front()) *
-                        row_values;
-    auto& host = host_kv_[slot][full_attention_slot];
-    cuda_check(cudaMemcpyAsync(host.keys + offset, staged_raw_keys_,
-                               copy_values * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost),
-               "commit authoritative FP16 keys");
-    cuda_check(cudaMemcpyAsync(host.values + offset, staged_raw_values_,
-                               copy_values * sizeof(std::uint16_t),
-                               cudaMemcpyDeviceToHost),
-               "commit authoritative FP16 values");
-    host_kv_populated_tokens_[slot] = std::max(
-        host_kv_populated_tokens_[slot], cache_positions.front() + rows);
+    std::uint32_t copied{};
+    while (copied < rows) {
+      const auto position = cache_positions.front() + copied;
+      const auto page_index = position / kv_page_tokens_;
+      const auto page_offset = position % kv_page_tokens_;
+      const auto count = std::min(rows - copied,
+                                  kv_page_tokens_ - page_offset);
+      const auto [host_keys, host_values] =
+          host_kv_layer_page(state, full_attention_slot, page_index);
+      const auto host_offset = static_cast<std::size_t>(page_offset) *
+                               row_values;
+      const auto device_offset = static_cast<std::size_t>(copied) *
+                                 row_values;
+      const auto copy_bytes = static_cast<std::size_t>(count) * row_values *
+                              sizeof(std::uint16_t);
+      cuda_check(cudaMemcpyAsync(host_keys + host_offset,
+                                 staged_raw_keys_ + device_offset, copy_bytes,
+                                 cudaMemcpyDeviceToHost),
+                 "commit progressive authoritative FP16 keys");
+      cuda_check(cudaMemcpyAsync(host_values + host_offset,
+                                 staged_raw_values_ + device_offset,
+                                 copy_bytes, cudaMemcpyDeviceToHost),
+                 "commit progressive authoritative FP16 values");
+      copied += count;
+    }
+    state.host_kv_populated_tokens = std::max(
+        state.host_kv_populated_tokens, cache_positions.front() + rows);
     const auto continues_device_layer =
-        active_gate_fraction_ppm_ == 0U &&
-        ((cache_positions.front() == 0U) ||
-         (gate_device_slot_ == slot &&
-          gate_device_layer_ == full_attention_slot &&
-          gate_device_context_ == cache_positions.front()));
+        (cache_positions.front() == 0U) ||
+        (staged_device_slot_ == slot &&
+         staged_device_layer_ == full_attention_slot &&
+         staged_device_context_ == cache_positions.front());
     if (continues_device_layer) {
-      cuda_check(cudaMemcpyAsync(gate_device_keys_ + offset,
+      const auto device_offset =
+          static_cast<std::size_t>(cache_positions.front()) * row_values;
+      const auto copy_values = static_cast<std::size_t>(rows) * row_values;
+      cuda_check(cudaMemcpyAsync(staged_device_keys_ + device_offset,
                                  staged_raw_keys_,
                                  copy_values * sizeof(std::uint16_t),
                                  cudaMemcpyDeviceToDevice),
                  "extend device FP16 prefill keys");
-      cuda_check(cudaMemcpyAsync(gate_device_values_ + offset,
+      cuda_check(cudaMemcpyAsync(staged_device_values_ + device_offset,
                                  staged_raw_values_,
                                  copy_values * sizeof(std::uint16_t),
                                  cudaMemcpyDeviceToDevice),
                  "extend device FP16 prefill values");
-      gate_device_slot_ = slot;
-      gate_device_layer_ = full_attention_slot;
-      gate_device_context_ = cache_positions.front() + rows;
+      staged_device_slot_ = slot;
+      staged_device_layer_ = full_attention_slot;
+      staged_device_context_ = cache_positions.front() + rows;
     }
     const auto first_context_tokens = cache_positions.front() + 1U;
-    std::uint32_t retained_first_token{};
-    if (active_gate_fraction_ppm_ != 0U) {
-      const auto retained = std::max<std::uint64_t>(
-          1U, static_cast<std::uint64_t>(first_context_tokens) *
-                  active_gate_fraction_ppm_ / 1'000'000U);
-      retained_first_token = first_context_tokens -
-          static_cast<std::uint32_t>(retained);
-    }
     const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
                               query_heads_ * head_dim_;
     const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
@@ -2298,16 +2689,30 @@ void DenseFp4Provider::run_full_attention(
         staged_split_tokens_};
     if (continues_device_layer) {
       status_check(ec::gated_gqa_attention_staged_device_fp16(
-          {query_gate_, gate_device_keys_, gate_device_values_, attention_,
-           max_context_, first_context_tokens, retained_first_token, rows,
+          {query_gate_, staged_device_keys_, staged_device_values_, attention_,
+           max_context_, first_context_tokens, 0U, rows,
            query_heads_, kv_heads_, head_dim_, nullptr},
           workspace));
     } else {
+      std::vector<const void*> key_pages;
+      std::vector<const void*> value_pages;
+      key_pages.reserve(state.host_kv_pages.size());
+      value_pages.reserve(state.host_kv_pages.size());
+      for (std::uint32_t page_index = 0U;
+           page_index < state.host_kv_pages.size(); ++page_index) {
+        const auto [keys, values] =
+            host_kv_layer_page(state, full_attention_slot, page_index);
+        key_pages.push_back(keys);
+        value_pages.push_back(values);
+      }
       status_check(ec::gated_gqa_attention_staged_host_fp16(
-          {query_gate_, host.keys, host.values, attention_,
-           host_kv_contexts_[slot], first_context_tokens,
-           retained_first_token, rows, query_heads_, kv_heads_, head_dim_,
-           nullptr},
+          {query_gate_, nullptr, nullptr, attention_,
+           static_cast<std::uint32_t>(state.host_kv_pages.size()) *
+               kv_page_tokens_,
+           first_context_tokens,
+           0U, rows, query_heads_, kv_heads_, head_dim_,
+           nullptr, key_pages.data(), value_pages.data(), kv_page_tokens_,
+           static_cast<std::uint32_t>(key_pages.size())},
           workspace));
     }
     project(binding(operation, "output_projection"), attention_, residual_,
@@ -2315,10 +2720,8 @@ void DenseFp4Provider::run_full_attention(
     return;
   }
   if (full_attention_slot >=
-      (authoritative_fp16_kv() &&
-               !exact_tier_gate_.full_context_fp4_draft()
-           ? mtp_layers_
-           : target_full_layers_ + mtp_layers_))
+      (authoritative_fp16_kv() ? mtp_layers_
+                              : target_full_layers_ + mtp_layers_))
     throw std::runtime_error("invalid paged full-attention slot");
   const auto target_fp8 =
       target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head;
@@ -2335,6 +2738,16 @@ void DenseFp4Provider::run_full_attention(
   for (std::uint32_t row = 0U; row < rows; ++row) {
     ensure_page(slot, cache_positions[row]);
   }
+  if (!mrope_positions.empty()) {
+    if (target_fp8 && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_fp8_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else
+      status_check(ec::store_gqa_kv_paged_fp4_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+  }
   if (rows == 1U) {
     auto* page =
         slot_pages_[slot][cache_positions.front() / kv_page_tokens_];
@@ -2342,7 +2755,8 @@ void DenseFp4Provider::run_full_attention(
       page = static_cast<void*>(static_cast<std::byte*>(page) +
                                 mtp_kv_page_offset_);
     if (target_fp8 && !mixed_mtp) {
-      status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_at(
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_at(
           query_gate_, key_, value_,
           binding(operation, "query_norm").f32,
           binding(operation, "key_norm").f32, page, physical_layer,
@@ -2355,7 +2769,8 @@ void DenseFp4Provider::run_full_attention(
           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
           kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
     } else {
-      status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_at(
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_at(
           query_gate_, key_, value_,
           binding(operation, "query_norm").f32,
           binding(operation, "key_norm").f32, page, physical_layer,
@@ -2369,20 +2784,23 @@ void DenseFp4Provider::run_full_attention(
           kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
     }
   } else {
-    if (target_fp8 && !mixed_mtp)
-      status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_batch(
+    if (target_fp8 && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_batch(
           query_gate_, key_, value_, binding(operation, "query_norm").f32,
           binding(operation, "key_norm").f32, page_table, physical_layer,
           kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
           rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
           epsilon_, rope_theta_, nullptr));
-    else
-      status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_batch(
+    } else {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_batch(
           query_gate_, key_, value_, binding(operation, "query_norm").f32,
           binding(operation, "key_norm").f32, page_table, physical_layer,
           kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
           rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
           epsilon_, rope_theta_, nullptr));
+    }
     if (rows * (query_heads_ / kv_heads_) <= 16U) {
       const ec::PagedFp4GatedGqaPrefillLaunch launch{
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
@@ -2539,11 +2957,37 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
     if (head_rows != 1U)
       throw std::runtime_error(
           "sampling requires a single terminal head row");
+    const auto top_k = request_parameter(*request, "sampling_top_k");
+    if (top_k != 0U && top_k <= kMaximumGpuSamplingTopK) {
+      status_check(ec::topk_logits(
+          logits_, vocabulary_size_, static_cast<std::uint32_t>(top_k),
+          sampling_top_logits_, sampling_top_tokens_, nullptr));
+      std::vector<float> host_logits(static_cast<std::size_t>(top_k));
+      std::vector<std::uint32_t> host_tokens(
+          static_cast<std::size_t>(top_k));
+      cuda_check(cudaMemcpy(host_logits.data(), sampling_top_logits_,
+                            host_logits.size() * sizeof(host_logits[0]),
+                            cudaMemcpyDeviceToHost),
+                 "copy dense FP4 top-k sampling logits");
+      cuda_check(cudaMemcpy(host_tokens.data(), sampling_top_tokens_,
+                            host_tokens.size() * sizeof(host_tokens[0]),
+                            cudaMemcpyDeviceToHost),
+                 "copy dense FP4 top-k sampling tokens");
+      ++sampling_gpu_calls_;
+      sampling_logit_transfer_bytes_ +=
+          host_logits.size() * sizeof(host_logits[0]) +
+          host_tokens.size() * sizeof(host_tokens[0]);
+      return {sample_sorted_candidates(host_logits, host_tokens, *request,
+                                       sample_position)};
+    }
     std::vector<float> host_logits(vocabulary_size_);
     cuda_check(cudaMemcpy(host_logits.data(), logits_,
                           host_logits.size() * sizeof(host_logits[0]),
                           cudaMemcpyDeviceToHost),
                "copy dense FP4 sampling logits");
+    ++sampling_host_calls_;
+    sampling_logit_transfer_bytes_ +=
+        host_logits.size() * sizeof(host_logits[0]);
     return {sample_token(host_logits, *request, sample_position)};
   }
   status_check(ec::argmax_batch(logits_, vocabulary_size_, head_rows,
@@ -2557,17 +3001,19 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
 }
 
 std::vector<std::uint32_t> DenseFp4Provider::run_target(
-    std::uint32_t slot, std::span<const std::uint32_t> tokens,
+    RequestState& state, std::span<const std::uint32_t> tokens,
     std::span<const std::uint32_t> positions, bool transactional_second) {
   if (tokens.empty() || tokens.size() > kWorkspaceRows ||
       tokens.size() != positions.size())
     throw std::runtime_error("invalid target-model microbatch");
   const auto rows = static_cast<std::uint32_t>(tokens.size());
+  const auto slot = state.slot();
   std::vector<std::uint32_t> result;
   for (const auto& operation_pointer : prepared_target_) {
     const auto& operation = *operation_pointer;
     const auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
     const auto stage = rows > 8U && operation.kernel != Kernel::embedding &&
+                       operation.kernel != Kernel::vision &&
                        operation.kernel != Kernel::head;
     if (stage) activate_staged_weights(operation);
     switch (operation.kernel) {
@@ -2584,7 +3030,9 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
             binding(operation, "weight").matrix(), output_tokens_, hidden_,
             rows, nullptr));
         break;
-      case Kernel::full_attention:
+      case Kernel::vision:
+        break;
+      case Kernel::full_attention: {
         cuda_check(cudaMemcpy(residual_, hidden_,
                               static_cast<std::size_t>(rows) * hidden_size_ *
                                   sizeof(float),
@@ -2592,11 +3040,22 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
                    "retain target attention residual");
         normalize_rows(hidden_, binding(operation, "input_norm").f32,
                        normalized_, rows);
-        run_full_attention(operation, slot, positions, positions, rows,
+        std::array<std::uint32_t, kWorkspaceRows> rotary{};
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+          const auto adjusted = static_cast<std::int64_t>(positions[row]) +
+                                slot_rope_deltas_.at(slot);
+          if (adjusted < 0 ||
+              adjusted > std::numeric_limits<std::uint32_t>::max())
+            throw std::runtime_error("adjusted rotary position is invalid");
+          rotary[row] = static_cast<std::uint32_t>(adjusted);
+        }
+        run_full_attention(operation, state, positions,
+                           std::span(rotary).first(rows), rows,
                            operation.full_attention_slot);
         status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
                                       nullptr));
         break;
+      }
       case Kernel::recurrent_attention:
         cuda_check(cudaMemcpy(residual_, hidden_,
                               static_cast<std::size_t>(rows) * hidden_size_ *
@@ -2674,378 +3133,6 @@ void DenseFp4Provider::checkpoint_recurrent_state(std::uint32_t slot) {
   }
 }
 
-void DenseFp4Provider::build_mtp_tree(RequestState& state,
-                                      std::uint32_t position,
-                                      std::uint32_t context_limit) {
-  if (!exact_tier_gate_.tree_enabled() || mtp_tree_)
-    return;
-  if (state.mtp_length != position || context_limit <= position + 1U)
-    throw std::runtime_error("invalid MTP tree root");
-  const auto horizon = std::min(
-      exact_tier_gate_.tree_horizon, context_limit - position - 1U);
-  const auto beam_width = exact_tier_gate_.tree_beam_width;
-  if (!horizon || !beam_width)
-    throw std::runtime_error("empty MTP tree contract");
-  const auto started = std::chrono::steady_clock::now();
-  std::uint64_t peak_host_bytes{};
-  const auto root_length = state.mtp_length;
-  const auto fp4_record_bytes = static_cast<std::size_t>(
-      head_dim_ / 2U + head_dim_ / 32U);
-  const auto token_record_bytes = static_cast<std::size_t>(2U) * kv_heads_ *
-                                  fp4_record_bytes;
-  const auto records_per_kind = static_cast<std::size_t>(kv_page_tokens_) *
-                                kv_heads_;
-  const auto layer_stride = 2U * records_per_kind * fp4_record_bytes;
-  const auto mtp_slot = mtp_attention_->full_attention_slot;
-
-  const auto copy_record = [&](std::uint32_t cache_position,
-                               std::vector<std::uint8_t>& record) {
-    const auto page_index = cache_position / kv_page_tokens_;
-    if (page_index >= slot_pages_.at(state.slot()).size())
-      throw std::runtime_error("MTP tree record exceeds page table");
-    auto* page = static_cast<std::uint8_t*>(
-        slot_pages_[state.slot()][page_index]);
-    if (!page)
-      throw std::runtime_error("MTP tree record page is absent");
-    record.resize(token_record_bytes);
-    const auto token = cache_position % kv_page_tokens_;
-    const auto token_offset = static_cast<std::size_t>(token) * kv_heads_ *
-                              fp4_record_bytes;
-    const auto* keys = page + static_cast<std::size_t>(mtp_slot) *
-                                 layer_stride + token_offset;
-    const auto* values = page + static_cast<std::size_t>(mtp_slot) *
-                                   layer_stride +
-                         records_per_kind * fp4_record_bytes + token_offset;
-    const auto kind_bytes = static_cast<std::size_t>(kv_heads_) *
-                            fp4_record_bytes;
-    cuda_check(cudaMemcpy(record.data(), keys, kind_bytes,
-                          cudaMemcpyDeviceToHost),
-               "capture MTP tree keys");
-    cuda_check(cudaMemcpy(record.data() + kind_bytes, values, kind_bytes,
-                          cudaMemcpyDeviceToHost),
-               "capture MTP tree values");
-  };
-  const auto restore_record = [&](std::uint32_t cache_position,
-                                  const std::vector<std::uint8_t>& record) {
-    if (record.size() != token_record_bytes)
-      throw std::runtime_error("MTP tree record has invalid size");
-    const auto page_index = cache_position / kv_page_tokens_;
-    auto* page = static_cast<std::uint8_t*>(
-        slot_pages_.at(state.slot()).at(page_index));
-    if (!page)
-      throw std::runtime_error("MTP tree restore page is absent");
-    const auto token = cache_position % kv_page_tokens_;
-    const auto token_offset = static_cast<std::size_t>(token) * kv_heads_ *
-                              fp4_record_bytes;
-    auto* keys = page + static_cast<std::size_t>(mtp_slot) * layer_stride +
-                 token_offset;
-    auto* values = page + static_cast<std::size_t>(mtp_slot) * layer_stride +
-                   records_per_kind * fp4_record_bytes + token_offset;
-    const auto kind_bytes = static_cast<std::size_t>(kv_heads_) *
-                            fp4_record_bytes;
-    cuda_check(cudaMemcpy(keys, record.data(), kind_bytes,
-                          cudaMemcpyHostToDevice),
-               "restore MTP tree keys");
-    cuda_check(cudaMemcpy(values, record.data() + kind_bytes, kind_bytes,
-                          cudaMemcpyHostToDevice),
-               "restore MTP tree values");
-  };
-
-  struct Candidate final {
-    std::uint32_t token{};
-    double log_probability{};
-  };
-  std::vector<float> host_logits(vocabulary_size_);
-  const auto top_candidates = [&]() {
-    cuda_check(cudaMemcpy(host_logits.data(), logits_,
-                          host_logits.size() * sizeof(host_logits[0]),
-                          cudaMemcpyDeviceToHost),
-               "copy MTP tree logits");
-    std::vector<std::uint32_t> order(vocabulary_size_);
-    peak_host_bytes = std::max<std::uint64_t>(
-        peak_host_bytes,
-        host_logits.capacity() * sizeof(host_logits[0]) +
-            order.capacity() * sizeof(order[0]));
-    std::iota(order.begin(), order.end(), 0U);
-    const auto greater = [&](std::uint32_t left, std::uint32_t right) {
-      const auto left_value = host_logits[left];
-      const auto right_value = host_logits[right];
-      if (std::isnan(left_value)) return false;
-      if (std::isnan(right_value)) return true;
-      return left_value == right_value ? left < right
-                                       : left_value > right_value;
-    };
-    const auto count = std::min<std::size_t>(beam_width, order.size());
-    std::partial_sort(order.begin(), order.begin() + count, order.end(),
-                      greater);
-    const auto maximum = static_cast<double>(host_logits[order.front()]);
-    if (!std::isfinite(maximum))
-      throw std::runtime_error("MTP tree logits are not finite");
-    double sum{};
-    for (const auto value : host_logits)
-      if (std::isfinite(value))
-        sum += std::exp(static_cast<double>(value) - maximum);
-    const auto normalizer = maximum + std::log(sum);
-    std::vector<Candidate> result;
-    result.reserve(count);
-    for (std::size_t index = 0U; index < count; ++index)
-      result.push_back({order[index],
-                        static_cast<double>(host_logits[order[index]]) -
-                            normalizer});
-    return result;
-  };
-
-  std::vector<float> root_hidden(hidden_size_);
-  cuda_check(cudaMemcpy(
-                 root_hidden.data(),
-                 slot_mtp_last_hidden_ +
-                     static_cast<std::size_t>(state.slot()) * hidden_size_,
-                 hidden_size_ * sizeof(float), cudaMemcpyDeviceToHost),
-             "capture MTP tree root hidden state");
-  const auto roots = top_candidates();
-  if (roots.empty() || roots.front().token != state.draft_token)
-    throw std::runtime_error("MTP tree root logits do not match draft state");
-  std::vector<MtpTreeNode> nodes;
-  nodes.reserve(static_cast<std::size_t>(horizon) * beam_width);
-  std::vector<std::size_t> beam;
-  for (const auto& root : roots) {
-    nodes.push_back({-1, root.token, 1U, root.log_probability, {}, {}});
-    beam.push_back(nodes.size() - 1U);
-  }
-
-  struct Expansion final {
-    std::size_t parent{};
-    std::uint32_t token{};
-    double score{};
-  };
-  for (std::uint32_t depth = 1U; depth < horizon; ++depth) {
-    std::vector<Expansion> expansions;
-    expansions.reserve(beam.size() * beam_width);
-    for (const auto node_index : beam) {
-      auto& node = nodes.at(node_index);
-      std::vector<std::size_t> ancestors;
-      for (auto parent = node.parent; parent >= 0;
-           parent = nodes.at(static_cast<std::size_t>(parent)).parent)
-        ancestors.push_back(static_cast<std::size_t>(parent));
-      std::reverse(ancestors.begin(), ancestors.end());
-      for (const auto ancestor : ancestors) {
-        const auto& retained = nodes.at(ancestor);
-        restore_record(root_length + retained.depth - 1U,
-                       retained.kv_record);
-      }
-      const auto& previous_hidden = node.parent < 0
-                                        ? root_hidden
-                                        : nodes.at(static_cast<std::size_t>(
-                                              node.parent)).hidden;
-      if (previous_hidden.size() != hidden_size_)
-        throw std::runtime_error("MTP tree hidden state is incomplete");
-      cuda_check(cudaMemcpy(mtp_rollout_previous_hidden_,
-                            previous_hidden.data(),
-                            hidden_size_ * sizeof(float),
-                            cudaMemcpyHostToDevice),
-                 "restore MTP tree hidden state");
-      state.mtp_length = root_length + depth - 1U;
-      const std::array token{node.token};
-      const std::array rotary_position{position + depth};
-      static_cast<void>(run_mtp(state, token, mtp_rollout_previous_hidden_,
-                                rotary_position, true));
-      copy_record(state.mtp_length - 1U, node.kv_record);
-      node.hidden.resize(hidden_size_);
-      cuda_check(cudaMemcpy(
-                     node.hidden.data(),
-                     slot_mtp_last_hidden_ +
-                         static_cast<std::size_t>(state.slot()) * hidden_size_,
-                     hidden_size_ * sizeof(float), cudaMemcpyDeviceToHost),
-                 "capture MTP tree hidden state");
-      for (const auto& candidate : top_candidates())
-        expansions.push_back({node_index, candidate.token,
-                              node.score + candidate.log_probability});
-      std::uint64_t retained_bytes =
-          host_logits.capacity() * sizeof(host_logits[0]) +
-          static_cast<std::uint64_t>(vocabulary_size_) *
-              sizeof(std::uint32_t) +
-          nodes.capacity() * sizeof(nodes[0]) +
-          beam.capacity() * sizeof(beam[0]) +
-          expansions.capacity() * sizeof(expansions[0]) +
-          root_hidden.capacity() * sizeof(root_hidden[0]);
-      for (const auto& retained_node : nodes)
-        retained_bytes +=
-            retained_node.kv_record.capacity() *
-                sizeof(retained_node.kv_record[0]) +
-            retained_node.hidden.capacity() *
-                sizeof(retained_node.hidden[0]);
-      peak_host_bytes = std::max(peak_host_bytes, retained_bytes);
-    }
-    std::sort(expansions.begin(), expansions.end(),
-              [](const auto& left, const auto& right) {
-                if (left.score != right.score) return left.score > right.score;
-                if (left.token != right.token) return left.token < right.token;
-                return left.parent < right.parent;
-              });
-    if (expansions.size() > beam_width) expansions.resize(beam_width);
-    beam.clear();
-    for (const auto& expansion : expansions) {
-      nodes.push_back({static_cast<std::int32_t>(expansion.parent),
-                       expansion.token, depth + 1U, expansion.score, {}, {}});
-      beam.push_back(nodes.size() - 1U);
-    }
-  }
-  state.mtp_length = root_length;
-
-  MtpTreeProposal proposal;
-  proposal.start_position = position;
-  proposal.horizon = horizon;
-  proposal.paths.reserve(nodes.size());
-  std::set<std::vector<std::uint32_t>> unique_prefixes;
-  for (std::size_t retained_node = 0U; retained_node < nodes.size();
-       ++retained_node) {
-    std::vector<std::uint32_t> path;
-    for (auto node = static_cast<std::int32_t>(retained_node); node >= 0;
-         node = nodes.at(static_cast<std::size_t>(node)).parent)
-      path.push_back(nodes.at(static_cast<std::size_t>(node)).token);
-    std::reverse(path.begin(), path.end());
-    if (path.size() != nodes[retained_node].depth)
-      throw std::runtime_error("MTP tree path has invalid depth");
-    unique_prefixes.insert(path);
-    proposal.paths.push_back(std::move(path));
-  }
-  proposal.surviving.assign(proposal.paths.size(), true);
-  proposal.nodes = static_cast<std::uint32_t>(unique_prefixes.size());
-  proposal.proposer_ns = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - started)
-          .count());
-  std::uint64_t proposal_bytes =
-      proposal.paths.capacity() * sizeof(proposal.paths[0]) +
-      (proposal.surviving.capacity() + 7U) / 8U;
-  for (const auto& path : proposal.paths)
-    proposal_bytes += path.capacity() * sizeof(path[0]);
-  proposal.peak_host_bytes = std::max(peak_host_bytes, proposal_bytes);
-  mtp_tree_ = std::move(proposal);
-  state.mtp_length = root_length;
-}
-
-void DenseFp4Provider::refine_tree_with_block_jacobi(
-    RequestState& state, std::uint32_t position,
-    std::uint32_t context_limit) {
-  if (!exact_tier_gate_.full_context_fp4_draft() || !mtp_tree_ ||
-      mtp_tree_->block_refined)
-    return;
-  auto& proposal = *mtp_tree_;
-  if (proposal.start_position != position ||
-      proposal.horizon > context_limit - position - 1U)
-    throw std::runtime_error("block-Jacobi proposal root is invalid");
-  const auto seed = std::max_element(
-      proposal.paths.begin(), proposal.paths.end(),
-      [](const auto& left, const auto& right) {
-        return left.size() < right.size();
-      });
-  if (seed == proposal.paths.end() || seed->size() != proposal.horizon)
-    throw std::runtime_error("block-Jacobi seed does not reach the horizon");
-
-  const auto started = std::chrono::steady_clock::now();
-  std::vector<std::vector<std::uint32_t>> trajectories;
-  trajectories.reserve(
-      static_cast<std::size_t>(exact_tier_gate_.block_jacobi_iterations) +
-      1U);
-  trajectories.push_back(*seed);
-  std::vector<std::uint32_t> inputs(proposal.horizon);
-  std::vector<std::uint32_t> positions(proposal.horizon);
-  for (std::uint32_t row = 0U; row < proposal.horizon; ++row)
-    positions[row] = position + row;
-
-  checkpoint_recurrent_state(state.slot());
-  try {
-    for (std::uint32_t iteration = 0U;
-         iteration < exact_tier_gate_.block_jacobi_iterations; ++iteration) {
-      restore_recurrent_checkpoint(state.slot());
-      inputs.front() = state.synchronized_token;
-      std::copy_n(trajectories.back().begin(), proposal.horizon - 1U,
-                  inputs.begin() + 1U);
-      active_full_context_fp4_draft_ = true;
-      auto corrected = run_target(state.slot(), inputs, positions, false);
-      active_full_context_fp4_draft_ = false;
-      if (corrected.size() != proposal.horizon)
-        throw std::runtime_error(
-            "block-Jacobi target pass returned an invalid trajectory");
-      trajectories.push_back(std::move(corrected));
-      ++block_jacobi_passes_;
-    }
-    restore_recurrent_checkpoint(state.slot());
-  } catch (...) {
-    active_full_context_fp4_draft_ = false;
-    restore_recurrent_checkpoint(state.slot());
-    throw;
-  }
-
-  std::set<std::vector<std::uint32_t>> prefixes;
-  for (const auto& trajectory : trajectories) {
-    std::vector<std::uint32_t> prefix;
-    prefix.reserve(trajectory.size());
-    for (const auto token : trajectory) {
-      prefix.push_back(token);
-      prefixes.insert(prefix);
-    }
-  }
-  if (prefixes.size() > 128U)
-    throw std::runtime_error("block-Jacobi proposal exceeded its node budget");
-  const auto elapsed = static_cast<std::uint64_t>(
-      std::chrono::duration_cast<std::chrono::nanoseconds>(
-          std::chrono::steady_clock::now() - started)
-          .count());
-  block_jacobi_ns_ += elapsed;
-  proposal.proposer_ns += elapsed;
-  proposal.nodes = static_cast<std::uint32_t>(prefixes.size());
-  proposal.paths = std::move(trajectories);
-  proposal.surviving.assign(proposal.paths.size(), true);
-  std::uint64_t host_bytes =
-      proposal.paths.capacity() * sizeof(proposal.paths[0]) +
-      inputs.capacity() * sizeof(inputs[0]) +
-      positions.capacity() * sizeof(positions[0]);
-  for (const auto& path : proposal.paths)
-    host_bytes += path.capacity() * sizeof(path[0]);
-  proposal.peak_host_bytes = std::max(proposal.peak_host_bytes, host_bytes);
-  proposal.block_refined = true;
-}
-
-void DenseFp4Provider::observe_mtp_tree(std::uint32_t exact_token) {
-  if (!mtp_tree_) return;
-  auto& proposal = *mtp_tree_;
-  bool any{};
-  for (std::size_t path = 0U; path < proposal.paths.size(); ++path) {
-    if (!proposal.surviving[path]) continue;
-    if (proposal.compared_depth >= proposal.paths[path].size() ||
-        proposal.paths[path][proposal.compared_depth] != exact_token)
-      proposal.surviving[path] = false;
-    else
-      any = true;
-  }
-  ++proposal.compared_depth;
-  if (any) proposal.accepted_depth = proposal.compared_depth;
-  if (!any)
-    finish_mtp_tree("mismatch");
-  else if (proposal.compared_depth == proposal.horizon)
-    finish_mtp_tree("horizon");
-}
-
-void DenseFp4Provider::finish_mtp_tree(std::string_view termination) {
-  if (!mtp_tree_) return;
-  const auto& proposal = *mtp_tree_;
-  tree_output_ << proposal.start_position << '\t' << proposal.horizon << '\t'
-               << exact_tier_gate_.tree_beam_width << '\t' << proposal.nodes
-               << '\t' << proposal.proposer_ns << '\t'
-               << proposal.peak_host_bytes << '\t'
-               << proposal.accepted_depth << '\t' << termination << '\n';
-  tree_output_.flush();
-  ++tree_cycles_;
-  tree_nodes_ += proposal.nodes;
-  tree_proposer_ns_ += proposal.proposer_ns;
-  tree_accepted_tokens_ += proposal.accepted_depth;
-  tree_peak_host_bytes_ =
-      std::max(tree_peak_host_bytes_, proposal.peak_host_bytes);
-  mtp_tree_.reset();
-}
-
 std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
     RequestState& state, std::span<const std::uint32_t> tokens,
     const float* previous_hidden,
@@ -3092,11 +3179,32 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
   normalize_rows(hidden_, binding(*mtp_attention_, "input_norm").f32,
                  normalized_, rows);
   std::array<std::uint32_t, kWorkspaceRows> cache_positions{};
+  std::array<std::uint32_t, 3U * kWorkspaceRows> mrope_positions{};
   for (std::uint32_t row = 0U; row < rows; ++row)
     cache_positions[row] = state.mtp_length + row;
-  run_full_attention(*mtp_attention_, state.slot(),
-                     std::span(cache_positions).first(rows), rotary_positions,
-                     rows, mtp_attention_->full_attention_slot);
+  for (std::uint32_t row = 0U;
+       row < rows && !state.prompt_mrope_positions.empty(); ++row) {
+    const auto position = rotary_positions[row];
+    if (position < state.prompt_mrope_positions.size() / 3U) {
+      std::copy_n(state.prompt_mrope_positions.data() + 3U * position, 3U,
+                  mrope_positions.data() + 3U * row);
+    } else {
+      const auto adjusted = static_cast<std::int64_t>(position) +
+                            state.rope_delta;
+      if (adjusted < 0 ||
+          adjusted > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("adjusted MTP rotary position is invalid");
+      std::fill_n(mrope_positions.data() + 3U * row, 3U,
+                  static_cast<std::uint32_t>(adjusted));
+    }
+  }
+  run_full_attention(*mtp_attention_, state,
+                     std::span(cache_positions).first(rows),
+                     rotary_positions, rows,
+                     mtp_attention_->full_attention_slot,
+                     state.prompt_mrope_positions.empty()
+                         ? std::span<const std::uint32_t>{}
+                         : std::span(mrope_positions).first(3U * rows));
   status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
                                 nullptr));
   run_ffn(*mtp_ffn_, rows);
@@ -3131,7 +3239,8 @@ bool DenseFp4Provider::supports_program_sequence(
     const er::CompiledModelProgram& program) const noexcept {
   try {
     if (program.operations.size() != prepared_target_.size() ||
-        program.operations.empty() || program.inputs.size() != 2U ||
+        program.operations.empty() ||
+        program.inputs.size() != (vision_enabled_ ? 3U : 2U) ||
         program.outputs.size() != 1U ||
         std::any_of(prepared_target_.begin(), prepared_target_.end(),
                     [](const auto& operation) { return !operation; }))
@@ -3139,6 +3248,7 @@ bool DenseFp4Provider::supports_program_sequence(
 
     std::optional<std::uint32_t> token_input;
     std::optional<std::uint32_t> position_input;
+    std::optional<std::uint32_t> media_input;
     for (const auto& endpoint : program.inputs) {
       if (endpoint.value_index >= program.values.size()) return false;
       const auto& abi = program.values[endpoint.value_index].abi;
@@ -3146,10 +3256,14 @@ bool DenseFp4Provider::supports_program_sequence(
         token_input = endpoint.value_index;
       else if (abi == kPositionAbi && !position_input)
         position_input = endpoint.value_index;
+      else if (abi == kMultimodalAbi && !media_input)
+        media_input = endpoint.value_index;
       else
         return false;
     }
-    if (!token_input || !position_input) return false;
+    if (!token_input || !position_input ||
+        (vision_enabled_ != media_input.has_value()))
+      return false;
 
     const auto output_endpoint = program.outputs.front();
     if (output_endpoint.value_index >= program.values.size() ||
@@ -3177,6 +3291,16 @@ bool DenseFp4Provider::supports_program_sequence(
           if (index != 0U || compiled.input_values.size() != 1U ||
               compiled.output_values.size() != 1U ||
               value_for_port(compiled, "token_ids", false) != token_input)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          if (!hidden) return false;
+          break;
+        case Kernel::vision:
+          if (!vision_enabled_ || !hidden || !media_input ||
+              compiled.input_values.size() != 2U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hidden", false) != hidden ||
+              value_for_port(compiled, "media", false) != media_input)
             return false;
           hidden = value_for_port(compiled, "hidden", true);
           if (!hidden) return false;
@@ -3233,6 +3357,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
     auto sequence = std::make_shared<SequenceState>();
     sequence->request = request;
     sequence->generation = invocation.request;
+    request->exact_decode_enabled =
+        request_parameter(invocation.request, "exact_decode_enabled") != 0U;
     const auto retention =
         invocation.request.parameters.find("retention_checkpoint_position");
     if (retention != invocation.request.parameters.end()) {
@@ -3254,6 +3380,7 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
 
     const er::ExecutionValue* token_value{};
     const er::ExecutionValue* position_value{};
+    const er::ExecutionValue* media_value{};
     for (std::size_t index = 0U; index < invocation.inputs.size(); ++index) {
       const auto value_index = invocation.program.inputs[index].value_index;
       if (value_index >= invocation.program.values.size())
@@ -3263,6 +3390,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
         token_value = &invocation.inputs[index];
       else if (abi == kPositionAbi)
         position_value = &invocation.inputs[index];
+      else if (abi == kMultimodalAbi)
+        media_value = &invocation.inputs[index];
     }
     const auto copy_host_u32 = [this](const er::ExecutionValue* value,
                                       std::string_view abi,
@@ -3300,17 +3429,33 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
         throw std::runtime_error(
             "program-sequence position stream is not contiguous");
     }
-    if (sequence->retention_position != 0U &&
-        (sequence->retention_position <= sequence->positions.front() ||
-         sequence->retention_position > sequence->positions.back() + 1U))
+    if (vision_enabled_) {
+      if (!media_value)
+        throw std::runtime_error("program-sequence media input is absent");
+      sequence->media = parse_media_payload(
+          *media_value, static_cast<std::uint32_t>(sequence->tokens.size()),
+          vision_patch_dimension_, vision_spatial_merge_size_);
+      if (!sequence->media.empty()) {
+        request->rope_delta = sequence->media.rope_delta;
+        request->prompt_mrope_positions = sequence->media.positions_thw;
+        slot_rope_deltas_.at(request->slot()) = request->rope_delta;
+      }
+    }
+    if (sequence->retention_position > sequence->positions.back() + 1U)
       throw std::runtime_error(
           "program-sequence retention checkpoint is outside its positions");
+    if (sequence->retention_position <= sequence->positions.front())
+      sequence->retention_position = 0U;
     if (request->synchronization_rows != 0U)
       throw std::runtime_error("previous target batch was not synchronized");
-    if (sequence->tokens.size() >
-        std::numeric_limits<std::size_t>::max() / hidden_size_)
+    if (!sequence_tile_rows_ ||
+        sequence->tokens.size() >
+            std::numeric_limits<std::size_t>::max() / hidden_size_)
       throw std::runtime_error("program-sequence hidden state is too large");
-    sequence->hidden.resize(sequence->tokens.size() * hidden_size_);
+    sequence->tile_rows =
+        std::min<std::size_t>(sequence_tile_rows_, sequence->tokens.size());
+    if (request->exact_decode_enabled)
+      sequence->hidden.resize(sequence->tokens.size() * hidden_size_);
 
     return er::OperationExecutionHandle::from_callbacks(
         [this, sequence] { return poll_program_sequence(sequence); },
@@ -3336,7 +3481,8 @@ er::Status DenseFp4Provider::checkpoint_request_state(
       return er::Status::success();
     }
     if (state->current_position + 1U != next_position ||
-        (exact_ && state->mtp_length != next_position))
+        (exact_ && state->exact_decode_enabled &&
+         state->mtp_length != next_position))
       throw std::runtime_error("retention checkpoint position is invalid");
     const auto conv_dimension =
         2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
@@ -3410,6 +3556,7 @@ er::Status DenseFp4Provider::rewind_request_state(
                        static_cast<std::size_t>(state->slot()) * hidden_size_,
                    hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
                "rewind retained target hidden state");
+    if (authoritative_fp16_kv()) trim_host_kv(*state, next_position);
     state->current_position = next_position - 1U;
     state->current_batch_first = next_position - 1U;
     state->current_batch_rows = 0U;
@@ -3422,6 +3569,387 @@ er::Status DenseFp4Provider::rewind_request_state(
     return er::Status::success();
   } catch (const std::exception& error) {
     return {er::ErrorCode::internal, error.what()};
+  }
+}
+
+er::RequestStateParkingResult DenseFp4Provider::park_request_state(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    std::uint32_t next_position) {
+  try {
+    std::lock_guard lock(mutex_);
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || state->parked() ||
+        state->slot() >= capacity_ || !slot_in_use_[state->slot()] ||
+        next_position == 0U || next_position > max_context_ ||
+        state->current_position + 1U != next_position ||
+        !state->retention_valid ||
+        state->retention_position != next_position ||
+        state->synchronization_rows != 0U)
+      throw std::runtime_error("request state is not parkable");
+
+    const auto page_count = static_cast<std::uint64_t>(
+        (next_position + kv_page_tokens_ - 1U) / kv_page_tokens_);
+    if (authoritative_fp16_kv() &&
+        (state->host_kv_populated_tokens < next_position ||
+         state->host_kv_pages.size() < page_count))
+      throw std::runtime_error(
+          "authoritative FP16 KV prefix is incomplete at park");
+    const auto conv_dimension =
+        2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
+    const auto conv_values =
+        static_cast<std::size_t>(conv_dimension) * conv_kernel_;
+    const auto matrix_values = static_cast<std::size_t>(value_heads_) *
+                               key_head_dim_ * value_head_dim_;
+    const auto recurrent_values =
+        static_cast<std::uint64_t>(recurrent_layers_) *
+        (conv_values + matrix_values);
+    const auto state_bytes =
+        recurrent_values * sizeof(float) +
+        3U * static_cast<std::uint64_t>(hidden_size_) * sizeof(float);
+    std::uint64_t resident_page_count{};
+    for (std::uint64_t page_index = 0U; page_index < page_count;
+         ++page_index)
+      if (slot_pages_.at(state->slot()).at(
+              static_cast<std::size_t>(page_index)))
+        ++resident_page_count;
+    if (!authoritative_fp16_kv() && resident_page_count != page_count)
+      throw std::runtime_error("populated request KV page is absent");
+    if ((kv_page_bytes_ == 0U && resident_page_count != 0U) ||
+        (kv_page_bytes_ != 0U &&
+         resident_page_count > std::numeric_limits<std::uint64_t>::max() /
+                                   kv_page_bytes_))
+      throw std::runtime_error("parked KV byte count overflows");
+    const auto page_bytes = resident_page_count * kv_page_bytes_;
+    if (state_bytes > std::numeric_limits<std::uint64_t>::max() - page_bytes)
+      throw std::runtime_error("parked request byte count overflows");
+    const auto required_bytes = page_bytes + state_bytes;
+    if (required_bytes > ram_cache_bytes_ ||
+        host_kv_bytes_ + parked_request_bytes_ >
+            ram_cache_bytes_ - required_bytes)
+      return {{er::ErrorCode::backpressure,
+               "request-state RAM parking capacity is exhausted"},
+              0U, 0U};
+
+    ParkedRequestState parked;
+    parked.bytes = required_bytes;
+    if (state->host_kv_bytes >
+        std::numeric_limits<std::uint64_t>::max() - required_bytes)
+      throw std::runtime_error("parked session byte count overflows");
+    parked.reported_bytes = required_bytes + state->host_kv_bytes;
+    if (page_count > std::numeric_limits<std::uint32_t>::max() ||
+        required_bytes > std::numeric_limits<std::size_t>::max())
+      throw std::runtime_error("parked request geometry overflows");
+    parked.logical_pages = static_cast<std::uint32_t>(page_count);
+    parked.page_payload_bytes = page_bytes;
+    parked.page_indices.reserve(static_cast<std::size_t>(resident_page_count));
+    parked.payload.allocate(static_cast<std::size_t>(required_bytes));
+    const auto slot = state->slot();
+    std::size_t page_ordinal{};
+    for (std::uint64_t page_index = 0U; page_index < page_count;
+         ++page_index) {
+      const auto* page = slot_pages_.at(slot).at(
+          static_cast<std::size_t>(page_index));
+      if (!page) continue;
+      parked.page_indices.push_back(static_cast<std::uint32_t>(page_index));
+      cuda_check(cudaMemcpyAsync(
+                     parked.payload.data + page_ordinal * kv_page_bytes_, page,
+                     static_cast<std::size_t>(kv_page_bytes_),
+                     cudaMemcpyDeviceToHost, parking_stream_),
+                 "park request KV page");
+      ++page_ordinal;
+    }
+
+    std::size_t payload_offset = static_cast<std::size_t>(page_bytes);
+    const auto copy_layers = [&](const std::vector<float*>& sources,
+                                 std::size_t values, std::string_view label) {
+      for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
+        cuda_check(cudaMemcpyAsync(
+                       parked.payload.data + payload_offset,
+                       sources.at(layer) +
+                           static_cast<std::size_t>(slot) * values,
+                       values * sizeof(float), cudaMemcpyDeviceToHost,
+                       parking_stream_),
+                   label);
+        payload_offset += values * sizeof(float);
+      }
+    };
+    copy_layers(recurrent_conv_state_, conv_values,
+                "park recurrent convolution state");
+    copy_layers(recurrent_matrix_state_,
+                matrix_values, "park recurrent matrix state");
+    const auto hidden_bytes = static_cast<std::size_t>(hidden_size_) *
+                              sizeof(float);
+    cuda_check(cudaMemcpyAsync(parked.payload.data + payload_offset,
+                               slot_last_hidden(slot), hidden_bytes,
+                               cudaMemcpyDeviceToHost, parking_stream_),
+               "park target hidden state");
+    payload_offset += hidden_bytes;
+    cuda_check(cudaMemcpyAsync(
+                   parked.payload.data + payload_offset,
+                   slot_mtp_last_hidden_ +
+                       static_cast<std::size_t>(slot) * hidden_size_,
+                   hidden_bytes, cudaMemcpyDeviceToHost, parking_stream_),
+               "park MTP hidden state");
+    payload_offset += hidden_bytes;
+    cuda_check(cudaMemcpyAsync(
+                   parked.payload.data + payload_offset,
+                   slot_retention_last_hidden_ +
+                       static_cast<std::size_t>(slot) * hidden_size_,
+                   hidden_bytes, cudaMemcpyDeviceToHost, parking_stream_),
+               "park retained target hidden state");
+    payload_offset += hidden_bytes;
+    if (payload_offset != required_bytes ||
+        page_ordinal != parked.page_indices.size())
+      throw std::runtime_error("parked request blob layout is inconsistent");
+
+    const auto table_bytes = static_cast<std::size_t>(maximum_pages_per_slot_) *
+                             sizeof(void*);
+    cuda_check(cudaMemsetAsync(
+                   device_page_table_ + static_cast<std::size_t>(slot) *
+                                            maximum_pages_per_slot_,
+                   0, table_bytes, parking_stream_),
+               "unpublish parked KV page table");
+    if (device_mtp_page_table_ != device_page_table_)
+      cuda_check(cudaMemsetAsync(
+                     device_mtp_page_table_ +
+                         static_cast<std::size_t>(slot) *
+                             maximum_pages_per_slot_,
+                     0, table_bytes, parking_stream_),
+                 "unpublish parked MTP KV page table");
+    cuda_check(cudaStreamSynchronize(parking_stream_),
+               "finish request-state parking transfers");
+
+    for (std::uint32_t page_index = 0U;
+         page_index < maximum_pages_per_slot_; ++page_index) {
+      auto*& page = slot_pages_[slot][page_index];
+      if (page) {
+        free_kv_pages_.push_back(page);
+        page = nullptr;
+      }
+    }
+    slot_rope_deltas_[slot] = 0;
+    slot_in_use_[slot] = false;
+    state->slot_ = kNoSlot;
+    state->parked_state.emplace(std::move(parked));
+    parked_request_bytes_ += required_bytes;
+    parked_session_bytes_ += state->parked_state->reported_bytes;
+    park_device_to_host_bytes_ += required_bytes;
+    ++park_calls_;
+    return {er::Status::success(), page_count,
+            state->parked_state->reported_bytes};
+  } catch (const std::exception& error) {
+    if (parking_stream_)
+      static_cast<void>(cudaStreamSynchronize(parking_stream_));
+    return {{er::ErrorCode::internal, error.what()}, 0U, 0U};
+  }
+}
+
+er::RequestStateParkingResult DenseFp4Provider::restore_request_state(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state) {
+  try {
+    std::lock_guard lock(mutex_);
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || !state->parked() ||
+        state->slot() != kNoSlot)
+      throw std::runtime_error("request state is not parked");
+    const auto free = std::find(slot_in_use_.begin(), slot_in_use_.end(), false);
+    if (free == slot_in_use_.end())
+      return {{er::ErrorCode::backpressure,
+               "dense FP4 provider has no free request slot"},
+              0U, 0U};
+    const auto& parked = *state->parked_state;
+    const auto page_count = static_cast<std::uint64_t>(parked.logical_pages);
+    const auto resident_page_count =
+        static_cast<std::uint64_t>(parked.page_indices.size());
+    if (page_count > maximum_pages_per_slot_ ||
+        parked.page_payload_bytes != resident_page_count * kv_page_bytes_ ||
+        parked.payload.bytes != parked.bytes)
+      throw std::runtime_error("parked request blob is invalid");
+    const auto unallocated = kv_page_capacity_ - all_kv_pages_.size();
+    if (resident_page_count > free_kv_pages_.size() + unallocated)
+      return {{er::ErrorCode::backpressure,
+               "KV physical page budget is exhausted during restore"},
+              0U, 0U};
+
+    const auto slot = static_cast<std::uint32_t>(free - slot_in_use_.begin());
+    *free = true;
+    std::vector<std::uint32_t> published;
+    published.reserve(static_cast<std::size_t>(resident_page_count));
+    try {
+      const auto table_bytes =
+          static_cast<std::size_t>(maximum_pages_per_slot_) * sizeof(void*);
+      const auto table_count =
+          device_mtp_page_table_ == device_page_table_ ? 1U : 2U;
+      PinnedHostBuffer host_tables;
+      host_tables.allocate(table_count * table_bytes);
+      std::memset(host_tables.data, 0, host_tables.bytes);
+      auto** target_table = reinterpret_cast<void**>(host_tables.data);
+      auto** mtp_table = table_count == 1U
+          ? target_table
+          : reinterpret_cast<void**>(host_tables.data + table_bytes);
+      for (std::size_t ordinal = 0U;
+           ordinal < parked.page_indices.size(); ++ordinal) {
+        const auto page_index = parked.page_indices[ordinal];
+        if (page_index >= page_count)
+          throw std::runtime_error("parked KV page index is invalid");
+        auto*& page = slot_pages_[slot][page_index];
+        if (!free_kv_pages_.empty()) {
+          page = free_kv_pages_.back();
+          free_kv_pages_.pop_back();
+        } else {
+          cuda_check(cudaMalloc(&page, static_cast<std::size_t>(kv_page_bytes_)),
+                     "allocate restored KV page");
+          all_kv_pages_.push_back(page);
+        }
+        published.push_back(page_index);
+        cuda_check(cudaMemcpyAsync(
+                       page,
+                       parked.payload.data + ordinal * kv_page_bytes_,
+                       static_cast<std::size_t>(kv_page_bytes_),
+                       cudaMemcpyHostToDevice, parking_stream_),
+                   "restore request KV page");
+        target_table[page_index] = page;
+        if (device_mtp_page_table_ != device_page_table_) {
+          mtp_table[page_index] = static_cast<void*>(
+              static_cast<std::byte*>(page) + mtp_kv_page_offset_);
+        }
+      }
+
+      const auto conv_dimension =
+          2U * key_heads_ * key_head_dim_ + value_heads_ * value_head_dim_;
+      const auto conv_values =
+          static_cast<std::size_t>(conv_dimension) * conv_kernel_;
+      const auto matrix_values = static_cast<std::size_t>(value_heads_) *
+                                 key_head_dim_ * value_head_dim_;
+      std::size_t payload_offset =
+          static_cast<std::size_t>(parked.page_payload_bytes);
+      const auto restore_layers = [&](const std::vector<float*>& destinations,
+                                      std::size_t values,
+                                      std::string_view label) {
+        for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
+          cuda_check(cudaMemcpyAsync(
+                         destinations.at(layer) +
+                             static_cast<std::size_t>(slot) * values,
+                         parked.payload.data + payload_offset,
+                         values * sizeof(float), cudaMemcpyHostToDevice,
+                         parking_stream_),
+                     label);
+          payload_offset += values * sizeof(float);
+        }
+      };
+      restore_layers(recurrent_conv_state_, conv_values,
+                     "restore recurrent convolution state");
+      restore_layers(recurrent_matrix_state_,
+                     matrix_values, "restore recurrent matrix state");
+      const auto clone_device_layers = [&, slot](
+        const std::vector<float*>& destinations,
+          const std::vector<float*>& sources, std::size_t values,
+          std::string_view label) {
+        for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer)
+          cuda_check(cudaMemcpyAsync(
+                         destinations.at(layer) +
+                             static_cast<std::size_t>(slot) * values,
+                         sources.at(layer) +
+                             static_cast<std::size_t>(slot) * values,
+                         values * sizeof(float), cudaMemcpyDeviceToDevice,
+                         parking_stream_),
+                     label);
+      };
+      clone_device_layers(recurrent_conv_checkpoint_, recurrent_conv_state_,
+                          conv_values,
+                          "initialize recurrent convolution checkpoint");
+      clone_device_layers(recurrent_matrix_checkpoint_,
+                          recurrent_matrix_state_, matrix_values,
+                          "initialize recurrent matrix checkpoint");
+      clone_device_layers(recurrent_conv_retention_checkpoint_,
+                          recurrent_conv_state_, conv_values,
+                          "initialize retained recurrent convolution state");
+      clone_device_layers(recurrent_matrix_retention_checkpoint_,
+                          recurrent_matrix_state_, matrix_values,
+                          "initialize retained recurrent matrix state");
+      const auto hidden_bytes = static_cast<std::size_t>(hidden_size_) *
+                                sizeof(float);
+      if (payload_offset > parked.payload.bytes ||
+          3U * hidden_bytes > parked.payload.bytes - payload_offset)
+        throw std::runtime_error("parked hidden state has invalid size");
+      cuda_check(cudaMemcpyAsync(slot_last_hidden(slot),
+                                 parked.payload.data + payload_offset,
+                                 hidden_bytes, cudaMemcpyHostToDevice,
+                                 parking_stream_),
+                 "restore target hidden state");
+      payload_offset += hidden_bytes;
+      cuda_check(cudaMemcpyAsync(
+                     slot_mtp_last_hidden_ +
+                         static_cast<std::size_t>(slot) * hidden_size_,
+                     parked.payload.data + payload_offset, hidden_bytes,
+                     cudaMemcpyHostToDevice, parking_stream_),
+                 "restore MTP hidden state");
+      payload_offset += hidden_bytes;
+      cuda_check(cudaMemcpyAsync(
+                     slot_retention_last_hidden_ +
+                         static_cast<std::size_t>(slot) * hidden_size_,
+                     parked.payload.data + payload_offset, hidden_bytes,
+                     cudaMemcpyHostToDevice, parking_stream_),
+                 "restore retained target hidden state");
+      payload_offset += hidden_bytes;
+      if (payload_offset != parked.payload.bytes)
+        throw std::runtime_error("parked request blob layout changed");
+      cuda_check(cudaMemcpyAsync(
+                     device_page_table_ + static_cast<std::size_t>(slot) *
+                                              maximum_pages_per_slot_,
+                     target_table, table_bytes, cudaMemcpyHostToDevice,
+                     parking_stream_),
+                 "publish restored KV page table");
+      if (device_mtp_page_table_ != device_page_table_)
+        cuda_check(cudaMemcpyAsync(
+                       device_mtp_page_table_ +
+                           static_cast<std::size_t>(slot) *
+                               maximum_pages_per_slot_,
+                       mtp_table, table_bytes, cudaMemcpyHostToDevice,
+                       parking_stream_),
+                   "publish restored MTP KV page table");
+      cuda_check(cudaStreamSynchronize(parking_stream_),
+                 "finish request-state restore transfers");
+    } catch (...) {
+      static_cast<void>(cudaStreamSynchronize(parking_stream_));
+      for (const auto page_index : published) {
+        auto*& page = slot_pages_[slot][page_index];
+        if (page) free_kv_pages_.push_back(page);
+        page = nullptr;
+      }
+      const auto table_bytes =
+          static_cast<std::size_t>(maximum_pages_per_slot_) * sizeof(void*);
+      static_cast<void>(cudaMemset(
+          device_page_table_ + static_cast<std::size_t>(slot) *
+                                   maximum_pages_per_slot_,
+          0, table_bytes));
+      if (device_mtp_page_table_ != device_page_table_)
+        static_cast<void>(cudaMemset(
+            device_mtp_page_table_ + static_cast<std::size_t>(slot) *
+                                         maximum_pages_per_slot_,
+            0, table_bytes));
+      *free = false;
+      throw;
+    }
+
+    state->slot_ = slot;
+    slot_rope_deltas_[slot] = state->rope_delta;
+    const auto bytes = parked.bytes;
+    const auto reported_bytes = parked.reported_bytes;
+    if (bytes > parked_request_bytes_)
+      throw std::runtime_error("parked request accounting underflow");
+    if (reported_bytes > parked_session_bytes_)
+      throw std::runtime_error("parked session accounting underflow");
+    parked_request_bytes_ -= bytes;
+    parked_session_bytes_ -= reported_bytes;
+    state->parked_state.reset();
+    restore_host_to_device_bytes_ += bytes;
+    ++restore_calls_;
+    return {er::Status::success(), page_count, reported_bytes};
+  } catch (const std::exception& error) {
+    if (parking_stream_)
+      static_cast<void>(cudaStreamSynchronize(parking_stream_));
+    return {{er::ErrorCode::internal, error.what()}, 0U, 0U};
   }
 }
 
@@ -3443,16 +3971,62 @@ DenseFp4Provider::poll_program_sequence(
     const auto& operation =
         *sequence->operations[sequence->next_operation];
     const auto total_rows = sequence->tokens.size();
+    if (!sequence->tile_rows || sequence->tile_first > total_rows ||
+        sequence->tile_rows > total_rows - sequence->tile_first)
+      throw std::runtime_error("program-sequence tile state is invalid");
+    auto* tile_hidden =
+        sequence_hidden_ +
+        static_cast<std::size_t>(sequence->request->slot()) *
+            sequence_tile_rows_ * hidden_size_;
 
     if (operation.kernel == Kernel::head) {
-      if (sequence->next_row != 0U || total_rows == 0U)
+      if (sequence->next_row != 0U || total_rows == 0U ||
+          sequence->next_operation + 1U != sequence->operations.size())
         throw std::runtime_error("program-sequence head state is invalid");
-      const auto last_row = total_rows - 1U;
+      const auto tile_bytes = sequence->tile_rows * hidden_size_ *
+                              sizeof(float);
+      if (sequence->request->exact_decode_enabled) {
+        cuda_check(cudaMemcpy(
+                       sequence->hidden.data() +
+                           sequence->tile_first * hidden_size_,
+                       tile_hidden, tile_bytes, cudaMemcpyDeviceToHost),
+                   "retain exact target hidden tile");
+        program_sequence_host_bytes_ += tile_bytes;
+      }
+      if (sequence->retention_position != 0U) {
+        const auto checkpoint_row = static_cast<std::size_t>(
+            sequence->retention_position - sequence->positions.front() - 1U);
+        if (checkpoint_row >= sequence->tile_first &&
+            checkpoint_row < sequence->tile_first + sequence->tile_rows) {
+          cuda_check(cudaMemcpy(
+                         slot_retention_last_hidden_ +
+                             static_cast<std::size_t>(
+                                 sequence->request->slot()) *
+                                 hidden_size_,
+                         tile_hidden +
+                             (checkpoint_row - sequence->tile_first) *
+                                 hidden_size_,
+                         hidden_size_ * sizeof(float),
+                         cudaMemcpyDeviceToDevice),
+                     "retain program-sequence checkpoint hidden state");
+          sequence->request->retention_position =
+              sequence->retention_position;
+        }
+      }
+      ++program_sequence_tiles_;
+      if (sequence->tile_first + sequence->tile_rows != total_rows) {
+        sequence->tile_first += sequence->tile_rows;
+        sequence->tile_rows = std::min<std::size_t>(
+            sequence_tile_rows_, total_rows - sequence->tile_first);
+        sequence->next_operation = 0U;
+        sequence->next_row = 0U;
+        return std::nullopt;
+      }
       cuda_check(cudaMemcpy(
                      hidden_,
-                     sequence->hidden.data() + last_row * hidden_size_,
-                     hidden_size_ * sizeof(float), cudaMemcpyHostToDevice),
-                 "upload final program-sequence hidden state");
+                     tile_hidden + (sequence->tile_rows - 1U) * hidden_size_,
+                     hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "load final program-sequence hidden state");
       const auto phase_event = begin_gpu_phase(GpuPhase::head);
       auto predictions = run_head(operation, 1U, &sequence->generation,
                                   sequence->positions.back(), true);
@@ -3468,20 +4042,6 @@ DenseFp4Provider::poll_program_sequence(
                             hidden_, hidden_size_ * sizeof(float),
                             cudaMemcpyDeviceToDevice),
                  "retain final program-sequence target state");
-      if (sequence->retention_position != 0U) {
-        const auto checkpoint_row = static_cast<std::size_t>(
-            sequence->retention_position - sequence->positions.front() - 1U);
-        cuda_check(cudaMemcpy(
-                       slot_retention_last_hidden_ +
-                           static_cast<std::size_t>(
-                               sequence->request->slot()) *
-                               hidden_size_,
-                       sequence->hidden.data() + checkpoint_row * hidden_size_,
-                       hidden_size_ * sizeof(float), cudaMemcpyHostToDevice),
-                   "retain program-sequence checkpoint hidden state");
-        sequence->request->retention_position =
-            sequence->retention_position;
-      }
       end_gpu_phase(phase_event);
       collect_gpu_phases();
 
@@ -3490,13 +4050,22 @@ DenseFp4Provider::poll_program_sequence(
       sequence->request->current_batch_rows =
           static_cast<std::uint32_t>(total_rows);
       sequence->request->current_position = sequence->positions.back();
-      sequence->request->synchronization_first =
-          sequence->positions.front();
-      sequence->request->synchronization_rows =
-          static_cast<std::uint32_t>(total_rows);
-      sequence->request->synchronization_consumed = 0U;
-      sequence->request->sequence_target_hidden =
-          std::move(sequence->hidden);
+      if (sequence->request->exact_decode_enabled) {
+        sequence->request->synchronization_first =
+            sequence->positions.front();
+        sequence->request->synchronization_rows =
+            static_cast<std::uint32_t>(total_rows);
+        sequence->request->synchronization_consumed = 0U;
+        sequence->request->sequence_target_hidden =
+            std::move(sequence->hidden);
+      } else {
+        sequence->request->synchronization_first = 0U;
+        sequence->request->synchronization_rows = 0U;
+        sequence->request->synchronization_consumed = 0U;
+        sequence->request->sequence_target_hidden.clear();
+        sequence->request->mtp_length = sequence->request->current_position + 1U;
+        sequence->request->draft_valid = false;
+      }
 
       auto owner = std::make_shared<std::vector<std::uint32_t>>(
           std::move(predictions));
@@ -3515,19 +4084,39 @@ DenseFp4Provider::poll_program_sequence(
       return result;
     }
 
+    if (operation.kernel == Kernel::vision) {
+      if (sequence->next_row != 0U)
+        throw std::runtime_error("program-sequence vision state is invalid");
+      const auto phase_event = begin_gpu_phase(GpuPhase::vision);
+      run_vision(operation, sequence->media, tile_hidden,
+                 static_cast<std::uint32_t>(total_rows),
+                 static_cast<std::uint32_t>(sequence->tile_first),
+                 static_cast<std::uint32_t>(sequence->tile_rows),
+                 !sequence->vision_prepared);
+      sequence->vision_prepared = true;
+      end_gpu_phase(phase_event);
+      collect_gpu_phases();
+      ++sequence->next_operation;
+      return std::nullopt;
+    }
+
     auto chunk_rows = std::min<std::size_t>(
-        kWorkspaceRows, total_rows - sequence->next_row);
+        kWorkspaceRows, sequence->tile_rows - sequence->next_row);
     if (sequence->retention_position != 0U) {
       const auto checkpoint_offset = static_cast<std::size_t>(
           sequence->retention_position - sequence->positions.front());
-      if (sequence->next_row < checkpoint_offset &&
-          checkpoint_offset < sequence->next_row + chunk_rows)
-        chunk_rows = checkpoint_offset - sequence->next_row;
+      const auto global_row = sequence->tile_first + sequence->next_row;
+      if (global_row < checkpoint_offset &&
+          checkpoint_offset < global_row + chunk_rows)
+        chunk_rows = checkpoint_offset - global_row;
     }
     const auto rows = static_cast<std::uint32_t>(chunk_rows);
     if (!rows)
       throw std::runtime_error("program-sequence operation has no rows");
-    const auto offset = sequence->next_row;
+    const auto tile_offset = sequence->next_row;
+    const auto offset = sequence->tile_first + tile_offset;
+    const auto hidden_bytes = static_cast<std::size_t>(rows) * hidden_size_ *
+                              sizeof(float);
     const auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
     if (operation.kernel == Kernel::embedding) {
       cuda_check(cudaMemcpy(output_tokens_, sequence->tokens.data() + offset,
@@ -3537,14 +4126,18 @@ DenseFp4Provider::poll_program_sequence(
       status_check(ec::fp4_embedding_batch(
           binding(operation, "weight").matrix(), output_tokens_, hidden_, rows,
           nullptr));
+      cuda_check(cudaMemcpy(
+                     tile_hidden + tile_offset * hidden_size_, hidden_,
+                     hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "store program-sequence embedding tile");
+      program_sequence_device_bytes_ += hidden_bytes;
     } else {
       cuda_check(cudaMemcpy(hidden_,
-                            sequence->hidden.data() + offset * hidden_size_,
-                            static_cast<std::size_t>(rows) * hidden_size_ *
-                                sizeof(float),
-                            cudaMemcpyHostToDevice),
-                 "upload program-sequence hidden chunk");
-      activate_staged_weights(operation);
+                            tile_hidden + tile_offset * hidden_size_,
+                            hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence hidden tile");
+      const auto single_tile = total_rows <= sequence_tile_rows_;
+      if (single_tile) activate_staged_weights(operation);
       switch (operation.kernel) {
         case Kernel::full_attention:
         case Kernel::recurrent_attention: {
@@ -3557,11 +4150,30 @@ DenseFp4Provider::poll_program_sequence(
                          normalized_, rows);
           const auto positions = std::span(sequence->positions)
                                      .subspan(offset, rows);
-          if (operation.kernel == Kernel::full_attention)
-            run_full_attention(operation, sequence->request->slot(), positions,
-                               positions, rows,
-                               operation.full_attention_slot);
-          else
+          if (operation.kernel == Kernel::full_attention) {
+            std::array<std::uint32_t, kWorkspaceRows> adjusted{};
+            auto rotary = positions;
+            if (sequence->media.positions_thw.empty() &&
+                sequence->request->rope_delta != 0) {
+              for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto value = static_cast<std::int64_t>(positions[row]) +
+                                   sequence->request->rope_delta;
+                if (value < 0 ||
+                    value > std::numeric_limits<std::uint32_t>::max())
+                  throw std::runtime_error(
+                      "adjusted sequence rotary position is invalid");
+                adjusted[row] = static_cast<std::uint32_t>(value);
+              }
+              rotary = std::span(adjusted).first(rows);
+            }
+            run_full_attention(
+                operation, *sequence->request, positions, rotary, rows,
+                operation.full_attention_slot,
+                sequence->media.positions_thw.empty()
+                    ? std::span<const std::uint32_t>{}
+                    : std::span(sequence->media.positions_thw)
+                          .subspan(3U * offset, 3U * rows));
+          } else
             run_recurrent_attention(operation, sequence->request->slot(), rows,
                                     false);
           if (operation.kernel == Kernel::recurrent_attention &&
@@ -3608,23 +4220,23 @@ DenseFp4Provider::poll_program_sequence(
           run_ffn(operation, rows);
           break;
         case Kernel::embedding:
+        case Kernel::vision:
         case Kernel::head:
         case Kernel::exact_decode:
           throw std::runtime_error(
               "invalid operation in program-sequence hidden phase");
       }
-      deactivate_staged_weights();
+      if (single_tile) deactivate_staged_weights();
+      cuda_check(cudaMemcpy(
+                     tile_hidden + tile_offset * hidden_size_, hidden_,
+                     hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "store program-sequence hidden tile");
+      program_sequence_device_bytes_ += 2U * hidden_bytes;
     }
-    cuda_check(cudaMemcpy(sequence->hidden.data() + offset * hidden_size_,
-                          hidden_,
-                          static_cast<std::size_t>(rows) * hidden_size_ *
-                              sizeof(float),
-                          cudaMemcpyDeviceToHost),
-               "download program-sequence hidden chunk");
     end_gpu_phase(phase_event);
     collect_gpu_phases();
     sequence->next_row += rows;
-    if (sequence->next_row == total_rows) {
+    if (sequence->next_row == sequence->tile_rows) {
       sequence->next_row = 0U;
       ++sequence->next_operation;
     }
@@ -3654,6 +4266,9 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
     const auto phase_event = begin_gpu_phase(gpu_phase(operation->kernel));
     switch (operation->kernel) {
       case Kernel::embedding: {
+        state->exact_decode_enabled =
+            request_parameter(invocation.request, "exact_decode_enabled") !=
+            0U;
         if (state->synchronization_rows != 0U)
           throw std::runtime_error(
               "previous target batch was not synchronized");
@@ -3672,6 +4287,20 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
             static_cast<std::uint32_t>(tokens.size()), nullptr));
         state->current_batch_rows = static_cast<std::uint32_t>(tokens.size());
         outputs.emplace("hidden", device_hidden_value(state->current_batch_rows));
+        break;
+      }
+      case Kernel::vision: {
+        const auto rows = require_hidden_value(
+            invocation_input(*operation, invocation, "hidden"));
+        if (rows != state->current_batch_rows)
+          throw std::runtime_error("vision batch width changed in program");
+        const auto media = parse_media_payload(
+            invocation_input(*operation, invocation, "media"), 0U,
+            vision_patch_dimension_, vision_spatial_merge_size_);
+        if (!media.empty())
+          throw std::runtime_error(
+              "image input requires program-sequence prefill");
+        outputs.emplace("hidden", device_hidden_value(rows));
         break;
       }
       case Kernel::full_attention:
@@ -3700,8 +4329,18 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
         normalize_rows(hidden_, binding(*operation, "input_norm").f32,
                        normalized_, rows);
         if (operation->kernel == Kernel::full_attention) {
-          run_full_attention(*operation, state->slot(), positions, positions,
-                             rows, operation->full_attention_slot);
+          std::array<std::uint32_t, kWorkspaceRows> rotary{};
+          for (std::uint32_t row = 0U; row < rows; ++row) {
+            const auto adjusted = static_cast<std::int64_t>(positions[row]) +
+                                  state->rope_delta;
+            if (adjusted < 0 ||
+                adjusted > std::numeric_limits<std::uint32_t>::max())
+              throw std::runtime_error("adjusted rotary position is invalid");
+            rotary[row] = static_cast<std::uint32_t>(adjusted);
+          }
+          run_full_attention(*operation, *state, positions,
+                             std::span(rotary).first(rows), rows,
+                             operation->full_attention_slot);
         } else {
           run_recurrent_attention(*operation, state->slot(), rows, false);
         }
@@ -3739,9 +4378,17 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
                            static_cast<std::size_t>(rows - 1U) * hidden_size_,
                        hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
                    "retain final target hidden state");
-        state->synchronization_first = state->current_batch_first;
-        state->synchronization_rows = rows;
-        state->synchronization_consumed = 0U;
+        if (state->exact_decode_enabled) {
+          state->synchronization_first = state->current_batch_first;
+          state->synchronization_rows = rows;
+          state->synchronization_consumed = 0U;
+        } else {
+          state->synchronization_first = 0U;
+          state->synchronization_rows = 0U;
+          state->synchronization_consumed = 0U;
+          state->mtp_length = state->current_position + 1U;
+          state->draft_valid = false;
+        }
         auto owner =
             std::make_shared<std::vector<std::uint32_t>>(
                 run_head(*operation, rows, &invocation.request,
@@ -3911,102 +4558,12 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
         invocation.context_limit > max_context_)
       throw std::runtime_error("exact MTP invocation stream is invalid");
 
-    if (exact_tier_gate_.enabled()) {
-      build_mtp_tree(*state, invocation.position, invocation.context_limit);
-      refine_tree_with_block_jacobi(*state, invocation.position,
-                                    invocation.context_limit);
-      const std::array probe_tokens{invocation.guaranteed_token};
-      const std::array probe_positions{invocation.position};
-      struct Preview final {
-        std::uint32_t fraction_ppm{};
-        std::uint32_t token{};
-        std::vector<float> logits;
-      };
-      std::vector<Preview> previews;
-      previews.reserve(exact_tier_gate_.fractions_ppm.size());
-      for (const auto fraction : exact_tier_gate_.fractions_ppm) {
-        checkpoint_recurrent_state(state->slot());
-        active_gate_fraction_ppm_ = fraction;
-        const auto output = run_target(state->slot(), probe_tokens,
-                                       probe_positions, false);
-        if (output.size() != 1U)
-          throw std::runtime_error(
-              "exact-tier preview produced an invalid token batch");
-        Preview preview;
-        preview.fraction_ppm = fraction;
-        preview.token = output.front();
-        preview.logits.resize(vocabulary_size_);
-        cuda_check(cudaMemcpy(preview.logits.data(), logits_,
-                              preview.logits.size() * sizeof(float),
-                              cudaMemcpyDeviceToHost),
-                   "copy exact-tier preview logits");
-        previews.push_back(std::move(preview));
-        restore_recurrent_checkpoint(state->slot());
-      }
-      active_gate_fraction_ppm_ = 0U;
-      const auto target_outputs = run_target(
-          state->slot(), probe_tokens, probe_positions, false);
-      if (target_outputs.size() != 1U)
-        throw std::runtime_error(
-            "exact-tier target produced an invalid token batch");
-      const auto next_token = target_outputs.front();
-      observe_mtp_tree(next_token);
-      cuda_check(cudaMemcpy(slot_last_hidden(state->slot()), hidden_,
-                            hidden_size_ * sizeof(float),
-                            cudaMemcpyDeviceToDevice),
-                 "commit exact-tier target hidden state");
-      for (const auto& preview : previews) {
-        const auto target_logit = preview.logits.at(next_token);
-        std::uint32_t rank = 1U;
-        for (std::uint32_t token = 0U; token < vocabulary_size_; ++token) {
-          const auto candidate = preview.logits[token];
-          if (candidate > target_logit ||
-              (candidate == target_logit && token < next_token))
-            ++rank;
-        }
-        const auto context_tokens = invocation.position + 1U;
-        const auto retained = std::max<std::uint64_t>(
-            1U, static_cast<std::uint64_t>(context_tokens) *
-                    preview.fraction_ppm / 1'000'000U);
-        gate_output_ << invocation.position << '\t' << preview.fraction_ppm
-                     << '\t'
-                     << context_tokens - static_cast<std::uint32_t>(retained)
-                     << '\t' << next_token << '\t' << preview.token << '\t'
-                     << rank << '\n';
-        ++gate_records_;
-      }
-      gate_output_.flush();
-
-      state->draft_valid = false;
-      const auto future_exact =
-          invocation.position + 2U < invocation.context_limit;
-      if (invocation.position + 1U < max_context_) {
-        const std::array mtp_tokens{next_token};
-        const std::array mtp_positions{invocation.position + 1U};
-        auto drafts = run_mtp(*state, mtp_tokens, hidden_, mtp_positions,
-                              future_exact);
-        if (future_exact) {
-          state->draft_token = drafts.back();
-          state->draft_valid = true;
-        }
-      }
-      state->synchronized_token = next_token;
-      er::ExactDecodeExecutionResult result;
-      result.status = er::Status::success();
-      result.emitted_tokens.push_back(invocation.guaranteed_token);
-      result.next_token = next_token;
-      result.positions_advanced = 1U;
-      ++exact_calls_;
-      ++program_steps_;
-      return completed_exact(std::move(result));
-    }
-
     const std::array target_tokens{invocation.guaranteed_token,
                                    state->draft_token};
     const std::array target_positions{invocation.position,
                                       invocation.position + 1U};
-    const auto target_outputs = run_target(
-        state->slot(), target_tokens, target_positions, true);
+    const auto target_outputs =
+        run_target(*state, target_tokens, target_positions, true);
     if (target_outputs.size() != 2U)
       throw std::runtime_error("two-position target verification is incomplete");
     const bool accepted = target_outputs[0] == state->draft_token;
@@ -4080,7 +4637,8 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path& artifact_root, std::uint32_t max_context,
     std::uint32_t capacity, std::uint64_t ram_cache_bytes,
     std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
-    std::uint32_t kv_page_tokens, std::string_view kv_cache_dtype) {
+    std::uint32_t kv_page_tokens, std::string_view kv_cache_dtype,
+    bool profile_gpu_phases) {
   try {
     er::ModelArtifact artifact;
     auto status = er::ModelArtifact::load(artifact_root, artifact);
@@ -4090,7 +4648,8 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     if (!status.ok()) return {status, {}};
     auto implementation = std::make_shared<DenseFp4Provider>(
         artifact.model(), tensor_store, max_context, capacity, ram_cache_bytes,
-        vram_cache_bytes, kv_cache_bytes, kv_page_tokens, kv_cache_dtype);
+        vram_cache_bytes, kv_cache_bytes, kv_page_tokens, kv_cache_dtype,
+        profile_gpu_phases);
     er::ExecutionProviderModule module;
     module.definition = {"sm86-dense-fp4", 200U, provider_capabilities(),
                          implementation};
@@ -4103,9 +4662,7 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
         "per_request_nonblocking",
         "artifact",
         std::string(implementation->target_kv_dtype()),
-        implementation->authoritative_fp16_kv()
-            ? "preallocated"
-            : "paged_on_demand",
+        "paged_on_demand",
         implementation->kv_page_tokens(),
         implementation->kv_page_bytes(),
         implementation->kv_page_capacity(),
@@ -4122,6 +4679,14 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
         false,
         false,
         true};
+    module.service.session_parking =
+        implementation->supports_request_state_parking();
+    module.service.session_park_ram_bytes =
+        module.service.session_parking ? ram_cache_bytes : 0U;
+    module.service.session_park_page_capacity =
+        module.service.session_parking
+            ? ram_cache_bytes / implementation->kv_page_bytes()
+            : 0U;
     module.telemetry = [implementation] { return implementation->telemetry(); };
     return {er::Status::success(), std::move(module)};
   } catch (const std::exception& error) {

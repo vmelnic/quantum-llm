@@ -37,6 +37,20 @@ class CodingContextTests(unittest.TestCase):
         minimum, _, _ = exact_prompt_ids(tokenizer, content, 400)
         self.assertEqual(len(minimum), 400)
 
+    def test_checkpoint_encoder_replaces_missing_chat_template(self):
+        tokenizer = CharacterTokenizer()
+        tokenizer.apply_chat_template = None
+
+        def encoder(messages, thinking_mode):
+            self.assertEqual(thinking_mode, "chat")
+            return "<official>" + messages[1]["content"] + "</official>"
+
+        ids, _, rendered = exact_prompt_ids(
+            tokenizer, "repository source\n" * 100, 300, encoder
+        )
+        self.assertEqual(len(ids), 300)
+        self.assertTrue(rendered.startswith("<official>"))
+
 
 if __name__ == "__main__":
     unittest.main()

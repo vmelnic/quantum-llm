@@ -3185,6 +3185,9 @@ int expert_vm_hybrid_delta_moe_provider_main(int argc, char** argv) {
       if (!parsed.status.ok())
         throw std::runtime_error(std::string(parsed.status.message()));
       auto options = std::move(parsed.options);
+      if (options.profile_gpu_phases)
+        throw std::runtime_error(
+            "execution provider does not support GPU phase profiling");
       if (!options.extensions.empty())
         throw std::runtime_error("execution provider does not support requested extension");
       if (options.ram_cache_gib >

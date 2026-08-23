@@ -132,6 +132,62 @@ struct Fp4Block32Matrix final {
     void* stream) noexcept;
 [[nodiscard]] Status add_in_place(float* destination, const float* source,
                                   std::uint32_t elements, void* stream) noexcept;
+[[nodiscard]] Status add_bias_in_place(float* destination, const float* bias,
+                                       std::uint32_t rows,
+                                       std::uint32_t columns,
+                                       void* stream) noexcept;
+[[nodiscard]] Status layer_norm_batch(
+    const float* input, const float* weight, const float* bias, float* output,
+    std::uint32_t rows, std::uint32_t elements, float epsilon,
+    void* stream) noexcept;
+[[nodiscard]] Status gelu_tanh_in_place(float* values,
+                                        std::uint32_t elements,
+                                        void* stream) noexcept;
+[[nodiscard]] Status gelu_exact_in_place(float* values,
+                                         std::uint32_t elements,
+                                         void* stream) noexcept;
+
+// Artifact-declared vision composite primitives. Patch rows follow the
+// processor's spatial-merge-major order. Segment bounds keep attention exact
+// and independent between multiple images without a quadratic mask tensor.
+[[nodiscard]] Status add_fp4_position_interpolation(
+    float* hidden, const Fp4Block32Matrix& positions,
+    const std::uint32_t* interpolation_indices,
+    const float* interpolation_weights, std::uint32_t rows,
+    void* stream) noexcept;
+[[nodiscard]] Status vision_qkv_rope_in_place(
+    float* qkv, const std::uint32_t* row_positions,
+    std::uint32_t rows, std::uint32_t heads, std::uint32_t head_dim,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status vision_segment_attention(
+    const float* qkv, const std::uint32_t* segment_first,
+    const std::uint32_t* segment_last, float* output, std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t head_dim,
+    void* stream) noexcept;
+
+// Standard Q/K RMSNorm plus Qwen-style three-axis interleaved mRoPE.
+[[nodiscard]] Status gated_gqa_qk_norm_mrope_batch(
+    float* q_and_gate, float* key, const float* q_norm_weight,
+    const float* k_norm_weight, const std::uint32_t* positions_thw,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, std::uint32_t mrope_section_0,
+    std::uint32_t mrope_section_1, std::uint32_t mrope_section_2,
+    float epsilon, float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status store_gqa_kv_paged_fp4_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+[[nodiscard]] Status store_gqa_kv_paged_fp8_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+[[nodiscard]] Status store_gqa_kv_fp16_batch(
+    const float* key, const float* value, void* fp16_keys,
+    void* fp16_values, std::uint32_t rows, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* stream) noexcept;
 
 [[nodiscard]] Status silu_product(const float* gate, const float* up,
                                   float* output, std::uint32_t elements,
@@ -466,6 +522,13 @@ struct HostFp16GatedGqaAttentionLaunch final {
   std::uint32_t kv_heads{};
   std::uint32_t head_dim{};
   void* stream{};
+  // Optional request-owned paged host source. When present, these replace
+  // host_keys/host_values and let exact FP16 KV grow without relocating a
+  // contiguous cache or tying it to an execution slot.
+  const void* const* host_key_pages{};
+  const void* const* host_value_pages{};
+  std::uint32_t host_page_tokens{};
+  std::uint32_t host_page_count{};
 };
 
 struct DeviceFp16GatedGqaAttentionLaunch final {
@@ -605,5 +668,13 @@ struct SplitGatedDeltaPrefillLaunch final {
                                   std::uint32_t batch,
                                   std::uint32_t* output,
                                   void* stream) noexcept;
+
+// Deterministic descending top-k over one logit row. NaNs are excluded and
+// equal logits are ordered by the lower token id, matching host sampling.
+[[nodiscard]] Status topk_logits(const float* values, std::uint32_t count,
+                                 std::uint32_t top_k,
+                                 float* output_values,
+                                 std::uint32_t* output_indices,
+                                 void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

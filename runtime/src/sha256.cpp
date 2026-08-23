@@ -5,9 +5,69 @@
 #include <bit>
 #include <cstdint>
 #include <cstring>
+#include <limits>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#include <bcrypt.h>
+#endif
 
 namespace expert::runtime {
 namespace {
+
+#ifdef _WIN32
+bool native_sha256(std::span<const std::byte> input,
+                   Sha256Digest& output) noexcept {
+  BCRYPT_ALG_HANDLE algorithm{};
+  BCRYPT_HASH_HANDLE hash{};
+  void* object{};
+  DWORD object_bytes{};
+  DWORD returned{};
+  bool success{};
+  do {
+    if (BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM,
+                                    nullptr, 0U) < 0)
+      break;
+    if (BCryptGetProperty(
+            algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&object_bytes), sizeof(object_bytes),
+            &returned, 0U) < 0 ||
+        returned != sizeof(object_bytes) || object_bytes == 0U)
+      break;
+    object = HeapAlloc(GetProcessHeap(), 0U, object_bytes);
+    if (!object) break;
+    if (BCryptCreateHash(algorithm, &hash, static_cast<PUCHAR>(object),
+                         object_bytes, nullptr, 0U, 0U) < 0)
+      break;
+    std::size_t cursor{};
+    while (cursor < input.size()) {
+      const auto remaining = input.size() - cursor;
+      const auto chunk = static_cast<ULONG>(std::min<std::size_t>(
+          remaining, std::numeric_limits<ULONG>::max()));
+      if (BCryptHashData(
+              hash,
+              const_cast<PUCHAR>(reinterpret_cast<const UCHAR*>(
+                  input.data() + cursor)),
+              chunk, 0U) < 0)
+        break;
+      cursor += chunk;
+    }
+    if (cursor != input.size()) break;
+    if (BCryptFinishHash(hash, reinterpret_cast<PUCHAR>(output.data()),
+                         static_cast<ULONG>(output.size()), 0U) < 0)
+      break;
+    success = true;
+  } while (false);
+  if (hash) static_cast<void>(BCryptDestroyHash(hash));
+  if (object) static_cast<void>(HeapFree(GetProcessHeap(), 0U, object));
+  if (algorithm)
+    static_cast<void>(BCryptCloseAlgorithmProvider(algorithm, 0U));
+  return success;
+}
+#endif
 
 constexpr std::array<std::uint32_t, 64> kRoundConstants = {
     0x428a2f98U, 0x71374491U, 0xb5c0fbcfU, 0xe9b5dba5U,
@@ -142,6 +202,10 @@ Sha256Digest Sha256::finalize() noexcept {
 }
 
 Sha256Digest sha256(std::span<const std::byte> input) noexcept {
+#ifdef _WIN32
+  Sha256Digest native{};
+  if (native_sha256(input, native)) return native;
+#endif
   Sha256 hasher;
   hasher.update(input);
   return hasher.finalize();

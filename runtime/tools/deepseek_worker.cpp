@@ -1003,6 +1003,17 @@ class Model final : public er::IOperationProvider,
       bool failed{};
     };
 
+    struct RetentionCheckpoint final {
+      void* host_state{};
+      std::uint64_t host_state_bytes{};
+      std::uint32_t position{};
+      std::uint32_t predicted{};
+      std::uint32_t draft{};
+      bool draft_ready{};
+      bool speculation_suppressed{};
+      bool valid{};
+    };
+
     std::shared_ptr<Model> owner;
     std::shared_ptr<er::cuda::DeepSeekRequestState> state;
     std::shared_ptr<er::cuda::DeepSeekVerifyState> verify;
@@ -1018,6 +1029,7 @@ class Model final : public er::IOperationProvider,
     float* remote_outputs_host{};
     std::uint32_t* route_prediction_host{};
     std::vector<PrefetchItem> prefetch_items;
+    std::array<RetentionCheckpoint, 2U> retention_checkpoints;
     std::uint64_t next_remote_invocation{1U};
     std::uint32_t provider_slot{};
     std::uint32_t context_limit{};
@@ -1029,6 +1041,9 @@ class Model final : public er::IOperationProvider,
     std::uint32_t prediction_target_layer{
         std::numeric_limits<std::uint32_t>::max()};
     std::uint32_t current_router_component_layer{
+        std::numeric_limits<std::uint32_t>::max()};
+    std::uint32_t retention_target_position{};
+    std::uint32_t selected_retention_checkpoint{
         std::numeric_limits<std::uint32_t>::max()};
     std::optional<std::uint32_t> current_prefetch_target_layer;
     bool embedded{};
@@ -1058,6 +1073,9 @@ class Model final : public er::IOperationProvider,
         static_cast<void>(cudaFreeHost(remote_outputs_host));
       if (remote_input_host)
         static_cast<void>(cudaFreeHost(remote_input_host));
+      for (auto& checkpoint : retention_checkpoints)
+        if (checkpoint.host_state)
+          static_cast<void>(cudaFreeHost(checkpoint.host_state));
       if (stream) static_cast<void>(cudaStreamDestroy(stream));
       if (owner) owner->release_callable_provider_slot(provider_slot);
     }
@@ -1217,6 +1235,190 @@ class Model final : public er::IOperationProvider,
     }
   }
 
+  [[nodiscard]] std::uint64_t retention_checkpoint_bytes(
+      const CallableRequestState& state) const {
+    std::uint64_t bytes{};
+    for (std::uint32_t layer = 0U; layer < state.state->layer_count();
+         ++layer) {
+      const auto view = state.state->layer(layer);
+      require(view.attention_state != nullptr,
+              "DeepSeek retention layer state is absent");
+      const auto layer_bytes =
+          view.attention_state->retention_checkpoint_bytes();
+      require(layer_bytes <=
+                  std::numeric_limits<std::uint64_t>::max() - bytes,
+              "DeepSeek retention checkpoint size overflow");
+      bytes += layer_bytes;
+    }
+    return bytes;
+  }
+
+  er::Status capture_retention_checkpoint(CallableRequestState& state,
+                                          std::uint32_t position,
+                                          bool select) {
+    try {
+      require(position != 0U && position == state.next_position,
+              "DeepSeek retention checkpoint is not at a causal boundary");
+      auto selected = std::numeric_limits<std::uint32_t>::max();
+      for (std::uint32_t index = 0U;
+           index < state.retention_checkpoints.size(); ++index) {
+        if (state.retention_checkpoints[index].valid &&
+            state.retention_checkpoints[index].position == position) {
+          selected = index;
+          break;
+        }
+      }
+      if (selected == std::numeric_limits<std::uint32_t>::max()) {
+        for (std::uint32_t index = 0U;
+             index < state.retention_checkpoints.size(); ++index) {
+          if (!state.retention_checkpoints[index].valid ||
+              index != state.selected_retention_checkpoint) {
+            selected = index;
+            break;
+          }
+        }
+      }
+      require(selected < state.retention_checkpoints.size(),
+              "DeepSeek retention checkpoint ring is exhausted");
+      auto& checkpoint = state.retention_checkpoints[selected];
+      const auto bytes = retention_checkpoint_bytes(state);
+      if (checkpoint.host_state_bytes != bytes) {
+        if (checkpoint.host_state) {
+          cuda_check(cudaFreeHost(checkpoint.host_state),
+                     "release resized DeepSeek retention checkpoint");
+          checkpoint.host_state = nullptr;
+        }
+        if (bytes != 0U)
+          cuda_check(cudaHostAlloc(&checkpoint.host_state,
+                                   static_cast<std::size_t>(bytes),
+                                   cudaHostAllocPortable),
+                     "allocate DeepSeek retention checkpoint");
+        checkpoint.host_state_bytes = bytes;
+      }
+      auto* cursor = static_cast<std::byte*>(checkpoint.host_state);
+      for (std::uint32_t layer = 0U; layer < state.state->layer_count();
+           ++layer) {
+        const auto view = state.state->layer(layer);
+        const auto layer_bytes =
+            view.attention_state->retention_checkpoint_bytes();
+        const auto status = view.attention_state->checkpoint_retention_state(
+            layer_bytes == 0U ? nullptr : cursor, state.stream);
+        require(status.ok(), status.message());
+        if (layer_bytes != 0U) cursor += layer_bytes;
+      }
+      cuda_check(cudaStreamSynchronize(state.stream),
+                 "complete DeepSeek retention checkpoint");
+      checkpoint.position = position;
+      checkpoint.predicted = state.predicted;
+      checkpoint.draft = state.draft;
+      checkpoint.draft_ready = state.draft_ready;
+      checkpoint.speculation_suppressed = state.speculation_suppressed;
+      checkpoint.valid = true;
+      if (select) state.selected_retention_checkpoint = selected;
+      return er::Status::success();
+    } catch (const std::exception& error) {
+      return {er::ErrorCode::internal, error.what()};
+    }
+  }
+
+  [[nodiscard]] bool supports_request_state_retention()
+      const noexcept override {
+    return true;
+  }
+
+  er::Status checkpoint_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+      std::uint32_t position) override {
+    const auto state =
+        std::dynamic_pointer_cast<CallableRequestState>(opaque_state);
+    if (!state || state->owner.get() != this)
+      return {er::ErrorCode::invalid_argument,
+              "DeepSeek retention checkpoint ownership is invalid"};
+    for (std::uint32_t index = 0U;
+         index < state->retention_checkpoints.size(); ++index) {
+      if (state->retention_checkpoints[index].valid &&
+          state->retention_checkpoints[index].position == position) {
+        state->selected_retention_checkpoint = index;
+        return er::Status::success();
+      }
+    }
+    return capture_retention_checkpoint(*state, position, true);
+  }
+
+  er::Status rewind_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+      std::uint32_t position) override {
+    const auto state =
+        std::dynamic_pointer_cast<CallableRequestState>(opaque_state);
+    if (!state || state->owner.get() != this)
+      return {er::ErrorCode::invalid_argument,
+              "DeepSeek retention rewind ownership is invalid"};
+    try {
+      const auto found = std::find_if(
+          state->retention_checkpoints.begin(),
+          state->retention_checkpoints.end(),
+          [position](const CallableRequestState::RetentionCheckpoint& item) {
+            return item.valid && item.position == position;
+          });
+      require(found != state->retention_checkpoints.end(),
+              "DeepSeek retention checkpoint is unavailable");
+      reset_callable_prefetch(*state, true);
+      auto* cursor = static_cast<const std::byte*>(found->host_state);
+      for (std::uint32_t layer = 0U; layer < state->state->layer_count();
+           ++layer) {
+        const auto view = state->state->layer(layer);
+        const auto layer_bytes =
+            view.attention_state->retention_checkpoint_bytes();
+        const auto status = view.attention_state->restore_retention_state(
+            layer_bytes == 0U ? nullptr : cursor, state->stream);
+        require(status.ok(), status.message());
+        if (layer_bytes != 0U) cursor += layer_bytes;
+      }
+      cuda_check(cudaStreamSynchronize(state->stream),
+                 "complete DeepSeek retention rewind");
+      state->next_position = position;
+      state->predicted = found->predicted;
+      state->draft = found->draft;
+      state->draft_ready = found->draft_ready;
+      state->speculation_suppressed = found->speculation_suppressed;
+      state->embedded = false;
+      state->attention_ready = false;
+      state->route_ready = false;
+      state->current_prefetch_target_layer.reset();
+      state->current_router_component_layer =
+          std::numeric_limits<std::uint32_t>::max();
+      state->selected_retention_checkpoint = static_cast<std::uint32_t>(
+          found - state->retention_checkpoints.begin());
+      state->retention_target_position = position;
+      return er::Status::success();
+    } catch (const std::exception& error) {
+      return {er::ErrorCode::internal, error.what()};
+    }
+  }
+
+  er::Status rebind_request_state(
+      const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+      const er::ProgramRequestContext& request) override {
+    const auto state =
+        std::dynamic_pointer_cast<CallableRequestState>(opaque_state);
+    const auto reserved = request.parameters.find("reserved_context_tokens");
+    const auto checkpoint =
+        request.parameters.find("retention_checkpoint_position");
+    if (!state || state->owner.get() != this ||
+        reserved == request.parameters.end() || reserved->second == 0U ||
+        reserved->second > max_context_ ||
+        (checkpoint != request.parameters.end() &&
+         (checkpoint->second == 0U || checkpoint->second > reserved->second)))
+      return {er::ErrorCode::invalid_argument,
+              "DeepSeek retained request rebind is invalid"};
+    state->context_limit = static_cast<std::uint32_t>(reserved->second);
+    state->retention_target_position =
+        checkpoint == request.parameters.end()
+            ? 0U
+            : static_cast<std::uint32_t>(checkpoint->second);
+    return er::Status::success();
+  }
+
   er::CreateOperationRequestStateResult create_request_state(
       const er::ProgramRequestContext& request) override {
     try {
@@ -1236,6 +1438,19 @@ class Model final : public er::IOperationProvider,
       state->owner = shared_from_this();
       state->provider_slot = *slot;
       state->context_limit = static_cast<std::uint32_t>(reserved->second);
+      const auto checkpoint =
+          request.parameters.find("retention_checkpoint_position");
+      if (checkpoint != request.parameters.end()) {
+        if (checkpoint->second == 0U ||
+            checkpoint->second > reserved->second ||
+            checkpoint->second >
+                std::numeric_limits<std::uint32_t>::max())
+          return {{er::ErrorCode::invalid_argument,
+                   "compressed sparse retention checkpoint is invalid"},
+                  {}};
+        state->retention_target_position =
+            static_cast<std::uint32_t>(checkpoint->second);
+      }
       try {
         auto created = er::cuda::create_deepseek_request_state(
             model_, {max_context_, request_bytes_, compression_ratios_,
@@ -1451,6 +1666,11 @@ class Model final : public er::IOperationProvider,
                      "complete callable DeepSeek token step");
           state->predicted = *token;
           ++state->next_position;
+          if (state->retention_target_position == state->next_position) {
+            const auto checkpoint = capture_retention_checkpoint(
+                *state, state->next_position, false);
+            require(checkpoint.ok(), checkpoint.message());
+          }
           state->embedded = false;
           er::ExecutionValue output{std::string(token_abi), "host", token,
                                     reinterpret_cast<const std::byte*>(
@@ -2713,9 +2933,6 @@ class Model final : public er::IOperationProvider,
              {held.selection}, {held.selection}});
       }
       const auto started = std::chrono::steady_clock::now();
-      std::cerr << "[callable-cpu-begin] request=" << context.request_id
-                << " layer=" << prepared.component_layer
-                << " experts=" << groups.size() << '\n';
       auto status = model->cpu_->execute(
           groups,
           std::span<const float>(request->remote_input_host,
@@ -2729,10 +2946,6 @@ class Model final : public er::IOperationProvider,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - started)
               .count());
-      std::cerr << "[callable-cpu-end] request=" << context.request_id
-                << " layer=" << prepared.component_layer
-                << " experts=" << groups.size()
-                << " elapsed_ns=" << elapsed << '\n';
       model->planner_->observe_cpu(elapsed, host_leases.size());
       if (!status.ok()) return status;
       for (const auto& held : host_leases) {
@@ -4846,7 +5059,7 @@ int expert_vm_compressed_sparse_moe_provider_main(int argc, char** argv) {
       options.extensions.erase(found);
       return value;
     };
-    const bool profile_gpu_phases = boolean_extension("profile-gpu-phases");
+    const bool profile_gpu_phases = options.profile_gpu_phases;
     const bool retain_previous_route =
         !boolean_extension("no-retain-previous-route");
     const bool enable_cpu_hybrid = boolean_extension("cpu-hybrid");

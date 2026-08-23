@@ -1214,6 +1214,9 @@ WorkerOptions parse_worker_options(int argc, char** argv) {
   auto parsed = expert::runtime::parse_worker_launch_options(arguments);
   status_check(parsed.status);
   auto common = std::move(parsed.options);
+  if (common.profile_gpu_phases)
+    throw std::runtime_error(
+        "execution provider does not support GPU phase profiling");
   WorkerOptions options;
   options.max_context = common.max_context;
   options.capacity = common.capacity;

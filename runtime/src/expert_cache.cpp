@@ -463,10 +463,22 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
 
   void satisfy_host_waiters_locked(Entry& entry) {
     if (!entry.host_copy || !entry.validated_sections) return;
+    auto weak = weak_from_this();
     for (auto& [id, waiter] : entry.host_waiters) {
       (void)id;
       record_waiter_completion(*waiter);
-      waiter->promise.set_value({Status::success(), true});
+      HostExpertLease lease;
+      if (waiter->options.acquire_lease) {
+        add_reference_locked(entry);
+        lease = HostExpertLease(
+            entry.host_copy, *entry.validated_sections,
+            entry.validated_compact, entry.record.source_abi,
+            [weak, key = entry.key]() noexcept {
+              if (auto core = weak.lock()) core->release_reference(key);
+            });
+      }
+      waiter->promise.set_value(
+          {Status::success(), true, std::move(lease)});
       Telemetry::add(metrics.host_preloads_completed_);
     }
     entry.host_preloaded = true;
@@ -1553,7 +1565,19 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
             entry.ram_protection_persistent = true;
             promote_ram_locked(entry, true);
           }
-          waiter->promise.set_value({Status::success(), true});
+          HostExpertLease lease;
+          if (options.acquire_lease) {
+            add_reference_locked(entry);
+            auto weak = weak_from_this();
+            lease = HostExpertLease(
+                entry.host_copy, *entry.validated_sections,
+                entry.validated_compact, entry.record.source_abi,
+                [weak, key = entry.key]() noexcept {
+                  if (auto core = weak.lock()) core->release_reference(key);
+                });
+          }
+          waiter->promise.set_value(
+              {Status::success(), true, std::move(lease)});
           record_waiter_completion(*waiter);
           Telemetry::add(metrics.host_preloads_completed_);
         } else if (entry.state == CacheState::ram_ready ||

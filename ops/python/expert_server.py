@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import argparse
 import hmac
-import importlib.util
 import json
 import os
 import queue
@@ -14,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -27,28 +27,24 @@ from typing import Any, Callable, Iterator
 from urllib.parse import unquote, urlsplit
 
 try:
+    from .artifact_chat_codec import discover_artifact_chat_codec
     from .response_protocols import install_declared_response_protocol
+    from .multimodal_input import (
+        MultimodalInputError, PreparedMultimodalPrompt,
+        create_image_processor, load_image, prepare_multimodal_prompt,
+    )
 except ImportError:  # Direct script launch from Start-ExpertServer.ps1.
+    from artifact_chat_codec import discover_artifact_chat_codec
     from response_protocols import install_declared_response_protocol
+    from multimodal_input import (
+        MultimodalInputError, PreparedMultimodalPrompt,
+        create_image_processor, load_image, prepare_multimodal_prompt,
+    )
 
 from transformers import AutoTokenizer
 
 
 LOG_FILE: Any = None
-
-
-def _load_deepseek_chat_encoder(snapshot: Path) -> Callable[..., str]:
-    path = snapshot / "encoding" / "encoding_dsv4.py"
-    spec = importlib.util.spec_from_file_location("encoding_dsv4", path)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"cannot load official DeepSeek encoder: {path}")
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    encoder = getattr(module, "encode_messages", None)
-    if not callable(encoder):
-        raise RuntimeError(f"official DeepSeek encoder has no encode_messages: {path}")
-    return encoder
-
 
 def log(event: str, **fields: Any) -> None:
     line = json.dumps({"event": event, "time": time.time(), **fields}, separators=(",", ":"))
@@ -115,6 +111,10 @@ class GenerationRequest:
     sampling: SamplingSettings = SamplingSettings(0.0, 1.0, 0, 0.0, 0)
     tools: tuple[dict[str, Any], ...] = ()
     tool_choice: str | dict[str, Any] = "auto"
+    media_packet: bytes | None = None
+    media_signature: bytes | None = None
+    image_count: int = 0
+    image_tokens: int = 0
 
 
 @dataclass(frozen=True)
@@ -177,6 +177,8 @@ class Session:
     tokens: list[int]
     pages: int
     last_used: float
+    media_signature: bytes | None = None
+    parked_bytes: int = 0
 
 
 @dataclass
@@ -248,16 +250,86 @@ class IncrementalTextDecoder:
         return delta
 
 
-def _text_content(content: Any, param: str) -> str:
+class IncrementalTokenDecoder:
+    """Bounded exact tokenizer decoding with a retained token overlap."""
+
+    def __init__(self, tokenizer: Any, overlap_tokens: int = 64,
+                 maximum_window_tokens: int = 256) -> None:
+        if overlap_tokens < 1 or maximum_window_tokens <= overlap_tokens:
+            raise ValueError("invalid incremental token decoder window")
+        self.tokenizer = tokenizer
+        self.overlap_tokens = overlap_tokens
+        self.maximum_window_tokens = maximum_window_tokens
+        self.tokens: list[int] = []
+        self.emitted = ""
+
+    def _decode(self, tokens: list[int]) -> str:
+        return self.tokenizer.decode(
+            tokens, skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )
+
+    def push(self, token: int, final: bool = False) -> str:
+        self.tokens.append(token)
+        current = self._decode(self.tokens)
+        if not current.startswith(self.emitted):
+            raise WorkerError("tokenizer changed an already streamed text prefix")
+        stable_end = len(current)
+        if not final:
+            replacement = current.find("\ufffd", len(self.emitted))
+            if replacement >= 0:
+                stable_end = replacement
+        delta = current[len(self.emitted):stable_end]
+        self.emitted = current[:stable_end]
+        if stable_end == len(current) and len(self.tokens) > self.overlap_tokens:
+            suffix_tokens = self.tokens[-self.overlap_tokens:]
+            suffix = self._decode(suffix_tokens)
+            if current.endswith(suffix) and self.emitted.endswith(suffix):
+                self.tokens = suffix_tokens
+                self.emitted = suffix
+        if len(self.tokens) > self.maximum_window_tokens:
+            raise WorkerError(
+                "tokenizer has no bounded stable streaming boundary"
+            )
+        return delta
+
+
+def _text_content(content: Any, param: str, *, allow_images: bool = False,
+                  user_content: bool = False) -> str | list[dict[str, Any]]:
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         raise RequestError("message content must be text or an array of text parts", param)
     pieces: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    has_image = False
     for index, part in enumerate(content):
         if not isinstance(part, dict):
             raise RequestError("message content parts must be objects", f"{param}.{index}")
         kind = part.get("type")
+        if kind in {"image_url", "input_image"}:
+            if not allow_images or not user_content:
+                raise RequestError(
+                    "image input is not supported by the active artifact",
+                    f"{param}.{index}.type", "unsupported_value",
+                )
+            reference = part.get("image_url")
+            if isinstance(reference, dict):
+                reference = reference.get("url")
+            if not isinstance(reference, str):
+                raise RequestError(
+                    "image content requires image_url",
+                    f"{param}.{index}.image_url",
+                )
+            try:
+                image = load_image(reference)
+            except MultimodalInputError as error:
+                raise RequestError(
+                    str(error), f"{param}.{index}.image_url"
+                ) from error
+            normalized.append({"type": "image", "image": image})
+            has_image = True
+            continue
         if kind not in {"text", "input_text", "output_text"}:
             raise RequestError(
                 f"content type {kind!r} is not supported by this text-only model",
@@ -266,7 +338,8 @@ def _text_content(content: Any, param: str) -> str:
         if not isinstance(part.get("text"), str):
             raise RequestError("text content part requires a string", f"{param}.{index}.text")
         pieces.append(part["text"])
-    return "".join(pieces)
+        normalized.append({"type": "text", "text": part["text"]})
+    return normalized if has_image else "".join(pieces)
 
 
 class CudaWorker:
@@ -354,6 +427,13 @@ class CudaWorker:
         self.prefill_mode = str(response.get("prefill_mode", ""))
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
         self.session_retention = bool(response.get("session_retention", False))
+        self.session_parking = bool(response.get("session_parking", False))
+        self.session_park_ram_bytes = int(
+            response.get("session_park_ram_bytes", 0)
+        )
+        self.session_park_page_capacity = int(
+            response.get("session_park_page_capacity", 0)
+        )
         self.request_stream_mode = str(
             response.get("request_stream_mode", "default")
         )
@@ -418,8 +498,8 @@ class CudaWorker:
                 self.placement_mode == "budgeted" and
                 (
                     self.placement_profile != placement_profile or
-                    self.ram_cache_bytes != ram_cache_gib << 30 or
-                    self.vram_cache_bytes != vram_cache_gib << 30 or
+                    not 0 < self.ram_cache_bytes <= ram_cache_gib << 30 or
+                    not 0 < self.vram_cache_bytes <= vram_cache_gib << 30 or
                     self.placement_prefetch_state not in
                         {"disabled", "observing", "ready"} or
                     self.placement_prefetch_enabled !=
@@ -473,7 +553,24 @@ class CudaWorker:
             any(not isinstance(capability, str) or not capability
                 for capability in self.operation_capabilities)
         )
+        parking_invalid = self.protocol >= 9 and (
+            (
+                self.session_parking and
+                (
+                    not self.session_retention or
+                    not 0 < self.session_park_ram_bytes <=
+                        ram_cache_gib << 30 or
+                    self.session_park_page_capacity <= 0
+                )
+            ) or
+            (
+                not self.session_parking and
+                (self.session_park_ram_bytes != 0 or
+                 self.session_park_page_capacity != 0)
+            )
+        )
         if (self.protocol < 4 or descriptor_invalid or
+                parking_invalid or
                 self.capacity != requested_capacity or
                 self.prefill_mode not in {
                     "causal_chunked",
@@ -581,6 +678,7 @@ class CudaWorker:
 
     def begin(self, request_id: int, prompt_ids: list[int], context_limit: int,
               sampling: SamplingSettings,
+              media_packet: bytes | None = None,
               checkpoint_tokens: int | None = None,
               cancel_check: Callable[[], bool] | None = None,
               deadline: float | None = None,
@@ -589,14 +687,34 @@ class CudaWorker:
             raise WorkerError("duplicate worker request")
         command = (f"BEGIN\t{request_id}\t{context_limit}\t" +
                    ",".join(str(token) for token in prompt_ids))
+        media_path: str | None = None
+        if media_packet is not None:
+            with tempfile.NamedTemporaryFile(
+                    mode="wb", prefix="quantum-llm-media-", suffix=".bin",
+                    delete=False) as media_file:
+                media_file.write(media_packet)
+                media_file.flush()
+                os.fsync(media_file.fileno())
+                media_path = media_file.name
+            if "\t" in media_path or "\n" in media_path or "\r" in media_path:
+                os.unlink(media_path)
+                raise WorkerError("temporary media path is not protocol safe")
+            command += f"\tMULTIMODAL\t{media_path}"
         if checkpoint_tokens is not None:
             command += f"\tCHECKPOINT\t{checkpoint_tokens}"
         command += self._sampling_command(sampling)
-        response = self._command(
-            command,
-            cancel_check=cancel_check, cancel_id=request_id,
-            deadline=deadline, progress_callback=progress_callback,
-        )
+        try:
+            response = self._command(
+                command,
+                cancel_check=cancel_check, cancel_id=request_id,
+                deadline=deadline, progress_callback=progress_callback,
+            )
+        finally:
+            if media_path is not None:
+                try:
+                    os.unlink(media_path)
+                except FileNotFoundError:
+                    pass
         if response.get("type") != "begun" or response.get("id") != request_id:
             raise WorkerError("unexpected BEGIN response")
         self.active_ids.add(request_id)
@@ -611,8 +729,6 @@ class CudaWorker:
                      ) -> None:
         if request_id in self.active_ids:
             raise WorkerError("duplicate worker request")
-        if not delta_ids:
-            raise WorkerError("resume requires at least one delta token")
         command = (f"BEGIN\t{request_id}\t{context_limit}\t" +
                    ",".join(str(token) for token in delta_ids) +
                    f"\tRESUME\t{session_key}")
@@ -642,15 +758,34 @@ class CudaWorker:
         )
 
     def end_retain(self, request_id: int, session_key: int,
-                   checkpoint_tokens: int | None = None) -> int:
+                   checkpoint_tokens: int | None = None,
+                   ) -> tuple[int, int, int]:
         command = f"END\t{request_id}\tRETAIN\t{session_key}"
         if checkpoint_tokens is not None:
             command += f"\tAT\t{checkpoint_tokens}"
         response = self._command(command)
         if response.get("type") != "ended" or response.get("id") != request_id:
             raise WorkerError("unexpected END response")
+        retained_tokens = int(response.get("retained_tokens", 0))
+        parked_pages = int(response.get("parked_pages", 0))
+        parked_bytes = int(response.get("parked_bytes", 0))
+        # kv_page_bytes is the maximum resident footprint of a logical page,
+        # including optional provider state such as an MTP draft page.  It is
+        # not a lower bound for a parked request: sampling requests
+        # intentionally omit MTP state.  Validate the provider-authoritative
+        # accounting against the negotiated global limits instead.
+        if self.session_parking and (
+                retained_tokens <= 0 or parked_pages <= 0 or
+                parked_bytes <= 0 or
+                parked_pages > self.session_park_page_capacity or
+                parked_bytes > self.session_park_ram_bytes):
+            try:
+                self.drop_session(session_key)
+            finally:
+                self.active_ids.discard(request_id)
+            raise WorkerError("worker returned invalid parked-state accounting")
         self.active_ids.discard(request_id)
-        return int(response.get("retained_tokens", 0))
+        return retained_tokens, parked_pages, parked_bytes
 
     def drop_session(self, session_key: int) -> None:
         response = self._command(f"DROP\t{session_key}")
@@ -842,6 +977,13 @@ class Application:
         self.response_protocol = install_declared_response_protocol(
             self.tokenizer
         )
+        self.artifact_chat_codec = discover_artifact_chat_codec(
+            args.tokenizer
+        )
+        if (self.response_protocol is None and
+                self.artifact_chat_codec is not None and
+                self.artifact_chat_codec.supports_response_parsing):
+            self.response_protocol = "artifact-chat-codec-v1"
         generation_config_path = args.tokenizer / "generation_config.json"
         generation_config: dict[str, Any] = {}
         if generation_config_path.is_file():
@@ -863,12 +1005,6 @@ class Application:
             seed=0,
         )
         self._validate_sampling(self.default_sampling, "generation_config")
-        self.checkpoint_chat_encoder: Callable[..., str] | None = None
-        if (not self.tokenizer.chat_template and
-                (args.tokenizer / "encoding" / "encoding_dsv4.py").is_file()):
-            self.checkpoint_chat_encoder = _load_deepseek_chat_encoder(
-                args.tokenizer
-            )
         eos = self.tokenizer.eos_token_id
         if eos is None:
             self.eos_token_ids: set[int] = set()
@@ -892,6 +1028,21 @@ class Application:
                                  True if args.enable_worker_cpu_hybrid else None,
                                  args.worker_route_trace_file,
                                  args.worker_route_trace_max_steps)
+        self.vision_capability = (
+            "vision.patch-transformer-merge.fp4-block32.v1"
+        )
+        self.vision_enabled = (
+            self.vision_capability in self.worker.operation_capabilities
+        )
+        self.image_processor = None
+        if self.vision_enabled:
+            preprocessor = args.tokenizer / "preprocessor_config.json"
+            if not preprocessor.is_file():
+                self.worker.close()
+                raise RuntimeError(
+                    "vision artifact is missing preprocessor_config.json"
+                )
+            self.image_processor = create_image_processor(str(args.tokenizer))
         self.capacity = threading.BoundedSemaphore(
             args.maximum_queue + args.worker_capacity
         )
@@ -907,6 +1058,9 @@ class Application:
         self.active = 0
         self.active_lock = threading.Lock()
         self.metric_lock = threading.Lock()
+        self._worker_stats_lock = threading.Lock()
+        self._worker_stats_cache: dict[str, int] = {}
+        self._worker_stats_updated_at = 0.0
         self.metrics = {
             "admitted": 0, "rejected": 0, "completed": 0,
             "failed": 0, "cancelled": 0, "generated_tokens": 0,
@@ -919,6 +1073,7 @@ class Application:
         self.decode_batcher = ContinuousDecodeBatcher(
             self.worker, args.microbatch_window_ms, self.record_decode_batch
         )
+        self.worker_stats(refresh=True)
         log("service_ready", model=args.model, build=args.build_id,
             manifest=self.manifest["indexes"]["experts_sha256"])
 
@@ -955,7 +1110,8 @@ class Application:
         pages = (context_tokens + self.worker.kv_page_tokens - 1) // \
             self.worker.kv_page_tokens
         with self.kv_credit_lock:
-            if self.kv_reserved_pages + pages > self.worker.kv_page_capacity:
+            if self.kv_reserved_pages + pages > \
+                    self._session_page_capacity():
                 return 0
             self.kv_reserved_pages += pages
         return pages
@@ -974,9 +1130,14 @@ class Application:
         return (context_tokens + self.worker.kv_page_tokens - 1) // \
             self.worker.kv_page_tokens
 
+    def _session_page_capacity(self) -> int:
+        if getattr(self.worker, "session_parking", False):
+            return int(self.worker.session_park_page_capacity)
+        return int(self.worker.kv_page_capacity)
+
     def _acquire_pages(self, pages: int) -> bool:
         with self.kv_credit_lock:
-            if self.kv_reserved_pages + pages > self.worker.kv_page_capacity:
+            if self.kv_reserved_pages + pages > self._session_page_capacity():
                 return False
             self.kv_reserved_pages += pages
         return True
@@ -1013,7 +1174,8 @@ class Application:
         log("session_evicted", key=session.key, tokens=len(session.tokens))
         return True
 
-    def checkout_session(self, prompt_ids: list[int]) -> Session | None:
+    def checkout_session(self, prompt_ids: list[int],
+                         media_signature: bytes | None = None) -> Session | None:
         """Take the longest retained prefix of prompt_ids out of the map."""
         if not self.retention_enabled():
             return None
@@ -1024,6 +1186,7 @@ class Application:
                 length = len(session.tokens)
                 if (length <= len(prompt_ids) and
                         prompt_ids[:length] == session.tokens and
+                        session.media_signature == media_signature and
                         (best is None or length > len(best.tokens))):
                     best = session
             if best is not None:
@@ -1031,15 +1194,19 @@ class Application:
         return best
 
     def store_session(self, session_key: int, tokens: list[int],
-                      pages: int) -> None:
+                      pages: int,
+                      media_signature: bytes | None = None,
+                      parked_bytes: int = 0) -> None:
         duplicates: list[Session] = []
         with self.session_lock:
             for key, session in list(self.sessions.items()):
-                if session.tokens == tokens:
+                if (session.tokens == tokens and
+                        session.media_signature == media_signature):
                     duplicates.append(self.sessions.pop(key))
             self.sessions[session_key] = Session(
                 key=session_key, tokens=tokens, pages=pages,
-                last_used=time.monotonic(),
+                last_used=time.monotonic(), media_signature=media_signature,
+                parked_bytes=parked_bytes,
             )
         for duplicate in duplicates:
             self._drop_worker_session(duplicate.key)
@@ -1057,44 +1224,77 @@ class Application:
             return key
 
     def acquire_request_context(self, prompt_ids: list[int],
-                                maximum: int) -> RequestContext | None:
-        session = self.checkout_session(prompt_ids)
-        # One extra position covers the non-final trailing decode step that
-        # retained turns require. At the model context boundary generate()
-        # disables retention, so admission must not reserve an impossible
-        # position beyond the advertised context window.
-        context_tokens = len(prompt_ids) + maximum
-        retain_headroom = int(
-            self.retention_enabled() and context_tokens < self.args.max_context
-        )
-        total_pages = self._context_pages(context_tokens + retain_headroom)
+                                maximum: int,
+                                media_signature: bytes | None = None,
+                                ) -> RequestContext | None:
+        session = self.checkout_session(prompt_ids, media_signature)
+        # The provider allocates execution KV on demand. Admission therefore
+        # carries only an already-parked prefix; speculative output capacity
+        # is never reserved as if it were populated state.
         base_pages = session.pages if session is not None else 0
-        needed = max(0, total_pages - base_pages)
+        return RequestContext(session=session, held_pages=base_pages)
+
+    def resize_request_context(self, context: RequestContext,
+                               target_pages: int) -> bool:
+        if target_pages < 0:
+            raise RuntimeError("invalid retained context page count")
+        if target_pages < context.held_pages:
+            self.release_context_credits(context.held_pages - target_pages)
+            context.held_pages = target_pages
+            return True
+        needed = target_pages - context.held_pages
         while needed > 0 and not self._acquire_pages(needed):
             if not self.evict_lru_session():
-                if session is not None:
-                    self.abandon_session(session)
-                return None
-        return RequestContext(session=session,
-                              held_pages=base_pages + needed)
+                return False
+        context.held_pages = target_pages
+        return True
 
     def release_request_context(self, context: RequestContext) -> None:
         if context.retained:
-            # The retained session keeps the worker slot and its KV pages.
+            # The retained session owns the exact parked-page credits.
             return
         if context.held_pages > 0:
             self.release_context_credits(context.held_pages)
         if context.session is not None:
             self._drop_worker_session(context.session.key)
 
-    def worker_stats(self) -> dict[str, int]:
+    def worker_stats(self, refresh: bool = True) -> dict[str, int]:
+        lock = getattr(self, "_worker_stats_lock", None)
+        if not refresh:
+            if lock is None:
+                return dict(getattr(self, "_worker_stats_cache", {}))
+            with lock:
+                return dict(self._worker_stats_cache)
         stats = getattr(self.worker, "stats", None)
         if stats is None:
-            return {}
-        try:
-            return stats()
-        except Exception:
-            return {}
+            result: dict[str, int] = {}
+        else:
+            try:
+                result = stats()
+            except Exception:
+                if lock is None:
+                    return dict(getattr(self, "_worker_stats_cache", {}))
+                with lock:
+                    return dict(self._worker_stats_cache)
+        if lock is None:
+            self._worker_stats_cache = dict(result)
+            self._worker_stats_updated_at = time.monotonic()
+            return result
+        with lock:
+            self._worker_stats_cache = dict(result)
+            self._worker_stats_updated_at = time.monotonic()
+        return result
+
+    def worker_stats_age_seconds(self) -> float:
+        lock = getattr(self, "_worker_stats_lock", None)
+        if lock is None:
+            updated_at = getattr(self, "_worker_stats_updated_at", 0.0)
+        else:
+            with lock:
+                updated_at = self._worker_stats_updated_at
+        if updated_at <= 0.0:
+            return 0.0
+        return max(0.0, time.monotonic() - updated_at)
 
     def record_decode_batch(self, rows: int) -> None:
         self.increment("decode_batches")
@@ -1143,10 +1343,10 @@ class Application:
             ))
         lines.extend(("# TYPE expert_service_ready gauge",
                       f"expert_service_ready {int(self.worker.healthy() and not self.draining.is_set())}"))
-        try:
-            worker_stats = self.worker.stats()
-        except WorkerError:
-            worker_stats = {}
+        worker_stats = self.worker_stats(refresh=False)
+        lines.extend(("# TYPE expert_worker_stats_age_seconds gauge",
+                      "expert_worker_stats_age_seconds "
+                      f"{self.worker_stats_age_seconds()}"))
         for name, value in worker_stats.items():
             metric = f"expert_worker_{name}"
             lines.extend((f"# TYPE {metric} gauge", f"{metric} {value}"))
@@ -1158,14 +1358,16 @@ class Application:
                          reasoning_effort: str = "xhigh",
                          enable_thinking: bool = True,
                          preserve_thinking: bool = True) -> list[int]:
-        encoder = getattr(self, "checkpoint_chat_encoder", None)
-        if encoder is not None:
-            if tools:
-                raise RequestError(
-                    "the published tokenizer adapter does not declare tool calling",
-                    "tools", "unsupported_value",
-                )
-            prompt = encoder(messages, thinking_mode="chat")
+        codec = getattr(self, "artifact_chat_codec", None)
+        if codec is not None:
+            prompt = codec.encode(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                tools=tools,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            )
             return [int(token) for token in self.tokenizer.encode(
                 prompt, add_special_tokens=False
             )]
@@ -1185,11 +1387,113 @@ class Application:
             ids = ids[0]
         return [int(token) for token in ids]
 
+    @staticmethod
+    def _has_images(messages: list[dict[str, Any]]) -> bool:
+        return any(
+            isinstance(message.get("content"), list) and
+            any(isinstance(part, dict) and part.get("type") == "image"
+                for part in message["content"])
+            for message in messages
+        )
+
+    def _prepare_chat_prompt(
+            self, messages: list[dict[str, Any]],
+            add_generation_prompt: bool = True,
+            tools: tuple[dict[str, Any], ...] = (),
+            reasoning_effort: str = "xhigh",
+            enable_thinking: bool = True,
+            preserve_thinking: bool = True,
+            ) -> tuple[list[int], bytes | None, bytes | None, int, int]:
+        if not self._has_images(messages):
+            return (self._chat_prompt_ids(
+                messages, add_generation_prompt=add_generation_prompt,
+                tools=tools, reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+            ), None, None, 0, 0)
+        if (not getattr(self, "vision_enabled", False) or
+                getattr(self, "image_processor", None) is None):
+            raise RequestError(
+                "image input is not supported by the active artifact",
+                "messages", "unsupported_value",
+            )
+        try:
+            prepared: PreparedMultimodalPrompt = prepare_multimodal_prompt(
+                self.tokenizer, self.image_processor, messages,
+                add_generation_prompt=add_generation_prompt,
+                tools=list(tools) if tools else None,
+                reasoning_effort=reasoning_effort,
+                enable_thinking=enable_thinking,
+                preserve_thinking=preserve_thinking,
+                maximum_image_pixels=self.args.maximum_image_pixels,
+                maximum_patch_tokens=self.args.maximum_image_patch_tokens,
+            )
+        except MultimodalInputError as error:
+            raise RequestError(str(error), "messages") from error
+        return (
+            prepared.token_ids, prepared.packet, prepared.media_signature,
+            prepared.image_count, prepared.image_tokens,
+        )
+
     def response_stream_parser(self, request: GenerationRequest) -> Any:
         if self.response_protocol is None:
             return None
+        codec = getattr(self, "artifact_chat_codec", None)
+        if codec is not None and codec.supports_response_parsing:
+            return codec.stream_parser(request.enable_thinking)
         return self.tokenizer.get_response_parser(
             prefix=request.prompt_ids,
+        )
+
+    @staticmethod
+    def _assistant_output_from_message(
+            message: dict[str, Any]) -> AssistantOutput:
+        reasoning = message.get(
+            "reasoning_content",
+            message.get("reasoning", message.get("thinking", "")),
+        )
+        visible = message.get("content", "")
+        if reasoning is None:
+            reasoning = ""
+        if visible is None:
+            visible = ""
+        if not isinstance(reasoning, str) or not isinstance(visible, str):
+            raise ValueError("response parser returned non-text regions")
+        calls: list[ToolCall] = []
+        raw_calls = message.get("tool_calls", [])
+        if raw_calls is None:
+            raw_calls = []
+        if not isinstance(raw_calls, list):
+            raise ValueError("response parser returned invalid tool calls")
+        for raw_call in raw_calls:
+            if (not isinstance(raw_call, dict) or
+                    raw_call.get("type") != "function"):
+                raise ValueError("response parser returned an invalid tool call")
+            function = raw_call.get("function")
+            if not isinstance(function, dict):
+                raise ValueError("parsed tool call has no function")
+            name = function.get("name")
+            arguments = function.get("arguments", {})
+            if not isinstance(name, str) or not name:
+                raise ValueError("parsed tool call has no function name")
+            if isinstance(arguments, str):
+                parsed_arguments = json.loads(arguments)
+                if not isinstance(parsed_arguments, dict):
+                    raise ValueError("parsed tool arguments are not an object")
+                arguments = parsed_arguments
+            if not isinstance(arguments, dict):
+                raise ValueError("parsed tool arguments are not an object")
+            calls.append(ToolCall(
+                item_id="fc_" + uuid.uuid4().hex,
+                call_id="call_" + uuid.uuid4().hex,
+                name=name,
+                arguments=json.dumps(
+                    arguments, separators=(",", ":"), ensure_ascii=False
+                ),
+            ))
+        return AssistantOutput(
+            text=visible, reasoning=reasoning,
+            reasoning_complete=True, tool_calls=tuple(calls),
         )
 
     def parse_assistant_output(
@@ -1198,65 +1502,23 @@ class Application:
             return AssistantOutput(text=text, reasoning="",
                                    reasoning_complete=True, tool_calls=())
         try:
-            message = self.tokenizer.parse_response(
-                text, prefix=request.prompt_ids,
-                tools=list(request.tools) if request.tools else None,
-            )
+            codec = getattr(self, "artifact_chat_codec", None)
+            if codec is not None and codec.supports_response_parsing:
+                message = codec.parse(text, request.enable_thinking)
+            else:
+                message = self.tokenizer.parse_response(
+                    text, prefix=request.prompt_ids,
+                    tools=list(request.tools) if request.tools else None,
+                )
             if not isinstance(message, dict):
                 raise ValueError("response parser returned a non-object")
-            reasoning = message.get(
-                "reasoning_content",
-                message.get("reasoning", message.get("thinking", "")),
-            )
-            visible = message.get("content", "")
-            if reasoning is None:
-                reasoning = ""
-            if visible is None:
-                visible = ""
-            if not isinstance(reasoning, str) or not isinstance(visible, str):
-                raise ValueError("response parser returned non-text regions")
-            calls: list[ToolCall] = []
-            raw_calls = message.get("tool_calls", [])
-            if raw_calls is None:
-                raw_calls = []
-            if not isinstance(raw_calls, list):
-                raise ValueError("response parser returned invalid tool calls")
-            complete_tool_markup = (
-                text.count("<tool_call>") == text.count("</tool_call>") and
-                text.count("<function=") == text.count("</function>")
-            )
-            if raw_calls and not complete_tool_markup:
+            if (codec is None and message.get("tool_calls") and
+                    (text.count("<tool_call>") != text.count("</tool_call>") or
+                     text.count("<function=") != text.count("</function>"))):
                 raise ValueError("model emitted an incomplete tool call")
-            for raw_call in raw_calls:
-                if not isinstance(raw_call, dict) or raw_call.get("type") != "function":
-                    raise ValueError("response parser returned an invalid tool call")
-                function = raw_call.get("function")
-                if not isinstance(function, dict):
-                    raise ValueError("parsed tool call has no function")
-                name = function.get("name")
-                arguments = function.get("arguments", {})
-                if not isinstance(name, str) or not name:
-                    raise ValueError("parsed tool call has no function name")
-                if isinstance(arguments, str):
-                    parsed_arguments = json.loads(arguments)
-                    if not isinstance(parsed_arguments, dict):
-                        raise ValueError("parsed tool arguments are not an object")
-                    arguments = parsed_arguments
-                if not isinstance(arguments, dict):
-                    raise ValueError("parsed tool arguments are not an object")
-                calls.append(ToolCall(
-                    item_id="fc_" + uuid.uuid4().hex,
-                    call_id="call_" + uuid.uuid4().hex,
-                    name=name,
-                    arguments=json.dumps(
-                        arguments, separators=(",", ":"), ensure_ascii=False
-                    ),
-                ))
-            return AssistantOutput(
-                text=visible, reasoning=reasoning,
-                reasoning_complete=True, tool_calls=tuple(calls),
-            )
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            return self._assistant_output_from_message(message)
+        except (AssertionError, TypeError, ValueError,
+                json.JSONDecodeError) as error:
             log("response_parse_failed", protocol=self.response_protocol,
                 error=str(error))
             return AssistantOutput(text=text, reasoning="",
@@ -1328,7 +1590,11 @@ class Application:
             if raw_content is None and role == "assistant":
                 content = ""
             else:
-                content = _text_content(raw_content, f"{item_param}.content")
+                content = _text_content(
+                    raw_content, f"{item_param}.content",
+                    allow_images=getattr(self, "vision_enabled", False),
+                    user_content=role == "user",
+                )
             normalized: dict[str, Any] = {"role": role, "content": content}
             if role == "assistant":
                 reasoning = message.get("reasoning_content")
@@ -1516,6 +1782,8 @@ class Application:
 
             tool_results: list[dict[str, Any]] = []
             text: list[str] = []
+            user_parts: list[dict[str, Any]] = []
+            has_image = False
             for block_index, block in enumerate(content):
                 block_param = f"{param}.content.{block_index}"
                 if not isinstance(block, dict):
@@ -1548,15 +1816,50 @@ class Application:
                         raise RequestError("text block requires text",
                                            f"{block_param}.text")
                     text.append(value)
+                    user_parts.append({"type": "text", "text": value})
+                elif kind == "image":
+                    if tool_results:
+                        raise RequestError(
+                            "image blocks cannot follow tool results", block_param
+                        )
+                    source = block.get("source")
+                    if not isinstance(source, dict):
+                        raise RequestError(
+                            "image block requires source", f"{block_param}.source"
+                        )
+                    source_type = source.get("type")
+                    if source_type == "base64":
+                        media_type = source.get("media_type")
+                        data = source.get("data")
+                        if not isinstance(media_type, str) or not isinstance(data, str):
+                            raise RequestError(
+                                "base64 image requires media_type and data",
+                                f"{block_param}.source",
+                            )
+                        reference = f"data:{media_type};base64,{data}"
+                    elif source_type == "url" and isinstance(source.get("url"), str):
+                        reference = source["url"]
+                    else:
+                        raise RequestError(
+                            "image source must be base64 or url",
+                            f"{block_param}.source.type", "unsupported_value",
+                        )
+                    user_parts.append({
+                        "type": "image_url", "image_url": {"url": reference}
+                    })
+                    has_image = True
                 else:
                     raise RequestError(
                         f"content block type {kind!r} is not supported",
                         f"{block_param}.type", "unsupported_value",
                     )
             normalized.extend(tool_results)
-            if text:
-                normalized.append({"role": "user", "content": "".join(text)})
-            if not tool_results and not text:
+            if user_parts:
+                normalized.append({
+                    "role": "user",
+                    "content": user_parts if has_image else "".join(text),
+                })
+            if not tool_results and not user_parts:
                 raise RequestError("user content has no supported blocks",
                                    f"{param}.content")
         return normalized, cache_prefix_message_count
@@ -1752,16 +2055,28 @@ class Application:
                 raise RequestError("function parameters must be a JSON schema object",
                                    f"{param}.function.parameters")
             names.add(name)
-            normalized_function: dict[str, Any] = {
-                "name": name, "parameters": parameters,
-            }
-            if description is not None:
-                normalized_function["description"] = description
             if "strict" in function:
                 if not isinstance(function["strict"], bool):
                     raise RequestError("function strict must be boolean",
                                        f"{param}.function.strict")
-                normalized_function["strict"] = function["strict"]
+            values: dict[str, Any] = {"name": name}
+            if "description" in function:
+                values["description"] = description
+            values["parameters"] = parameters
+            if "strict" in function:
+                values["strict"] = function["strict"]
+            # The official chat template serializes mappings in insertion
+            # order. Preserve the client's order among supported fields so
+            # validation does not silently change the model-visible token
+            # stream. Append only fields whose API default was omitted.
+            normalized_function = {
+                field: values[field]
+                for field in function
+                if field in values
+            }
+            for field in ("name", "parameters"):
+                if field not in normalized_function:
+                    normalized_function[field] = values[field]
             tools.append({"type": "function", "function": normalized_function})
         return tuple(tools)
 
@@ -2004,9 +2319,14 @@ class Application:
             raise RequestError("user must be a string", "user")
 
         cache_prefix_tokens = 0
+        media_packet: bytes | None = None
+        media_signature: bytes | None = None
+        image_count = 0
+        image_tokens = 0
         if endpoint in {"chat", "anthropic"}:
             messages = self._messages(payload.get("messages"))
-            prompt_ids = self._chat_prompt_ids(
+            (prompt_ids, media_packet, media_signature,
+             image_count, image_tokens) = self._prepare_chat_prompt(
                 messages, tools=prompt_tools,
                 reasoning_effort=reasoning_effort,
                 enable_thinking=enable_thinking,
@@ -2019,13 +2339,18 @@ class Application:
                 stable_messages = self._messages(
                     raw_cache_messages, "_cache_prefix_messages"
                 )
-            stable_ids = self._chat_prompt_ids(
+            stable_ids, _stable_packet, stable_signature, \
+                _stable_images, _stable_image_tokens = self._prepare_chat_prompt(
                 stable_messages, add_generation_prompt=False,
                 tools=prompt_tools,
                 reasoning_effort=reasoning_effort,
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
             )
+            if stable_signature != media_signature:
+                raise RequestError(
+                    "cache prefix changes the request media set", "messages"
+                )
             cache_prefix_tokens = len(stable_ids)
         elif endpoint == "responses":
             raw_input = payload.get("input")
@@ -2035,18 +2360,24 @@ class Application:
                 messages = self._messages(raw_input, "input")
             if instructions:
                 messages.insert(0, {"role": "system", "content": instructions})
-            prompt_ids = self._chat_prompt_ids(
+            (prompt_ids, media_packet, media_signature,
+             image_count, image_tokens) = self._prepare_chat_prompt(
                 messages, tools=prompt_tools,
                 reasoning_effort=reasoning_effort,
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
             )
-            stable_ids = self._chat_prompt_ids(
+            stable_ids, _stable_packet, stable_signature, \
+                _stable_images, _stable_image_tokens = self._prepare_chat_prompt(
                 messages, add_generation_prompt=False, tools=prompt_tools,
                 reasoning_effort=reasoning_effort,
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
             )
+            if stable_signature != media_signature:
+                raise RequestError(
+                    "cache prefix changes the request media set", "input"
+                )
             cache_prefix_tokens = len(stable_ids)
         else:
             prompt = payload.get("prompt")
@@ -2080,6 +2411,8 @@ class Application:
             enable_thinking=enable_thinking,
             preserve_thinking=preserve_thinking, sampling=sampling,
             tools=tools, tool_choice=tool_choice,
+            media_packet=media_packet, media_signature=media_signature,
+            image_count=image_count, image_tokens=image_tokens,
         )
 
     _TELEMETRY_DELTA_KEYS = (
@@ -2208,14 +2541,90 @@ class Application:
     # instantaneous resource gauges are excluded from deltas.
     _TELEMETRY_GAUGE_KEYS = frozenset({
         "active_requests", "retained_sessions", "allocated_pages",
+        "parked_sessions", "parked_pages",
         "reserved_pages", "kv_allocated_pages", "kv_reserved_pages",
+        "provider_parked_request_bytes",
     })
 
     @staticmethod
     def _capacity_error(error: Exception) -> bool:
         message = str(error)
         return "capacity" in message or "slot available" in message or \
-            "credits" in message
+            "no free request slot" in message or "credits" in message
+
+    def end_retain_with_eviction(
+            self, request_id: int, session_key: int,
+            checkpoint_tokens: int | None,
+            ) -> int | tuple[int, int, int]:
+        while True:
+            try:
+                try:
+                    return self.worker.end_retain(
+                        request_id, session_key, checkpoint_tokens
+                    )
+                except TypeError as error:
+                    if "positional" not in str(error):
+                        raise
+                    return self.worker.end_retain(request_id, session_key)
+            except WorkerError as error:
+                if self._capacity_error(error) and self.evict_lru_session():
+                    continue
+                raise
+
+    def _retain_active_request(
+            self, request_id: int, context: RequestContext,
+            session: Session | None, checkpoint_tokens: int,
+            visible_tokens: list[int], media_signature: bytes | None,
+            resumed: bool, require_exact_checkpoint: bool = False) -> bool:
+        if checkpoint_tokens <= 0 or checkpoint_tokens > len(visible_tokens):
+            raise WorkerError("retention checkpoint is outside visible tokens")
+        expected_pages = self._context_pages(checkpoint_tokens)
+        if not self.resize_request_context(context, expected_pages):
+            raise WorkerError("retained-session RAM credits are exhausted")
+        session_key = session.key if session is not None \
+            else self.allocate_session_key()
+        retained_result = self.end_retain_with_eviction(
+            request_id, session_key, checkpoint_tokens
+        )
+        if isinstance(retained_result, tuple):
+            retained_tokens, parked_pages, parked_bytes = retained_result
+        else:
+            retained_tokens = int(retained_result)
+            parked_pages = self._context_pages(retained_tokens)
+            parked_bytes = 0
+        retained_tokens_valid = (
+            retained_tokens == checkpoint_tokens
+            if require_exact_checkpoint
+            else 0 < retained_tokens <= len(visible_tokens)
+        )
+        if not retained_tokens_valid:
+            self.worker.drop_session(session_key)
+            log("session_retain_mismatch", key=session_key,
+                retained_tokens=retained_tokens,
+                expected_tokens=(checkpoint_tokens
+                                 if require_exact_checkpoint
+                                 else len(visible_tokens)))
+            return False
+        retained_pages = self._context_pages(retained_tokens)
+        if parked_pages not in {0, retained_pages}:
+            self.worker.drop_session(session_key)
+            raise WorkerError(
+                "worker parked-page accounting does not match "
+                "the retained prefix"
+            )
+        if not self.resize_request_context(context, retained_pages):
+            self.worker.drop_session(session_key)
+            raise WorkerError(
+                "retained-session RAM credits changed during parking"
+            )
+        self.store_session(
+            session_key, visible_tokens[:retained_tokens], retained_pages,
+            media_signature, parked_bytes,
+        )
+        context.retained = True
+        log("session_retained", key=session_key, tokens=retained_tokens,
+            resumed=resumed)
+        return True
 
     def generate(self, prompt_ids: list[int], maximum: int,
                  context: RequestContext | None = None,
@@ -2223,10 +2632,12 @@ class Application:
                  cache_prefix_tokens: int | None = None,
                  sampling: SamplingSettings | None = None,
                  progress_callback: Callable[[], None] | None = None,
+                 media_packet: bytes | None = None,
+                 media_signature: bytes | None = None,
                  ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
-        decoder = IncrementalTextDecoder()
+        decoder = IncrementalTokenDecoder(self.tokenizer)
         started = time.monotonic()
         first_token_seconds: float | None = None
         previous_token_at: float | None = None
@@ -2270,21 +2681,44 @@ class Application:
                     prefill_tokens = len(delta)
                 else:
                     if cancel_check is None:
-                        self.worker.begin(request_id, prompt_ids, context_limit,
-                                          effective_sampling)
+                        if media_packet is None:
+                            self.worker.begin(
+                                request_id, prompt_ids, context_limit,
+                                effective_sampling,
+                            )
+                        else:
+                            self.worker.begin(
+                                request_id, prompt_ids, context_limit,
+                                effective_sampling, media_packet=media_packet,
+                            )
                     else:
+                        begin_options = {
+                            "checkpoint_tokens": checkpoint_tokens,
+                            "cancel_check": cancel_check,
+                            "deadline": deadline,
+                            "progress_callback": progress_callback,
+                        }
+                        if media_packet is not None:
+                            begin_options["media_packet"] = media_packet
                         self.worker.begin(
                             request_id, prompt_ids, context_limit,
-                            effective_sampling,
-                            checkpoint_tokens=checkpoint_tokens,
-                            cancel_check=cancel_check, deadline=deadline,
-                            progress_callback=progress_callback,
+                            effective_sampling, **begin_options,
                         )
                 break
             except WorkerError as error:
                 if self._capacity_error(error) and self.evict_lru_session():
                     continue
                 if session is not None:
+                    if "retained session preserved:" in str(error):
+                        assert context is not None
+                        self.store_session(
+                            session.key, session.tokens, session.pages,
+                            session.media_signature, session.parked_bytes,
+                        )
+                        context.retained = True
+                        log("session_resume_rolled_back", key=session.key,
+                            error=str(error))
+                        raise
                     # The retained state is gone or inconsistent; fall back
                     # to a fresh full prefill.
                     log("session_resume_failed", key=session.key,
@@ -2324,12 +2758,8 @@ class Application:
                 previous_token_at = token_at
                 self.increment("generated_tokens")
                 generated.append(token)
-                current = self.tokenizer.decode(
-                    generated, skip_special_tokens=True,
-                    clean_up_tokenization_spaces=False,
-                )
                 final_text = token in self.eos_token_ids or index + 1 == maximum
-                delta = decoder.push(current, final=final_text)
+                delta = decoder.push(token, final=final_text)
                 if final_text:
                     # The consumer closes the generator right after this
                     # final token; from here on the turn is complete and its
@@ -2345,34 +2775,35 @@ class Application:
                 else []
             if finished and retain and not buffered:
                 try:
-                    session_key = session.key if session is not None \
-                        else self.allocate_session_key()
-                    try:
-                        retained_tokens = self.worker.end_retain(
-                            request_id, session_key, checkpoint_tokens
-                        )
-                    except TypeError as error:
-                        if "positional" not in str(error):
-                            raise
-                        retained_tokens = self.worker.end_retain(
-                            request_id, session_key
-                        )
-                    tokens = (prompt_ids + generated + buffered)[
-                        :retained_tokens]
-                    if 0 < retained_tokens == len(tokens):
-                        self.store_session(session_key, tokens,
-                                           context.held_pages)
-                        context.retained = True
-                        log("session_retained", key=session_key,
-                            tokens=retained_tokens, resumed=resumed)
-                    else:
-                        self.worker.drop_session(session_key)
-                        log("session_retain_mismatch", key=session_key,
-                            retained_tokens=retained_tokens,
-                            expected_tokens=len(prompt_ids) + len(generated) +
-                            len(buffered))
+                    assert context is not None
+                    expected_retained_tokens = checkpoint_tokens or \
+                        len(prompt_ids) + len(generated)
+                    self._retain_active_request(
+                        request_id, context, session,
+                        expected_retained_tokens,
+                        prompt_ids + generated + buffered,
+                        media_signature, resumed,
+                    )
                 except WorkerError as error:
                     log("session_retain_failed", error=str(error))
+            elif (not finished and retain and
+                  request_id in self.worker.active_ids):
+                # A client may disconnect after prefill while a decode token
+                # is in flight. Rewind to the declared prompt checkpoint and
+                # retain that exact, client-echoable prefix; partial assistant
+                # output must never leak into a later turn's KV state.
+                try:
+                    assert context is not None
+                    assert checkpoint_tokens is not None
+                    if self._retain_active_request(
+                            request_id, context, session, checkpoint_tokens,
+                            prompt_ids, media_signature, resumed,
+                            require_exact_checkpoint=True):
+                        log("session_cancelled_prefix_retained",
+                            tokens=checkpoint_tokens, resumed=resumed)
+                except WorkerError as error:
+                    log("session_cancelled_prefix_retain_failed",
+                        error=str(error))
             elif finished and retain:
                 # An unemitted speculative bonus token remains buffered; the
                 # worker state no longer matches any client-echoable prefix,
@@ -2410,7 +2841,13 @@ class Application:
                                  for session in self.sessions.values())
             session_pages = sum(session.pages
                                 for session in self.sessions.values())
-        kv_stats = self.worker.stats()
+            session_parked_bytes = sum(
+                session.parked_bytes for session in self.sessions.values()
+            )
+        # Introspection must remain available during a long layer-major
+        # prefill.  The worker command stream is deliberately serialized, so
+        # querying STATS here would otherwise block behind the GPU request.
+        kv_stats = self.worker_stats(refresh=False)
         runtime_stats = {
             key: value for key, value in kv_stats.items()
             if key not in {"allocated_pages", "reserved_pages",
@@ -2427,6 +2864,10 @@ class Application:
             "experts_index_sha256": self.manifest["indexes"]["experts_sha256"],
             "architecture": self.manifest["architecture"],
             "masses": self.manifest["masses"],
+            "input_modalities": (
+                ["text", "image"]
+                if getattr(self, "vision_enabled", False) else ["text"]
+            ),
             "active_requests": active,
             "maximum_queue": self.args.maximum_queue,
             "worker_capacity": self.args.worker_capacity,
@@ -2490,16 +2931,29 @@ class Application:
                 "page_tokens": self.worker.kv_page_tokens,
                 "page_bytes": self.worker.kv_page_bytes,
                 "page_capacity": self.worker.kv_page_capacity,
-                "allocated_pages": kv_stats["allocated_pages"],
-                "reserved_pages": kv_stats["reserved_pages"],
+                "allocated_pages": kv_stats.get("allocated_pages", 0),
+                "reserved_pages": kv_stats.get("reserved_pages", 0),
             },
             "worker_sessions": {
                 "enabled": self.retention_enabled(),
+                "parking_enabled": getattr(
+                    self.worker, "session_parking", False
+                ),
+                "park_ram_bytes": getattr(
+                    self.worker, "session_park_ram_bytes", 0
+                ),
+                "park_page_capacity": getattr(
+                    self.worker, "session_park_page_capacity", 0
+                ),
                 "retained": session_count,
                 "retained_tokens": session_tokens,
                 "reserved_pages": session_pages,
+                "parked_bytes": session_parked_bytes,
             },
-            "worker_runtime": runtime_stats,
+            "worker_runtime": {
+                **runtime_stats,
+                "stats_snapshot_age_seconds": self.worker_stats_age_seconds(),
+            },
             "runtime_config": {
                 "host": self.args.host,
                 "port": self.args.port,
@@ -2524,6 +2978,11 @@ class Application:
                 "queue_timeout_seconds": self.args.queue_timeout,
                 "generation_timeout_seconds": self.args.generation_timeout,
                 "maximum_body_bytes": self.args.maximum_body_bytes,
+                "maximum_image_pixels": getattr(
+                    self.args, "maximum_image_pixels", 2 << 20
+                ),
+                "maximum_image_patch_tokens":
+                    getattr(self.args, "maximum_image_patch_tokens", 4096),
             },
             "draining": self.draining.is_set(),
         }
@@ -2680,6 +3139,8 @@ class Handler(BaseHTTPRequestHandler):
                 cache_prefix_tokens=request.cache_prefix_tokens,
                 sampling=request.sampling,
                 progress_callback=progress_callback,
+                media_packet=request.media_packet,
+                media_signature=request.media_signature,
             )
         except TypeError as error:
             if not any(name in str(error) for name in (
@@ -2829,74 +3290,99 @@ class Handler(BaseHTTPRequestHandler):
             self._anthropic_sse("ping", {"type": "ping"})
             last_heartbeat = now
 
-        if request.tools and request.tool_choice != "none":
-            raw_text, completion_count, finish_reason = self._run_generation(
-                request, lambda _delta: None, context,
-                progress_callback=heartbeat,
-            )
-            parsed = self.app.parse_assistant_output(raw_text, request)
-            text, calls = parsed.text, parsed.tool_calls
-            index = 0
-            if text or not calls:
+        index = 0
+        text_open = False
+        streamed_text: list[str] = []
+        pending_leading_whitespace: list[str] = []
+        parser = AssistantStreamParser(self.app, request)
+
+        def emit_confirmed_text(delta: str) -> None:
+            nonlocal text_open
+            if not delta:
+                return
+            if not text_open:
                 self._anthropic_sse("content_block_start", {
                     "type": "content_block_start", "index": index,
                     "content_block": {"type": "text", "text": ""},
                 })
-                if text:
-                    self._anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta", "index": index,
-                        "delta": {"type": "text_delta", "text": text},
-                    })
-                self._anthropic_sse("content_block_stop", {
-                    "type": "content_block_stop", "index": index,
-                })
-                index += 1
-            for call in calls:
-                self._anthropic_sse("content_block_start", {
-                    "type": "content_block_start", "index": index,
-                    "content_block": {
-                        "type": "tool_use", "id": self._anthropic_tool_id(call),
-                        "name": call.name, "input": {},
-                    },
-                })
-                self._anthropic_sse("content_block_delta", {
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "input_json_delta",
-                              "partial_json": call.arguments},
-                })
-                self._anthropic_sse("content_block_stop", {
-                    "type": "content_block_stop", "index": index,
-                })
-                index += 1
-        else:
-            calls = ()
-            index = 0
+                text_open = True
+            streamed_text.append(delta)
+            self._anthropic_sse("content_block_delta", {
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "text_delta", "text": delta},
+            })
+
+        def emit_stream_text(delta: str) -> None:
+            if not delta:
+                return
+            # Standard response parsers can report template whitespace as a
+            # clean content chunk before they see a following tool-call
+            # marker, then remove it from the finalized assistant message.
+            # Hold only the bounded leading whitespace. As soon as real text
+            # appears it is stable and can stream; at finalization the
+            # authoritative parsed message decides whether the whitespace is
+            # content or merely grammar padding.
+            if not streamed_text and not delta.strip():
+                pending_leading_whitespace.append(delta)
+                if sum(map(len, pending_leading_whitespace)) > 4096:
+                    raise WorkerError(
+                        "response parser produced excessive leading whitespace"
+                    )
+                return
+            if pending_leading_whitespace:
+                delta = "".join(pending_leading_whitespace) + delta
+                pending_leading_whitespace.clear()
+            emit_confirmed_text(delta)
+
+        def emit(delta: str) -> None:
+            _reasoning, visible = parser.feed(delta)
+            emit_stream_text(visible)
+
+        raw_text, completion_count, finish_reason = self._run_generation(
+            request, emit, context, progress_callback=heartbeat,
+        )
+        _reasoning_tail, visible_tail = parser.finish()
+        emit_stream_text(visible_tail)
+        parsed = self.app.parse_assistant_output(raw_text, request)
+        text, calls = parsed.text, parsed.tool_calls
+        emitted_text = "".join(streamed_text)
+        if not text.startswith(emitted_text):
+            raise WorkerError(
+                "response parser changed already streamed assistant text"
+            )
+        pending_leading_whitespace.clear()
+        emit_confirmed_text(text[len(emitted_text):])
+        if text_open:
+            self._anthropic_sse("content_block_stop", {
+                "type": "content_block_stop", "index": index,
+            })
+            index += 1
+        if not calls and not text_open:
             self._anthropic_sse("content_block_start", {
                 "type": "content_block_start", "index": index,
                 "content_block": {"type": "text", "text": ""},
             })
-            parser = AssistantStreamParser(self.app, request)
-
-            def emit(delta: str) -> None:
-                _reasoning, visible = parser.feed(delta)
-                if visible:
-                    self._anthropic_sse("content_block_delta", {
-                        "type": "content_block_delta", "index": index,
-                        "delta": {"type": "text_delta", "text": visible},
-                    })
-
-            _raw_text, completion_count, finish_reason = self._run_generation(
-                request, emit, context, progress_callback=heartbeat,
-            )
-            _reasoning_tail, visible_tail = parser.finish()
-            if visible_tail:
-                self._anthropic_sse("content_block_delta", {
-                    "type": "content_block_delta", "index": index,
-                    "delta": {"type": "text_delta", "text": visible_tail},
-                })
             self._anthropic_sse("content_block_stop", {
                 "type": "content_block_stop", "index": index,
             })
+            index += 1
+        for call in calls:
+            self._anthropic_sse("content_block_start", {
+                "type": "content_block_start", "index": index,
+                "content_block": {
+                    "type": "tool_use", "id": self._anthropic_tool_id(call),
+                    "name": call.name, "input": {},
+                },
+            })
+            self._anthropic_sse("content_block_delta", {
+                "type": "content_block_delta", "index": index,
+                "delta": {"type": "input_json_delta",
+                          "partial_json": call.arguments},
+            })
+            self._anthropic_sse("content_block_stop", {
+                "type": "content_block_stop", "index": index,
+            })
+            index += 1
 
         self._anthropic_sse("message_delta", {
             "type": "message_delta",
@@ -3036,9 +3522,14 @@ class Handler(BaseHTTPRequestHandler):
                             "all model slots are busy", "server_error",
                             code="overloaded")
             return
-        context = self.app.acquire_request_context(
-            request.prompt_ids, request.maximum
-        )
+        if request.media_signature is None:
+            context = self.app.acquire_request_context(
+                request.prompt_ids, request.maximum
+            )
+        else:
+            context = self.app.acquire_request_context(
+                request.prompt_ids, request.maximum, request.media_signature
+            )
         if context is None:
             self.app.release_worker_slot()
             self.app.release()
@@ -3499,6 +3990,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--microbatch-window-ms", type=float, default=2.0)
     parser.add_argument("--latency-window", type=int, default=4096)
     parser.add_argument("--maximum-body-bytes", type=int, default=1 << 20)
+    parser.add_argument("--maximum-image-pixels", type=int, default=2 << 20)
+    parser.add_argument(
+        "--maximum-image-patch-tokens", type=int, default=4096
+    )
     parser.add_argument("--queue-timeout", type=float, default=1.0)
     parser.add_argument("--generation-timeout", type=float, default=120.0)
     parser.add_argument("--startup-timeout", type=float, default=120.0)
@@ -3520,6 +4015,8 @@ def main() -> int:
         (args.worker_placement_settle_steps is not None and
          args.worker_placement_settle_steps < 0) or
         args.session_idle_seconds < 0 or args.maximum_body_bytes < 1 or
+        args.maximum_image_pixels < 65536 or
+        args.maximum_image_patch_tokens < 256 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
     if (args.host not in {"127.0.0.1", "::1", "localhost"} and

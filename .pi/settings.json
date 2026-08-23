@@ -1,0 +1,24 @@
+{
+  "defaultProvider": "quantum-llm",
+  "defaultModel": "qwen3.8-27b-fp4",
+  "defaultThinkingLevel": "xhigh",
+  "enabledModels": [
+    "quantum-llm/qwen3.8-27b-fp4:xhigh",
+    "quantum-llm/deepseek-v4-flash:xhigh"
+  ],
+  "compaction": {
+    "enabled": true,
+    "reserveTokens": 8192,
+    "keepRecentTokens": 32768
+  },
+  "retry": {
+    "enabled": false,
+    "provider": {
+      "timeoutMs": 14400000,
+      "maxRetries": 0,
+      "maxRetryDelayMs": 0
+    }
+  },
+  "httpIdleTimeoutMs": 0,
+  "enableInstallTelemetry": false
+}

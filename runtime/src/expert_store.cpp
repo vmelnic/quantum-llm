@@ -85,23 +85,18 @@ std::optional<ExpertResolveResult> LocalResolveState::poll() {
         continue;
       }
       auto retained = item.host_handle.get();
-      if (!retained.status.ok() || !retained.retained) {
+      if (!retained.status.ok() || !retained.retained || !retained.lease) {
         item.error.emplace(
             retained.status.ok()
                 ? Status(ErrorCode::internal,
-                         "host expert resolve completed without retention")
+                         "host expert resolve completed without ownership")
                 : copy_status(retained.status));
         complete = false;
         continue;
       }
-      item.host = cache->try_acquire_host(
-          item.key, item.record, item.options.record_access,
-          item.options.priority);
-      if (!item.host) {
-        item.error.emplace(ErrorCode::internal,
-                           "host expert resolve lost retained ownership");
-        complete = false;
-      }
+      item.host = std::move(retained.lease);
+      if (item.options.record_access)
+        static_cast<void>(cache->record_access(item.key));
       continue;
     }
     if (item.result) continue;
@@ -209,7 +204,7 @@ ExpertResolveHandle LocalExpertStore::resolve(
     } else if (request.target == ExpertResolveTarget::host) {
       item.host_handle = cache_.preload_host(
           request.key, request.record,
-          HostPreloadOptions{request.options.priority, false});
+          HostPreloadOptions{request.options.priority, false, true});
       if (!item.host_handle.valid()) {
         item.error.emplace(ErrorCode::backpressure,
                            "host expert-page resolve was rejected");

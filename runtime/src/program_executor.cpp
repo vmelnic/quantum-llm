@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <set>
 #include <utility>
@@ -257,7 +258,11 @@ struct ProgramExecutionSession::Core final {
   ExecuteSequence execute_sequence;
   RetentionControl checkpoint_retention;
   RetentionControl rewind_retention;
+  Park park_retention;
+  Restore restore_retention;
   Rebind rebind;
+  TransactionControl begin_transaction;
+  TransactionControl end_transaction;
   ExactDecodeAvailable exact_available;
   SynchronizeExactDecodeBatch synchronize_exact;
   ExecuteExactDecode execute_exact;
@@ -358,6 +363,38 @@ Status ProgramExecutionSession::rewind_retention(
   }
 }
 
+RequestStateParkingResult ProgramExecutionSession::park_retention(
+    std::uint32_t next_position) const noexcept {
+  if (!valid() || !core_->park_retention)
+    return {{ErrorCode::cancelled, "model execution session is closed"},
+            0U, 0U};
+  try {
+    return core_->park_retention(next_position);
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state parking failed: ") + error.what()},
+            0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state parking failed"}, 0U, 0U};
+  }
+}
+
+RequestStateParkingResult ProgramExecutionSession::restore_retention()
+    const noexcept {
+  if (!valid() || !core_->restore_retention)
+    return {{ErrorCode::cancelled, "model execution session is closed"},
+            0U, 0U};
+  try {
+    return core_->restore_retention();
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state restore failed: ") + error.what()},
+            0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state restore failed"}, 0U, 0U};
+  }
+}
+
 Status ProgramExecutionSession::rebind_request(
     ProgramRequestContext request) const noexcept {
   if (!valid() || !core_->rebind)
@@ -370,6 +407,26 @@ Status ProgramExecutionSession::rebind_request(
                 error.what()};
   } catch (...) {
     return {ErrorCode::internal, "model execution session rebind failed"};
+  }
+}
+
+Status ProgramExecutionSession::begin_retention_transaction() const noexcept {
+  if (!valid() || !core_->begin_transaction)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  try {
+    return core_->begin_transaction();
+  } catch (...) {
+    return {ErrorCode::internal, "retention transaction start failed"};
+  }
+}
+
+Status ProgramExecutionSession::end_retention_transaction() const noexcept {
+  if (!valid() || !core_->end_transaction)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  try {
+    return core_->end_transaction();
+  } catch (...) {
+    return {ErrorCode::internal, "retention transaction end failed"};
   }
 }
 
@@ -443,12 +500,17 @@ void ProgramExecutionSession::cancel() noexcept {
 ProgramExecutionSession ProgramExecutionSession::from_callbacks(
     Execute execute, SequenceAvailable sequence_available,
     ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
-    RetentionControl rewind_retention, Rebind rebind,
+    RetentionControl rewind_retention, Park park_retention,
+    Restore restore_retention, Rebind rebind,
+    TransactionControl begin_transaction,
+    TransactionControl end_transaction,
     ExactDecodeAvailable exact_available,
     SynchronizeExactDecodeBatch synchronize_exact,
     ExecuteExactDecode execute_exact, Cancel cancel) {
   if (!execute || !sequence_available || !execute_sequence ||
-      !checkpoint_retention || !rewind_retention || !rebind ||
+      !checkpoint_retention || !rewind_retention || !park_retention ||
+      !restore_retention || !rebind || !begin_transaction ||
+      !end_transaction ||
       !exact_available || !synchronize_exact || !execute_exact || !cancel)
     return {};
   auto core = std::make_unique<Core>();
@@ -457,7 +519,11 @@ ProgramExecutionSession ProgramExecutionSession::from_callbacks(
   core->execute_sequence = std::move(execute_sequence);
   core->checkpoint_retention = std::move(checkpoint_retention);
   core->rewind_retention = std::move(rewind_retention);
+  core->park_retention = std::move(park_retention);
+  core->restore_retention = std::move(restore_retention);
   core->rebind = std::move(rebind);
+  core->begin_transaction = std::move(begin_transaction);
+  core->end_transaction = std::move(end_transaction);
   core->exact_available = std::move(exact_available);
   core->synchronize_exact = std::move(synchronize_exact);
   core->execute_exact = std::move(execute_exact);
@@ -500,7 +566,12 @@ struct MoeProgramExecutor::Core final {
     std::weak_ptr<RequestState> active_step;
     std::weak_ptr<ExactDecodeState> active_exact;
     bool active{};
+    bool parked{};
     bool closed{};
+    bool retention_transaction{};
+    std::uint32_t parked_position{};
+    std::uint64_t parked_pages{};
+    std::uint64_t parked_bytes{};
 
     [[nodiscard]] StartProgramExecutionResult start(
         std::map<std::string, ExecutionValue, std::less<>> inputs,
@@ -512,6 +583,9 @@ struct MoeProgramExecutor::Core final {
         std::uint32_t next_position) noexcept;
     [[nodiscard]] Status rewind_retention(
         std::uint32_t next_position) noexcept;
+    [[nodiscard]] RequestStateParkingResult park_retention(
+        std::uint32_t next_position) noexcept;
+    [[nodiscard]] RequestStateParkingResult restore_retention() noexcept;
     [[nodiscard]] bool exact_available() const noexcept;
     [[nodiscard]] Status synchronize_exact(
         std::span<const std::uint32_t> next_tokens,
@@ -523,6 +597,8 @@ struct MoeProgramExecutor::Core final {
     void finish(RequestState* step, bool success) noexcept;
     void finish_exact(ExactDecodeState* step, bool success) noexcept;
     [[nodiscard]] Status rebind(ProgramRequestContext replacement) noexcept;
+    [[nodiscard]] Status begin_transaction() noexcept;
+    [[nodiscard]] Status end_transaction() noexcept;
     void cancel() noexcept;
     void close() noexcept;
   };
@@ -998,6 +1074,154 @@ Status MoeProgramExecutor::Core::SessionState::rewind_retention(
   }
 }
 
+RequestStateParkingResult
+MoeProgramExecutor::Core::SessionState::park_retention(
+    std::uint32_t next_position) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed)
+      return {{ErrorCode::cancelled, "model execution session is closed"},
+              0U, 0U};
+    if (active)
+      return {{ErrorCode::backpressure,
+               "model execution session already has an active step"},
+              0U, 0U};
+    if (parked)
+      return {{ErrorCode::invalid_argument,
+               "model execution session is already parked"},
+              0U, 0U};
+
+    const auto provider_for = [this](std::uint32_t registry_index) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      return prepared == program->prepared.end()
+                 ? program->exact_decode &&
+                           program->exact_decode->provider_registry_index ==
+                               registry_index
+                       ? program->exact_decode->provider
+                       : std::shared_ptr<IOperationProvider>{}
+                 : prepared->provider;
+    };
+
+    std::vector<std::pair<std::shared_ptr<IOperationProvider>,
+                          std::shared_ptr<IOperationProviderRequestState>>>
+        completed;
+    std::uint64_t pages{};
+    std::uint64_t bytes{};
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto implementation = provider_for(registry_index);
+      if (!implementation ||
+          !implementation->supports_request_state_parking()) {
+        for (auto item = completed.rbegin(); item != completed.rend(); ++item)
+          static_cast<void>(item->first->restore_request_state(item->second));
+        return {{ErrorCode::invalid_argument,
+                 "request-state parking is not supported by every provider"},
+                0U, 0U};
+      }
+      auto result =
+          implementation->park_request_state(state, next_position);
+      if (!result.status.ok()) {
+        for (auto item = completed.rbegin(); item != completed.rend(); ++item)
+          static_cast<void>(item->first->restore_request_state(item->second));
+        return result;
+      }
+      if (pages > std::numeric_limits<std::uint64_t>::max() -
+                      result.populated_pages ||
+          bytes > std::numeric_limits<std::uint64_t>::max() -
+                      result.parked_bytes) {
+        static_cast<void>(implementation->restore_request_state(state));
+        for (auto item = completed.rbegin(); item != completed.rend(); ++item)
+          static_cast<void>(item->first->restore_request_state(item->second));
+        return {{ErrorCode::internal,
+                 "request-state parking accounting overflowed"},
+                0U, 0U};
+      }
+      pages += result.populated_pages;
+      bytes += result.parked_bytes;
+      completed.emplace_back(implementation, state);
+    }
+    parked = true;
+    parked_position = next_position;
+    parked_pages = pages;
+    parked_bytes = bytes;
+    return {Status::success(), pages, bytes};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state parking failed: ") + error.what()},
+            0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state parking failed"}, 0U, 0U};
+  }
+}
+
+RequestStateParkingResult
+MoeProgramExecutor::Core::SessionState::restore_retention() noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed)
+      return {{ErrorCode::cancelled, "model execution session is closed"},
+              0U, 0U};
+    if (active)
+      return {{ErrorCode::backpressure,
+               "model execution session already has an active step"},
+              0U, 0U};
+    if (!parked)
+      return {{ErrorCode::invalid_argument,
+               "model execution session is not parked"},
+              0U, 0U};
+
+    const auto provider_for = [this](std::uint32_t registry_index) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      return prepared == program->prepared.end()
+                 ? program->exact_decode &&
+                           program->exact_decode->provider_registry_index ==
+                               registry_index
+                       ? program->exact_decode->provider
+                       : std::shared_ptr<IOperationProvider>{}
+                 : prepared->provider;
+    };
+
+    std::vector<std::pair<std::shared_ptr<IOperationProvider>,
+                          std::shared_ptr<IOperationProviderRequestState>>>
+        restored;
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto implementation = provider_for(registry_index);
+      if (!implementation)
+        return {{ErrorCode::internal,
+                 "request-state restore provider is absent"},
+                0U, 0U};
+      auto result = implementation->restore_request_state(state);
+      if (!result.status.ok()) {
+        for (auto item = restored.rbegin(); item != restored.rend(); ++item)
+          static_cast<void>(item->first->park_request_state(
+              item->second, parked_position));
+        return result;
+      }
+      restored.emplace_back(implementation, state);
+    }
+    const auto pages = parked_pages;
+    const auto bytes = parked_bytes;
+    parked = false;
+    parked_position = 0U;
+    parked_pages = 0U;
+    parked_bytes = 0U;
+    return {Status::success(), pages, bytes};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state restore failed: ") + error.what()},
+            0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state restore failed"}, 0U, 0U};
+  }
+}
+
 bool MoeProgramExecutor::Core::SessionState::exact_available() const noexcept {
   return program && program->exact_decode.has_value();
 }
@@ -1110,7 +1334,7 @@ void MoeProgramExecutor::Core::SessionState::finish(
     active_step.reset();
     active = false;
   }
-  if (!success) closed = true;
+  if (!success && !retention_transaction) closed = true;
   if (closed) provider_states.clear();
 }
 
@@ -1122,7 +1346,7 @@ void MoeProgramExecutor::Core::SessionState::finish_exact(
     active_exact.reset();
     active = false;
   }
-  if (!success) closed = true;
+  if (!success && !retention_transaction) closed = true;
   if (closed) provider_states.clear();
 }
 
@@ -1146,7 +1370,49 @@ Status MoeProgramExecutor::Core::SessionState::rebind(
             "model execution session has an active step"};
   for (const auto& [name, value] : request.parameters)
     replacement.parameters.try_emplace(name, value);
+  for (const auto& [registry_index, state] : provider_states) {
+    const auto prepared = std::find_if(
+        program->prepared.begin(), program->prepared.end(),
+        [registry_index](const Core::PreparedInstruction& item) {
+          return item.provider_registry_index == registry_index;
+        });
+    const auto implementation =
+        prepared == program->prepared.end()
+            ? program->exact_decode &&
+                      program->exact_decode->provider_registry_index ==
+                          registry_index
+                  ? program->exact_decode->provider
+                  : std::shared_ptr<IOperationProvider>{}
+            : prepared->provider;
+    if (!implementation)
+      return internal_error("request rebind provider is absent");
+    const auto rebound =
+        implementation->rebind_request_state(state, replacement);
+    if (!rebound.ok()) return copy_status(rebound);
+  }
   request = std::move(replacement);
+  return Status::success();
+}
+
+Status MoeProgramExecutor::Core::SessionState::begin_transaction() noexcept {
+  std::lock_guard lock(mutex);
+  if (closed)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  if (active || parked || retention_transaction)
+    return {ErrorCode::backpressure,
+            "model execution session cannot start a retention transaction"};
+  retention_transaction = true;
+  return Status::success();
+}
+
+Status MoeProgramExecutor::Core::SessionState::end_transaction() noexcept {
+  std::lock_guard lock(mutex);
+  if (closed)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  if (active || !retention_transaction)
+    return {ErrorCode::backpressure,
+            "model execution session cannot end a retention transaction"};
+  retention_transaction = false;
   return Status::success();
 }
 
@@ -1371,9 +1637,15 @@ BeginProgramExecutionSessionResult MoeProgramExecutor::begin_session(
       [state](std::uint32_t position) {
         return state->rewind_retention(position);
       },
+      [state](std::uint32_t position) {
+        return state->park_retention(position);
+      },
+      [state] { return state->restore_retention(); },
       [state](ProgramRequestContext request) {
         return state->rebind(std::move(request));
       },
+      [state] { return state->begin_transaction(); },
+      [state] { return state->end_transaction(); },
       [state] { return state->exact_available(); },
       [state](std::span<const std::uint32_t> tokens,
               std::uint32_t position, bool draft) {

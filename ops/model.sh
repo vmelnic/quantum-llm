@@ -80,6 +80,8 @@ max_output="${MODEL_MAX_OUTPUT_TOKENS:-8192}"
 ready_timeout="${MODEL_READY_TIMEOUT:-600}"
 generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 max_body_mib="${MODEL_MAX_BODY_MIB:-16}"
+max_image_pixels="${MODEL_MAX_IMAGE_PIXELS:-2097152}"
+max_image_patch_tokens="${MODEL_MAX_IMAGE_PATCH_TOKENS:-4096}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
 ram_cache_gib="${MODEL_RAM_CACHE_GIB:-48}"
 vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-12}"
@@ -100,6 +102,8 @@ require_uint MODEL_MAX_OUTPUT_TOKENS "${max_output}"
 require_uint MODEL_READY_TIMEOUT "${ready_timeout}"
 require_uint MODEL_GENERATION_TIMEOUT_SECONDS "${generation_timeout}"
 require_uint MODEL_MAX_BODY_MIB "${max_body_mib}"
+require_uint MODEL_MAX_IMAGE_PIXELS "${max_image_pixels}"
+require_uint MODEL_MAX_IMAGE_PATCH_TOKENS "${max_image_patch_tokens}"
 require_uint MODEL_RAM_CACHE_GIB "${ram_cache_gib}"
 require_uint MODEL_VRAM_CACHE_GIB "${vram_cache_gib}"
 require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
@@ -158,6 +162,8 @@ print_config() {
     "max_output_tokens=${max_output}" \
     "generation_timeout_seconds=${generation_timeout}" \
     "max_body_mib=${max_body_mib}" \
+    "max_image_pixels=${max_image_pixels}" \
+    "max_image_patch_tokens=${max_image_patch_tokens}" \
     "sync_on_start=${sync_on_start}" \
     "api_key_configured=$([[ -n "${api_key}" ]] && printf yes || printf no)"
   [[ -z "${model_id}" ]] || printf '%s\n' \
@@ -194,6 +200,8 @@ start_model() {
     -PlacementProfile "${placement_profile}"
     -GenerationTimeoutSeconds "${generation_timeout}"
     -MaximumBodyMiB "${max_body_mib}"
+    -MaximumImagePixels "${max_image_pixels}"
+    -MaximumImagePatchTokens "${max_image_patch_tokens}"
     -StartupTimeoutSeconds 600
     -BuildId "${build_id}"
     -Start

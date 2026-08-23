@@ -1,377 +1,85 @@
-# Expert Runtime v1 contract
+# Expert Runtime contract
 
-Status: current runtime contract as of 2026-08-19. It includes the generic
-artifact/program/provider boundary described in
-[the current handoff](moe-vm-next.md).
+Status: current VM, worker and placement contract, 2026-08-23.
 
-This document defines invariants between the portable core, Windows storage,
-heterogeneous cache/scheduler, CUDA backend, model runner, and HTTP service.
-The current backend target is Windows + RTX 3090 (SM86).
+## Program and provider negotiation
 
-## Module boundary
+Every service artifact publishes `runtime-model.tsv`. The common native runner
+parses the program, validates geometry/encodings and asks registered providers
+for the declared kernel capabilities. Common code does not branch on Qwen,
+DeepSeek, layer count or upstream tensor names.
 
-```text
-manifest/index → feasibility/admission → request state
-                                         │
-exact router → device dispatch plan → expert-centric scheduler
-                                         │
-           ┌─────────────────────────────┼────────────────────────────┐
-           ▼                             ▼                            ▼
-     VRAM resident                 RAM → H2D slab               RAM CPU lease
-     grouped CUDA                  transient CUDA               CPU executor
-           └─────────────────────────────┬────────────────────────────┘
-                                         ▼
-                              stable weighted aggregation
-```
-
-Core contracts expose IDs, byte budgets, state and interfaces. Win32 handles
-and CUDA types remain behind backend boundaries.
-
-`runtime-model.tsv` schema 2 supplies model topology, routed components,
-router programs, ordered operations, tensor-role bindings and provider-owned
-numeric parameters. The common parser and capability registries do not inspect
-the artifact's architecture name. At present, however, the serving runner
-selects one complete worker provider for the operation set; compiled
-per-operation provider bindings are not yet the active model loop.
-
-## Container lifecycle
-
-```text
-UNOPENED → MANIFEST_VALID → PACKS_VALID → PLANNED → READY
-    └────────────── any validation/planning error ─────────► FAILED
-READY → DRAINING → CLOSED
-```
-
-`READY` requires exact schema/ABI support, valid hashes, compatible SM target,
-and feasible declared budgets. No best-effort integrity mode exists.
-
-## Expert lifecycle
-
-```text
-ABSENT → SSD_LOADING → RAM_READY → GPU_UPLOADING → VRAM_READY
-   ▲          └──────────── failure ───────────────────────► FAILED
-   └──────────────── safe eviction after leases/events ──────────────┘
-```
-
-Rules:
-
-- one load and one upload in flight per expert key;
-- waiters share the same operation;
-- RAM publishes only after complete read and checksum;
-- VRAM publishes only after copy completion event;
-- leases, scheduler reservations and incomplete CUDA events prevent eviction;
-- eviction skips route-pinned victims (host-side pin view) and retirement
-  never spins: a busy entry is skipped rather than waited on;
-- each active device route owns an independent bounded pin token, so one
-  request waiting on expert readiness does not invalidate or serialize another;
-- credits are acquired before allocation and returned exactly once;
-- cancellation removes a waiter, not data still required by another request;
-- short read, checksum or CUDA error fails all dependent requests;
-- RAM cache, pinned staging, VRAM resident/transient, workspace and KV budgets
-  are independent.
-
-Acquisitions carry `demand`, `prefetch` or `warm` priority. Demand is serviced
-ahead of speculative work, and an exact demand can upgrade an existing waiter.
-`preload_host` authenticates SSD bytes into bounded RAM without requiring a
-VRAM allocation. Optional protected RAM and transient VRAM segments separate
-census/session evidence from one-shot demand while remaining evictable under
-their declared budgets.
-
-`stored_bytes` and `device_bytes` are separate capacity claims. Zero
-`device_bytes` preserves the legacy equal-size path. Any expanding admission
-must declare the exact hot allocation before I/O begins; the cache reserves
-that value and refuses work that cannot fit. Upload completion may shrink a
-reservation but may never exceed it. Current routed DeepSeek records remain
-13,369,344-byte FP4 records through SSD, RAM and VRAM; they are not expanded
-into the obsolete 25,198,592-byte INT8 slot.
-
-`source_abi` and the key's target `quant_abi` form a fail-closed pair. Expert
-Pack v1 records continue through their existing validator and uploader; the
-validator accepts quant ABI 1 (INT8 per-row) and quant ABI 3 (FP4-E2M1/UE8M0
-block-32), and ABI 3 records stay packed through storage and residency and are
-consumed directly by the `__dp4a` selection-batch kernels — no expansion into
-INT8 slots.
-DeepSeek compact records are SHA-256 checked as complete 13,369,344-byte
-staging payloads and published in compact form for the packed SM86 `__dp4a`
-kernels. Compact source bytes are never exposed through the legacy host INT8
-executor.
-
-FP8 shared experts use a separate source ABI with 128×128 block scales but
-converge on the same SM86 slot. Source ABI therefore selects decoding semantics;
-target ABI alone never guesses how bytes should be interpreted. Shared experts
-are integrity-loaded through the cache, then planner-pinned as always-active
-model state rather than admitted by routed frequency.
-
-`ResidentExpertSet` owns those long-lived leases. Its startup path is serial by
-design: one pinned source slot bounds host memory while VRAM accumulates only
-the declared final allocations. Duplicate keys fail before I/O. A load failure
-releases the partial set and trims its now-unreferenced cache entries.
-
-Dense block-scaled FP8 matrices use `DeepSeekDenseMatrix`, not a synthetic
-expert key. Admission validates 128×128 source geometry, rejects E4M3FN/UE8M0
-NaNs, derives a row-INT8 matrix, and exposes the existing `Int8Matrix` GEMV ABI.
-Source and device byte claims remain explicit; dense allocations are model
-state rather than router-evictable cache entries.
-
-`DeepSeekDenseSet` validates the complete name/shape/byte plan, loads matrices
-serially through one maximum-sized pinned slot, and publishes the collection
-only after all matrices succeed. Hot paths bind matrix pointers once during
-model construction; string lookup is not part of token execution.
-
-The key is `(artifact-derived namespace, component layer, expert,
-encoding_abi)`. The namespace prevents equal local coordinates from colliding
-across artifacts or routed components.
-
-## Heterogeneous execution
-
-An `ExpertWorkGroup` represents one expert and every microbatch row selecting
-it. Executors are:
-
-- `cuda_resident`: published device directory entry;
-- `cuda_slab`: bounded RAM→pinned→device transient execution;
-- `cpu_local`: host lease and bounded CPU pool;
-- future `remote_worker`: same semantic output from another node.
-
-Every executor writes a per-selection output. Device aggregation applies
-routing weights in stable `(request, row, top-k slot)` order. Completion order
-must not alter numerical order.
-
-CPU execution uses compact result slots. Each CPU work group retains the global
-selection ID for input-row lookup and maps it to a unique compact output slot.
-Only `cpu_selection_count × hidden × sizeof(float)` is copied to the device;
-the aggregation kernel resolves non-GPU selections through a bounded
-`cpu_slot_by_selection` table. The mapping changes storage only, never routing
-or aggregation order.
-
-Planner decisions use measured queue, transfer and compute costs. A missing
-expert is never treated as zero and a timeout never reduces top-k.
-
-DeepSeek layer execution exposes cache misses as a resumable state-machine
-boundary. Attention/router results remain in bounded request state while the
-outer scheduler acquires the exact missing experts. Resume replans the complete
-top-k, executes only when every dependency is available, and releases the
-request's directory pin after the FFN stream completes.
-
-The current immutable DeepSeek routed catalog contains 43 × 256 records in
-layer-major order because that is what the artifact declares. A record may
-resolve to six authenticated checkpoint extents or one compact-pack extent and
-declares compact FP4 source/device bytes. Lookup does not parse files, allocate,
-or hash in the hot path. Catalog generation hashes the authoritative source
-once; normal cache admission verifies the selected expert again before
-publication. Common catalog/VM code does not assume 43 layers or 256 experts;
-the current numeric provider still validates the geometry it supports.
-
-The DeepSeek outer scheduler converts controller misses into catalog-backed
-`ExpertCache::acquire` handles. Its independent credits bound active requests,
-cache waiters, and layer advances per event-loop poll. Completed acquisitions
-become request-owned leases; a request becomes runnable only when its entire
-exact top-6 route is present. Other runnable requests continue while a route is
-on SSD/I/O/H2D. Shared expert 256 is not silently loaded from the routed catalog:
-it must be held by the resident model set, otherwise the request fails closed.
-
-DeepSeek request admission also budgets the complete output surface: HC-head
-workspace, 129,280 FP32 logits, and one sampled token. Embedding and head
-bindings point into the immutable typed model state. The runtime rounds at the
-same BF16 boundaries as the reference before final normalization/projection;
-greedy argmax is device-side, so ordinary decode does not copy full logits to
-the host.
-
-`HybridDispatchPlanner` receives one unique candidate per routed expert. It
-keeps resident GPU experts fixed, assigns forced paths explicitly, then greedily
-balances flexible RAM misses by projected critical path. Current synchronous
-H2D is modeled as serialized before GPU expert compute; CPU compute may overlap
-that GPU path. Stable ties remain on CPU to avoid unnecessary placement
-mutation. Invalid, duplicate, unavailable, or over-bound plans fail closed.
-
-CPU/GPU/H2D cost EWMAs are bounded state. The newest 256 per-expert reason/cost
-snapshots form a circular diagnostic trace; aggregate counters are emitted for
-benchmark windows. The trace affects neither routing nor aggregation order.
-
-The CPU executor owns a maximum worker pool but activates only its calibrated
-subset. Lazy calibration tests physical-core and logical-thread estimates with
-two bounded gate/down tiles on the first real batch. Persistent scratch,
-precomputed row pointers, multi-row weight reuse, and AVX2 software prefetch do
-not change FP32 activation arithmetic or compact output-slot semantics.
-Telemetry reports calibration cost, chosen threads/tiles, selections, logical
-weight bytes, and effective bytes/s; the latter is not raw DRAM bandwidth.
-
-## Placement policy
-
-The cache uses bounded frequency/reuse evidence with aging. RAM→VRAM promotion
-must outperform the conservative H2D cost and displace only a strictly colder
-entry. Current execution continues on an available path while asynchronous
-promotion can benefit future tokens.
-
-Cache temperature also includes exact selected-router score mass and peak
-score, encoded at Q20 precision. Score evidence ages with frequency and affects
-victim/admission ordering only; it never changes router top-k, routing weights,
-or aggregation. Non-finite feedback is ignored and all arithmetic saturates.
-The entry snapshot exposes frequency, score evidence, and final temperature for
-diagnostics.
-
-At warmup/request barriers, admitted promotions drain and placement freezes.
-The frozen epoch performs no demand promotion or policy mutation, and its
-resident routes run with zero expert storage reads and zero demand H2D. One
-bounded exception exists: a RAM-resident hot expert may be re-promoted to VRAM
-while frozen, gated once per forward pass by the stale-victim byte budget
-(`ExpertCache::vram_stale_resident_bytes` — unreferenced VRAM residents not
-routed for at least 2^19 access-clock ticks), so a repeating route whose
-working set exceeds the VRAM budget cannot ping-pong. Promotions upload from
-the RAM tier and add no storage reads.
-
-The promotion predictor retains at most 4,096 histories, requires two recent
-observations, expires them after 192 routed-layer epochs, and permits one
-in-flight promotion. Score-weighted saved CPU debt determines priority only
-after current work is planned. Stale pending work is cancelled. A completed
-promotion is useful only when a later route finds it GPU-resident; selection
-after eviction or TTL expiry is charged as wasted bytes. Prefetch never weakens
-strictly-colder admission or current-route references.
-
-Operators select a policy goal with `-PlacementProfile` (PowerShell) or
-`--placement-profile` (HTTP server):
-
-| Profile | Policy | Evidence boundary |
-|---|---|---|
-| `latency` | Admit prefetch after one recent observation and remove the extra admission margin. | More aggressive warming; not yet an independent throughput SLO. |
-| `balanced` | Require two recent observations and use measured CPU/H2D/GPU critical-path cost. | Qualified default for the reference 80B deployment. |
-| `capacity` | Disable speculative prefetch and opportunistic RAM→VRAM execution; retain mandatory cold fallback. | Minimizes churn for larger working sets; not a promise that CPU execution is faster. |
-
-These are policy goals, not expert percentages. Resident experts stay on the
-GPU, unavailable host experts still take the required load path, and all three
-profiles preserve exact routing and stable aggregation. RAM and VRAM budgets
-remain independent operator inputs.
-
-## Windows storage
-
-- pack files are opened read-only with overlapped I/O;
-- unbuffered I/O is used only when file offset, length and buffer alignment
-  meet effective volume constraints;
-- one bounded IOCP/pool serves reads—never one blocking thread per expert;
-- staging buffers have explicit owner/generation and fixed capacity;
-- durable RAM cache is pageable so pinned staging cannot be exhausted by
-  retention;
-- useful, requested, physical-read and overfetch bytes are measured separately;
-- EOF, short completion, checksum mismatch and device removal fail closed.
-
-Legacy DeepSeek source-catalog ingestion uses an exact-cover gather descriptor:
-six buffered, overlapped SafeTensors reads target disjoint offsets in one
-pinned staging buffer, then a whole-payload checksum gates CUDA admission.
-Compact-pack ingestion resolves one aligned extent. Buffered children are
-intentional because source tensor offsets need not satisfy sector alignment;
-unbuffered aligned reads remain the contiguous-pack path. No full checkpoint or
-extra per-expert payload copy is created.
-
-## CUDA ABI
-
-`expert-pack-sm86-int8-row-v1` is the retained generic legacy ABI for symmetric
-per-row INT8 weights and FP32 scales.
-`expert-pack-sm86-fp4-block32-v1` consumes packed FP4-E2M1
-expert weights with one UE8M0 scale per 32-value block. Expert function:
-
-```text
-down(silu(gate(x)) * up(x))
-```
-
-Resident/transient descriptors contain only device pointers, declared geometry,
-dtype, ABI, workspace and completion event. Host pointers are never published
-in the device directory. Pointer generations prevent ABA reuse after eviction.
-
-The straightforward FP32-activation kernel is the numerical oracle, not the
-performance contract. Optimized kernels may change internal tiling/dtype only
-behind a versioned kernel ABI and correctness tolerance.
-
-## Native provider state
-
-The Qwen3.8 provider implements full-attention GQA with partial RoPE/output gate
-and gated linear attention with persistent Conv/recurrent state. Dense FP4
-projection and MLP operations run through the compiled program. KV and linear
-state are isolated by worker slot; immutable weights are shared.
-
-The KV implementation uses on-demand FP16 pages:
-
-```text
-logical KV bytes are derived from artifact head/layer geometry × admitted tokens
-```
-
-KV is reserved in 256-token pages spanning the artifact-declared full-attention
-layers. Page credits are acquired per request, physical pages are allocated on
-first use, and released pages enter a bounded reuse pool. Online-softmax
-attention does not allocate a score array proportional to context length.
-
-DeepSeek owns its distinct sparse attention/recurrent state behind its operation
-capability set. It shares the common service, artifact program and expert-page
-contracts.
-
-The reference Qwen3.8 lifecycle advertises 262,144 context tokens and 8,192
-output tokens. Qwen allocates KV pages on demand, so short requests do not
-reserve that maximum physically. A 262,016-token prompt plus 128 generated
-tokens completed, demonstrating physical capacity. Efficient prefill,
-maximum-context decode throughput and semantic quality remain separate gates.
+A new checkpoint using existing operations requires a strict source adapter
+and a new artifact. New mathematics, encoding or geometry requires a provider
+implementation plus an independent numerical oracle. It does not require a
+new HTTP service, scheduled task or `model.sh` case.
 
 ## Worker protocol
 
-The local line-framed protocol supports:
+The server starts one native worker and performs a handshake that advertises
+model identity, context/output limits, provider capabilities, KV policy,
+session retention and telemetry schema. Commands cover:
 
-- startup `ready` with protocol/capacity, causal prefill chunk size, session
-  retention support, and KV page geometry;
-- protocol-v5 `BEGIN` with an exact context reservation, then position-ordered
-  causal prefill in chunks decoupled from the decode batch capacity (Qwen);
-  `BEGIN … RESUME <key>` reuses a retained slot and prefills only the delta
-  tokens of a continued conversation;
-- explicit placement-prefetch state and a token list for the MTP boundary,
-  with front-end compatibility for the existing Qwen runner's older scalar
-  token and inferred-prefetch forms;
-- `STEP` to decode several active request IDs together; each item carries a
-  mode flag — 0 decode, 1 final emit-and-release, 2 hold (plain decode that
-  keeps the slot; a retained MTP turn ends on a hold step so the worker state
-  stops on an exact emitted-token boundary);
-- `STATS` for KV page allocation/reservation plus cumulative phase, cache,
-  and scheduler counters used for per-request telemetry deltas;
-- `END` to release/cancel request state, or `END … RETAIN <key>` to park the
-  slot's KV/recurrent state as a retained session; `DROP <key>` evicts a
-  retained session (LRU/idle pressure from the front-end);
-- `SHUTDOWN` for orderly worker exit (all requests ended, no retained
-  sessions).
+- request begin/resume and bounded prompt feed;
+- token step/generation and streaming output;
+- commit/checkpoint, rewind, retain/park, restore and drop;
+- cancellation and shutdown;
+- cached status/telemetry snapshots.
 
-Unexpected message type, duplicate ID, invalid capacity or mismatched response
-is fatal to the affected control flow. The front-end serializes worker commands
-and continuously batches compatible decode waiters within a bounded window; a
-lone queued waiter is dispatched immediately instead of paying the window.
+Request state transitions are transactional. Resume does not consume the
+parked state until rebind and suffix feed succeed. A zero-length suffix is
+valid. Cancellation rewinds to the last client-echoable prompt checkpoint;
+worker/protocol errors fail the request rather than silently rebuilding a
+different state.
 
-## Request lifecycle
+## Dense placement
+
+The Qwen provider owns one hot CUDA execution slot:
+
+- FP4 matrix weights are resident in VRAM;
+- activation tiles stay device-resident across the operation program;
+- recurrent state remains hot while a request executes;
+- exact target F16 KV grows as request-owned 256-token pinned-host pages;
+- bounded KV spans are staged to the GPU for full attention;
+- inactive sessions retain populated pages and a compact continuation blob.
+
+MTP/draft state is allocated only when the generation policy can actually use
+exact verification. Stochastic sampling currently uses target-only decode;
+paying draft prefill/KV in that mode is forbidden.
+
+## Sparse placement
+
+DeepSeek experts use immutable keys and a single state machine:
 
 ```text
-QUEUED → ADMITTED → PREFILL → DECODE → STREAMING → COMPLETE
-             └──────── failure/cancel ───────────► FAILED/CANCELLED
+absent -> SSD loading -> RAM ready -> GPU upload -> VRAM ready
 ```
 
-Admission reserves capacity before streaming headers. Queue and worker-slot
-waits have deadlines. Client disconnect is checked before scheduling another
-decode step; cancellation always closes the generator and sends `END` when the
-worker state is active.
+Demand, prediction and warm work are separate priorities. Demand owns enough
+staging capacity to make progress; speculative work is bounded and
+cancellable. Protected/probationary host retention and transient/protected
+VRAM keep one-shot routes from evicting established hot records. Leases pin
+records until consuming CUDA work completes.
 
-## Telemetry
+## Capacity and accounting
 
-The runtime distinguishes SSD misses, RAM hits, VRAM hits, useful/read/uploaded
-bytes, cache high-water marks, executor time, batch rows, TTFT and inter-token
-latency. Metrics windows are bounded. A benchmark must identify cold/warm/frozen
-placement and cannot infer hot-path throughput from configuration alone.
+Worker slots, queue entries, RAM pages, VRAM pages, staging buffers and output
+tokens are independent credits. Parking admission accounts the real stored
+bytes, including fixed continuation state, rather than deriving capacity only
+from KV page count. Status reports actual allocated/populated bytes and never
+speculatively reserves a request's declared maximum.
 
-Cache attribution is split by demand/prefetch/warm priority and includes
-storage/upload/wait time, reload count, reread bytes, host-preload usefulness
-and waste, priority upgrades, protected/probationary RAM, transient/protected
-VRAM and staging high-water marks. These counters are the gate for any renewed
-placement optimization; configured cache size is not evidence of a hit rate.
+The current Python command channel/provider mutex serializes Qwen execution.
+`MODEL_WORKER_CAPACITY>1` can retain/admit more state but does not create
+parallel GPU kernels. Multi-device execution requires the allocator/shard/P2P
+work in [Roadmap](roadmap.md).
 
-Expert-lane telemetry distinguishes CPU and resident-GPU selections and time,
-reports nanoseconds per selection, and accounts separately for compact CPU
-results and selection-map H2D bytes. GPU time uses CUDA events. Observed
-CPU/GPU overlap is the positive difference between the sum of both lane times
-and the enclosing expert-phase wall time; because transfer and aggregation are
-inside that enclosing phase, this is a lower bound rather than a complete
-critical-path trace.
+## Correctness boundaries
 
-Chunked prefill shares the normal transformer microbatch implementation. The
-full-model gate requires its generated sequence to equal scalar prefill plus
-decode exactly. The implementation does not claim FlashAttention or an
-efficient 262K path.
+- unknown operation, encoding, record version or missing provider fails start;
+- missing routed experts fail the request; they are never treated as zero;
+- exact target F16 KV cannot be substituted with FP8/Q4 by policy;
+- sampling, reasoning, tool and image behavior use artifact template metadata;
+- profiling is capability-driven and disabled unless explicitly requested;
+- all model-specific source knowledge ends before the common program/runtime
+  boundary.

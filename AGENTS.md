@@ -243,6 +243,15 @@
   24 threads were slower. Even granting perfect two-token MTP amplification
   and zero GPU/service time caps it at 8.8386 generated tok/s. Do not tune this
   kernel or implement this placement for the 15 tok/s target.
+- Keeping every exact F16 K resident and selecting V on demand also fails the
+  physical allocation gate. The measured maximum-context exact provider peak
+  is about 18,754 MiB and already contains one 512 MiB K layer plus one
+  512 MiB V layer. Replacing that pair with all 16 K layers adds 7,168 MiB,
+  reaching about 25,922 MiB before any selective-V staging. This exceeds even
+  the RTX 3090's 24,576 MiB physical capacity, and its attention-only provider
+  floor is already 10.8977 calls/s before dense compute. Do not implement the
+  all-K-resident/selective-V design on this host unless a preceding exact
+  mechanism first frees and measures the missing capacity.
 - Held-out raw-F16 Huffman coding required 13.7195388675 bits/value including
   unseen-symbol literals and codebooks. zlib, Zstandard, and LZ4 were worse.
   Basic previous-layer XOR/delta increased entropy; byte conditioning reached
@@ -252,6 +261,57 @@
   coding prompt achieved only 3.8485 useful tokens/cycle, maximum 17, with no
   cycle reaching the required 24. Do not implement a prompt-copy proposer for
   this trace.
+- Pagewise exact-K progressive refinement with a Q4 KV surrogate failed its
+  real 262,144-token lower-bound gate. Even after granting exact V, all other
+  K heads, every other attention component, bounds compute, and metadata for
+  free, the independent score-interval certificate required at least
+  2,029.014182 MiB of one-head F16 K traffic per scalar target call. The
+  absolute 15-calls/s transfer ceiling is only 272.822299 MiB, a 7.437127x
+  violation. A 32-token page cannot fix it: splitting each 64-token page in
+  two can improve the fractional optimum by at most 2x, leaving a proven
+  1,014.507091 MiB lower bound. Do not restore this provider instrumentation,
+  run the block-32 variant, or build an executable refinement cache behind it.
+- AirLLM-style dense layer streaming changes capacity, not the Qwen decode
+  hot-byte requirement. Streaming the measured 12.689922 GiB target-call
+  weight scan over the 12.46 GiB/s link costs at least 1.018454 seconds per
+  scalar call before K/V or compute. Keep layer streaming confined to fitting,
+  phase-specific prefill, or genuinely conditional organs; do not propose it
+  again as a 15 tok/s dense-decode mechanism.
+
+### DeepSeek maximum-context layer-major gate
+
+- Exact layer-major prefill must retain each routed selection output at its
+  original `(row, top-k slot)` until stable top-k aggregation. For the current
+  four-stream FP32 frontier, hidden 4096, top-6 route and 1,048,576 tokens, a
+  whole-prompt slab is 176 GiB, not 8--16 GiB. Do not describe one hidden
+  BF16 slab as the current provider's exact state.
+- The bounded valid schedule is eight causal blocks of 131,072 tokens. Each
+  block needs 22 GiB plus 6 MiB of exact host scratch and traverses all 43
+  layers before the next block; layer attention state persists across blocks.
+  This reduces the favorable routed-weight movement from 3.2124 PiB
+  token-major to 1.0708 TiB (eight complete compact-pack passes), while exact
+  activation traffic remains 23.5156 TiB across the host/device boundary.
+  These are a rejected experiment, not a completed provider or measured
+  prefill rate. The experimental `layer_major_prefill` planner was removed
+  after the populated gate failed; do not reintroduce or advertise
+  `causal_layer_major` for DeepSeek without a new end-to-end design and a
+  passing populated-context service gate.
+- The first real populated gate used 1,048,575 source-derived prompt tokens
+  plus one output token. After roughly 6.5 minutes it remained inside block
+  one while the RTX 3090 was 86% busy at 22,470 MiB and the worker had
+  transferred 33,437,075,614 bytes. It was stopped fail-fast. This disproves
+  the claim that routed-pack I/O is still the only active prefill bottleneck;
+  do not repeat the scalar dense attention/router/shared-FFN schedule at 1M.
+  Exact dense-row batching must pass a bounded parity gate before the next
+  populated run.
+- Exact two-row batching passed short-path parity and improved `hi` from 6.269
+  to 5.443 seconds, but failed the one-block long prerequisite. A 131,071-token
+  real repository prompt plus one output remained incomplete after more than
+  14 minutes at about 93% GPU utilization and 22,474 MiB. The favorable
+  eight-block lower bound therefore exceeds 112 minutes. Do not tune or rerun
+  pair widths 2/4/8 as the maximum-context solution. The next schedule must
+  separate large dense projection GEMMs from causal row-local state mutation,
+  and must pass one complete 131,072-token block before a 1M request.
 
 ## Universal MoE infrastructure (mandatory)
 
@@ -295,8 +355,13 @@
 
 ## Project pointers
 
-- `docs/inference-30toks-plan.md` — the serving-speed work plan for the
-  3090 host (Qwen3-Next-80B / DeepSeek-V4-Flash).
+- `docs/architecture.md` — the implemented artifact VM and memory-tier
+  architecture.
+- `docs/benchmarks.md` — the canonical measurement ledger; historical claims
+  not present there are not current evidence.
+- `docs/research-decisions.md` — rejected directions and the quantitative
+  gates that prevent repeating them.
+- `docs/roadmap.md` — the current dependency-ordered work plan.
 - The Memory Expert (KV-attach) experiment was extracted into the standalone
   public project at `../memory-expert` (validated architecture, results, and
   runbooks live there now).

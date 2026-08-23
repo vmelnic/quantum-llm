@@ -54,6 +54,9 @@ endif()
 
 find_package(Threads REQUIRED)
 target_link_libraries(expert_runtime PUBLIC Threads::Threads)
+if(WIN32)
+  target_link_libraries(expert_runtime PUBLIC bcrypt)
+endif()
 if(TARGET expert_core)
   target_link_libraries(expert_runtime PUBLIC expert_core)
 endif()
@@ -155,12 +158,6 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_link_libraries(expert-deepseek-admission-smoke PRIVATE
     expert_runtime CUDA::cudart)
   if(WIN32)
-    add_executable(expert-executable-swiglu-page
-      tools/executable_swiglu_page.cpp)
-    target_compile_features(expert-executable-swiglu-page PRIVATE cxx_std_20)
-    target_compile_options(expert-executable-swiglu-page PRIVATE /arch:AVX2)
-    target_link_libraries(expert-executable-swiglu-page PRIVATE
-      expert_runtime CUDA::cudart)
     add_executable(expert-deepseek-dense-smoke
       tools/deepseek_dense_smoke.cpp)
     target_compile_features(expert-deepseek-dense-smoke PRIVATE cxx_std_20)
@@ -223,12 +220,6 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     target_link_libraries(expert-deepseek-catalog-smoke PRIVATE
       expert_runtime CUDA::cudart)
   endif()
-  add_executable(expert-qwen3-next-runner tools/qwen3_next_runner.cpp)
-  target_compile_features(expert-qwen3-next-runner PRIVATE cxx_std_20)
-  target_link_libraries(expert-qwen3-next-runner PRIVATE expert_runtime expert_core CUDA::cudart)
-  add_executable(expert-olmoe-runner tools/olmoe_runner.cpp)
-  target_compile_features(expert-olmoe-runner PRIVATE cxx_std_20)
-  target_link_libraries(expert-olmoe-runner PRIVATE expert_runtime expert_core CUDA::cudart)
   add_library(expert-sm86-dense-moe-provider OBJECT tools/olmoe_runner.cpp)
   target_compile_features(expert-sm86-dense-moe-provider PRIVATE cxx_std_20)
   target_compile_definitions(expert-sm86-dense-moe-provider PRIVATE

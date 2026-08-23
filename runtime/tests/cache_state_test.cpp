@@ -1069,6 +1069,7 @@ void test_universal_worker_launch_preserves_provider_extensions() {
       std::string_view{"--kv-cache-dtype=fp8-e4m3-per-head"},
       std::string_view{"--placement-profile=balanced"},
       std::string_view{"--prefill-chunk-limit=512"},
+      std::string_view{"--profile-gpu-phases"},
       std::string_view{"--provider-fp4-pipeline=vendor-x"},
       std::string_view{"--provider-background-compile"}};
   const auto parsed = er::parse_worker_launch_options(arguments);
@@ -1076,6 +1077,7 @@ void test_universal_worker_launch_preserves_provider_extensions() {
               parsed.options.capacity == 3U &&
               parsed.options.kv_cache_dtype == "fp8-e4m3-per-head" &&
               parsed.options.prefill_chunk_limit == 512U &&
+              parsed.options.profile_gpu_phases &&
               parsed.options.extensions.at("provider-fp4-pipeline") ==
                   "vendor-x" &&
               !parsed.options.extensions.at("provider-background-compile"),
@@ -1602,6 +1604,44 @@ void test_expert_store_resolves_complete_ordered_union() {
               !cold_host_resolved->experts[0].device_lease &&
               harness.uploader->upload_count() == uploads_before_host_resolve,
           "cold host resolve uploaded weights or lost exact host ownership");
+
+  Harness atomic_harness(4096, 2, 8192);
+  er::LocalExpertStore atomic_store(atomic_harness.cache);
+  const auto retained = make_record(34, 0U);
+  const auto pressure = make_record(35, er::kExpertPackAlignment);
+  const std::array retained_request = {
+      er::ExpertResolveRequest{
+          retained.key, retained.record, er::ExpertResolveTarget::host,
+          er::ExpertAcquireOptions{er::ExpertRequestPriority::demand, false,
+                                   true, false}}};
+  auto retained_batch = atomic_store.resolve(retained_request);
+  atomic_harness.storage->complete_success(retained.bytes);
+  const auto ready_deadline = std::chrono::steady_clock::now() + 1s;
+  for (;;) {
+    const auto ready = atomic_harness.cache.inspect(retained.key);
+    if (ready && ready->state == er::CacheState::ram_ready &&
+        ready->has_host_copy)
+      break;
+    require(std::chrono::steady_clock::now() < ready_deadline,
+            "atomic host lease fixture did not publish RAM residency");
+    std::this_thread::yield();
+  }
+  auto pressure_preload = atomic_harness.cache.preload_host(
+      pressure.key, pressure.record,
+      {er::ExpertRequestPriority::demand, false});
+  require(atomic_harness.storage->pending_count() == 0U,
+          "host completion did not atomically retain its RAM ownership");
+  auto retained_result = retained_batch.poll();
+  require(retained_result && retained_result->status.ok() &&
+              retained_result->experts.size() == 1U &&
+              retained_result->experts[0].host_lease,
+          "host resolve lost ownership before its consumer polled");
+  retained_result->experts.clear();
+  require(atomic_harness.storage->pending_count() == 1U,
+          "released host ownership did not unblock RAM pressure");
+  atomic_harness.storage->complete_success(pressure.bytes);
+  require(pressure_preload.get().status.ok(),
+          "RAM pressure fixture did not complete after lease release");
 }
 
 class FixtureRemoteLease final : public er::IRemoteExpertLease {

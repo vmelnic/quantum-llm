@@ -38,6 +38,7 @@ from .deepseek_slice import (
     qualify_deepseek_shared_expert,
 )
 from .errors import ExpertPackError
+from .quality import qualify_container_against_source
 from .safetensors import SafeTensorCheckpoint
 from .source_inventory import inspect_source
 from .validate import validate_container
@@ -66,6 +67,16 @@ def _parser() -> argparse.ArgumentParser:
 
     validate_parser = commands.add_parser("validate", help="independently validate a completed container")
     validate_parser.add_argument("container", type=Path)
+
+    quality_parser = commands.add_parser(
+        "qualify-fp4-container",
+        help="compare a published FP4 container with its declared SafeTensors source",
+    )
+    quality_parser.add_argument("--source", type=Path, required=True)
+    quality_parser.add_argument("--container", type=Path, required=True)
+    quality_parser.add_argument("--samples-per-tensor", type=int, default=8)
+    quality_parser.add_argument("--maximum-relative-l2", type=float, default=0.20)
+    quality_parser.add_argument("--minimum-cosine", type=float, default=0.98)
 
     refresh_parser = commands.add_parser(
         "refresh-model-program",
@@ -272,6 +283,14 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "validate":
             result = validate_container(args.container)
+        elif args.command == "qualify-fp4-container":
+            result = qualify_container_against_source(
+                args.source,
+                args.container,
+                samples_per_tensor=args.samples_per_tensor,
+                maximum_relative_l2=args.maximum_relative_l2,
+                minimum_cosine=args.minimum_cosine,
+            )
         elif args.command == "refresh-model-program":
             result = refresh_runtime_model_program(
                 args.container, args.output, args.source, args.adapter

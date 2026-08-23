@@ -1,0 +1,6 @@
+# Isolated immutable-checkpoint qualification environment.  PyTorch is
+# installed separately from its CUDA wheel index by the Windows installer.
+transformers==5.15.0
+accelerate==1.14.0
+safetensors==0.8.0
+Pillow==11.3.0

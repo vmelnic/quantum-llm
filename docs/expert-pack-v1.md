@@ -1,185 +1,80 @@
 # Expert Pack v1
 
-Status: current FP4 physical container contract as of 2026-08-19. The active
-dense deployment is Qwen3.8-27B; sparse DeepSeek still uses its compact/bundle
-adapter. Container unification is tracked in
-[the current handoff](moe-vm-next.md).
+Status: current QPack storage contract, 2026-08-23.
 
-Expert Pack is a compute-ready, placement-oriented container for sparse MoE
-inference. It is not only a quantization format: dense tensors and individual
-experts are independently indexed, checksummed, aligned, and addressable from
-SSD, RAM, VRAM, or a future remote worker.
+## Purpose
 
-The executable sources of truth are:
+Expert Pack converts a SafeTensors checkpoint into immutable, independently
+validated records that are already laid out for native execution. The physical
+container is not the VM: `runtime-model.tsv` declares geometry, operations and
+provider ABIs, while QPack supplies the referenced bytes.
 
-- `schemas/expert-pack-v1.schema.json`;
-- `compiler/expert_pack/` writer and validator;
-- runtime record readers under `runtime/`.
+## Container
 
-Unknown fields, versions, ABIs, flags, or record layouts are rejected.
+A completed artifact contains at least:
 
-## Published container
+- `manifest.json`, source identity and hashes;
+- `runtime-model.tsv`, bound by length and SHA-256 in the manifest;
+- one or more dense/expert QPack files and indexes;
+- tokenizer, generation and optional processor assets copied from the source;
+- `COMPLETED`, written only after independent validation succeeds.
 
-```text
-model.expert-pack/
-  manifest.json
-  COMPLETED
-  conversion-report.json
-  runtime-model.tsv
-  dense.qpack
-  experts-000.qpack
-  experts-001.qpack
-  ...
-  tokenizer/
-```
+The compiler writes `<output>.partial`, supports resume only with identical
+source bytes/options, then atomically publishes the final directory. The
+supported publication workflow creates a candidate below `MODEL_ROOT` and
+uses `Promote-ModelArtifact.ps1` for the final rename/rollback boundary.
 
-Conversion occurs in a neighboring `.partial` directory. Publication requires
-complete pack writes, fsync, independent validation, and atomic rename. A
-directory without a valid `COMPLETED` marker is not deployable.
+## Record ABI
 
-## Manifest
+Records use a fixed 256-byte little-endian header. File records are 4 KiB
+aligned and payload sections are 256-byte aligned. Headers declare kind,
+version, flags, quantization ABI, dimensions, offsets, lengths, source-name
+identity and payload SHA-256. Readers do not infer an ABI from record size.
 
-The strict top-level object contains exactly:
+The deployed Qwen profile is:
 
-```text
-schema, format, compatibility, source, architecture, model_program,
-quantization, kernel_abi, alignment, tensors, experts,
-packs, indexes, masses, requirements, tokenizer, integrity
-```
+| Field | Value |
+|---|---|
+| profile | `fp4-e2m1-ue8m0-block32-v1` |
+| ABI | 3 |
+| matrix values | FP4 E2M1, two nibbles per byte |
+| scale | one UE8M0 code per 32 input values of each output row |
+| scale range | codes 1..254; zero and NaN code 255 are never emitted |
+| accumulation | provider-owned FP32/native packed CUDA path |
 
-Key responsibilities:
+Raw tensors, router/norm state and runtime intermediates retain their declared
+formats; describing the artifact as simply “4-bit” would be incomplete. The
+current Qwen3.8 artifact has a 14,775,390,208-byte `dense.qpack` with 1,199
+records. It is not an INT8 artifact.
 
-- `source`: immutable checkpoint identity, file sizes and SHA-256;
-- `architecture`: complete OLMoE, Qwen3-Next, Qwen3.8 or LFM2-MoE
-  geometry/semantics;
-- `model_program`: authenticated `runtime-model.tsv` execution descriptor;
-  the current Qwen3.8 artifact uses schema 3;
-- `quantization`: current serving profile
-  `fp4-e2m1-ue8m0-block32-v1` (quant ABI 3); quant ABI 1 remains readable only
-  for legacy format/test compatibility;
-- `kernel_abi`: layout, activation, ordering, target architecture;
-- `alignment`: record, section, direct-I/O, pinned and CUDA alignment;
-- `tensors` / `experts`: complete record indexes;
-- `packs`: size, record count and SHA-256 per file;
-- `indexes`: canonical hashes of dense and expert indexes;
-- `masses`: source/container/dense/expert/active byte accounting;
-- `requirements`: compiler lower bounds for feasibility;
-- `tokenizer`: local files, hashes, template and special tokens;
-- `integrity`: canonical manifest content hash.
+## Executable program
 
-Canonical JSON is UTF-8, keys sorted, no insignificant whitespace, and
-`ensure_ascii=false`. To calculate `integrity.content_sha256`, set that field to
-the empty string, serialize canonically, then hash the bytes.
+`runtime-model.tsv` schema 3 declares:
 
-`COMPLETED` contains format version, canonical manifest-content SHA-256, and
-the SHA-256 of the actual `manifest.json` bytes.
+- program inputs/outputs and tensor ABIs;
+- components, layers and ordered operations;
+- required kernels/capabilities and their versions;
+- record references, geometry and encoding names;
+- optional exact-decode, response and multimodal contracts.
 
-## Pack rules
-
-- all multibyte values are little-endian;
-- record offset and stored size are multiples of pack alignment (at least 4096);
-- fixed record header is 256 bytes;
-- payload sections are aligned to 256 bytes;
-- all alignment padding is zero;
-- manifest indexes are authoritative; readers do not infer records by scanning;
-- record payload SHA-256 covers bytes `[record + 256, record + stored_bytes)`,
-  including zero padding.
-
-Common flags:
-
-| Bit | Name | Value |
-|---:|---|---:|
-| 0 | row major | `0x01` |
-| 1 | gate/up fused | `0x02` |
-| 2 | symmetric | `0x04` |
-| 3 | per-row scales | `0x08` |
-
-## Dense record (`EPDENS01`)
-
-The dense header declares version, flags, quant ABI, rank/dimensions, stored
-bytes, data/scales offsets and sizes, tensor-name SHA-256, and payload SHA-256.
-
-- FP32 dense records contain row-major data and no scale section;
-- INT8 dense matrices contain one signed byte per value and one FP32 scale per
-  output row;
-- router matrices and rank-one normalization tensors remain FP32;
-- direct casting to a native C struct is forbidden because packed `u64` fields
-  are not naturally aligned.
-
-## Expert record (`EPEXPR01`)
-
-An expert record declares layer, expert ID, hidden/intermediate geometry, ABI,
-stored bytes, four section offsets/sizes, and payload hash. Sections are:
-
-```text
-gate_up_q       I8  [2*I, H]  # all gate rows, then all up rows
-gate_up_scales  F32 [2*I]
-down_q          I8  [H, I]    # output-major
-down_scales     F32 [H]
-```
-
-The expert has all common flags (`0x0f`). Sections cannot overlap and appear in
-the declared order. Under quant ABI 3 the same section layout carries packed
-FP4-E2M1 rows (two values per byte) with UE8M0 block scales instead of I8/F32.
-
-## Quantization profiles
-
-Current serving artifacts use FP4. The INT8 algorithm below documents generic
-legacy ABI 1 bytes that the format validator/runtime still recognizes.
-
-For each decoded FP32 row:
-
-```text
-maximum = max(abs(row))
-scale   = maximum / 127, or 1.0 for an all-zero row
-q[i]    = clamp(round_ties_to_even(row[i] / scale), -127, 127)
-```
-
-Non-finite values are rejected. Scales are finite positive FP32. There are no
-zero points. The two compiler implementations (dependency-free and optional
-NumPy acceleration) must produce the same ABI and deterministic bytes.
-
-The alternative FP4 profile (`fp4-e2m1-ue8m0-block32-v1`, quant ABI 3) stores
-routed expert weights as packed FP4-E2M1 values with one UE8M0 scale per
-32-value block along each output row — the same device format as the DeepSeek
-compact path, consumed directly by the packed `__dp4a` kernels (kernel ABI
-`expert-pack-sm86-fp4-block32-v1`). Scale codes are clamped to [1, 254]: 255
-is the UE8M0 NaN and code 0 decodes inconsistently between toolchain and CUDA
-kernel, so the compiler never emits it. Dense tensors, router matrices and
-normalizations keep their INT8/FP32 encodings under both profiles.
-
-## Architecture semantics
-
-The adapter owns semantics that cannot be inferred from shapes. Examples:
-
-- OLMoE query/key normalization and tensor naming;
-- Qwen3-Next alternating full attention and Gated DeltaNet;
-- Qwen3.8 alternating full and gated linear attention, multimodal source
-  partition and dense MTP roles;
-- LFM2-MoE dense-prefix and sparse-layer tensor roles;
-- attention output gate and partial RoPE;
-- Qwen3-Next normalization `(1 + weight)` where specified;
-- global softmax, top-k and selected-probability renormalization;
-- explicit preservation of the auxiliary MTP tensors.
-
-An adapter must classify every source tensor. “Ignore unknown” is not allowed.
-It also emits `runtime-model.tsv`: an ordered provider-neutral operation
-program with routed components, router ABI, tensor-role bindings and numeric
-parameters. The artifact may name an architecture for provenance, but common
-provider selection never branches on that name.
+The common runner binds declarations to providers by capability and encoding,
+not by model name or architecture ID. Source adapters may still be
+family-aware because upstream tensor names/configuration are not universal.
 
 ## Validation
 
-The validator fails closed for:
+```powershell
+.\.venv\Scripts\python.exe -m compiler validate `
+  "$env:MODEL_ROOT\qwen3.8-27b-fp4"
+```
 
-- absent/invalid `COMPLETED`;
-- unknown schema, format, quant or kernel ABI;
-- missing/extra manifest fields or tensors;
-- file size/hash mismatch;
-- invalid geometry, offsets, alignment, overlap or flags;
-- nonzero padding;
-- record/index hash mismatch;
-- inconsistent byte accounting;
-- missing tokenizer files or mismatched tokenizer hashes.
+Validation is fail-closed for unknown fields/ABIs, missing records, unsafe
+paths, dimensions, alignment, byte ranges, hashes, tokenizer assets, program
+identity and completion state. The Python validator and native readers are the
+authoritative schema; the obsolete static JSON schema was removed because it
+accepted old INT8/family layouts but rejected the deployed schema-3 FP4
+artifact.
 
-Startup repeats the relevant validation before allocating large runtime state.
+FP4 completion additionally requires the source quality gate and the real
+SM86 provider path. A successful parser or INT8 execution does not qualify the
+FP4 artifact.

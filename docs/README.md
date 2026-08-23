@@ -1,56 +1,50 @@
-# Documentation map
+# Documentation
 
-Status: synchronized with the Qwen3.8 production-pilot state on 2026-08-19.
+Status: authoritative documentation index, 2026-08-23.
 
-Start with [MoE VM current state and remaining work](moe-vm-next.md). It is the
-canonical handoff for the next implementation session. Historical plans retain
-measurements and decisions, but they are not active backlogs.
+The repository documents the implementation that exists today, the evidence
+that has actually been measured, and the next accepted work. Detailed journals
+for abandoned experiments were removed; their durable conclusions are
+consolidated in [Research decisions](research-decisions.md), while the original
+material remains recoverable from Git history.
 
-## Current contracts and operation
-
-| Document | Purpose |
-|---|---|
-| [Architecture](architecture.md) | Current system boundaries, including the implemented and missing parts of the MoE VM |
-| [Getting started](getting-started.md) | Build, Xet download, FP4 compilation, validation and foreground startup |
-| [Deployment](deployment.md) | POSIX control host to Windows/CUDA lifecycle through `ops/model.sh` |
-| [Operations](operations.md) | Short day-two runbook |
-| [OpenAI-compatible API](openai-api.md) | Supported HTTP/SSE contract and explicit omissions |
-| [Anthropic Messages API](anthropic-api.md) | Claude Code adapter, tool blocks, SSE and private-LAN configuration |
-| [WSL2 Unsloth Qwen3.8](wsl2-unsloth-qwen38.md) | External production path for Qwen3.8 GGUF, llama.cpp and Claude Code on the RTX 3090 host |
-| [Production readiness](production-readiness.md) | Pilot verdict, qualification matrix and release blockers |
-| [Heterogeneous organ placement](heterogeneous-placement-research.md) | Research contract for executing model/state shards directly from VRAM/GPU and RAM/CPU |
-| [Exact tiered tree verification](exact-tiered-tree-verification.md) | Active 262K exact-F16 decode research, equations and fail-fast gates for the 15 tok/s target |
-
-## Artifact and runtime contracts
+## Start here
 
 | Document | Purpose |
 |---|---|
-| [Expert Pack v1](expert-pack-v1.md) | FP4 placement container and record ABI |
-| [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Current DeepSeek routed-weight storage representation |
-| [Compute-ready representations](compute-ready.md) | Distinction between source, placement, compute and device layouts |
-| [Expert Runtime v1](expert-runtime.md) | Cache, placement, execution, worker protocol and telemetry invariants |
+| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen dense execution, DeepSeek expert paging, KV and session state |
+| [Production readiness](production-readiness.md) | What is usable, what is not, and the release blockers |
+| [Benchmarks](benchmarks.md) | Canonical measurements and capacity/bandwidth equations |
+| [Roadmap](roadmap.md) | Dependency-ordered work that advances the active goals |
+| [Research decisions](research-decisions.md) | Rejected mechanisms and current heterogeneous multi-GPU direction |
 
-The current service has one launcher, one scheduled task and one binary:
-`ops/model.sh`, `QuantumLLM-ExpertVm` and `expert-moe-vm-runner.exe`. This does
-not yet mean one physical container or one composable numeric executor.
-Expert Pack v1 and DeepSeek worker bundle v3 still enter through separate
-storage adapters, and the common binary currently selects one complete worker
-provider for the artifact's operation set. Qwen3.8 is the active dense FP4
-target; DeepSeek remains the sparse demand-paged compatibility target.
+## Build and operate
 
-## Evidence and historical records
-
-| Document | Status |
+| Document | Purpose |
 |---|---|
-| [Performance evidence](benchmarks.md) | Measured results; current functional VM acceptance plus historical performance campaigns |
-| [Heterogeneous placement benchmark](heterogeneous-placement-benchmark.md) | Qwen3.8 manifest inventory, measured CUDA inputs and placement bounds |
-| [Engineering history](history.md) | Completed, rejected and extracted work |
-| [30 tok/s plan](inference-30toks-plan.md) | Executed historical campaign, not the active plan |
-| [Scaling follow-on](inference-scaling-next.md) | Historical FP4/performance research; partially executed |
-| [Performance architecture review](performance-architecture-review.md) | Historical diagnosis |
-| [Neural CPU experiment](neural-cpu-experiment.md) | Completed negative research experiment; not active runtime work |
-| [Roadmap](roadmap.md) | Compatibility pointer to the canonical handoff |
+| [Getting started](getting-started.md) | Host prerequisites, build, artifact preparation and first service run |
+| [Deployment](deployment.md) | Stable artifact publication and the supported lifecycle |
+| [Operations](operations.md) | Health, telemetry, diagnosis, rollback and cleanup |
+| [Pi CLI](pi-cli.md) | Local coding-agent configuration, thinking control and session behavior |
 
-The external Memory Expert/KV-attach project is no longer maintained in this
-repository. Its current architecture, results and runbooks live in
-`../memory-expert`.
+## Interfaces and formats
+
+| Document | Purpose |
+|---|---|
+| [Expert Runtime contract](expert-runtime.md) | Program/provider ABI, worker protocol, placement and request lifecycle |
+| [Expert Pack v1](expert-pack-v1.md) | QPack records, manifest, FP4 encoding and publication rules |
+| [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Authenticated routed-expert storage and bundle layout |
+| [OpenAI-compatible API](openai-api.md) | Models, Completions, Chat Completions and Responses |
+| [Anthropic Messages API](anthropic-api.md) | Claude-compatible wire adapter and its explicit limitations |
+
+## Claims policy
+
+- A configured context limit is not a populated-context result.
+- A short `hi` smoke proves lifecycle and basic generation, not quality or
+  maximum-context performance.
+- Post-first-token, end-to-end and aggregate rates are different metrics.
+- Qwen FP4 storage, exact F16 KV, DeepSeek FP4 routed experts, FP8 shared
+  tensors and FP32 runtime state are always reported separately.
+- A theoretical hardware ceiling is not a service result.
+- Removed research code is not a hidden roadmap; only
+  [Roadmap](roadmap.md) is active.

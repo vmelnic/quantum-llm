@@ -100,6 +100,13 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
         found != raw.end())
       options.placement_settle_steps =
           u32(required_value(raw, "placement-settle-steps"), true);
+    if (const auto found = raw.find("profile-gpu-phases");
+        found != raw.end()) {
+      if (found->second)
+        throw std::invalid_argument(
+            "boolean worker option profile-gpu-phases has a value");
+      options.profile_gpu_phases = true;
+    }
 
     constexpr std::string_view common_names[]{
         "max-context",          "ram-cache-gib",
@@ -107,7 +114,7 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
         "kv-cache-mib",        "kv-page-tokens",
         "kv-cache-dtype",
         "placement-profile",   "prefill-chunk-limit",
-        "placement-settle-steps"};
+        "placement-settle-steps", "profile-gpu-phases"};
     for (auto& [name, value] : raw) {
       if (std::find(std::begin(common_names), std::end(common_names), name) ==
           std::end(common_names))

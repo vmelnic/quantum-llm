@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 
 EXCLUDED_DIRECTORIES = {
@@ -21,9 +22,10 @@ SYSTEM_PROMPT = (
     "required by the task."
 )
 TASK_PREFIX = """Task:
-Review this repository as a whole and continue the exact tiered verification
-work described in AGENTS.md and docs/exact-tiered-tree-verification.md. Find
-correctness and performance defects that block the stated production goal.
+Review this repository as a whole and complete the requested production task.
+Use AGENTS.md, docs/architecture.md, docs/production-readiness.md and
+docs/roadmap.md as the current contracts. Preserve numerical and deployment
+invariants, and report evidence for every claimed result.
 
 Repository snapshot follows. Every included byte comes from the working tree;
 paths excluded as runtime/build state are listed in the capture metadata.
@@ -68,23 +70,46 @@ def repository_text(root: Path) -> tuple[str, list[dict[str, Any]]]:
     return TASK_PREFIX + "".join(sections), files
 
 
-def template_parts(tokenizer: Any) -> tuple[str, str]:
+def load_checkpoint_chat_encoder(
+        tokenizer_root: Path) -> Callable[..., str] | None:
+    path = tokenizer_root / "encoding" / "encoding_dsv4.py"
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("encoding_dsv4", path)
+    if spec is None or spec.loader is None:
+        raise ValueError(f"cannot load checkpoint chat encoder: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    encoder = getattr(module, "encode_messages", None)
+    if not callable(encoder):
+        raise ValueError(f"checkpoint chat encoder has no encode_messages: {path}")
+    return encoder
+
+
+def template_parts(tokenizer: Any,
+                   chat_encoder: Callable[..., str] | None = None
+                   ) -> tuple[str, str]:
     sentinel = "QUANTUM_LLM_REAL_REPOSITORY_SNAPSHOT_7F9C2D1A"
-    rendered = tokenizer.apply_chat_template(
-        [{"role": "system", "content": SYSTEM_PROMPT},
-         {"role": "user", "content": sentinel}],
-        tokenize=False, add_generation_prompt=True, tools=None,
-        reasoning_effort="xhigh", enable_thinking=True,
-        preserve_thinking=True,
-    )
+    messages = [{"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": sentinel}]
+    if chat_encoder is not None:
+        rendered = chat_encoder(messages, thinking_mode="chat")
+    else:
+        rendered = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True, tools=None,
+            reasoning_effort="xhigh", enable_thinking=True,
+            preserve_thinking=True,
+        )
     if not isinstance(rendered, str) or rendered.count(sentinel) != 1:
         raise ValueError("tokenizer template did not preserve the prompt marker")
     return tuple(rendered.split(sentinel, 1))  # type: ignore[return-value]
 
 
 def exact_prompt_ids(tokenizer: Any, content: str,
-                     target_tokens: int) -> tuple[list[int], int, str]:
-    prefix, suffix = template_parts(tokenizer)
+                     target_tokens: int,
+                     chat_encoder: Callable[..., str] | None = None
+                     ) -> tuple[list[int], int, str]:
+    prefix, suffix = template_parts(tokenizer, chat_encoder)
 
     def encode(characters: int) -> tuple[list[int], str]:
         rendered = prefix + content[:characters] + suffix
@@ -138,6 +163,7 @@ def main() -> int:
     parser.add_argument("--tokenizer", required=True, type=Path)
     parser.add_argument("--target-tokens", type=int, default=262_016)
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--rendered-output", type=Path)
     args = parser.parse_args()
     if args.target_tokens < 2:
         raise ValueError("target token count must be at least two")
@@ -150,12 +176,19 @@ def main() -> int:
     tokenizer = AutoTokenizer.from_pretrained(
         tokenizer_root, local_files_only=True, trust_remote_code=False
     )
+    chat_encoder = load_checkpoint_chat_encoder(tokenizer_root)
     token_ids, included_characters, rendered = exact_prompt_ids(
-        tokenizer, content, args.target_tokens
+        tokenizer, content, args.target_tokens, chat_encoder
     )
     args.output.parent.mkdir(parents=True, exist_ok=True)
     encoded = ",".join(str(token) for token in token_ids)
     args.output.write_text(encoded + "\n", encoding="ascii")
+    if args.rendered_output is not None:
+        rendered_output = args.rendered_output.resolve()
+        if rendered_output == args.output.resolve():
+            raise ValueError("rendered output must differ from token output")
+        rendered_output.parent.mkdir(parents=True, exist_ok=True)
+        rendered_output.write_text(rendered, encoding="utf-8")
     metadata = {
         "schema_version": 1,
         "format": "coding-context-token-ids-v1",
@@ -170,6 +203,8 @@ def main() -> int:
         "rendered_prompt_sha256": hashlib.sha256(
             rendered.encode("utf-8")).hexdigest(),
         "token_ids_sha256": hashlib.sha256(encoded.encode("ascii")).hexdigest(),
+        "rendered_output": (str(args.rendered_output.resolve())
+                            if args.rendered_output is not None else None),
         "excluded_directories": sorted(EXCLUDED_DIRECTORIES),
         "files": files,
     }

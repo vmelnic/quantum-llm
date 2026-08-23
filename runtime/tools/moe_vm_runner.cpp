@@ -5,19 +5,23 @@
 #include "expert/runtime/worker_provider.hpp"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <filesystem>
 #include <functional>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <span>
@@ -43,7 +47,7 @@ make_sm86_hybrid_delta_moe_callable_provider(
 er::WorkerProviderDefinition make_sm86_dense_fp4_provider();
 er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
-    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view);
+    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view, bool);
 #ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
 er::WorkerProviderDefinition make_sm86_compressed_sparse_moe_provider();
 er::CreateExecutionProviderModuleResult
@@ -57,8 +61,18 @@ namespace {
 
 constexpr std::string_view kTokenAbi = "batch.token-id.u32.host.v1";
 constexpr std::string_view kPositionAbi = "batch.position.u32.host.v1";
+constexpr std::string_view kMultimodalAbi =
+    "request.multimodal.fp32.host.v1";
 
 using CreateModule = std::function<er::CreateExecutionProviderModuleResult()>;
+
+void startup_phase(std::string_view phase) {
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now().time_since_epoch());
+  std::cerr << "startup_phase=" << phase
+            << " monotonic_ms=" << elapsed.count() << '\n'
+            << std::flush;
+}
 
 struct ModuleFactory final {
   er::WorkerProviderDefinition metadata;
@@ -68,6 +82,7 @@ struct ModuleFactory final {
 struct ServicePorts final {
   std::string token_input;
   std::string position_input;
+  std::string multimodal_input;
   std::string token_output;
 };
 
@@ -86,11 +101,14 @@ struct SamplingSettings final {
 struct ActiveRequest final {
   er::ProgramExecutionSession session;
   std::uint32_t predicted{};
+  std::uint32_t retention_predicted{};
   std::uint32_t next_position{};
   std::uint32_t context_limit{};
   std::uint32_t retention_position{};
   std::uint64_t reserved_pages{};
+  bool retention_prediction_valid{};
   SamplingSettings sampling;
+  std::vector<std::byte> multimodal;
 };
 
 struct StartedStep final {
@@ -173,6 +191,7 @@ std::vector<std::string_view> split_tabs(std::string_view line) {
 std::vector<std::uint32_t> parse_tokens(std::string_view text,
                                         std::uint32_t vocabulary_size) {
   std::vector<std::uint32_t> result;
+  if (text.empty()) return result;
   for (;;) {
     const auto separator = text.find(',');
     const auto value = std::stoull(std::string(text.substr(0U, separator)));
@@ -181,7 +200,6 @@ std::vector<std::uint32_t> parse_tokens(std::string_view text,
     if (separator == std::string_view::npos) break;
     text.remove_prefix(separator + 1U);
   }
-  require(!result.empty(), "empty token sequence");
   return result;
 }
 
@@ -217,6 +235,40 @@ er::ExecutionValue host_u32_batch(std::span<const std::uint32_t> values,
           owner->size() * sizeof((*owner)[0])};
 }
 
+std::vector<std::byte> empty_multimodal_packet() {
+  std::vector<std::byte> result(40U);
+  constexpr std::array magic{'Q', 'L', 'M', 'M', 'E', 'D', 'I', 'A'};
+  for (std::size_t index = 0U; index < magic.size(); ++index)
+    result[index] = static_cast<std::byte>(magic[index]);
+  result[8] = std::byte{1};
+  return result;
+}
+
+er::ExecutionValue host_multimodal(std::span<const std::byte> values) {
+  auto owner = std::make_shared<std::vector<std::byte>>(
+      values.empty() ? empty_multimodal_packet()
+                     : std::vector<std::byte>(values.begin(), values.end()));
+  return {std::string(kMultimodalAbi), "host", owner, owner->data(),
+          owner->size()};
+}
+
+std::vector<std::byte> read_multimodal_file(
+    const std::filesystem::path& path) {
+  constexpr std::uintmax_t kMaximumBytes = 128U << 20U;
+  std::error_code error;
+  const auto bytes = std::filesystem::file_size(path, error);
+  require(!error && bytes >= 40U && bytes <= kMaximumBytes,
+          "multimodal request file has an invalid size");
+  std::ifstream input(path, std::ios::binary);
+  require(static_cast<bool>(input), "cannot open multimodal request file");
+  std::vector<std::byte> result(static_cast<std::size_t>(bytes));
+  input.read(reinterpret_cast<char*>(result.data()),
+             static_cast<std::streamsize>(result.size()));
+  require(input && input.peek() == std::char_traits<char>::eof(),
+          "multimodal request file is incomplete");
+  return result;
+}
+
 std::vector<std::uint32_t> read_u32_batch(
     const er::ExecutionValue& value) {
   require(value.valid() && value.abi == kTokenAbi &&
@@ -247,6 +299,10 @@ ServicePorts service_ports(const er::ModelDescriptor& model) {
       require(result.position_input.empty(),
               "multiple position program inputs");
       result.position_input = role;
+    } else if (endpoint.abi == kMultimodalAbi) {
+      require(result.multimodal_input.empty(),
+              "multiple multimodal program inputs");
+      result.multimodal_input = role;
     }
   }
   for (const auto& [role, endpoint] : model.program_outputs) {
@@ -277,6 +333,8 @@ er::ProgramRequestContext request_context(std::uint64_t request_id,
   result.parameters.emplace("sampling_top_k", sampling.top_k);
   result.parameters.emplace("sampling_min_p_ppm", sampling.min_p_ppm);
   result.parameters.emplace("sampling_seed", sampling.seed);
+  result.parameters.emplace("exact_decode_enabled",
+                            sampling.enabled() ? 0U : 1U);
   return result;
 }
 
@@ -288,6 +346,8 @@ er::StartProgramExecutionResult start_step(
                  host_u32(token, std::string(kTokenAbi)));
   inputs.emplace(ports.position_input,
                  host_u32(position, std::string(kPositionAbi)));
+  if (!ports.multimodal_input.empty())
+    inputs.emplace(ports.multimodal_input, host_multimodal({}));
   return request.session.execute(std::move(inputs));
 }
 
@@ -310,12 +370,15 @@ er::StartProgramExecutionResult start_prefill_batch(
                  host_u32_batch(tokens, std::string(kTokenAbi)));
   inputs.emplace(ports.position_input,
                  host_u32_batch(positions, std::string(kPositionAbi)));
+  if (!ports.multimodal_input.empty())
+    inputs.emplace(ports.multimodal_input, host_multimodal({}));
   return request.session.execute(std::move(inputs));
 }
 
 er::StartProgramExecutionResult start_prefill_sequence(
     ActiveRequest& request, const ServicePorts& ports,
-    std::span<const std::uint32_t> tokens, std::uint32_t first_position) {
+    std::span<const std::uint32_t> tokens, std::uint32_t first_position,
+    std::span<const std::byte> multimodal) {
   require(!tokens.empty() &&
               tokens.size() <=
                   std::numeric_limits<std::uint32_t>::max() &&
@@ -331,6 +394,8 @@ er::StartProgramExecutionResult start_prefill_sequence(
                  host_u32_batch(tokens, std::string(kTokenAbi)));
   inputs.emplace(ports.position_input,
                  host_u32_batch(positions, std::string(kPositionAbi)));
+  if (!ports.multimodal_input.empty())
+    inputs.emplace(ports.multimodal_input, host_multimodal(multimodal));
   return request.session.execute_program_sequence(std::move(inputs));
 }
 
@@ -384,7 +449,7 @@ er::ExecutionProviderModule create_module(
                root, options.max_context, options.capacity,
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
                options.kv_cache_mib << 20U, options.kv_page_tokens,
-               options.kv_cache_dtype);
+               options.kv_cache_dtype, options.profile_gpu_phases);
          }});
   }
   {
@@ -450,6 +515,18 @@ void validate_service_contract(
               service.session_retention ==
                   module.definition.implementation
                       ->supports_request_state_retention() &&
+              service.session_parking ==
+                  module.definition.implementation
+                      ->supports_request_state_parking() &&
+              (!service.session_parking ||
+               (service.session_retention &&
+                service.session_park_ram_bytes != 0U &&
+                service.session_park_ram_bytes <=
+                    (options.ram_cache_gib << 30U) &&
+                service.session_park_page_capacity != 0U)) &&
+              (service.session_parking ||
+               (service.session_park_ram_bytes == 0U &&
+                service.session_park_page_capacity == 0U)) &&
               !service.request_stream_mode.empty() &&
               !service.rope_mode.empty() && !service.kv_dtype.empty() &&
               (options.kv_cache_dtype == "artifact" ||
@@ -461,8 +538,10 @@ void validate_service_contract(
                service.placement_mode == "resident") &&
               ((service.placement_mode == "budgeted" &&
                 service.placement_profile == options.placement_profile &&
-                service.ram_cache_bytes == (options.ram_cache_gib << 30U) &&
-                service.vram_cache_bytes == (options.vram_cache_gib << 30U)) ||
+                service.ram_cache_bytes != 0U &&
+                service.ram_cache_bytes <= (options.ram_cache_gib << 30U) &&
+                service.vram_cache_bytes != 0U &&
+                service.vram_cache_bytes <= (options.vram_cache_gib << 30U)) ||
                (service.placement_mode == "resident" &&
                 service.placement_profile == "resident" &&
                 service.ram_cache_bytes == 0U &&
@@ -479,11 +558,11 @@ void validate_service_contract(
 
 void print_ready(const er::ModelDescriptor& descriptor,
                  const er::ExecutionProviderModule::ServiceContract& service,
-                 std::uint32_t capacity) {
+                 std::uint32_t capacity, bool profile_gpu_phases) {
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":8,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":9,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -509,9 +588,17 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << service.prefill_chunk_tokens
             << ",\"session_retention\":"
             << (service.session_retention ? "true" : "false")
+            << ",\"session_parking\":"
+            << (service.session_parking ? "true" : "false")
+            << ",\"session_park_ram_bytes\":"
+            << service.session_park_ram_bytes
+            << ",\"session_park_page_capacity\":"
+            << service.session_park_page_capacity
             << ",\"request_stream_mode\":\""
             << service.request_stream_mode
-            << "\",\"gpu_phase_timing\":false,\"sampling_supported\":"
+            << "\",\"gpu_phase_timing\":"
+            << (profile_gpu_phases ? "true" : "false")
+            << ",\"sampling_supported\":"
             << (service.sampling_supported ? "true" : "false")
             << ",\"mtp_resource_available\":"
             << (service.mtp_resource_available ? "true" : "false")
@@ -557,7 +644,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
   std::uint64_t exact_decode_accepted_tokens{};
   std::uint64_t cancelled_requests{};
   CommandInbox inbox;
-  print_ready(descriptor, module.service, options.capacity);
+  print_ready(descriptor, module.service, options.capacity,
+              options.profile_gpu_phases);
 
   const auto feed = [&](std::uint64_t request_id, ActiveRequest& request,
                         std::span<const std::uint32_t> tokens,
@@ -566,7 +654,6 @@ int worker_loop(er::MoeProgramExecutor& executor,
       for (;;) {
         if (inbox.take_cancel(request_id)) {
           handle.cancel();
-          request.session.cancel();
           ++cancelled_requests;
           throw std::runtime_error("model prefill was cancelled");
         }
@@ -586,42 +673,75 @@ int worker_loop(er::MoeProgramExecutor& executor,
         std::max<std::uint32_t>(1U, module.service.prefill_chunk_tokens);
     if (tokens.size() > 1U &&
         request.session.program_sequence_available()) {
-      auto step =
-          start_prefill_sequence(request, ports, tokens, first_position);
-      require(step.status.ok(), step.status.message());
       const auto started = std::chrono::steady_clock::now();
-      auto predictions = complete_prefill(step.handle);
-      require(predictions.size() == 1U,
-              "program-sequence returned an invalid prediction width");
-      request.predicted = predictions.front();
+      const auto final_position =
+          first_position + static_cast<std::uint32_t>(tokens.size());
+      std::array<std::span<const std::uint32_t>, 2U> segments{tokens, {}};
+      std::size_t segment_count = 1U;
+      if (request.multimodal.empty() &&
+          request.retention_position > first_position &&
+          request.retention_position < final_position) {
+        const auto checkpoint_rows = static_cast<std::size_t>(
+            request.retention_position - first_position);
+        segments[0] = tokens.first(checkpoint_rows);
+        segments[1] = tokens.subspan(checkpoint_rows);
+        segment_count = 2U;
+      }
+      auto segment_position = first_position;
+      std::size_t segment_offset{};
+      for (std::size_t index = 0U; index < segment_count; ++index) {
+        auto step = start_prefill_sequence(
+            request, ports, segments[index], segment_position,
+            request.multimodal);
+        require(step.status.ok(), step.status.message());
+        auto predictions = complete_prefill(step.handle);
+        require(predictions.size() == 1U,
+                "program-sequence returned an invalid prediction width");
+        request.predicted = predictions.front();
+        if (!request.sampling.enabled() &&
+            request.session.exact_decode_available()) {
+          for (std::size_t offset = 0U;
+               offset < segments[index].size();) {
+            const auto count = std::min<std::size_t>(
+                chunk_tokens, segments[index].size() - offset);
+            std::vector<std::uint32_t> successors(count);
+            for (std::size_t row = 0U; row < count; ++row) {
+              const auto global = segment_offset + offset + row;
+              successors[row] = global + 1U == tokens.size()
+                                    ? request.predicted
+                                    : tokens[global + 1U];
+            }
+            const auto synchronized =
+                request.session.synchronize_exact_decode_batch(
+                    successors,
+                    first_position + static_cast<std::uint32_t>(
+                                         segment_offset + offset),
+                    segment_offset + offset + count == tokens.size());
+            require(synchronized.ok(), synchronized.message());
+            offset += count;
+          }
+        }
+        segment_position +=
+            static_cast<std::uint32_t>(segments[index].size());
+        segment_offset += segments[index].size();
+        if (segment_position == request.retention_position) {
+          request.retention_predicted = request.predicted;
+          request.retention_prediction_valid = true;
+        }
+      }
       program_steps += tokens.size();
       program_step_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - started)
               .count());
-      if (request.session.exact_decode_available()) {
-        for (std::size_t offset = 0U; offset < tokens.size();) {
-          const auto count = std::min<std::size_t>(
-              chunk_tokens, tokens.size() - offset);
-          std::vector<std::uint32_t> successors(count);
-          for (std::size_t row = 0U; row < count; ++row) {
-            const auto index = offset + row;
-            successors[row] = index + 1U == tokens.size()
-                                  ? request.predicted
-                                  : tokens[index + 1U];
-          }
-          const auto synchronized =
-              request.session.synchronize_exact_decode_batch(
-                  successors,
-                  first_position + static_cast<std::uint32_t>(offset),
-                  offset + count == tokens.size() &&
-                      !request.sampling.enabled());
-          require(synchronized.ok(), synchronized.message());
-          offset += count;
-        }
-      }
       request.next_position =
           first_position + static_cast<std::uint32_t>(tokens.size());
+      if (request.next_position == request.retention_position) {
+        request.retention_predicted = request.predicted;
+        request.retention_prediction_valid = true;
+      }
+      request.multimodal.clear();
+      request.multimodal.shrink_to_fit();
       if (module.service.session_retention) {
         const auto retention_position = request.retention_position == 0U
                                             ? request.next_position
@@ -630,12 +750,24 @@ int worker_loop(er::MoeProgramExecutor& executor,
             request.session.checkpoint_retention(retention_position);
         require(checkpoint.ok(), checkpoint.message());
         request.retention_position = retention_position;
+        if (retention_position == request.next_position) {
+          request.retention_predicted = request.predicted;
+          request.retention_prediction_valid = true;
+        }
       }
       return;
     }
     for (std::size_t offset = 0U; offset < tokens.size();) {
-      const auto count = std::min<std::size_t>(
+      auto count = std::min<std::size_t>(
           chunk_tokens, tokens.size() - offset);
+      const auto chunk_first =
+          first_position + static_cast<std::uint32_t>(offset);
+      const auto chunk_end =
+          chunk_first + static_cast<std::uint32_t>(count);
+      if (request.retention_position > chunk_first &&
+          request.retention_position < chunk_end)
+        count = static_cast<std::size_t>(
+            request.retention_position - chunk_first);
       const auto batch = tokens.subspan(offset, count);
       auto step = start_prefill_batch(
           request, ports, batch,
@@ -646,12 +778,31 @@ int worker_loop(er::MoeProgramExecutor& executor,
       require(predictions.size() == 1U || predictions.size() == count,
               "provider returned an invalid prefill prediction width");
       request.predicted = predictions.back();
+      if (request.retention_position >
+              first_position + static_cast<std::uint32_t>(offset) &&
+          request.retention_position <=
+              first_position + static_cast<std::uint32_t>(offset + count)) {
+        const auto checkpoint_row = static_cast<std::size_t>(
+            request.retention_position - first_position -
+            static_cast<std::uint32_t>(offset) - 1U);
+        if (predictions.size() == 1U) {
+          require(checkpoint_row + 1U == count,
+                  "prefill did not expose the retained boundary prediction");
+          request.retention_predicted = predictions.front();
+        } else {
+          require(checkpoint_row < predictions.size(),
+                  "prefill did not return the retained boundary prediction");
+          request.retention_predicted = predictions[checkpoint_row];
+        }
+        request.retention_prediction_valid = true;
+      }
       program_steps += count;
       program_step_ns += static_cast<std::uint64_t>(
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - started)
               .count());
-      if (request.session.exact_decode_available()) {
+      if (!request.sampling.enabled() &&
+          request.session.exact_decode_available()) {
         std::vector<std::uint32_t> successors(count);
         for (std::size_t row = 0U; row < count; ++row) {
           const auto index = offset + row;
@@ -662,14 +813,17 @@ int worker_loop(er::MoeProgramExecutor& executor,
             request.session.synchronize_exact_decode_batch(
                 successors,
                 first_position + static_cast<std::uint32_t>(offset),
-                offset + count == tokens.size() &&
-                    !request.sampling.enabled());
+                offset + count == tokens.size());
         require(synchronized.ok(), synchronized.message());
       }
       offset += count;
     }
     request.next_position =
         first_position + static_cast<std::uint32_t>(tokens.size());
+    if (request.next_position == request.retention_position) {
+      request.retention_predicted = request.predicted;
+      request.retention_prediction_valid = true;
+    }
     if (module.service.session_retention) {
       const auto retention_position = request.retention_position == 0U
                                           ? request.next_position
@@ -678,6 +832,10 @@ int worker_loop(er::MoeProgramExecutor& executor,
           request.session.checkpoint_retention(retention_position);
       require(checkpoint.ok(), checkpoint.message());
       request.retention_position = retention_position;
+      if (retention_position == request.next_position) {
+        request.retention_predicted = request.predicted;
+        request.retention_prediction_valid = true;
+      }
     }
   };
 
@@ -705,6 +863,17 @@ int worker_loop(er::MoeProgramExecutor& executor,
           require(field + 1U < fields.size(), "invalid BEGIN resume marker");
           resume = true;
           resume_key = std::stoull(std::string(fields[field + 1U]));
+          field += 2U;
+        }
+        require(resume || !prompt.empty(), "fresh BEGIN has no prompt");
+        std::vector<std::byte> multimodal;
+        if (field < fields.size() && fields[field] == "MULTIMODAL") {
+          require(field + 1U < fields.size(),
+                  "invalid BEGIN multimodal marker");
+          require(!ports.multimodal_input.empty(),
+                  "artifact does not accept multimodal input");
+          multimodal = read_multimodal_file(
+              std::filesystem::path(std::string(fields[field + 1U])));
           field += 2U;
         }
         std::uint32_t checkpoint_position{};
@@ -747,41 +916,114 @@ int worker_loop(er::MoeProgramExecutor& executor,
         if (resume) {
           const auto found = retained.find(resume_key);
           require(found != retained.end(), "unknown retained session");
-          request = std::move(found->second);
-          retained.erase(found);
           require(checkpoint_position == 0U ||
-                      (checkpoint_position > request.next_position &&
+                      (checkpoint_position >= found->second.next_position &&
                        checkpoint_position <=
-                           request.next_position + prompt.size()),
+                           found->second.next_position + prompt.size()),
                   "resumed checkpoint is outside the prompt delta");
-          if (checkpoint_position != 0U)
-            request.retention_position = checkpoint_position;
-          request.sampling = sampling;
-          auto rebound = request.session.rebind_request(
-              request_context(id, options.max_context,
-                              request.retention_position, request.sampling));
-          require(rebound.ok(), rebound.message());
-          require(request.next_position + prompt.size() <= context,
+          require(found->second.next_position + prompt.size() <= context,
                   "resumed prompt exhausts request context");
-          feed(id, request, prompt, request.next_position);
+          auto& retained_request = found->second;
+          require(retained_request.sampling.enabled() == sampling.enabled(),
+                  "retained session exact-decode policy changed");
+          const auto original_position = retained_request.next_position;
+          const auto original_retention = retained_request.retention_position;
+          const auto original_predicted = retained_request.predicted;
+          const auto original_retention_predicted =
+              retained_request.retention_predicted;
+          const auto original_retention_prediction_valid =
+              retained_request.retention_prediction_valid;
+          const auto original_sampling = retained_request.sampling;
+          const auto original_context = retained_request.context_limit;
+          bool restored{};
+          bool transaction{};
+          try {
+            if (module.service.session_parking) {
+              const auto result = retained_request.session.restore_retention();
+              require(result.status.ok(), result.status.message());
+              require(result.populated_pages ==
+                          retained_request.reserved_pages,
+                      "restored request page accounting changed");
+              restored = true;
+            }
+            const auto begun =
+                retained_request.session.begin_retention_transaction();
+            require(begun.ok(), begun.message());
+            transaction = true;
+            if (checkpoint_position != 0U)
+              retained_request.retention_position = checkpoint_position;
+            if (retained_request.retention_position != original_retention)
+              retained_request.retention_prediction_valid = false;
+            retained_request.sampling = sampling;
+            auto rebound = retained_request.session.rebind_request(
+                request_context(id, static_cast<std::uint32_t>(context),
+                                retained_request.retention_position,
+                                retained_request.sampling));
+            require(rebound.ok(), rebound.message());
+            if (!prompt.empty())
+              feed(id, retained_request, prompt,
+                   retained_request.next_position);
+            const auto committed =
+                retained_request.session.end_retention_transaction();
+            require(committed.ok(), committed.message());
+            transaction = false;
+            request = std::move(retained_request);
+            retained.erase(found);
+          } catch (...) {
+            const auto failure = std::current_exception();
+            if (transaction || restored) {
+              const auto rewound = retained_request.session.rewind_retention(
+                  original_position);
+              require(rewound.ok(), rewound.message());
+              retained_request.next_position = original_position;
+              retained_request.retention_position = original_retention;
+              retained_request.predicted = original_predicted;
+              retained_request.retention_predicted =
+                  original_retention_predicted;
+              retained_request.retention_prediction_valid =
+                  original_retention_prediction_valid;
+              retained_request.sampling = original_sampling;
+              retained_request.context_limit = original_context;
+              if (module.service.session_parking) {
+                const auto parked = retained_request.session.park_retention(
+                    original_position);
+                require(parked.status.ok(), parked.status.message());
+                retained_request.reserved_pages = parked.populated_pages;
+              }
+            }
+            if (transaction) {
+              const auto ended =
+                  retained_request.session.end_retention_transaction();
+                require(ended.ok(), ended.message());
+            }
+            try {
+              std::rethrow_exception(failure);
+            } catch (const std::exception& error) {
+              throw std::runtime_error(
+                  std::string("retained session preserved: ") +
+                  error.what());
+            }
+          }
         } else {
           require(checkpoint_position == 0U ||
                       checkpoint_position <= prompt.size(),
                   "checkpoint is outside the prompt");
           request.retention_position = checkpoint_position;
           request.sampling = sampling;
-          require(active.size() + retained.size() < options.capacity,
+          request.multimodal = std::move(multimodal);
+          require(active.size() < options.capacity &&
+                      (module.service.session_parking ||
+                       active.size() + retained.size() < options.capacity),
                   "callable provider capacity is exhausted");
           auto begun = executor.begin_session(
-              request_context(id, options.max_context,
+              request_context(id, static_cast<std::uint32_t>(context),
                               request.retention_position, request.sampling));
           require(begun.status.ok(), begun.status.message());
           request.session = std::move(begun.session);
-          request.reserved_pages = page_count(
-              static_cast<std::uint32_t>(context),
-              module.service.kv_page_tokens);
           feed(id, request, prompt, 0U);
         }
+        request.reserved_pages = page_count(
+            request.next_position, module.service.kv_page_tokens);
         request.context_limit = static_cast<std::uint32_t>(context);
         active.emplace(id, std::move(request));
         std::cout << "{\"type\":\"begun\",\"id\":" << id << "}\n"
@@ -860,11 +1102,11 @@ int worker_loop(er::MoeProgramExecutor& executor,
             auto& request = active.at(started[index].request_id);
             request.predicted = read_u32(output->second);
             ++request.next_position;
-            if (request.session.exact_decode_available()) {
+            if (!request.sampling.enabled() &&
+                request.session.exact_decode_available()) {
               const auto synchronized =
                   request.session.synchronize_exact_decode(
-                  request.predicted, request.next_position - 1U,
-                  !request.sampling.enabled());
+                  request.predicted, request.next_position - 1U, true);
               require(synchronized.ok(), synchronized.message());
             }
             done[index] = true;
@@ -898,6 +1140,12 @@ int worker_loop(er::MoeProgramExecutor& executor,
                 std::chrono::steady_clock::now() - batch_started)
                 .count());
         for (const auto& tokens : emitted) useful_tokens += tokens.size();
+        for (const auto [id, mode] : items) {
+          (void)mode;
+          auto& request = active.at(id);
+          request.reserved_pages = page_count(
+              request.next_position, module.service.kv_page_tokens);
+        }
 
         const auto print_tokens = [](const auto& tokens) {
           for (std::size_t index = 0U; index < tokens.size(); ++index) {
@@ -959,14 +1207,35 @@ int worker_loop(er::MoeProgramExecutor& executor,
             const auto rewound = found->second.session.rewind_retention(
                 static_cast<std::uint32_t>(position));
             require(rewound.ok(), rewound.message());
+            require(found->second.retention_prediction_valid,
+                    "retention checkpoint prediction is unavailable");
             found->second.next_position =
                 static_cast<std::uint32_t>(position);
+            found->second.predicted =
+                found->second.retention_predicted;
           }
           const auto tokens = found->second.next_position;
+          std::uint64_t parked_pages{};
+          std::uint64_t parked_bytes{};
+          if (module.service.session_parking) {
+            require(fields.size() == 6U,
+                    "parked retention requires an exact checkpoint");
+            const auto parked =
+                found->second.session.park_retention(tokens);
+            require(parked.status.ok(), parked.status.message());
+            found->second.reserved_pages = parked.populated_pages;
+            parked_pages = parked.populated_pages;
+            parked_bytes = parked.parked_bytes;
+          } else {
+            found->second.reserved_pages = page_count(
+                tokens, module.service.kv_page_tokens);
+          }
           retained.emplace(key, std::move(found->second));
           active.erase(found);
           std::cout << "{\"type\":\"ended\",\"id\":" << id
-                    << ",\"retained_tokens\":" << tokens << "}\n"
+                    << ",\"retained_tokens\":" << tokens
+                    << ",\"parked_pages\":" << parked_pages
+                    << ",\"parked_bytes\":" << parked_bytes << "}\n"
                     << std::flush;
         } else {
           active.erase(found);
@@ -1006,8 +1275,18 @@ int worker_loop(er::MoeProgramExecutor& executor,
         telemetry["cancelled_requests"] = cancelled_requests;
         telemetry["active_requests"] = active.size();
         telemetry["retained_sessions"] = retained.size();
+        telemetry["parked_sessions"] =
+            module.service.session_parking ? retained.size() : 0U;
+        telemetry["parked_pages"] =
+            module.service.session_parking
+                ? std::accumulate(
+                      retained.begin(), retained.end(), std::uint64_t{},
+                      [](std::uint64_t total, const auto& item) {
+                        return total + item.second.reserved_pages;
+                      })
+                : 0U;
         telemetry.try_emplace("kv_allocated_pages", reserved_pages);
-        telemetry.try_emplace("kv_reserved_pages", reserved_pages);
+        telemetry["kv_reserved_pages"] = reserved_pages;
         std::cout << "{\"type\":\"stats\"";
         for (const auto& [name, value] : telemetry)
           std::cout << ",\"" << json_text(name) << "\":" << value;
@@ -1053,12 +1332,16 @@ int main(int argc, char** argv) {
             "worker resource byte count overflows");
 
     const std::filesystem::path root(argv[1]);
+    startup_phase("artifact_load_begin");
     er::ModelArtifact artifact;
     auto status = er::ModelArtifact::load(root, artifact);
     require(status.ok(), status.message());
     require(artifact.model().schema_version >= 3U,
             "callable VM service requires a schema v3 artifact");
+    startup_phase("artifact_load_complete");
+    startup_phase("provider_create_begin");
     auto module = create_module(artifact, root, parsed.options);
+    startup_phase("provider_create_complete");
     validate_service_contract(artifact.model(), module, parsed.options);
 
     er::ExecutionProviderRegistry registry;
@@ -1068,10 +1351,13 @@ int main(int argc, char** argv) {
         artifact.model(), er::ExecutionProviderBindingMode::executable);
     require(bound.status.ok(), bound.status.message());
     er::MoeProgramExecutor executor;
+    startup_phase("program_prepare_begin");
     status = er::MoeProgramExecutor::create(
         artifact.model(), std::move(bound.provider), module.tensor_store.get(),
         executor);
     require(status.ok(), status.message());
+    startup_phase("program_prepare_complete");
+    startup_phase("worker_ready");
     return worker_loop(executor, artifact.model(), module, parsed.options);
   } catch (const std::exception& error) {
     std::cerr << "MoE VM runner: " << error.what() << '\n';

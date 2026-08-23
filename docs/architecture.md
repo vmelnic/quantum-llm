@@ -1,184 +1,203 @@
 # Architecture
 
-Status: current runtime architecture as of 2026-08-19. The active target is
-Qwen3.8-27B FP4; DeepSeek-V4-Flash remains the sparse demand-paged
-compatibility target. Remaining work is tracked in
-[Current state and next work](moe-vm-next.md).
+Status: implemented architecture and explicit boundaries, 2026-08-23.
 
-## Objective
+## Purpose
 
-Run artifact-declared transformer programs through one lifecycle, API and
-native runner, whether the artifact is dense or sparse. The common path must
-not select a model family, fixed layer count or tensor naming convention.
+Quantum LLM is a self-contained native inference runtime for models whose
+useful execution state does not map cleanly to a single GPU allocation. It is
+built around two distinct cases:
 
-For sparse models, selected experts are immutable logical pages resolved from
-VRAM, RAM or storage without requiring the whole model to fit either memory
-tier. Exact top-k and routing weights are preserved. For dense models such as
-Qwen3.8-27B, the same program/provider boundary executes a resident FP4 pack;
-expert paging is not involved.
+1. a dense/hybrid model such as Qwen3.8-27B, where every target-call matrix is
+   hot and the difficult state is long-context KV;
+2. a sparse MoE model such as DeepSeek-V4-Flash, where dense organs are hot but
+   only the routed experts selected by the exact router are needed for a token.
 
-## System view
+The project does not claim that SSD paging makes arbitrary dense models fast.
+It pages only state that is absent from the current exact execution path, and
+reports the resulting VRAM, RAM, PCIe and storage traffic.
+
+## End-to-end system
 
 ```text
 official checkpoint
-       │ strict source adapter: names/metadata → tensor roles and capabilities
-       ▼
-transactional artifact below MODEL_ROOT
-  ├── manifest, hashes, tokenizer and generation config
-  ├── one or more typed/FP4 packs
-  └── runtime-model.tsv: geometry, ordered operations and required ABIs
-       │
-       ▼
-OpenAI HTTP → admission → official chat template → retained request state
-       │                                             │
-       │                                             ▼
-       │                                  compiled operation program
-       │                                             │
-       │                          capability/geometry provider binding
-       │                                             │
-       └──── streaming text/reasoning/tools ◄─ token selection ◄─ logits
-                                                     │
-                           dense FP4 CUDA ───────────┤
-                           sparse exact router ─► expert-page store
-                                                    ├─ VRAM
-                                                    ├─ RAM/H2D
-                                                    └─ SSD/IOCP
+       |
+       | strict source adapter: names/config -> tensor roles/capabilities
+       v
+transactionally published artifact under ${MODEL_ROOT}
+  manifest + hashes + tokenizer/generation assets
+  qpack/compact payloads
+  runtime-model.tsv: geometry + ordered operations + numeric ABIs
+       |
+       v
+common HTTP service -> admission -> chat template -> retained session
+       |                                      |
+       v                                      v
+common native VM runner -> capability binding -> request state
+       |                                      |
+       +------------------+-------------------+
+                          |
+              +-----------+-----------+
+              |                       |
+       dense FP4 provider       sparse DeepSeek provider
+       resident weights         exact router + expert pages
+              |                       |
+       exact/paged KV           VRAM <- RAM <- NVMe
+              +-----------+-----------+
+                          |
+                  sampled/greedy tokens
 ```
 
-## Artifact boundary
+The common service and VM do not select Qwen, DeepSeek, a fixed layer count or
+a tensor path. The artifact declares operations and ABIs; providers advertise
+which declarations they can execute. A source adapter may understand an
+upstream family because checkpoint tensor names are not universal. New
+mathematics or a new encoding requires a provider, not another HTTP server or
+launcher.
 
-An adapter may understand upstream family-specific tensor names and config
-semantics. Its output is provider-neutral:
+## The model as organs
 
-- tensor roles and shapes;
-- model geometry and ordered operations;
-- numeric/quantization ABI for every record class;
-- tokenizer and response grammar assets;
-- immutable source, pack, index and program hashes.
+| Organ | Access pattern | Correct placement rule |
+|---|---|---|
+| embedding | selected rows | keep/stage selected rows; do not scan it per token |
+| dense projections and MLP | every target call | fastest compute memory; streaming only solves capacity |
+| recurrent/linear-attention state | every next token, fixed size | device resident while the request owns a hot slot |
+| full-attention K/V | every retained position is active at decode | compute must stay near the complete shard; per-token NVMe/PCIe streaming is a throughput failure |
+| MoE router | every routed layer | resident and exact |
+| routed experts | only selected experts | immutable logical pages, eligible for demand paging |
+| shared experts | every routed layer | resident model state |
+| vocabulary head | every generated target token | resident or explicitly accounted hot traffic |
+| MTP/draft state | only when the generation policy can use exact verification | allocate conditionally; never pay it for incompatible sampling |
 
-Common compiler validation, lifecycle, API, program execution and placement do
-not branch on Qwen or DeepSeek. A new model using supported operations and
-encodings needs an adapter only. Genuinely new math, encoding or geometry needs
-a capability provider and an independent numerical gate.
+## Qwen3.8 dense execution
 
-Publication is transactional. Compiler output is completed and validated in a
-candidate directory before it replaces `${MODEL_ROOT}/<stable-name>`. `out/`
-contains builds and experiments, never service-ready model artifacts.
+The current artifact is `${MODEL_ROOT}/qwen3.8-27b-fp4` and declares:
 
-## Compiled program and providers
+- 64 text layers: 16 full-attention and 48 recurrent/linear-attention layers;
+- 262,144 maximum positions;
+- one 14,775,390,208-byte `dense.qpack` with 1,199 records;
+- FP4 E2M1 matrix payloads with UE8M0 block-32 scales, quant ABI 3;
+- separately declared raw/FP32 records, norms and metadata;
+- text, MTP and vision operations in a schema-3 `runtime-model.tsv` program;
+- no router and no routed experts.
 
-`runtime-model.tsv` schema 3 is the current ordered execution contract. Startup
-parses it, binds each required capability to a provider and validates its
-geometry/ABI once. Token execution uses compiled handles rather than model
-names or tensor-path lookups.
+The FP4 weights are loaded into the RTX 3090 execution tier. Prompt execution
+uses bounded device-resident activation tiles, so hidden states no longer make
+a full GPU-to-host-to-GPU round trip after every operation.
 
-Current provider sets include:
+Exact target F16 KV is request-owned and allocated progressively in pinned RAM
+in 256-token pages. Declaring a 262K context does not allocate 262K KV at
+`BEGIN`. At attention time, the current provider stages bounded K/V spans and
+executes one layer at a time on the GPU. This preserves exact F16 values but is
+not a fast saturated-context design: at 262K, all 16 GiB of target K/V is hot
+for every scalar decode call.
 
-- Qwen3.8 dense SM86 operations: embedding, RMSNorm, gated GQA full attention,
-  gated linear/recurrent attention, dense gated MLP, MTP boundary, vocabulary
-  head and sampling;
-- DeepSeek sparse SM86 operations: its declared attention/CSA/HCA schedule,
-  router programs, shared/routed experts, MTP draft/verify and exact
-  demand-paged expert placement.
+The 48 recurrent layers keep their causal convolution/matrix state in the hot
+provider slot. Checkpoint, rewind and retention state preserve exact append-only
+session semantics.
 
-Provider constraints such as supported head dimension or encoding are explicit
-startup failures. They are not disguised model-family checks.
+## Qwen sessions and multi-agent behavior
 
-## Qwen3.8 execution
-
-The published Qwen3.8 artifact declares 64 text layers: 16 full-attention and
-48 linear-attention layers. Its dense pack has 1,199 records and
-14,775,390,208 bytes. Matrix payloads use FP4 E2M1 with UE8M0 block-32 scales
-(quant ABI 3); raw ABI-0 records and float32 norms/metadata remain separately
-declared. The model has no routed experts.
-
-The provider keeps immutable weights in the device-resident execution tier and
-allocates mutable request state under explicit credits. Full-attention K/V is
-paged; short requests commit only the pages they touch. Linear-attention
-recurrent/conv state is position ordered. Retained append-only sessions reuse
-both state classes and prefill only the new suffix.
-
-The reference service reserves 5,120 MiB of aggregate KV capacity and one
-worker slot. A real 262,016-token prompt plus 128 generated tokens completed.
-That proves allocation and execution through all 262,144 positions, not the
-speed SLO: TTFT was 5,423.422 seconds and decode after the first token was
-approximately 3.24 tok/s.
-
-## DeepSeek expert-page execution
-
-An expert is addressed by artifact namespace, routed component, layer and
-expert ID. Its bounded state machine is:
+The current RTX 3090 provider has one hot execution slot. Multiple Pi sessions
+may declare a 262K maximum because the maximum is not reserved upfront. An
+inactive request is parked in bounded host RAM:
 
 ```text
-ABSENT → SSD_LOADING → RAM_READY → GPU_UPLOADING → VRAM_READY
-   └──────────────────────── failure ───────────────────────► FAILED
+active session
+  exact F16 KV pages already owned in host RAM
+  recurrent + hidden + optional compact device state in hot slot
+        |
+        | END RETAIN
+        v
+parked session
+  populated F16 pages + one compact continuation blob in RAM
+  zero hot provider slots
+        |
+        | BEGIN RESUME + suffix only
+        v
+active session
 ```
 
-One in-flight acquisition exists per key. Typed host/device leases and CUDA
-events prevent eviction while an exact route uses a record. Demand is strictly
-prioritized over bounded prefetch/warm work. Protected/probationary RAM,
-transient/protected VRAM, census warm-up and request-attributed telemetry are
-cache policies below the same logical-page contract.
+Resume is transactional. A failed suffix prefill rewinds to the committed
+prompt checkpoint and reparks it. A client cancellation retains only the
+client-echoable prompt, never partial assistant output. An unchanged prefix is
+a valid zero-delta resume.
 
-The scheduler publishes the complete selected union. A partial top-k never
-executes: missing pages suspend the FFN until the exact union is ready or fail
-the request explicitly. Model size may exceed RAM+VRAM because only dense state
-and bounded active expert pages must fit those tiers.
+This is capacity multiplexing, not simultaneous GPU execution. Several agents
+can retain short/medium histories, but if several sessions actually populate
+hundreds of thousands of F16 tokens, pinned RAM and park/restore bandwidth
+become the admission limits. `MODEL_WORKER_CAPACITY` does not remove the
+serialized Python command channel and provider mutex.
 
-## HTTP and response protocol
+## DeepSeek sparse execution
 
-The Python service owns tokenization, bounded admission, streaming, session
-matching and OpenAI wire objects. The native worker owns model state, compiled
-program execution and token selection. Their line protocol is versioned; the
-current worker advertises protocol 8 and actual provider capabilities.
+DeepSeek's bundle keeps dense, shared, attention and MTP resources as declared
+model state. Its 11,008 routed experts are immutable logical pages identified
+by artifact namespace, component, layer, expert ID and encoding ABI. The
+current compact record is 13,369,344 bytes of authenticated FP4/UE8M0 payload.
 
-Qwen3.8 uses the official tokenizer chat template and Transformers response
-parser. Default reasoning effort is `xhigh`. Sampling defaults come from the
-artifact generation config and are executed by the provider. Official XML
-function calls are converted into normal Chat Completions/Responses tool-call
-objects; tool results re-enter the official conversation template.
+```text
+ABSENT -> SSD_LOADING -> RAM_READY -> GPU_UPLOADING -> VRAM_READY
+   +------------------------- failure ----------------------> FAILED
+```
 
-DeepSeek has no Transformers chat template and therefore uses only its pinned
-official encoder adapter. Artifacts without a declared response grammar reject
-tools. This is capability selection, not a common-path model-name branch.
+One acquisition exists per key. Demand outranks bounded prefetch and warm work.
+Protected/probationary RAM and transient/protected VRAM prevent cold first
+touches from immediately displacing known-hot pages. Leases and CUDA events
+prevent eviction while a route uses a record.
 
-## Admission and failure model
+The scheduler publishes the complete exact top-6 union for each routed layer.
+Execution waits until every selected expert is available; no missing expert is
+treated as zero and top-k is never reduced. Stable aggregation preserves the
+router's selection order and weights.
 
-Budgets for request slots, queue depth, body bytes, KV pages, RAM cache, VRAM
-cache and staging are independent. Admission reserves prompt plus requested
-output credits before generation. Exhaustion returns an explicit bounded error
-instead of depending on pagefile pressure or CUDA OOM.
+This is where NVMe/RAM/VRAM paging is valid: unselected experts are cold for
+the current token. It makes a model larger than RAM+VRAM executable, but novel
+routes still pay first-touch storage traffic and cannot be advertised at the
+settled-cache rate.
 
-- malformed/mismatched model data prevents readiness;
-- unsupported capabilities or geometry fail at startup/request parsing;
-- a client disconnect cancels before another decode step is admitted;
-- worker failure fails dependent requests explicitly;
-- session state is published only after complete successful allocation;
-- the stop path kills the Python/native descendant tree and must release GPU
-  ownership;
-- source checkpoints are not deleted by normal compile/publish/deploy flows.
+## Artifact and provider boundary
 
-## Observability
+`runtime-model.tsv` is the executable program contract. It binds:
 
-`/model-info` publishes artifact identity, program/provider capabilities,
-limits, placement, KV geometry and worker protocol. JSONL request telemetry
-contains prompt/generated token counts, server TTFT, wall time and provider
-phase counters without prompt content.
+- model geometry and ordered operations;
+- tensor roles and input/output ABIs;
+- numeric/storage encodings;
+- provider capabilities and parameters;
+- optional response, vision and exact-decode capabilities.
 
-For reasoning models, first visible content is not first generated token.
-Performance claims use server TTFT and generated-token counts consistently;
-the terminal client's visible-content timing is not authoritative when hidden
-reasoning is enabled.
+Startup validates manifests, completion markers, sizes, hashes, record layouts
+and operation compatibility before readiness. Large pack SHA-256 is mandatory,
+but uses the Windows native cryptographic provider on the supported host.
 
-## Remaining architectural boundary
+Expert Pack and the DeepSeek compact bundle are still different physical
+containers. They converge at the model descriptor, operation-provider and
+logical-page contracts. The repository must not claim one universal physical
+format until the DeepSeek payload can be represented without losing its
+authenticated source ABI or paging geometry.
 
-The common program/provider execution path is implemented for the current
-dense FP4 operation set, while DeepSeek retains genuinely distinct sparse
-math/storage providers. Physical pack formats are not yet one universal
-container: dense Expert Pack and DeepSeek compact/bundle representations enter
-through adapters. That divergence must remain explicit.
+## API and failure boundaries
 
-There is no external owner or remote execution deployment. A future remote
-provider, if ever justified, would move activations to expert compute and obey
-the same all-or-nothing route lease semantics; it is not part of the current
-goal.
+The Python front end owns HTTP, authentication, body/media limits,
+tokenization, official chat templates, streaming and admission. The native
+worker owns model state, the compiled program, cache placement and token
+selection. Their protocol advertises actual capabilities; unsupported session,
+vision, tool or KV behavior fails explicitly.
+
+- `/health` is process liveness; `/ready` also requires an admitting worker.
+- `/model-info` reports the artifact, limits, provider and KV geometry.
+- `/metrics` uses a cached bounded worker snapshot and must remain responsive
+  during a long prefill.
+- queue, body, output, context, image, RAM, VRAM, KV and worker-slot budgets are
+  independent.
+- non-loopback serving requires bearer authentication; TLS and rate limiting
+  belong at the deployment edge.
+- stop must terminate both Python and native descendants and release VRAM.
+
+## Hardware boundary
+
+The implemented CUDA build targets SM86 and one RTX 3090. There is currently no
+multi-device allocator, P2P transport or SM60/SM61 provider. RTX 3090 + Tesla
+P100/P40 placement is a quantitatively defined roadmap item, not implemented
+functionality. See [Research decisions](research-decisions.md) and
+[Roadmap](roadmap.md).

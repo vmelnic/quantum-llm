@@ -25,6 +25,9 @@ struct WorkerLaunchOptions final {
   std::string placement_profile;
   std::optional<std::uint32_t> prefill_chunk_limit;
   std::optional<std::uint32_t> placement_settle_steps;
+  // Generic diagnostics policy. Providers must not collect synchronous GPU
+  // timings unless the service explicitly requests them.
+  bool profile_gpu_phases{};
   // Provider extensions are deliberately opaque to the common parser. A new
   // execution provider can add an option without changing this contract.
   std::map<std::string, std::optional<std::string>, std::less<>> extensions;

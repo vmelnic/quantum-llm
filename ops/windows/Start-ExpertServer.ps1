@@ -29,6 +29,8 @@ param(
     [double]$QueueTimeoutSeconds = 1.0,
     [double]$GenerationTimeoutSeconds = 120.0,
     [int]$MaximumBodyMiB = 16,
+    [ValidateRange(65536, 16777216)][int]$MaximumImagePixels = 2097152,
+    [ValidateRange(256, 32768)][int]$MaximumImagePatchTokens = 4096,
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
@@ -123,6 +125,8 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --queue-timeout $QueueTimeoutSeconds `
     --generation-timeout $GenerationTimeoutSeconds `
     --maximum-body-bytes ([int64]$MaximumBodyMiB * 1MB) `
+    --maximum-image-pixels $MaximumImagePixels `
+    --maximum-image-patch-tokens $MaximumImagePatchTokens `
     --startup-timeout $StartupTimeoutSeconds `
     --drain-timeout $DrainTimeoutSeconds `
     --build-id $BuildId `

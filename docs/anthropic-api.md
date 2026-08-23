@@ -1,83 +1,51 @@
-# Anthropic Messages API and Claude Code
+# Anthropic Messages API
 
-Status: protocol-compatible gateway; Qwen3.8 backend rejected for production
-Claude Code use on 2026-08-21.
-
-The common HTTP service exposes an Anthropic-compatible adapter in parallel
-with the existing OpenAI-compatible endpoints. Both protocols use the same
-artifact-selected tokenizer, prompt template, admission control, retained KV
-sessions and CUDA worker. The adapter does not add another model runner.
+Status: implemented wire adapter with explicit harness limits, 2026-08-23.
 
 ## Endpoints
 
-| Method | Path | Contract |
-|---|---|---|
-| `POST` | `/v1/messages` | Anthropic Messages JSON or named SSE events |
-| `POST` | `/v1/messages/count_tokens` | Token count after the real artifact chat template |
+- `POST /v1/messages`
+- `POST /v1/messages/count_tokens`
 
-Supported message blocks are `text`, assistant `thinking`, `tool_use`, and
-user `tool_result`. Client tools use Anthropic `input_schema` definitions and
-are translated to the tokenizer's declared function-tool contract. Images,
-documents, server-side Anthropic tools, structured output and constrained
-`any`/named tool choice are rejected rather than silently substituted.
-
-Prompt-cache `cache_control` annotations do not claim Anthropic cache
-accounting. Claude Code's inline system/cache boundary is translated into a
-worker KV checkpoint before the dynamic reminder, allowing later turns to
-prefill only their conversation delta. Runtime retained-prefix reuse remains
-the service's actual cache mechanism. Qwen reasoning stays hidden from the
-Messages response because this local model cannot produce Anthropic-signed
-thinking blocks.
-
-Streaming Messages emit Anthropic `ping` events during long prefill and
-buffered tool-call generation so clients do not mistake active local inference
-for an idle or failed connection.
-
-The OpenAI endpoints remain available and unchanged at `/v1/responses`,
-`/v1/chat/completions`, and `/v1/completions`.
-
-Protocol compatibility is not a model-quality claim. The real Qwen3.8 FP4
-qualification sent about 29.5K prompt tokens for a cold Claude request, took
-about 83 seconds to first token, fabricated basic facts in a simple poem task,
-and entered multi-thousand-token reasoning/tool loops. The service is therefore
-not an approved Claude Code backend despite accepting the API contract.
-
-## Private-LAN deployment
-
-The default bind remains loopback. To make the service reachable through the
-Windows host's private IP, configure the control-host `.env`:
-
-```dotenv
-MODEL_HOST=0.0.0.0
-EXPERT_API_KEY=<private-lan-token>
-```
-
-`model.sh start` passes both values into the one common scheduled task and its
-readiness check. A non-loopback bind without a key fails closed. Limit the
-Windows firewall rule to the private subnet or, preferably, the exact client
-address. The built-in service is plain HTTP and must not be exposed directly
-to the public internet.
-
-## Claude Code
-
-Pin every Claude Code model role to the single deployed artifact. Otherwise
-background/Haiku calls may send an undeployed Anthropic model ID and correctly
-receive `unknown model`:
+The adapter accepts Anthropic `user` and `assistant` message roles, a top-level
+system prompt, text/image content, tool definitions/results, streaming,
+sampling and output limits. It translates them into the same official
+artifact template and native request used by the OpenAI surface.
 
 ```bash
-export ANTHROPIC_BASE_URL=http://10.10.88.4:8080
-export ANTHROPIC_AUTH_TOKEN=<private-lan-token>
-export ANTHROPIC_MODEL=qwen3.8-27b-fp4
-export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3.8-27b-fp4
-export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3.8-27b-fp4
-export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3.8-27b-fp4
-export CLAUDE_CODE_SUBAGENT_MODEL=qwen3.8-27b-fp4
-
-claude --model qwen3.8-27b-fp4
+curl http://127.0.0.1:8080/v1/messages \
+  -H "x-api-key: $EXPERT_API_KEY" \
+  -H 'anthropic-version: 2023-06-01' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "qwen3.8-27b-fp4",
+    "max_tokens": 128,
+    "thinking": {"type": "enabled", "budget_tokens": 64},
+    "messages": [{"role": "user", "content": "hi"}]
+  }'
 ```
 
-`ANTHROPIC_AUTH_TOKEN` is sent as a bearer token. The server also accepts the
-Anthropic SDK's `x-api-key` header. See the upstream
-[gateway configuration](https://docs.anthropic.com/en/docs/claude-code/llm-gateway)
-and [model configuration](https://code.claude.com/docs/en/model-config) for the
-client-side behavior of these variables.
+Streaming emits Anthropic message/content block events and reports visible
+text, thinking and tool-use blocks separately. `/count_tokens` applies the
+same normalization/template path and returns the resulting input token count.
+
+## What compatibility does not mean
+
+This endpoint does not turn Qwen or DeepSeek into Claude. Model behavior,
+prompt interpretation, tool reliability, reasoning quality and latency remain
+those of the selected local artifact. Claude Code also injects a large system
+prompt, repository context and tool schema; a one-word user prompt therefore
+does not represent a one-token prefill.
+
+The adapter has passed protocol/unit gates, but Claude Code on the reference
+host produced unacceptable first-turn latency and factual behavior. It is not
+the recommended production harness. Pi is the maintained local coding-agent
+integration; see [Pi CLI](pi-cli.md).
+
+## Authentication and limits
+
+The configured secret is accepted as `x-api-key` or bearer authentication.
+Messages obey the same request-body, context, output, image, queue, timeout and
+KV admission limits as the OpenAI API. Unsupported roles/blocks and invalid
+thinking/tool combinations fail with Anthropic-shaped errors rather than being
+silently discarded.

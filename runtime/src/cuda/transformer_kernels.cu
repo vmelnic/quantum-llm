@@ -1058,6 +1058,245 @@ __global__ void add_kernel(float* destination, const float* source,
   if (i < count) destination[i] += source[i];
 }
 
+__global__ void add_bias_kernel(float* destination, const float* bias,
+                                std::uint32_t columns,
+                                std::size_t values) {
+  const auto item = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+  if (item < values) destination[item] += bias[item % columns];
+}
+
+__global__ void layer_norm_batch_kernel(
+    const float* input, const float* weight, const float* bias, float* output,
+    std::uint32_t elements, float epsilon) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  input += static_cast<std::size_t>(row) * elements;
+  output += static_cast<std::size_t>(row) * elements;
+  float sum = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < elements;
+       index += blockDim.x)
+    sum += input[index];
+  const auto mean = reduce_sum(sum) / static_cast<float>(elements);
+  float square = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < elements;
+       index += blockDim.x) {
+    const auto centered = input[index] - mean;
+    square += centered * centered;
+  }
+  const auto inverse = rsqrtf(
+      reduce_sum(square) / static_cast<float>(elements) + epsilon);
+  for (std::uint32_t index = threadIdx.x; index < elements;
+       index += blockDim.x)
+    output[index] = (input[index] - mean) * inverse * weight[index] +
+                    bias[index];
+}
+
+template <bool Exact>
+__global__ void gelu_in_place_kernel(float* values, std::size_t count) {
+  const auto item = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+  if (item >= count) return;
+  const auto value = values[item];
+  if constexpr (Exact) {
+    values[item] = 0.5F * value * (1.0F + erff(value * 0.7071067811865475F));
+  } else {
+    const auto cubic = value * value * value;
+    values[item] = 0.5F * value *
+        (1.0F + tanhf(0.7978845608028654F *
+                      (value + 0.044715F * cubic)));
+  }
+}
+
+__global__ void add_fp4_position_interpolation_kernel(
+    float* hidden, const std::uint8_t* position_weights,
+    const std::uint8_t* position_scales,
+    const std::uint32_t* interpolation_indices,
+    const float* interpolation_weights, std::uint32_t rows,
+    std::uint32_t columns, std::uint32_t padded_columns) {
+  const auto item = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+  const auto values = static_cast<std::size_t>(rows) * columns;
+  if (item >= values) return;
+  const auto row = static_cast<std::uint32_t>(item / columns);
+  const auto column = static_cast<std::uint32_t>(item % columns);
+  float position = 0.0F;
+  for (std::uint32_t tap = 0U; tap < 4U; ++tap) {
+    const auto source = interpolation_indices[4U * row + tap];
+    const auto packed = position_weights[
+        static_cast<std::size_t>(source) * (padded_columns / 2U) +
+        column / 2U];
+    const auto code = static_cast<std::uint8_t>(
+        (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+    const auto scale = decode_ue8m0(position_scales[
+        static_cast<std::size_t>(source) * (padded_columns / 32U) +
+        column / 32U]);
+    position += interpolation_weights[4U * row + tap] *
+                static_cast<float>(decode_fp4_twice(code)) * 0.5F * scale;
+  }
+  hidden[item] += position;
+}
+
+__global__ void vision_qkv_rope_kernel(
+    float* qkv, const std::uint32_t* row_positions,
+    std::uint32_t heads, std::uint32_t head_dim, float theta) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (head >= heads || dimension >= head_dim) return;
+  const auto hidden = heads * head_dim;
+  const auto half = head_dim / 2U;
+  const auto frequency_dimension = half / 2U;
+  const auto pair = dimension % half;
+  const auto axis = pair < frequency_dimension ? 0U : 1U;
+  const auto frequency = pair % frequency_dimension;
+  const auto position = row_positions[2U * row + axis];
+  const auto angle = static_cast<float>(position) *
+      powf(theta, -2.0F * static_cast<float>(frequency) /
+                       static_cast<float>(half));
+  const auto cosine = cosf(angle);
+  const auto sine = sinf(angle);
+  const auto row_base = static_cast<std::size_t>(row) * 3U * hidden;
+  for (std::uint32_t kind = 0U; kind < 2U; ++kind) {
+    auto* vector = qkv + row_base + static_cast<std::size_t>(kind) * hidden +
+                   static_cast<std::size_t>(head) * head_dim;
+    const auto other = dimension < half ? -vector[dimension + half]
+                                         : vector[dimension - half];
+    const auto value = vector[dimension];
+    __syncthreads();
+    vector[dimension] = value * cosine + other * sine;
+    __syncthreads();
+  }
+}
+
+__global__ void vision_segment_attention_kernel(
+    const float* qkv, const std::uint32_t* segment_first,
+    const std::uint32_t* segment_last, float* output,
+    std::uint32_t heads, std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto query_row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto hidden = heads * head_dim;
+  const auto query = qkv + static_cast<std::size_t>(query_row) * 3U * hidden +
+                     static_cast<std::size_t>(head) * head_dim;
+  float accumulator = 0.0F;
+  float maximum = kNegativeInfinity;
+  float denominator = 0.0F;
+  const auto scale = rsqrtf(static_cast<float>(head_dim));
+  for (auto key_row = segment_first[query_row];
+       key_row < segment_last[query_row]; ++key_row) {
+    const auto* key = qkv + static_cast<std::size_t>(key_row) * 3U * hidden +
+                      hidden + static_cast<std::size_t>(head) * head_dim;
+    const auto partial = dimension < head_dim
+                             ? query[dimension] * key[dimension]
+                             : 0.0F;
+    const auto score = reduce_sum(partial) * scale;
+    const auto next_maximum = fmaxf(maximum, score);
+    const auto previous_scale = expf(maximum - next_maximum);
+    const auto current_scale = expf(score - next_maximum);
+    if (dimension < head_dim) {
+      const auto* value = key + hidden;
+      accumulator = accumulator * previous_scale +
+                    value[dimension] * current_scale;
+    }
+    denominator = denominator * previous_scale + current_scale;
+    maximum = next_maximum;
+  }
+  if (dimension < head_dim)
+    output[static_cast<std::size_t>(query_row) * hidden +
+           static_cast<std::size_t>(head) * head_dim + dimension] =
+        accumulator / denominator;
+}
+
+__device__ std::uint32_t mrope_axis(std::uint32_t pair,
+                                    std::uint32_t section_one,
+                                    std::uint32_t section_two) {
+  if (pair % 3U == 1U && pair < 3U * section_one) return 1U;
+  if (pair % 3U == 2U && pair < 3U * section_two) return 2U;
+  return 0U;
+}
+
+__global__ void gated_gqa_qk_norm_mrope_kernel(
+    float* q_and_gate, float* key, const float* q_weight,
+    const float* k_weight, const std::uint32_t* positions_thw,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim,
+    std::uint32_t section_one, std::uint32_t section_two,
+    float epsilon, float theta) {
+  __shared__ float normalized[256];
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto query_width = 2U * query_heads * head_dim;
+  const auto key_width = kv_heads * head_dim;
+  q_and_gate += static_cast<std::size_t>(row) * query_width;
+  key += static_cast<std::size_t>(row) * key_width;
+  const auto apply = [&](float* vector, const float* weight) {
+    float square = dimension < head_dim
+                       ? vector[dimension] * vector[dimension]
+                       : 0.0F;
+    square = reduce_sum(square);
+    if (dimension < head_dim)
+      normalized[dimension] = vector[dimension] *
+          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+          (1.0F + weight[dimension]);
+    __syncthreads();
+    if (dimension < head_dim) {
+      auto result = normalized[dimension];
+      if (dimension < rotary_dim) {
+        const auto half = rotary_dim / 2U;
+        const auto pair = dimension % half;
+        const auto axis = mrope_axis(pair, section_one, section_two);
+        const auto position = positions_thw[3U * row + axis];
+        const auto angle = static_cast<float>(position) *
+            powf(theta, -2.0F * static_cast<float>(pair) /
+                             static_cast<float>(rotary_dim));
+        const auto other = dimension < half
+                               ? -normalized[dimension + half]
+                               : normalized[dimension - half];
+        result = normalized[dimension] * cosf(angle) + other * sinf(angle);
+      }
+      vector[dimension] = result;
+    }
+    __syncthreads();
+  };
+  if (head < query_heads)
+    apply(q_and_gate + static_cast<std::size_t>(head) * 2U * head_dim,
+          q_weight);
+  if (head < kv_heads)
+    apply(key + static_cast<std::size_t>(head) * head_dim, k_weight);
+}
+
+template <PagedKvEncoding Encoding>
+__global__ void store_gqa_kv_paged_batch_kernel(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto position = first_cache_position + row;
+  const auto width = kv_heads * head_dim;
+  auto* page = static_cast<std::uint8_t*>(
+      const_cast<void*>(page_table[position / page_tokens]));
+  store_paged_kv_record<Encoding>(
+      page, full_attention_layer, page_tokens, position, head, kv_heads,
+      head_dim, key + static_cast<std::size_t>(row) * width +
+                    static_cast<std::size_t>(head) * head_dim,
+      value + static_cast<std::size_t>(row) * width +
+                      static_cast<std::size_t>(head) * head_dim);
+}
+
+__global__ void store_gqa_kv_fp16_batch_kernel(
+    const float* key, const float* value, __half* fp16_keys,
+    __half* fp16_values, std::size_t values) {
+  const auto item = static_cast<std::size_t>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+  if (item < values) {
+    fp16_keys[item] = __float2half_rn(key[item]);
+    fp16_values[item] = __float2half_rn(value[item]);
+  }
+}
+
 __global__ void silu_product_kernel(const float* gate, const float* up,
                                     float* output, std::uint32_t count) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -3794,6 +4033,51 @@ __global__ void argmax_batch_kernel(const float* values, std::uint32_t count,
   if (threadIdx.x == 0) output[request] = best_indices[0];
 }
 
+__global__ void topk_logits_kernel(const float* values, std::uint32_t count,
+                                   std::uint32_t top_k,
+                                   float* output_values,
+                                   std::uint32_t* output_indices) {
+  __shared__ float best_values[kThreads];
+  __shared__ std::uint32_t best_indices[kThreads];
+  for (std::uint32_t rank = 0U; rank < top_k; ++rank) {
+    float best = kNegativeInfinity;
+    std::uint32_t index = 0xffffffffU;
+    for (std::uint32_t item = threadIdx.x; item < count;
+         item += blockDim.x) {
+      bool selected = false;
+      for (std::uint32_t previous = 0U; previous < rank; ++previous)
+        selected = selected || output_indices[previous] == item;
+      const auto value = values[item];
+      if (!selected && !isnan(value) &&
+          (value > best || (value == best && item < index))) {
+        best = value;
+        index = item;
+      }
+    }
+    best_values[threadIdx.x] = best;
+    best_indices[threadIdx.x] = index;
+    __syncthreads();
+    for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+      if (threadIdx.x < stride) {
+        const auto other_value = best_values[threadIdx.x + stride];
+        const auto other_index = best_indices[threadIdx.x + stride];
+        if (other_value > best_values[threadIdx.x] ||
+            (other_value == best_values[threadIdx.x] &&
+             other_index < best_indices[threadIdx.x])) {
+          best_values[threadIdx.x] = other_value;
+          best_indices[threadIdx.x] = other_index;
+        }
+      }
+      __syncthreads();
+    }
+    if (threadIdx.x == 0U) {
+      output_values[rank] = best_values[0];
+      output_indices[rank] = best_indices[0];
+    }
+    __syncthreads();
+  }
+}
+
 struct DeviceTopology final {
   cudaError_t status{cudaSuccess};
   int multiprocessors{};
@@ -4037,8 +4321,8 @@ Status fp4_decode_matrix_bf16(const Fp4Block32Matrix& m,
       decoded_weight_bytes < values * sizeof(__nv_bfloat16))
     return Status(ErrorCode::invalid_argument,
                   "FP4 BF16 matrix decode workspace is too small");
-  const auto blocks = static_cast<unsigned>(std::min<std::size_t>(
-      (values + kThreads - 1U) / kThreads, 65535U));
+  const auto blocks = static_cast<unsigned>(
+      (values + kThreads - 1U) / kThreads);
   fp4_decode_matrix_bf16_kernel<<<blocks, kThreads, 0,
                                   static_cast<cudaStream_t>(raw)>>>(
       m.weights, m.scales, static_cast<__nv_bfloat16*>(decoded_weights),
@@ -4301,6 +4585,178 @@ Status add_in_place(float* destination, const float* source, std::uint32_t eleme
   if (!destination || !source || !elements) return Status(ErrorCode::invalid_argument, "invalid add");
   add_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(destination, source, elements);
   return checked(cudaPeekAtLastError(), "add");
+}
+Status add_bias_in_place(float* destination, const float* bias,
+                         std::uint32_t rows, std::uint32_t columns,
+                         void* raw) noexcept {
+  if (!destination || !bias || !rows || !columns)
+    return Status(ErrorCode::invalid_argument, "invalid bias add");
+  const auto values = static_cast<std::size_t>(rows) * columns;
+  const auto blocks = static_cast<unsigned>(
+      (values + kThreads - 1U) / kThreads);
+  add_bias_kernel<<<blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      destination, bias, columns, values);
+  return checked(cudaPeekAtLastError(), "bias add");
+}
+Status layer_norm_batch(const float* input, const float* weight,
+                        const float* bias, float* output,
+                        std::uint32_t rows, std::uint32_t elements,
+                        float epsilon, void* raw) noexcept {
+  if (!input || !weight || !bias || !output || !rows || !elements ||
+      !(epsilon > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid layer norm batch");
+  layer_norm_batch_kernel<<<rows, kThreads, 0,
+                            static_cast<cudaStream_t>(raw)>>>(
+      input, weight, bias, output, elements, epsilon);
+  return checked(cudaPeekAtLastError(), "layer norm batch");
+}
+Status gelu_tanh_in_place(float* values, std::uint32_t elements,
+                          void* raw) noexcept {
+  if (!values || !elements)
+    return Status(ErrorCode::invalid_argument, "invalid tanh GELU");
+  gelu_in_place_kernel<false><<<(elements + kThreads - 1U) / kThreads,
+                                 kThreads, 0,
+                                 static_cast<cudaStream_t>(raw)>>>(
+      values, elements);
+  return checked(cudaPeekAtLastError(), "tanh GELU");
+}
+Status gelu_exact_in_place(float* values, std::uint32_t elements,
+                           void* raw) noexcept {
+  if (!values || !elements)
+    return Status(ErrorCode::invalid_argument, "invalid exact GELU");
+  gelu_in_place_kernel<true><<<(elements + kThreads - 1U) / kThreads,
+                                kThreads, 0,
+                                static_cast<cudaStream_t>(raw)>>>(
+      values, elements);
+  return checked(cudaPeekAtLastError(), "exact GELU");
+}
+Status add_fp4_position_interpolation(
+    float* hidden, const Fp4Block32Matrix& positions,
+    const std::uint32_t* interpolation_indices,
+    const float* interpolation_weights, std::uint32_t rows,
+    void* raw) noexcept {
+  if (!hidden || !positions.weights || !positions.scales ||
+      !interpolation_indices || !interpolation_weights || !rows ||
+      !positions.rows || !positions.columns ||
+      positions.padded_columns < positions.columns ||
+      positions.padded_columns % 32U)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP4 position interpolation");
+  const auto values = static_cast<std::size_t>(rows) * positions.columns;
+  const auto blocks = static_cast<unsigned>(
+      (values + kThreads - 1U) / kThreads);
+  add_fp4_position_interpolation_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      hidden, positions.weights, positions.scales, interpolation_indices,
+      interpolation_weights, rows, positions.columns,
+      positions.padded_columns);
+  return checked(cudaPeekAtLastError(), "FP4 position interpolation");
+}
+Status vision_qkv_rope_in_place(
+    float* qkv, const std::uint32_t* row_positions, std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t head_dim, float rope_theta,
+    void* raw) noexcept {
+  if (!qkv || !row_positions || !rows || !heads || !head_dim ||
+      head_dim > 1024U || head_dim % 4U || !(rope_theta > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid vision QKV rope");
+  vision_qkv_rope_kernel<<<dim3(heads, rows), head_dim, 0,
+                           static_cast<cudaStream_t>(raw)>>>(
+      qkv, row_positions, heads, head_dim, rope_theta);
+  return checked(cudaPeekAtLastError(), "vision QKV rope");
+}
+Status vision_segment_attention(
+    const float* qkv, const std::uint32_t* segment_first,
+    const std::uint32_t* segment_last, float* output, std::uint32_t rows,
+    std::uint32_t heads, std::uint32_t head_dim, void* raw) noexcept {
+  if (!qkv || !segment_first || !segment_last || !output || !rows ||
+      !heads || !head_dim || head_dim > kThreads)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid segmented vision attention");
+  vision_segment_attention_kernel<<<
+      dim3(heads, rows), kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      qkv, segment_first, segment_last, output, heads, head_dim);
+  return checked(cudaPeekAtLastError(), "segmented vision attention");
+}
+Status gated_gqa_qk_norm_mrope_batch(
+    float* q_and_gate, float* key, const float* q_norm_weight,
+    const float* k_norm_weight, const std::uint32_t* positions_thw,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, std::uint32_t section_zero,
+    std::uint32_t section_one, std::uint32_t section_two,
+    float epsilon, float rope_theta, void* raw) noexcept {
+  if (!q_and_gate || !key || !q_norm_weight || !k_norm_weight ||
+      !positions_thw || !rows || !query_heads || !kv_heads ||
+      query_heads % kv_heads || !head_dim || head_dim > kThreads ||
+      !rotary_dim || rotary_dim > head_dim || rotary_dim % 2U ||
+      !section_zero || !section_one || !section_two ||
+      section_zero + section_one + section_two != rotary_dim / 2U ||
+      !(epsilon > 0.0F) || !(rope_theta > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid three-axis GQA QKV mRoPE batch");
+  gated_gqa_qk_norm_mrope_kernel<<<
+      dim3(query_heads, rows), kThreads, 0,
+      static_cast<cudaStream_t>(raw)>>>(
+      q_and_gate, key, q_norm_weight, k_norm_weight, positions_thw,
+      query_heads, kv_heads, head_dim, rotary_dim, section_one, section_two,
+      epsilon, rope_theta);
+  return checked(cudaPeekAtLastError(), "three-axis GQA QKV mRoPE batch");
+}
+template <PagedKvEncoding Encoding>
+Status store_gqa_kv_paged_batch_impl(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* raw,
+    const char* name) noexcept {
+  if (!key || !value || !page_table || !page_tokens || !rows || !kv_heads ||
+      !head_dim || head_dim > kThreads || head_dim % 32U ||
+      first_cache_position > 0xffffffffU - (rows - 1U))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid paged GQA KV store batch");
+  store_gqa_kv_paged_batch_kernel<Encoding><<<
+      dim3(kv_heads, rows), kThreads, 0,
+      static_cast<cudaStream_t>(raw)>>>(
+      key, value, page_table, full_attention_layer, page_tokens,
+      first_cache_position, kv_heads, head_dim);
+  return checked(cudaPeekAtLastError(), name);
+}
+Status store_gqa_kv_paged_fp4_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* raw) noexcept {
+  return store_gqa_kv_paged_batch_impl<PagedKvEncoding::fp4>(
+      key, value, page_table, full_attention_layer, page_tokens,
+      first_cache_position, rows, kv_heads, head_dim, raw,
+      "paged FP4 GQA KV store batch");
+}
+Status store_gqa_kv_paged_fp8_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* raw) noexcept {
+  return store_gqa_kv_paged_batch_impl<PagedKvEncoding::fp8>(
+      key, value, page_table, full_attention_layer, page_tokens,
+      first_cache_position, rows, kv_heads, head_dim, raw,
+      "paged FP8 GQA KV store batch");
+}
+Status store_gqa_kv_fp16_batch(
+    const float* key, const float* value, void* fp16_keys,
+    void* fp16_values, std::uint32_t rows, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* raw) noexcept {
+  if (!key || !value || !fp16_keys || !fp16_values || !rows || !kv_heads ||
+      !head_dim)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP16 GQA KV store batch");
+  const auto values = static_cast<std::size_t>(rows) * kv_heads * head_dim;
+  const auto blocks = static_cast<unsigned>(std::min<std::size_t>(
+      (values + kThreads - 1U) / kThreads, 65535U));
+  store_gqa_kv_fp16_batch_kernel<<<
+      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      key, value, static_cast<__half*>(fp16_keys),
+      static_cast<__half*>(fp16_values), values);
+  return checked(cudaPeekAtLastError(), "FP16 GQA KV store batch");
 }
 Status silu_product(const float* gate, const float* up, float* output,
                     std::uint32_t elements, void* raw) noexcept {
@@ -5140,6 +5596,13 @@ Status gated_gqa_attention_staged_fp16_impl(
     const Launch& launch,
     const HostFp16GatedGqaAttentionWorkspace& workspace,
     bool source_is_host) noexcept {
+  const auto paged_host_source = [&]() {
+    if constexpr (std::is_same_v<Launch, HostFp16GatedGqaAttentionLaunch>)
+      return launch.host_key_pages != nullptr ||
+             launch.host_value_pages != nullptr;
+    else
+      return false;
+  }();
   const auto* source_keys = [&]() -> const void* {
     if constexpr (std::is_same_v<Launch, HostFp16GatedGqaAttentionLaunch>)
       return launch.host_keys;
@@ -5152,7 +5615,19 @@ Status gated_gqa_attention_staged_fp16_impl(
     else
       return launch.device_values;
   }();
-  if (!launch.q_and_gate || !source_keys || !source_values ||
+  const auto valid_source = [&]() {
+    if constexpr (std::is_same_v<Launch, HostFp16GatedGqaAttentionLaunch>) {
+      if (!paged_host_source) return source_keys && source_values;
+      return launch.host_key_pages && launch.host_value_pages &&
+             launch.host_page_tokens && launch.host_page_count &&
+             launch.cache_capacity <=
+                 static_cast<std::uint64_t>(launch.host_page_tokens) *
+                     launch.host_page_count;
+    } else {
+      return source_keys && source_values;
+    }
+  }();
+  if (!launch.q_and_gate || !valid_source ||
       !launch.output || !launch.cache_capacity ||
       !launch.first_context_tokens || !launch.rows || !launch.query_heads ||
       !launch.kv_heads || launch.query_heads % launch.kv_heads ||
@@ -5227,15 +5702,50 @@ Status gated_gqa_attention_staged_fp16_impl(
   const auto* fp16_keys = static_cast<const __half*>(source_keys);
   const auto* fp16_values = static_cast<const __half*>(source_values);
   for (std::uint32_t first_token = launch.retained_first_token;
-       first_token < last_context; first_token += split_tokens) {
-    const auto tokens = std::min(split_tokens, last_context - first_token);
+       first_token < last_context;) {
+    auto tokens = std::min(split_tokens, last_context - first_token);
+    if constexpr (std::is_same_v<Launch,
+                                 HostFp16GatedGqaAttentionLaunch>) {
+      if (paged_host_source)
+        tokens = std::min(tokens, launch.host_page_tokens -
+                                      first_token % launch.host_page_tokens);
+    }
     const auto raw_values =
         static_cast<std::size_t>(tokens) * record_values;
     const auto raw_bytes = raw_values * sizeof(__half);
-    const __half* raw_keys =
-        fp16_keys + static_cast<std::size_t>(first_token) * record_values;
-    const __half* raw_values_source =
-        fp16_values + static_cast<std::size_t>(first_token) * record_values;
+    const __half* raw_keys{};
+    const __half* raw_values_source{};
+    if constexpr (std::is_same_v<Launch,
+                                 HostFp16GatedGqaAttentionLaunch>) {
+      if (paged_host_source) {
+        const auto page = first_token / launch.host_page_tokens;
+        if (page >= launch.host_page_count ||
+            !launch.host_key_pages[page] ||
+            !launch.host_value_pages[page])
+          return Status(ErrorCode::invalid_argument,
+                        "paged host FP16 source is incomplete");
+        const auto offset = static_cast<std::size_t>(
+                                first_token % launch.host_page_tokens) *
+                            record_values;
+        raw_keys = static_cast<const __half*>(launch.host_key_pages[page]) +
+                   offset;
+        raw_values_source =
+            static_cast<const __half*>(launch.host_value_pages[page]) +
+            offset;
+      } else {
+        raw_keys = fp16_keys +
+                   static_cast<std::size_t>(first_token) * record_values;
+        raw_values_source =
+            fp16_values +
+            static_cast<std::size_t>(first_token) * record_values;
+      }
+    } else {
+      raw_keys = fp16_keys +
+                 static_cast<std::size_t>(first_token) * record_values;
+      raw_values_source =
+          fp16_values +
+          static_cast<std::size_t>(first_token) * record_values;
+    }
     if (source_is_host) {
       auto copy = cudaMemcpyAsync(workspace.raw_keys, raw_keys, raw_bytes,
                                   cudaMemcpyHostToDevice, stream);
@@ -5300,6 +5810,7 @@ Status gated_gqa_attention_staged_fp16_impl(
         CUBLAS_GEMM_DEFAULT_TENSOR_OP);
     if (blas_status != CUBLAS_STATUS_SUCCESS)
       return checked(blas_status, "staged FP16 PV GEMM");
+    first_token += tokens;
   }
   staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, workspace.sums, launch.output,
@@ -5445,6 +5956,17 @@ Status argmax_batch(const float* values, std::uint32_t count,
                         static_cast<cudaStream_t>(raw)>>>(values, count,
                                                           output);
   return checked(cudaPeekAtLastError(), "batched argmax");
+}
+
+Status topk_logits(const float* values, std::uint32_t count,
+                   std::uint32_t top_k, float* output_values,
+                   std::uint32_t* output_indices, void* raw) noexcept {
+  if (!values || !count || !top_k || top_k > 64U || top_k > count ||
+      !output_values || !output_indices)
+    return Status(ErrorCode::invalid_argument, "invalid top-k logits");
+  topk_logits_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      values, count, top_k, output_values, output_indices);
+  return checked(cudaPeekAtLastError(), "top-k logits");
 }
 
 }  // namespace expert::runtime::cuda

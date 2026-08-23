@@ -88,6 +88,9 @@ DTYPE_BYTES = {
 MODEL_CONFIG_FILES = (
     "config.json",
     "generation_config.json",
+    "preprocessor_config.json",
+    "processor_config.json",
+    "video_preprocessor_config.json",
 )
 
 TOKENIZER_FILES = (

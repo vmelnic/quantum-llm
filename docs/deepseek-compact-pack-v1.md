@@ -1,118 +1,74 @@
 # DeepSeek compact pack v1
 
-Status: current DeepSeek-specific storage format as of 2026-08-11. It is
-accepted by the common MoE VM runner through a storage adapter, but it is not
-yet the same physical container as Expert Pack v1. The unification work is in
-[the MoE VM handoff](moe-vm-next.md).
+Status: deployed routed-expert and worker-bundle contract, 2026-08-23.
 
-DeepSeek compact pack v1 is a placement and I/O representation for routed
-experts. It preserves the checkpoint's authenticated FP4/UE8M0 bytes; it is
-not another quantization and does not contain expanded SM86 INT8 slots.
+## Why it is separate
 
-The current V4-Flash artifact declares 43 routed layers and therefore has 43
-layer shards:
+DeepSeek-V4-Flash stores routed experts as compact block-scaled FP8 source
+extents. The runtime's SM86 expert ABI repacks each complete expert into one
+authenticated FP4/UE8M0 record. This physical layout is different from QPack,
+but both artifacts publish the same model-program/provider and logical-page
+contracts.
 
-```text
-manifest.json
-catalog.tsv
-extents.tsv
-experts-00.dsc
-...
-experts-42.dsc
-experts-00.dsc.commit.json
-...
-```
+The physical formats must not be described as unified until the source ABI,
+record authentication and demand-paging geometry can be preserved without a
+model-specific execution stack.
 
-Each `experts-LL.dsc` contains 256 records in expert-ID order. Every record is
-13,369,344 bytes and begins on a 4,096-byte boundary; a layer shard is exactly
-3,422,552,064 bytes. Projection order is:
+## Geometry and files
 
-```text
-w1.weight, w1.scale, w3.weight, w3.scale, w2.weight, w2.scale
-```
+The main decoder contains 43 routed layers × 256 experts = 11,008 logical
+pages. Each compact record is 13,369,344 bytes; all routed payloads total
+147,169,738,752 bytes before indexes and bundle metadata.
 
-These bytes are identical to the six logical SafeTensors extents recorded by
-`deepseek-routed-catalog-v1`. The per-expert SHA-256 is therefore unchanged.
-The runtime accepts either six checkpoint extents or one packed extent and
-publishes the same `deepseek-fp4-e2m1-ue8m0-block32-v1` source ABI.
+`pack-deepseek-routed` publishes:
 
-## Publication and recovery
+- one `experts-*.dsc` shard and commit descriptor per layer;
+- `catalog.tsv`, mapping layer/expert keys to one packed extent;
+- `extents.tsv`, physical path/offset/length information;
+- `manifest.json`, source identity, geometry and hashes.
 
-Packing never modifies or deletes the checkpoint. A layer is written to a
-temporary file, every source record is checked against the catalog, the shard
-is flushed, and only then is it renamed and given an atomic commit marker.
-Interrupted runs retain the `.partial` directory. `--resume` reuses only
-complete layer shards with commit markers and canonical byte size. The final
-directory is published only after every config-declared layer and both
-catalogs are durable. For the current artifact that count is 43; the publisher
-derives it from the pinned checkpoint configuration rather than a common
-runtime constant.
-A process-scoped file lock rejects overlapping pack writers while still
-releasing automatically if a process exits or crashes.
+Packing is resumable by committed layer. A layer is accepted only after all
+256 records and hashes are durable. The main MTP layer, when enabled, is a
+separate namespace and compact pack.
 
-## Build
+## Worker bundle
 
-On Windows use:
+`Publish-DeepSeekWorkerBundle.ps1` validates and combines:
 
-```powershell
-.\ops\windows\Invoke-DeepSeekCompactPack.ps1 `
-  -ModelId "deepseek-ai/DeepSeek-V4-Flash" `
-  -Revision "<pinned-revision>" `
-  -Output (Join-Path $env:MODEL_ROOT "deepseek-v4-flash/compact-pack-v1") `
-  -Resume
-```
+- dense FP8 descriptor set;
+- typed BF16/F32/I64 descriptor set;
+- always-active shared-expert descriptor set;
+- main routed catalog/compact pack;
+- tokenizer/config/encoding assets;
+- optional MTP dense/typed/shared/routed resources;
+- `runtime.tsv`, `runtime-model.tsv` schema 3 and an authenticated manifest.
 
-The loader detects the packed headers and resolves payload shards relative to
-the pack, while legacy extent catalogs still resolve against the checkpoint.
-Publish the complete `worker-bundle-v3` afterward; the common launcher consumes
-that immutable artifact directory, not loose launcher arguments.
+Large immutable weights may remain referenced in the pinned checkpoint while
+routed compact shards live on NVMe. All locations are captured in the
+published bundle; the common service receives only the stable bundle path
+below `MODEL_ROOT`.
 
-The older asynchronous `Start-DeepSeekCompactPack.ps1` wrapper still rejects
-every destination under repository `work/`, which conflicts with the current
-`MODEL_ROOT=D:/quantum-llm/work/models` convention. It is therefore not the
-documented publication path until that guard is made root-aware. The direct
-packer above remains transactional/resumable and never deletes or modifies the
-source checkpoint.
+## Build outline
 
-`Publish-DeepSeekWorkerBundle.ps1` binds the compact catalog, dense/shared/MTP
-resources and tokenizer into `deepseek-v4-flash/worker-bundle-v3`. Its manifest
-also authenticates `runtime-model.tsv` schema 2. The operation and compression
-schedules are derived from the pinned config; adding that program metadata did
-not rewrite the compact expert payload.
+1. inspect and validate the pinned source with the `deepseek_v4` contract;
+2. export dense, typed, shared and routed descriptors;
+3. pack the routed catalog with `Invoke-DeepSeekCompactPack.ps1`;
+4. build and qualify optional MTP resources as one complete namespace;
+5. run independent numeric oracles for FP8 admission, attention, HCA, routing,
+   experts and I/O;
+6. publish `worker-bundle-v3` only after every dependency is complete.
 
-## Current compute boundary
+The repository deliberately keeps the direct compact-pack command instead of
+the former background wrappers: publication state already provides the
+transaction boundary and one operator-visible command is less ambiguous.
 
-Version 1 removes six-way scattered reads and creates the stable input layout
-for a direct compressed CUDA kernel. That kernel exists: since `05b474e`
-("Execute DeepSeek experts directly from packed FP4") the worker uploads the
-13,369,344-byte compact record unchanged (`CudaCompactExpertAllocation`),
-the directory publishes it as `DeviceExpertFormat::deepseek_fp4_block32`,
-and gate/up/down run the packed `__dp4a` selection-batch kernels — the same
-geometry-generic kernels the Qwen FP4 pack (ABI 3) reuses. The SM86 expansion
-path remains only for FP8 shared experts.
+## Runtime semantics
 
-A direct-FP4 qualification prototype kept routed records compact in VRAM and
-performed FP4 dequantization inside gate/up/down. It was numerically correct,
-but increased a real FFN block from 6.94 to 38.64 ms and the five-token prompt
-from 3.74 to 26.75 seconds, so the execution branch was removed. The lesson
-carried into `05b474e`: direct compact execution pays off only with packed
-vectorized (`__dp4a`) kernels, not per-value dequantization.
+The router selects exact top-6 experts. Demand acquisition waits for all six,
+uses stable route order and weights, and never reduces top-k. Routed records
+move through SSD, protected/probationary RAM and transient/protected VRAM.
+Telemetry attributes hits, reloads, reread bytes, storage wait and H2D wait.
 
-Accounting note (fixed 2026-08-10): the routed catalog originally kept
-declaring `device_bytes = 25,198,592` (the int8 slot) after direct-FP4
-landed, so VRAM budgets, preflight and the census warm set sized every FP4
-slot at ~2x its real footprint and `warm_from_census` was hard-capped at 6
-experts/layer. The catalog now declares the compact record size
-(13,369,344) for routed records; the warm cap derives from the VRAM entry
-budget (clamped 6..32/layer). Measured effect and the route-skew analysis
-behind the cap choice: docs/benchmarks.md §S1-DeepSeek.
-
-## Qualification result
-
-The complete pack contains 43 shards, 11,008 records, and 147,169,738,752
-payload bytes. A real five-token chat prompt retained the expected `Hello`
-token. The cold run took 29.05 seconds and read 12.57 GB; an immediate warm
-run took 3.61 seconds versus the previous 3.74-second warm baseline. This modest
-warm improvement does not satisfy the throughput objective. The evidence
-requires persistent RAM/VRAM placement and a faster grouped compute path;
-compact files are a prerequisite, not the final optimization.
+The current bundle is executable on the SM86 RTX 3090 provider. P40/P100
+providers and multi-device ownership remain roadmap work, not properties of
+this format.

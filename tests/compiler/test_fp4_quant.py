@@ -21,6 +21,7 @@ from compiler.expert_pack.constants import (
 from compiler.expert_pack.deepseek_quant import decode_scaled_fp4_e2m1_row
 from compiler.expert_pack.errors import SourceFormatError
 from compiler.expert_pack.quant import write_fp4_block32_rows
+from compiler.expert_pack.quality import qualify_container_against_source
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint
 from compiler.expert_pack.util import load_json
 from compiler.expert_pack.validate import validate_container
@@ -254,6 +255,62 @@ class Fp4Block32EncoderTests(unittest.TestCase):
 
 
 class Fp4ExpertPackCompileTests(unittest.TestCase):
+    def test_fp4_source_quality_gate_is_artifact_driven_and_detects_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_wide_fixture(source)
+            output = root / "pack"
+            compile_checkpoint(
+                CompileOptions(
+                    source=source,
+                    output=output,
+                    quant_profile=FP4_QUANT_PROFILE,
+                    max_expert_pack_bytes=PACK_ALIGNMENT,
+                    source_id="synthetic/quality",
+                    source_revision=source.name,
+                )
+            )
+            result = qualify_container_against_source(
+                source, output, samples_per_tensor=3,
+                maximum_relative_l2=0.30, minimum_cosine=0.90,
+            )
+            self.assertTrue(result["valid"])
+            self.assertEqual(result["sampled"]["fp4_payload_mismatches"], 0)
+            self.assertEqual(result["sampled"]["f32_value_mismatches"], 0)
+            self.assertFalse(result["records"]["unreferenced"])
+            fp4_values = result["aggregate"]["fp4"]["values"]
+            f32_values = result["aggregate"]["f32"]["values"]
+            int8_values = result["aggregate"]["int8"]["values"]
+            self.assertGreater(fp4_values, 0)
+            self.assertGreater(f32_values, 0)
+            self.assertGreater(int8_values, 0)
+            self.assertEqual(
+                result["aggregate"]["all"]["values"],
+                fp4_values + int8_values + f32_values,
+            )
+
+            manifest = load_json(output / "manifest.json")
+            entry = manifest["experts"][0]
+            pack = output / entry["pack"]
+            position = (
+                entry["offset"] + entry["sections"]["gate_up_q"]["offset"]
+            )
+            with pack.open("r+b") as handle:
+                handle.seek(position)
+                original = handle.read(1)
+                handle.seek(position)
+                handle.write(bytes((original[0] ^ 0x01,)))
+            corrupted = qualify_container_against_source(
+                source, output, samples_per_tensor=3,
+                maximum_relative_l2=0.30, minimum_cosine=0.90,
+            )
+            self.assertFalse(corrupted["valid"])
+            self.assertGreater(
+                corrupted["sampled"]["fp4_payload_mismatches"], 0
+            )
+
     def test_unaligned_geometry_is_refused(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

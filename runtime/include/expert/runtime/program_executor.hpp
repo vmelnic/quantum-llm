@@ -102,6 +102,15 @@ struct CreateOperationRequestStateResult final {
   std::shared_ptr<IOperationProviderRequestState> state;
 };
 
+// Exact accounting for a retained request moved out of execution memory.
+// `parked_bytes` includes KV pages and provider-private state required to
+// restore the request without replaying its retained prefix.
+struct RequestStateParkingResult final {
+  Status status;
+  std::uint64_t populated_pages{};
+  std::uint64_t parked_bytes{};
+};
+
 struct OperationExecutionResult final {
   Status status;
   // Exact artifact output-port order. The interpreter rejects a partial set,
@@ -254,6 +263,31 @@ class IOperationProvider {
     return {ErrorCode::invalid_argument,
             "operation provider has no retention rewind implementation"};
   }
+  // Rebinds request-scoped limits and retention policy before an append-only
+  // retained session consumes its next prompt delta. Providers that derive
+  // all limits from each invocation need no private update.
+  [[nodiscard]] virtual Status rebind_request_state(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      const ProgramRequestContext&) {
+    return Status::success();
+  }
+  [[nodiscard]] virtual bool supports_request_state_parking()
+      const noexcept {
+    return false;
+  }
+  [[nodiscard]] virtual RequestStateParkingResult park_request_state(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      std::uint32_t) {
+    return {{ErrorCode::invalid_argument,
+             "operation provider has no request-state parking implementation"},
+            0U, 0U};
+  }
+  [[nodiscard]] virtual RequestStateParkingResult restore_request_state(
+      const std::shared_ptr<IOperationProviderRequestState>&) {
+    return {{ErrorCode::invalid_argument,
+             "operation provider has no request-state restore implementation"},
+            0U, 0U};
+  }
   [[nodiscard]] virtual PrepareOperationResult prepare_exact_decode(
       const ExactDecodePreparationContext&) {
     return {{ErrorCode::invalid_argument,
@@ -327,6 +361,11 @@ struct ExecutionProviderModule final {
     // True only when the selected provider implements request-scoped token
     // sampling for the artifact's token-selection capability.
     bool sampling_supported{};
+    // Parking releases an execution slot while retaining exact request state
+    // in host memory. It is capability-driven and independent of model family.
+    bool session_parking{};
+    std::uint64_t session_park_ram_bytes{};
+    std::uint64_t session_park_page_capacity{};
   } service;
   ExecutionProviderDefinition definition;
   std::shared_ptr<IModelTensorStore> tensor_store;
@@ -407,8 +446,13 @@ class ProgramExecutionSession final {
       std::uint32_t next_position) const noexcept;
   [[nodiscard]] Status rewind_retention(
       std::uint32_t next_position) const noexcept;
+  [[nodiscard]] RequestStateParkingResult park_retention(
+      std::uint32_t next_position) const noexcept;
+  [[nodiscard]] RequestStateParkingResult restore_retention() const noexcept;
   [[nodiscard]] Status rebind_request(
       ProgramRequestContext request) const noexcept;
+  [[nodiscard]] Status begin_retention_transaction() const noexcept;
+  [[nodiscard]] Status end_retention_transaction() const noexcept;
   [[nodiscard]] bool exact_decode_available() const noexcept;
   [[nodiscard]] Status synchronize_exact_decode(
       std::uint32_t next_token, std::uint32_t target_position,
@@ -430,7 +474,10 @@ class ProgramExecutionSession final {
   using SequenceAvailable = std::function<bool()>;
   using ExecuteSequence = Execute;
   using RetentionControl = std::function<Status(std::uint32_t)>;
+  using Park = std::function<RequestStateParkingResult(std::uint32_t)>;
+  using Restore = std::function<RequestStateParkingResult()>;
   using Rebind = std::function<Status(ProgramRequestContext)>;
+  using TransactionControl = std::function<Status()>;
   using ExactDecodeAvailable = std::function<bool()>;
   using SynchronizeExactDecodeBatch = std::function<Status(
       std::span<const std::uint32_t>, std::uint32_t, bool)>;
@@ -442,7 +489,10 @@ class ProgramExecutionSession final {
   [[nodiscard]] static ProgramExecutionSession from_callbacks(
       Execute execute, SequenceAvailable sequence_available,
       ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
-      RetentionControl rewind_retention, Rebind rebind,
+      RetentionControl rewind_retention, Park park_retention,
+      Restore restore_retention, Rebind rebind,
+      TransactionControl begin_transaction,
+      TransactionControl end_transaction,
       ExactDecodeAvailable exact_available,
       SynchronizeExactDecodeBatch synchronize_exact,
       ExecuteExactDecode execute_exact, Cancel cancel);
