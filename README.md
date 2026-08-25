@@ -3,10 +3,12 @@
 Quantum LLM is a native Windows/CUDA research runtime for exact inference when
 one model's useful state must be placed across GPU memory, system memory and
 NVMe. It is built for a self-contained RTX 3090 host and currently executes
-two materially different workloads through one artifact-driven VM:
+three models through one artifact-driven VM:
 
 - **Qwen3.8-27B FP4:** dense/hybrid weights in VRAM, recurrent state on the
   GPU and progressively allocated exact F16 long-context KV in host RAM;
+- **Ornith-1.5-35B-A3B FP4:** dense/recurrent organs plus exact top-8 standard
+  FP4 expert pages split dynamically between its host bank and routed VRAM;
 - **DeepSeek-V4-Flash:** resident dense/shared organs plus exact top-6 routed
   experts demand-paged through NVMe → RAM → VRAM.
 
@@ -18,8 +20,8 @@ exact F16 KV for a smaller representation.
 > **Current status:** functional research/pilot software, not yet
 > production-ready for the 262K coding target. Qwen short-context service
 > works, but an exact-F16 262,001-token prefill measured 2,183.815 seconds.
-> DeepSeek works beyond RAM+VRAM through exact expert paging, but currently
-> measures about 0.89 end-to-end tok/s on the reference host. See
+> DeepSeek works beyond RAM+VRAM through exact expert paging, but its latest
+> short `hi` gate measured 0.94 end-to-end tok/s on the reference host. See
 > [Benchmarks](docs/benchmarks.md) and
 > [Production readiness](docs/production-readiness.md).
 
@@ -60,7 +62,7 @@ common HTTP service ─► common native VM ─► capability providers
         └──────────────────────────────────────┘
 ```
 
-The common service and VM do not branch on Qwen, DeepSeek, layer counts or
+The common service and VM do not branch on Qwen, Ornith, DeepSeek, layer counts or
 family tensor paths. A source adapter understands an upstream checkpoint's
 names; the published program then drives execution. New mathematics or a new
 encoding needs a provider and numerical qualification, not a second server,
@@ -68,8 +70,8 @@ task or deployment path.
 
 ## What it provides today
 
-- source-pinned, transactionally published Qwen FP4 and DeepSeek artifacts;
-- one capability-driven model program and native runner for both models;
+- source-pinned, transactionally published Qwen, Ornith and DeepSeek artifacts;
+- one capability-driven model program and native runner for all three models;
 - packed FP4 E2M1/UE8M0 SM86 kernels and exact format reporting;
 - Windows IOCP, bounded staging and protected RAM/VRAM expert caches;
 - exact DeepSeek top-k with per-tier hits, reloads, bytes and wait telemetry;
@@ -87,21 +89,21 @@ public-network edge.
 
 | Project | Its strength | Why Quantum LLM is different |
 |---|---|---|
-| [Ollama](https://github.com/ollama/ollama) | simple local model acquisition and lifecycle on top of a broadly supported backend | Quantum LLM is not a desktop model manager; it exposes artifact ABIs, exact tier traffic and per-organ placement for two controlled research targets |
+| [Ollama](https://github.com/ollama/ollama) | simple local model acquisition and lifecycle on top of a broadly supported backend | Quantum LLM is not a desktop model manager; it exposes artifact ABIs, exact tier traffic and per-organ placement for three controlled model shapes |
 | [llama.cpp](https://github.com/ggml-org/llama.cpp) | portable GGUF inference, many quantizations/backends, CPU+GPU offload and a mature [server](https://github.com/ggml-org/llama.cpp/tree/master/tools/server) | llama.cpp is the better general local runtime; Quantum LLM trades breadth for compute-ready records, native Windows expert paging and exact placement/accounting experiments |
 | [vLLM](https://docs.vllm.ai/) | high-throughput GPU serving, continuous batching, PagedAttention and tensor/pipeline parallelism | vLLM is the better resident/distributed production server; Quantum LLM targets a single host where sparse weights may exceed RAM+VRAM and storage traffic is part of the execution contract |
-| [SGLang](https://docs.sglang.io/) / [TensorRT-LLM](https://docs.nvidia.com/tensorrt-llm/) | production scheduling, prefix reuse, optimized attention and multi-GPU kernels | Quantum LLM has a far smaller serving surface; its focus is exact heterogeneous state ownership and old/new GPU organ placement, not replacing these schedulers |
+| [SGLang](https://docs.sglang.io/) / [TensorRT-LLM](https://docs.nvidia.com/tensorrt-llm/) | production scheduling, prefix reuse, optimized attention and multi-GPU kernels | Quantum LLM has a far smaller serving surface; its focus is exact heterogeneous state ownership on one controlled host, not replacing these schedulers |
 | [KTransformers](https://github.com/kvcache-ai/ktransformers) | optimized CPU/GPU heterogeneous MoE execution with hot experts on GPU | Quantum LLM adds an explicit NVMe tier, immutable logical expert pages and Windows IOCP, but is currently slower and narrower |
 | [AirLLM](https://github.com/lyogavin/airllm) | running oversized dense models by loading layers sequentially | Quantum LLM rejects per-token dense-layer streaming as its speed path; it pages only sparse routed experts and treats dense/KV organs separately |
-| [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | the closest overlap: expert offload/prefetch, activation caching, batching and multi-GPU MoE serving | SSD expert offload alone is therefore not a novelty claim. Quantum LLM's distinct work is its fail-closed compute-ready artifact/program ABI, exact byte/tier attribution and Qwen exact-KV plus Pascal/3090 organ-placement research |
+| [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | the closest overlap: expert offload/prefetch, activation caching, batching and multi-GPU MoE serving | SSD expert offload alone is therefore not a novelty claim. Quantum LLM's distinct work is its fail-closed compute-ready artifact/program ABI, exact byte/tier attribution and dense/sparse organ placement through one VM |
 
 The honest advantage is not “faster than everything.” It is a controlled
 system in which a huge sparse model can execute exactly beyond RAM+VRAM and
 every representation, placement decision and transfer can be verified. The
-active research question is whether the same artifact VM can bind organs to an
-RTX 3090 plus Pascal HBM devices and turn that control into a demonstrated
-throughput advantage. Until the gates in [Roadmap](docs/roadmap.md) pass, that
-remains a target rather than a result.
+active research question is whether that control can produce a demonstrated
+maximum-context and novel-route throughput advantage on the self-contained
+RTX 3090 host. Until the gates in [Roadmap](docs/roadmap.md) pass, that remains
+a target rather than a result.
 
 ## Quick start
 
@@ -122,6 +124,14 @@ The same public path selects DeepSeek:
 ```bash
 ./ops/model.sh start deepseek
 ./ops/model.sh chat deepseek
+./ops/model.sh stop all
+```
+
+Ornith uses that same path and service task:
+
+```bash
+./ops/model.sh start ornith
+./ops/model.sh chat ornith
 ./ops/model.sh stop all
 ```
 

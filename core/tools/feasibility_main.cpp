@@ -31,7 +31,7 @@ expert::core::ManifestResources ParseManifest(std::string_view text) {
          "model_program", "quantization", "kernel_abi", "alignment",
          "tensors", "experts", "packs", "indexes", "masses",
          "requirements", "tokenizer", "integrity"},
-        {}, "manifest");
+        {"auxiliary_tensors"}, "manifest");
     const auto& model_program = Required(root, "model_program", "manifest")
                                     .AsObject("manifest.model_program");
     RequireExactKeys(model_program, {"format", "path", "bytes", "sha256"},

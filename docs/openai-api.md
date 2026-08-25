@@ -77,8 +77,17 @@ model, which is outside this project's serving goal.
 
 ## Limits and errors
 
-Model ID, roles, body size, prompt+output context, output ceiling, media,
-sampling values and tools are validated before admission. Authentication uses
-401; malformed/unsupported requests use 400; queue/slot/KV exhaustion uses
-503; unknown model/routes use 404. Clients should not retry 400/401 responses
-or create unbounded 503 retry loops.
+Model ID, roles, body size, service output ceiling, media, sampling values and
+tools are validated before admission. The service may advertise an absolute
+output ceiling of `max_context - 1`; after exact prompt tokenization, the
+effective generation ceiling is:
+
+```text
+min(requested_output_tokens, max_context - exact_prompt_tokens)
+```
+
+This clamp does not preallocate KV. KV pages grow only with populated prompt
+and generated positions. Authentication uses 401; malformed/unsupported
+requests use 400; queue/slot/KV exhaustion uses 503; unknown model/routes use
+404. Clients should not retry 400/401 responses or create unbounded 503 retry
+loops.

@@ -34,6 +34,14 @@ class TensorInfo:
     shape: tuple[int, ...]
     offset: int
     nbytes: int
+    # Logical tensor regions keep their own stable name while referring back
+    # to the immutable physical SafeTensors entry which owns the bytes.
+    source_name: str | None = None
+    source_byte_offset: int = 0
+
+    @property
+    def physical_name(self) -> str:
+        return self.source_name or self.name
 
 
 class TensorView:
@@ -114,12 +122,65 @@ class SafeTensorCheckpoint:
                 raise SourceFormatError(f"index maps tensors to wrong shard: {mismatched[:3]}")
         return tensors, shard_names
 
-    def open_tensor(self, name: str) -> TensorView:
-        try:
-            info = self.tensors[name]
-        except KeyError as error:
-            raise SourceFormatError(f"unknown source tensor: {name}") from error
+    def open_tensor(self, tensor: str | TensorInfo) -> TensorView:
+        if isinstance(tensor, str):
+            try:
+                info = self.tensors[tensor]
+            except KeyError as error:
+                raise SourceFormatError(f"unknown source tensor: {tensor}") from error
+        else:
+            info = tensor
+            try:
+                physical = self.tensors[info.physical_name]
+            except KeyError as error:
+                raise SourceFormatError(
+                    f"unknown physical source tensor: {info.physical_name}"
+                ) from error
+            expected_bytes = _element_count(info.shape) * DTYPE_BYTES[info.dtype]
+            if (
+                info.shard != physical.shard
+                or info.dtype != physical.dtype
+                or info.nbytes != expected_bytes
+                or info.source_byte_offset < 0
+                or info.source_byte_offset + info.nbytes > physical.nbytes
+                or info.offset != physical.offset + info.source_byte_offset
+            ):
+                raise SourceFormatError(
+                    f"invalid source tensor region: {info.name}"
+                )
         return TensorView(self.root / info.shard, info)
+
+    def tensor_region(
+        self,
+        source_name: str,
+        logical_name: str,
+        shape: tuple[int, ...],
+        byte_offset: int,
+    ) -> TensorInfo:
+        try:
+            physical = self.tensors[source_name]
+        except KeyError as error:
+            raise SourceFormatError(f"unknown source tensor: {source_name}") from error
+        if logical_name in self.tensors and logical_name != source_name:
+            raise SourceFormatError(
+                f"logical tensor region collides with physical tensor: {logical_name}"
+            )
+        nbytes = _element_count(shape) * DTYPE_BYTES[physical.dtype]
+        if byte_offset < 0 or byte_offset + nbytes > physical.nbytes:
+            raise SourceFormatError(
+                f"source tensor region exceeds {source_name}: "
+                f"offset={byte_offset}, bytes={nbytes}, source_bytes={physical.nbytes}"
+            )
+        return TensorInfo(
+            name=logical_name,
+            shard=physical.shard,
+            dtype=physical.dtype,
+            shape=shape,
+            offset=physical.offset + byte_offset,
+            nbytes=nbytes,
+            source_name=source_name if logical_name != source_name or byte_offset else None,
+            source_byte_offset=byte_offset,
+        )
 
     def source_files(self) -> Iterator[Path]:
         yield self.root / "config.json"
@@ -198,4 +259,3 @@ def _read_shard_header(path: Path, shard_name: str) -> dict[str, TensorInfo]:
     if not result:
         raise SourceFormatError(f"SafeTensors shard has no tensors: {path}")
     return result
-

@@ -17,6 +17,7 @@ inline constexpr std::uint32_t kExpertEncodingAbiFp4Block32 = 2;
 // On-record quantization ABI IDs used by the Expert Pack v1 header.
 inline constexpr std::uint32_t kExpertRecordAbiInt8PerRow = 1;
 inline constexpr std::uint32_t kExpertRecordAbiFp4Block32 = 3;
+inline constexpr std::uint32_t kExpertRecordAbiFp4Relu2Block32 = 4;
 // Compatibility names for existing artifact adapters. New common code uses
 // encoding ABI, source ABI, and record ABI as separate fields.
 inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow =

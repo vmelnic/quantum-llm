@@ -47,7 +47,8 @@ make_sm86_hybrid_delta_moe_callable_provider(
 er::WorkerProviderDefinition make_sm86_dense_fp4_provider();
 er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
-    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view, bool);
+    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
+    std::string_view, bool);
 #ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
 er::WorkerProviderDefinition make_sm86_compressed_sparse_moe_provider();
 er::CreateExecutionProviderModuleResult
@@ -449,7 +450,8 @@ er::ExecutionProviderModule create_module(
                root, options.max_context, options.capacity,
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
                options.kv_cache_mib << 20U, options.kv_page_tokens,
-               options.kv_cache_dtype, options.profile_gpu_phases);
+               options.kv_cache_dtype, options.placement_profile,
+               options.profile_gpu_phases);
          }});
   }
   {

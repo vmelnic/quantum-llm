@@ -55,30 +55,37 @@ HybridDispatchPlanner::HybridDispatchPlanner(HybridDispatchConfig config)
 void HybridDispatchPlanner::observe_cpu(std::uint64_t elapsed_ns,
                                         std::uint64_t selections) noexcept {
   if (elapsed_ns == 0 || selections == 0) return;
+  std::lock_guard lock(mutex_);
   update_ewma(telemetry_.cpu_ns_per_selection,
               static_cast<double>(elapsed_ns) / selections,
               config_.observation_ewma_alpha);
+  ++telemetry_.cpu_observations;
 }
 
 void HybridDispatchPlanner::observe_gpu(std::uint64_t elapsed_ns,
                                         std::uint64_t selections) noexcept {
   if (elapsed_ns == 0 || selections == 0) return;
+  std::lock_guard lock(mutex_);
   update_ewma(telemetry_.gpu_ns_per_selection,
               static_cast<double>(elapsed_ns) / selections,
               config_.observation_ewma_alpha);
+  ++telemetry_.gpu_observations;
 }
 
 void HybridDispatchPlanner::observe_h2d(std::uint64_t elapsed_ns,
                                         std::uint64_t bytes) noexcept {
   if (elapsed_ns == 0 || bytes == 0) return;
+  std::lock_guard lock(mutex_);
   update_ewma(telemetry_.h2d_bytes_per_second,
               static_cast<double>(bytes) * 1.0e9 /
                   static_cast<double>(elapsed_ns),
               config_.observation_ewma_alpha);
+  ++telemetry_.h2d_observations;
 }
 
 HybridDispatchPlan HybridDispatchPlanner::plan(
     std::span<const HybridDispatchCandidate> candidates) {
+  std::lock_guard lock(mutex_);
   HybridDispatchPlan result;
   if (candidates.empty()) {
     result.status = {ErrorCode::invalid_argument,
@@ -157,7 +164,14 @@ HybridDispatchPlan HybridDispatchPlanner::plan(
         ++telemetry_.gpu_cost_wins;
         break;
       case HybridDispatchReason::cpu_stable_tie:
+      case HybridDispatchReason::gpu_stable_tie:
         ++telemetry_.stable_ties;
+        break;
+      case HybridDispatchReason::cpu_calibration:
+        ++telemetry_.cpu_calibrations;
+        break;
+      case HybridDispatchReason::gpu_cache_warm:
+        ++telemetry_.gpu_cache_warms;
         break;
     }
   };
@@ -191,13 +205,24 @@ HybridDispatchPlan HybridDispatchPlanner::plan(
     }
   }
 
-  std::sort(flexible.begin(), flexible.end(),
-            [&](const auto& left, const auto& right) {
-              const auto left_cost = cpu_cost(left);
-              const auto right_cost = cpu_cost(right);
-              return left_cost != right_cost ? left_cost > right_cost
-                                             : left.expert < right.expert;
-            });
+  std::sort(flexible.begin(), flexible.end(), [&](const auto& left,
+                                                  const auto& right) {
+    const auto left_cost = cpu_cost(left);
+    const auto right_cost = cpu_cost(right);
+    if (left_cost != right_cost) return left_cost > right_cost;
+    if (left.placement_temperature != right.placement_temperature)
+      return left.placement_temperature > right.placement_temperature;
+    if (left.last_access != right.last_access)
+      return left.last_access > right.last_access;
+    return left.expert < right.expert;
+  });
+  std::size_t gpu_uploads = static_cast<std::size_t>(std::count_if(
+      result.decisions.begin(), result.decisions.end(), [](const auto& value) {
+        return value.executor == HybridExecutor::gpu_upload;
+      }));
+  bool cpu_probe_pending = config_.bootstrap_cpu_probe &&
+                           telemetry_.h2d_observations != 0U &&
+                           telemetry_.cpu_observations == 0U;
   for (const auto& candidate : flexible) {
     const auto cpu_finish =
         saturating_add(result.projected_cpu_ns, cpu_cost(candidate));
@@ -210,12 +235,34 @@ HybridDispatchPlan HybridDispatchPlanner::plan(
         saturating_add(result.projected_gpu_ns, gpu_cost(candidate));
     const auto gpu_finish = saturating_add(h2d_finish, gpu_compute_finish);
     const auto gpu_critical = std::max(result.projected_cpu_ns, gpu_finish);
-    if (gpu_critical < cpu_critical) {
+    const bool h2d_unmeasured = config_.require_live_h2d_before_cpu &&
+                                telemetry_.h2d_observations == 0U;
+    const bool warm_gpu = gpu_uploads < config_.minimum_gpu_uploads;
+    if (h2d_unmeasured || warm_gpu) {
       result.projected_h2d_ns = h2d_finish;
       result.projected_gpu_ns = gpu_compute_finish;
       append({candidate.expert, HybridExecutor::gpu_upload,
-              HybridDispatchReason::gpu_lower_critical_path, cpu_critical,
+              warm_gpu ? HybridDispatchReason::gpu_cache_warm
+                       : HybridDispatchReason::gpu_lower_critical_path,
+              cpu_critical,
               gpu_critical});
+      ++gpu_uploads;
+    } else if (cpu_probe_pending) {
+      result.projected_cpu_ns = cpu_finish;
+      append({candidate.expert, HybridExecutor::cpu_local,
+              HybridDispatchReason::cpu_calibration, cpu_critical,
+              gpu_critical});
+      cpu_probe_pending = false;
+    } else if (gpu_critical < cpu_critical ||
+               (gpu_critical == cpu_critical && config_.prefer_gpu_on_tie)) {
+      result.projected_h2d_ns = h2d_finish;
+      result.projected_gpu_ns = gpu_compute_finish;
+      append({candidate.expert, HybridExecutor::gpu_upload,
+              gpu_critical == cpu_critical
+                  ? HybridDispatchReason::gpu_stable_tie
+                  : HybridDispatchReason::gpu_lower_critical_path,
+              cpu_critical, gpu_critical});
+      ++gpu_uploads;
     } else {
       result.projected_cpu_ns = cpu_finish;
       append({candidate.expert, HybridExecutor::cpu_local,
@@ -241,10 +288,12 @@ HybridDispatchPlan HybridDispatchPlanner::plan(
 }
 
 HybridDispatchTelemetry HybridDispatchPlanner::telemetry() const noexcept {
+  std::lock_guard lock(mutex_);
   return telemetry_;
 }
 
 std::vector<HybridDispatchDecision> HybridDispatchPlanner::trace() const {
+  std::lock_guard lock(mutex_);
   if (trace_.size() < config_.maximum_trace_decisions || next_trace_slot_ == 0)
     return trace_;
   std::vector<HybridDispatchDecision> ordered;

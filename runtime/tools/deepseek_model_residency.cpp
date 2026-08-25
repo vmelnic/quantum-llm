@@ -40,6 +40,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -271,11 +272,16 @@ int main(int argc, char** argv) {
                    "<dense-bundle> <typed-bundle> <checkpoint> "
                    "<attention-oracle> <routed-catalog> <io-oracle> "
                    "<shared-set> [prompt-token-file] [max-new-tokens] "
-                   "[host-cache-gib] [compact-vram-cache-gib]\n";
+                   "[host-cache-gib] [compact-vram-cache-gib]\n"
+                   "       prompt-token-file may be "
+                   "--attention-batch-parity-only\n";
       return 64;
     }
     const std::filesystem::path source = argv[3];
-    const auto prompt = argc >= 9
+    const bool attention_batch_parity_only =
+        argc == 9 &&
+        std::string_view(argv[8]) == "--attention-batch-parity-only";
+    const auto prompt = argc >= 9 && !attention_batch_parity_only
                             ? std::optional(prompt_tokens(argv[8]))
                             : std::nullopt;
     const auto max_new_tokens = argc >= 10
@@ -528,6 +534,205 @@ int main(int argc, char** argv) {
     check(cudaMemcpy(actual_output.data(), device_output,
                      stream_values * sizeof(float), cudaMemcpyDeviceToHost),
           "copy attention output");
+    {
+      constexpr std::uint32_t parity_rows = 16U;
+      const auto scalar_parity_state =
+          er::cuda::create_deepseek_attention_state(oracle_ratio, 4096U);
+      const auto batch_parity_state =
+          er::cuda::create_deepseek_attention_state(oracle_ratio, 4096U);
+      const auto batch_workspace =
+          er::cuda::create_deepseek_attention_batch_workspace(4096U,
+                                                               parity_rows);
+      const auto capacity_attention_workspace =
+          er::cuda::create_deepseek_attention_batch_workspace(
+              4096U, er::cuda::kDeepSeekMaximumSequenceRows);
+      const auto capacity_ffn_workspace =
+          er::cuda::create_deepseek_ffn_batch_workspace(
+              er::cuda::kDeepSeekMaximumSequenceRows);
+      require(scalar_parity_state.status.ok() &&
+                  scalar_parity_state.state &&
+                  batch_parity_state.status.ok() &&
+                  batch_parity_state.state && batch_workspace.status.ok() &&
+                  batch_workspace.workspace &&
+                  capacity_attention_workspace.status.ok() &&
+                  capacity_attention_workspace.workspace &&
+                  capacity_ffn_workspace.status.ok() &&
+                  capacity_ffn_workspace.workspace,
+              "cannot allocate DeepSeek batch parity state");
+      std::vector<float> parity_streams(
+          static_cast<std::size_t>(parity_rows) * token_stream_values);
+      for (std::uint32_t row = 0U; row < parity_rows; ++row)
+        std::copy_n(host_streams.data(), token_stream_values,
+                    parity_streams.data() +
+                        static_cast<std::size_t>(row) * token_stream_values);
+      std::vector<float> parity_rope(
+          static_cast<std::size_t>(parity_rows) * 8U * 32U);
+      for (std::uint32_t row = 0U; row < parity_rows; ++row) {
+        const auto ratio_four_start = row + 1U >= 4U ? row + 1U - 4U : 0U;
+        const auto ratio_128_start =
+            row + 1U >= 128U ? row + 1U - 128U : 0U;
+        const std::array<std::array<float, 32U>, 8U> values{
+            rope_values(row, false, false),
+            rope_values(row, true, false),
+            rope_values(row, false, true),
+            rope_values(row, true, true),
+            rope_values(ratio_four_start, false, true),
+            rope_values(ratio_four_start, true, true),
+            rope_values(ratio_128_start, false, true),
+            rope_values(ratio_128_start, true, true)};
+        std::memcpy(parity_rope.data() +
+                        static_cast<std::size_t>(row) * 8U * 32U,
+                    values.data(), sizeof(values));
+      }
+      float *device_parity_streams = nullptr, *device_scalar_output = nullptr,
+            *device_batch_output = nullptr, *device_parity_rope = nullptr;
+      check(cudaMalloc(reinterpret_cast<void**>(&device_parity_streams),
+                       parity_streams.size() * sizeof(float)),
+            "allocate DeepSeek parity streams");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_scalar_output),
+                       parity_streams.size() * sizeof(float)),
+            "allocate DeepSeek scalar parity output");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_batch_output),
+                       parity_streams.size() * sizeof(float)),
+            "allocate DeepSeek batch parity output");
+      check(cudaMalloc(reinterpret_cast<void**>(&device_parity_rope),
+                       parity_rope.size() * sizeof(float)),
+            "allocate DeepSeek parity RoPE");
+      check(cudaMemcpy(device_parity_streams, parity_streams.data(),
+                       parity_streams.size() * sizeof(float),
+                       cudaMemcpyHostToDevice),
+            "upload DeepSeek parity streams");
+      check(cudaMemcpy(device_parity_rope, parity_rope.data(),
+                       parity_rope.size() * sizeof(float),
+                       cudaMemcpyHostToDevice),
+            "upload DeepSeek parity RoPE");
+      std::vector<er::cuda::DeepSeekAttentionBatchRow> batch_rows(
+          parity_rows);
+      for (std::uint32_t row = 0U; row < parity_rows; ++row) {
+        auto* rope = device_parity_rope +
+                     static_cast<std::size_t>(row) * 8U * 32U;
+        const auto primary = oracle_ratio == 0U ? 0U : 2U;
+        const auto emits = oracle_ratio != 0U &&
+                           (row + 1U) % oracle_ratio == 0U;
+        const auto group = oracle_ratio == 4U ? 4U : 6U;
+        batch_rows[row] = {rope + primary * 32U,
+                           rope + (primary + 1U) * 32U,
+                           emits ? rope + group * 32U : nullptr,
+                           emits ? rope + (group + 1U) * 32U : nullptr, row};
+        const auto scalar_status = er::cuda::deepseek_attention_decode({
+            &oracle_attention, scalar_parity_state.state.get(),
+            device_parity_streams +
+                static_cast<std::size_t>(row) * token_stream_values,
+            device_scalar_output +
+                static_cast<std::size_t>(row) * token_stream_values,
+            batch_rows[row].cosine, batch_rows[row].sine,
+            batch_rows[row].compressed_cosine,
+            batch_rows[row].compressed_sine, row, 1e-6F, 20U, nullptr});
+        require(scalar_status.ok(), std::string(scalar_status.message()));
+      }
+      const auto batch_status = er::cuda::deepseek_attention_decode_batch({
+          &oracle_attention, batch_parity_state.state.get(),
+          batch_workspace.workspace.get(), device_parity_streams,
+          device_batch_output, batch_rows.data(), parity_rows, 1e-6F, 20U,
+          nullptr, nullptr});
+      require(batch_status.ok(), std::string(batch_status.message()));
+      check(cudaDeviceSynchronize(),
+            "synchronize DeepSeek attention batch parity");
+      std::vector<float> scalar_parity(parity_streams.size());
+      std::vector<float> batch_parity(parity_streams.size());
+      check(cudaMemcpy(scalar_parity.data(), device_scalar_output,
+                       scalar_parity.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "copy DeepSeek scalar parity output");
+      check(cudaMemcpy(batch_parity.data(), device_batch_output,
+                       batch_parity.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "copy DeepSeek batch parity output");
+      float batch_parity_maximum = 0.0F;
+      for (std::size_t index = 0U; index < scalar_parity.size(); ++index) {
+        require(std::isfinite(batch_parity[index]),
+                "DeepSeek batch parity output is non-finite");
+        batch_parity_maximum = std::max(
+            batch_parity_maximum,
+            std::abs(batch_parity[index] - scalar_parity[index]));
+      }
+      require(batch_parity_maximum < 1e-2F,
+              "DeepSeek 16-row batch changed exact attention numerics; max=" +
+                  std::to_string(batch_parity_maximum));
+      auto scalar_ffn_state = er::cuda::create_deepseek_ffn_state(oracle_layer);
+      auto route_workspace =
+          er::cuda::create_deepseek_ffn_batch_workspace(parity_rows);
+      require(scalar_ffn_state.status.ok() && scalar_ffn_state.state &&
+                  route_workspace.status.ok() && route_workspace.workspace,
+              "cannot allocate DeepSeek FFN route parity state");
+      std::array<std::uint32_t, parity_rows> parity_tokens{};
+      std::vector<float> scalar_route_weights(
+          static_cast<std::size_t>(parity_rows) * 6U);
+      std::vector<std::uint32_t> scalar_route_indices(
+          static_cast<std::size_t>(parity_rows) * 6U);
+      for (std::uint32_t row = 0U; row < parity_rows; ++row) {
+        parity_tokens[row] = row;
+        const auto route_status = er::cuda::deepseek_ffn_route({
+            &oracle_ffn, scalar_ffn_state.state.get(),
+            device_batch_output +
+                static_cast<std::size_t>(row) * token_stream_values,
+            row, 1e-6F, 20U, nullptr});
+        require(route_status.ok(), std::string(route_status.message()));
+        check(cudaMemcpy(scalar_route_weights.data() + row * 6U,
+                         scalar_ffn_state.state->routing_weights(),
+                         6U * sizeof(float), cudaMemcpyDeviceToHost),
+              "copy DeepSeek scalar route parity weights");
+        check(cudaMemcpy(scalar_route_indices.data() + row * 6U,
+                         scalar_ffn_state.state->expert_indices(),
+                         6U * sizeof(std::uint32_t), cudaMemcpyDeviceToHost),
+              "copy DeepSeek scalar route parity indices");
+      }
+      const auto batch_route_status = er::cuda::deepseek_ffn_route_batch({
+          &oracle_ffn, scalar_ffn_state.state.get(),
+          route_workspace.workspace.get(), device_batch_output,
+          parity_tokens.data(), parity_rows, 1e-6F, 20U, nullptr});
+      require(batch_route_status.ok(),
+              std::string(batch_route_status.message()));
+      std::vector<float> batch_route_weights(scalar_route_weights.size());
+      std::vector<std::uint32_t> batch_route_indices(
+          scalar_route_indices.size());
+      check(cudaMemcpy(batch_route_weights.data(),
+                       route_workspace.workspace->routing_weights(),
+                       batch_route_weights.size() * sizeof(float),
+                       cudaMemcpyDeviceToHost),
+            "copy DeepSeek batch route parity weights");
+      check(cudaMemcpy(batch_route_indices.data(),
+                       route_workspace.workspace->expert_indices(),
+                       batch_route_indices.size() * sizeof(std::uint32_t),
+                       cudaMemcpyDeviceToHost),
+            "copy DeepSeek batch route parity indices");
+      float route_parity_maximum = 0.0F;
+      for (std::size_t index = 0U; index < scalar_route_weights.size();
+           ++index) {
+        require(batch_route_indices[index] == scalar_route_indices[index],
+                "DeepSeek batch route selected a different expert");
+        route_parity_maximum = std::max(
+            route_parity_maximum,
+            std::abs(batch_route_weights[index] -
+                     scalar_route_weights[index]));
+      }
+      require(route_parity_maximum < 1e-3F,
+              "DeepSeek 16-row batch changed exact routing numerics; max=" +
+                  std::to_string(route_parity_maximum));
+      check(cudaFree(device_parity_rope), "free DeepSeek parity RoPE");
+      check(cudaFree(device_batch_output),
+            "free DeepSeek batch parity output");
+      check(cudaFree(device_scalar_output),
+            "free DeepSeek scalar parity output");
+      check(cudaFree(device_parity_streams),
+            "free DeepSeek parity streams");
+    }
+    if (attention_batch_parity_only) {
+      std::cout << "{\"status\":\"pass\","
+                   "\"gate\":\"deepseek-sequence-batch-parity\","
+                   "\"rows\":16}\n";
+      return 0;
+    }
     auto ffn_state = er::cuda::create_deepseek_ffn_state(oracle_layer);
     require(ffn_state.status.ok() && ffn_state.state,
             std::string(ffn_state.status.message()));

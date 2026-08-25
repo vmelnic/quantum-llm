@@ -7,6 +7,12 @@
 
 namespace expert::runtime::cuda {
 
+// The exact staged-FP16 attention path is GEMM-shaped by total query heads,
+// not by warps per KV head. Keep this contract shared by descriptor admission,
+// QKV preparation, and attention execution so a supported GQA geometry cannot
+// pass startup and then fail on its first request.
+inline constexpr std::uint32_t kMaximumExactFp16GroupedQueryHeads = 16U;
+
 struct Int8Matrix final {
   const std::int8_t* weights{};
   const float* scales{};
@@ -85,12 +91,24 @@ struct Fp4Block32Matrix final {
 [[nodiscard]] Status gemv_batch(const Int8Matrix& matrix, const float* input,
                                 float* output, std::uint32_t batch,
                                 void* stream) noexcept;
-// Large-output projection path (for example lm_head). One warp keeps several
-// request accumulators and reads each weight row once. Bounded to batch <= 8 to
-// avoid the register-pressure regression observed on smaller dense matrices.
+// Large-output projection path (for example lm_head). One warp keeps up to
+// eight request accumulators and reads each weight row once. Larger batches are
+// split into contiguous eight-row tiles by the launcher.
 [[nodiscard]] Status gemv_batch_weight_reuse(
     const Int8Matrix& matrix, const float* input, float* output,
     std::uint32_t batch, void* stream) noexcept;
+// Exact dequantization boundary for large causal-prefill tiles. The immutable
+// INT8 rows are expanded once into caller-owned FP32 scratch, then one SGEMM
+// consumes the complete activation tile. This avoids rescanning dense weights
+// once per small GEMV group while preserving the artifact's row scales.
+[[nodiscard]] Status int8_gemm_f32_batch(
+    const Int8Matrix& matrix, const float* input, float* output,
+    std::uint32_t batch, float* decoded_matrix,
+    std::uint64_t decoded_matrix_values, void* stream) noexcept;
+[[nodiscard]] Status int8_grouped_gemm_f32_batch(
+    const Int8Matrix& matrix, const float* input, float* output,
+    std::uint32_t groups, std::uint32_t batch, float* decoded_matrix,
+    std::uint64_t decoded_matrix_values, void* stream) noexcept;
 [[nodiscard]] Status gemv_f32(const float* matrix, std::uint32_t rows,
                               std::uint32_t columns, const float* input,
                               float* output, void* stream) noexcept;
@@ -110,6 +128,11 @@ struct Fp4Block32Matrix final {
     const std::uint16_t* matrix, std::uint32_t rows, std::uint32_t columns,
     const float* input, float* output, std::uint32_t batch,
     void* stream) noexcept;
+[[nodiscard]] Status bf16_gemm_f32_batch(
+    const std::uint16_t* matrix, std::uint32_t rows, std::uint32_t columns,
+    const float* input, float* output, std::uint32_t batch,
+    float* decoded_matrix, std::uint64_t decoded_matrix_values,
+    void* stream) noexcept;
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;
@@ -127,6 +150,10 @@ struct Fp4Block32Matrix final {
     const float* input, const float* weight, float* output,
     std::uint32_t elements, float epsilon, void* stream) noexcept;
 [[nodiscard]] Status zero_centered_rms_norm_batch(
+    const float* input, const float* weight, float* output,
+    std::uint32_t rows, std::uint32_t elements, float epsilon,
+    void* stream) noexcept;
+[[nodiscard]] Status rms_norm_batch(
     const float* input, const float* weight, float* output,
     std::uint32_t rows, std::uint32_t elements, float epsilon,
     void* stream) noexcept;
@@ -192,6 +219,12 @@ struct Fp4Block32Matrix final {
 [[nodiscard]] Status silu_product(const float* gate, const float* up,
                                   float* output, std::uint32_t elements,
                                   void* stream) noexcept;
+[[nodiscard]] Status relu2_in_place(float* values, std::uint32_t elements,
+                                    void* stream) noexcept;
+[[nodiscard]] Status deepseek_swiglu_product(
+    const float* gate, const float* up, float* output,
+    std::uint32_t elements, float limit, bool bf16_output,
+    void* stream) noexcept;
 [[nodiscard]] Status sigmoid_scale_in_place(float* values,
                                             const float* gate,
                                             std::uint32_t elements,
@@ -256,6 +289,16 @@ struct Fp4Block32Matrix final {
     const float* input, const std::uint16_t* router_weights,
     const float* selection_bias, float* logits, float* topk_scores,
     std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
+[[nodiscard]] Status deepseek_router_hash_rows(
+    const float* input, const std::uint16_t* router_weights,
+    const std::int64_t* token_experts, const std::uint32_t* token_ids,
+    std::uint32_t rows, float* logits, float* topk_scores,
+    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
+[[nodiscard]] Status deepseek_router_learned_rows(
+    const float* input, const std::uint16_t* router_weights,
+    const float* selection_bias, std::uint32_t rows, float* logits,
+    float* topk_scores, std::uint32_t* topk_indices, float route_scale,
+    void* stream) noexcept;
 
 // Qwen3-Next full attention. q_and_gate is laid out per query head as
 // [query(head_dim), output_gate(head_dim)]. K/V caches retain only KV heads.
@@ -498,11 +541,36 @@ using PagedFp8GatedGqaStagedPrefillWorkspace =
     std::uint32_t kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float epsilon, float rope_theta,
     void* stream) noexcept;
+[[nodiscard]] Status standard_gqa_qkv_rope_fp16_batch(
+    float* query, float* key, const float* value,
+    void* fp16_keys, void* fp16_values, std::uint32_t first_rotary_position,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float rope_theta, void* stream) noexcept;
+
+// Publishes exact projected K/V rows without a positional transform. Query
+// rows remain in FP32 for the attention provider. This is a distinct ABI from
+// the RoPE path because position encoding is model mathematics, not a launch
+// policy that the runtime may infer.
+[[nodiscard]] Status standard_gqa_kv_fp16_batch(
+    const float* key, const float* value,
+    void* fp16_keys, void* fp16_values, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* stream) noexcept;
 
 // Encodes already RoPE-transformed FP16 K/V rows into the compact paged
 // FP4-E2M1/UE8M0 cache. This lets a lossless authoritative cache and an
 // approximate full-context draft cache be populated by the same target pass.
 [[nodiscard]] Status pack_gqa_kv_fp16_to_paged_fp4(
+    const void* fp16_keys, const void* fp16_values,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t rows, std::uint32_t kv_heads, std::uint32_t head_dim,
+    void* stream) noexcept;
+
+// Lossless FP16 page publication. Source rows have already passed the exact
+// Q/K normalization and rotary transform; no quantization is performed.
+[[nodiscard]] Status store_gqa_kv_fp16_to_paged(
     const void* fp16_keys, const void* fp16_values,
     const void* const* page_table, std::uint32_t full_attention_layer,
     std::uint32_t page_tokens, std::uint32_t first_cache_position,
@@ -529,6 +597,7 @@ struct HostFp16GatedGqaAttentionLaunch final {
   const void* const* host_value_pages{};
   std::uint32_t host_page_tokens{};
   std::uint32_t host_page_count{};
+  bool output_gated{true};
 };
 
 struct DeviceFp16GatedGqaAttentionLaunch final {
@@ -544,6 +613,14 @@ struct DeviceFp16GatedGqaAttentionLaunch final {
   std::uint32_t kv_heads{};
   std::uint32_t head_dim{};
   void* stream{};
+  // Optional device-resident table of device page bases. When present, it
+  // replaces the contiguous pointers and keeps exact FP16 KV progressively
+  // allocated without copying page contents through the host.
+  const void* const* device_pages{};
+  std::uint32_t device_page_layer{};
+  std::uint32_t device_page_tokens{};
+  std::uint32_t device_page_count{};
+  bool output_gated{true};
 };
 
 struct HostFp16GatedGqaAttentionWorkspace final {
@@ -661,6 +738,32 @@ struct SplitGatedDeltaPrefillLaunch final {
 // chunk in two launches instead of invoking the decode kernels per token.
 [[nodiscard]] Status split_gated_delta_prefill(
     const SplitGatedDeltaPrefillLaunch& launch) noexcept;
+
+struct Mamba2BatchLaunch final {
+  const float* projected{};       // [rows, intermediate + conv + heads]
+  const float* conv_weights{};    // [conv_size, 1, conv_kernel]
+  const float* conv_bias{};       // [conv_size]
+  const float* dt_bias{};         // [heads]
+  const float* a_log{};           // [heads]
+  const float* skip{};            // [heads]
+  const float* norm_weight{};     // [intermediate]
+  float* conv_state{};            // [conv_size, conv_kernel]
+  float* recurrent_state{};       // [heads, head_dim, state_size]
+  float* conv_output{};           // [rows, conv_size]
+  float* output{};                // [rows, intermediate]
+  std::uint32_t rows{};
+  std::uint32_t heads{};
+  std::uint32_t head_dim{};
+  std::uint32_t state_size{};
+  std::uint32_t groups{};
+  std::uint32_t conv_kernel{};
+  float epsilon{};
+  float time_step_min{};
+  void* stream{};
+};
+
+[[nodiscard]] Status mamba2_forward(
+    const Mamba2BatchLaunch& launch) noexcept;
 
 [[nodiscard]] Status argmax(const float* values, std::uint32_t count,
                             std::uint32_t* output, void* stream) noexcept;

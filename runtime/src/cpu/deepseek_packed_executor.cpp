@@ -1,4 +1,4 @@
-#include "expert/runtime/cpu/deepseek_packed_executor.hpp"
+#include "expert/runtime/cpu/fp4_host_executor.hpp"
 
 #if defined(_M_X64) || defined(__x86_64__) || defined(__amd64__)
 #include <immintrin.h>
@@ -33,7 +33,6 @@ namespace expert::runtime::cpu {
 namespace {
 
 constexpr std::uint32_t kBlockColumns = 32U;
-constexpr std::uint32_t kMaximumRowsPerExpert = 32U;
 
 float decode_ue8m0(std::uint8_t code) noexcept {
   const std::uint32_t bits = code == 0U ? 0x00400000U
@@ -158,7 +157,7 @@ const T* section(std::span<const std::byte> record,
   return reinterpret_cast<const T*>(record.data() + offset);
 }
 
-Status validate_group(const DeepSeekPackedWorkGroup& group,
+Status validate_group(const Fp4HostWorkGroup& group,
                       std::uint32_t rows, std::uint32_t top_k,
                       std::size_t input_values,
                       std::size_t output_values) {
@@ -166,12 +165,13 @@ Status validate_group(const DeepSeekPackedWorkGroup& group,
       group.hidden == 0U || group.intermediate == 0U ||
       group.hidden % kBlockColumns != 0U ||
       group.intermediate % kBlockColumns != 0U ||
-      group.selections.size() > kMaximumRowsPerExpert ||
+      group.selections.size() >
+          static_cast<std::size_t>(rows) * top_k ||
       group.output_slots.size() != group.selections.size() ||
       input_values < static_cast<std::size_t>(rows) * group.hidden ||
       output_values < group.hidden || output_values % group.hidden != 0U) {
     return {ErrorCode::invalid_argument,
-            "invalid packed DeepSeek CPU work group"};
+            "invalid FP4 host work group"};
   }
   const auto matrix_bytes = [](std::uint32_t output,
                                std::uint32_t input) -> std::uint64_t {
@@ -189,7 +189,7 @@ Status validate_group(const DeepSeekPackedWorkGroup& group,
       s.w3_scale_bytes != scale_bytes(group.intermediate, group.hidden) ||
       s.w2_scale_bytes != scale_bytes(group.hidden, group.intermediate)) {
     return {ErrorCode::invalid_argument,
-            "packed DeepSeek CPU section geometry mismatch"};
+            "FP4 host section geometry mismatch"};
   }
   const auto within = [&](std::uint64_t offset, std::uint64_t bytes) {
     return offset <= group.record_bytes.size() &&
@@ -202,28 +202,28 @@ Status validate_group(const DeepSeekPackedWorkGroup& group,
       !within(s.w2_weight_offset, s.w2_weight_bytes) ||
       !within(s.w2_scale_offset, s.w2_scale_bytes)) {
     return {ErrorCode::invalid_argument,
-            "packed DeepSeek CPU section exceeds record"};
+            "FP4 host section exceeds record"};
   }
   for (const auto selection : group.selections) {
     if (selection >= rows * top_k)
       return {ErrorCode::invalid_argument,
-              "packed DeepSeek CPU selection exceeds microbatch"};
+              "FP4 host selection exceeds microbatch"};
   }
   for (const auto slot : group.output_slots) {
     if (slot >= output_values / group.hidden)
       return {ErrorCode::invalid_argument,
-              "packed DeepSeek CPU output slot exceeds output"};
+              "FP4 host output slot exceeds output"};
   }
   return Status::success();
 }
 
 }  // namespace
 
-struct DeepSeekPackedExecutor::Impl final {
+struct Fp4HostExecutor::Impl final {
   enum class Phase : std::uint8_t { gate_up, down };
 
   struct Batch final {
-    std::span<const DeepSeekPackedWorkGroup> groups;
+    std::span<const Fp4HostWorkGroup> groups;
     const float* inputs{};
     float* outputs{};
     std::uint32_t rows{};
@@ -242,12 +242,12 @@ struct DeepSeekPackedExecutor::Impl final {
     std::uint32_t end{};
   };
 
-  explicit Impl(DeepSeekPackedExecutorConfig value) : config(value) {
+  explicit Impl(Fp4HostExecutorConfig value) : config(value) {
     if (config.maximum_threads == 0U || config.maximum_threads > 64U ||
         config.gate_chunk == 0U || config.down_chunk == 0U ||
         config.swiglu_limit < 0.0F)
       throw std::invalid_argument(
-          "invalid packed DeepSeek CPU executor configuration");
+          "invalid FP4 host executor configuration");
     metrics.maximum_threads = config.maximum_threads;
     workers.reserve(config.maximum_threads);
     for (std::uint32_t index = 0; index < config.maximum_threads; ++index)
@@ -390,18 +390,18 @@ struct DeepSeekPackedExecutor::Impl final {
         static_cast<std::uint32_t>(std::popcount(metrics.worker_mask_last));
     if (metrics.workers_used_last != active_threads) {
       return {ErrorCode::internal,
-              "packed DeepSeek CPU executor did not engage every worker"};
+              "FP4 host executor did not engage every worker"};
     }
     return Status::success();
   }
 
-  Status execute(std::span<const DeepSeekPackedWorkGroup> groups,
+  Status execute(std::span<const Fp4HostWorkGroup> groups,
                  std::span<const float> inputs, std::uint32_t rows,
                  std::uint32_t top_k, std::span<float> outputs) {
     if (groups.empty()) return Status::success();
     if (rows == 0U || top_k == 0U || inputs.empty() || outputs.empty())
       return {ErrorCode::invalid_argument,
-              "invalid packed DeepSeek CPU batch"};
+              "invalid FP4 host batch"};
     std::lock_guard execution_lock(execution_mutex);
     auto& batch = scratch;
     batch.groups = groups;
@@ -419,14 +419,14 @@ struct DeepSeekPackedExecutor::Impl final {
     for (const auto& group : groups) {
       if (group.hidden != hidden || group.intermediate != intermediate_width)
         return {ErrorCode::invalid_argument,
-                "packed DeepSeek CPU groups disagree on geometry"};
+                "FP4 host groups disagree on geometry"};
       auto status = validate_group(group, rows, top_k, inputs.size(),
                                    outputs.size());
       if (!status.ok()) return status;
       for (const auto slot : group.output_slots) {
         if (claimed[slot])
           return {ErrorCode::invalid_argument,
-                  "duplicate packed DeepSeek CPU output slot"};
+                  "duplicate FP4 host output slot"};
         claimed[slot] = true;
       }
       batch.offsets.push_back(intermediate_values);
@@ -479,14 +479,14 @@ struct DeepSeekPackedExecutor::Impl final {
     return Status::success();
   }
 
-  DeepSeekPackedExecutorTelemetry telemetry() const noexcept {
+  Fp4HostExecutorTelemetry telemetry() const noexcept {
     std::lock_guard lock(execution_mutex);
     return metrics;
   }
 
-  DeepSeekPackedExecutorConfig config;
+  Fp4HostExecutorConfig config;
   mutable std::mutex execution_mutex;
-  DeepSeekPackedExecutorTelemetry metrics;
+  Fp4HostExecutorTelemetry metrics;
   std::vector<std::thread> workers;
   std::mutex work_mutex;
   std::condition_variable work_ready;
@@ -502,20 +502,19 @@ struct DeepSeekPackedExecutor::Impl final {
   bool stopping{};
 };
 
-DeepSeekPackedExecutor::DeepSeekPackedExecutor(
-    DeepSeekPackedExecutorConfig config)
+Fp4HostExecutor::Fp4HostExecutor(Fp4HostExecutorConfig config)
     : impl_(std::make_unique<Impl>(config)) {}
 
-DeepSeekPackedExecutor::~DeepSeekPackedExecutor() = default;
+Fp4HostExecutor::~Fp4HostExecutor() = default;
 
-Status DeepSeekPackedExecutor::execute(
-    std::span<const DeepSeekPackedWorkGroup> groups,
+Status Fp4HostExecutor::execute(
+    std::span<const Fp4HostWorkGroup> groups,
     std::span<const float> inputs, std::uint32_t rows, std::uint32_t top_k,
     std::span<float> selection_outputs) {
   return impl_->execute(groups, inputs, rows, top_k, selection_outputs);
 }
 
-DeepSeekPackedExecutorTelemetry DeepSeekPackedExecutor::telemetry()
+Fp4HostExecutorTelemetry Fp4HostExecutor::telemetry()
     const noexcept {
   return impl_->telemetry();
 }

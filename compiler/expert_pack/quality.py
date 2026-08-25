@@ -20,6 +20,7 @@ from typing import Any, BinaryIO
 from .constants import (
     DTYPE_BYTES,
     FP4_QUANT_ABI_ID,
+    FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     QUANT_ABI_ID,
 )
@@ -31,7 +32,7 @@ from .quant import (
     _fp4_nearest_index,
     _fp4_pack_nibbles,
 )
-from .safetensors import SafeTensorCheckpoint, TensorView
+from .safetensors import SafeTensorCheckpoint, TensorInfo, TensorView
 from .util import load_json
 
 
@@ -100,6 +101,66 @@ def _safe_child(root: Path, relative: Any) -> Path:
             f"manifest path escapes container: {relative}"
         ) from error
     return candidate
+
+
+def _expert_source_region(
+    checkpoint: SafeTensorCheckpoint,
+    entry: dict[str, Any],
+    role: str,
+) -> TensorInfo:
+    tensors = entry.get("source_tensors")
+    shapes = entry.get("source_shape")
+    regions = entry.get("source_regions")
+    _require(
+        isinstance(tensors, dict) and isinstance(shapes, dict),
+        "expert source mapping is incomplete",
+    )
+    logical_name = tensors.get(role)
+    shape = shapes.get(role)
+    _require(
+        isinstance(logical_name, str)
+        and isinstance(shape, list)
+        and all(isinstance(value, int) for value in shape),
+        f"expert {role} source metadata is invalid",
+    )
+    if regions is None:
+        _require(
+            logical_name in checkpoint.tensors,
+            f"unknown expert source tensor: {logical_name}",
+        )
+        return checkpoint.tensors[logical_name]
+    _require(
+        isinstance(regions, dict) and set(regions) == set(tensors),
+        "expert source region map is invalid",
+    )
+    region = regions.get(role)
+    _require(isinstance(region, dict), f"expert {role} source region is invalid")
+    physical_name = region.get("tensor")
+    byte_offset = region.get("byte_offset")
+    byte_count = region.get("bytes")
+    region_shape = region.get("shape")
+    tensor_bytes = region.get("tensor_bytes")
+    tensor_shape = region.get("tensor_shape")
+    _require(
+        isinstance(physical_name, str)
+        and isinstance(byte_offset, int)
+        and not isinstance(byte_offset, bool)
+        and isinstance(byte_count, int)
+        and not isinstance(byte_count, bool)
+        and region_shape == shape,
+        f"expert {role} source region metadata is invalid",
+    )
+    info = checkpoint.tensor_region(
+        physical_name, logical_name, tuple(shape), byte_offset
+    )
+    physical = checkpoint.tensors[physical_name]
+    _require(
+        info.nbytes == byte_count
+        and tensor_bytes == physical.nbytes
+        and tensor_shape == list(physical.shape),
+        f"expert {role} source region size mismatch",
+    )
+    return info
 
 
 def _semantic_bindings(program: Path) -> dict[str, tuple[str, ...]]:
@@ -269,7 +330,8 @@ def _qualify_expert(
         pack: BinaryIO, checkpoint: SafeTensorCheckpoint,
         entry: dict[str, Any], samples_per_tensor: int,
         ) -> tuple[_Moments, int, int, list[dict[str, Any]]]:
-    _require(entry.get("quant_abi") == FP4_QUANT_ABI_ID,
+    _require(entry.get("quant_abi") in (
+                 FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID),
              "quality gate accepts only FP4 routed expert records")
     tensors = entry.get("source_tensors")
     shapes = entry.get("source_shape")
@@ -279,27 +341,31 @@ def _qualify_expert(
         and isinstance(sections, dict),
         "expert source mapping is incomplete",
     )
-    gate_elements = math.prod(shapes["gate"])
+    first_data = sections["gate_up_q"]["offset"]
+    first_scales = sections["gate_up_scales"]["offset"]
     components = {
-        "gate": (
-            sections["gate_up_q"]["offset"],
-            sections["gate_up_scales"]["offset"],
-        ),
-        "up": (
-            sections["gate_up_q"]["offset"] + gate_elements // 2,
-            sections["gate_up_scales"]["offset"]
-            + gate_elements // FP4_QUANT_GROUP_SIZE,
-        ),
         "down": (
             sections["down_q"]["offset"],
             sections["down_scales"]["offset"],
         ),
     }
+    if entry.get("quant_abi") == FP4_RELU2_EXPERT_ABI_ID:
+        components["up"] = (first_data, first_scales)
+    else:
+        gate_elements = math.prod(shapes["gate"])
+        components.update({
+            "gate": (first_data, first_scales),
+            "up": (
+                first_data + gate_elements // 2,
+                first_scales + gate_elements // FP4_QUANT_GROUP_SIZE,
+            ),
+        })
     aggregate = _Moments()
     payload_mismatches = scale_mismatches = 0
     reports: list[dict[str, Any]] = []
     for role, (data_offset, scale_offset) in components.items():
         name = tensors[role]
+        source_info = _expert_source_region(checkpoint, entry, role)
         pseudo_entry = {
             "name": name,
             "source_shape": shapes[role],
@@ -309,7 +375,7 @@ def _qualify_expert(
                 "scales": {"offset": scale_offset},
             },
         }
-        with checkpoint.open_tensor(name) as view:
+        with checkpoint.open_tensor(source_info) as view:
             moments, payload_bad, scale_bad = _qualify_fp4(
                 pack, view, pseudo_entry, samples_per_tensor
             )
@@ -318,7 +384,7 @@ def _qualify_expert(
         scale_mismatches += scale_bad
         reports.append({
             "name": name,
-            "quant_abi": FP4_QUANT_ABI_ID,
+            "quant_abi": entry["quant_abi"],
             "roles": [f"routed_expert:{role}"],
             **moments.report(),
         })
@@ -369,10 +435,21 @@ def qualify_container_against_source(
         name for entry in experts
         for name in entry.get("source_tensors", {}).values()
     }
-    all_source_names = manifest_names | expert_source_names
+    expert_physical_names = {
+        (
+            entry["source_regions"][role]["tensor"]
+            if isinstance(entry.get("source_regions"), dict)
+            else name
+        )
+        for entry in experts
+        for role, name in entry.get("source_tensors", {}).items()
+    }
+    all_source_names = manifest_names | expert_physical_names
     metadata_match = (
         len(manifest_names) == len(entries)
-        and len(expert_source_names) == len(experts) * 3
+        and len(expert_source_names) == sum(
+            len(entry.get("source_tensors", {})) for entry in experts
+        )
         and all_source_names == set(checkpoint.tensors)
         and all(
             checkpoint.tensors[entry["name"]].shape
@@ -382,19 +459,27 @@ def qualify_container_against_source(
             for entry in entries
         )
         and all(
-            checkpoint.tensors[name].shape
+            _expert_source_region(checkpoint, entry, role).shape
                 == tuple(entry["source_shape"][role])
-            and checkpoint.tensors[name].dtype
+            and _expert_source_region(checkpoint, entry, role).dtype
                 == entry["source_dtype"][role]
             for entry in experts
-            for role, name in entry["source_tensors"].items()
+            for role in entry["source_tensors"]
         )
     )
     program_info = manifest.get("model_program")
     _require(isinstance(program_info, dict), "manifest model program is absent")
     program = _safe_child(container_root, program_info.get("path"))
     bindings = _semantic_bindings(program)
-    unreferenced = sorted(manifest_names - set(bindings))
+    auxiliary = manifest.get("auxiliary_tensors", [])
+    _require(
+        isinstance(auxiliary, list)
+        and all(isinstance(name, str) for name in auxiliary)
+        and len(set(auxiliary)) == len(auxiliary)
+        and set(auxiliary) <= manifest_names,
+        "manifest auxiliary tensor index is invalid",
+    )
+    unreferenced = sorted(manifest_names - set(bindings) - set(auxiliary))
     unknown_bindings = sorted(set(bindings) - manifest_names)
 
     packs = manifest.get("packs")

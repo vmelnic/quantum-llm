@@ -49,6 +49,7 @@ class IDeviceResidencyDirectory {
 struct UploadRequest final {
   ExpertKey key;
   std::uint32_t source_abi{};
+  std::uint32_t record_abi{};
   ExpertSections sections;
   std::span<const std::byte> complete_record;
   DeepSeekCompactSections compact;
@@ -108,6 +109,9 @@ struct ExpertCacheConfig final {
   // immutable source and skip the retention memcpy until demand repeats.
   // Appended last to keep positional aggregate initializers source-compatible.
   std::uint32_t ram_retention_minimum_frequency{1};
+  // Optional allocator for immutable retained records. The staging pool keeps
+  // its independent allocator and demand reservation.
+  std::shared_ptr<IHostAllocator> retained_host_allocator;
 };
 
 enum class ExpertRequestPriority : std::uint8_t {
@@ -180,7 +184,8 @@ class HostExpertLease final {
       const noexcept;
   [[nodiscard]] std::uint32_t source_abi() const noexcept;
 
-  HostExpertLease(std::shared_ptr<const std::vector<std::byte>> bytes,
+  HostExpertLease(std::shared_ptr<const void> ownership,
+                  const std::byte* bytes, std::size_t byte_count,
                   ExpertSections sections, DeepSeekCompactSections compact,
                   std::uint32_t source_abi,
                   std::function<void()> release) noexcept;
@@ -188,7 +193,9 @@ class HostExpertLease final {
  private:
   void reset() noexcept;
 
-  std::shared_ptr<const std::vector<std::byte>> bytes_;
+  std::shared_ptr<const void> ownership_;
+  const std::byte* bytes_{};
+  std::size_t byte_count_{};
   ExpertSections sections_{};
   DeepSeekCompactSections compact_{};
   std::uint32_t source_abi_{};
@@ -270,6 +277,7 @@ struct CacheEntrySnapshot final {
   std::uint64_t routing_score_mass_q20{};
   std::uint32_t routing_score_peak_q20{};
   std::uint64_t placement_temperature{};
+  std::uint64_t last_access{};
 };
 
 struct CacheUsage final {

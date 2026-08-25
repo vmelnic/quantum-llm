@@ -143,14 +143,19 @@ def _print_info(base_url: str) -> None:
 
 
 def _chat(base_url: str, model: str, messages: list[dict[str, str]],
-          maximum: int, request_timeout: float) -> tuple[str, TurnStats]:
-    body = json.dumps({
+          maximum: int, request_timeout: float,
+          thinking: str) -> tuple[str, TurnStats]:
+    payload: dict[str, Any] = {
         "model": model,
         "messages": messages,
         "max_completion_tokens": maximum,
         "stream": True,
         "stream_options": {"include_usage": True},
-    }).encode()
+        "chat_template_kwargs": {"enable_thinking": thinking != "off"},
+    }
+    if thinking != "off":
+        payload["reasoning_effort"] = "xhigh" if thinking == "high" else thinking
+    body = json.dumps(payload).encode()
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/chat/completions", body, _headers(),
         method="POST",
@@ -221,6 +226,10 @@ def main() -> int:
     parser.add_argument("--remote-port", type=int, default=8080)
     parser.add_argument("--ready-timeout", type=float, default=30.0)
     parser.add_argument("--request-timeout", type=float, default=660.0)
+    parser.add_argument(
+        "--thinking", choices=("off", "low", "medium", "high", "xhigh"),
+        default="xhigh",
+    )
     parser.add_argument("--show-stats", action=argparse.BooleanOptionalAction,
                         default=True)
     args = parser.parse_args()
@@ -271,7 +280,7 @@ def main() -> int:
             try:
                 answer, last_stats = _chat(
                     base_url, model, messages, args.max_tokens,
-                    args.request_timeout,
+                    args.request_timeout, args.thinking,
                 )
             except RuntimeError as error:
                 messages.pop()

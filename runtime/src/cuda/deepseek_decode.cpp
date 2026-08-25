@@ -97,7 +97,7 @@ Status DeepSeekDecodeController::configure_verify(
 Status DeepSeekDecodeController::stage_cpu_placements(
     std::span<const DeepSeekCpuExpertPlacement> placements) noexcept {
   if (!active_ || !waiting_for_experts_ || !cpu_executor_ ||
-      !hybrid_workspace_ || placements.empty() || placements.size() > 6U)
+      !hybrid_workspace_ || placements.empty() || placements.size() > 12U)
     return {ErrorCode::invalid_argument,
             "invalid DeepSeek CPU placement staging"};
   std::set<std::uint32_t> unique;
@@ -335,10 +335,36 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
                           plan.selected_experts.begin() + 7U,
                           plan.selected_experts.begin() + 13U);
     pin_id_ = plan.pin_id;
-    if (!plan.missing_experts.empty()) {
+    std::vector<std::uint32_t> uncovered_missing;
+    std::vector<cpu::DeepSeekPackedWorkGroup> cpu_groups;
+    uncovered_missing.reserve(plan.missing_experts.size());
+    cpu_groups.reserve(cpu_placements_.size());
+    std::uint32_t alternate_slot = 0U;
+    for (const auto missing : plan.missing_experts) {
+      const auto placement = std::find_if(
+          cpu_placements_.begin(), cpu_placements_.end(),
+          [missing](const auto& value) { return value.expert == missing; });
+      if (placement == cpu_placements_.end()) {
+        uncovered_missing.push_back(missing);
+        continue;
+      }
+      cpu::DeepSeekPackedWorkGroup group{
+          placement->record_bytes, placement->sections, 4096U, 2048U, {}, {}};
+      for (std::uint32_t selection = 0U;
+           selection < routed_experts.size(); ++selection) {
+        if (routed_experts[selection] != missing) continue;
+        group.selections.push_back(selection);
+        group.output_slots.push_back(alternate_slot++);
+      }
+      if (group.selections.empty())
+        return fail({ErrorCode::internal,
+                     "staged pair CPU expert is absent from the route"});
+      cpu_groups.push_back(std::move(group));
+    }
+    if (!uncovered_missing.empty()) {
       waiting_for_experts_ = true;
       return {Status::success(), DeepSeekDecodeProgress::needs_experts,
-              current_layer_, std::move(plan.missing_experts),
+              current_layer_, std::move(uncovered_missing),
               std::move(plan.ready_experts), std::move(routed_experts), 2U};
     }
     if (pin_id_ == 0U)
@@ -346,12 +372,20 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
                    "DeepSeek pair directory returned no execution pin"});
     const auto pair_view = verify_->layer(current_layer_);
     const auto ffn_started = std::chrono::steady_clock::now();
-    const auto execute = deepseek_ffn_execute_pair({
-        pair_view.ffn_weights, pair_view.ffn_states,
-        verify_->ffn_workspace(), directory_->device_entries(),
-        {request_->streams_b_, verify_->speculative_streams_b_},
-        {request_->streams_a_, verify_->speculative_streams_a_},
-        directory_->experts_per_layer(), stream_});
+    const auto execute = cpu_groups.empty()
+        ? deepseek_ffn_execute_pair({
+              pair_view.ffn_weights, pair_view.ffn_states,
+              verify_->ffn_workspace(), directory_->device_entries(),
+              {request_->streams_b_, verify_->speculative_streams_b_},
+              {request_->streams_a_, verify_->speculative_streams_a_},
+              directory_->experts_per_layer(), stream_})
+        : deepseek_ffn_execute_pair_hybrid({
+              pair_view.ffn_weights, pair_view.ffn_states,
+              verify_->ffn_workspace(), directory_->device_entries(),
+              {request_->streams_b_, verify_->speculative_streams_b_},
+              {request_->streams_a_, verify_->speculative_streams_a_},
+              hybrid_workspace_.get(), cpu_executor_.get(), cpu_groups,
+              directory_->experts_per_layer(), stream_});
     telemetry_.ffn_submit_ns += static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::nanoseconds>(
             std::chrono::steady_clock::now() - ffn_started)
@@ -367,6 +401,7 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     if (!release.ok()) return fail(release);
     const auto completed_layer = current_layer_++;
     waiting_for_experts_ = false;
+    clear_cpu_placements();
     if (current_layer_ == layer_limit_) {
       active_ = false;
       complete_ = true;

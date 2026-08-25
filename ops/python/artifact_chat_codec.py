@@ -21,8 +21,10 @@ class ArtifactCodecStreamParser:
 
     def __init__(self, codec: "ArtifactChatCodec", thinking: bool) -> None:
         self.codec = codec
+        self.thinking = thinking
         self.field = "reasoning_content" if thinking else "content"
         self.pending = ""
+        self.raw_pieces: list[str] = []
         self.finished = False
 
     @staticmethod
@@ -43,7 +45,10 @@ class ArtifactCodecStreamParser:
         return text, ""
 
     def feed(self, delta: str) -> list[dict[str, Any]]:
-        if self.finished or not delta:
+        if not delta:
+            return []
+        self.raw_pieces.append(delta)
+        if self.finished:
             return []
         self.pending += delta
         events: list[dict[str, Any]] = []
@@ -79,7 +84,7 @@ class ArtifactCodecStreamParser:
             events = self._event(self.field, self.pending)
         self.pending = ""
         self.finished = True
-        return {}, events
+        return self.codec.parse("".join(self.raw_pieces), self.thinking), events
 
 
 class ArtifactChatCodec:

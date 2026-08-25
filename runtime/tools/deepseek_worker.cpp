@@ -117,6 +117,35 @@ void cuda_check(cudaError_t error, const char* operation) {
                              cudaGetErrorString(error));
 }
 
+template <typename T>
+class PinnedBuffer final {
+ public:
+  explicit PinnedBuffer(std::size_t count) : count_(count) {
+    require(count_ != 0U, "pinned buffer cannot be empty");
+    cuda_check(cudaHostAlloc(reinterpret_cast<void**>(&data_),
+                             count_ * sizeof(T), cudaHostAllocPortable),
+               "allocate DeepSeek sequence host frontier");
+  }
+  ~PinnedBuffer() {
+    if (data_) static_cast<void>(cudaFreeHost(data_));
+  }
+  PinnedBuffer(const PinnedBuffer&) = delete;
+  PinnedBuffer& operator=(const PinnedBuffer&) = delete;
+  [[nodiscard]] T* data() noexcept { return data_; }
+  [[nodiscard]] const T* data() const noexcept { return data_; }
+  [[nodiscard]] std::size_t size() const noexcept { return count_; }
+  [[nodiscard]] T& operator[](std::size_t index) noexcept {
+    return data_[index];
+  }
+  [[nodiscard]] const T& operator[](std::size_t index) const noexcept {
+    return data_[index];
+  }
+
+ private:
+  T* data_{};
+  std::size_t count_{};
+};
+
 std::vector<std::string_view> split_tabs(std::string_view line) {
   std::vector<std::string_view> result;
   for (;;) {
@@ -600,6 +629,17 @@ struct WorkerTelemetry final {
   std::uint64_t mtp_acquire_wait_ns{};
   std::uint64_t prefill_protection_candidates{};
   std::uint64_t prefill_protection_promoted{};
+  std::uint64_t sequence_blocks{};
+  std::uint64_t sequence_rows{};
+  std::uint64_t sequence_layers{};
+  std::uint64_t sequence_attention_hca_pre_norm_ns{};
+  std::uint64_t sequence_attention_projection_ns{};
+  std::uint64_t sequence_causal_attention_ns{};
+  std::uint64_t sequence_attention_output_projection_ns{};
+  std::uint64_t sequence_route_ns{};
+  std::uint64_t sequence_expert_wait_ns{};
+  std::uint64_t sequence_expert_execute_ns{};
+  std::uint64_t sequence_finalize_ns{};
 };
 
 class Model final : public er::IOperationProvider,
@@ -750,15 +790,44 @@ class Model final : public er::IOperationProvider,
             "DeepSeek VRAM cache cannot hold shared plus one route");
     std::size_t free{}, total{};
     cuda_check(cudaMemGetInfo(&free, &total), "inspect DeepSeek worker VRAM");
-    const auto fixed = artifacts_.dense_device_bytes +
-                       artifacts_.typed_source_bytes +
-                       request_bytes_ * capacity_ + rope_table_bytes() +
-                       mtp_artifacts_.dense_device_bytes +
-                       mtp_artifacts_.typed_source_bytes +
-                       mtp_request_bytes_ * capacity_ +
-                       verify_request_bytes_ * capacity_;
-    require(fixed + vram_bytes_ + (1ULL << 30U) <= free,
-            "DeepSeek worker VRAM preflight failed");
+    const auto fixed_without_sequence =
+        artifacts_.dense_device_bytes + artifacts_.typed_source_bytes +
+        request_bytes_ * capacity_ + rope_table_bytes() +
+        mtp_artifacts_.dense_device_bytes +
+        mtp_artifacts_.typed_source_bytes +
+        mtp_request_bytes_ * capacity_ +
+        verify_request_bytes_ * capacity_;
+    constexpr std::uint64_t device_reserve_bytes = 1ULL << 30U;
+    const auto reserved_without_sequence =
+        fixed_without_sequence + vram_bytes_ + device_reserve_bytes;
+    require(reserved_without_sequence <= free,
+            "DeepSeek worker VRAM preflight failed before sequence "
+            "workspace: required=" +
+                std::to_string(reserved_without_sequence) +
+                ", free=" + std::to_string(free));
+    const auto sequence_budget = free - reserved_without_sequence;
+    constexpr std::uint32_t sequence_row_quantum = 32U;
+    for (std::uint32_t candidate = kMaximumSequenceTileRows;
+         candidate >= sequence_row_quantum;
+         candidate -= sequence_row_quantum) {
+      const auto attention_size =
+          er::cuda::deepseek_attention_batch_workspace_size(max_context_,
+                                                             candidate);
+      const auto ffn_bytes =
+          er::cuda::deepseek_ffn_batch_workspace_size(candidate);
+      if (!attention_size.status.ok() || ffn_bytes == 0U) continue;
+      const auto workspace_bytes =
+          attention_size.bytes + ffn_bytes +
+          2ULL * candidate * 4U * 4096U * sizeof(float);
+      if (workspace_bytes <= sequence_budget / capacity_) {
+        sequence_tile_rows_ = candidate;
+        sequence_workspace_bytes_ = workspace_bytes;
+        break;
+      }
+    }
+    require(sequence_tile_rows_ != 0U,
+            "DeepSeek worker VRAM preflight cannot fit a 32-row exact "
+            "sequence tile: budget=" + std::to_string(sequence_budget));
 
     // Four IOCP workers match the Qwen runner and the useful NCQ depth of
     // the SATA pack drive; more outstanding random reads mostly add seeks.
@@ -924,12 +993,13 @@ class Model final : public er::IOperationProvider,
     initialize_rope_table();
     cpu_ = std::make_shared<er::cpu::DeepSeekPackedExecutor>(
         er::cpu::DeepSeekPackedExecutorConfig{
-            std::max(1U, std::thread::hardware_concurrency()),
+            std::clamp(std::thread::hardware_concurrency(), 1U, 64U),
             8U, 8U, 10.0F, true, true});
     planner_ = std::make_shared<er::HybridDispatchPlanner>(
         er::HybridDispatchConfig{bundle_.cpu_ns, bundle_.gpu_ns,
                                  bundle_.h2d_bytes_per_second,
-                                 0.125, 256U, 256U});
+                                 0.125, 256U, 256U,
+                                 true, true, true, 1U});
     auto census_loaded = er::RouteCensus::load(
         bundle_.census, routed_->census_config());
     if (census_loaded.status.ok()) {
@@ -1022,14 +1092,29 @@ class Model final : public er::IOperationProvider,
     std::shared_ptr<er::cuda::CudaDirectoryPlanWorkspace> directory_workspace;
     std::shared_ptr<er::cuda::DeepSeekRoutePredictionState>
         route_prediction_state;
+    std::shared_ptr<er::cuda::DeepSeekAttentionBatchWorkspace>
+        sequence_attention_workspace;
+    std::shared_ptr<er::cuda::DeepSeekFfnBatchWorkspace>
+        sequence_ffn_workspace;
     cudaStream_t stream{};
     cudaEvent_t remote_input_ready_event{};
     cudaEvent_t route_prediction_ready_event{};
+    cudaEvent_t gpu_selection_started_event{};
+    cudaEvent_t gpu_selection_finished_event{};
     float* remote_input_host{};
     float* remote_outputs_host{};
     std::uint32_t* route_prediction_host{};
+    float* sequence_stream_allocation{};
+    float* sequence_primary_streams{};
+    float* sequence_attention_streams{};
     std::vector<PrefetchItem> prefetch_items;
     std::array<RetentionCheckpoint, 2U> retention_checkpoints;
+    std::vector<std::map<std::uint32_t, PromptRouteEvidence>> prompt_routes;
+    std::uint64_t prompt_route_clock{};
+    std::vector<std::uint32_t> sequence_sync_successors;
+    std::vector<float> sequence_final_target_streams;
+    std::uint32_t sequence_sync_first{};
+    std::uint32_t sequence_sync_consumed{};
     std::uint64_t next_remote_invocation{1U};
     std::uint32_t provider_slot{};
     std::uint32_t context_limit{};
@@ -1052,6 +1137,9 @@ class Model final : public er::IOperationProvider,
     bool prediction_copy_pending{};
     bool draft_ready{};
     bool speculation_suppressed{};
+    bool exact_decode_enabled{};
+    bool gpu_selection_observation_pending{};
+    std::uint32_t gpu_selection_observation_selections{};
 
     ~CallableRequestState() override {
       for (auto& item : prefetch_items) item.handle.cancel();
@@ -1059,6 +1147,8 @@ class Model final : public er::IOperationProvider,
       directory_workspace.reset();
       if (stream) static_cast<void>(cudaStreamSynchronize(stream));
       route_prediction_state.reset();
+      sequence_attention_workspace.reset();
+      sequence_ffn_workspace.reset();
       verify_controller.reset();
       verify.reset();
       mtp.reset();
@@ -1067,8 +1157,14 @@ class Model final : public er::IOperationProvider,
         static_cast<void>(cudaEventDestroy(route_prediction_ready_event));
       if (remote_input_ready_event)
         static_cast<void>(cudaEventDestroy(remote_input_ready_event));
+      if (gpu_selection_finished_event)
+        static_cast<void>(cudaEventDestroy(gpu_selection_finished_event));
+      if (gpu_selection_started_event)
+        static_cast<void>(cudaEventDestroy(gpu_selection_started_event));
       if (route_prediction_host)
         static_cast<void>(cudaFreeHost(route_prediction_host));
+      if (sequence_stream_allocation)
+        static_cast<void>(cudaFree(sequence_stream_allocation));
       if (remote_outputs_host)
         static_cast<void>(cudaFreeHost(remote_outputs_host));
       if (remote_input_host)
@@ -1078,6 +1174,42 @@ class Model final : public er::IOperationProvider,
           static_cast<void>(cudaFreeHost(checkpoint.host_state));
       if (stream) static_cast<void>(cudaStreamDestroy(stream));
       if (owner) owner->release_callable_provider_slot(provider_slot);
+    }
+  };
+
+  struct CallableProgramSequence final {
+    std::shared_ptr<CallableRequestState> request;
+    er::ProgramRequestContext context;
+    std::vector<const PreparedOperation*> operations;
+    std::vector<std::uint32_t> tokens;
+    std::vector<std::uint32_t> positions;
+    std::atomic<bool> cancelled{false};
+    std::mutex result_mutex;
+    std::optional<er::OperationExecutionResult> result;
+    std::thread worker;
+    bool consumed{};
+
+    ~CallableProgramSequence() {
+      cancelled.store(true, std::memory_order_release);
+      if (worker.joinable()) worker.join();
+    }
+
+    void publish(er::OperationExecutionResult value) {
+      std::lock_guard lock(result_mutex);
+      result = std::move(value);
+    }
+
+    [[nodiscard]] std::optional<er::OperationExecutionResult> poll() {
+      std::optional<er::OperationExecutionResult> completed;
+      {
+        std::lock_guard lock(result_mutex);
+        if (consumed || !result) return std::nullopt;
+        consumed = true;
+        completed = std::move(result);
+        result.reset();
+      }
+      if (worker.joinable()) worker.join();
+      return completed;
     }
   };
 
@@ -1181,23 +1313,87 @@ class Model final : public er::IOperationProvider,
       const er::IPreparedOperation& opaque_operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
       const er::ExactDecodeSynchronization& synchronization) override {
+    const std::array<std::uint32_t, 1U> tokens{
+        synchronization.next_token};
+    return synchronize_exact_decode_batch(
+        opaque_operation, opaque_state,
+        {synchronization.request, tokens, synchronization.target_position,
+         synchronization.produce_draft});
+  }
+
+  er::Status synchronize_exact_decode_batch(
+      const er::IPreparedOperation& opaque_operation,
+      const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+      const er::ExactDecodeSynchronizationBatch& synchronization) override {
     const auto* prepared =
         dynamic_cast<const PreparedExactDecode*>(&opaque_operation);
     const auto state =
         std::dynamic_pointer_cast<CallableRequestState>(opaque_state);
-    if (!prepared || !state || state->owner.get() != this ||
-        !state->mtp || synchronization.next_token >=
-                           bundle_.descriptor.vocab_size ||
-        synchronization.target_position + 1U != state->next_position ||
-        (synchronization.produce_draft &&
-         synchronization.next_token != state->predicted))
+    if (!prepared || !state || state->owner.get() != this || !state->mtp ||
+        synchronization.next_tokens.empty() ||
+        std::any_of(synchronization.next_tokens.begin(),
+                    synchronization.next_tokens.end(),
+                    [this](std::uint32_t token) {
+                      return token >= bundle_.descriptor.vocab_size;
+                    }))
       return {er::ErrorCode::invalid_argument,
               "compressed sparse exact decode synchronization is invalid"};
     try {
-      advance_mtp_state(*state, synchronization.next_token,
+      if (!state->sequence_sync_successors.empty()) {
+        const auto total = state->sequence_sync_successors.size();
+        const auto count = synchronization.next_tokens.size();
+        if (state->sequence_sync_consumed > total ||
+            count > total - state->sequence_sync_consumed ||
+            synchronization.first_target_position !=
+                state->sequence_sync_first + state->sequence_sync_consumed ||
+            state->sequence_final_target_streams.size() !=
+                4ULL * bundle_.descriptor.hidden_size)
+          throw std::runtime_error(
+              "DeepSeek sequence exact-sync cursor is invalid");
+        for (std::size_t row = 0U; row < count; ++row) {
+          const auto index = state->sequence_sync_consumed + row;
+          if (index + 1U < total &&
+              synchronization.next_tokens[row] !=
+                  state->sequence_sync_successors[index])
+            throw std::runtime_error(
+                "DeepSeek sequence exact-sync successor changed");
+          if (index + 1U == total) {
+            cuda_check(
+                cudaMemcpyAsync(
+                    state->state->primary_streams(),
+                    state->sequence_final_target_streams.data(),
+                    state->sequence_final_target_streams.size() *
+                        sizeof(float),
+                    cudaMemcpyHostToDevice, state->stream),
+                "upload final DeepSeek sequence exact-sync streams");
+            advance_mtp_state(
+                *state, synchronization.next_tokens[row],
+                state->state->primary_streams(),
+                synchronization.first_target_position +
+                    static_cast<std::uint32_t>(row),
+                synchronization.produce_final_draft);
+          }
+        }
+        state->sequence_sync_consumed += static_cast<std::uint32_t>(count);
+        if (state->sequence_sync_consumed == total) {
+          state->sequence_sync_successors.clear();
+          state->sequence_final_target_streams.clear();
+          state->sequence_sync_first = 0U;
+          state->sequence_sync_consumed = 0U;
+        }
+        return er::Status::success();
+      }
+      if (synchronization.next_tokens.size() != 1U ||
+          synchronization.first_target_position + 1U !=
+              state->next_position ||
+          (synchronization.produce_final_draft &&
+           synchronization.next_tokens.front() != state->predicted))
+        throw std::runtime_error(
+            "DeepSeek scalar exact-sync boundary is invalid");
+      advance_mtp_state(*state, synchronization.next_tokens.front(),
                         state->state->current_streams(),
-                        synchronization.target_position,
-                        synchronization.produce_draft);
+                        synchronization.first_target_position,
+                        synchronization.produce_final_draft);
       return er::Status::success();
     } catch (const std::exception& error) {
       return {er::ErrorCode::internal, error.what()};
@@ -1323,7 +1519,11 @@ class Model final : public er::IOperationProvider,
 
   [[nodiscard]] bool supports_request_state_retention()
       const noexcept override {
-    return true;
+    // Target recurrent state is checkpointed below, but the callable MTP and
+    // in-flight sequence synchronization state have not passed an exact
+    // checkpoint/rewind parity gate. Do not expose retention commands until
+    // every selected state component is qualified.
+    return false;
   }
 
   er::Status checkpoint_request_state(
@@ -1468,6 +1668,35 @@ class Model final : public er::IOperationProvider,
         cuda_check(cudaStreamCreateWithFlags(&state->stream,
                                              cudaStreamNonBlocking),
                    "create callable DeepSeek stream");
+        auto attention_workspace =
+            er::cuda::create_deepseek_attention_batch_workspace(
+                max_context_, sequence_tile_rows_);
+        require(attention_workspace.status.ok() &&
+                    attention_workspace.workspace,
+                attention_workspace.status.ok()
+                    ? "DeepSeek sequence attention workspace is absent"
+                    : attention_workspace.status.message());
+        state->sequence_attention_workspace =
+            std::move(attention_workspace.workspace);
+        auto ffn_workspace = er::cuda::create_deepseek_ffn_batch_workspace(
+            sequence_tile_rows_);
+        require(ffn_workspace.status.ok() && ffn_workspace.workspace,
+                ffn_workspace.status.ok()
+                    ? "DeepSeek sequence FFN workspace is absent"
+                    : ffn_workspace.status.message());
+        state->sequence_ffn_workspace = std::move(ffn_workspace.workspace);
+        const auto active_sequence_stream_values =
+            2ULL * sequence_tile_rows_ * 4U * 4096U;
+        cuda_check(cudaMalloc(
+                       reinterpret_cast<void**>(
+                           &state->sequence_stream_allocation),
+                       active_sequence_stream_values * sizeof(float)),
+                   "allocate callable DeepSeek sequence streams");
+        state->sequence_primary_streams = state->sequence_stream_allocation;
+        state->sequence_attention_streams =
+            state->sequence_primary_streams +
+            static_cast<std::uint64_t>(sequence_tile_rows_) * 4U * 4096U;
+        state->prompt_routes.resize(state->state->layer_count());
         if (mtp_enabled_) {
           auto mtp_state = er::cuda::create_deepseek_mtp_request_state(
               model_, mtp_model_, {max_context_, mtp_request_bytes_});
@@ -1520,6 +1749,10 @@ class Model final : public er::IOperationProvider,
                        &state->route_prediction_ready_event,
                        cudaEventDisableTiming),
                    "create callable route prediction event");
+        cuda_check(cudaEventCreate(&state->gpu_selection_started_event),
+                   "create callable GPU selection start event");
+        cuda_check(cudaEventCreate(&state->gpu_selection_finished_event),
+                   "create callable GPU selection finish event");
         auto workspace = directory_->create_plan_workspace();
         require(workspace.status.ok() && workspace.workspace,
                 workspace.status.ok()
@@ -1533,6 +1766,144 @@ class Model final : public er::IOperationProvider,
       return {er::Status::success(), std::move(state)};
     } catch (const std::exception& error) {
       return {{er::ErrorCode::internal, error.what()}, {}};
+    }
+  }
+
+  [[nodiscard]] bool supports_program_sequence(
+      const er::CompiledModelProgram& program) const noexcept override {
+    try {
+      const auto layers = bundle_.descriptor.layer_program.size();
+      if (layers == 0U || program.layers.size() != layers ||
+          program.operations.size() != 2U + 3U * layers ||
+          program.inputs.size() != 2U || program.outputs.size() != 1U)
+        return false;
+      bool token_input = false;
+      bool position_input = false;
+      for (const auto& endpoint : program.inputs) {
+        if (endpoint.value_index >= program.values.size()) return false;
+        const auto& abi = program.values[endpoint.value_index].abi;
+        if (abi == token_abi && !token_input)
+          token_input = true;
+        else if (abi == position_abi && !position_input)
+          position_input = true;
+        else
+          return false;
+      }
+      const auto output = program.outputs.front().value_index;
+      return token_input && position_input && output < program.values.size() &&
+             program.values[output].abi == token_abi;
+    } catch (...) {
+      return false;
+    }
+  }
+
+  er::OperationExecutionHandle execute_program_sequence(
+      const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+      const er::ProgramSequenceInvocation& invocation) override {
+    try {
+      auto request =
+          std::dynamic_pointer_cast<CallableRequestState>(opaque_state);
+      if (!request || request->owner.get() != this ||
+          !supports_program_sequence(invocation.program) ||
+          invocation.operations.size() != invocation.program.operations.size() ||
+          invocation.inputs.size() != invocation.program.inputs.size() ||
+          request->embedded || request->attention_ready || request->route_ready)
+        throw std::runtime_error(
+            "compressed sparse program-sequence contract is invalid");
+
+      auto sequence = std::make_shared<CallableProgramSequence>();
+      sequence->request = std::move(request);
+      sequence->context = invocation.request;
+      sequence->operations.reserve(invocation.operations.size());
+      for (const auto* opaque : invocation.operations) {
+        const auto* prepared = dynamic_cast<const PreparedOperation*>(opaque);
+        if (!prepared)
+          throw std::runtime_error(
+              "compressed sparse program-sequence operation is foreign");
+        sequence->operations.push_back(prepared);
+      }
+      const auto layer_count = sequence->request->state->layer_count();
+      if (sequence->operations.front()->kernel != kCallableEmbedding ||
+          sequence->operations.back()->kernel != kCallableHead ||
+          sequence->operations.size() != 2U + 3U * layer_count)
+        throw std::runtime_error(
+            "compressed sparse program-sequence order is invalid");
+      for (std::uint32_t layer = 0U; layer < layer_count; ++layer) {
+        const auto offset = 1U + 3U * layer;
+        const auto* attention = sequence->operations[offset];
+        const auto* router = sequence->operations[offset + 1U];
+        const auto* moe = sequence->operations[offset + 2U];
+        if (attention->kernel != kCallableAttention ||
+            router->kernel != kCallableRouter ||
+            moe->kernel != kCallableRoutedMoe ||
+            attention->logical_layer >= layer_count ||
+            router->component_layer >= layer_count ||
+            router->component_layer != moe->component_layer)
+          throw std::runtime_error(
+              "compressed sparse program-sequence layer is invalid");
+      }
+
+      const er::ExecutionValue* token_value{};
+      const er::ExecutionValue* position_value{};
+      for (std::size_t index = 0U; index < invocation.inputs.size(); ++index) {
+        const auto value_index = invocation.program.inputs[index].value_index;
+        if (value_index >= invocation.program.values.size())
+          throw std::runtime_error(
+              "compressed sparse program-sequence input is invalid");
+        const auto& abi = invocation.program.values[value_index].abi;
+        if (abi == token_abi)
+          token_value = &invocation.inputs[index];
+        else if (abi == position_abi)
+          position_value = &invocation.inputs[index];
+      }
+      sequence->tokens = host_u32_batch(
+          token_value, token_abi, "DeepSeek sequence tokens", max_context_);
+      sequence->positions = host_u32_batch(
+          position_value, position_abi, "DeepSeek sequence positions",
+          max_context_);
+      if (sequence->tokens.size() != sequence->positions.size() ||
+          sequence->tokens.empty() ||
+          sequence->positions.front() != sequence->request->next_position ||
+          sequence->positions.back() >= sequence->request->context_limit ||
+          std::any_of(sequence->tokens.begin(), sequence->tokens.end(),
+                      [this](std::uint32_t token) {
+                        return token >= bundle_.descriptor.vocab_size;
+                      }))
+        throw std::runtime_error(
+            "compressed sparse program-sequence rows are invalid");
+      for (std::size_t row = 1U; row < sequence->positions.size(); ++row)
+        if (sequence->positions[row] != sequence->positions.front() + row)
+          throw std::runtime_error(
+              "compressed sparse program-sequence positions are not contiguous");
+
+      const auto exact = invocation.request.parameters.find(
+          "exact_decode_enabled");
+      sequence->request->exact_decode_enabled =
+          exact != invocation.request.parameters.end() && exact->second != 0U;
+      sequence->request->sequence_sync_successors.clear();
+      sequence->request->sequence_final_target_streams.clear();
+      sequence->request->sequence_sync_consumed = 0U;
+      sequence->worker = std::thread([sequence] {
+        try {
+          sequence->publish(
+              sequence->request->owner->run_callable_program_sequence(
+                  *sequence));
+        } catch (const std::exception& error) {
+          sequence->publish({{er::ErrorCode::internal, error.what()}, {}});
+        } catch (...) {
+          sequence->publish(
+              {{er::ErrorCode::internal,
+                "compressed sparse program-sequence failed"}, {}});
+        }
+      });
+      return er::OperationExecutionHandle::from_callbacks(
+          [sequence] { return sequence->poll(); },
+          [sequence] {
+            sequence->cancelled.store(true, std::memory_order_release);
+          });
+    } catch (const std::exception& error) {
+      return completed_operation(
+          {{er::ErrorCode::invalid_argument, error.what()}, {}});
     }
   }
 
@@ -1773,14 +2144,16 @@ class Model final : public er::IOperationProvider,
         ranked.resize(maximum_per_layer);
       for (const auto& [expert, evidence] : ranked) {
         (void)evidence;
-        ++telemetry_.prefill_protection_candidates;
+        prefill_protection_candidates_.fetch_add(1U,
+                                                  std::memory_order_relaxed);
         const auto key = routed_->key(layer, expert);
         static_cast<void>(cache_->protect(key, true, true));
         const auto snapshot = cache_->inspect(key);
         if (snapshot &&
             (!snapshot->has_host_copy || snapshot->ram_protected) &&
             (!snapshot->has_device_copy || snapshot->vram_resident)) {
-          ++telemetry_.prefill_protection_promoted;
+          prefill_protection_promoted_.fetch_add(1U,
+                                                 std::memory_order_relaxed);
         }
       }
       request.prompt_routes[layer].clear();
@@ -2191,6 +2564,9 @@ class Model final : public er::IOperationProvider,
   std::uint64_t ram_bytes() const noexcept { return ram_bytes_; }
   std::uint64_t vram_bytes() const noexcept { return vram_bytes_; }
   std::uint32_t kv_page_tokens() const noexcept { return kv_page_tokens_; }
+  std::uint32_t sequence_tile_rows() const noexcept {
+    return sequence_tile_rows_;
+  }
   std::uint64_t kv_page_bytes() const noexcept { return kv_page_bytes_; }
   std::uint64_t kv_page_capacity() const noexcept {
     return kv_page_capacity_;
@@ -2347,6 +2723,32 @@ class Model final : public er::IOperationProvider,
     result.warm_vram_bytes =
         warm_vram_bytes_.load(std::memory_order_relaxed);
     result.warm_vram_ns = warm_vram_ns_.load(std::memory_order_relaxed);
+    result.prefill_protection_candidates =
+        prefill_protection_candidates_.load(std::memory_order_relaxed);
+    result.prefill_protection_promoted =
+        prefill_protection_promoted_.load(std::memory_order_relaxed);
+    result.sequence_blocks =
+        sequence_blocks_.load(std::memory_order_relaxed);
+    result.sequence_rows = sequence_rows_.load(std::memory_order_relaxed);
+    result.sequence_layers =
+        sequence_layers_.load(std::memory_order_relaxed);
+    result.sequence_attention_hca_pre_norm_ns =
+        sequence_attention_hca_pre_norm_ns_.load(std::memory_order_relaxed);
+    result.sequence_attention_projection_ns =
+        sequence_attention_projection_ns_.load(std::memory_order_relaxed);
+    result.sequence_causal_attention_ns =
+        sequence_causal_attention_ns_.load(std::memory_order_relaxed);
+    result.sequence_attention_output_projection_ns =
+        sequence_attention_output_projection_ns_.load(
+            std::memory_order_relaxed);
+    result.sequence_route_ns =
+        sequence_route_ns_.load(std::memory_order_relaxed);
+    result.sequence_expert_wait_ns =
+        sequence_expert_wait_ns_.load(std::memory_order_relaxed);
+    result.sequence_expert_execute_ns =
+        sequence_expert_execute_ns_.load(std::memory_order_relaxed);
+    result.sequence_finalize_ns =
+        sequence_finalize_ns_.load(std::memory_order_relaxed);
     return result;
   }
   void record_callable_selection_launch(std::uint32_t selections,
@@ -2355,6 +2757,42 @@ class Model final : public er::IOperationProvider,
     callable_selections_.fetch_add(selections, std::memory_order_relaxed);
     if (overlapped)
       callable_overlap_launches_.fetch_add(1U, std::memory_order_relaxed);
+  }
+  void refresh_hybrid_transfer_observation() noexcept {
+    try {
+      const auto snapshot = cache_->telemetry();
+      std::lock_guard lock(hybrid_observation_mutex_);
+      const auto bytes = snapshot.uploaded_bytes >= observed_upload_bytes_
+                             ? snapshot.uploaded_bytes - observed_upload_bytes_
+                             : 0U;
+      const auto elapsed = snapshot.upload_wait_ns >= observed_upload_wait_ns_
+                               ? snapshot.upload_wait_ns -
+                                     observed_upload_wait_ns_
+                               : 0U;
+      observed_upload_bytes_ = snapshot.uploaded_bytes;
+      observed_upload_wait_ns_ = snapshot.upload_wait_ns;
+      if (bytes && elapsed) planner_->observe_h2d(elapsed, bytes);
+    } catch (...) {
+    }
+  }
+  void poll_callable_gpu_observation(CallableRequestState& request) noexcept {
+    if (!request.gpu_selection_observation_pending) return;
+    const auto query = cudaEventQuery(request.gpu_selection_finished_event);
+    if (query == cudaErrorNotReady) return;
+    if (query != cudaSuccess) {
+      request.gpu_selection_observation_pending = false;
+      return;
+    }
+    float milliseconds = 0.0F;
+    if (cudaEventElapsedTime(&milliseconds, request.gpu_selection_started_event,
+                             request.gpu_selection_finished_event) ==
+            cudaSuccess &&
+        milliseconds > 0.0F && request.gpu_selection_observation_selections) {
+      planner_->observe_gpu(
+          static_cast<std::uint64_t>(milliseconds * 1.0e6F),
+          request.gpu_selection_observation_selections);
+    }
+    request.gpu_selection_observation_pending = false;
   }
   void record_remote_active_expert(
       const er::ActiveExpertExecutionEvidence& evidence) noexcept {
@@ -2476,6 +2914,13 @@ class Model final : public er::IOperationProvider,
   static constexpr std::uint32_t kCallableRouter = 2U;
   static constexpr std::uint32_t kCallableRoutedMoe = 3U;
   static constexpr std::uint32_t kCallableHead = 4U;
+  // The provider advertises a 512-row kernel ceiling. Construction chooses
+  // the largest multiple of 32 that fits the authenticated target/MTP state,
+  // the configured expert cache and the mandatory 1 GiB device reserve.
+  static constexpr std::uint32_t kMaximumSequenceTileRows =
+      er::cuda::kDeepSeekMaximumSequenceRows;
+  static constexpr std::uint32_t kSequenceBlockRows = 16384U;
+  static constexpr std::uint32_t kSequenceStreams = 4U;
   static constexpr std::string_view token_abi =
       "batch.token-id.u32.host.v1";
   static constexpr std::string_view position_abi =
@@ -2811,6 +3256,8 @@ class Model final : public er::IOperationProvider,
           plan.missing_experts.empty())
         return er::Status::success();
       const auto& component = model->routed_->component();
+      model->refresh_hybrid_transfer_observation();
+      model->poll_callable_gpu_observation(*request);
       std::vector<er::HybridDispatchCandidate> candidates;
       candidates.reserve(component.route_width);
       for (std::uint32_t slot = 0U; slot < component.route_width; ++slot) {
@@ -2837,8 +3284,14 @@ class Model final : public er::IOperationProvider,
         const bool ready =
             std::find(plan.ready_experts.begin(), plan.ready_experts.end(),
                       expert) != plan.ready_experts.end();
-        candidates.push_back({expert, 1U, record->stored_bytes, ready,
-                              true, true});
+        const auto snapshot = model->cache_->inspect(key);
+        const bool host_ready = snapshot && snapshot->has_host_copy &&
+            (snapshot->state == er::CacheState::ram_ready ||
+             snapshot->state == er::CacheState::vram_ready);
+        candidates.push_back(
+            {expert, 1U, record->stored_bytes, ready, host_ready, true,
+             snapshot ? snapshot->placement_temperature : 0U,
+             snapshot ? snapshot->last_access : 0U});
       }
       if (candidates.empty()) return er::Status::success();
       const auto placement = model->planner_->plan(candidates);
@@ -2860,6 +3313,13 @@ class Model final : public er::IOperationProvider,
         auto lease = model->cache_->try_acquire_host(
             model->routed_->key(prepared.component_layer, decision.expert),
             *record, false, er::ExpertRequestPriority::demand);
+        const auto selection = static_cast<std::uint32_t>(
+            selected - plan.selected_experts.begin());
+        // The planner is advisory, while this lease is the atomic tier gate.
+        // If RAM was evicted after inspect(), preserve progress by leaving the
+        // expert on the ordinary demand-to-GPU path. Never turn an NVMe read
+        // into a proactive CPU placement.
+        if (!lease) continue;
         for (std::size_t index = 0U; index < pending.size();) {
           if (pending[index].expert != decision.expert) {
             ++index;
@@ -2869,27 +3329,8 @@ class Model final : public er::IOperationProvider,
           pending.erase(pending.begin() +
                         static_cast<std::ptrdiff_t>(index));
         }
-        const auto selection = static_cast<std::uint32_t>(
-            selected - plan.selected_experts.begin());
-        if (lease) {
-          host_leases.push_back(
-              {decision.expert, selection, std::move(*lease)});
-          continue;
-        }
-        const std::array<std::uint32_t, 1U> one{decision.expert};
-        auto handle = model->routed_->resolve(
-            prepared.component_layer, one, er::ExpertResolveTarget::host,
-            er::ExpertAcquireOptions{er::ExpertRequestPriority::demand,
-                                     false, true, false});
-        if (!handle.valid())
-          return {er::ErrorCode::backpressure,
-                  "callable CPU host-page resolve was rejected"};
-        pending.push_back({decision.expert, er::ExpertResolveTarget::host,
-                           std::move(handle)});
-        model->callable_resolves_launched_.fetch_add(
-            1U, std::memory_order_relaxed);
-        model->callable_cpu_host_resolves_launched_.fetch_add(
-            1U, std::memory_order_relaxed);
+        host_leases.push_back(
+            {decision.expert, selection, std::move(*lease)});
       }
       return er::Status::success();
     }
@@ -3178,11 +3619,22 @@ class Model final : public er::IOperationProvider,
       const auto mask = ready_selection_mask(plan);
       if (mask == 0U) return er::Status::success();
       const auto view = request->state->layer(prepared.component_layer);
+      model->poll_callable_gpu_observation(*request);
+      const bool measure = !request->gpu_selection_observation_pending &&
+          cudaEventRecord(request->gpu_selection_started_event,
+                          request->stream) == cudaSuccess;
       auto status = er::cuda::deepseek_ffn_execute_selections(
           {view.ffn_weights, view.ffn_state,
            model->directory_->device_entries(), mask,
            model->directory_->experts_per_layer(), request->stream});
       if (!status.ok()) return {status.code(), std::string(status.message())};
+      if (measure &&
+          cudaEventRecord(request->gpu_selection_finished_event,
+                          request->stream) == cudaSuccess) {
+        request->gpu_selection_observation_pending = true;
+        request->gpu_selection_observation_selections =
+            static_cast<std::uint32_t>(std::popcount(mask));
+      }
       completed_selection_mask |= mask;
       model->record_callable_selection_launch(
           static_cast<std::uint32_t>(std::popcount(mask)),
@@ -3623,6 +4075,27 @@ class Model final : public er::IOperationProvider,
     std::memcpy(&result, value.data, sizeof(result));
     return result;
   }
+
+  static std::vector<std::uint32_t> host_u32_batch(
+      const er::ExecutionValue* value, std::string_view abi,
+      std::string_view label, std::uint32_t maximum_rows) {
+    if (!value || !value->valid() || value->abi != abi ||
+        value->memory_domain != "host" || value->bytes == 0U ||
+        value->bytes % sizeof(std::uint32_t) != 0U ||
+        value->bytes / sizeof(std::uint32_t) > maximum_rows ||
+        reinterpret_cast<std::uintptr_t>(value->data) %
+                alignof(std::uint32_t) !=
+            0U)
+      throw std::runtime_error(std::string(label) + " ABI mismatch");
+    std::vector<std::uint32_t> result(
+        static_cast<std::size_t>(value->bytes / sizeof(std::uint32_t)));
+    std::memcpy(result.data(), value->data,
+                result.size() * sizeof(result.front()));
+    return result;
+  }
+
+  [[nodiscard]] er::OperationExecutionResult run_callable_program_sequence(
+      CallableProgramSequence& sequence);
 
   static void require_device_value(const er::ExecutionValue& value,
                                    const void* expected,
@@ -4070,8 +4543,9 @@ class Model final : public er::IOperationProvider,
   Bundle bundle_;
   std::vector<std::uint32_t> compression_ratios_;
   std::uint32_t hash_router_layers_{};
-  std::uint32_t max_context_{}, capacity_{};
-  std::uint64_t ram_bytes_{}, vram_bytes_{}, request_bytes_{}, next_operation_{1U};
+  std::uint32_t max_context_{}, capacity_{}, sequence_tile_rows_{};
+  std::uint64_t ram_bytes_{}, vram_bytes_{}, request_bytes_{},
+      sequence_workspace_bytes_{}, next_operation_{1U};
   std::uint64_t mtp_request_bytes_{}, mtp_cache_bytes_{},
       verify_request_bytes_{};
   std::uint64_t kv_cache_bytes_{}, kv_page_bytes_{}, kv_page_capacity_{};
@@ -4126,6 +4600,9 @@ class Model final : public er::IOperationProvider,
   er::ResidentExpertSet mtp_shared_;
   std::shared_ptr<er::cpu::DeepSeekPackedExecutor> cpu_;
   std::shared_ptr<er::HybridDispatchPlanner> planner_;
+  std::mutex hybrid_observation_mutex_;
+  std::uint64_t observed_upload_bytes_{};
+  std::uint64_t observed_upload_wait_ns_{};
   std::shared_ptr<er::RouteCensus> census_;
   std::unique_ptr<er::cuda::DeepSeekDecodeScheduler> scheduler_;
   std::vector<er::RouteCensusWarmEntry> warm_candidates_;
@@ -4194,10 +4671,603 @@ class Model final : public er::IOperationProvider,
   std::atomic<std::uint64_t> callable_remote_owner_vram_read_bytes_{0U};
   std::atomic<std::uint64_t> callable_remote_owner_execution_ns_{0U};
   std::atomic<std::uint64_t> callable_remote_transport_wait_ns_{0U};
+  std::atomic<std::uint64_t> prefill_protection_candidates_{0U};
+  std::atomic<std::uint64_t> prefill_protection_promoted_{0U};
+  std::atomic<std::uint64_t> sequence_blocks_{0U};
+  std::atomic<std::uint64_t> sequence_rows_{0U};
+  std::atomic<std::uint64_t> sequence_layers_{0U};
+  std::atomic<std::uint64_t> sequence_attention_hca_pre_norm_ns_{0U};
+  std::atomic<std::uint64_t> sequence_attention_projection_ns_{0U};
+  std::atomic<std::uint64_t> sequence_causal_attention_ns_{0U};
+  std::atomic<std::uint64_t> sequence_attention_output_projection_ns_{0U};
+  std::atomic<std::uint64_t> sequence_route_ns_{0U};
+  std::atomic<std::uint64_t> sequence_expert_wait_ns_{0U};
+  std::atomic<std::uint64_t> sequence_expert_execute_ns_{0U};
+  std::atomic<std::uint64_t> sequence_finalize_ns_{0U};
   std::mutex callable_provider_mutex_;
   std::vector<bool> callable_provider_slots_;
   WorkerTelemetry telemetry_;
 };
+
+er::OperationExecutionResult Model::run_callable_program_sequence(
+    CallableProgramSequence& sequence) {
+  constexpr std::size_t hidden = 4096U;
+  constexpr std::size_t streams_per_row = kSequenceStreams * hidden;
+  const auto top_k = routed_->component().route_width;
+  const auto expert_count = routed_->component().experts_per_layer;
+  require(top_k == 6U && expert_count != 0U,
+          "DeepSeek sequence route geometry is unsupported");
+
+  struct HostFrontier final {
+    HostFrontier(std::size_t rows, std::size_t top_k,
+                 std::size_t tile_rows, std::size_t hidden_size,
+                 std::size_t stream_values)
+        : primary(rows * stream_values),
+          attention(rows * stream_values),
+          ffn_inputs(rows * hidden_size),
+          routing_weights(rows * top_k),
+          expert_indices(rows * top_k),
+          selection_outputs(rows * top_k * hidden_size),
+          post(rows * kSequenceStreams),
+          combination(rows * kSequenceStreams * kSequenceStreams),
+          expert_input_tile(tile_rows * hidden_size),
+          expert_output_tile(tile_rows * hidden_size) {}
+
+    PinnedBuffer<float> primary;
+    PinnedBuffer<float> attention;
+    PinnedBuffer<float> ffn_inputs;
+    PinnedBuffer<float> routing_weights;
+    PinnedBuffer<std::uint32_t> expert_indices;
+    PinnedBuffer<float> selection_outputs;
+    PinnedBuffer<float> post;
+    PinnedBuffer<float> combination;
+    PinnedBuffer<float> expert_input_tile;
+    PinnedBuffer<float> expert_output_tile;
+  } host(kSequenceBlockRows, top_k, sequence_tile_rows_, hidden,
+         streams_per_row);
+
+  auto& request = *sequence.request;
+  auto& attention_workspace = *request.sequence_attention_workspace;
+  auto& ffn_workspace = *request.sequence_ffn_workspace;
+  const auto device_entries = directory_->device_entries();
+  const auto experts_per_layer = expert_count +
+      routed_->component().shared_experts_per_layer;
+  const auto stream = request.stream;
+  const auto cancelled = [&] {
+    return sequence.cancelled.load(std::memory_order_acquire) ||
+           std::chrono::steady_clock::now() > sequence.context.deadline;
+  };
+  const auto ensure_active = [&] {
+    if (cancelled())
+      throw std::runtime_error(
+          "compressed sparse program-sequence was cancelled");
+  };
+  const auto copy_async = [&](void* destination, const void* source,
+                              std::size_t bytes, cudaMemcpyKind kind,
+                              const char* operation) {
+    cuda_check(cudaMemcpyAsync(destination, source, bytes, kind, stream),
+               operation);
+  };
+  DemandActivity demand(demand_depth_);
+
+  struct SequenceProfileEvents final {
+    SequenceProfileEvents() {
+      for (auto& event : events)
+        cuda_check(cudaEventCreate(&event),
+                   "create DeepSeek sequence profile event");
+    }
+    ~SequenceProfileEvents() {
+      for (auto event : events)
+        if (event) static_cast<void>(cudaEventDestroy(event));
+    }
+    SequenceProfileEvents(const SequenceProfileEvents&) = delete;
+    SequenceProfileEvents& operator=(const SequenceProfileEvents&) = delete;
+
+    [[nodiscard]] std::uint64_t elapsed_ns(std::size_t first,
+                                           std::size_t last) const {
+      float milliseconds = 0.0F;
+      cuda_check(cudaEventElapsedTime(&milliseconds, events[first],
+                                      events[last]),
+                 "measure DeepSeek sequence phase");
+      return static_cast<std::uint64_t>(
+          std::llround(static_cast<double>(milliseconds) * 1'000'000.0));
+    }
+
+    std::array<cudaEvent_t, 6U> events{};
+  } profile;
+  const er::cuda::DeepSeekAttentionBatchLaunch::ProfileEvents
+      attention_profile{profile.events[1], profile.events[2],
+                        profile.events[3], profile.events[4]};
+
+  if (request.exact_decode_enabled) {
+    request.sequence_sync_successors.resize(sequence.tokens.size());
+    for (std::size_t row = 0U; row + 1U < sequence.tokens.size(); ++row)
+      request.sequence_sync_successors[row] = sequence.tokens[row + 1U];
+    request.sequence_sync_first = sequence.positions.front();
+    request.sequence_sync_consumed = 0U;
+    request.sequence_final_target_streams.resize(streams_per_row);
+  }
+
+  for (std::size_t block_first = 0U; block_first < sequence.tokens.size();
+       block_first += kSequenceBlockRows) {
+    ensure_active();
+    const auto block_rows = static_cast<std::uint32_t>(
+        std::min<std::size_t>(kSequenceBlockRows,
+                             sequence.tokens.size() - block_first));
+    sequence_blocks_.fetch_add(1U, std::memory_order_relaxed);
+    sequence_rows_.fetch_add(block_rows, std::memory_order_relaxed);
+
+    // Embeddings are sparse row lookups; tile them only to bound device
+    // storage. The expensive dense operations begin below.
+    for (std::uint32_t tile_first = 0U; tile_first < block_rows;
+         tile_first += sequence_tile_rows_) {
+      const auto rows =
+          std::min(sequence_tile_rows_, block_rows - tile_first);
+      for (std::uint32_t row = 0U; row < rows; ++row) {
+        const auto global = block_first + tile_first + row;
+        auto status = request.state->embed(sequence.tokens[global], stream);
+        require(status.ok(), status.message());
+        copy_async(request.sequence_primary_streams +
+                       static_cast<std::size_t>(row) * streams_per_row,
+                   request.state->primary_streams(),
+                   streams_per_row * sizeof(float),
+                   cudaMemcpyDeviceToDevice,
+                   "stage DeepSeek sequence embedding");
+      }
+      copy_async(host.primary.data() +
+                     static_cast<std::size_t>(tile_first) * streams_per_row,
+                 request.sequence_primary_streams,
+                 static_cast<std::size_t>(rows) * streams_per_row *
+                     sizeof(float),
+                 cudaMemcpyDeviceToHost,
+                 "retain DeepSeek sequence embedding frontier");
+      cuda_check(cudaStreamSynchronize(stream),
+                 "complete DeepSeek sequence embedding tile");
+    }
+
+    for (std::uint32_t program_layer = 0U;
+         program_layer < request.state->layer_count(); ++program_layer) {
+      ensure_active();
+      sequence_layers_.fetch_add(1U, std::memory_order_relaxed);
+      const auto operation_offset = 1U + 3U * program_layer;
+      const auto* attention_operation =
+          sequence.operations[operation_offset];
+      const auto* router_operation =
+          sequence.operations[operation_offset + 1U];
+      const auto component_layer = router_operation->component_layer;
+      const auto attention_view =
+          request.state->layer(attention_operation->logical_layer);
+      const auto ffn_view = request.state->layer(component_layer);
+      require(attention_view.attention_weights &&
+                  attention_view.attention_state && ffn_view.ffn_weights &&
+                  ffn_view.ffn_state,
+              "DeepSeek sequence layer state is absent");
+
+      for (std::uint32_t tile_first = 0U; tile_first < block_rows;
+           tile_first += sequence_tile_rows_) {
+        ensure_active();
+        const auto rows =
+            std::min(sequence_tile_rows_, block_rows - tile_first);
+        copy_async(request.sequence_primary_streams,
+                   host.primary.data() +
+                       static_cast<std::size_t>(tile_first) * streams_per_row,
+                   static_cast<std::size_t>(rows) * streams_per_row *
+                       sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence attention frontier");
+        std::array<er::cuda::DeepSeekAttentionBatchRow,
+                   kMaximumSequenceTileRows>
+            row_state{};
+        for (std::uint32_t row = 0U; row < rows; ++row) {
+          const auto global = block_first + tile_first + row;
+          const auto position = sequence.positions[global];
+          const auto rope = rope_at(position);
+          const auto compressed = attention_view.compress_ratio != 0U;
+          const auto emits = compressed &&
+              (position + 1U) % attention_view.compress_ratio == 0U;
+          const float* group_cosine = nullptr;
+          const float* group_sine = nullptr;
+          if (emits && attention_view.compress_ratio == 4U) {
+            group_cosine = rope.ratio_four_group_cosine;
+            group_sine = rope.ratio_four_group_sine;
+          } else if (emits) {
+            group_cosine = rope.ratio_128_group_cosine;
+            group_sine = rope.ratio_128_group_sine;
+          }
+          row_state[row] = {
+              compressed ? rope.compressed_cosine : rope.base_cosine,
+              compressed ? rope.compressed_sine : rope.base_sine,
+              group_cosine, group_sine, position};
+        }
+        cuda_check(cudaEventRecord(profile.events[0], stream),
+                   "start DeepSeek sequence attention profile");
+        auto status = er::cuda::deepseek_attention_decode_batch(
+            {attention_view.attention_weights,
+             attention_view.attention_state, &attention_workspace,
+             request.sequence_primary_streams,
+             request.sequence_attention_streams, row_state.data(), rows,
+             1e-6F, 20U, stream, &attention_profile});
+        require(status.ok(), status.message());
+        status = er::cuda::deepseek_ffn_route_batch(
+            {ffn_view.ffn_weights, ffn_view.ffn_state, &ffn_workspace,
+             request.sequence_attention_streams,
+             sequence.tokens.data() + block_first + tile_first, rows, 1e-6F,
+             20U, stream});
+        require(status.ok(), status.message());
+        cuda_check(cudaEventRecord(profile.events[5], stream),
+                   "finish DeepSeek sequence route profile");
+
+        const auto row_offset = static_cast<std::size_t>(tile_first);
+        copy_async(host.attention.data() + row_offset * streams_per_row,
+                   request.sequence_attention_streams,
+                   static_cast<std::size_t>(rows) * streams_per_row *
+                       sizeof(float),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence attention output");
+        copy_async(host.ffn_inputs.data() + row_offset * hidden,
+                   ffn_workspace.normalized_input(),
+                   static_cast<std::size_t>(rows) * hidden * sizeof(float),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence expert inputs");
+        copy_async(host.routing_weights.data() + row_offset * top_k,
+                   ffn_workspace.routing_weights(),
+                   static_cast<std::size_t>(rows) * top_k * sizeof(float),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence route weights");
+        copy_async(host.expert_indices.data() + row_offset * top_k,
+                   ffn_workspace.expert_indices(),
+                   static_cast<std::size_t>(rows) * top_k *
+                       sizeof(std::uint32_t),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence route indices");
+        copy_async(host.post.data() + row_offset * kSequenceStreams,
+                   ffn_workspace.post_control(),
+                   static_cast<std::size_t>(rows) * kSequenceStreams *
+                       sizeof(float),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence HCA post control");
+        copy_async(
+            host.combination.data() +
+                row_offset * kSequenceStreams * kSequenceStreams,
+            ffn_workspace.combination_control(),
+            static_cast<std::size_t>(rows) * kSequenceStreams *
+                kSequenceStreams * sizeof(float),
+            cudaMemcpyDeviceToHost,
+            "retain DeepSeek sequence HCA combination control");
+        cuda_check(cudaStreamSynchronize(stream),
+                   "complete DeepSeek sequence attention and route tile");
+        sequence_attention_hca_pre_norm_ns_.fetch_add(
+            profile.elapsed_ns(0U, 1U), std::memory_order_relaxed);
+        sequence_attention_projection_ns_.fetch_add(
+            profile.elapsed_ns(1U, 2U), std::memory_order_relaxed);
+        sequence_causal_attention_ns_.fetch_add(
+            profile.elapsed_ns(2U, 3U), std::memory_order_relaxed);
+        sequence_attention_output_projection_ns_.fetch_add(
+            profile.elapsed_ns(3U, 4U), std::memory_order_relaxed);
+        sequence_route_ns_.fetch_add(
+            profile.elapsed_ns(4U, 5U), std::memory_order_relaxed);
+      }
+
+      std::fill_n(host.selection_outputs.data(),
+                  static_cast<std::size_t>(block_rows) * top_k * hidden,
+                  0.0F);
+      std::vector<std::vector<std::uint32_t>> selections(expert_count);
+      std::vector<er::ExpertAccess> accesses;
+      accesses.reserve(expert_count);
+      for (std::uint32_t row = 0U; row < block_rows; ++row) {
+        std::span<const std::uint32_t> route(
+            host.expert_indices.data() +
+                static_cast<std::size_t>(row) * top_k,
+            top_k);
+        for (std::uint32_t slot = 0U; slot < top_k; ++slot) {
+          const auto expert = route[slot];
+          require(expert < expert_count,
+                  "DeepSeek sequence route references an invalid expert");
+          selections[expert].push_back(row * top_k + slot);
+          auto& evidence = request.prompt_routes[component_layer][expert];
+          if (evidence.count != std::numeric_limits<std::uint32_t>::max())
+            ++evidence.count;
+          evidence.last_seen = ++request.prompt_route_clock;
+        }
+        const auto observed = census_->observe(component_layer, route);
+        require(observed.ok(), observed.message());
+      }
+
+      struct PendingExpert final {
+        std::uint32_t expert{};
+        er::AcquireHandle handle;
+      };
+      std::vector<std::uint32_t> active_experts;
+      active_experts.reserve(expert_count);
+      for (std::uint32_t expert = 0U; expert < expert_count; ++expert) {
+        if (selections[expert].empty()) continue;
+        require(routed_->record(component_layer, expert) != nullptr,
+                "DeepSeek sequence expert is absent from the catalog");
+        active_experts.push_back(expert);
+      }
+
+      // Acquire ahead far enough to keep the eight staging buffers busy, but
+      // never pin a whole layer's unique expert set. A completed acquire owns
+      // a device lease even before get(); issuing every expert at once can
+      // therefore exhaust the transient VRAM class with unevictable pages.
+      constexpr std::size_t kAcquireWindow = 8U;
+      std::vector<PendingExpert> pending;
+      pending.reserve(kAcquireWindow);
+      std::size_t next_expert = 0U;
+      const auto launch_pending = [&] {
+        while (pending.size() < kAcquireWindow &&
+               next_expert < active_experts.size()) {
+          const auto expert = active_experts[next_expert++];
+          const auto* record = routed_->record(component_layer, expert);
+          pending.push_back(
+              {expert,
+               cache_->acquire(
+                   routed_->key(component_layer, expert), *record,
+                   er::ExpertAcquireOptions{
+                       er::ExpertRequestPriority::demand, false, true,
+                       false})});
+        }
+      };
+      const auto cancel_pending = [&] {
+        for (auto& item : pending)
+          if (item.handle.valid()) item.handle.cancel();
+      };
+      try {
+        launch_pending();
+        while (!pending.empty()) {
+          auto item = std::move(pending.front());
+          pending.erase(pending.begin());
+          const auto wait_started = std::chrono::steady_clock::now();
+          while (item.handle.wait_for(std::chrono::milliseconds(1)) !=
+                 std::future_status::ready) {
+            ensure_active();
+          }
+          auto acquired = item.handle.get();
+          sequence_expert_wait_ns_.fetch_add(
+              static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - wait_started)
+                      .count()),
+              std::memory_order_relaxed);
+          require(acquired.status.ok() && acquired.lease,
+                  acquired.status.ok()
+                      ? "DeepSeek sequence expert lease is absent"
+                      : acquired.status.message());
+          const auto* expert = dynamic_cast<
+              const er::cuda::CudaCompactExpertAllocation*>(
+              acquired.lease.get());
+          require(expert != nullptr,
+                  "DeepSeek sequence expert is not direct packed FP4");
+          launch_pending();
+          const auto execute_started = std::chrono::steady_clock::now();
+          const auto& assigned = selections[item.expert];
+          for (std::size_t first = 0U; first < assigned.size();
+               first += sequence_tile_rows_) {
+            ensure_active();
+            const auto rows = static_cast<std::uint32_t>(
+                std::min<std::size_t>(sequence_tile_rows_,
+                                     assigned.size() - first));
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+              const auto selection = assigned[first + row];
+              const auto input_row = selection / top_k;
+              std::memcpy(
+                  host.expert_input_tile.data() +
+                      static_cast<std::size_t>(row) * hidden,
+                  host.ffn_inputs.data() +
+                      static_cast<std::size_t>(input_row) * hidden,
+                  hidden * sizeof(float));
+            }
+            copy_async(ffn_workspace.expert_inputs(),
+                       host.expert_input_tile.data(),
+                       static_cast<std::size_t>(rows) * hidden * sizeof(float),
+                       cudaMemcpyHostToDevice,
+                       "upload DeepSeek grouped expert inputs");
+            const auto status = er::cuda::deepseek_ffn_execute_packed_batch(
+                {expert, &ffn_workspace, ffn_workspace.expert_inputs(),
+                 ffn_workspace.expert_outputs(), rows, 10.0F, true, stream});
+            require(status.ok(), status.message());
+            copy_async(host.expert_output_tile.data(),
+                       ffn_workspace.expert_outputs(),
+                       static_cast<std::size_t>(rows) * hidden * sizeof(float),
+                       cudaMemcpyDeviceToHost,
+                       "retain DeepSeek grouped expert outputs");
+            cuda_check(cudaStreamSynchronize(stream),
+                       "complete DeepSeek grouped expert batch");
+            for (std::uint32_t row = 0U; row < rows; ++row) {
+              const auto selection = assigned[first + row];
+              std::memcpy(
+                  host.selection_outputs.data() +
+                      static_cast<std::size_t>(selection) * hidden,
+                  host.expert_output_tile.data() +
+                      static_cast<std::size_t>(row) * hidden,
+                  hidden * sizeof(float));
+            }
+          }
+          accesses.push_back(
+              {routed_->key(component_layer, item.expert),
+               static_cast<std::uint32_t>(std::min<std::size_t>(
+                   assigned.size(),
+                   std::numeric_limits<std::uint32_t>::max()))});
+          sequence_expert_execute_ns_.fetch_add(
+              static_cast<std::uint64_t>(
+                  std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      std::chrono::steady_clock::now() - execute_started)
+                      .count()),
+              std::memory_order_relaxed);
+        }
+      } catch (...) {
+        cancel_pending();
+        throw;
+      }
+      static_cast<void>(cache_->record_accesses(accesses));
+
+      for (std::uint32_t tile_first = 0U; tile_first < block_rows;
+           tile_first += sequence_tile_rows_) {
+        ensure_active();
+        const auto finalize_started = std::chrono::steady_clock::now();
+        const auto rows =
+            std::min(sequence_tile_rows_, block_rows - tile_first);
+        const auto row_offset = static_cast<std::size_t>(tile_first);
+        copy_async(request.sequence_attention_streams,
+                   host.attention.data() + row_offset * streams_per_row,
+                   static_cast<std::size_t>(rows) * streams_per_row *
+                       sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence FFN residuals");
+        copy_async(ffn_workspace.normalized_input(),
+                   host.ffn_inputs.data() + row_offset * hidden,
+                   static_cast<std::size_t>(rows) * hidden * sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence FFN inputs");
+        copy_async(ffn_workspace.routing_weights(),
+                   host.routing_weights.data() + row_offset * top_k,
+                   static_cast<std::size_t>(rows) * top_k * sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence route weights");
+        copy_async(ffn_workspace.expert_indices(),
+                   host.expert_indices.data() + row_offset * top_k,
+                   static_cast<std::size_t>(rows) * top_k *
+                       sizeof(std::uint32_t),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence route indices");
+        copy_async(ffn_workspace.selection_outputs(),
+                   host.selection_outputs.data() +
+                       row_offset * top_k * hidden,
+                   static_cast<std::size_t>(rows) * top_k * hidden *
+                       sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence selection outputs");
+        copy_async(ffn_workspace.post_control(),
+                   host.post.data() + row_offset * kSequenceStreams,
+                   static_cast<std::size_t>(rows) * kSequenceStreams *
+                       sizeof(float),
+                   cudaMemcpyHostToDevice,
+                   "upload DeepSeek sequence HCA post control");
+        copy_async(
+            ffn_workspace.combination_control(),
+            host.combination.data() +
+                row_offset * kSequenceStreams * kSequenceStreams,
+            static_cast<std::size_t>(rows) * kSequenceStreams *
+                kSequenceStreams * sizeof(float),
+            cudaMemcpyHostToDevice,
+            "upload DeepSeek sequence HCA combination control");
+        const auto status = er::cuda::deepseek_ffn_finalize_batch(
+            {ffn_view.ffn_weights, ffn_view.ffn_state, &ffn_workspace,
+             device_entries, request.sequence_attention_streams,
+             request.sequence_primary_streams, rows, experts_per_layer,
+             stream});
+        require(status.ok(), status.message());
+        copy_async(host.primary.data() + row_offset * streams_per_row,
+                   request.sequence_primary_streams,
+                   static_cast<std::size_t>(rows) * streams_per_row *
+                       sizeof(float),
+                   cudaMemcpyDeviceToHost,
+                   "retain DeepSeek sequence layer frontier");
+        cuda_check(cudaStreamSynchronize(stream),
+                   "complete DeepSeek sequence FFN tile");
+        sequence_finalize_ns_.fetch_add(
+            static_cast<std::uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - finalize_started)
+                    .count()),
+            std::memory_order_relaxed);
+      }
+    }
+
+    if (request.exact_decode_enabled) {
+      for (std::uint32_t row = 0U; row < block_rows; ++row) {
+        const auto global = block_first + row;
+        if (global + 1U == sequence.tokens.size()) {
+          std::memcpy(request.sequence_final_target_streams.data(),
+                      host.primary.data() +
+                          static_cast<std::size_t>(row) * streams_per_row,
+                      streams_per_row * sizeof(float));
+          break;
+        }
+        copy_async(request.state->primary_streams(),
+                   host.primary.data() +
+                       static_cast<std::size_t>(row) * streams_per_row,
+                   streams_per_row * sizeof(float), cudaMemcpyHostToDevice,
+                   "upload DeepSeek exact-sync target streams");
+        advance_mtp_state(request, sequence.tokens[global + 1U],
+                          request.state->primary_streams(),
+                          sequence.positions[global], false);
+      }
+    }
+
+    if (block_first + block_rows == sequence.tokens.size()) {
+      copy_async(request.state->primary_streams(),
+                 host.primary.data() +
+                     static_cast<std::size_t>(block_rows - 1U) *
+                         streams_per_row,
+                 streams_per_row * sizeof(float), cudaMemcpyHostToDevice,
+                 "commit DeepSeek sequence final streams");
+      cuda_check(cudaStreamSynchronize(stream),
+                 "complete DeepSeek sequence final-stream commit");
+    }
+  }
+
+  ensure_active();
+  auto status = request.state->project_logits(stream);
+  require(status.ok(), status.message());
+  auto token = std::make_shared<std::uint32_t>();
+  copy_async(token.get(), request.state->sampled_token(), sizeof(*token),
+             cudaMemcpyDeviceToHost,
+             "copy DeepSeek sequence sampled token");
+  cuda_check(cudaStreamSynchronize(stream),
+             "complete DeepSeek sequence sampled token");
+  request.predicted = *token;
+  request.current_token = sequence.tokens.back();
+  request.current_position = sequence.positions.back();
+  request.next_position = sequence.positions.back() + 1U;
+  request.embedded = false;
+  request.attention_ready = true;
+  request.route_ready = true;
+
+  const auto maximum_per_layer = routed_->component().route_width;
+  for (std::uint32_t layer = 0U; layer < request.prompt_routes.size();
+       ++layer) {
+    std::vector<std::pair<std::uint32_t, PromptRouteEvidence>> ranked(
+        request.prompt_routes[layer].begin(),
+        request.prompt_routes[layer].end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& left,
+                                               const auto& right) {
+      if (left.second.count != right.second.count)
+        return left.second.count > right.second.count;
+      if (left.second.last_seen != right.second.last_seen)
+        return left.second.last_seen > right.second.last_seen;
+      return left.first < right.first;
+    });
+    if (ranked.size() > maximum_per_layer)
+      ranked.resize(maximum_per_layer);
+    for (const auto& [expert, evidence] : ranked) {
+      (void)evidence;
+      prefill_protection_candidates_.fetch_add(1U,
+                                               std::memory_order_relaxed);
+      const auto key = routed_->key(layer, expert);
+      static_cast<void>(cache_->protect(key, true, true));
+      const auto snapshot = cache_->inspect(key);
+      if (snapshot &&
+          (!snapshot->has_host_copy || snapshot->ram_protected) &&
+          (!snapshot->has_device_copy || snapshot->vram_resident))
+        prefill_protection_promoted_.fetch_add(1U,
+                                              std::memory_order_relaxed);
+    }
+    request.prompt_routes[layer].clear();
+  }
+  request.prompt_route_clock = 0U;
+  if (request.retention_target_position == request.next_position) {
+    const auto checkpoint = capture_retention_checkpoint(
+        request, request.next_position, false);
+    require(checkpoint.ok(), checkpoint.message());
+  }
+
+  er::ExecutionValue output{
+      std::string(token_abi), "host", token,
+      reinterpret_cast<const std::byte*>(token.get()), sizeof(*token)};
+  return operation_result(*sequence.operations.back(),
+                          {{"token_ids", std::move(output)}});
+}
 
 struct Active final {
   std::unique_ptr<Request> request;
@@ -4293,9 +5363,11 @@ int worker_loop(Model& model) {
               << '"';
   }
   std::cout << ']'
-            << ",\"prefill_mode\":\"causal_sequential\""
-            << ",\"prefill_chunk_tokens\":1"
-            << ",\"session_retention\":true"
+            << ",\"prefill_mode\":\"causal_blocked_exact\""
+            << ",\"prefill_chunk_tokens\":"
+            << model.sequence_tile_rows()
+            << ",\"session_retention\":"
+            << (model.supports_request_state_retention() ? "true" : "false")
             << ",\"request_stream_mode\":\"per_request_nonblocking\""
             << ",\"rope_mode\":\"resident_table\""
             << ",\"kv_dtype\":\"bf16\""
@@ -5032,6 +6104,7 @@ int expert_vm_compressed_sparse_moe_provider_main(int argc, char** argv) {
                    "--placement-profile=NAME "
                    "[--profile-gpu-phases] "
                    "[--no-retain-previous-route] [--cpu-hybrid] "
+                   "[--no-cpu-hybrid] "
                    "[--route-trace-file=<path>] "
                    "[--route-trace-max-steps=<count>]\n";
       return 64;
@@ -5062,7 +6135,14 @@ int expert_vm_compressed_sparse_moe_provider_main(int argc, char** argv) {
     const bool profile_gpu_phases = options.profile_gpu_phases;
     const bool retain_previous_route =
         !boolean_extension("no-retain-previous-route");
-    const bool enable_cpu_hybrid = boolean_extension("cpu-hybrid");
+    const bool requested_cpu_hybrid = boolean_extension("cpu-hybrid");
+    const bool disable_cpu_hybrid = boolean_extension("no-cpu-hybrid");
+    require(!(requested_cpu_hybrid && disable_cpu_hybrid),
+            "conflicting CPU-hybrid worker extensions");
+    // This provider owns an exact FP4 host executor and an adaptive split
+    // planner, so hybrid execution is a provider capability rather than a
+    // deployment experiment. Keep a direct-worker opt-out for diagnosis.
+    const bool enable_cpu_hybrid = !disable_cpu_hybrid;
     require(!options.placement_settle_steps,
             "execution provider does not support placement settling");
     std::filesystem::path route_trace_path;
@@ -5134,7 +6214,7 @@ make_sm86_compressed_sparse_moe_callable_provider(
     module.definition = {"sm86-compressed-sparse-moe", 100U,
                          provider_capabilities(), implementation};
     module.service = {
-        "causal_sequential", 1U,
+        "causal_blocked_exact", implementation->sequence_tile_rows(),
         implementation->supports_request_state_retention(),
         "per_request_nonblocking",
         "resident_table", "bf16", "preallocated", kv_page_tokens,
@@ -5317,6 +6397,23 @@ make_sm86_compressed_sparse_moe_callable_provider(
           {"warm_vram_pages_loaded", worker.warm_vram_loaded},
           {"warm_vram_pages_failed", worker.warm_vram_failed},
           {"warm_vram_bytes", worker.warm_vram_bytes},
+          {"sequence_blocks", worker.sequence_blocks},
+          {"sequence_tile_rows", implementation->sequence_tile_rows()},
+          {"sequence_rows", worker.sequence_rows},
+          {"sequence_layers", worker.sequence_layers},
+          {"sequence_attention_hca_pre_norm_ns",
+           worker.sequence_attention_hca_pre_norm_ns},
+          {"sequence_attention_projection_ns",
+           worker.sequence_attention_projection_ns},
+          {"sequence_causal_attention_ns",
+           worker.sequence_causal_attention_ns},
+          {"sequence_attention_output_projection_ns",
+           worker.sequence_attention_output_projection_ns},
+          {"sequence_route_ns", worker.sequence_route_ns},
+          {"sequence_expert_wait_ns", worker.sequence_expert_wait_ns},
+          {"sequence_expert_execute_ns",
+           worker.sequence_expert_execute_ns},
+          {"sequence_finalize_ns", worker.sequence_finalize_ns},
           {"census_namespace_rebinds",
            worker.census_namespace_rebinds}};
     };

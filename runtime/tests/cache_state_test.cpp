@@ -14,6 +14,7 @@
 #include "expert/runtime/route_census.hpp"
 #include "expert/runtime/routed_expert_runtime.hpp"
 #include "expert/runtime/cpu/deepseek_packed_executor.hpp"
+#include "expert/runtime/cpu/fp4_host_executor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
@@ -1235,6 +1236,59 @@ FixtureRecord make_fp4_record(std::uint32_t expert_id,
   return result;
 }
 
+FixtureRecord make_fp4_relu2_record(std::uint32_t expert_id,
+                                    std::uint32_t layer = 3U) {
+  FixtureRecord result;
+  result.key = {0x0123456789abcdefULL, layer, expert_id,
+                er::kExpertEncodingAbiFp4Block32};
+  result.bytes.resize(er::kExpertPackAlignment);
+  for (std::size_t index = er::kExpertHeaderBytes; index < result.bytes.size();
+       ++index)
+    result.bytes[index] =
+        static_cast<std::byte>((index * 29U + expert_id) & 0xffU);
+  for (const auto& span : {std::pair{768ULL, 32ULL}, {1536ULL, 32ULL}}) {
+    for (std::size_t index = span.first; index < span.first + span.second;
+         ++index) {
+      const auto code = static_cast<unsigned>(result.bytes[index]) % 254U;
+      result.bytes[index] = static_cast<std::byte>(code + 1U);
+    }
+  }
+  auto* header = result.bytes.data();
+  std::memcpy(header, "EPEXPR01", 8);
+  write_le<std::uint16_t>(header + 8, er::kExpertPackVersion);
+  write_le<std::uint16_t>(header + 10, er::kExpertHeaderBytes);
+  write_le<std::uint32_t>(header + 12, 0x0dU);
+  write_le<std::uint32_t>(header + 16,
+                          er::kExpertRecordAbiFp4Relu2Block32);
+  write_le<std::int32_t>(header + 20, static_cast<std::int32_t>(layer));
+  write_le<std::int32_t>(header + 24, static_cast<std::int32_t>(expert_id));
+  write_le<std::uint32_t>(header + 28, 32U);
+  write_le<std::uint32_t>(header + 32, 32U);
+  write_le<std::uint32_t>(header + 36, 32U);
+  write_le<std::uint32_t>(header + 40, 0U);
+  write_le<std::uint64_t>(header + 44, result.bytes.size());
+  write_le<std::uint64_t>(header + 52, 256U);
+  write_le<std::uint64_t>(header + 60, 512U);
+  write_le<std::uint64_t>(header + 68, 768U);
+  write_le<std::uint64_t>(header + 76, 32U);
+  write_le<std::uint64_t>(header + 84, 1024U);
+  write_le<std::uint64_t>(header + 92, 512U);
+  write_le<std::uint64_t>(header + 100, 1536U);
+  write_le<std::uint64_t>(header + 108, 32U);
+  const auto digest = er::sha256(
+      std::span<const std::byte>(result.bytes).subspan(er::kExpertHeaderBytes));
+  std::copy(digest.begin(), digest.end(), header + 116);
+  result.record.path = "fixture.qpack";
+  result.record.stored_bytes = result.bytes.size();
+  result.record.decoded_bytes = 2ULL * 32U * 32U * sizeof(float);
+  result.record.header_bytes = er::kExpertHeaderBytes;
+  result.record.alignment = er::kExpertPackAlignment;
+  result.record.source_abi = er::kExpertSourceAbiExpertPackV1;
+  result.record.record_abi = er::kExpertRecordAbiFp4Relu2Block32;
+  result.record.payload_sha256 = digest;
+  return result;
+}
+
 void test_fp4_block32_admission_validation() {
   auto fixture = make_fp4_record(7);
   const auto valid = er::validate_expert_admission(
@@ -1243,7 +1297,13 @@ void test_fp4_block32_admission_validation() {
               valid.target.gate_up_q_bytes == 1024U &&
               valid.target.gate_up_scale_bytes == 64U &&
               valid.target.down_q_bytes == 512U &&
-              valid.target.down_scale_bytes == 32U,
+              valid.target.down_scale_bytes == 32U &&
+              valid.compact.w1_weight_offset == 256U &&
+              valid.compact.w3_weight_offset == 768U &&
+              valid.compact.w1_scale_offset == 1280U &&
+              valid.compact.w3_scale_offset == 1312U &&
+              valid.compact.w2_weight_offset == 1536U &&
+              valid.compact.w2_scale_offset == 2048U,
           "valid FP4 block-32 admission was rejected");
 
   auto corrupt = make_fp4_record(7);
@@ -1274,6 +1334,25 @@ void test_fp4_block32_admission_validation() {
                                          abi_mismatch.record)
                .status.ok(),
           "FP4 record was admitted under the int8 ABI");
+}
+
+void test_fp4_relu2_block32_admission_validation() {
+  const auto fixture = make_fp4_relu2_record(11U);
+  const auto valid = er::validate_expert_admission(
+      fixture.bytes, fixture.key, fixture.record);
+  require(valid.status.ok() && valid.target.gate_up_q_bytes == 512U &&
+              valid.target.gate_up_scale_bytes == 32U &&
+              valid.target.down_q_bytes == 512U &&
+              valid.compact.w1_weight_offset == 256U &&
+              valid.compact.w3_weight_bytes == 0U &&
+              valid.compact.w2_weight_offset == 1024U &&
+              valid.compact.w2_scale_offset == 1536U,
+          "valid FP4 ReLU-squared admission was rejected");
+  auto wrong = fixture;
+  write_le<std::uint32_t>(wrong.bytes.data() + 12, 0x0fU);
+  require(!er::validate_expert_admission(wrong.bytes, wrong.key, wrong.record)
+               .status.ok(),
+          "FP4 ReLU-squared admission accepted gated-record flags");
 }
 
 class ControlledStorage final : public er::IAsyncStorage {
@@ -1511,7 +1590,8 @@ struct Harness final {
                {vram_budget ? vram_budget : budget,
                 vram_budget ? vram_budget : budget,
                 std::min<std::uint64_t>(4096,
-                    vram_budget ? vram_budget : budget)}, true, placement},
+                    vram_budget ? vram_budget : budget)}, true, placement,
+               false, 1U, {}},
               storage, uploader, buffers) {}
 
   er::AcquireResult finish(er::AcquireHandle& handle,
@@ -2924,6 +3004,68 @@ void test_deepseek_packed_executor_engages_every_worker() {
               metrics.source_weight_bytes == record_bytes &&
               metrics.compute_ns > 0U,
           "packed DeepSeek CPU executor did not use every configured worker");
+
+  auto standard = make_fp4_record(7U);
+  const auto copy = [&](std::size_t destination, std::size_t source,
+                        std::size_t bytes) {
+    std::memcpy(standard.bytes.data() + destination,
+                record.data() + source, bytes);
+  };
+  copy(256U, w1_weight, matrix_bytes);
+  copy(768U, w3_weight, matrix_bytes);
+  copy(1280U, w1_scale, scale_bytes);
+  copy(1312U, w3_scale, scale_bytes);
+  copy(1536U, w2_weight, matrix_bytes);
+  copy(2048U, w2_scale, scale_bytes);
+  const auto digest = er::sha256(
+      std::span<const std::byte>(standard.bytes)
+          .subspan(er::kExpertHeaderBytes));
+  std::copy(digest.begin(), digest.end(), standard.bytes.data() + 116U);
+  standard.record.payload_sha256 = digest;
+  const auto admitted = er::validate_expert_admission(
+      standard.bytes, standard.key, standard.record);
+  require(admitted.status.ok(),
+          "standard FP4 expert did not expose the universal host ABI");
+  const er::cpu::Fp4HostWorkGroup standard_group{
+      standard.bytes, admitted.compact, hidden, intermediate,
+      {0U, 3U}, {1U, 0U}};
+  er::cpu::Fp4HostExecutor universal(
+      {4U, 8U, 8U, 0.0F, false, false});
+  std::vector<float> standard_outputs(2U * hidden, -321.0F);
+  require(universal.execute(std::span(&standard_group, 1U), inputs, 2U, 2U,
+                            standard_outputs)
+              .ok() &&
+              std::equal(outputs.begin(), outputs.end(),
+                         standard_outputs.begin()),
+          "standard and compact FP4 source layouts diverged on the host ABI");
+
+  // The universal prefill provider routes tiles of up to 512 rows. A hot
+  // expert may therefore receive more than the old decode-oriented 32-row
+  // bound even though every selection and output slot is valid.
+  constexpr std::uint32_t prefill_rows = 33U;
+  std::vector<float> prefill_inputs(prefill_rows * hidden);
+  std::vector<std::uint32_t> prefill_selections(prefill_rows);
+  std::vector<std::uint32_t> prefill_slots(prefill_rows);
+  for (std::uint32_t row = 0U; row < prefill_rows; ++row) {
+    std::copy_n(inputs.begin(), hidden,
+                prefill_inputs.begin() + static_cast<std::size_t>(row) * hidden);
+    prefill_selections[row] = row;
+    prefill_slots[row] = row;
+  }
+  const er::cpu::Fp4HostWorkGroup prefill_group{
+      standard.bytes, admitted.compact, hidden, intermediate,
+      std::move(prefill_selections), std::move(prefill_slots)};
+  std::vector<float> prefill_outputs(prefill_rows * hidden, -456.0F);
+  require(universal.execute(std::span(&prefill_group, 1U), prefill_inputs,
+                            prefill_rows, 1U, prefill_outputs).ok(),
+          "universal FP4 host ABI rejected a valid prefill-sized work group");
+  for (std::uint32_t row = 0U; row < prefill_rows; ++row) {
+    require(std::equal(standard_outputs.begin(),
+                       standard_outputs.begin() + hidden,
+                       prefill_outputs.begin() +
+                           static_cast<std::size_t>(row) * hidden),
+            "prefill-sized FP4 host work group changed numerical output");
+  }
 }
 
 void test_layer_partitioned_eviction_protects_other_layers() {
@@ -3254,6 +3396,64 @@ void test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic() {
           "hybrid planner did not enforce its candidate bound");
 }
 
+void test_hybrid_dispatch_requires_live_tiers_and_warms_hot_gpu_pages() {
+  er::HybridDispatchPlanner planner(
+      {100.0, 10.0, 1.0e9, 0.5, 8U, 16U, true, true, true, 1U});
+  const std::array candidates{
+      er::HybridDispatchCandidate{2U, 1U, 90U, false, true, true, 10U, 2U},
+      er::HybridDispatchCandidate{1U, 1U, 90U, false, true, true, 50U, 5U}};
+  const auto cold = planner.plan(candidates);
+  require(cold.status.ok() &&
+              std::all_of(cold.decisions.begin(), cold.decisions.end(),
+                          [](const auto& item) {
+                            return item.executor == er::HybridExecutor::gpu_upload;
+                          }),
+          "unmeasured H2D path was allowed to speculate on CPU");
+
+  planner.observe_h2d(90U, 90U);
+  const auto calibrated = planner.plan(candidates);
+  const auto hot = std::find_if(calibrated.decisions.begin(),
+                                calibrated.decisions.end(),
+                                [](const auto& item) {
+                                  return item.expert == 1U;
+                                });
+  const auto probe = std::find_if(calibrated.decisions.begin(),
+                                  calibrated.decisions.end(),
+                                  [](const auto& item) {
+                                    return item.reason ==
+                                           er::HybridDispatchReason::cpu_calibration;
+                                  });
+  require(hot != calibrated.decisions.end() &&
+              hot->reason == er::HybridDispatchReason::gpu_cache_warm &&
+              probe != calibrated.decisions.end(),
+          "hybrid bootstrap did not warm the hottest page and calibrate CPU");
+  planner.observe_cpu(200U, 1U);
+  planner.observe_gpu(20U, 1U);
+  const auto telemetry = planner.telemetry();
+  require(telemetry.h2d_observations == 1U &&
+              telemetry.cpu_observations == 1U &&
+              telemetry.gpu_observations == 1U &&
+              telemetry.cpu_calibrations == 1U &&
+              telemetry.gpu_cache_warms == 2U,
+          "hybrid live observation telemetry is incomplete");
+}
+
+void test_monotonic_host_allocator_is_bounded_and_aligned() {
+  auto arena = std::make_shared<er::MonotonicHostAllocator>(
+      4096U, 256U, std::make_shared<er::AlignedHostAllocator>());
+  auto* first = arena->allocate(100U, 64U);
+  auto* second = arena->allocate(200U, 256U);
+  require(first && second &&
+              reinterpret_cast<std::uintptr_t>(first) % 64U == 0U &&
+              reinterpret_cast<std::uintptr_t>(second) % 256U == 0U &&
+              arena->bytes_used() == 456U && !arena->page_locked(),
+          "monotonic host allocator violated bank geometry");
+  arena->deallocate(first);
+  require(arena->bytes_used() == 456U &&
+              arena->allocate(4096U, 256U) == nullptr,
+          "monotonic host allocator reclaimed or exceeded its fixed bank");
+}
+
 void test_route_census_is_bounded_ranked_and_recoverable() {
   const std::array identity_bytes{std::byte{1}, std::byte{7}, std::byte{9}};
   er::RouteCensusConfig config{17U, er::sha256(identity_bytes), 3U,
@@ -3398,6 +3598,7 @@ int main() {
     test_universal_worker_launch_preserves_provider_extensions();
     test_deepseek_fp8_shared_admission_validation();
     test_fp4_block32_admission_validation();
+    test_fp4_relu2_block32_admission_validation();
     test_extent_gather_is_exact_and_bounded();
     test_state_machine_and_sha256();
     test_buffer_pool_reserves_demand_capacity_globally();
@@ -3429,6 +3630,8 @@ int main() {
     test_prefetch_credits_and_stale_epoch_cancel_pending_work();
     test_hybrid_dispatch_minimizes_measured_critical_path();
     test_hybrid_dispatch_ties_bounds_and_trace_are_deterministic();
+    test_hybrid_dispatch_requires_live_tiers_and_warms_hot_gpu_pages();
+    test_monotonic_host_allocator_is_bounded_and_aligned();
     test_route_census_is_bounded_ranked_and_recoverable();
     test_placement_profile_uses_measurements_and_exact_budgets();
     std::cout << "expert_runtime_tests: PASS\n";

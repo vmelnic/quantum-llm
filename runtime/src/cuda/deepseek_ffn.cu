@@ -1,6 +1,7 @@
 #include "expert/runtime/cuda/deepseek_ffn.hpp"
 
 #include "expert/runtime/cuda/deepseek_hca.hpp"
+#include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
 
@@ -77,6 +78,13 @@ __global__ void pair_route_layout_kernel(
   }
 }
 
+__global__ void batch_shared_layout_kernel(std::uint32_t* shared_indices,
+                                           std::uint32_t rows) {
+  const auto row = static_cast<std::uint32_t>(
+      blockIdx.x * blockDim.x + threadIdx.x);
+  if (row < rows) shared_indices[row] = kSharedExpert;
+}
+
 __global__ void routed_selection_mask_kernel(std::uint8_t* mask,
                                              std::uint64_t bits) {
   const auto slot = static_cast<std::uint32_t>(threadIdx.x);
@@ -122,6 +130,17 @@ DeepSeekFfnPairWorkspace::~DeepSeekFfnPairWorkspace() {
   if (allocation_) static_cast<void>(cudaFree(allocation_));
 }
 
+DeepSeekFfnBatchWorkspace::DeepSeekFfnBatchWorkspace(
+    void* allocation, std::uint64_t bytes,
+    std::uint32_t maximum_rows) noexcept
+    : allocation_(allocation), bytes_(bytes), maximum_rows_(maximum_rows) {
+  map(allocation);
+}
+
+DeepSeekFfnBatchWorkspace::~DeepSeekFfnBatchWorkspace() {
+  if (allocation_) static_cast<void>(cudaFree(allocation_));
+}
+
 void DeepSeekFfnPairWorkspace::map(void* base) noexcept {
   Arena arena{static_cast<std::byte*>(base)};
   hca_normalized_ = arena.take<float>(2U * 4U * kHidden);
@@ -147,6 +166,41 @@ void DeepSeekFfnPairWorkspace::map(void* base) noexcept {
   routed_q_intermediate_scales_ = arena.take<float>(2U * kTopK);
   shared_intermediate_ = arena.take<float>(2U * kIntermediate);
   shared_output_ = arena.take<float>(2U * kHidden);
+  bytes_ = align_up(arena.cursor);
+}
+
+void DeepSeekFfnBatchWorkspace::map(void* base) noexcept {
+  Arena arena{static_cast<std::byte*>(base)};
+  const auto rows = static_cast<std::size_t>(maximum_rows_);
+  hca_normalized_ = arena.take<float>(rows * 4U * kHidden);
+  hca_mixes_ = arena.take<float>(rows * 24U);
+  collapsed_ = arena.take<float>(rows * kHidden);
+  pre_ = arena.take<float>(rows * 4U);
+  post_ = arena.take<float>(rows * 4U);
+  comb_ = arena.take<float>(rows * 16U);
+  ffn_input_ = arena.take<float>(rows * kHidden);
+  router_logits_ = arena.take<float>(rows * 256U);
+  routing_weights_ = arena.take<float>(rows * kTopK);
+  expert_indices_ = arena.take<std::uint32_t>(rows * kTopK);
+  routed_selection_outputs_ =
+      arena.take<float>(rows * kTopK * kHidden);
+  routed_output_ = arena.take<float>(rows * kHidden);
+  shared_indices_ = arena.take<std::uint32_t>(rows);
+  shared_intermediate_ = arena.take<float>(rows * kIntermediate);
+  shared_output_ = arena.take<float>(rows * kHidden);
+  shared_q_input_ = arena.take<std::int8_t>(rows * kHidden);
+  shared_q_input_scales_ = arena.take<float>(rows);
+  shared_q_intermediate_ = arena.take<std::int8_t>(rows * kIntermediate);
+  shared_q_intermediate_scales_ = arena.take<float>(rows);
+  direct_inputs_ = arena.take<float>(rows * kHidden);
+  direct_gate_ = arena.take<float>(rows * kIntermediate);
+  direct_up_ = arena.take<float>(rows * kIntermediate);
+  direct_intermediate_ = arena.take<float>(rows * kIntermediate);
+  direct_outputs_ = arena.take<float>(rows * kHidden);
+  direct_q_input_ = arena.take<std::int8_t>(rows * kHidden);
+  direct_q_input_scales_ = arena.take<float>(rows);
+  direct_q_intermediate_ = arena.take<std::int8_t>(rows * kIntermediate);
+  direct_q_intermediate_scales_ = arena.take<float>(rows);
   bytes_ = align_up(arena.cursor);
 }
 
@@ -196,14 +250,14 @@ DeepSeekFfnHybridWorkspace::~DeepSeekFfnHybridWorkspace() {
 
 void DeepSeekFfnHybridWorkspace::map() noexcept {
   Arena device{static_cast<std::byte*>(device_allocation_)};
-  selection_mask_ = device.take<std::uint8_t>(kTopK);
-  alternate_slot_by_selection_ = device.take<std::uint32_t>(kTopK);
-  alternate_outputs_ = device.take<float>(kTopK * kHidden);
+  selection_mask_ = device.take<std::uint8_t>(2U * kTopK);
+  alternate_slot_by_selection_ = device.take<std::uint32_t>(2U * kTopK);
+  alternate_outputs_ = device.take<float>(2U * kTopK * kHidden);
   device_bytes_ = align_up(device.cursor);
   auto* host = static_cast<float*>(host_allocation_);
   host_input_ = host;
-  host_outputs_ = host ? host + kHidden : nullptr;
-  host_bytes_ = (kHidden + kTopK * kHidden) * sizeof(float);
+  host_outputs_ = host ? host + 2U * kHidden : nullptr;
+  host_bytes_ = (2U * kHidden + 2U * kTopK * kHidden) * sizeof(float);
 }
 
 DeepSeekFfnHybridWorkspaceResult create_deepseek_ffn_hybrid_workspace()
@@ -323,6 +377,171 @@ DeepSeekFfnPairWorkspaceResult create_deepseek_ffn_pair_workspace() noexcept {
   if (error != cudaSuccess)
     return {failure(error, "reset DeepSeek pair FFN workspace"), {}};
   return {Status::success(), std::move(workspace)};
+}
+
+std::uint64_t deepseek_ffn_batch_workspace_size(
+    std::uint32_t maximum_rows) noexcept {
+  if (maximum_rows == 0U ||
+      maximum_rows > kDeepSeekMaximumSequenceRows)
+    return 0U;
+  DeepSeekFfnBatchWorkspace sizing(nullptr, 0U, maximum_rows);
+  return sizing.bytes();
+}
+
+DeepSeekFfnBatchWorkspaceResult create_deepseek_ffn_batch_workspace(
+    std::uint32_t maximum_rows) noexcept {
+  const auto bytes = deepseek_ffn_batch_workspace_size(maximum_rows);
+  if (bytes == 0U)
+    return {{ErrorCode::invalid_argument,
+             "invalid DeepSeek batch FFN workspace geometry"}, {}};
+  void* allocation = nullptr;
+  auto error = cudaMalloc(&allocation, bytes);
+  if (error != cudaSuccess)
+    return {failure(error, "allocate DeepSeek batch FFN workspace"), {}};
+  auto workspace = std::shared_ptr<DeepSeekFfnBatchWorkspace>(
+      new DeepSeekFfnBatchWorkspace(allocation, bytes, maximum_rows));
+  error = cudaMemset(allocation, 0, bytes);
+  if (error != cudaSuccess)
+    return {failure(error, "reset DeepSeek batch FFN workspace"), {}};
+  return {Status::success(), std::move(workspace)};
+}
+
+Status deepseek_ffn_route_batch(
+    const DeepSeekFfnBatchRouteLaunch& launch) noexcept {
+  if (!launch.weights || !launch.identity_state || !launch.workspace ||
+      !launch.streams || !launch.token_ids || launch.rows == 0U ||
+      launch.rows > launch.workspace->maximum_rows() ||
+      launch.epsilon <= 0.0F || launch.sinkhorn_iterations == 0U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek batch FFN route launch"};
+  auto status = check_binding(*launch.weights, *launch.identity_state);
+  if (!status.ok()) return status;
+  auto& workspace = *launch.workspace;
+  const auto& weights = *launch.weights;
+  status = deepseek_hca_pre_batch(
+      {weights.hca_function, weights.hca_base, weights.hca_scale, kHidden},
+      launch.streams, launch.rows, workspace.collapsed_, workspace.pre_,
+      workspace.post_, workspace.comb_,
+      {workspace.hca_normalized_, workspace.hca_mixes_}, launch.epsilon,
+      launch.sinkhorn_iterations, launch.stream);
+  if (!status.ok()) return status;
+  status = rms_norm_bf16_weight_batch(
+      workspace.collapsed_, weights.ffn_norm, workspace.ffn_input_,
+      launch.rows, kHidden, launch.epsilon, launch.stream);
+  if (!status.ok()) return status;
+  if (weights.hash_router) {
+    return deepseek_router_hash_rows(
+        workspace.ffn_input_, weights.router_weight, weights.token_experts,
+        launch.token_ids, launch.rows, workspace.router_logits_,
+        workspace.routing_weights_, workspace.expert_indices_, 1.5F,
+        launch.stream);
+  }
+  return deepseek_router_learned_rows(
+      workspace.ffn_input_, weights.router_weight, weights.router_bias,
+      launch.rows, workspace.router_logits_, workspace.routing_weights_,
+      workspace.expert_indices_, 1.5F, launch.stream);
+}
+
+Status deepseek_ffn_execute_packed_batch(
+    const DeepSeekFfnPackedBatchLaunch& launch) noexcept {
+  if (!launch.expert || !launch.workspace || !launch.input || !launch.output ||
+      launch.rows == 0U || launch.rows > launch.workspace->maximum_rows() ||
+      launch.swiglu_limit < 0.0F)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek packed FFN batch launch"};
+  const auto& sections = launch.expert->sections();
+  const auto* base = launch.expert->base();
+  constexpr std::uint64_t kMatrixValues =
+      static_cast<std::uint64_t>(kHidden) * kIntermediate;
+  constexpr std::uint64_t kWeightBytes = kMatrixValues / 2U;
+  constexpr std::uint64_t kScaleBytes = kMatrixValues / 32U;
+  if (!base || sections.w1_weight_bytes != kWeightBytes ||
+      sections.w3_weight_bytes != kWeightBytes ||
+      sections.w2_weight_bytes != kWeightBytes ||
+      sections.w1_scale_bytes != kScaleBytes ||
+      sections.w3_scale_bytes != kScaleBytes ||
+      sections.w2_scale_bytes != kScaleBytes)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek packed FFN batch expert"};
+  auto& workspace = *launch.workspace;
+  auto status = quantize_q8_batch(
+      launch.input, workspace.direct_q_input_,
+      workspace.direct_q_input_scales_, launch.rows, kHidden, kHidden,
+      launch.stream);
+  if (!status.ok()) return status;
+  const Fp4Block32Matrix w1{
+      base + sections.w1_weight_offset,
+      base + sections.w1_scale_offset, kIntermediate, kHidden, kHidden};
+  const Fp4Block32Matrix w3{
+      base + sections.w3_weight_offset,
+      base + sections.w3_scale_offset, kIntermediate, kHidden, kHidden};
+  const Fp4Block32Matrix w2{
+      base + sections.w2_weight_offset,
+      base + sections.w2_scale_offset, kHidden, kIntermediate, kIntermediate};
+  status = fp4_gemm_q8_block32(
+      w1, workspace.direct_q_input_, workspace.direct_q_input_scales_,
+      workspace.direct_gate_, launch.rows, launch.stream);
+  if (!status.ok()) return status;
+  status = fp4_gemm_q8_block32(
+      w3, workspace.direct_q_input_, workspace.direct_q_input_scales_,
+      workspace.direct_up_, launch.rows, launch.stream);
+  if (!status.ok()) return status;
+  const auto intermediate_values = launch.rows * kIntermediate;
+  status = deepseek_swiglu_product(
+      workspace.direct_gate_, workspace.direct_up_,
+      workspace.direct_intermediate_, intermediate_values,
+      launch.swiglu_limit, launch.bf16_intermediate, launch.stream);
+  if (!status.ok()) return status;
+  status = quantize_q8_batch(
+      workspace.direct_intermediate_, workspace.direct_q_intermediate_,
+      workspace.direct_q_intermediate_scales_, launch.rows, kIntermediate,
+      kIntermediate, launch.stream);
+  if (!status.ok()) return status;
+  return fp4_gemm_q8_block32(
+      w2, workspace.direct_q_intermediate_,
+      workspace.direct_q_intermediate_scales_, launch.output, launch.rows,
+      launch.stream);
+}
+
+Status deepseek_ffn_finalize_batch(
+    const DeepSeekFfnBatchFinalizeLaunch& launch) noexcept {
+  if (!launch.weights || !launch.identity_state || !launch.workspace ||
+      !launch.directory_entries || !launch.streams ||
+      !launch.updated_streams || launch.rows == 0U ||
+      launch.rows > launch.workspace->maximum_rows() ||
+      launch.experts_per_layer != 257U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek batch FFN finalize launch"};
+  auto status = check_binding(*launch.weights, *launch.identity_state);
+  if (!status.ok()) return status;
+  auto& workspace = *launch.workspace;
+  status = launch_moe_aggregate({
+      workspace.routed_selection_outputs_, nullptr, nullptr, nullptr,
+      workspace.routing_weights_, workspace.routed_output_, 0U, launch.rows,
+      kHidden, kTopK, launch.stream});
+  if (!status.ok()) return status;
+  batch_shared_layout_kernel<<<(launch.rows + 255U) / 256U, 256U, 0,
+                               static_cast<cudaStream_t>(launch.stream)>>>(
+      workspace.shared_indices_, launch.rows);
+  auto error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+    return failure(error, "prepare DeepSeek batch shared route");
+  status = launch_moe_selection_batch({
+      workspace.ffn_input_, nullptr, workspace.shared_indices_, nullptr,
+      workspace.shared_intermediate_, workspace.shared_output_,
+      workspace.shared_q_input_, workspace.shared_q_input_scales_,
+      workspace.shared_q_intermediate_,
+      workspace.shared_q_intermediate_scales_, launch.rows, kHidden,
+      kIntermediate, 1U, launch.experts_per_layer, launch.stream,
+      launch.directory_entries, launch.weights->layer, 10.0F, true, true});
+  if (!status.ok()) return status;
+  status = add_in_place(workspace.routed_output_, workspace.shared_output_,
+                        launch.rows * kHidden, launch.stream);
+  if (!status.ok()) return status;
+  return deepseek_hca_post_batch(
+      workspace.routed_output_, launch.streams, workspace.post_,
+      workspace.comb_, launch.updated_streams, launch.rows, kHidden,
+      launch.stream);
 }
 
 Status deepseek_ffn_route_pair(
@@ -800,6 +1019,130 @@ Status deepseek_ffn_execute_hybrid(
   return deepseek_hca_post(state.routed_output_, launch.streams, state.post_,
                            state.comb_, launch.updated_streams, kHidden,
                            launch.stream);
+}
+
+Status deepseek_ffn_execute_pair_hybrid(
+    const DeepSeekFfnHybridPairExecuteLaunch& launch) noexcept {
+  constexpr std::uint32_t kRows = 2U;
+  constexpr std::uint32_t kSelections = kRows * kTopK;
+  if (!launch.weights || !launch.states[0] || !launch.states[1] ||
+      !launch.pair_workspace || !launch.directory_entries ||
+      !launch.streams[0] || !launch.streams[1] ||
+      !launch.updated_streams[0] || !launch.updated_streams[1] ||
+      !launch.hybrid_workspace || !launch.cpu_executor ||
+      launch.cpu_groups.empty() || launch.experts_per_layer != 257U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek hybrid pair FFN execute launch"};
+  for (auto* state : launch.states) {
+    const auto checked = check_binding(*launch.weights, *state);
+    if (!checked.ok()) return checked;
+  }
+
+  std::array<std::uint8_t, kSelections> primary_mask{};
+  primary_mask.fill(1U);
+  std::array<std::uint32_t, kSelections> alternate_slots{};
+  std::array<bool, kSelections> claimed{};
+  std::uint32_t alternate_count = 0U;
+  for (const auto& group : launch.cpu_groups) {
+    if (group.selections.size() != group.output_slots.size())
+      return {ErrorCode::invalid_argument,
+              "DeepSeek hybrid pair CPU selection mapping mismatch"};
+    for (std::size_t index = 0U; index < group.selections.size(); ++index) {
+      const auto selection = group.selections[index];
+      const auto output_slot = group.output_slots[index];
+      if (selection >= kSelections || output_slot >= kSelections ||
+          claimed[selection])
+        return {ErrorCode::invalid_argument,
+                "invalid or duplicate DeepSeek hybrid pair selection"};
+      claimed[selection] = true;
+      primary_mask[selection] = 0U;
+      alternate_slots[selection] = output_slot;
+      alternate_count = std::max(alternate_count, output_slot + 1U);
+    }
+  }
+  const auto cpu_selection_count = static_cast<std::uint32_t>(
+      std::count(claimed.begin(), claimed.end(), true));
+  if (cpu_selection_count == 0U || alternate_count != cpu_selection_count)
+    return {ErrorCode::invalid_argument,
+            "DeepSeek hybrid pair CPU outputs must use compact slots"};
+
+  auto& pair = *launch.pair_workspace;
+  auto& hybrid = *launch.hybrid_workspace;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  const auto input_ready =
+      static_cast<cudaEvent_t>(hybrid.input_ready_event_);
+  auto error = cudaMemcpyAsync(hybrid.host_input_, pair.ffn_input_,
+                               kRows * kHidden * sizeof(float),
+                               cudaMemcpyDeviceToHost, stream);
+  if (error == cudaSuccess) error = cudaEventRecord(input_ready, stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(hybrid.selection_mask_, primary_mask.data(),
+                            primary_mask.size(), cudaMemcpyHostToDevice,
+                            stream);
+  if (error == cudaSuccess)
+    error = cudaMemcpyAsync(hybrid.alternate_slot_by_selection_,
+                            alternate_slots.data(),
+                            alternate_slots.size() * sizeof(std::uint32_t),
+                            cudaMemcpyHostToDevice, stream);
+  if (error != cudaSuccess)
+    return failure(error, "stage DeepSeek hybrid pair inputs");
+
+  auto status = launch_moe_selection_batch({
+      pair.ffn_input_, pair.routing_weights_, pair.routed_indices_,
+      hybrid.selection_mask_, pair.routed_intermediate_,
+      pair.routed_selection_outputs_, pair.routed_q_input_,
+      pair.routed_q_input_scales_, pair.routed_q_intermediate_,
+      pair.routed_q_intermediate_scales_, kRows, kHidden, kIntermediate,
+      kTopK, launch.experts_per_layer, launch.stream,
+      launch.directory_entries, launch.weights->layer, 10.0F, true, true});
+  if (!status.ok()) return status;
+
+  error = cudaEventSynchronize(input_ready);
+  if (error != cudaSuccess)
+    return failure(error, "wait for DeepSeek hybrid pair CPU input");
+  status = launch.cpu_executor->execute(
+      launch.cpu_groups,
+      std::span<const float>(hybrid.host_input_, kRows * kHidden), kRows,
+      kTopK,
+      std::span<float>(hybrid.host_outputs_,
+                       static_cast<std::size_t>(alternate_count) * kHidden));
+  if (!status.ok()) {
+    static_cast<void>(cudaStreamSynchronize(stream));
+    return status;
+  }
+  error = cudaMemcpyAsync(
+      hybrid.alternate_outputs_, hybrid.host_outputs_,
+      static_cast<std::size_t>(alternate_count) * kHidden * sizeof(float),
+      cudaMemcpyHostToDevice, stream);
+  if (error != cudaSuccess)
+    return failure(error, "upload DeepSeek hybrid pair CPU outputs");
+
+  status = launch_moe_aggregate({
+      pair.routed_selection_outputs_, hybrid.alternate_outputs_,
+      hybrid.selection_mask_, hybrid.alternate_slot_by_selection_,
+      pair.routing_weights_, pair.routed_output_, alternate_count, kRows,
+      kHidden, kTopK, launch.stream});
+  if (!status.ok()) return status;
+  status = launch_moe_selection_batch({
+      pair.ffn_input_, pair.shared_weights_, pair.shared_indices_, nullptr,
+      pair.shared_intermediate_, pair.shared_output_, pair.routed_q_input_,
+      pair.routed_q_input_scales_, pair.routed_q_intermediate_,
+      pair.routed_q_intermediate_scales_, kRows, kHidden, kIntermediate, 1U,
+      launch.experts_per_layer, launch.stream, launch.directory_entries,
+      launch.weights->layer, 10.0F, true, true});
+  if (!status.ok()) return status;
+  status = add_in_place(pair.routed_output_, pair.shared_output_,
+                        kRows * kHidden, launch.stream);
+  if (!status.ok()) return status;
+  for (std::uint32_t row = 0U; row < kRows; ++row) {
+    status = deepseek_hca_post(
+        pair.routed_output_ + static_cast<std::size_t>(row) * kHidden,
+        launch.streams[row], pair.post_ + row * 4U,
+        pair.comb_ + row * 16U, launch.updated_streams[row], kHidden,
+        launch.stream);
+    if (!status.ok()) return status;
+  }
+  return Status::success();
 }
 
 }  // namespace expert::runtime::cuda

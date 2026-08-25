@@ -1469,12 +1469,159 @@ LongContextAttentionProfile attention_262144_profile() {
           std::move(decode_profiles)};
 }
 
+double standard_gqa_ratio16_check() {
+  constexpr std::uint32_t rows = 2U;
+  constexpr std::uint32_t query_heads = 32U;
+  constexpr std::uint32_t kv_heads = 2U;
+  constexpr std::uint32_t head_dim = 32U;
+  constexpr std::uint32_t rotary_dim = 32U;
+  constexpr float theta = 10000.0F;
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            head_dim;
+  const auto kv_values = static_cast<std::size_t>(rows) * kv_heads * head_dim;
+  std::vector<float> query(query_values);
+  std::vector<float> key(kv_values);
+  std::vector<float> value(kv_values);
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 1U) * 0.013F);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::cos(static_cast<float>(index + 3U) * 0.017F);
+    value[index] = std::sin(static_cast<float>(index + 5U) * 0.019F);
+  }
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<std::uint16_t> fp16_keys(kv_values);
+  DeviceBuffer<std::uint16_t> fp16_values(kv_values);
+  device_query.upload(query);
+  device_key.upload(key);
+  device_value.upload(value);
+  status_check(expert::runtime::cuda::standard_gqa_qkv_rope_fp16_batch(
+      device_query.get(), device_key.get(), device_value.get(),
+      fp16_keys.get(), fp16_values.get(), 7U, rows, query_heads, kv_heads,
+      head_dim, rotary_dim, theta, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize ratio-16 standard GQA smoke");
+  const auto actual_query = device_query.download();
+  const auto actual_key = device_key.download();
+  const auto actual_fp16_keys = fp16_keys.download();
+  const auto actual_fp16_values = fp16_values.download();
+  double maximum_error{};
+  const auto expected_rope = [&](const float* source, std::uint32_t dimension,
+                                 std::uint32_t position) {
+    const auto half = rotary_dim / 2U;
+    const auto pair = dimension % half;
+    const auto angle = static_cast<float>(position) *
+        std::pow(theta, -2.0F * static_cast<float>(pair) /
+                            static_cast<float>(rotary_dim));
+    const auto other = dimension < half ? -source[dimension + half]
+                                        : source[dimension - half];
+    return source[dimension] * std::cos(angle) + other * std::sin(angle);
+  };
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto base = (static_cast<std::size_t>(row) * query_heads + head) *
+                        head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        maximum_error = std::max(
+            maximum_error,
+            static_cast<double>(std::abs(
+                actual_query[base + dimension] -
+                expected_rope(query.data() + base, dimension, 7U + row))));
+    }
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto base = (static_cast<std::size_t>(row) * kv_heads + head) *
+                        head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto expected = expected_rope(
+            key.data() + base, dimension, 7U + row);
+        maximum_error = std::max(
+            maximum_error,
+            static_cast<double>(std::abs(actual_key[base + dimension] -
+                                         expected)));
+        maximum_error = std::max(
+            maximum_error,
+            static_cast<double>(std::abs(
+                __half2float(*reinterpret_cast<const __half*>(
+                    &actual_fp16_keys[base + dimension])) - expected)));
+        maximum_error = std::max(
+            maximum_error,
+            static_cast<double>(std::abs(
+                __half2float(*reinterpret_cast<const __half*>(
+                    &actual_fp16_values[base + dimension])) -
+                value[base + dimension])));
+      }
+    }
+  }
+  return maximum_error;
+}
+
+double standard_gqa_no_position_check() {
+  constexpr std::uint32_t rows = 3U;
+  constexpr std::uint32_t query_heads = 32U;
+  constexpr std::uint32_t kv_heads = 2U;
+  constexpr std::uint32_t head_dim = 32U;
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            head_dim;
+  const auto kv_values = static_cast<std::size_t>(rows) * kv_heads * head_dim;
+  std::vector<float> query(query_values);
+  std::vector<float> key(kv_values);
+  std::vector<float> value(kv_values);
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 1U) * 0.011F);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::cos(static_cast<float>(index + 3U) * 0.023F);
+    value[index] = std::sin(static_cast<float>(index + 5U) * 0.029F);
+  }
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<std::uint16_t> fp16_keys(kv_values);
+  DeviceBuffer<std::uint16_t> fp16_values(kv_values);
+  device_query.upload(query);
+  device_key.upload(key);
+  device_value.upload(value);
+  status_check(expert::runtime::cuda::standard_gqa_kv_fp16_batch(
+      device_key.get(), device_value.get(),
+      fp16_keys.get(), fp16_values.get(), rows, query_heads, kv_heads,
+      head_dim, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize position-free standard GQA smoke");
+  const auto actual_query = device_query.download();
+  const auto actual_key = device_key.download();
+  const auto actual_fp16_keys = fp16_keys.download();
+  const auto actual_fp16_values = fp16_values.download();
+  double maximum_error{};
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        static_cast<double>(std::abs(actual_query[index] - query[index])));
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    maximum_error = std::max(
+        maximum_error,
+        static_cast<double>(std::abs(actual_key[index] - key[index])));
+    maximum_error = std::max(
+        maximum_error,
+        static_cast<double>(std::abs(
+            __half2float(*reinterpret_cast<const __half*>(
+                &actual_fp16_keys[index])) - key[index])));
+    maximum_error = std::max(
+        maximum_error,
+        static_cast<double>(std::abs(
+            __half2float(*reinterpret_cast<const __half*>(
+                &actual_fp16_values[index])) - value[index])));
+  }
+  return maximum_error;
+}
+
 double host_fp16_attention_check() {
   constexpr std::uint32_t rows = 3U;
-  constexpr std::uint32_t query_heads = 4U;
+  constexpr std::uint32_t query_heads = 32U;
   constexpr std::uint32_t kv_heads = 2U;
   constexpr std::uint32_t head_dim = 32U;
   constexpr std::uint32_t cache_capacity = 8U;
+  constexpr std::uint32_t page_tokens = 4U;
+  constexpr std::uint32_t page_count = cache_capacity / page_tokens;
   constexpr std::uint32_t first_context_tokens = 5U;
   constexpr std::uint32_t split_tokens = 4U;
   constexpr std::uint32_t grouped_heads = query_heads / kv_heads;
@@ -1507,6 +1654,11 @@ double host_fp16_attention_check() {
   DeviceBuffer<float> output(query_values);
   DeviceBuffer<std::uint16_t> device_cache_keys(cache_values);
   DeviceBuffer<std::uint16_t> device_cache_values(cache_values);
+  const auto page_values = static_cast<std::size_t>(page_tokens) * kv_heads *
+                           head_dim;
+  DeviceBuffer<std::uint16_t> device_page_zero(2U * page_values);
+  DeviceBuffer<std::uint16_t> device_page_one(2U * page_values);
+  DeviceBuffer<void*> device_page_table(page_count);
   DeviceBuffer<std::uint16_t> queries(query_values);
   DeviceBuffer<std::uint16_t> raw_keys(staged_values);
   DeviceBuffer<std::uint16_t> raw_values(staged_values);
@@ -1526,6 +1678,14 @@ double host_fp16_attention_check() {
                         cache_values * sizeof(std::uint16_t),
                         cudaMemcpyHostToDevice),
              "upload staged device FP16 values");
+  std::array<void*, page_count> device_pages{
+      device_page_zero.get(), device_page_one.get()};
+  device_page_table.upload(
+      std::vector<void*>(device_pages.begin(), device_pages.end()));
+  status_check(expert::runtime::cuda::store_gqa_kv_fp16_to_paged(
+      device_cache_keys.get(), device_cache_values.get(),
+      reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+      page_tokens, 0U, cache_capacity, kv_heads, head_dim, nullptr));
   status_check(expert::runtime::cuda::gated_gqa_attention_staged_host_fp16(
       {device_query.get(), host_keys.get(), host_values.get(), output.get(),
        cache_capacity, first_context_tokens, 0U, rows, query_heads, kv_heads,
@@ -1564,6 +1724,27 @@ double host_fp16_attention_check() {
   cuda_check(cudaDeviceSynchronize(),
              "synchronize staged device FP16 attention smoke");
   const auto device_actual = output.download();
+  status_check(expert::runtime::cuda::gated_gqa_attention_staged_device_fp16(
+      {device_query.get(), nullptr, nullptr, output.get(), cache_capacity,
+       first_context_tokens, 0U, rows, query_heads, kv_heads, head_dim,
+       nullptr,
+       reinterpret_cast<const void* const*>(device_page_table.get()),
+       0U, page_tokens, page_count},
+      {queries.get(), query_values * sizeof(std::uint16_t), raw_keys.get(),
+       staged_values * sizeof(std::uint16_t), raw_values.get(),
+       staged_values * sizeof(std::uint16_t), keys.get(),
+       staged_values * sizeof(std::uint16_t), values.get(),
+       staged_values * sizeof(std::uint16_t), scores.get(),
+       score_values * sizeof(float), probabilities.get(),
+       score_values * sizeof(std::uint16_t), accumulator.get(),
+       query_values * sizeof(float), maxima.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       sums.get(),
+       static_cast<std::size_t>(kv_heads) * matrix_rows * sizeof(float),
+       split_tokens}));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize staged paged-device FP16 attention smoke");
+  const auto paged_device_actual = output.download();
 
   std::vector<float> expected(query_values);
   for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -1644,6 +1825,11 @@ double host_fp16_attention_check() {
     maximum_error = std::max(
         maximum_error,
         std::abs(static_cast<double>(device_actual[index] - actual[index])));
+  for (std::size_t index = 0U; index < actual.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(paged_device_actual[index] -
+                                    actual[index])));
   return maximum_error;
 }
 
@@ -1790,6 +1976,9 @@ int main() {
     const auto delta_error = delta_prefill_check();
     const auto attention_error = attention_prefill_check();
     const auto fp8_kv_attention = fp8_kv_attention_check();
+    const auto standard_gqa_ratio16_error = standard_gqa_ratio16_check();
+    const auto standard_gqa_no_position_error =
+        standard_gqa_no_position_check();
     const auto host_fp16_attention_error = host_fp16_attention_check();
     const auto resident_fp16_attention =
         resident_fp16_attention_262144_profile();
@@ -1828,6 +2017,8 @@ int main() {
                                         output_mean_absolute_difference) &&
                       std::isfinite(
                           fp8_kv_attention.output_cosine_similarity) &&
+                      standard_gqa_ratio16_error < 5.0e-4 &&
+                      standard_gqa_no_position_error < 5.0e-4 &&
                       host_fp16_attention_error < 5.0e-4 &&
                       std::isfinite(
                           resident_fp16_attention.best_milliseconds) &&
@@ -1911,6 +2102,10 @@ int main() {
               << fp8_kv_attention.output_mean_absolute_difference
               << ",\"fp8_kv_output_cosine_similarity\":"
               << fp8_kv_attention.output_cosine_similarity
+              << ",\"standard_gqa_ratio16_maximum_absolute_error\":"
+              << standard_gqa_ratio16_error
+              << ",\"standard_gqa_no_position_maximum_absolute_error\":"
+              << standard_gqa_no_position_error
               << ",\"host_fp16_attention_maximum_absolute_error\":"
               << host_fp16_attention_error
               << ",\"resident_fp16_attention_262144_best_milliseconds\":"

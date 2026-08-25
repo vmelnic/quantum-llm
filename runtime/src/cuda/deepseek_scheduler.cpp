@@ -107,6 +107,22 @@ struct DeepSeekDecodeScheduler::Core final {
   DeepSeekDecodeSchedulerSnapshot metrics;
   std::uint64_t observed_cpu_compute_ns{};
   std::uint64_t observed_cpu_selections{};
+  std::uint64_t observed_upload_wait_ns{};
+  std::uint64_t observed_uploaded_bytes{};
+
+  Status configure_hybrid(
+      const std::shared_ptr<DeepSeekDecodeController>& controller) {
+    if (!hybrid.cpu_executor || controller->hybrid_configured())
+      return Status::success();
+    auto workspace = create_deepseek_ffn_hybrid_workspace();
+    if (!workspace.status.ok() || !workspace.workspace)
+      return workspace.status.ok()
+          ? Status(ErrorCode::internal,
+                   "DeepSeek hybrid workspace returned no ownership")
+          : copied_status(workspace.status);
+    return controller->configure_hybrid(
+        hybrid.cpu_executor, std::move(workspace.workspace));
+  }
 
   void refresh_cpu_cost() noexcept {
     if (!hybrid.cpu_executor || !hybrid.planner) return;
@@ -119,6 +135,19 @@ struct DeepSeekDecodeScheduler::Core final {
     }
     observed_cpu_compute_ns = current.compute_ns;
     observed_cpu_selections = current.selections;
+  }
+
+  void refresh_transfer_cost() noexcept {
+    if (!hybrid.planner) return;
+    const auto current = cache.telemetry();
+    if (current.upload_wait_ns >= observed_upload_wait_ns &&
+        current.uploaded_bytes >= observed_uploaded_bytes) {
+      hybrid.planner->observe_h2d(
+          current.upload_wait_ns - observed_upload_wait_ns,
+          current.uploaded_bytes - observed_uploaded_bytes);
+    }
+    observed_upload_wait_ns = current.upload_wait_ns;
+    observed_uploaded_bytes = current.uploaded_bytes;
   }
 
   void enqueue_runnable(ScheduledRequest& request) {
@@ -506,13 +535,18 @@ struct DeepSeekDecodeScheduler::Core final {
       ScheduledRequest& request,
       const DeepSeekDecodeAdvanceResult& result,
       std::set<std::uint32_t>& cpu_selected) {
-    if (result.route_rows != 1U || !hybrid.cpu_executor || !hybrid.planner ||
+    if ((result.route_rows != 1U && result.route_rows != 2U) ||
+        !hybrid.cpu_executor || !hybrid.planner ||
         !request.cpu_experts.empty())
       return Status::success();
     refresh_cpu_cost();
+    refresh_transfer_cost();
+    std::map<std::uint32_t, std::uint32_t> selection_counts;
+    for (const auto expert : result.routed_experts)
+      ++selection_counts[expert];
     std::vector<HybridDispatchCandidate> candidates;
-    candidates.reserve(result.routed_experts.size());
-    for (const auto expert : result.routed_experts) {
+    candidates.reserve(selection_counts.size());
+    for (const auto& [expert, selections] : selection_counts) {
       const auto* record = catalog.find(result.layer, expert);
       if (!record)
         return {ErrorCode::invalid_argument,
@@ -522,9 +556,13 @@ struct DeepSeekDecodeScheduler::Core final {
                          result.ready_experts.end();
       const auto key = routed.key(result.layer, expert);
       const auto snapshot = cache.inspect(key);
-      const auto host_ready = snapshot && snapshot->has_host_copy;
-      candidates.push_back({expert, 1U, record->stored_bytes, ready,
-                            host_ready, true});
+      const auto host_ready = snapshot && snapshot->has_host_copy &&
+          (snapshot->state == CacheState::ram_ready ||
+           snapshot->state == CacheState::vram_ready);
+      candidates.push_back(
+          {expert, selections, record->stored_bytes, ready, host_ready, true,
+           snapshot ? snapshot->placement_temperature : 0U,
+           snapshot ? snapshot->last_access : 0U});
     }
     const auto placement = hybrid.planner->plan(candidates);
     if (!placement.status.ok()) return copied_status(placement.status);
@@ -818,21 +856,10 @@ Status DeepSeekDecodeScheduler::submit(
     return {ErrorCode::backpressure,
             "DeepSeek scheduled request capacity exhausted"};
   }
-  if (core_->hybrid.cpu_executor && !controller->hybrid_configured()) {
-    auto workspace = create_deepseek_ffn_hybrid_workspace();
-    if (!workspace.status.ok() || !workspace.workspace) {
-      ++core_->metrics.rejected_requests;
-      return workspace.status.ok()
-                 ? Status(ErrorCode::internal,
-                          "DeepSeek hybrid workspace returned no ownership")
-                 : copied_status(workspace.status);
-    }
-    const auto configured = controller->configure_hybrid(
-        core_->hybrid.cpu_executor, std::move(workspace.workspace));
-    if (!configured.ok()) {
-      ++core_->metrics.rejected_requests;
-      return copied_status(configured);
-    }
+  const auto hybrid_configured = core_->configure_hybrid(controller);
+  if (!hybrid_configured.ok()) {
+    ++core_->metrics.rejected_requests;
+    return copied_status(hybrid_configured);
   }
   const auto started = controller->begin(begin);
   if (!started.ok()) {
@@ -864,6 +891,11 @@ Status DeepSeekDecodeScheduler::submit_verify(
     ++core_->metrics.rejected_requests;
     return {ErrorCode::backpressure,
             "DeepSeek scheduled request capacity exhausted"};
+  }
+  const auto hybrid_configured = core_->configure_hybrid(controller);
+  if (!hybrid_configured.ok()) {
+    ++core_->metrics.rejected_requests;
+    return copied_status(hybrid_configured);
   }
   const auto started = controller->begin_verify_pair(begin);
   if (!started.ok()) {

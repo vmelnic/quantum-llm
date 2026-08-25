@@ -202,6 +202,24 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(decoder.push(1), "")
         self.assertEqual(decoder.push(2), "😊")
 
+    def test_incremental_token_decoder_strips_retained_context_prefix(self) -> None:
+        class Tokenizer:
+            maximum_seen = 0
+
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                self.maximum_seen = max(self.maximum_seen, len(tokens))
+                marker = "" if tokens and tokens[0] == 1 else "^"
+                return marker + "".join(chr(96 + token) for token in tokens)
+
+        tokenizer = Tokenizer()
+        decoder = IncrementalTokenDecoder(
+            tokenizer, overlap_tokens=4, maximum_window_tokens=8
+        )
+        tokens = list(range(1, 21))
+        output = "".join(decoder.push(token) for token in tokens)
+        self.assertEqual(output, "".join(chr(96 + token) for token in tokens))
+        self.assertLessEqual(tokenizer.maximum_seen, 8)
+
     def test_standard_stream_events_split_reasoning_and_content(self) -> None:
         class Parser:
             def feed(self, delta: str) -> list[dict[str, object]]:
@@ -212,13 +230,20 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             def finalize(self) -> tuple[dict[str, object], list[dict[str, object]]]:
                 return {}, []
 
-        app = types.SimpleNamespace(response_stream_parser=lambda _request: Parser())
+        app = types.SimpleNamespace(
+            response_stream_parser=lambda _request: Parser(),
+            assistant_output_from_parsed_message=lambda message, _text,
+                fallback_text: expert_server.Application.
+                _assistant_output_from_message(message),
+        )
         parser = AssistantStreamParser(app, object())
         self.assertEqual(parser.feed("thinking:check assumptions"),
                          ("check assumptions", ""))
         self.assertEqual(parser.feed("content:final answer"),
                          ("", "final answer"))
-        self.assertEqual(parser.finish(), ("", ""))
+        reasoning, content, output = parser.finish()
+        self.assertEqual((reasoning, content), ("", ""))
+        self.assertEqual(output.tool_calls, ())
 
     def test_worker_tokens_accept_legacy_scalar_and_mtp_list(self) -> None:
         self.assertEqual(
@@ -407,6 +432,41 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             )
         self.assertEqual(worker.ram_cache_bytes, 40 << 30)
         self.assertEqual(worker.vram_cache_bytes, 11 << 30)
+
+    def test_worker_accepts_exact_blocked_causal_prefill(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 9, "capacity": 1,
+            "architecture_id": "fixture.vendor.sparse",
+            "vocab_size": 64000, "max_context_tokens": 262144,
+            "routed_layers": 43, "experts_per_layer": 256,
+            "route_width": 6, "expert_encoding": "fp4.vendor.group32",
+            "operation_capabilities": ["attention.vendor.v2"],
+            "prefill_mode": "causal_blocked_exact",
+            "prefill_chunk_tokens": 256,
+            "session_retention": False, "session_parking": False,
+            "session_park_ram_bytes": 0, "session_park_page_capacity": 0,
+            "kv_dtype": "bf16", "kv_allocation": "preallocated",
+            "kv_page_tokens": 256, "kv_page_bytes": 1024,
+            "kv_page_capacity": 65536, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 40 << 30, "vram_cache_bytes": 12 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"), expert_server.Path("pack"),
+                262144, 1, 1, 40, 12, 5120, 256, "balanced", False,
+                prefill_chunk_tokens=512,
+            )
+        self.assertEqual(worker.prefill_mode, "causal_blocked_exact")
+        self.assertEqual(worker.prefill_chunk_tokens, 256)
 
     def test_worker_accepts_provider_cpu_policy_by_default(self) -> None:
         ready = {
@@ -604,17 +664,47 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
     def test_http_openai_response_and_stream_contracts(self) -> None:
         class Tokenizer:
+            parse_calls = 0
+
             def apply_chat_template(self, _messages: object, **_kwargs: object) -> list[int]:
                 return [10, 11]
 
-            def parse_response(self, _text: str,
+            def parse_response(self, text: str,
                                **_kwargs: object) -> dict[str, object]:
-                return {"role": "assistant", "tool_calls": [{
+                self.parse_calls += 1
+                if "<tool_call>" not in text:
+                    return {"role": "assistant", "content": text.strip()}
+                content = text.split("<tool_call>", 1)[0].strip()
+                return {"role": "assistant", "content": content,
+                        "tool_calls": [{
                     "type": "function", "function": {
                         "name": "get_weather",
                         "arguments": {"city": "Chisinau"},
                     },
                 }]}
+
+            def get_response_parser(self, **_kwargs: object) -> object:
+                tokenizer = self
+
+                class Parser:
+                    def __init__(self) -> None:
+                        self.raw: list[str] = []
+
+                    def feed(self, delta: str) -> list[dict[str, object]]:
+                        self.raw.append(delta)
+                        if "<tool_call>" in delta:
+                            return []
+                        return [{"type": "region_chunk", "field": "content",
+                                 "text": delta, "dirty": False}]
+
+                    def finalize(self) -> tuple[dict[str, object],
+                                                list[dict[str, object]]]:
+                        message = tokenizer.parse_response("".join(self.raw))
+                        if message.get("tool_calls") and message.get("content"):
+                            message["content"] = "different final rendering"
+                        return message, []
+
+                return Parser()
 
         app = application_fixture()
         app.args = types.SimpleNamespace(
@@ -685,6 +775,33 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             self.assertIn('"choices":[],"usage":', stream)
             self.assertTrue(stream.endswith("data: [DONE]\n\n"))
 
+            tool = {"type": "function", "function": {
+                "name": "get_weather", "description": "Read weather",
+                "parameters": {"type": "object", "properties": {
+                    "city": {"type": "string"},
+                }, "required": ["city"]},
+            }}
+            app.response_protocol = "fixture"
+            # Transformers marks the combined template separator + first
+            # content byte as a clean stream chunk, but its final parser
+            # removes the leading separator.
+            app.generated = ("\n\nfirst ", "second")
+            connection.request("POST", "/v1/chat/completions", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "explain"}],
+                "tools": [tool], "tool_choice": "auto",
+                "max_completion_tokens": 2, "stream": True,
+                "stream_options": {"include_usage": True},
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            stream = response.read().decode()
+            first = '"delta":{"content":"first"}'
+            second = '"delta":{"content":" second"}'
+            self.assertGreaterEqual(stream.find(first), 0)
+            self.assertGreater(stream.find(second), stream.find(first))
+            self.assertNotIn('"delta":{"content":"first second"}', stream)
+
+            app.generated = ("hello", " world")
             connection.request("POST", "/v1/messages", body=json.dumps({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "hi"}],
@@ -727,18 +844,47 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             response = connection.getresponse()
             self.assertEqual(json.loads(response.read()), {"input_tokens": 2})
 
-            app.generated = (
+            tool_generation = (
                 "<tool_call>\n<function=get_weather>\n"
                 "<parameter=city>\nChisinau\n</parameter>\n"
                 "</function>\n</tool_call>",
             )
-            tool = {"type": "function", "function": {
-                "name": "get_weather", "description": "Read weather",
-                "parameters": {"type": "object", "properties": {
-                    "city": {"type": "string"},
-                }, "required": ["city"]},
-            }}
-            app.response_protocol = "fixture"
+            app.generated = tool_generation
+            app.tokenizer.parse_calls = 0
+            connection.request("POST", "/v1/chat/completions", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [tool], "tool_choice": "auto",
+                "max_completion_tokens": 2, "stream": True,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            stream = response.read().decode()
+            self.assertIn('"delta":{"tool_calls":[', stream)
+            self.assertNotIn("<tool_call>", stream)
+            self.assertEqual(app.tokenizer.parse_calls, 1)
+
+            app.generated = (
+                "I will inspect the repository.\n\n",
+                tool_generation[0],
+            )
+            connection.request("POST", "/v1/chat/completions", body=json.dumps({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "weather"}],
+                "tools": [tool], "tool_choice": "auto",
+                "max_completion_tokens": 2, "stream": True,
+            }), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            stream = response.read().decode()
+            self.assertIn(
+                '"delta":{"content":"I will inspect the repository."}',
+                stream,
+            )
+            self.assertNotIn("repository.\\n", stream)
+            self.assertNotIn("different final rendering", stream)
+            self.assertIn('"delta":{"tool_calls":[', stream)
+            self.assertEqual(app.tokenizer.parse_calls, 2)
+            app.generated = tool_generation
+
             connection.request("POST", "/v1/chat/completions", body=json.dumps({
                 "model": "test-model",
                 "messages": [{"role": "user", "content": "weather"}],
@@ -1029,7 +1175,13 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
             def finalize(self) -> tuple[dict[str, object],
                                         list[dict[str, object]]]:
-                return {}, []
+                return {
+                    "role": "assistant", "content": "",
+                    "tool_calls": [{"type": "function", "function": {
+                        "name": "get_weather",
+                        "arguments": {"city": "Chisinau"},
+                    }}],
+                }, []
 
         call = expert_server.ToolCall(
             item_id="item_1", call_id="call_1", name="get_weather",
@@ -1039,10 +1191,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.args = types.SimpleNamespace(model="test-model")
         app.response_stream_parser = lambda _request: Parser()
         app.parse_assistant_output = lambda _text, _request: \
-            expert_server.AssistantOutput(
-                text="", reasoning="", reasoning_complete=True,
-                tool_calls=(call,),
-            )
+            (_ for _ in ()).throw(AssertionError("stream response was reparsed"))
         handler = Handler.__new__(Handler)
         handler.server = types.SimpleNamespace(app=app)
         events: list[tuple[str, dict[str, object]]] = []
@@ -1192,13 +1341,11 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                          SamplingSettings(0.5, 0.8, 7, 0.1, 42))
 
         app.args.max_context = 9
-        with self.assertRaises(RequestError) as raised:
-            app.parse_request({
-                "model": "test-model", "input": "hello",
-                "max_output_tokens": 8, "temperature": 0,
-            }, "responses")
-        self.assertEqual(raised.exception.param, "max_output_tokens")
-        self.assertIn("exceeds context capacity", str(raised.exception))
+        clamped = app.parse_request({
+            "model": "test-model", "input": "hello",
+            "max_output_tokens": 8, "temperature": 0,
+        }, "responses")
+        self.assertEqual(clamped.maximum, 7)
 
     def test_artifact_encoder_fills_missing_chat_template(self) -> None:
         class Tokenizer:

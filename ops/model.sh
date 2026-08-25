@@ -43,8 +43,10 @@ action="${1:-status}"
 selection_explicit=0
 if (( $# >= 2 )); then selection_explicit=1; fi
 selection="${2:-${CHAT_MODEL:-deepseek-v4-flash}}"
+extra_arguments=("${@:3}")
 model_id="${selection}"
 artifact_name="${selection}"
+alias_kv_cache_dtype=""
 task_name="QuantumLLM-ExpertVm"
 if [[ "${selection}" == all ]]; then
   model_id=""
@@ -55,16 +57,29 @@ else
     die "model selector must contain only letters, digits, dot, underscore or dash"
   alias_file="${MODEL_ALIAS_FILE:-${script_dir}/model-aliases.tsv}"
   [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
-  while IFS=$'\t' read -r alias advertised_model artifact extra; do
-    [[ "${alias}" != model-aliases-v1 && -n "${alias}" ]] || continue
-    [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" ]] ||
+  alias_registry_version=""
+  while IFS=$'\t' read -r alias advertised_model artifact declared_kv extra; do
+    if [[ "${alias}" == model-aliases-v2 ]]; then
+      [[ -z "${advertised_model}${artifact}${declared_kv}${extra}" ]] ||
+        die "invalid model alias registry header"
+      alias_registry_version="${alias}"
+      continue
+    fi
+    [[ -n "${alias}" ]] || continue
+    [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" &&
+       ( "${declared_kv}" == artifact ||
+         "${declared_kv}" == fp8-e4m3-per-head ||
+         "${declared_kv}" == fp16 ) ]] ||
       die "invalid model alias registry row for '${alias}'"
     if [[ "${alias}" == "${selection}" ]]; then
       model_id="${advertised_model}"
       artifact_name="${artifact}"
+      alias_kv_cache_dtype="${declared_kv}"
       break
     fi
   done < "${alias_file}"
+  [[ "${alias_registry_version}" == model-aliases-v2 ]] ||
+    die "unsupported model alias registry version"
   [[ "${artifact_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
     die "model alias resolves outside MODEL_ROOT"
 fi
@@ -76,7 +91,7 @@ port="${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
 host_address="${MODEL_HOST:-127.0.0.1}"
 api_key="${EXPERT_API_KEY:-}"
 max_context="${MODEL_MAX_CONTEXT:-65536}"
-max_output="${MODEL_MAX_OUTPUT_TOKENS:-8192}"
+max_output="${MODEL_MAX_OUTPUT_TOKENS:-}"
 ready_timeout="${MODEL_READY_TIMEOUT:-600}"
 generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 max_body_mib="${MODEL_MAX_BODY_MIB:-16}"
@@ -89,7 +104,7 @@ worker_capacity="${MODEL_WORKER_CAPACITY:-1}"
 maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
 kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
 kv_page_tokens="${MODEL_KV_PAGE_TOKENS:-256}"
-kv_cache_dtype="${MODEL_KV_CACHE_DTYPE:-artifact}"
+kv_cache_dtype="${MODEL_KV_CACHE_DTYPE_OVERRIDE:-${alias_kv_cache_dtype:-${MODEL_KV_CACHE_DTYPE:-artifact}}}"
 placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
@@ -98,6 +113,9 @@ vm_runner="${MODEL_VM_RUNNER:-${remote_root}/out/build/windows-msvc-release/runt
 
 require_uint MODEL_PORT "${port}"
 require_uint MODEL_MAX_CONTEXT "${max_context}"
+if [[ -z "${max_output}" ]]; then
+  max_output=$((max_context - 1))
+fi
 require_uint MODEL_MAX_OUTPUT_TOKENS "${max_output}"
 require_uint MODEL_READY_TIMEOUT "${ready_timeout}"
 require_uint MODEL_GENERATION_TIMEOUT_SECONDS "${generation_timeout}"
@@ -263,10 +281,14 @@ case "${action}" in
   chat)
     [[ -n "${model_id}" ]] || die "chat requires one model"
     if (( selection_explicit )); then
-      exec "${script_dir}/chat.sh" --model "${model_id}"
+      chat_command_args=(--model "${model_id}")
     else
-      exec "${script_dir}/chat.sh" --model auto
+      chat_command_args=(--model auto)
     fi
+    if (( ${#extra_arguments[@]} )); then
+      chat_command_args+=("${extra_arguments[@]}")
+    fi
+    exec "${script_dir}/chat.sh" "${chat_command_args[@]}"
     ;;
   config)
     print_config

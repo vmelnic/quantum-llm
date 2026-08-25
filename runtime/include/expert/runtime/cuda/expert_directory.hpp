@@ -22,6 +22,7 @@ enum class DeviceExpertFormat : std::uint32_t {
   // records (quant ABI 3); the packed_fp4_q8_dot kernels are
   // geometry-generic, only the w1/w3/w2 views differ per source.
   fp4_e2m1_ue8m0_block32 = 1,
+  fp4_relu2_e2m1_ue8m0_block32 = 2,
 };
 
 // Small compute-ready metadata entry. The full model is never materialized in

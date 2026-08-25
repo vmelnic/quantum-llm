@@ -23,6 +23,28 @@
 namespace expert::runtime {
 namespace {
 
+class ImmutableHostBuffer final {
+ public:
+  ImmutableHostBuffer(std::shared_ptr<IHostAllocator> allocator,
+                      std::size_t bytes, std::size_t alignment)
+      : allocator_(std::move(allocator)), bytes_(bytes) {
+    data_ = static_cast<std::byte*>(allocator_->allocate(bytes_, alignment));
+    if (!data_) throw std::bad_alloc();
+  }
+  ~ImmutableHostBuffer() { allocator_->deallocate(data_); }
+  ImmutableHostBuffer(const ImmutableHostBuffer&) = delete;
+  ImmutableHostBuffer& operator=(const ImmutableHostBuffer&) = delete;
+
+  [[nodiscard]] std::byte* data() noexcept { return data_; }
+  [[nodiscard]] const std::byte* data() const noexcept { return data_; }
+  [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
+
+ private:
+  std::shared_ptr<IHostAllocator> allocator_;
+  std::byte* data_{};
+  std::size_t bytes_{};
+};
+
 constexpr std::size_t kStateCount = 6;
 constexpr std::uint64_t kRoutingScoreScale = 1ULL << 20U;
 
@@ -82,7 +104,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::map<std::uint64_t, std::shared_ptr<Waiter>> waiters;
     std::map<std::uint64_t, std::shared_ptr<HostWaiter>> host_waiters;
     std::shared_ptr<FixedBufferPool::Lease> host;
-    std::shared_ptr<std::vector<std::byte>> host_copy;
+    std::shared_ptr<ImmutableHostBuffer> host_copy;
     std::shared_ptr<IDeviceAllocation> device;
     std::optional<ExpertSections> validated_sections;
     DeepSeekCompactSections validated_compact;
@@ -143,6 +165,9 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
             config.ram.high_watermark_bytes) {
       throw std::invalid_argument("invalid expert cache configuration");
     }
+    if (!config.retained_host_allocator)
+      config.retained_host_allocator =
+          std::make_shared<AlignedHostAllocator>();
     host_worker = std::thread([this] { host_worker_loop(); });
   }
 
@@ -471,7 +496,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (waiter->options.acquire_lease) {
         add_reference_locked(entry);
         lease = HostExpertLease(
-            entry.host_copy, *entry.validated_sections,
+            entry.host_copy, entry.host_copy->data(), entry.host_copy->size(),
+            *entry.validated_sections,
             entry.validated_compact, entry.record.source_abi,
             [weak, key = entry.key]() noexcept {
               if (auto core = weak.lock()) core->release_reference(key);
@@ -498,7 +524,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       (void)id;
       record_waiter_completion(*waiter);
       record_waiter_failure(*waiter);
-      waiter->promise.set_value({status, false});
+      waiter->promise.set_value({status, false, {}});
     }
     entry.host_waiters.clear();
     refresh_task_indexes_locked(entry);
@@ -1073,8 +1099,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
 
     auto weak = weak_from_this();
-    UploadRequest request{entry->key, entry->record.source_abi, sections, bytes,
-                          compact};
+    UploadRequest request{entry->key, entry->record.source_abi,
+                          entry->record.record_abi, sections, bytes, compact};
     const auto operation = uploader->upload(
         request, [weak, key = entry->key](UploadResult result) mutable {
           if (auto core = weak.lock()) {
@@ -1134,7 +1160,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       return;
     }
 
-    std::shared_ptr<std::vector<std::byte>> retained;
+    std::shared_ptr<ImmutableHostBuffer> retained;
     for (;;) {
       bool need_copy = false;
       {
@@ -1149,7 +1175,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (need_copy && !retained) {
         const auto copy_started = std::chrono::steady_clock::now();
         try {
-          retained = std::make_shared<std::vector<std::byte>>(count);
+          retained = std::make_shared<ImmutableHostBuffer>(
+              config.retained_host_allocator, count, kExpertPackAlignment);
           std::memcpy(retained->data(), bytes.data(), count);
           Telemetry::add(metrics.host_copy_bytes_, count);
           Telemetry::add(metrics.host_copy_bytes_by_priority_[priority_index(
@@ -1529,7 +1556,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
         Telemetry::add(metrics.cancellation_count_);
         waiter->promise.set_value(
             {Status(ErrorCode::cancelled, "expert cache is shutting down"),
-             false});
+             false, {}});
       } else {
         auto [iterator, inserted] = entries.try_emplace(key);
         if (inserted) {
@@ -1547,14 +1574,14 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           waiter->promise.set_value(
               {Status(ErrorCode::invalid_argument,
                       "same expert key references different immutable records"),
-               false});
+               false, {}});
         } else if (entry.state == CacheState::failed) {
           record_waiter_completion(*waiter);
           record_waiter_failure(*waiter);
           waiter->promise.set_value(
               {Status(ErrorCode::checksum_mismatch,
                       "expert is quarantined after a failed load"),
-               false});
+               false, {}});
         } else if (entry.host_copy && entry.validated_sections &&
                    (entry.state == CacheState::ram_ready ||
                     entry.state == CacheState::vram_ready)) {
@@ -1570,7 +1597,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
             add_reference_locked(entry);
             auto weak = weak_from_this();
             lease = HostExpertLease(
-                entry.host_copy, *entry.validated_sections,
+                entry.host_copy, entry.host_copy->data(),
+                entry.host_copy->size(), *entry.validated_sections,
                 entry.validated_compact, entry.record.source_abi,
                 [weak, key = entry.key]() noexcept {
                   if (auto core = weak.lock()) core->release_reference(key);
@@ -1590,7 +1618,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           waiter->promise.set_value(
               {Status(ErrorCode::backpressure,
                       "resident expert has no pageable host copy"),
-               false});
+               false, {}});
         } else {
           Telemetry::add(metrics.ssd_misses_by_priority_[priority_index(
               options.priority)]);
@@ -1654,7 +1682,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     Telemetry::add(metrics.ram_hits_by_priority_[priority_slot]);
     auto weak = weak_from_this();
     return HostExpertLease(
-        entry.host_copy, *entry.validated_sections, entry.validated_compact,
+        entry.host_copy, entry.host_copy->data(), entry.host_copy->size(),
+        *entry.validated_sections, entry.validated_compact,
         record.source_abi,
         [weak, key]() noexcept {
           if (auto core = weak.lock()) core->release_reference(key);
@@ -1856,7 +1885,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       if (waiter == entry.host_waiters.end()) return;
       record_waiter_completion(*waiter->second);
       waiter->second->promise.set_value(
-          {Status(ErrorCode::cancelled, "host preload cancelled"), false});
+          {Status(ErrorCode::cancelled, "host preload cancelled"), false, {}});
       Telemetry::add(metrics.cancellations_by_priority_[priority_index(
           waiter->second->options.priority)]);
       entry.host_waiters.erase(waiter);
@@ -2006,37 +2035,49 @@ void ExpertLease::reset() noexcept {
 }
 
 HostExpertLease::HostExpertLease(
-    std::shared_ptr<const std::vector<std::byte>> bytes,
+    std::shared_ptr<const void> ownership, const std::byte* bytes,
+    std::size_t byte_count,
     ExpertSections sections, DeepSeekCompactSections compact,
     std::uint32_t source_abi, std::function<void()> release) noexcept
-    : bytes_(std::move(bytes)), sections_(sections), compact_(compact),
+    : ownership_(std::move(ownership)), bytes_(bytes),
+      byte_count_(byte_count), sections_(sections), compact_(compact),
       source_abi_(source_abi),
       release_(std::move(release)) {}
 
 HostExpertLease::HostExpertLease(HostExpertLease&& other) noexcept
-    : bytes_(std::move(other.bytes_)), sections_(other.sections_),
+    : ownership_(std::move(other.ownership_)), bytes_(other.bytes_),
+      byte_count_(other.byte_count_), sections_(other.sections_),
       compact_(other.compact_), source_abi_(other.source_abi_),
-      release_(std::move(other.release_)) {}
+      release_(std::move(other.release_)) {
+  other.bytes_ = nullptr;
+  other.byte_count_ = 0U;
+}
 
 HostExpertLease& HostExpertLease::operator=(HostExpertLease&& other) noexcept {
   if (this != &other) {
     reset();
-    bytes_ = std::move(other.bytes_);
+    ownership_ = std::move(other.ownership_);
+    bytes_ = other.bytes_;
+    byte_count_ = other.byte_count_;
     sections_ = other.sections_;
     compact_ = other.compact_;
     source_abi_ = other.source_abi_;
     release_ = std::move(other.release_);
+    other.bytes_ = nullptr;
+    other.byte_count_ = 0U;
   }
   return *this;
 }
 
 HostExpertLease::~HostExpertLease() { reset(); }
 
-HostExpertLease::operator bool() const noexcept { return bytes_ != nullptr; }
+HostExpertLease::operator bool() const noexcept {
+  return ownership_ != nullptr && bytes_ != nullptr;
+}
 
 std::span<const std::byte> HostExpertLease::bytes() const noexcept {
   if (!bytes_) return {};
-  return *bytes_;
+  return {bytes_, byte_count_};
 }
 
 const ExpertSections& HostExpertLease::sections() const noexcept {
@@ -2053,7 +2094,9 @@ std::uint32_t HostExpertLease::source_abi() const noexcept {
 }
 
 void HostExpertLease::reset() noexcept {
-  bytes_.reset();
+  ownership_.reset();
+  bytes_ = nullptr;
+  byte_count_ = 0U;
   if (release_) {
     auto release = std::move(release_);
     release();
@@ -2162,7 +2205,8 @@ std::optional<CacheEntrySnapshot> ExpertCache::inspect(
                             entry.vram_resident, entry.frequency,
                             entry.routing_score_mass_q20,
                             entry.routing_score_peak_q20,
-                            core_->temperature_locked(entry)};
+                            core_->temperature_locked(entry),
+                            entry.last_access};
 }
 
 TelemetrySnapshot ExpertCache::telemetry() const noexcept {

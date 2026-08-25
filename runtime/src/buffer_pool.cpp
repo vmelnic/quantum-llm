@@ -33,6 +33,45 @@ void AlignedHostAllocator::deallocate(void* pointer) noexcept {
 #endif
 }
 
+MonotonicHostAllocator::MonotonicHostAllocator(
+    std::size_t capacity, std::size_t alignment,
+    std::shared_ptr<IHostAllocator> upstream)
+    : upstream_(std::move(upstream)), capacity_(capacity),
+      alignment_(alignment) {
+  if (!capacity_ || !alignment_ || (alignment_ & (alignment_ - 1U)) != 0U ||
+      !upstream_)
+    throw std::invalid_argument("invalid monotonic host allocator");
+  base_ = upstream_->allocate(capacity_, alignment_);
+  if (!base_) throw std::bad_alloc();
+}
+
+MonotonicHostAllocator::~MonotonicHostAllocator() {
+  upstream_->deallocate(base_);
+}
+
+void* MonotonicHostAllocator::allocate(std::size_t bytes,
+                                       std::size_t alignment) {
+  if (!bytes || !alignment || (alignment & (alignment - 1U)) != 0U ||
+      alignment > alignment_)
+    return nullptr;
+  std::lock_guard lock(mutex_);
+  const auto aligned = (cursor_ + alignment - 1U) / alignment * alignment;
+  if (aligned > capacity_ || bytes > capacity_ - aligned) return nullptr;
+  cursor_ = aligned + bytes;
+  return static_cast<std::byte*>(base_) + aligned;
+}
+
+void MonotonicHostAllocator::deallocate(void*) noexcept {}
+
+bool MonotonicHostAllocator::page_locked() const noexcept {
+  return upstream_->page_locked();
+}
+
+std::size_t MonotonicHostAllocator::bytes_used() const noexcept {
+  std::lock_guard lock(mutex_);
+  return cursor_;
+}
+
 struct FixedBufferPool::SharedState final {
   struct Slot final {
     void* pointer{};

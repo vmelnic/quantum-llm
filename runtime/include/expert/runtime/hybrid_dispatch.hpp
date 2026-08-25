@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <span>
 #include <vector>
 
@@ -22,6 +23,9 @@ enum class HybridDispatchReason : std::uint8_t {
   cpu_lower_critical_path,
   gpu_lower_critical_path,
   cpu_stable_tie,
+  gpu_stable_tie,
+  cpu_calibration,
+  gpu_cache_warm,
 };
 
 struct HybridDispatchConfig final {
@@ -31,6 +35,19 @@ struct HybridDispatchConfig final {
   double observation_ewma_alpha{0.125};
   std::size_t maximum_candidates{4096};
   std::size_t maximum_trace_decisions{256};
+  // Do not send flexible misses to the CPU until the running service has
+  // measured its actual upload path. Artifact defaults remain telemetry
+  // seeds, not evidence that a host lane will shorten the critical path.
+  bool require_live_h2d_before_cpu{};
+  // Once H2D has been measured, execute one RAM-ready expert on the CPU to
+  // calibrate that lane before making adaptive split decisions.
+  bool bootstrap_cpu_probe{};
+  // Warming a reusable expert is preferable to a CPU tie because the upload
+  // benefits later routes. The legacy stable CPU tie remains the default.
+  bool prefer_gpu_on_tie{};
+  // Preserve at least this many non-resident GPU admissions per plan when
+  // flexible candidates exist. Candidates are selected by placement heat.
+  std::size_t minimum_gpu_uploads{};
 };
 
 struct HybridDispatchCandidate final {
@@ -40,6 +57,8 @@ struct HybridDispatchCandidate final {
   bool gpu_resident{};
   bool cpu_available{};
   bool gpu_available{};
+  std::uint64_t placement_temperature{};
+  std::uint64_t last_access{};
 };
 
 struct HybridDispatchDecision final {
@@ -68,7 +87,12 @@ struct HybridDispatchTelemetry final {
   std::uint64_t cpu_cost_wins{};
   std::uint64_t gpu_cost_wins{};
   std::uint64_t stable_ties{};
+  std::uint64_t cpu_calibrations{};
+  std::uint64_t gpu_cache_warms{};
   std::uint64_t rejected_plans{};
+  std::uint64_t cpu_observations{};
+  std::uint64_t gpu_observations{};
+  std::uint64_t h2d_observations{};
   double cpu_ns_per_selection{};
   double gpu_ns_per_selection{};
   double h2d_bytes_per_second{};
@@ -96,6 +120,7 @@ class HybridDispatchPlanner final {
 
  private:
   HybridDispatchConfig config_;
+  mutable std::mutex mutex_;
   HybridDispatchTelemetry telemetry_;
   std::vector<HybridDispatchDecision> trace_;
   std::size_t next_trace_slot_{};

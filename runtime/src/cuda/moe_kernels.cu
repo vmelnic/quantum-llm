@@ -303,16 +303,25 @@ __global__ void gate_up_silu_selection_batch(
       input + static_cast<std::size_t>(request_row) * hidden;
   float gate_sum = 0.0F;
   float up_sum = 0.0F;
+  const bool relu2 = entry.format == static_cast<std::uint32_t>(
+      DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32);
   if (entry.format == static_cast<std::uint32_t>(
-                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32)) {
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32) ||
+      relu2) {
     const auto* q = quantized_input +
                     static_cast<std::size_t>(request_row) * hidden;
-    gate_sum = packed_fp4_q8_dot(entry.w1_fp4, entry.w1_ue8m0, q,
+    if (relu2) {
+      up_sum = packed_fp4_q8_dot(entry.w1_fp4, entry.w1_ue8m0, q,
                                 quantized_input_scales[request_row],
                                 output_row, hidden);
-    up_sum = packed_fp4_q8_dot(entry.w3_fp4, entry.w3_ue8m0, q,
-                              quantized_input_scales[request_row],
-                              output_row, hidden);
+    } else {
+      gate_sum = packed_fp4_q8_dot(entry.w1_fp4, entry.w1_ue8m0, q,
+                                  quantized_input_scales[request_row],
+                                  output_row, hidden);
+      up_sum = packed_fp4_q8_dot(entry.w3_fp4, entry.w3_ue8m0, q,
+                                quantized_input_scales[request_row],
+                                output_row, hidden);
+    }
   } else {
     const auto* gate =
         entry.gate_up + static_cast<std::size_t>(output_row) * hidden;
@@ -333,7 +342,8 @@ __global__ void gate_up_silu_selection_batch(
       gate_sum = fminf(gate_sum, swiglu_limit);
       up_sum = fminf(fmaxf(up_sum, -swiglu_limit), swiglu_limit);
     }
-    float value = (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+    float value = relu2 ? fmaxf(up_sum, 0.0F) * fmaxf(up_sum, 0.0F)
+                        : (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
     if (bf16_intermediate)
       value = __bfloat162float(__float2bfloat16_rn(value));
     intermediate[static_cast<std::size_t>(selection) * width + output_row] =
@@ -360,7 +370,9 @@ __global__ void down_selection_batch(
       intermediate + static_cast<std::size_t>(selection) * width;
   float partial = 0.0F;
   if (entry.format == static_cast<std::uint32_t>(
-                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32)) {
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32) ||
+      entry.format == static_cast<std::uint32_t>(
+                          DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32)) {
     const auto* q = quantized_intermediate +
                     static_cast<std::size_t>(selection) * width;
     partial = packed_fp4_q8_dot(

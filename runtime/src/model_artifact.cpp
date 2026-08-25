@@ -64,10 +64,11 @@ std::filesystem::path safe_child(const std::filesystem::path& root,
 }
 
 std::uint64_t fp4_device_bytes(std::uint32_t hidden,
-                               std::uint32_t intermediate) {
+                               std::uint32_t intermediate,
+                               bool relu2 = false) {
   const auto elements = static_cast<std::uint64_t>(hidden) * intermediate;
-  return elements + 2U * elements / kExpertFp4BlockSize + elements / 2U +
-         elements / kExpertFp4BlockSize;
+  const auto matrices = relu2 ? 2U : 3U;
+  return matrices * (elements / 2U + elements / kExpertFp4BlockSize);
 }
 
 std::uint64_t runtime_u64(std::string_view text, std::string_view key) {
@@ -363,8 +364,11 @@ Status ModelArtifact::load_expert_pack_v1(
           Required(item, "payload_sha256", "expert")
               .AsString("expert.payload_sha256"));
       record.device_bytes =
-          record.record_abi == kExpertRecordAbiFp4Block32
-              ? fp4_device_bytes(record.hidden, record.intermediate)
+          (record.record_abi == kExpertRecordAbiFp4Block32 ||
+           record.record_abi == kExpertRecordAbiFp4Relu2Block32)
+              ? fp4_device_bytes(
+                    record.hidden, record.intermediate,
+                    record.record_abi == kExpertRecordAbiFp4Relu2Block32)
               : 3ULL * record.hidden * record.intermediate +
                     static_cast<std::uint64_t>(
                         2U * record.intermediate + record.hidden) *
@@ -373,7 +377,8 @@ Status ModelArtifact::load_expert_pack_v1(
           record.stored_bytes > pack->second - record.record_offset ||
           record.source_abi != kExpertSourceAbiExpertPackV1 ||
           (record.record_abi != kExpertRecordAbiInt8PerRow &&
-           record.record_abi != kExpertRecordAbiFp4Block32))
+           record.record_abi != kExpertRecordAbiFp4Block32 &&
+           record.record_abi != kExpertRecordAbiFp4Relu2Block32))
         throw std::invalid_argument("expert record index is invalid");
       present[index] = true;
     }

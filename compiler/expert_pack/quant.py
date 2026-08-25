@@ -199,28 +199,61 @@ def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: obje
     row_bytes = columns * element_bytes
     blocks = padded_columns // FP4_QUANT_GROUP_SIZE
     scales = bytearray()
-    for row in range(rows):
-        start = row * row_bytes
-        values = _decode_float_row(view.raw[start : start + row_bytes], view.info.dtype)
-        if _np is not None:
-            numeric = _np.asarray(values, dtype="<f8")
-            if numeric.size != columns:
-                raise SourceFormatError(f"short decoded row in {view.info.name}")
-            if not bool(_np.isfinite(numeric).all()):
-                raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
-            if padded_columns != columns:
-                numeric = _np.pad(numeric, (0, padded_columns - columns))
-            grid = numeric.reshape(blocks, FP4_QUANT_GROUP_SIZE)
-            maxima = _np.max(_np.abs(grid), axis=1)
-            codes = _np.array(
-                [_fp4_block_code(float(maximum)) for maximum in maxima], dtype="<f8"
+    if _np is not None:
+        # Amortize Python, mmap slicing and write overhead across a bounded
+        # number of rows. The arithmetic remains float64 and preserves the
+        # exact row-major payload/scale order of the dependency-free path.
+        maximum_chunk_values = 256 * 1024
+        chunk_rows = max(
+            1, min(1024, maximum_chunk_values // max(padded_columns, 1))
+        )
+        levels = _np.asarray(_FP4_E2M1_LEVELS, dtype="<f8")
+        for first_row in range(0, rows, chunk_rows):
+            count = min(chunk_rows, rows - first_row)
+            start = first_row * row_bytes
+            raw = view.raw[start : start + count * row_bytes]
+            numeric = _np.asarray(
+                _decode_float_row(raw, view.info.dtype), dtype="<f8"
             )
-            block_scales = _np.ldexp(1.0, codes.astype("<i8") - 127)
-            quotient = grid / block_scales[:, None]
+            if numeric.size != count * columns:
+                raise SourceFormatError(f"short decoded rows in {view.info.name}")
+            if not bool(_np.isfinite(numeric).all()):
+                raise SourceFormatError(
+                    f"non-finite weight in {view.info.name}, rows "
+                    f"{first_row}:{first_row + count}"
+                )
+            numeric = numeric.reshape(count, columns)
+            if padded_columns != columns:
+                numeric = _np.pad(
+                    numeric, ((0, 0), (0, padded_columns - columns))
+                )
+            grid = numeric.reshape(count, blocks, FP4_QUANT_GROUP_SIZE)
+            maxima = _np.max(_np.abs(grid), axis=2)
+            positive = maxima != 0.0
+            mantissas, exponents = _np.frexp(
+                _np.where(positive, maxima / 6.0, 1.0)
+            )
+            covering_exponents = _np.where(
+                mantissas == 0.5, exponents - 1, exponents
+            )
+            codes = _np.where(
+                positive,
+                _np.clip(
+                    covering_exponents + 127,
+                    FP4_UE8M0_MIN_CODE,
+                    FP4_UE8M0_MAX_CODE,
+                ),
+                127,
+            ).astype("<u1")
+            block_scales = _np.ldexp(
+                1.0, codes.astype("<i8") - 127
+            )
+            quotient = grid / block_scales[:, :, None]
             magnitude = _np.abs(quotient)
-            levels = _np.asarray(_FP4_E2M1_LEVELS, dtype="<f8")
             upper = _np.clip(
-                _np.searchsorted(levels, magnitude, side="left"), 1, len(levels) - 1
+                _np.searchsorted(levels, magnitude, side="left"),
+                1,
+                len(levels) - 1,
             )
             lower = upper - 1
             low_distance = magnitude - levels[lower]
@@ -230,14 +263,20 @@ def write_fp4_block32_rows(view: TensorView, destination: BinaryIO, digest: obje
             )
             indices = _np.where(choose_upper, upper, lower).astype("<u1")
             signs = (quotient < 0.0).astype("<u1")
-            nibbles = (indices | (signs << 3)).reshape(-1)
+            nibbles = (indices | (signs << 3)).reshape(
+                count, padded_columns
+            )
             payload = (
-                nibbles[0::2] | (nibbles[1::2] << 4)
+                nibbles[:, 0::2] | (nibbles[:, 1::2] << 4)
             ).astype("<u1").tobytes()
             write_all(destination, payload)
             digest.update(payload)
-            scales.extend(codes.astype("<u1").tobytes())
-            continue
+            scales.extend(codes.tobytes())
+        return bytes(scales)
+
+    for row in range(rows):
+        start = row * row_bytes
+        values = _decode_float_row(view.raw[start : start + row_bytes], view.info.dtype)
         materialized: list[float] = []
         for value in values:
             scalar = float(value)

@@ -15,6 +15,7 @@ constexpr std::array<std::byte, 8> kMagic = {
     std::byte{'E'}, std::byte{'P'}, std::byte{'E'}, std::byte{'X'},
     std::byte{'P'}, std::byte{'R'}, std::byte{'0'}, std::byte{'1'}};
 constexpr std::uint32_t kRequiredFlags = 0x0fU;
+constexpr std::uint32_t kRelu2RequiredFlags = 0x0dU;
 constexpr std::size_t kStructuredHeaderBytes = 148;
 constexpr std::uint32_t kSectionAlignment = 256;
 
@@ -92,24 +93,26 @@ ExpertRecordValidation validate_expert_record(
   const auto fused_rows = read_le<std::uint32_t>(raw + 36);
   const auto reserved = read_le<std::uint32_t>(raw + 40);
   const auto record_bytes = read_le<std::uint64_t>(raw + 44);
+  const bool relu2 = record_abi == kExpertRecordAbiFp4Relu2Block32;
 
   if (version != kExpertPackVersion || header_bytes != kExpertHeaderBytes ||
-      flags != kRequiredFlags ||
+      flags != (relu2 ? kRelu2RequiredFlags : kRequiredFlags) ||
       (record_abi != kExpertRecordAbiInt8PerRow &&
-       record_abi != kExpertRecordAbiFp4Block32) ||
+       record_abi != kExpertRecordAbiFp4Block32 &&
+       record_abi != kExpertRecordAbiFp4Relu2Block32) ||
       (expected.record_abi != 0U && record_abi != expected.record_abi) ||
-      (record_abi == kExpertRecordAbiFp4Block32
+      (record_abi == kExpertRecordAbiFp4Block32 || relu2
            ? kExpertEncodingAbiFp4Block32
            : kExpertEncodingAbiInt8PerRow) != key.encoding_abi ||
       reserved != 0 ||
       layer < 0 || expert < 0 || static_cast<std::uint32_t>(layer) != key.layer ||
       static_cast<std::uint32_t>(expert) != key.expert ||
       record_bytes != expected.stored_bytes || hidden == 0 || intermediate == 0 ||
-      fused_rows != 2U * intermediate) {
+      fused_rows != (relu2 ? intermediate : 2U * intermediate)) {
     return failure(ErrorCode::checksum_mismatch,
                    "expert header/manifest ABI mismatch");
   }
-  const bool fp4 = record_abi == kExpertRecordAbiFp4Block32;
+  const bool fp4 = record_abi == kExpertRecordAbiFp4Block32 || relu2;
   if (fp4 && (hidden % kExpertFp4BlockSize != 0 ||
               intermediate % kExpertFp4BlockSize != 0)) {
     return failure(ErrorCode::checksum_mismatch,
@@ -141,9 +144,11 @@ ExpertRecordValidation validate_expert_record(
                    "expert section dimensions are inconsistent");
   }
   if (fp4) {
-    if (sections.gate_up_q_bytes != hidden_intermediate ||
+    if (sections.gate_up_q_bytes !=
+            (relu2 ? hidden_intermediate / 2U : hidden_intermediate) ||
         sections.gate_up_scale_bytes !=
-            2ULL * hidden_intermediate / kExpertFp4BlockSize ||
+            (relu2 ? hidden_intermediate : 2ULL * hidden_intermediate) /
+                kExpertFp4BlockSize ||
         sections.down_q_bytes != hidden_intermediate / 2U ||
         sections.down_scale_bytes !=
             hidden_intermediate / kExpertFp4BlockSize) {
@@ -191,7 +196,8 @@ ExpertRecordValidation validate_expert_record(
       }
     }
   }
-  const auto expected_decoded = 3ULL * hidden_intermediate * sizeof(float);
+  const auto expected_decoded = (relu2 ? 2ULL : 3ULL) * hidden_intermediate *
+                                sizeof(float);
   if (expected.decoded_bytes != 0 && expected.decoded_bytes != expected_decoded) {
     return failure(ErrorCode::checksum_mismatch,
                    "expert decoded byte count mismatch");
@@ -220,7 +226,34 @@ ExpertAdmissionValidation validate_expert_admission(
        key.encoding_abi == kExpertEncodingAbiFp4Block32) &&
       expected.source_abi == kExpertSourceAbiExpertPackV1) {
     const auto validated = validate_expert_record(bytes, key, expected);
-    return {validated.status, validated.record.sections, {}};
+    SplitExpertSections split{};
+    if (validated.status.ok() &&
+        key.encoding_abi == kExpertEncodingAbiFp4Block32) {
+      const auto& sections = validated.record.sections;
+      const auto matrix_bytes =
+          static_cast<std::uint64_t>(sections.hidden) *
+          sections.intermediate / 2U;
+      const auto scale_bytes =
+          static_cast<std::uint64_t>(sections.hidden) *
+          sections.intermediate / kExpertFp4BlockSize;
+      if (expected.record_abi == kExpertRecordAbiFp4Relu2Block32) {
+        split = {
+            sections.gate_up_q_offset, matrix_bytes,
+            sections.gate_up_scale_offset, scale_bytes,
+            0U, 0U, 0U, 0U,
+            sections.down_q_offset, matrix_bytes,
+            sections.down_scale_offset, scale_bytes};
+      } else {
+        split = {
+            sections.gate_up_q_offset, matrix_bytes,
+            sections.gate_up_scale_offset, scale_bytes,
+            sections.gate_up_q_offset + matrix_bytes, matrix_bytes,
+            sections.gate_up_scale_offset + scale_bytes, scale_bytes,
+            sections.down_q_offset, matrix_bytes,
+            sections.down_scale_offset, scale_bytes};
+      }
+    }
+    return {validated.status, validated.record.sections, split};
   }
   if (key.encoding_abi != kExpertEncodingAbiFp4Block32 ||
       (expected.source_abi != kExpertSourceAbiDeepSeekCompactV1 &&

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import struct
 import tempfile
@@ -8,6 +9,7 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from compiler.expert_pack.adapters import RuntimeOperationTopology, adapt_checkpoint
 from compiler.expert_pack.compile import (
@@ -34,6 +36,8 @@ from compiler.expert_pack.deepseek_slice import (
     _deepseek_mtp_partition,
 )
 from compiler.expert_pack.errors import AdapterError, ValidationError
+from compiler.expert_pack.quality import qualify_container_against_source
+from compiler.expert_pack import quant
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
 from compiler.expert_pack.util import load_json, sha256_file
@@ -256,15 +260,14 @@ def _make_qwen3_next_fixture(root: Path, include_mtp: bool = False) -> None:
     _write_safetensors(root / "model.safetensors", tensors)
 
 
-def _make_qwen3_5_fixture(root: Path) -> None:
-    """Build a small but topology-complete Qwen3.5 multimodal checkpoint."""
+def _make_hybrid_delta_fixture(root: Path, *, moe: bool = False) -> None:
+    """Build a small, topology-complete hybrid-delta checkpoint."""
     text = {
-        "model_type": "qwen3_5_text",
+        "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
         "hidden_act": "silu",
         "hidden_size": 32,
-        "intermediate_size": 32,
         "max_position_embeddings": 64,
-        # Exercise Qwen3.5's explicit output-gated head width: the query
+        # Exercise the ABI's explicit output-gated head width: the query
         # projection width may exceed hidden_size and hidden_size need not be
         # divisible by the head count (as in the official 27B checkpoint).
         "num_attention_heads": 3,
@@ -296,8 +299,17 @@ def _make_qwen3_5_fixture(root: Path) -> None:
         "tie_word_embeddings": False,
         "vocab_size": 64,
     }
+    if moe:
+        text.update({
+            "moe_intermediate_size": 32,
+            "shared_expert_intermediate_size": 32,
+            "num_experts": 2,
+            "num_experts_per_tok": 1,
+        })
+    else:
+        text["intermediate_size"] = 32
     vision = {
-        "model_type": "qwen3_5_vision",
+        "model_type": "qwen3_5_moe_vision" if moe else "qwen3_5_vision",
         "depth": 1,
         "hidden_size": 32,
         "intermediate_size": 48,
@@ -311,8 +323,11 @@ def _make_qwen3_5_fixture(root: Path) -> None:
     }
     config = {
         "_name_or_path": "synthetic/qwen3.5",
-        "architectures": ["Qwen3_5ForConditionalGeneration"],
-        "model_type": "qwen3_5",
+        "model_type": "qwen3_5_moe" if moe else "qwen3_5",
+        "architectures": [
+            "Qwen3_5MoeForConditionalGeneration"
+            if moe else "Qwen3_5ForConditionalGeneration"
+        ],
         "language_model_only": False,
         "text_config": text,
         "vision_config": vision,
@@ -324,7 +339,9 @@ def _make_qwen3_5_fixture(root: Path) -> None:
     (root / "tokenizer.json").write_text("{}", encoding="utf-8")
 
     hidden = int(text["hidden_size"])
-    intermediate = int(text["intermediate_size"])
+    intermediate = int(
+        text["moe_intermediate_size"] if moe else text["intermediate_size"]
+    )
     heads = int(text["num_attention_heads"])
     kv_heads = int(text["num_key_value_heads"])
     head_dim = int(text["head_dim"])
@@ -345,10 +362,28 @@ def _make_qwen3_5_fixture(root: Path) -> None:
         shapes.update({
             prefix + "input_layernorm.weight": (hidden,),
             prefix + "post_attention_layernorm.weight": (hidden,),
-            prefix + "mlp.gate_proj.weight": (intermediate, hidden),
-            prefix + "mlp.up_proj.weight": (intermediate, hidden),
-            prefix + "mlp.down_proj.weight": (hidden, intermediate),
         })
+        if moe:
+            shapes.update({
+                prefix + "mlp.gate.weight": (2, hidden),
+                prefix + "mlp.shared_expert.gate_proj.weight":
+                    (intermediate, hidden),
+                prefix + "mlp.shared_expert.up_proj.weight":
+                    (intermediate, hidden),
+                prefix + "mlp.shared_expert.down_proj.weight":
+                    (hidden, intermediate),
+                prefix + "mlp.shared_expert_gate.weight": (1, hidden),
+                prefix + "mlp.experts.gate_up_proj":
+                    (2, 2 * intermediate, hidden),
+                prefix + "mlp.experts.down_proj":
+                    (2, hidden, intermediate),
+            })
+        else:
+            shapes.update({
+                prefix + "mlp.gate_proj.weight": (intermediate, hidden),
+                prefix + "mlp.up_proj.weight": (intermediate, hidden),
+                prefix + "mlp.down_proj.weight": (hidden, intermediate),
+            })
         if layer_type == "full_attention":
             shapes.update({
                 prefix + "self_attn.q_proj.weight":
@@ -398,10 +433,34 @@ def _make_qwen3_5_fixture(root: Path) -> None:
                 (hidden, heads * head_dim),
             prefix + "self_attn.q_norm.weight": (head_dim,),
             prefix + "self_attn.k_norm.weight": (head_dim,),
-            prefix + "mlp.gate_proj.weight": (intermediate, hidden),
-            prefix + "mlp.up_proj.weight": (intermediate, hidden),
-            prefix + "mlp.down_proj.weight": (hidden, intermediate),
         })
+        if moe:
+            shapes.update({
+                prefix + "mlp.gate.weight": (2, hidden),
+                prefix + "mlp.shared_expert.gate_proj.weight":
+                    (intermediate, hidden),
+                prefix + "mlp.shared_expert.up_proj.weight":
+                    (intermediate, hidden),
+                prefix + "mlp.shared_expert.down_proj.weight":
+                    (hidden, intermediate),
+                prefix + "mlp.shared_expert_gate.weight": (1, hidden),
+            })
+            for expert in range(2):
+                expert_prefix = prefix + f"mlp.experts.{expert}."
+                shapes.update({
+                    expert_prefix + "gate_proj.weight":
+                        (intermediate, hidden),
+                    expert_prefix + "up_proj.weight":
+                        (intermediate, hidden),
+                    expert_prefix + "down_proj.weight":
+                        (hidden, intermediate),
+                })
+        else:
+            shapes.update({
+                prefix + "mlp.gate_proj.weight": (intermediate, hidden),
+                prefix + "mlp.up_proj.weight": (intermediate, hidden),
+                prefix + "mlp.down_proj.weight": (hidden, intermediate),
+            })
 
     vision_hidden = int(vision["hidden_size"])
     vision_intermediate = int(vision["intermediate_size"])
@@ -595,6 +654,34 @@ def _deepseek_metadata_checkpoint() -> SimpleNamespace:
 
 
 class ExpertPackTests(unittest.TestCase):
+    def test_numpy_fp4_row_batches_match_dependency_free_bytes(self) -> None:
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "config.json").write_text("{}\n", encoding="utf-8")
+            name = "matrix.weight"
+            _write_safetensors(
+                root / "model.safetensors", {name: _tensor(name, (1025, 37))}
+            )
+            checkpoint = SafeTensorCheckpoint(root)
+            with checkpoint.open_tensor(name) as view:
+                accelerated = io.BytesIO()
+                accelerated_scales = quant.write_fp4_block32_rows(
+                    view, accelerated, hashlib.sha256()
+                )
+            with checkpoint.open_tensor(name) as view, mock.patch.object(
+                quant, "_np", None
+            ):
+                reference = io.BytesIO()
+                reference_scales = quant.write_fp4_block32_rows(
+                    view, reference, hashlib.sha256()
+                )
+            self.assertEqual(accelerated.getvalue(), reference.getvalue())
+            self.assertEqual(accelerated_scales, reference_scales)
+
     def test_publish_directory_preserves_completed_tree(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -804,6 +891,11 @@ class ExpertPackTests(unittest.TestCase):
             conv = next(item for item in manifest["tensors"] if item["name"].endswith("conv1d.weight"))
             self.assertEqual(conv["source_shape"], [64, 1, 2])
             self.assertEqual(conv["stored_dtype"], "F32")
+            router = next(
+                item for item in manifest["tensors"]
+                if item["name"] == "model.layers.0.mlp.gate.weight"
+            )
+            self.assertEqual(router["stored_dtype"], "F32")
             self.assertEqual(
                 manifest["quantization"]["abi_id"], FP4_QUANT_ABI_ID
             )
@@ -820,16 +912,18 @@ class ExpertPackTests(unittest.TestCase):
             self.assertEqual(adapted.source_tensor_count,
                              len(adapted.dense) + 3 * len(adapted.experts))
 
-    def test_qwen3_5_dense_fp4_schema3_artifact(self) -> None:
+    def test_hybrid_delta_dense_fp4_schema3_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source = root / "source"
             source.mkdir()
-            _make_qwen3_5_fixture(source)
+            _make_hybrid_delta_fixture(source)
 
             checkpoint = SafeTensorCheckpoint(source)
-            adapted = adapt_checkpoint(checkpoint, "qwen3_5")
-            self.assertEqual(adapted.architecture["family"], "qwen3_5")
+            adapted = adapt_checkpoint(checkpoint, "hybrid_delta")
+            self.assertEqual(
+                adapted.architecture["family"], "hybrid_delta_dense"
+            )
             self.assertEqual(adapted.architecture["num_hidden_layers"], 4)
             self.assertEqual(adapted.source_tensor_count, len(adapted.dense))
             self.assertEqual(adapted.experts, ())
@@ -854,7 +948,7 @@ class ExpertPackTests(unittest.TestCase):
                 compile_checkpoint(CompileOptions(
                     source=source,
                     output=rejected,
-                    adapter="qwen3_5",
+                    adapter="hybrid_delta",
                 ))
             self.assertFalse(rejected.exists())
 
@@ -862,7 +956,7 @@ class ExpertPackTests(unittest.TestCase):
             result = compile_checkpoint(CompileOptions(
                 source=source,
                 output=output,
-                adapter="qwen3_5",
+                adapter="hybrid_delta",
                 quant_profile=FP4_QUANT_PROFILE,
                 max_expert_pack_bytes=PACK_ALIGNMENT,
             ))
@@ -896,7 +990,9 @@ class ExpertPackTests(unittest.TestCase):
             program = (output / manifest["model_program"]["path"]).read_text(
                 encoding="utf-8"
             )
-            self.assertIn("model\t3\tqwen3_5\t64\t64\t32", program)
+            self.assertIn(
+                "model\t3\thybrid_delta_dense\t64\t64\t32", program
+            )
             self.assertNotIn("\ncomponent\t", program)
             self.assertIn(
                 "layer\t3\tblock.full-attention.output-gated.v1\t1\t-\t0",
@@ -929,6 +1025,120 @@ class ExpertPackTests(unittest.TestCase):
                 "mtp.layers.0.self_attn.q_proj.weight",
                 program,
             )
+
+    def test_hybrid_delta_moe_fused_experts_are_logical_fp4_pages(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source, moe=True)
+
+            checkpoint = SafeTensorCheckpoint(source)
+            adapted = adapt_checkpoint(checkpoint, "hybrid_delta")
+            self.assertEqual(adapted.family, "hybrid_delta_moe")
+            self.assertEqual(len(adapted.experts), 8)
+            self.assertEqual(len(adapted.runtime_topology.components), 1)
+            self.assertIsNone(adapted.runtime_topology.exact_decode)
+            self.assertEqual(len(adapted.auxiliary_dense), 23)
+            self.assertEqual(
+                adapted.runtime_topology.components[0].execution_capability,
+                "moe.swiglu.routed.merge-shared.v1",
+            )
+            shared_router = (
+                "model.language_model.layers.0.mlp."
+                "shared_expert_gate.weight"
+            )
+            self.assertIn(shared_router, adapted.dense_float32)
+            self.assertNotIn(shared_router, adapted.dense_fp4)
+            first, second = adapted.experts[:2]
+            self.assertEqual(first.gate.physical_name,
+                "model.language_model.layers.0.mlp.experts.gate_up_proj")
+            self.assertEqual(first.gate.source_byte_offset, 0)
+            self.assertEqual(first.up.source_byte_offset, 2048)
+            self.assertEqual(second.gate.source_byte_offset, 4096)
+            self.assertEqual(first.down.source_byte_offset, 0)
+            self.assertEqual(second.down.source_byte_offset, 2048)
+
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="hybrid_delta",
+                quant_profile=FP4_QUANT_PROFILE,
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+                source_revision="source",
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            self.assertEqual(
+                manifest["architecture"]["family"], "hybrid_delta_moe"
+            )
+            self.assertEqual(
+                manifest["architecture"]["upstream_model_type"],
+                "qwen3_5_moe",
+            )
+            self.assertEqual(len(manifest["experts"]), 8)
+            self.assertEqual(
+                manifest["source"]["tensor_count"], len(checkpoint.tensors)
+            )
+            self.assertEqual(
+                set(manifest["auxiliary_tensors"]), adapted.auxiliary_dense
+            )
+            first_entry = manifest["experts"][0]
+            self.assertEqual(first_entry["stored_dtype"], "FP4_E2M1")
+            dense_by_name = {
+                entry["name"]: entry for entry in manifest["tensors"]
+            }
+            self.assertEqual(
+                dense_by_name[shared_router]["stored_dtype"], "F32"
+            )
+            self.assertEqual(
+                first_entry["source_regions"]["gate"],
+                {
+                    "tensor": (
+                        "model.language_model.layers.0.mlp.experts."
+                        "gate_up_proj"
+                    ),
+                    "byte_offset": 0,
+                    "bytes": 2048,
+                    "shape": [32, 32],
+                    "tensor_bytes": 8192,
+                    "tensor_shape": [2, 64, 32],
+                },
+            )
+            dense_by_name = {
+                entry["name"]: entry for entry in manifest["tensors"]
+            }
+            self.assertEqual(
+                dense_by_name[
+                    "model.language_model.layers.0.mlp.gate.weight"
+                ]["stored_dtype"],
+                "F32",
+            )
+            self.assertEqual(
+                dense_by_name[
+                    "model.language_model.layers.0.mlp.shared_expert."
+                    "gate_proj.weight"
+                ]["stored_dtype"],
+                "FP4_E2M1",
+            )
+            program = (output / manifest["model_program"]["path"]).read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "component\tdecoder\t0\t4\t2\t1\t1\t32\t32\t",
+                program,
+            )
+            self.assertIn(
+                "block.recurrent-linear-attention.split-gated-delta.v1",
+                program,
+            )
+            self.assertIn("router.linear-topk.shared-swiglu.v1", program)
+            self.assertIn("moe.swiglu.routed.merge-shared.v1", program)
+            self.assertNotIn("ffn.swiglu.dense.fp4-block32.v1", program)
+            self.assertNotIn("exact_decode\t", program)
+            quality = qualify_container_against_source(source, output)
+            self.assertTrue(quality["valid"])
 
     def test_lfm2_moe_adapter_compiles_dense_prefix_and_local_expert_layers(
         self,

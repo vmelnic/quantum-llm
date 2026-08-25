@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 
 namespace expert::runtime {
@@ -41,6 +42,35 @@ class AlignedHostAllocator final : public IHostAllocator {
                                std::size_t alignment) override;
   void deallocate(void* pointer) noexcept override;
   [[nodiscard]] bool page_locked() const noexcept override { return false; }
+};
+
+// One bounded host allocation carved into immutable aligned records. This is
+// useful when the complete expert pool fits RAM: it avoids thousands of OS or
+// CUDA pin/unpin operations while keeping every retained record in one bank.
+// Individual deallocations are intentionally no-ops; the bank is reclaimed as
+// a unit after the cache releases all records.
+class MonotonicHostAllocator final : public IHostAllocator {
+ public:
+  MonotonicHostAllocator(std::size_t capacity, std::size_t alignment,
+                         std::shared_ptr<IHostAllocator> upstream);
+  ~MonotonicHostAllocator() override;
+  MonotonicHostAllocator(const MonotonicHostAllocator&) = delete;
+  MonotonicHostAllocator& operator=(const MonotonicHostAllocator&) = delete;
+
+  [[nodiscard]] void* allocate(std::size_t bytes,
+                               std::size_t alignment) override;
+  void deallocate(void* pointer) noexcept override;
+  [[nodiscard]] bool page_locked() const noexcept override;
+  [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+  [[nodiscard]] std::size_t bytes_used() const noexcept;
+
+ private:
+  std::shared_ptr<IHostAllocator> upstream_;
+  void* base_{};
+  std::size_t capacity_{};
+  std::size_t alignment_{};
+  std::size_t cursor_{};
+  mutable std::mutex mutex_;
 };
 
 #if defined(EXPERT_RUNTIME_HAS_CUDA_PINNED)

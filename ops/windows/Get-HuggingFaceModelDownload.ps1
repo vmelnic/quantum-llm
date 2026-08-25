@@ -32,9 +32,11 @@ foreach ($partial in $incomplete) {
     $incompleteBytes += [int64]$partial.Length
 }
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
-$selectedFiles = if ($null -ne $state.PSObject.Properties["files"]) {
-    @($state.files | ForEach-Object { [string]$_ })
-} else { @() }
+$selectedFiles = @(
+    if ($null -ne $state.PSObject.Properties["files"]) {
+        $state.files | ForEach-Object { [string]$_ }
+    }
+)
 $missingReferencedFiles = @()
 if ($selectedFiles.Count -gt 0) {
     $shards = @($selectedFiles | ForEach-Object {
@@ -64,6 +66,11 @@ $exit = if (Test-Path ([string]$state.exit_status) -PathType Leaf) {
     Get-Content ([string]$state.exit_status) -Raw | ConvertFrom-Json
 } else { $null }
 $selectedIntegrityChecked = $false
+$fullIntegrityChecked = $selectedFiles.Count -eq 0 -and $null -ne $exit -and
+    [string]$exit.model_id -eq [string]$state.model_id -and
+    [string]$exit.revision -eq [string]$state.revision -and
+    $null -ne $exit.PSObject.Properties["integrity_checked"] -and
+    [bool]$exit.integrity_checked
 $selectedMetadataMissing = @()
 $selectedSizeMismatches = @()
 $selectedHashMismatches = @()
@@ -146,6 +153,7 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
       $selectedHashMismatches.Count -eq 0) -or
      ($selectedFiles.Count -eq 0 -and
       $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
+      $fullIntegrityChecked -and
       $incomplete.Count -eq 0)) -and
     $missingReferencedFiles.Count -eq 0
 
@@ -164,7 +172,11 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     incomplete_transfers = $incomplete.Count
     incomplete_bytes = $incompleteBytes
     missing_referenced_files = $missingReferencedFiles.Count
-    integrity_checked = $selectedIntegrityChecked
+    integrity_checked = if ($selectedFiles.Count -gt 0) {
+        $selectedIntegrityChecked
+    } else {
+        $fullIntegrityChecked
+    }
     metadata_missing = $selectedMetadataMissing
     size_mismatches = $selectedSizeMismatches
     hash_mismatches = $selectedHashMismatches

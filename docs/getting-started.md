@@ -1,6 +1,6 @@
 # Getting started
 
-Status: supported setup path, 2026-08-23.
+Status: supported setup path, 2026-08-25.
 
 This project uses a POSIX control host and a self-contained Windows/CUDA
 execution host. The reference execution host is `3090box`; paths below are
@@ -77,7 +77,7 @@ the repository scripts. Supply the exact repository byte and shard inventory:
 
 Do not use ad-hoc `curl`, parallel downloaders or `HF_HUB_DISABLE_XET`.
 
-## Compile and publish Qwen FP4
+## Compile and publish hybrid FP4 models
 
 The official checkpoint is compiled directly into a candidate below
 `MODEL_ROOT`, validated, then atomically promoted:
@@ -87,13 +87,16 @@ The official checkpoint is compiled directly into a candidate below
   -ModelId Qwen/Qwen3.8-27B \
   -Revision <immutable-commit> \
   -StableName qwen3.8-27b-fp4 \
-  -Adapter qwen3_5 \
+  -Adapter hybrid_delta \
   -QuantProfile fp4-e2m1-ue8m0-block32-v1
 ```
 
-`qwen3_5` is the compiler adapter identifier inherited from the upstream
-checkpoint ABI; it does not create or select a Qwen3.5 deployment. The
-published service alias is only Qwen3.8. See [Expert Pack v1](expert-pack-v1.md).
+`hybrid_delta` is the generic compiler adapter for checkpoints that declare
+the split-GatedDeltaNet hybrid Transformer ABI. Upstream family identifiers
+are accepted only as source metadata and do not become runtime or deployment
+names. The same command publishes Ornith by selecting its pinned official
+source and `-StableName ornith-1.5-35b-a3b-fp4`; no new service task or runner
+is created. See [Expert Pack v1](expert-pack-v1.md).
 
 DeepSeek uses its authenticated compact-bundle workflow documented in
 [DeepSeek compact pack v1](deepseek-compact-pack-v1.md).
@@ -109,6 +112,7 @@ DeepSeek uses its authenticated compact-bundle workflow documented in
 
 The real smoke prompt is `hi`. A successful smoke validates lifecycle and the
 common path; it is not a performance or quality qualification. Repeat the same
-commands with `deepseek` when changing common runtime/service code.
+commands with `ornith` and `deepseek` when changing common runtime/service
+code.
 
 Continue with [Deployment](deployment.md) and [Operations](operations.md).

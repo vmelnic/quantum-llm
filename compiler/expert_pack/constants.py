@@ -30,6 +30,10 @@ QUANT_GROUP_SIZE = 0  # 0 means one scale per complete output row.
 # compiler never emits it.
 FP4_QUANT_PROFILE = "fp4-e2m1-ue8m0-block32-v1"
 FP4_QUANT_ABI_ID = 3
+# Routed ReLU2 experts use the same FP4 payload encoding as ABI 3, but their
+# executable record contains only up/down matrices.  Keeping a distinct ABI
+# prevents a SwiGLU runtime from interpreting the first section as gate+up.
+FP4_RELU2_EXPERT_ABI_ID = 4
 FP4_QUANT_GROUP_SIZE = 32
 FP4_UE8M0_MIN_CODE = 1
 FP4_UE8M0_MAX_CODE = 254

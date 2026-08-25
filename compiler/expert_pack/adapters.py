@@ -7,7 +7,7 @@ import math
 import struct
 from dataclasses import dataclass
 
-from .constants import FP4_QUANT_PROFILE, QUANT_PROFILES
+from .constants import DTYPE_BYTES, FP4_QUANT_PROFILE, QUANT_PROFILES
 from .errors import AdapterError
 from .safetensors import SafeTensorCheckpoint, TensorInfo
 
@@ -25,7 +25,7 @@ LFM2_EXPERT_PATTERN = re.compile(
 class ExpertSource:
     layer: int
     expert: int
-    gate: TensorInfo
+    gate: TensorInfo | None
     up: TensorInfo
     down: TensorInfo
 
@@ -119,6 +119,10 @@ class AdaptedModel:
     # only when the selected container profile is FP4; existing adapters keep
     # their current INT8/FP32 dense representation by leaving this set empty.
     dense_fp4: frozenset[str] = frozenset()
+    # Source tensors preserved and qualified in the artifact but intentionally
+    # absent from the executable program (for example an unsupported optional
+    # draft head). They are explicit, not silently dead runtime bindings.
+    auxiliary_dense: frozenset[str] = frozenset()
     supported_expert_quant_profiles: frozenset[str] = frozenset(QUANT_PROFILES)
 
 
@@ -898,38 +902,79 @@ class Qwen3NextAdapter:
             experts=tuple(sources),
             source_tensor_count=len(checkpoint.tensors),
             runtime_topology=runtime_topology,
+            dense_float32=frozenset(
+                f"model.layers.{layer}.mlp.gate.weight"
+                for layer in range(layers)
+            ),
             supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
         )
 
 
-class Qwen3_5Adapter:
-    """Strict adapter for the official dense Qwen3.5/Qwen3.8 checkpoint ABI."""
+class HybridDeltaAdapter:
+    """Strict adapter for split-GatedDeltaNet hybrid Transformer ABIs."""
 
-    name = "qwen3_5"
+    name = "hybrid_delta"
+    _UPSTREAM_DENSE_MODEL_TYPE = "qwen3_5"
+    _UPSTREAM_MOE_MODEL_TYPE = "qwen3_5_moe"
+    _UPSTREAM_DENSE_TEXT_TYPE = "qwen3_5_text"
+    _UPSTREAM_MOE_TEXT_TYPE = "qwen3_5_moe_text"
+    _UPSTREAM_DENSE_VISION_TYPE = "qwen3_5_vision"
+    _UPSTREAM_MOE_VISION_TYPE = "qwen3_5_moe_vision"
 
     def adapt(self, checkpoint: SafeTensorCheckpoint) -> AdaptedModel:
         config = checkpoint.config
-        if config.get("model_type") != self.name:
+        model_type = config.get("model_type")
+        is_moe = model_type == self._UPSTREAM_MOE_MODEL_TYPE
+        if model_type not in {
+            self._UPSTREAM_DENSE_MODEL_TYPE,
+            self._UPSTREAM_MOE_MODEL_TYPE,
+        }:
             raise AdapterError(
-                "qwen3_5 adapter requires config.model_type == 'qwen3_5'"
+                "hybrid_delta adapter requires a supported upstream "
+                "split-GatedDeltaNet model_type"
             )
+        runtime_family = "hybrid_delta_moe" if is_moe else "hybrid_delta_dense"
         architectures = config.get("architectures")
-        if not isinstance(architectures, list) or (
-            "Qwen3_5ForConditionalGeneration" not in architectures
+        expected_architecture = (
+            "Qwen3_5MoeForConditionalGeneration"
+            if is_moe else "Qwen3_5ForConditionalGeneration"
+        )
+        if (
+            not isinstance(architectures, list)
+            or expected_architecture not in architectures
         ):
             raise AdapterError(
-                "qwen3_5 adapter requires Qwen3_5ForConditionalGeneration"
+                f"hybrid_delta adapter requires {expected_architecture}"
             )
         text = config.get("text_config")
         vision = config.get("vision_config")
         if not isinstance(text, dict) or not isinstance(vision, dict):
-            raise AdapterError("qwen3_5 requires text_config and vision_config")
-        if text.get("model_type") != "qwen3_5_text":
-            raise AdapterError("qwen3_5 text_config has an unexpected model_type")
+            raise AdapterError(
+                "hybrid_delta requires text_config and vision_config"
+            )
+        expected_text_type = (
+            self._UPSTREAM_MOE_TEXT_TYPE
+            if is_moe else self._UPSTREAM_DENSE_TEXT_TYPE
+        )
+        if text.get("model_type") != expected_text_type:
+            raise AdapterError(
+                "hybrid_delta text_config has an unexpected upstream "
+                "model_type"
+            )
 
         layers = _integer(text, "num_hidden_layers")
         hidden = _integer(text, "hidden_size")
-        intermediate = _integer(text, "intermediate_size")
+        if is_moe:
+            expert_width = _integer(text, "moe_intermediate_size")
+            shared_width = _integer(text, "shared_expert_intermediate_size")
+            experts = _integer(text, "num_experts")
+            top_k = _integer(text, "num_experts_per_tok")
+            if top_k > experts:
+                raise AdapterError("hybrid_delta top-k exceeds expert count")
+            intermediate = expert_width
+        else:
+            intermediate = _integer(text, "intermediate_size")
+            expert_width = shared_width = experts = top_k = 0
         vocab = _integer(text, "vocab_size")
         max_context = _integer(text, "max_position_embeddings")
         heads = _integer(text, "num_attention_heads")
@@ -943,17 +988,18 @@ class Qwen3_5Adapter:
         full_interval = _integer(text, "full_attention_interval")
         mtp_layers = _integer(text, "mtp_num_hidden_layers")
         epsilon = _number(text, "rms_norm_eps")
-        # Qwen3.5 declares head_dim explicitly.  Its output-gated attention
-        # may project to a query width larger than hidden_size (the official
-        # 27B checkpoint uses 24 * 256 versus hidden_size 5120), so residual
+        # This ABI declares head_dim explicitly. Its output-gated attention
+        # may project to a query width larger than hidden_size, so residual
         # width divisibility by the query-head count is not an invariant.
         if value_heads % key_heads or heads % kv_heads:
-            raise AdapterError("qwen3_5 attention geometry is inconsistent")
+            raise AdapterError("hybrid_delta attention geometry is inconsistent")
         if hidden // heads != head_dim:
-            # Qwen3.5 has an output-gated query width which need not equal the
-            # residual width, so only the explicit head_dim is authoritative.
+            # The output-gated query width need not equal the residual width,
+            # so only the explicit head_dim is authoritative.
             if heads * head_dim <= hidden:
-                raise AdapterError("qwen3_5 explicit head geometry is invalid")
+                raise AdapterError(
+                    "hybrid_delta explicit head geometry is invalid"
+                )
         layer_types = text.get("layer_types")
         if (
             not isinstance(layer_types, list)
@@ -967,20 +1013,24 @@ class Qwen3_5Adapter:
                 for layer, value in enumerate(layer_types)
             )
         ):
-            raise AdapterError("qwen3_5 layer_types disagree with configured topology")
+            raise AdapterError(
+                "hybrid_delta layer_types disagree with configured topology"
+            )
         partial_rotary = text.get("partial_rotary_factor")
         if (
             isinstance(partial_rotary, bool)
             or not isinstance(partial_rotary, (int, float))
             or not 0.0 < float(partial_rotary) <= 1.0
         ):
-            raise AdapterError("qwen3_5 partial_rotary_factor must be in (0,1]")
+            raise AdapterError(
+                "hybrid_delta partial_rotary_factor must be in (0,1]"
+            )
         rotary_dim = int(head_dim * float(partial_rotary))
         if rotary_dim <= 0 or rotary_dim % 2:
-            raise AdapterError("qwen3_5 rotary dimension is invalid")
+            raise AdapterError("hybrid_delta rotary dimension is invalid")
         rope = text.get("rope_parameters")
         if not isinstance(rope, dict):
-            raise AdapterError("qwen3_5 rope_parameters are absent")
+            raise AdapterError("hybrid_delta rope_parameters are absent")
         rope_theta = _number(rope, "rope_theta")
         mrope_sections = rope.get("mrope_section")
         if (
@@ -990,8 +1040,17 @@ class Qwen3_5Adapter:
                    or value <= 0 for value in mrope_sections)
             or sum(mrope_sections) != rotary_dim // 2
         ):
-            raise AdapterError("qwen3_5 mRoPE sections are inconsistent")
+            raise AdapterError("hybrid_delta mRoPE sections are inconsistent")
 
+        expected_vision_type = (
+            self._UPSTREAM_MOE_VISION_TYPE
+            if is_moe else self._UPSTREAM_DENSE_VISION_TYPE
+        )
+        if vision.get("model_type") != expected_vision_type:
+            raise AdapterError(
+                "hybrid_delta vision_config has an unexpected upstream "
+                "model_type"
+            )
         vision_depth = _integer(vision, "depth")
         vision_hidden = _integer(vision, "hidden_size")
         vision_intermediate = _integer(vision, "intermediate_size")
@@ -1008,9 +1067,12 @@ class Qwen3_5Adapter:
             or vision_output != hidden
             or vision_grid_side * vision_grid_side != vision_positions
         ):
-            raise AdapterError("qwen3_5 vision/text geometry is inconsistent")
+            raise AdapterError(
+                "hybrid_delta vision/text geometry is inconsistent"
+            )
 
         expected: dict[str, tuple[int, ...]] = {}
+        routed_physical: dict[str, tuple[int, ...]] = {}
         fp4_names: set[str] = set()
         float32_names: set[str] = set()
 
@@ -1019,7 +1081,9 @@ class Qwen3_5Adapter:
             preserve: bool = False,
         ) -> None:
             if name in expected or (fp4 and preserve):
-                raise AdapterError(f"duplicate/ambiguous qwen3_5 tensor role: {name}")
+                raise AdapterError(
+                    f"duplicate/ambiguous hybrid_delta tensor role: {name}"
+                )
             expected[name] = shape
             if fp4:
                 fp4_names.add(name)
@@ -1039,9 +1103,29 @@ class Qwen3_5Adapter:
             prefix = f"{text_prefix}layers.{layer}."
             add(prefix + "input_layernorm.weight", (hidden,), preserve=True)
             add(prefix + "post_attention_layernorm.weight", (hidden,), preserve=True)
-            add(prefix + "mlp.gate_proj.weight", (intermediate, hidden), fp4=True)
-            add(prefix + "mlp.up_proj.weight", (intermediate, hidden), fp4=True)
-            add(prefix + "mlp.down_proj.weight", (hidden, intermediate), fp4=True)
+            if is_moe:
+                add(prefix + "mlp.gate.weight", (experts, hidden), preserve=True)
+                add(prefix + "mlp.shared_expert.gate_proj.weight",
+                    (shared_width, hidden), fp4=True)
+                add(prefix + "mlp.shared_expert.up_proj.weight",
+                    (shared_width, hidden), fp4=True)
+                add(prefix + "mlp.shared_expert.down_proj.weight",
+                    (hidden, shared_width), fp4=True)
+                add(prefix + "mlp.shared_expert_gate.weight",
+                    (1, hidden), preserve=True)
+                routed_physical[prefix + "mlp.experts.gate_up_proj"] = (
+                    experts, 2 * expert_width, hidden
+                )
+                routed_physical[prefix + "mlp.experts.down_proj"] = (
+                    experts, hidden, expert_width
+                )
+            else:
+                add(prefix + "mlp.gate_proj.weight",
+                    (intermediate, hidden), fp4=True)
+                add(prefix + "mlp.up_proj.weight",
+                    (intermediate, hidden), fp4=True)
+                add(prefix + "mlp.down_proj.weight",
+                    (hidden, intermediate), fp4=True)
             if layer_type == "full_attention":
                 add(prefix + "self_attn.q_proj.weight",
                     (2 * heads * head_dim, hidden), fp4=True)
@@ -1072,7 +1156,9 @@ class Qwen3_5Adapter:
                     (hidden, value_dim), fp4=True)
 
         if mtp_layers and bool(text.get("mtp_use_dedicated_embeddings", False)):
-            raise AdapterError("qwen3_5 dedicated MTP embeddings are unsupported")
+            raise AdapterError(
+                "hybrid_delta dedicated MTP embeddings are unsupported"
+            )
         if mtp_layers:
             add("mtp.fc.weight", (hidden, 2 * hidden), fp4=True)
             add("mtp.pre_fc_norm_embedding.weight", (hidden,), preserve=True)
@@ -1092,9 +1178,31 @@ class Qwen3_5Adapter:
                     (hidden, heads * head_dim), fp4=True)
                 add(prefix + "self_attn.q_norm.weight", (head_dim,), preserve=True)
                 add(prefix + "self_attn.k_norm.weight", (head_dim,), preserve=True)
-                add(prefix + "mlp.gate_proj.weight", (intermediate, hidden), fp4=True)
-                add(prefix + "mlp.up_proj.weight", (intermediate, hidden), fp4=True)
-                add(prefix + "mlp.down_proj.weight", (hidden, intermediate), fp4=True)
+                if is_moe:
+                    add(prefix + "mlp.gate.weight", (experts, hidden), preserve=True)
+                    add(prefix + "mlp.shared_expert.gate_proj.weight",
+                        (shared_width, hidden), fp4=True)
+                    add(prefix + "mlp.shared_expert.up_proj.weight",
+                        (shared_width, hidden), fp4=True)
+                    add(prefix + "mlp.shared_expert.down_proj.weight",
+                        (hidden, shared_width), fp4=True)
+                    add(prefix + "mlp.shared_expert_gate.weight",
+                        (1, hidden), preserve=True)
+                    for expert in range(experts):
+                        expert_prefix = prefix + f"mlp.experts.{expert}."
+                        add(expert_prefix + "gate_proj.weight",
+                            (expert_width, hidden), fp4=True)
+                        add(expert_prefix + "up_proj.weight",
+                            (expert_width, hidden), fp4=True)
+                        add(expert_prefix + "down_proj.weight",
+                            (hidden, expert_width), fp4=True)
+                else:
+                    add(prefix + "mlp.gate_proj.weight",
+                        (intermediate, hidden), fp4=True)
+                    add(prefix + "mlp.up_proj.weight",
+                        (intermediate, hidden), fp4=True)
+                    add(prefix + "mlp.down_proj.weight",
+                        (hidden, intermediate), fp4=True)
 
         visual_prefix = "model.visual."
         add(visual_prefix + "patch_embed.proj.weight",
@@ -1130,32 +1238,72 @@ class Qwen3_5Adapter:
             (vision_output, merged), fp4=True)
         add(visual_prefix + "merger.linear_fc2.bias", (vision_output,), preserve=True)
 
+        classified = set(expected) | set(routed_physical)
         actual = set(checkpoint.tensors)
-        if actual != set(expected):
-            missing = sorted(set(expected) - actual)
-            unknown = sorted(actual - set(expected))
+        if actual != classified:
+            missing = sorted(classified - actual)
+            unknown = sorted(actual - classified)
             raise AdapterError(
-                f"qwen3_5 tensor partition mismatch; missing={missing[:8]}, "
+                f"hybrid_delta tensor partition mismatch; missing={missing[:8]}, "
                 f"unknown={unknown[:8]}"
             )
-        for name, shape in expected.items():
+        for name, shape in {**expected, **routed_physical}.items():
             info = checkpoint.tensors[name]
             if info.shape != shape:
                 raise AdapterError(
-                    f"qwen3_5 shape mismatch for {name}: expected {shape}, "
+                    f"hybrid_delta shape mismatch for {name}: expected {shape}, "
                     f"got {info.shape}"
                 )
             if info.dtype not in {"BF16", "F16", "F32"}:
                 raise AdapterError(
-                    f"qwen3_5 tensor {name} has unsupported dtype {info.dtype}"
+                    f"hybrid_delta tensor {name} has unsupported dtype "
+                    f"{info.dtype}"
                 )
+
+        routed_sources: list[ExpertSource] = []
+        if is_moe:
+            for layer in range(layers):
+                prefix = f"{text_prefix}layers.{layer}.mlp.experts."
+                gate_up_name = prefix + "gate_up_proj"
+                down_name = prefix + "down_proj"
+                gate_up = checkpoint.tensors[gate_up_name]
+                down = checkpoint.tensors[down_name]
+                gate_up_element_bytes = DTYPE_BYTES[gate_up.dtype]
+                down_element_bytes = DTYPE_BYTES[down.dtype]
+                gate_or_up_bytes = expert_width * hidden * gate_up_element_bytes
+                gate_up_expert_bytes = 2 * gate_or_up_bytes
+                down_expert_bytes = hidden * expert_width * down_element_bytes
+                for expert in range(experts):
+                    logical_prefix = f"{prefix}expert-{expert}."
+                    gate = checkpoint.tensor_region(
+                        gate_up_name,
+                        logical_prefix + "gate_proj.weight",
+                        (expert_width, hidden),
+                        expert * gate_up_expert_bytes,
+                    )
+                    up = checkpoint.tensor_region(
+                        gate_up_name,
+                        logical_prefix + "up_proj.weight",
+                        (expert_width, hidden),
+                        expert * gate_up_expert_bytes + gate_or_up_bytes,
+                    )
+                    routed_down = checkpoint.tensor_region(
+                        down_name,
+                        logical_prefix + "down_proj.weight",
+                        (hidden, expert_width),
+                        expert * down_expert_bytes,
+                    )
+                    routed_sources.append(ExpertSource(
+                        layer, expert, gate, up, routed_down
+                    ))
 
         norm_bits = _float32_bits(epsilon)
         rope_bits = _float32_bits(rope_theta)
         full_layers = sum(value == "full_attention" for value in layer_types)
         architecture = {
-            "family": self.name,
-            "model_type": self.name,
+            "family": runtime_family,
+            "model_type": runtime_family,
+            "upstream_model_type": str(model_type),
             "architectures": architectures,
             "language_model_only": bool(config.get("language_model_only", False)),
             "hidden_size": hidden,
@@ -1185,6 +1333,30 @@ class Qwen3_5Adapter:
             "vision_hidden_size": vision_hidden,
             "vision_intermediate_size": vision_intermediate,
         }
+        if is_moe:
+            architecture.update({
+                "moe_intermediate_size": expert_width,
+                "shared_expert_intermediate_size": shared_width,
+                "num_experts": experts,
+                "num_experts_per_token": top_k,
+                "shared_experts": 1,
+                "normalize_topk_probability": True,
+            })
+        runtime_component = (
+            RuntimeComponentTopology(
+                name="decoder",
+                layer_count=layers,
+                experts_per_layer=experts,
+                route_width=top_k,
+                shared_experts_per_layer=1,
+                hidden_size=hidden,
+                intermediate_size=expert_width,
+                execution_capability="moe.swiglu.routed.merge-shared.v1",
+                router_capability="router.linear-topk.shared-swiglu.v1",
+                router_parameters=(("normalize", 1),),
+            )
+            if is_moe else None
+        )
         runtime_layers = tuple(
             RuntimeLayerTopology(
                 logical_layer=layer,
@@ -1194,8 +1366,8 @@ class Qwen3_5Adapter:
                     "block.recurrent-linear-attention.split-gated-delta.v1"
                 ),
                 block_abi=1,
-                routed_component=None,
-                component_layer=0,
+                routed_component="decoder" if is_moe else None,
+                component_layer=layer if is_moe else 0,
             )
             for layer, layer_type in enumerate(layer_types)
         )
@@ -1283,21 +1455,83 @@ class Qwen3_5Adapter:
                     ("output_norm", prefix + "linear_attn.norm.weight"),
                     ("output_projection", prefix + "linear_attn.out_proj.weight"),
                 )
-            operations.extend((
-                RuntimeOperationTopology(
-                    logical_layer=layer,
-                    capability=runtime_layers[layer].block_capability,
-                    abi=1,
-                    routed_component=None,
-                    component_layer=0,
-                    tensor_bindings=attention_bindings,
-                    input_bindings=(
-                        ("hidden", f"hidden.{layer}", HIDDEN_BATCH_ABI),
-                        ("positions", "request.positions", POSITION_BATCH_ABI),
-                    ),
-                    output_bindings=(("hidden", after_attention, HIDDEN_BATCH_ABI),),
+            operations.append(RuntimeOperationTopology(
+                logical_layer=layer,
+                capability=runtime_layers[layer].block_capability,
+                abi=1,
+                routed_component=None,
+                component_layer=0,
+                tensor_bindings=attention_bindings,
+                input_bindings=(
+                    ("hidden", f"hidden.{layer}", HIDDEN_BATCH_ABI),
+                    ("positions", "request.positions", POSITION_BATCH_ABI),
                 ),
-                RuntimeOperationTopology(
+                output_bindings=(("hidden", after_attention, HIDDEN_BATCH_ABI),),
+            ))
+            if is_moe:
+                route_indices = f"layer.{layer}.route_indices"
+                route_weights = f"layer.{layer}.route_weights"
+                residual = f"layer.{layer}.residual"
+                shared_output = f"layer.{layer}.shared_output"
+                expert_input = f"layer.{layer}.expert_input"
+                operations.extend((
+                    RuntimeOperationTopology(
+                        logical_layer=layer,
+                        capability="router.linear-topk.shared-swiglu.v1",
+                        abi=1,
+                        routed_component="decoder",
+                        component_layer=layer,
+                        parameters=(
+                            ("norm_epsilon_f32_bits", norm_bits),
+                            ("shared_intermediate_size", shared_width),
+                        ),
+                        tensor_bindings=(
+                            ("input_norm", prefix + "post_attention_layernorm.weight"),
+                            ("router_weight", prefix + "mlp.gate.weight"),
+                            ("shared_gate_projection",
+                             prefix + "mlp.shared_expert.gate_proj.weight"),
+                            ("shared_up_projection",
+                             prefix + "mlp.shared_expert.up_proj.weight"),
+                            ("shared_down_projection",
+                             prefix + "mlp.shared_expert.down_proj.weight"),
+                            ("shared_router",
+                             prefix + "mlp.shared_expert_gate.weight"),
+                        ),
+                        input_bindings=(
+                            ("hidden", after_attention, HIDDEN_BATCH_ABI),
+                        ),
+                        output_bindings=(
+                            ("expert_input", expert_input, HIDDEN_BATCH_ABI),
+                            ("route_indices", route_indices,
+                             ROUTE_INDEX_BATCH_ABI),
+                            ("route_weights", route_weights,
+                             ROUTE_WEIGHT_BATCH_ABI),
+                            ("residual", residual, HIDDEN_BATCH_ABI),
+                            ("shared_output", shared_output, HIDDEN_BATCH_ABI),
+                        ),
+                    ),
+                    RuntimeOperationTopology(
+                        logical_layer=layer,
+                        capability="moe.swiglu.routed.merge-shared.v1",
+                        abi=1,
+                        routed_component="decoder",
+                        component_layer=layer,
+                        input_bindings=(
+                            ("expert_input", expert_input, HIDDEN_BATCH_ABI),
+                            ("route_indices", route_indices,
+                             ROUTE_INDEX_BATCH_ABI),
+                            ("route_weights", route_weights,
+                             ROUTE_WEIGHT_BATCH_ABI),
+                            ("residual", residual, HIDDEN_BATCH_ABI),
+                            ("shared_output", shared_output, HIDDEN_BATCH_ABI),
+                        ),
+                        output_bindings=(
+                            ("hidden", f"hidden.{layer + 1}", HIDDEN_BATCH_ABI),
+                        ),
+                    ),
+                ))
+            else:
+                operations.append(RuntimeOperationTopology(
                     logical_layer=layer,
                     capability="ffn.swiglu.dense.fp4-block32.v1",
                     abi=1,
@@ -1309,12 +1543,13 @@ class Qwen3_5Adapter:
                         ("up_projection", prefix + "mlp.up_proj.weight"),
                         ("down_projection", prefix + "mlp.down_proj.weight"),
                     ),
-                    input_bindings=(("hidden", after_attention, HIDDEN_BATCH_ABI),),
+                    input_bindings=(
+                        ("hidden", after_attention, HIDDEN_BATCH_ABI),
+                    ),
                     output_bindings=(
                         ("hidden", f"hidden.{layer + 1}", HIDDEN_BATCH_ABI),
                     ),
-                ),
-            ))
+                ))
         operations.append(RuntimeOperationTopology(
             logical_layer=None,
             capability="head.rmsnorm.token-select.fp4-block32.v1",
@@ -1328,9 +1563,13 @@ class Qwen3_5Adapter:
             input_bindings=(("hidden", f"hidden.{layers}", HIDDEN_BATCH_ABI),),
             output_bindings=(("token_ids", "response.token_ids", TOKEN_BATCH_ABI),),
         ))
-        mtp_capability = "decode.mtp.dense-full-attention.fp4-block32.exact.v1"
+        mtp_capability = (
+            "decode.mtp.moe-full-attention.fp4-block32.exact.v1"
+            if is_moe
+            else "decode.mtp.dense-full-attention.fp4-block32.exact.v1"
+        )
         exact_decode = None
-        if mtp_layers:
+        if mtp_layers and not is_moe:
             mtp_bindings: list[tuple[str, str]] = [
                 ("token_embedding", text_prefix + "embed_tokens.weight"),
                 ("output_head", output_head),
@@ -1352,10 +1591,39 @@ class Qwen3_5Adapter:
                     (role + "key_norm", prefix + "self_attn.k_norm.weight"),
                     (role + "post_attention_norm",
                      prefix + "post_attention_layernorm.weight"),
-                    (role + "gate_projection", prefix + "mlp.gate_proj.weight"),
-                    (role + "up_projection", prefix + "mlp.up_proj.weight"),
-                    (role + "down_projection", prefix + "mlp.down_proj.weight"),
                 ))
+                if is_moe:
+                    mtp_bindings.extend((
+                        (role + "router_weight", prefix + "mlp.gate.weight"),
+                        (role + "shared_gate_projection",
+                         prefix + "mlp.shared_expert.gate_proj.weight"),
+                        (role + "shared_up_projection",
+                         prefix + "mlp.shared_expert.up_proj.weight"),
+                        (role + "shared_down_projection",
+                         prefix + "mlp.shared_expert.down_proj.weight"),
+                        (role + "shared_router",
+                         prefix + "mlp.shared_expert_gate.weight"),
+                    ))
+                    for expert in range(experts):
+                        expert_prefix = prefix + f"mlp.experts.{expert}."
+                        expert_role = role + f"expert.{expert}."
+                        mtp_bindings.extend((
+                            (expert_role + "gate_projection",
+                             expert_prefix + "gate_proj.weight"),
+                            (expert_role + "up_projection",
+                             expert_prefix + "up_proj.weight"),
+                            (expert_role + "down_projection",
+                             expert_prefix + "down_proj.weight"),
+                        ))
+                else:
+                    mtp_bindings.extend((
+                        (role + "gate_projection",
+                         prefix + "mlp.gate_proj.weight"),
+                        (role + "up_projection",
+                         prefix + "mlp.up_proj.weight"),
+                        (role + "down_projection",
+                         prefix + "mlp.down_proj.weight"),
+                    ))
             exact_decode = RuntimeExactDecodeTopology(
                 capability=mtp_capability,
                 abi=1,
@@ -1369,51 +1637,64 @@ class Qwen3_5Adapter:
             ("vision.patch-transformer-merge.fp4-block32.v1", 1),
             ("block.full-attention.output-gated.v1", 1),
             ("block.recurrent-linear-attention.split-gated-delta.v1", 1),
-            ("ffn.swiglu.dense.fp4-block32.v1", 1),
             ("head.rmsnorm.token-select.fp4-block32.v1", 1),
         ]
+        if is_moe:
+            required_kernels.extend((
+                ("router.linear-topk.shared-swiglu.v1", 1),
+                ("moe.swiglu.routed.merge-shared.v1", 1),
+            ))
+        else:
+            required_kernels.append(("ffn.swiglu.dense.fp4-block32.v1", 1))
         if exact_decode is not None:
             required_kernels.append((mtp_capability, 1))
+        runtime_attributes = [
+            ("attention_heads", heads),
+            ("kv_heads", kv_heads),
+            ("head_dim", head_dim),
+            ("full_attention_layers", full_layers),
+            ("linear_conv_kernel", conv_kernel),
+            ("linear_key_head_dim", key_head_dim),
+            ("linear_value_head_dim", value_head_dim),
+            ("linear_key_heads", key_heads),
+            ("linear_value_heads", value_heads),
+            ("norm_epsilon_f32_bits", norm_bits),
+            ("rope_theta_f32_bits", rope_bits),
+            ("rotary_dimension", rotary_dim),
+            ("mrope_interleaved", int(bool(rope.get("mrope_interleaved", False)))),
+            ("mrope_section_0", mrope_sections[0]),
+            ("mrope_section_1", mrope_sections[1]),
+            ("mrope_section_2", mrope_sections[2]),
+            ("vision_depth", vision_depth),
+            ("vision_hidden_size", vision_hidden),
+            ("vision_intermediate_size", vision_intermediate),
+            ("vision_heads", vision_heads),
+            ("vision_position_embeddings", vision_positions),
+            ("vision_grid_side", vision_grid_side),
+            ("vision_channels", vision_channels),
+            ("vision_patch_size", patch),
+            ("vision_temporal_patch_size", temporal_patch),
+            ("vision_spatial_merge_size", spatial_merge),
+            ("vision_output_size", vision_output),
+            ("vision_norm_epsilon_f32_bits", _float32_bits(1e-6)),
+            ("vision_rope_theta_f32_bits", _float32_bits(10_000.0)),
+            ("zero_centered_norm", 1),
+            ("mtp_layers", 0 if is_moe else mtp_layers),
+        ]
+        if is_moe:
+            runtime_attributes.extend((
+                ("expert_count", experts),
+                ("route_width", top_k),
+                ("shared_intermediate_size", shared_width),
+            ))
         runtime_topology = RuntimeModelTopology(
-            architecture_id=self.name,
+            architecture_id=runtime_family,
             vocab_size=vocab,
             max_context_tokens=max_context,
             hidden_size=hidden,
-            attributes=(
-                ("attention_heads", heads),
-                ("kv_heads", kv_heads),
-                ("head_dim", head_dim),
-                ("full_attention_layers", full_layers),
-                ("linear_conv_kernel", conv_kernel),
-                ("linear_key_head_dim", key_head_dim),
-                ("linear_value_head_dim", value_head_dim),
-                ("linear_key_heads", key_heads),
-                ("linear_value_heads", value_heads),
-                ("norm_epsilon_f32_bits", norm_bits),
-                ("rope_theta_f32_bits", rope_bits),
-                ("rotary_dimension", rotary_dim),
-                ("mrope_interleaved", int(bool(rope.get("mrope_interleaved", False)))),
-                ("mrope_section_0", mrope_sections[0]),
-                ("mrope_section_1", mrope_sections[1]),
-                ("mrope_section_2", mrope_sections[2]),
-                ("vision_depth", vision_depth),
-                ("vision_hidden_size", vision_hidden),
-                ("vision_intermediate_size", vision_intermediate),
-                ("vision_heads", vision_heads),
-                ("vision_position_embeddings", vision_positions),
-                ("vision_grid_side", vision_grid_side),
-                ("vision_channels", vision_channels),
-                ("vision_patch_size", patch),
-                ("vision_temporal_patch_size", temporal_patch),
-                ("vision_spatial_merge_size", spatial_merge),
-                ("vision_output_size", vision_output),
-                ("vision_norm_epsilon_f32_bits", _float32_bits(1e-6)),
-                ("vision_rope_theta_f32_bits", _float32_bits(10_000.0)),
-                ("zero_centered_norm", 1),
-                ("mtp_layers", mtp_layers),
-            ),
+            attributes=tuple(runtime_attributes),
             required_kernels=tuple(required_kernels),
-            components=(),
+            components=(runtime_component,) if runtime_component is not None else (),
             layers=runtime_layers,
             operations=tuple(operations),
             tensor_bindings=(
@@ -1432,14 +1713,18 @@ class Qwen3_5Adapter:
             exact_decode=exact_decode,
         )
         return AdaptedModel(
-            family=self.name,
+            family=runtime_family,
             architecture=architecture,
             dense=tuple(checkpoint.tensors[name] for name in sorted(expected)),
-            experts=(),
+            experts=tuple(routed_sources),
             source_tensor_count=len(checkpoint.tensors),
             runtime_topology=runtime_topology,
             dense_float32=frozenset(float32_names),
             dense_fp4=frozenset(fp4_names),
+            auxiliary_dense=frozenset(
+                name for name in expected
+                if is_moe and name.startswith("mtp.")
+            ),
             supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
         )
 
@@ -1885,7 +2170,7 @@ class Lfm2MoeAdapter:
 ADAPTERS = {
     OlmoeAdapter.name: OlmoeAdapter(),
     Qwen3NextAdapter.name: Qwen3NextAdapter(),
-    Qwen3_5Adapter.name: Qwen3_5Adapter(),
+    HybridDeltaAdapter.name: HybridDeltaAdapter(),
     Lfm2MoeAdapter.name: Lfm2MoeAdapter(),
 }
 

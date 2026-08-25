@@ -77,6 +77,15 @@ struct DeepSeekHcaWorkspace final {
     const DeepSeekHcaWorkspace& workspace, float epsilon,
     std::uint32_t sinkhorn_iterations, void* stream) noexcept;
 
+// Contiguous row-major variant for causal prefill tiles. Large control-matrix
+// products reuse weights in bounded CUDA tiles while every row keeps an
+// independent Sinkhorn control state.
+[[nodiscard]] Status deepseek_hca_pre_batch(
+    const DeepSeekHcaView& parameters, const float* streams,
+    std::uint32_t rows, float* collapsed, float* pre, float* post,
+    float* comb, const DeepSeekHcaWorkspace& workspace, float epsilon,
+    std::uint32_t sinkhorn_iterations, void* stream) noexcept;
+
 [[nodiscard]] Status deepseek_hca_pre(
     const DeepSeekHcaView& parameters, const float* streams,
     float* collapsed, float* pre, float* post, float* comb,
@@ -88,5 +97,9 @@ struct DeepSeekHcaWorkspace final {
     const float* sublayer, const float* streams, const float* post,
     const float* comb, float* updated, std::uint32_t hidden,
     void* stream) noexcept;
+[[nodiscard]] Status deepseek_hca_post_batch(
+    const float* sublayer, const float* streams, const float* post,
+    const float* comb, float* updated, std::uint32_t rows,
+    std::uint32_t hidden, void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

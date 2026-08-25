@@ -6,8 +6,8 @@ Transformers model or materializing the whole checkpoint in RAM.
 
 ## Supported source contracts
 
-- `qwen3_5`: upstream dense Qwen3.5/Qwen3.8 tensor/config ABI, including
-  alternating full/recurrent attention, MTP and vision metadata;
+- `hybrid_delta`: dense or MoE hybrid Transformer checkpoints with split
+  Gated DeltaNet, periodic full attention, MTP and vision metadata;
 - `qwen3_next`: Qwen3-Next MoE source adapter and MTP metadata;
 - `olmoe`: OLMoE source adapter;
 - `deepseek_v4`: exhaustive read-only DeepSeek-V4-Flash contract used by the
@@ -31,14 +31,14 @@ the same bytes as the dependency-free path.
 
 ```powershell
 .\.venv\Scripts\python.exe -m compiler inspect-source `
-  --source C:\path\to\snapshot --tensor-groups --adapter qwen3_5
+  --source C:\path\to\snapshot --tensor-groups --adapter hybrid_delta
 ```
 
 Inspection validates SafeTensors headers, index agreement, shard paths,
 ranges, dtypes and the selected source contract without reading full tensor
 payloads or writing an artifact.
 
-## Compile Qwen FP4
+## Compile a hybrid FP4 artifact
 
 ```powershell
 .\.venv\Scripts\python.exe -m compiler compile `
@@ -46,7 +46,7 @@ payloads or writing an artifact.
   --output C:\path\to\qwen3.8-27b-fp4.candidate `
   --source-id Qwen/Qwen3.8-27B `
   --source-revision <immutable-commit> `
-  --adapter qwen3_5 `
+  --adapter hybrid_delta `
   --quant-profile fp4-e2m1-ue8m0-block32-v1
 
 .\.venv\Scripts\python.exe -m compiler validate `

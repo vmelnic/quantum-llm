@@ -11,21 +11,34 @@ if [[ -f "${env_file}" ]]; then
   set +a
 fi
 
-chat_max_tokens="${CHAT_MAX_TOKENS:-${MODEL_MAX_OUTPUT_TOKENS:-8192}}"
+model_max_context="${MODEL_MAX_CONTEXT:-65536}"
+if [[ ! "${model_max_context}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MODEL_MAX_CONTEXT must be a positive integer" >&2
+  exit 2
+fi
+model_max_tokens="${MODEL_MAX_OUTPUT_TOKENS:-$((model_max_context - 1))}"
+chat_max_tokens="${CHAT_MAX_TOKENS:-${model_max_tokens}}"
 generation_timeout="${MODEL_GENERATION_TIMEOUT_SECONDS:-600}"
 if [[ ! "${generation_timeout}" =~ ^[1-9][0-9]*$ ]]; then
   echo "MODEL_GENERATION_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
 chat_request_timeout="${CHAT_REQUEST_TIMEOUT_SECONDS:-$((generation_timeout + 60))}"
+chat_thinking="${CHAT_THINKING_LEVEL:-xhigh}"
 if [[ ! "${chat_request_timeout}" =~ ^[1-9][0-9]*$ ]]; then
   echo "CHAT_REQUEST_TIMEOUT_SECONDS must be a positive integer" >&2
   exit 2
 fi
-if [[ -n "${MODEL_MAX_OUTPUT_TOKENS:-}" &&
-      "${chat_max_tokens}" =~ ^[0-9]+$ &&
-      "${MODEL_MAX_OUTPUT_TOKENS}" =~ ^[0-9]+$ ]] &&
-   (( chat_max_tokens > MODEL_MAX_OUTPUT_TOKENS )); then
+if [[ ! "${model_max_tokens}" =~ ^[1-9][0-9]*$ ||
+      ! "${chat_max_tokens}" =~ ^[1-9][0-9]*$ ]]; then
+  echo "MODEL_MAX_OUTPUT_TOKENS and CHAT_MAX_TOKENS must be positive integers" >&2
+  exit 2
+fi
+if (( model_max_tokens >= model_max_context )); then
+  echo "MODEL_MAX_OUTPUT_TOKENS must be smaller than MODEL_MAX_CONTEXT" >&2
+  exit 2
+fi
+if (( chat_max_tokens > model_max_tokens )); then
   echo "CHAT_MAX_TOKENS cannot exceed MODEL_MAX_OUTPUT_TOKENS" >&2
   exit 2
 fi
@@ -38,6 +51,7 @@ chat_args=(
   --remote-port "${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
   --ready-timeout "${CHAT_READY_TIMEOUT:-30}"
   --request-timeout "${chat_request_timeout}"
+  --thinking "${chat_thinking}"
 )
 if [[ -n "${CHAT_SSH:-}" ]]; then
   chat_args+=(--ssh "${CHAT_SSH}")

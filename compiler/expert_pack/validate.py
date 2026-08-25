@@ -20,6 +20,7 @@ from .constants import (
     FORMAT_NAME,
     FORMAT_VERSION,
     FP4_QUANT_ABI_ID,
+    FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     FP4_QUANT_PROFILE,
     FP4_UE8M0_MAX_CODE,
@@ -222,23 +223,34 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
     ) = unpacked
     _require(magic == EXPERT_MAGIC and version == FORMAT_VERSION, "unknown expert record ABI")
     _require(header_bytes == HEADER_BYTES and reserved == 0, "invalid expert header fields")
-    required_flags = FLAG_ROW_MAJOR | FLAG_GATE_UP_FUSED | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    relu2 = quant_abi == FP4_RELU2_EXPERT_ABI_ID
+    required_flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    if not relu2:
+        required_flags |= FLAG_GATE_UP_FUSED
     _require(flags == required_flags, "unknown expert quant/layout ABI")
-    fp4 = quant_abi == FP4_QUANT_ABI_ID
-    _require(quant_abi in (QUANT_ABI_ID, FP4_QUANT_ABI_ID), "unknown expert quant/layout ABI")
+    fp4 = quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    _require(
+        quant_abi in (QUANT_ABI_ID, FP4_QUANT_ABI_ID,
+                      FP4_RELU2_EXPERT_ABI_ID),
+        "unknown expert quant/layout ABI",
+    )
     _require(layer == entry.get("layer") and expert == entry.get("expert"), "expert identity mismatch")
     _require(record_bytes == stored_bytes, "expert record/manifest size mismatch")
-    _require(fused_rows == 2 * intermediate, "expert fused-row count mismatch")
+    first_rows = (1 if relu2 else 2) * intermediate
+    _require(fused_rows == first_rows, "expert first-section row count mismatch")
     if fp4:
         _require(
             hidden % FP4_QUANT_GROUP_SIZE == 0
             and intermediate % FP4_QUANT_GROUP_SIZE == 0,
             "FP4 expert geometry is not block-aligned",
         )
-        _require(gate_up_q_bytes == intermediate * hidden, "gate+up byte count mismatch")
         _require(
-            gate_up_scale_bytes == 2 * intermediate * hidden // FP4_QUANT_GROUP_SIZE,
-            "gate+up scale count mismatch",
+            gate_up_q_bytes == first_rows * hidden // 2,
+            "expert first-section byte count mismatch",
+        )
+        _require(
+            gate_up_scale_bytes == first_rows * hidden // FP4_QUANT_GROUP_SIZE,
+            "expert first-section scale count mismatch",
         )
         _require(down_q_bytes == hidden * intermediate // 2, "down byte count mismatch")
         _require(
@@ -267,12 +279,18 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
         _require(section_offset + section_bytes <= record_bytes, f"expert section exceeds record: {name}")
         previous_end = section_offset + section_bytes
     if fp4:
-        _validate_ue8m0_scales(path, offset + gate_up_scale_offset, gate_up_scale_bytes, "gate+up")
+        _validate_ue8m0_scales(
+            path, offset + gate_up_scale_offset, gate_up_scale_bytes,
+            "up" if relu2 else "gate+up",
+        )
         _validate_ue8m0_scales(path, offset + down_scale_offset, down_scale_bytes, "down")
     else:
         _validate_scales(path, offset + gate_up_scale_offset, gate_up_scale_bytes, "gate+up")
         _validate_scales(path, offset + down_scale_offset, down_scale_bytes, "down")
-    _require(entry.get("decoded_bytes") == 3 * hidden * intermediate * 4, "expert decoded byte mismatch")
+    _require(
+        entry.get("decoded_bytes") == (2 if relu2 else 3) * hidden * intermediate * 4,
+        "expert decoded byte mismatch",
+    )
     actual_hash = _payload_hash(path, offset + HEADER_BYTES, record_bytes - HEADER_BYTES)
     _require(actual_hash == payload_hash.hex(), "expert payload/header checksum mismatch")
     _require(actual_hash == entry.get("payload_sha256"), "expert payload/manifest checksum mismatch")
@@ -333,6 +351,7 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         "compatibility",
         "source",
         "architecture",
+        "auxiliary_tensors",
         "model_program",
         "quantization",
         "kernel_abi",
@@ -355,9 +374,14 @@ def validate_container(root: Path | str) -> dict[str, Any]:
     quant = manifest.get("quantization")
     _require(isinstance(quant, dict), "manifest quantization block missing")
     profile = quant.get("profile")
-    expected_abi = {QUANT_PROFILE: QUANT_ABI_ID, FP4_QUANT_PROFILE: FP4_QUANT_ABI_ID}
+    expected_abis = {
+        QUANT_PROFILE: {QUANT_ABI_ID},
+        FP4_QUANT_PROFILE: {
+            FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
+        },
+    }
     _require(
-        profile in expected_abi and quant.get("abi_id") == expected_abi[profile],
+        profile in expected_abis and quant.get("abi_id") in expected_abis[profile],
         "unsupported quant ABI",
     )
     alignment = manifest.get("alignment")
@@ -429,22 +453,113 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         dense_names.add(name)
         records_by_pack[pack_name].append(("dense", entry))
 
+    auxiliary = manifest.get("auxiliary_tensors", [])
+    _require(
+        isinstance(auxiliary, list)
+        and all(isinstance(name, str) for name in auxiliary)
+        and len(set(auxiliary)) == len(auxiliary)
+        and set(auxiliary) <= dense_names,
+        "auxiliary tensor index is invalid",
+    )
+
     expert_keys: set[tuple[int, int]] = set()
     source_expert_names: set[str] = set()
+    physical_source_regions: dict[
+        str, tuple[int, tuple[int, ...], list[tuple[int, int]]]
+    ] = {}
     for entry in experts:
         _require(isinstance(entry, dict), "invalid expert index entry")
         key = (entry.get("layer"), entry.get("expert"))
         _require(all(isinstance(value, int) for value in key), "invalid expert key")
         _require(key not in expert_keys, f"duplicate expert key: {key}")
+        _require(
+            entry.get("quant_abi") == quant.get("abi_id"),
+            "expert record ABI disagrees with manifest",
+        )
         pack_name = entry.get("pack")
         _require(pack_name in pack_by_name, f"expert references unknown pack: {key}")
         sources = entry.get("source_tensors")
-        _require(isinstance(sources, dict) and set(sources) == {"gate", "up", "down"}, "expert source map invalid")
+        expected_roles = (
+            {"up", "down"}
+            if entry.get("quant_abi") == FP4_RELU2_EXPERT_ABI_ID
+            else {"gate", "up", "down"}
+        )
+        _require(
+            isinstance(sources, dict) and set(sources) == expected_roles,
+            "expert source map invalid",
+        )
         for source_name in sources.values():
             _require(isinstance(source_name, str) and source_name not in source_expert_names, "duplicate expert source tensor")
             source_expert_names.add(source_name)
+        regions = entry.get("source_regions")
+        if regions is None:
+            for role, source_name in sources.items():
+                shape = entry.get("source_shape", {}).get(role)
+                dtype = entry.get("source_dtype", {}).get(role)
+                _require(
+                    isinstance(shape, list)
+                    and all(isinstance(value, int) and value >= 0 for value in shape)
+                    and dtype in DTYPE_BYTES,
+                    "legacy expert source metadata is invalid",
+                )
+                byte_count = math.prod(shape) * DTYPE_BYTES[dtype]
+                physical_source_regions[source_name] = (
+                    byte_count, tuple(shape), [(0, byte_count)]
+                )
+        else:
+            _require(
+                isinstance(regions, dict)
+                and set(regions) == expected_roles,
+                "expert source region map invalid",
+            )
+            for role, region in regions.items():
+                _require(isinstance(region, dict), "expert source region invalid")
+                physical_name = region.get("tensor")
+                byte_offset = region.get("byte_offset")
+                byte_count = region.get("bytes")
+                tensor_bytes = region.get("tensor_bytes")
+                shape = region.get("shape")
+                tensor_shape = region.get("tensor_shape")
+                dtype = entry.get("source_dtype", {}).get(role)
+                _require(
+                    isinstance(physical_name, str)
+                    and isinstance(byte_offset, int) and not isinstance(byte_offset, bool)
+                    and isinstance(byte_count, int) and not isinstance(byte_count, bool)
+                    and isinstance(tensor_bytes, int) and not isinstance(tensor_bytes, bool)
+                    and isinstance(shape, list)
+                    and shape == entry.get("source_shape", {}).get(role)
+                    and all(isinstance(value, int) and value >= 0 for value in shape)
+                    and isinstance(tensor_shape, list)
+                    and all(isinstance(value, int) and value >= 0 for value in tensor_shape)
+                    and dtype in DTYPE_BYTES
+                    and byte_offset >= 0
+                    and byte_count == math.prod(shape) * DTYPE_BYTES[dtype]
+                    and byte_offset + byte_count <= tensor_bytes,
+                    "expert source region metadata is invalid",
+                )
+                previous = physical_source_regions.get(physical_name)
+                if previous is None:
+                    physical_source_regions[physical_name] = (
+                        tensor_bytes, tuple(tensor_shape),
+                        [(byte_offset, byte_offset + byte_count)],
+                    )
+                else:
+                    previous_bytes, previous_shape, spans = previous
+                    _require(
+                        previous_bytes == tensor_bytes
+                        and previous_shape == tuple(tensor_shape),
+                        "physical expert tensor metadata is inconsistent",
+                    )
+                    spans.append((byte_offset, byte_offset + byte_count))
         expert_keys.add(key)
         records_by_pack[pack_name].append(("expert", entry))
+
+    for physical_name, (tensor_bytes, _, spans) in physical_source_regions.items():
+        cursor = 0
+        for start, end in sorted(spans):
+            _require(start == cursor, f"gap/overlap in source tensor {physical_name}")
+            cursor = end
+        _require(cursor == tensor_bytes, f"unindexed bytes in source tensor {physical_name}")
 
     architecture = manifest.get("architecture")
     _require(isinstance(architecture, dict), "architecture block missing")
@@ -482,7 +597,10 @@ def validate_container(root: Path | str) -> dict[str, Any]:
     _require(sum(entry["stored_bytes"] for entry in dense) == masses.get("dense_bytes"), "dense byte accounting mismatch")
     _require(sum(entry["stored_bytes"] for entry in experts) == masses.get("expert_bytes"), "expert byte accounting mismatch")
     source_count = manifest.get("source", {}).get("tensor_count")
-    _require(source_count == len(dense) + len(experts) * 3, "source tensor accounting mismatch")
+    _require(
+        source_count == len(dense_names | set(physical_source_regions)),
+        "source tensor accounting mismatch",
+    )
 
     tokenizer = manifest.get("tokenizer")
     _require(isinstance(tokenizer, dict) and isinstance(tokenizer.get("files"), list), "tokenizer index missing")

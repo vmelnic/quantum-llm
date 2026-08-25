@@ -696,6 +696,29 @@ __global__ void embedding_kernel(const std::int8_t* weights,
   }
 }
 
+__global__ void decode_int8_rows_f32_kernel(
+    const std::int8_t* weights, const float* scales, float* decoded,
+    std::uint64_t values, std::uint32_t columns) {
+  for (std::uint64_t index =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < values;
+       index += static_cast<std::uint64_t>(blockDim.x) * gridDim.x) {
+    decoded[index] = static_cast<float>(weights[index]) *
+                     scales[index / columns];
+  }
+}
+
+__global__ void decode_bf16_rows_f32_kernel(
+    const std::uint16_t* weights, float* decoded, std::uint64_t values) {
+  for (std::uint64_t index =
+           static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       index < values;
+       index += static_cast<std::uint64_t>(blockDim.x) * gridDim.x) {
+    decoded[index] = __uint_as_float(
+        static_cast<unsigned>(weights[index]) << 16U);
+  }
+}
+
 __global__ void int8_gemv_kernel(const std::int8_t* weights,
                                  const float* scales, const float* input,
                                  float* output, std::uint32_t rows,
@@ -1052,6 +1075,24 @@ __global__ void zero_centered_rms_batch_kernel(
     output[index] = input[index] * inverse * (1.0F + weight[index]);
 }
 
+__global__ void rms_batch_kernel(const float* input, const float* weight,
+                                 float* output, std::uint32_t count,
+                                 float epsilon) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  input += static_cast<std::size_t>(row) * count;
+  output += static_cast<std::size_t>(row) * count;
+  float square = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    square += input[index] * input[index];
+  square = reduce_sum(square);
+  const auto inverse =
+      rsqrtf(square / static_cast<float>(count) + epsilon);
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    output[index] = input[index] * inverse * weight[index];
+}
+
 __global__ void add_kernel(float* destination, const float* source,
                            std::uint32_t count) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -1301,6 +1342,31 @@ __global__ void silu_product_kernel(const float* gate, const float* up,
                                     float* output, std::uint32_t count) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (i < count) output[i] = (gate[i] / (1.0F + expf(-gate[i]))) * up[i];
+}
+
+__global__ void relu2_in_place_kernel(float* values, std::uint32_t count) {
+  const auto index =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index >= count) return;
+  const auto value = fmaxf(values[index], 0.0F);
+  values[index] = value * value;
+}
+
+__global__ void deepseek_swiglu_product_kernel(
+    const float* gate, const float* up, float* output, std::uint32_t count,
+    float limit, bool bf16_output) {
+  const auto i =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (i >= count) return;
+  auto gate_value = gate[i];
+  auto up_value = up[i];
+  if (limit > 0.0F) {
+    gate_value = fminf(gate_value, limit);
+    up_value = fminf(fmaxf(up_value, -limit), limit);
+  }
+  auto value = (gate_value / (1.0F + expf(-gate_value))) * up_value;
+  if (bf16_output) value = __bfloat162float(__float2bfloat16_rn(value));
+  output[i] = value;
 }
 
 __global__ void sigmoid_scale_kernel(float* values, const float* gate,
@@ -2358,6 +2424,68 @@ __global__ void gated_gqa_qkv_rope_fp16_batch_kernel(
       value[static_cast<std::size_t>(head) * head_dim + dimension]);
 }
 
+__device__ float standard_rope_value(const float* source,
+                                     std::uint32_t dimension,
+                                     std::uint32_t rotary_dim,
+                                     std::uint32_t position, float theta) {
+  if (dimension >= rotary_dim) return source[dimension];
+  const auto half = rotary_dim / 2U;
+  const auto pair = dimension % half;
+  const float angle = static_cast<float>(position) *
+      powf(theta, -2.0F * static_cast<float>(pair) /
+                      static_cast<float>(rotary_dim));
+  const float other = dimension < half ? -source[dimension + half]
+                                       : source[dimension - half];
+  return source[dimension] * cosf(angle) + other * sinf(angle);
+}
+
+__global__ void standard_gqa_qkv_rope_fp16_batch_kernel(
+    float* query, float* key, const float* value, __half* fp16_keys,
+    __half* fp16_values, std::uint32_t first_rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float theta) {
+  __shared__ float source[256];
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto position = first_rotary_position + row;
+  auto* query_head = query +
+      (static_cast<std::size_t>(row) * query_heads + head) * head_dim;
+  if (dimension < head_dim) source[dimension] = query_head[dimension];
+  __syncthreads();
+  if (dimension < head_dim)
+    query_head[dimension] = standard_rope_value(
+        source, dimension, rotary_dim, position, theta);
+  __syncthreads();
+  if (head >= kv_heads) return;
+  auto* key_head = key +
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim;
+  if (dimension < head_dim) source[dimension] = key_head[dimension];
+  __syncthreads();
+  if (dimension >= head_dim) return;
+  const auto encoded_key = standard_rope_value(
+      source, dimension, rotary_dim, position, theta);
+  key_head[dimension] = encoded_key;
+  const auto target =
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim + dimension;
+  fp16_keys[target] = __float2half_rn(encoded_key);
+  fp16_values[target] = __float2half_rn(value[target]);
+}
+
+__global__ void standard_gqa_kv_fp16_batch_kernel(
+    const float* key, const float* value, __half* fp16_keys,
+    __half* fp16_values, std::uint32_t kv_heads,
+    std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (head >= kv_heads || dimension >= head_dim) return;
+  const auto target =
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim + dimension;
+  fp16_keys[target] = __float2half_rn(key[target]);
+  fp16_values[target] = __float2half_rn(value[target]);
+}
+
 __global__ void pack_gqa_kv_fp16_to_paged_fp4_kernel(
     const __half* fp16_keys, const __half* fp16_values,
     const void* const* page_table, std::uint32_t full_attention_layer,
@@ -2413,6 +2541,33 @@ __global__ void pack_gqa_kv_fp16_to_paged_fp4_kernel(
     value_record[block * 16U + index] =
         static_cast<std::uint8_t>(value_low | (value_high << 4U));
   }
+}
+
+__global__ void store_gqa_kv_fp16_to_paged_kernel(
+    const __half* fp16_keys, const __half* fp16_values,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (head >= kv_heads || dimension >= head_dim) return;
+  const auto cache_position = first_cache_position + row;
+  auto* page = static_cast<__half*>(
+      const_cast<void*>(page_table[cache_position / page_tokens]));
+  const auto page_values = static_cast<std::size_t>(page_tokens) * kv_heads *
+                           head_dim;
+  auto* key_page = page + static_cast<std::size_t>(full_attention_layer) *
+                              2U * page_values;
+  auto* value_page = key_page + page_values;
+  const auto page_offset =
+      (static_cast<std::size_t>(cache_position % page_tokens) * kv_heads +
+       head) * head_dim + dimension;
+  const auto source =
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim +
+      dimension;
+  key_page[page_offset] = fp16_keys[source];
+  value_page[page_offset] = fp16_values[source];
 }
 
 __global__ void gated_gqa_attention_paged_fp4_split_kernel(
@@ -3530,6 +3685,84 @@ __global__ void split_delta_recurrent_kernel(
   }
 }
 
+__global__ void mamba2_conv_kernel(
+    const float* xbc, const float* weights, const float* bias, float* state,
+    float* output, std::uint32_t conv_size, std::uint32_t kernel) {
+  const auto channel =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (channel >= conv_size) return;
+  auto* channel_state = state + static_cast<std::size_t>(channel) * kernel;
+  for (std::uint32_t index = 1U; index < kernel; ++index)
+    channel_state[index - 1U] = channel_state[index];
+  channel_state[kernel - 1U] = xbc[channel];
+  const auto* channel_weights =
+      weights + static_cast<std::size_t>(channel) * kernel;
+  float sum = bias[channel];
+  for (std::uint32_t index = 0U; index < kernel; ++index)
+    sum += channel_state[index] * channel_weights[index];
+  output[channel] = sum / (1.0F + expf(-sum));
+}
+
+__global__ void mamba2_state_kernel(
+    const float* projected, const float* conv, const float* dt_bias,
+    const float* a_log, const float* skip, float* state, float* output,
+    std::uint32_t heads, std::uint32_t head_dim,
+    std::uint32_t state_size, std::uint32_t groups,
+    float time_step_min) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (head >= heads || dimension >= head_dim) return;
+  const auto intermediate = heads * head_dim;
+  const auto group = head / (heads / groups);
+  const auto x = conv[static_cast<std::size_t>(head) * head_dim + dimension];
+  const auto dt_raw = projected[intermediate +
+                                (intermediate + 2U * groups * state_size) +
+                                head] + dt_bias[head];
+  const auto dt = fmaxf(
+      log1pf(expf(-fabsf(dt_raw))) + fmaxf(dt_raw, 0.0F), time_step_min);
+  const auto decay = expf(-expf(a_log[head]) * dt);
+  const auto* b = conv + intermediate +
+                  static_cast<std::size_t>(group) * state_size;
+  const auto* c = conv + intermediate +
+                  static_cast<std::size_t>(groups) * state_size +
+                  static_cast<std::size_t>(group) * state_size;
+  auto* cell = state +
+      (static_cast<std::size_t>(head) * head_dim + dimension) * state_size;
+  float result = x * skip[head];
+  for (std::uint32_t index = 0U; index < state_size; ++index) {
+    cell[index] = cell[index] * decay + dt * b[index] * x;
+    result += cell[index] * c[index];
+  }
+  output[static_cast<std::size_t>(head) * head_dim + dimension] = result;
+}
+
+__global__ void mamba2_gated_group_norm_kernel(
+    const float* projected, float* values, const float* norm_weight,
+    std::uint32_t intermediate, std::uint32_t groups, float epsilon) {
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto group_size = intermediate / groups;
+  const auto first = group * group_size;
+  float square = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < group_size;
+       index += blockDim.x) {
+    const auto offset = first + index;
+    const auto gate = projected[offset];
+    const auto gated = values[offset] * gate / (1.0F + expf(-gate));
+    values[offset] = gated;
+    square += gated * gated;
+  }
+  square = reduce_sum(square);
+  __shared__ float inverse_rms;
+  if (threadIdx.x == 0U)
+    inverse_rms = rsqrtf(square / static_cast<float>(group_size) + epsilon);
+  __syncthreads();
+  for (std::uint32_t index = threadIdx.x; index < group_size;
+       index += blockDim.x) {
+    const auto offset = first + index;
+    values[offset] *= inverse_rms * norm_weight[offset];
+  }
+}
+
 __global__ void split_delta_conv_prefill_kernel(
     const float* projected_qkv, const float* weights, float* state,
     float* output, std::uint32_t rows, std::uint32_t conv_dim,
@@ -3696,7 +3929,7 @@ __global__ void staged_fp16_prepare_kernel(
     const float* q_and_gate, __half* queries, float* accumulator,
     float* maxima, float* sums, std::uint32_t rows,
     std::uint32_t query_heads, std::uint32_t kv_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t head_dim, bool output_gated) {
   const auto grouped_heads = query_heads / kv_heads;
   const auto matrix_rows = rows * grouped_heads;
   const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
@@ -3715,10 +3948,10 @@ __global__ void staged_fp16_prepare_kernel(
         (static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row) *
             head_dim +
         dimension;
+    const auto query_stride = (output_gated ? 2U : 1U) * head_dim;
     queries[packed] = __float2half_rn(q_and_gate[
-        (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
-            head_dim +
-        dimension]);
+        (static_cast<std::size_t>(row) * query_heads + query_head) *
+            query_stride + dimension]);
     accumulator[packed] = 0.0F;
     if (dimension == 0U) {
       maxima[static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row] =
@@ -3748,6 +3981,40 @@ __global__ void staged_fp16_transpose_kv_kernel(
         dimension;
     keys[target] = raw_keys[item];
     values[target] = raw_values[item];
+  }
+}
+
+__global__ void staged_fp16_transpose_paged_kv_kernel(
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_token,
+    __half* keys, __half* values, std::uint32_t tokens,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  const auto count =
+      static_cast<std::size_t>(tokens) * kv_heads * head_dim;
+  const auto page_values =
+      static_cast<std::size_t>(page_tokens) * kv_heads * head_dim;
+  for (std::size_t item =
+           static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       item < count;
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
+    const auto dimension = static_cast<std::uint32_t>(item % head_dim);
+    const auto record = item / head_dim;
+    const auto head = static_cast<std::uint32_t>(record % kv_heads);
+    const auto token = static_cast<std::uint32_t>(record / kv_heads);
+    const auto source_token = first_token + token;
+    const auto* page = static_cast<const __half*>(
+        page_table[source_token / page_tokens]);
+    const auto* page_keys =
+        page + static_cast<std::size_t>(full_attention_layer) * 2U *
+                   page_values;
+    const auto source =
+        (static_cast<std::size_t>(source_token % page_tokens) * kv_heads +
+         head) * head_dim + dimension;
+    const auto target =
+        (static_cast<std::size_t>(head) * tokens + token) * head_dim +
+        dimension;
+    keys[target] = page_keys[source];
+    values[target] = page_keys[page_values + source];
   }
 }
 
@@ -3971,7 +4238,7 @@ __global__ void staged_prefill_softmax_kernel(
 __global__ void staged_prefill_finalize_kernel(
     const float* q_and_gate, const float* accumulator, const float* sums,
     float* output, std::uint32_t rows, std::uint32_t query_heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim) {
+    std::uint32_t kv_heads, std::uint32_t head_dim, bool output_gated) {
   const auto grouped_heads = query_heads / kv_heads;
   const auto matrix_rows = rows * grouped_heads;
   const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
@@ -3988,13 +4255,15 @@ __global__ void staged_prefill_finalize_kernel(
     const auto matrix_row = row * grouped_heads + local_head;
     const auto packed_row =
         static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row;
-    const auto gate = q_and_gate[
-        (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
-            head_dim +
-        head_dim + dimension];
-    output[item] =
-        (accumulator[packed_row * head_dim + dimension] / sums[packed_row]) /
-        (1.0F + expf(-gate));
+    auto result = accumulator[packed_row * head_dim + dimension] /
+                  sums[packed_row];
+    if (output_gated) {
+      const auto gate = q_and_gate[
+          (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
+              head_dim + head_dim + dimension];
+      result /= 1.0F + expf(-gate);
+    }
+    output[item] = result;
   }
 }
 
@@ -4149,6 +4418,38 @@ Status checked(cublasStatus_t status, const char* name) {
 
 Status checked(cudaError_t error, const char* name) {
   return error == cudaSuccess ? Status::success() : Status(ErrorCode::upload_failed, std::string(name) + ": " + cudaGetErrorString(error));
+}
+
+Status f32_prefill_gemm(const float* matrix, std::uint32_t rows,
+                        std::uint32_t columns, const float* input,
+                        std::uint32_t input_stride, float* output,
+                        std::uint32_t output_stride, std::uint32_t batch,
+                        cudaStream_t stream) noexcept {
+  if (!matrix || !input || !output || !rows || !columns || !batch ||
+      input_stride < columns || output_stride < rows ||
+      rows > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      columns >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      batch > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      input_stride >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      output_stride >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    return {ErrorCode::invalid_argument, "invalid FP32 prefill GEMM"};
+  cublasHandle_t handle{};
+  auto blas = current_cublas_handle(stream, handle);
+  if (blas != CUBLAS_STATUS_SUCCESS)
+    return checked(blas, "prepare FP32 prefill GEMM");
+  constexpr float alpha = 1.0F;
+  constexpr float beta = 0.0F;
+  blas = cublasGemmEx(
+      handle, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(rows),
+      static_cast<int>(batch), static_cast<int>(columns), &alpha, matrix,
+      CUDA_R_32F, static_cast<int>(columns), input, CUDA_R_32F,
+      static_cast<int>(input_stride), &beta, output, CUDA_R_32F,
+      static_cast<int>(output_stride), CUBLAS_COMPUTE_32F_PEDANTIC,
+      CUBLAS_GEMM_DEFAULT);
+  return checked(blas, "FP32 prefill GEMM");
 }
 
 }  // namespace
@@ -4427,14 +4728,21 @@ Status gemv_grouped_inputs_batch_weight_reuse(
     std::uint32_t groups, std::uint32_t batch, void* raw) noexcept {
   if (!m.weights || !m.scales || !input || !output || !m.rows ||
       !m.columns || !groups || m.rows % groups != 0U ||
-      m.columns % 4U != 0U || !batch || batch > kMaximumWeightReuseBatch)
+      m.columns % 4U != 0U || !batch)
     return Status(ErrorCode::invalid_argument,
                   "invalid grouped-input weight-reuse batched gemv");
   const auto blocks = (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  int8_gemv_grouped_inputs_batch_reuse_kernel<<<
-      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      m.weights, m.scales, input, output, m.rows, m.columns,
-      m.rows / groups, groups, batch);
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto tile =
+        std::min(kMaximumWeightReuseBatch, batch - first);
+    int8_gemv_grouped_inputs_batch_reuse_kernel<<<
+        blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales,
+        input + static_cast<std::size_t>(first) * groups * m.columns,
+        output + static_cast<std::size_t>(first) * m.rows, m.rows, m.columns,
+        m.rows / groups, groups, tile);
+  }
   return checked(cudaPeekAtLastError(),
                  "grouped-input weight-reuse int8 batched gemv");
 }
@@ -4462,15 +4770,80 @@ Status gemv_batch_weight_reuse(const Int8Matrix& m, const float* input,
                                float* output, std::uint32_t batch,
                                void* raw) noexcept {
   if (!m.weights || !m.scales || !input || !output || !m.rows ||
-      !m.columns || !batch || batch > kMaximumWeightReuseBatch)
+      !m.columns || !batch)
     return Status(ErrorCode::invalid_argument,
                   "invalid weight-reuse batched gemv");
   const auto blocks =
       (m.rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  int8_gemv_batch_weight_reuse_kernel<<<
-      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      m.weights, m.scales, input, output, m.rows, m.columns, batch);
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto tile =
+        std::min(kMaximumWeightReuseBatch, batch - first);
+    int8_gemv_batch_weight_reuse_kernel<<<
+        blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales,
+        input + static_cast<std::size_t>(first) * m.columns,
+        output + static_cast<std::size_t>(first) * m.rows, m.rows, m.columns,
+        tile);
+  }
   return checked(cudaPeekAtLastError(), "weight-reuse int8 batched gemv");
+}
+Status int8_gemm_f32_batch(
+    const Int8Matrix& m, const float* input, float* output,
+    std::uint32_t batch, float* decoded_matrix,
+    std::uint64_t decoded_matrix_values, void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !batch || !decoded_matrix)
+    return {ErrorCode::invalid_argument, "invalid INT8 FP32 prefill GEMM"};
+  const auto values = static_cast<std::uint64_t>(m.rows) * m.columns;
+  if (values > decoded_matrix_values)
+    return {ErrorCode::invalid_argument,
+            "INT8 FP32 prefill GEMM workspace is too small"};
+  const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+      65535U, (values + kThreads - 1U) / kThreads));
+  const auto stream = static_cast<cudaStream_t>(raw);
+  decode_int8_rows_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+      m.weights, m.scales, decoded_matrix, values, m.columns);
+  auto status = checked(cudaPeekAtLastError(),
+                        "decode INT8 matrix for prefill GEMM");
+  if (!status.ok()) return status;
+  return f32_prefill_gemm(decoded_matrix, m.rows, m.columns, input,
+                          m.columns, output, m.rows, batch, stream);
+}
+Status int8_grouped_gemm_f32_batch(
+    const Int8Matrix& m, const float* input, float* output,
+    std::uint32_t groups, std::uint32_t batch, float* decoded_matrix,
+    std::uint64_t decoded_matrix_values, void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || !groups || m.rows % groups != 0U || !batch ||
+      !decoded_matrix)
+    return {ErrorCode::invalid_argument,
+            "invalid grouped INT8 FP32 prefill GEMM"};
+  const auto values = static_cast<std::uint64_t>(m.rows) * m.columns;
+  if (values > decoded_matrix_values)
+    return {ErrorCode::invalid_argument,
+            "grouped INT8 FP32 prefill GEMM workspace is too small"};
+  const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+      65535U, (values + kThreads - 1U) / kThreads));
+  const auto stream = static_cast<cudaStream_t>(raw);
+  decode_int8_rows_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+      m.weights, m.scales, decoded_matrix, values, m.columns);
+  auto status = checked(cudaPeekAtLastError(),
+                        "decode grouped INT8 matrix for prefill GEMM");
+  if (!status.ok()) return status;
+  const auto group_rows = m.rows / groups;
+  for (std::uint32_t group = 0U; group < groups; ++group) {
+    status = f32_prefill_gemm(
+        decoded_matrix + static_cast<std::uint64_t>(group) * group_rows *
+                             m.columns,
+        group_rows, m.columns,
+        input + static_cast<std::uint64_t>(group) * m.columns,
+        groups * m.columns,
+        output + static_cast<std::uint64_t>(group) * group_rows, m.rows,
+        batch, stream);
+    if (!status.ok()) return status;
+  }
+  return Status::success();
 }
 Status gemv_f32(const float* matrix, std::uint32_t rows, std::uint32_t columns, const float* input, float* output, void* raw) noexcept {
   if (!matrix || !input || !output || !rows || !columns) return Status(ErrorCode::invalid_argument, "invalid f32 gemv");
@@ -4497,14 +4870,19 @@ Status gemv_f32_batch_weight_reuse(
     const float* matrix, std::uint32_t rows, std::uint32_t columns,
     const float* input, float* output, std::uint32_t batch,
     void* raw) noexcept {
-  if (!matrix || !input || !output || !rows || !columns || !batch ||
-      batch > kMaximumWeightReuseBatch)
+  if (!matrix || !input || !output || !rows || !columns || !batch)
     return Status(ErrorCode::invalid_argument,
                   "invalid weight-reuse batched f32 gemv");
   const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  f32_gemv_batch_reuse_kernel<<<
-      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      matrix, input, output, rows, columns, batch);
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto tile =
+        std::min(kMaximumWeightReuseBatch, batch - first);
+    f32_gemv_batch_reuse_kernel<<<
+        blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        matrix, input + static_cast<std::size_t>(first) * columns,
+        output + static_cast<std::size_t>(first) * rows, rows, columns, tile);
+  }
   return checked(cudaPeekAtLastError(),
                  "weight-reuse f32 batched gemv");
 }
@@ -4522,15 +4900,43 @@ Status gemv_bf16_batch(const std::uint16_t* matrix, std::uint32_t rows,
                        std::uint32_t columns, const float* input,
                        float* output, std::uint32_t batch,
                        void* raw) noexcept {
-  if (!matrix || !input || !output || !rows || !columns || !batch ||
-      batch > kMaximumWeightReuseBatch)
+  if (!matrix || !input || !output || !rows || !columns || !batch)
     return Status(ErrorCode::invalid_argument,
                   "invalid weight-reuse batched bf16 gemv");
   const auto blocks = (rows + kWarpsPerBlock - 1U) / kWarpsPerBlock;
-  bf16_gemv_batch_reuse_kernel<<<
-      blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      matrix, input, output, rows, columns, batch);
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto tile =
+        std::min(kMaximumWeightReuseBatch, batch - first);
+    bf16_gemv_batch_reuse_kernel<<<
+        blocks, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        matrix, input + static_cast<std::size_t>(first) * columns,
+        output + static_cast<std::size_t>(first) * rows, rows, columns, tile);
+  }
   return checked(cudaPeekAtLastError(), "weight-reuse bf16 batched gemv");
+}
+Status bf16_gemm_f32_batch(
+    const std::uint16_t* matrix, std::uint32_t rows,
+    std::uint32_t columns, const float* input, float* output,
+    std::uint32_t batch, float* decoded_matrix,
+    std::uint64_t decoded_matrix_values, void* raw) noexcept {
+  if (!matrix || !input || !output || !rows || !columns || !batch ||
+      !decoded_matrix)
+    return {ErrorCode::invalid_argument, "invalid BF16 FP32 prefill GEMM"};
+  const auto values = static_cast<std::uint64_t>(rows) * columns;
+  if (values > decoded_matrix_values)
+    return {ErrorCode::invalid_argument,
+            "BF16 FP32 prefill GEMM workspace is too small"};
+  const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+      65535U, (values + kThreads - 1U) / kThreads));
+  const auto stream = static_cast<cudaStream_t>(raw);
+  decode_bf16_rows_f32_kernel<<<blocks, kThreads, 0, stream>>>(
+      matrix, decoded_matrix, values);
+  auto status = checked(cudaPeekAtLastError(),
+                        "decode BF16 matrix for prefill GEMM");
+  if (!status.ok()) return status;
+  return f32_prefill_gemm(decoded_matrix, rows, columns, input, columns,
+                          output, rows, batch, stream);
 }
 Status rms_norm(const float* input, const float* weight, float* output, std::uint32_t elements, float epsilon, void* raw) noexcept {
   if (!input || !weight || !output || !elements || epsilon <= 0) return Status(ErrorCode::invalid_argument, "invalid rms norm");
@@ -4580,6 +4986,15 @@ Status zero_centered_rms_norm_batch(
                                   static_cast<cudaStream_t>(raw)>>>(
       input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "zero-centered RMS norm batch");
+}
+Status rms_norm_batch(const float* input, const float* weight, float* output,
+                      std::uint32_t rows, std::uint32_t elements,
+                      float epsilon, void* raw) noexcept {
+  if (!input || !weight || !output || !rows || !elements || epsilon <= 0.0F)
+    return Status(ErrorCode::invalid_argument, "invalid RMS norm batch");
+  rms_batch_kernel<<<rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      input, weight, output, elements, epsilon);
+  return checked(cudaPeekAtLastError(), "RMS norm batch");
 }
 Status add_in_place(float* destination, const float* source, std::uint32_t elements, void* raw) noexcept {
   if (!destination || !source || !elements) return Status(ErrorCode::invalid_argument, "invalid add");
@@ -4767,6 +5182,27 @@ Status silu_product(const float* gate, const float* up, float* output,
                                                           elements);
   return checked(cudaPeekAtLastError(), "silu product");
 }
+Status relu2_in_place(float* values, std::uint32_t elements,
+                      void* raw) noexcept {
+  if (!values || !elements)
+    return Status(ErrorCode::invalid_argument, "invalid ReLU squared input");
+  relu2_in_place_kernel<<<(elements + kThreads - 1U) / kThreads, kThreads, 0,
+                           static_cast<cudaStream_t>(raw)>>>(values, elements);
+  return checked(cudaPeekAtLastError(), "ReLU squared");
+}
+Status deepseek_swiglu_product(
+    const float* gate, const float* up, float* output,
+    std::uint32_t elements, float limit, bool bf16_output,
+    void* raw) noexcept {
+  if (!gate || !up || !output || !elements || limit < 0.0F)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek SwiGLU product");
+  deepseek_swiglu_product_kernel<<<
+      (elements + kThreads - 1U) / kThreads, kThreads, 0,
+      static_cast<cudaStream_t>(raw)>>>(gate, up, output, elements, limit,
+                                       bf16_output);
+  return checked(cudaPeekAtLastError(), "DeepSeek SwiGLU product");
+}
 Status sigmoid_scale_in_place(float* values, const float* gate,
                               std::uint32_t elements, void* raw) noexcept {
   if (!values || !gate || !elements)
@@ -4924,6 +5360,55 @@ Status deepseek_router_learned_batch(
       logits, selection_bias, route_scale, scores, indices);
   return checked(cudaPeekAtLastError(),
                  "DeepSeek batched learned router select");
+}
+Status deepseek_router_hash_rows(
+    const float* input, const std::uint16_t* weights,
+    const std::int64_t* token_experts, const std::uint32_t* token_ids,
+    std::uint32_t rows, float* logits, float* scores,
+    std::uint32_t* indices, float route_scale, void* raw) noexcept {
+  if (!input || !weights || !token_experts || !token_ids || !rows ||
+      !logits || !scores || !indices || !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek hash router rows");
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    if (token_ids[row] >= 129280U)
+      return Status(ErrorCode::invalid_argument,
+                    "DeepSeek hash router token exceeds vocabulary");
+  }
+  auto status = gemv_bf16_batch(weights, 256U, 4096U, input, logits, rows,
+                                raw);
+  if (!status.ok()) return status;
+  const auto stream = static_cast<cudaStream_t>(raw);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    deepseek_hash_router_kernel<<<1U, 32U, 0, stream>>>(
+        logits + static_cast<std::size_t>(row) * 256U, token_experts,
+        token_ids[row], route_scale,
+        scores + static_cast<std::size_t>(row) * 6U,
+        indices + static_cast<std::size_t>(row) * 6U);
+  }
+  return checked(cudaPeekAtLastError(), "DeepSeek hash router rows select");
+}
+Status deepseek_router_learned_rows(
+    const float* input, const std::uint16_t* weights,
+    const float* selection_bias, std::uint32_t rows, float* logits,
+    float* scores, std::uint32_t* indices, float route_scale,
+    void* raw) noexcept {
+  if (!input || !weights || !selection_bias || !rows || !logits || !scores ||
+      !indices || !(route_scale > 0.0F))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid DeepSeek learned router rows");
+  auto status = gemv_bf16_batch(weights, 256U, 4096U, input, logits, rows,
+                                raw);
+  if (!status.ok()) return status;
+  const auto stream = static_cast<cudaStream_t>(raw);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    deepseek_learned_router_kernel<<<1U, kThreads, 0, stream>>>(
+        logits + static_cast<std::size_t>(row) * 256U, selection_bias,
+        route_scale, scores + static_cast<std::size_t>(row) * 6U,
+        indices + static_cast<std::size_t>(row) * 6U);
+  }
+  return checked(cudaPeekAtLastError(),
+                 "DeepSeek learned router rows select");
 }
 Status qwen3_next_qkv_rope_cache(
     float* q_and_gate, float* key, const float* value,
@@ -5182,6 +5667,48 @@ Status gated_gqa_qkv_rope_fp16_batch(
       epsilon, rope_theta);
   return checked(cudaPeekAtLastError(), "FP16 gated GQA QKV batch");
 }
+Status standard_gqa_qkv_rope_fp16_batch(
+    float* query, float* key, const float* value,
+    void* fp16_keys, void* fp16_values, std::uint32_t first_rotary_position,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim,
+    std::uint32_t rotary_dim, float rope_theta, void* raw) noexcept {
+  if (!query || !key || !value || !fp16_keys || !fp16_values || !rows ||
+      !query_heads || !kv_heads || query_heads % kv_heads ||
+      query_heads / kv_heads > kMaximumExactFp16GroupedQueryHeads ||
+      !head_dim || head_dim > kThreads ||
+      head_dim % 32U || !rotary_dim || rotary_dim > head_dim ||
+      rotary_dim % 2U || !(rope_theta > 0.0F) ||
+      first_rotary_position > 0xffffffffU - (rows - 1U))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP16 standard GQA QKV batch");
+  const dim3 grid(query_heads, rows);
+  standard_gqa_qkv_rope_fp16_batch_kernel<<<
+      grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      query, key, value, static_cast<__half*>(fp16_keys),
+      static_cast<__half*>(fp16_values), first_rotary_position,
+      query_heads, kv_heads, head_dim, rotary_dim, rope_theta);
+  return checked(cudaPeekAtLastError(), "FP16 standard GQA QKV batch");
+}
+Status standard_gqa_kv_fp16_batch(
+    const float* key, const float* value,
+    void* fp16_keys, void* fp16_values, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, void* raw) noexcept {
+  if (!key || !value || !fp16_keys || !fp16_values || !rows ||
+      !query_heads || !kv_heads || query_heads % kv_heads ||
+      query_heads / kv_heads > kMaximumExactFp16GroupedQueryHeads ||
+      !head_dim || head_dim > kThreads || head_dim % 32U)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP16 position-free standard GQA QKV batch");
+  const dim3 grid(kv_heads, rows);
+  standard_gqa_kv_fp16_batch_kernel<<<
+      grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      key, value, static_cast<__half*>(fp16_keys),
+      static_cast<__half*>(fp16_values), kv_heads, head_dim);
+  return checked(cudaPeekAtLastError(),
+                 "FP16 position-free standard GQA QKV batch");
+}
 Status pack_gqa_kv_fp16_to_paged_fp4(
     const void* fp16_keys, const void* fp16_values,
     const void* const* page_table, std::uint32_t full_attention_layer,
@@ -5202,6 +5729,26 @@ Status pack_gqa_kv_fp16_to_paged_fp4(
       head_dim);
   return checked(cudaPeekAtLastError(),
                  "FP16-to-paged-FP4 GQA cache pack");
+}
+Status store_gqa_kv_fp16_to_paged(
+    const void* fp16_keys, const void* fp16_values,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t rows, std::uint32_t kv_heads, std::uint32_t head_dim,
+    void* raw) noexcept {
+  if (!fp16_keys || !fp16_values || !page_table || !page_tokens || !rows ||
+      !kv_heads || !head_dim || head_dim > kThreads ||
+      first_cache_position > 0xffffffffU - (rows - 1U))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP16 paged GQA cache store");
+  const dim3 grid(kv_heads, rows);
+  store_gqa_kv_fp16_to_paged_kernel<<<
+      grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      static_cast<const __half*>(fp16_keys),
+      static_cast<const __half*>(fp16_values), page_table,
+      full_attention_layer, page_tokens, first_cache_position, kv_heads,
+      head_dim);
+  return checked(cudaPeekAtLastError(), "FP16 paged GQA cache store");
 }
 Status gated_gqa_attention_decode_paged_fp4(
     const PagedFp4GatedGqaAttentionLaunch& launch) noexcept {
@@ -5575,7 +6122,7 @@ Status gated_gqa_attention_staged_prefill_paged_impl(
   staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, workspace.sums,
       launch.output, launch.rows, launch.query_heads, launch.kv_heads,
-      launch.head_dim);
+      launch.head_dim, true);
   return checked(cudaPeekAtLastError(),
                  "finalize staged paged FP4 prefill");
 }
@@ -5603,6 +6150,12 @@ Status gated_gqa_attention_staged_fp16_impl(
     else
       return false;
   }();
+  const auto paged_device_source = [&]() {
+    if constexpr (std::is_same_v<Launch, DeviceFp16GatedGqaAttentionLaunch>)
+      return launch.device_pages != nullptr;
+    else
+      return false;
+  }();
   const auto* source_keys = [&]() -> const void* {
     if constexpr (std::is_same_v<Launch, HostFp16GatedGqaAttentionLaunch>)
       return launch.host_keys;
@@ -5624,14 +6177,20 @@ Status gated_gqa_attention_staged_fp16_impl(
                  static_cast<std::uint64_t>(launch.host_page_tokens) *
                      launch.host_page_count;
     } else {
-      return source_keys && source_values;
+      if (!paged_device_source) return source_keys && source_values;
+      return launch.device_pages && launch.device_page_tokens &&
+             launch.device_page_count &&
+             launch.cache_capacity <=
+                 static_cast<std::uint64_t>(launch.device_page_tokens) *
+                     launch.device_page_count;
     }
   }();
   if (!launch.q_and_gate || !valid_source ||
       !launch.output || !launch.cache_capacity ||
       !launch.first_context_tokens || !launch.rows || !launch.query_heads ||
       !launch.kv_heads || launch.query_heads % launch.kv_heads ||
-      launch.query_heads / launch.kv_heads > 8U || !launch.head_dim ||
+      launch.query_heads / launch.kv_heads >
+          kMaximumExactFp16GroupedQueryHeads || !launch.head_dim ||
       launch.head_dim > kThreads || launch.head_dim % 32U ||
       launch.first_context_tokens > launch.cache_capacity ||
       launch.first_context_tokens > 0xffffffffU - (launch.rows - 1U) ||
@@ -5685,7 +6244,8 @@ Status gated_gqa_attention_staged_fp16_impl(
   staged_fp16_prepare_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, static_cast<__half*>(workspace.queries),
       workspace.accumulator, workspace.maxima, workspace.sums, launch.rows,
-      launch.query_heads, launch.kv_heads, launch.head_dim);
+      launch.query_heads, launch.kv_heads, launch.head_dim,
+      launch.output_gated);
   auto status = checked(cudaPeekAtLastError(),
                         "prepare staged FP16 attention");
   if (!status.ok()) return status;
@@ -5740,11 +6300,13 @@ Status gated_gqa_attention_staged_fp16_impl(
             static_cast<std::size_t>(first_token) * record_values;
       }
     } else {
-      raw_keys = fp16_keys +
-                 static_cast<std::size_t>(first_token) * record_values;
-      raw_values_source =
-          fp16_values +
-          static_cast<std::size_t>(first_token) * record_values;
+      if (!paged_device_source) {
+        raw_keys = fp16_keys +
+                   static_cast<std::size_t>(first_token) * record_values;
+        raw_values_source =
+            fp16_values +
+            static_cast<std::size_t>(first_token) * record_values;
+      }
     }
     if (source_is_host) {
       auto copy = cudaMemcpyAsync(workspace.raw_keys, raw_keys, raw_bytes,
@@ -5761,12 +6323,32 @@ Status gated_gqa_attention_staged_fp16_impl(
     }
     const auto transpose_blocks =
         static_cast<unsigned>((raw_values + kThreads - 1U) / kThreads);
-    staged_fp16_transpose_kv_kernel<<<transpose_blocks, kThreads, 0,
-                                      stream>>>(
-        raw_keys, raw_values_source,
-        static_cast<__half*>(workspace.keys),
-        static_cast<__half*>(workspace.values), tokens, launch.kv_heads,
-        launch.head_dim);
+    if constexpr (std::is_same_v<Launch,
+                                 DeviceFp16GatedGqaAttentionLaunch>) {
+      if (paged_device_source) {
+        staged_fp16_transpose_paged_kv_kernel<<<transpose_blocks, kThreads,
+                                                0, stream>>>(
+            launch.device_pages, launch.device_page_layer,
+            launch.device_page_tokens, first_token,
+            static_cast<__half*>(workspace.keys),
+            static_cast<__half*>(workspace.values), tokens, launch.kv_heads,
+            launch.head_dim);
+      } else {
+        staged_fp16_transpose_kv_kernel<<<transpose_blocks, kThreads, 0,
+                                          stream>>>(
+            raw_keys, raw_values_source,
+            static_cast<__half*>(workspace.keys),
+            static_cast<__half*>(workspace.values), tokens, launch.kv_heads,
+            launch.head_dim);
+      }
+    } else {
+      staged_fp16_transpose_kv_kernel<<<transpose_blocks, kThreads, 0,
+                                        stream>>>(
+          raw_keys, raw_values_source,
+          static_cast<__half*>(workspace.keys),
+          static_cast<__half*>(workspace.values), tokens, launch.kv_heads,
+          launch.head_dim);
+    }
     status = checked(cudaPeekAtLastError(),
                      "transpose staged FP16 K/V");
     if (!status.ok()) return status;
@@ -5814,7 +6396,8 @@ Status gated_gqa_attention_staged_fp16_impl(
   }
   staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, workspace.sums, launch.output,
-      launch.rows, launch.query_heads, launch.kv_heads, launch.head_dim);
+      launch.rows, launch.query_heads, launch.kv_heads, launch.head_dim,
+      launch.output_gated);
   return checked(cudaPeekAtLastError(),
                  "finalize staged FP16 attention");
 }
@@ -5927,6 +6510,48 @@ Status split_gated_delta_prefill(
       launch.epsilon);
   return checked(cudaPeekAtLastError(),
                  "split gated-delta prefill recurrent");
+}
+Status mamba2_forward(const Mamba2BatchLaunch& launch) noexcept {
+  if (!launch.projected || !launch.conv_weights || !launch.conv_bias ||
+      !launch.dt_bias || !launch.a_log || !launch.skip ||
+      !launch.norm_weight || !launch.conv_state ||
+      !launch.recurrent_state || !launch.conv_output || !launch.output ||
+      !launch.rows || !launch.heads || !launch.head_dim ||
+      !launch.state_size || !launch.groups ||
+      launch.heads % launch.groups || !launch.conv_kernel ||
+      launch.conv_kernel > 16U || !(launch.epsilon > 0.0F) ||
+      !(launch.time_step_min > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid Mamba2 launch");
+  const auto intermediate = launch.heads * launch.head_dim;
+  const auto conv_size = intermediate + 2U * launch.groups * launch.state_size;
+  const auto projection_size = intermediate + conv_size + launch.heads;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  for (std::uint32_t row = 0U; row < launch.rows; ++row) {
+    const auto* projected = launch.projected +
+        static_cast<std::size_t>(row) * projection_size;
+    auto* conv = launch.conv_output +
+        static_cast<std::size_t>(row) * conv_size;
+    auto* output = launch.output +
+        static_cast<std::size_t>(row) * intermediate;
+    mamba2_conv_kernel<<<(conv_size + kThreads - 1U) / kThreads, kThreads,
+                           0, stream>>>(
+        projected + intermediate, launch.conv_weights, launch.conv_bias,
+        launch.conv_state, conv, conv_size, launch.conv_kernel);
+    auto status = checked(cudaPeekAtLastError(), "Mamba2 causal convolution");
+    if (!status.ok()) return status;
+    mamba2_state_kernel<<<launch.heads, launch.head_dim, 0, stream>>>(
+        projected, conv, launch.dt_bias, launch.a_log, launch.skip,
+        launch.recurrent_state, output, launch.heads, launch.head_dim,
+        launch.state_size, launch.groups, launch.time_step_min);
+    status = checked(cudaPeekAtLastError(), "Mamba2 selective state update");
+    if (!status.ok()) return status;
+    mamba2_gated_group_norm_kernel<<<launch.groups, kThreads, 0, stream>>>(
+        projected, output, launch.norm_weight, intermediate, launch.groups,
+        launch.epsilon);
+    status = checked(cudaPeekAtLastError(), "Mamba2 gated group RMSNorm");
+    if (!status.ok()) return status;
+  }
+  return Status::success();
 }
 Status causal_short_conv_decode(
     const CausalShortConvLaunch& launch) noexcept {

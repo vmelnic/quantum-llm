@@ -26,6 +26,7 @@ from .constants import (
     FLAG_SYMMETRIC,
     FORMAT_VERSION,
     FP4_QUANT_ABI_ID,
+    FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     HEADER_BYTES,
     PACK_ALIGNMENT,
@@ -119,13 +120,17 @@ def expert_record_size(
     intermediate: int,
     alignment: int = PACK_ALIGNMENT,
     quant_abi: int = QUANT_ABI_ID,
+    gated: bool = True,
 ) -> int:
     cursor = HEADER_BYTES
-    if quant_abi == FP4_QUANT_ABI_ID:
+    if quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID):
+        if (quant_abi == FP4_RELU2_EXPERT_ABI_ID) == gated:
+            raise ValueError("expert record ABI disagrees with expert mathematics")
         _check_fp4_geometry(hidden, intermediate)
-        cursor += intermediate * hidden  # 2 * I * H values at 4 bits
+        cursor += (2 if gated else 1) * intermediate * hidden // 2
         cursor = align_up(cursor, SECTION_ALIGNMENT)
-        cursor += 2 * intermediate * hidden // FP4_QUANT_GROUP_SIZE
+        cursor += ((2 if gated else 1) * intermediate * hidden
+                   // FP4_QUANT_GROUP_SIZE)
         cursor = align_up(cursor, SECTION_ALIGNMENT)
         cursor += hidden * intermediate // 2
         cursor = align_up(cursor, SECTION_ALIGNMENT)
@@ -264,7 +269,10 @@ def write_expert_record(
     alignment: int = PACK_ALIGNMENT,
     quant_abi: int = QUANT_ABI_ID,
 ) -> RecordResult:
-    fp4 = quant_abi == FP4_QUANT_ABI_ID
+    fp4 = quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    gated = expert.gate is not None
+    if (quant_abi == FP4_RELU2_EXPERT_ABI_ID) == gated:
+        raise ValueError("expert record ABI disagrees with expert mathematics")
     if not fp4 and quant_abi != QUANT_ABI_ID:
         raise ValueError(f"unsupported expert quant ABI {quant_abi}")
     if fp4:
@@ -281,12 +289,14 @@ def write_expert_record(
         return write_int8_rows(view, destination, record_digest)
 
     gate_up_q_offset = HEADER_BYTES
-    with checkpoint.open_tensor(expert.gate.name) as gate:
-        gate_scales = encode(gate, handle, digest)
-    with checkpoint.open_tensor(expert.up.name) as up:
+    gate_scales = b""
+    if expert.gate is not None:
+        with checkpoint.open_tensor(expert.gate) as gate:
+            gate_scales = encode(gate, handle, digest)
+    with checkpoint.open_tensor(expert.up) as up:
         up_scales = encode(up, handle, digest)
     if fp4:
-        gate_up_q_bytes = intermediate * hidden
+        gate_up_q_bytes = (2 if gated else 1) * intermediate * hidden // 2
     else:
         gate_up_q_bytes = 2 * intermediate * hidden
 
@@ -299,7 +309,7 @@ def write_expert_record(
 
     down_q_offset = align_up(handle.tell() - start, SECTION_ALIGNMENT)
     _pad_to(handle, start + down_q_offset, digest)
-    with checkpoint.open_tensor(expert.down.name) as down:
+    with checkpoint.open_tensor(expert.down) as down:
         down_scales = encode(down, handle, digest)
     down_q_bytes = hidden * intermediate // 2 if fp4 else hidden * intermediate
 
@@ -312,7 +322,9 @@ def write_expert_record(
     record_bytes = align_up(handle.tell() - start, alignment)
     _pad_to(handle, start + record_bytes, digest)
     payload_hash = digest.digest()
-    flags = FLAG_ROW_MAJOR | FLAG_GATE_UP_FUSED | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    if gated:
+        flags |= FLAG_GATE_UP_FUSED
     header = EXPERT_HEADER_STRUCT.pack(
         EXPERT_MAGIC,
         FORMAT_VERSION,
@@ -323,7 +335,7 @@ def write_expert_record(
         expert.expert,
         hidden,
         intermediate,
-        2 * intermediate,
+        (2 if gated else 1) * intermediate,
         0,
         record_bytes,
         gate_up_q_offset,
@@ -341,8 +353,10 @@ def write_expert_record(
     write_zeros(handle, HEADER_BYTES - len(header))
     handle.seek(start + record_bytes)
 
-    source_bytes = expert.gate.nbytes + expert.up.nbytes + expert.down.nbytes
-    decoded_bytes = (3 * hidden * intermediate) * 4
+    source_roles = (("gate", expert.gate),) if expert.gate is not None else ()
+    source_roles += (("up", expert.up), ("down", expert.down))
+    source_bytes = sum(tensor.nbytes for _, tensor in source_roles)
+    decoded_bytes = ((3 if gated else 2) * hidden * intermediate) * 4
     entry: dict[str, object] = {
         "layer": expert.layer,
         "expert": expert.expert,
@@ -351,28 +365,32 @@ def write_expert_record(
         "stored_bytes": record_bytes,
         "source_bytes": source_bytes,
         "decoded_bytes": decoded_bytes,
-        "source_dtype": {
-            "gate": expert.gate.dtype,
-            "up": expert.up.dtype,
-            "down": expert.down.dtype,
-        },
+        "source_dtype": {role: tensor.dtype for role, tensor in source_roles},
         "source_shape": {
-            "gate": list(expert.gate.shape),
-            "up": list(expert.up.shape),
-            "down": list(expert.down.shape),
+            role: list(tensor.shape) for role, tensor in source_roles
         },
         "stored_dtype": "FP4_E2M1" if fp4 else "I8",
         "layout": (
-            "gate-rows-then-up-rows;down-output-major;row-contiguous-fp4-e2m1-block32"
+            ("gate-rows-then-up-rows;" if gated else "up-rows;")
+            + "down-output-major;row-contiguous-fp4-e2m1-block32"
             if fp4
             else "gate-rows-then-up-rows;down-output-major;row-contiguous-int8"
         ),
         "quant_abi": quant_abi,
         "payload_sha256": payload_hash.hex(),
         "source_tensors": {
-            "gate": expert.gate.name,
-            "up": expert.up.name,
-            "down": expert.down.name,
+            role: tensor.name for role, tensor in source_roles
+        },
+        "source_regions": {
+            role: {
+                "tensor": tensor.physical_name,
+                "byte_offset": tensor.source_byte_offset,
+                "bytes": tensor.nbytes,
+                "shape": list(tensor.shape),
+                "tensor_bytes": checkpoint.tensors[tensor.physical_name].nbytes,
+                "tensor_shape": list(checkpoint.tensors[tensor.physical_name].shape),
+            }
+            for role, tensor in source_roles
         },
         "sections": {
             "gate_up_q": {"offset": gate_up_q_offset, "bytes": gate_up_q_bytes},

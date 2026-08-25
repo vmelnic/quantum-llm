@@ -134,11 +134,14 @@ class AssistantOutput:
 
 
 class AssistantStreamParser:
-    """Translate standard Transformers response events into API text deltas."""
+    """Own one artifact-declared parser for an entire streamed response."""
 
     def __init__(self, application: "Application",
                  request: GenerationRequest) -> None:
+        self.application = application
+        self.request = request
         self.parser = application.response_stream_parser(request)
+        self.raw_pieces: list[str] = []
 
     @staticmethod
     def _deltas(events: list[dict[str, Any]]) -> tuple[str, str]:
@@ -158,15 +161,77 @@ class AssistantStreamParser:
         return "".join(reasoning), "".join(content)
 
     def feed(self, delta: str) -> tuple[str, str]:
+        self.raw_pieces.append(delta)
         if self.parser is None:
             return "", delta
         return self._deltas(self.parser.feed(delta))
 
-    def finish(self) -> tuple[str, str]:
+    def finish(self) -> tuple[str, str, AssistantOutput]:
         if self.parser is None:
-            return "", ""
-        _message, events = self.parser.finalize()
-        return self._deltas(events)
+            return "", "", AssistantOutput(
+                text="", reasoning="", reasoning_complete=True, tool_calls=()
+            )
+        try:
+            message, events = self.parser.finalize()
+        except (AssertionError, TypeError, ValueError,
+                json.JSONDecodeError) as error:
+            log("response_stream_finalize_failed",
+                protocol=self.application.response_protocol,
+                error=str(error))
+            return "", "", AssistantOutput(
+                text="", reasoning="", reasoning_complete=False, tool_calls=()
+            )
+        output = self.application.assistant_output_from_parsed_message(
+            message, "".join(self.raw_pieces), fallback_text=""
+        )
+        reasoning, content = self._deltas(events)
+        return reasoning, content, output
+
+
+class StreamingTextField:
+    """Normalize a streamed parser text field without reparsing the response.
+
+    Transformers' text response field strips its outer whitespace at close.
+    Discard leading whitespace and hold a bounded trailing run until later
+    content makes it internal. The streamed deltas remain authoritative; the
+    final parsed message is used only for structured fields such as tool calls.
+    """
+
+    def __init__(self, maximum_ambiguous_whitespace: int = 4096) -> None:
+        self.maximum_ambiguous_whitespace = maximum_ambiguous_whitespace
+        self.pending_trailing_whitespace = ""
+        self.discarded_leading_whitespace = 0
+        self.started = False
+
+    def feed(self, text: str) -> str:
+        if not text:
+            return ""
+        combined = self.pending_trailing_whitespace + text
+        self.pending_trailing_whitespace = ""
+        if not self.started:
+            stripped = combined.lstrip()
+            self.discarded_leading_whitespace += len(combined) - len(stripped)
+            if self.discarded_leading_whitespace > \
+                    self.maximum_ambiguous_whitespace:
+                raise WorkerError(
+                    "response parser produced excessive leading whitespace"
+                )
+            combined = stripped
+        stable = combined.rstrip()
+        self.pending_trailing_whitespace = combined[len(stable):]
+        if len(self.pending_trailing_whitespace) > \
+                self.maximum_ambiguous_whitespace:
+            raise WorkerError(
+                "response parser produced excessive trailing whitespace"
+            )
+        if not stable:
+            return ""
+        self.started = True
+        return stable
+
+    def finish(self) -> None:
+        """Discard whitespace that stayed outer through the final boundary."""
+        self.pending_trailing_whitespace = ""
 
 
 @dataclass
@@ -262,14 +327,47 @@ class IncrementalTokenDecoder:
         self.maximum_window_tokens = maximum_window_tokens
         self.tokens: list[int] = []
         self.emitted = ""
+        self.decode_prefix = ""
 
-    def _decode(self, tokens: list[int]) -> str:
+    def _decode_raw(self, tokens: list[int]) -> str:
         return self.tokenizer.decode(
             tokens, skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
         )
 
+    def _decode(self, tokens: list[int]) -> str:
+        current = self._decode_raw(tokens)
+        if not current.startswith(self.decode_prefix):
+            raise WorkerError(
+                "tokenizer changed the retained streaming context"
+            )
+        return current[len(self.decode_prefix):]
+
+    def _compact(self) -> bool:
+        if len(self.tokens) <= self.overlap_tokens:
+            return True
+        suffix_tokens = self.tokens[-self.overlap_tokens:]
+        raw_suffix = self._decode_raw(suffix_tokens)
+        maximum = min(len(self.emitted), len(raw_suffix))
+        common = 0
+        while (common < maximum and
+               self.emitted[-common - 1] == raw_suffix[-common - 1]):
+            common += 1
+        # A tiny coincidental suffix is not an authenticated boundary. Keep
+        # the larger window and retry later unless at least half of the
+        # retained decode is known to be the exact already-emitted suffix.
+        if common == 0 or common * 2 < len(raw_suffix):
+            return False
+        self.tokens = suffix_tokens
+        self.decode_prefix = raw_suffix[:-common]
+        self.emitted = raw_suffix[-common:]
+        return True
+
     def push(self, token: int, final: bool = False) -> str:
+        if len(self.tokens) >= self.maximum_window_tokens and not self._compact():
+            raise WorkerError(
+                "tokenizer has no bounded stable streaming boundary"
+            )
         self.tokens.append(token)
         current = self._decode(self.tokens)
         if not current.startswith(self.emitted):
@@ -281,12 +379,9 @@ class IncrementalTokenDecoder:
                 stable_end = replacement
         delta = current[len(self.emitted):stable_end]
         self.emitted = current[:stable_end]
-        if stable_end == len(current) and len(self.tokens) > self.overlap_tokens:
-            suffix_tokens = self.tokens[-self.overlap_tokens:]
-            suffix = self._decode(suffix_tokens)
-            if current.endswith(suffix) and self.emitted.endswith(suffix):
-                self.tokens = suffix_tokens
-                self.emitted = suffix
+        if (stable_end == len(current) and
+                len(self.tokens) > 2 * self.overlap_tokens):
+            self._compact()
         if len(self.tokens) > self.maximum_window_tokens:
             raise WorkerError(
                 "tokenizer has no bounded stable streaming boundary"
@@ -573,6 +668,7 @@ class CudaWorker:
                 parking_invalid or
                 self.capacity != requested_capacity or
                 self.prefill_mode not in {
+                    "causal_blocked_exact",
                     "causal_chunked",
                     "causal_layer_major",
                     "causal_sequential",
@@ -1510,19 +1606,39 @@ class Application:
                     text, prefix=request.prompt_ids,
                     tools=list(request.tools) if request.tools else None,
                 )
-            if not isinstance(message, dict):
-                raise ValueError("response parser returned a non-object")
-            if (codec is None and message.get("tool_calls") and
-                    (text.count("<tool_call>") != text.count("</tool_call>") or
-                     text.count("<function=") != text.count("</function>"))):
-                raise ValueError("model emitted an incomplete tool call")
-            return self._assistant_output_from_message(message)
+            return self._validated_assistant_output(message, text)
         except (AssertionError, TypeError, ValueError,
                 json.JSONDecodeError) as error:
             log("response_parse_failed", protocol=self.response_protocol,
                 error=str(error))
             return AssistantOutput(text=text, reasoning="",
                                    reasoning_complete=False, tool_calls=())
+
+    def _validated_assistant_output(
+            self, message: Any, text: str) -> AssistantOutput:
+        if not isinstance(message, dict):
+            raise ValueError("response parser returned a non-object")
+        codec = getattr(self, "artifact_chat_codec", None)
+        if (codec is None and message.get("tool_calls") and
+                (text.count("<tool_call>") != text.count("</tool_call>") or
+                 text.count("<function=") != text.count("</function>"))):
+            raise ValueError("model emitted an incomplete tool call")
+        return self._assistant_output_from_message(message)
+
+    def assistant_output_from_parsed_message(
+            self, message: Any, text: str, *, fallback_text: str
+            ) -> AssistantOutput:
+        """Validate the final message returned by the active stream parser."""
+        try:
+            return self._validated_assistant_output(message, text)
+        except (AssertionError, TypeError, ValueError,
+                json.JSONDecodeError) as error:
+            log("response_stream_parse_failed", protocol=self.response_protocol,
+                error=str(error))
+            return AssistantOutput(
+                text=fallback_text, reasoning="", reasoning_complete=False,
+                tool_calls=(),
+            )
 
     def text_token_count(self, text: str) -> int:
         if not text:
@@ -2395,8 +2511,10 @@ class Application:
         if not prompt_ids or len(prompt_ids) >= self.args.max_context:
             raise RequestError("prompt is empty or exceeds context capacity",
                                "input" if endpoint == "responses" else "prompt")
-        if len(prompt_ids) + maximum > self.args.max_context:
-            raise RequestError("prompt plus output tokens exceeds context capacity", max_field)
+        # max_tokens is a ceiling, not a request to preallocate that many KV
+        # positions. Clamp it after exact tokenization so callers can advertise
+        # the model's full output range without guessing template/tool overhead.
+        maximum = min(maximum, self.args.max_context - len(prompt_ids))
         if endpoint in {"chat", "anthropic", "responses"} and (
                 cache_prefix_tokens <= 0 or
                 cache_prefix_tokens > len(prompt_ids) or
@@ -3293,8 +3411,8 @@ class Handler(BaseHTTPRequestHandler):
         index = 0
         text_open = False
         streamed_text: list[str] = []
-        pending_leading_whitespace: list[str] = []
         parser = AssistantStreamParser(self.app, request)
+        text_field = StreamingTextField()
 
         def emit_confirmed_text(delta: str) -> None:
             nonlocal text_open
@@ -3313,26 +3431,7 @@ class Handler(BaseHTTPRequestHandler):
             })
 
         def emit_stream_text(delta: str) -> None:
-            if not delta:
-                return
-            # Standard response parsers can report template whitespace as a
-            # clean content chunk before they see a following tool-call
-            # marker, then remove it from the finalized assistant message.
-            # Hold only the bounded leading whitespace. As soon as real text
-            # appears it is stable and can stream; at finalization the
-            # authoritative parsed message decides whether the whitespace is
-            # content or merely grammar padding.
-            if not streamed_text and not delta.strip():
-                pending_leading_whitespace.append(delta)
-                if sum(map(len, pending_leading_whitespace)) > 4096:
-                    raise WorkerError(
-                        "response parser produced excessive leading whitespace"
-                    )
-                return
-            if pending_leading_whitespace:
-                delta = "".join(pending_leading_whitespace) + delta
-                pending_leading_whitespace.clear()
-            emit_confirmed_text(delta)
+            emit_confirmed_text(text_field.feed(delta))
 
         def emit(delta: str) -> None:
             _reasoning, visible = parser.feed(delta)
@@ -3341,17 +3440,10 @@ class Handler(BaseHTTPRequestHandler):
         raw_text, completion_count, finish_reason = self._run_generation(
             request, emit, context, progress_callback=heartbeat,
         )
-        _reasoning_tail, visible_tail = parser.finish()
+        _reasoning_tail, visible_tail, parsed = parser.finish()
         emit_stream_text(visible_tail)
-        parsed = self.app.parse_assistant_output(raw_text, request)
-        text, calls = parsed.text, parsed.tool_calls
-        emitted_text = "".join(streamed_text)
-        if not text.startswith(emitted_text):
-            raise WorkerError(
-                "response parser changed already streamed assistant text"
-            )
-        pending_leading_whitespace.clear()
-        emit_confirmed_text(text[len(emitted_text):])
+        text_field.finish()
+        calls = parsed.tool_calls
         if text_open:
             self._anthropic_sse("content_block_stop", {
                 "type": "content_block_stop", "index": index,
@@ -3618,7 +3710,8 @@ class Handler(BaseHTTPRequestHandler):
                         _raw_text, completion_count, _finish_reason = self._run_generation(
                             request, emit_response, context
                         )
-                        reasoning_tail, visible_tail = reasoning_filter.finish()
+                        reasoning_tail, visible_tail, _parsed = \
+                            reasoning_filter.finish()
                         if reasoning_tail:
                             reasoning_pieces.append(reasoning_tail)
                         if visible_tail:
@@ -3728,6 +3821,42 @@ class Handler(BaseHTTPRequestHandler):
                         self.app, request
                     ) if chat else None
                     reasoning_pieces: list[str] = []
+                    visible_pieces: list[str] = []
+                    tool_response = bool(
+                        chat and request.tools and request.tool_choice != "none"
+                    )
+                    stream_tool_response = bool(
+                        tool_response and reasoning_filter is not None and
+                        reasoning_filter.parser is not None
+                    )
+                    text_field = StreamingTextField() \
+                        if tool_response else None
+                    reasoning_for_usage = ""
+
+                    def emit_reasoning(reasoning: str) -> None:
+                        if not reasoning:
+                            return
+                        reasoning_pieces.append(reasoning)
+                        self._sse({**base, "choices": [{
+                            "index": 0, "finish_reason": None,
+                            "logprobs": None,
+                            "delta": {"reasoning_content": reasoning},
+                        }]})
+
+                    def send_visible(visible: str) -> None:
+                        if not visible:
+                            return
+                        visible_pieces.append(visible)
+                        self._sse({**base, "choices": [{
+                            "index": 0, "finish_reason": None,
+                            "logprobs": None,
+                            "delta": {"content": visible},
+                        }]})
+
+                    def emit_visible(visible: str) -> None:
+                        if text_field is not None:
+                            visible = text_field.feed(visible)
+                        send_visible(visible)
 
                     def emit_completion(delta: str) -> None:
                         if self._client_disconnected():
@@ -3735,19 +3864,8 @@ class Handler(BaseHTTPRequestHandler):
                         if chat:
                             assert reasoning_filter is not None
                             reasoning, visible = reasoning_filter.feed(delta)
-                            if reasoning:
-                                reasoning_pieces.append(reasoning)
-                                self._sse({**base, "choices": [{
-                                    "index": 0, "finish_reason": None,
-                                    "logprobs": None,
-                                    "delta": {"reasoning_content": reasoning},
-                                }]})
-                            if visible:
-                                self._sse({**base, "choices": [{
-                                    "index": 0, "finish_reason": None,
-                                    "logprobs": None,
-                                    "delta": {"content": visible},
-                                }]})
+                            emit_reasoning(reasoning)
+                            emit_visible(visible)
                         else:
                             self._sse({**base, "choices": [{
                                 "index": 0, "finish_reason": None,
@@ -3755,26 +3873,35 @@ class Handler(BaseHTTPRequestHandler):
                             }]})
 
                     calls: tuple[ToolCall, ...] = ()
-                    if chat and request.tools and request.tool_choice != "none":
-                        pieces: list[str] = []
-                        raw_text, completion_count, finish_reason = self._run_generation(
-                            request, pieces.append, context
-                        )
-                        parsed = self.app.parse_assistant_output(raw_text, request)
+                    raw_text, completion_count, finish_reason = self._run_generation(
+                        request,
+                        emit_completion if not tool_response or stream_tool_response
+                        else lambda _delta: None,
+                        context,
+                    )
+                    streamed_output: AssistantOutput | None = None
+                    if reasoning_filter is None or (
+                            tool_response and not stream_tool_response):
+                        reasoning_tail, visible_tail = "", ""
+                    else:
+                        reasoning_tail, visible_tail, streamed_output = \
+                            reasoning_filter.finish()
+                    if chat:
+                        emit_reasoning(reasoning_tail)
+                        emit_visible(visible_tail)
+
+                    if tool_response:
+                        parsed = streamed_output if stream_tool_response else \
+                            self.app.parse_assistant_output(raw_text, request)
+                        assert parsed is not None
                         calls = parsed.tool_calls
-                        if parsed.reasoning:
-                            reasoning_pieces.append(parsed.reasoning)
-                            self._sse({**base, "choices": [{
-                                "index": 0, "finish_reason": None,
-                                "logprobs": None,
-                                "delta": {"reasoning_content": parsed.reasoning},
-                            }]})
-                        if parsed.text:
-                            self._sse({**base, "choices": [{
-                                "index": 0, "finish_reason": None,
-                                "logprobs": None,
-                                "delta": {"content": parsed.text},
-                            }]})
+                        reasoning_for_usage = "".join(reasoning_pieces) \
+                            if stream_tool_response else parsed.reasoning
+                        if not stream_tool_response:
+                            emit_reasoning(parsed.reasoning)
+                            send_visible(parsed.text)
+                        assert text_field is not None
+                        text_field.finish()
                         if calls:
                             self._sse({**base, "choices": [{
                                 "index": 0, "finish_reason": None,
@@ -3788,26 +3915,7 @@ class Handler(BaseHTTPRequestHandler):
                             }]})
                             finish_reason = "tool_calls"
                     else:
-                        _text, completion_count, finish_reason = self._run_generation(
-                            request, emit_completion, context
-                        )
-                        if reasoning_filter is None:
-                            reasoning_tail, visible_tail = "", ""
-                        else:
-                            reasoning_tail, visible_tail = reasoning_filter.finish()
-                        if chat and reasoning_tail:
-                            reasoning_pieces.append(reasoning_tail)
-                            self._sse({**base, "choices": [{
-                                "index": 0, "finish_reason": None,
-                                "logprobs": None,
-                                "delta": {"reasoning_content": reasoning_tail},
-                            }]})
-                        if chat and visible_tail:
-                            self._sse({**base, "choices": [{
-                                "index": 0, "finish_reason": None,
-                                "logprobs": None,
-                                "delta": {"content": visible_tail},
-                            }]})
+                        reasoning_for_usage = "".join(reasoning_pieces)
                     final_choice: dict[str, Any] = {
                         "index": 0, "finish_reason": finish_reason, "logprobs": None,
                     }
@@ -3818,7 +3926,7 @@ class Handler(BaseHTTPRequestHandler):
                                    "usage": self._usage(len(request.prompt_ids),
                                         completion_count,
                                         self.app.text_token_count(
-                                            "".join(reasoning_pieces)
+                                            reasoning_for_usage
                                         ))})
                     self._sse("[DONE]")
             else:
@@ -3948,7 +4056,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--maximum-queue", type=int, default=8)
     parser.add_argument("--worker-capacity", type=int, default=1)
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
-    parser.add_argument("--worker-vram-cache-gib", type=int, default=13)
+    parser.add_argument("--worker-vram-cache-gib", type=int, default=12)
     parser.add_argument(
         "--placement-profile", choices=("latency", "balanced", "capacity"),
         default="balanced",

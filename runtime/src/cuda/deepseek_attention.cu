@@ -20,6 +20,7 @@ namespace {
 constexpr std::uint32_t kHidden = 4096U;
 constexpr std::uint32_t kHeads = 64U;
 constexpr std::uint32_t kHeadDim = 512U;
+constexpr std::uint64_t kMaximumDenseMatrixValues = 32768ULL * 1024U;
 constexpr std::uint32_t kWindow = 128U;
 constexpr std::uint32_t kIndexTopK = 512U;
 constexpr std::size_t kAlignment = 256U;
@@ -149,6 +150,46 @@ void DeepSeekAttentionPairWorkspace::map(void* raw_base) noexcept {
   index_compress_scores_ = arena.take<float>(rows * 256U);
   index_compress_pooled_ = arena.take<float>(rows * 128U);
   index_compress_output_ = arena.take<float>(rows * 128U);
+  allocation_bytes_ = align_up(arena.cursor);
+}
+
+void DeepSeekAttentionBatchWorkspace::map(void* raw_base) noexcept {
+  Arena arena{static_cast<std::byte*>(raw_base)};
+  const auto rows = static_cast<std::size_t>(maximum_rows_);
+  selected_per_row_ =
+      kWindow + std::max(kIndexTopK, max_context_ / 128U);
+  index_scores_per_row_ = max_context_ / 4U;
+  query_bf16_ = arena.take<std::uint16_t>(rows * kHeads * kHeadDim);
+  attention_bf16_ = arena.take<std::uint16_t>(rows * kHeads * kHeadDim);
+  index_query_bf16_ = arena.take<std::uint16_t>(rows * kHeads * 128U);
+  indices_ = arena.take<std::int32_t>(rows * selected_per_row_);
+  hca_normalized_ = arena.take<float>(rows * 4U * kHidden);
+  hca_mixes_ = arena.take<float>(rows * 24U);
+  collapsed_ = arena.take<float>(rows * kHidden);
+  attention_input_ = arena.take<float>(rows * kHidden);
+  pre_ = arena.take<float>(rows * 4U);
+  post_ = arena.take<float>(rows * 4U);
+  comb_ = arena.take<float>(rows * 16U);
+  query_rank_ = arena.take<float>(rows * 1024U);
+  query_norm_ = arena.take<float>(rows * 1024U);
+  query_ = arena.take<float>(rows * kHeads * kHeadDim);
+  kv_ = arena.take<float>(rows * kHeadDim);
+  kv_norm_ = arena.take<float>(rows * kHeadDim);
+  attention_output_ = arena.take<float>(rows * kHeads * kHeadDim);
+  group_output_ = arena.take<float>(rows * 8192U);
+  sublayer_ = arena.take<float>(rows * kHidden);
+  compress_values_ = arena.take<float>(rows * 1024U);
+  compress_scores_ = arena.take<float>(rows * 1024U);
+  compress_pooled_ = arena.take<float>(rows * kHeadDim);
+  compress_output_ = arena.take<float>(rows * kHeadDim);
+  index_query_ = arena.take<float>(rows * kHeads * 128U);
+  index_head_weights_ = arena.take<float>(rows * kHeads);
+  index_scores_ = arena.take<float>(rows * index_scores_per_row_);
+  index_compress_values_ = arena.take<float>(rows * 256U);
+  index_compress_scores_ = arena.take<float>(rows * 256U);
+  index_compress_pooled_ = arena.take<float>(rows * 128U);
+  index_compress_output_ = arena.take<float>(rows * 128U);
+  decoded_dense_matrix_ = arena.take<float>(kMaximumDenseMatrixValues);
   allocation_bytes_ = align_up(arena.cursor);
 }
 
@@ -324,6 +365,16 @@ DeepSeekAttentionPairWorkspace::~DeepSeekAttentionPairWorkspace() {
   if (allocation_) static_cast<void>(cudaFree(allocation_));
 }
 
+DeepSeekAttentionBatchWorkspace::DeepSeekAttentionBatchWorkspace(
+    void* allocation, std::uint64_t allocation_bytes,
+    std::uint32_t max_context, std::uint32_t maximum_rows) noexcept
+    : allocation_(allocation), allocation_bytes_(allocation_bytes),
+      max_context_(max_context), maximum_rows_(maximum_rows) {}
+
+DeepSeekAttentionBatchWorkspace::~DeepSeekAttentionBatchWorkspace() {
+  if (allocation_) static_cast<void>(cudaFree(allocation_));
+}
+
 DeepSeekAttentionPairWorkspaceSize deepseek_attention_pair_workspace_size(
     std::uint32_t max_context) noexcept {
   if (max_context == 0U || max_context > 1'048'576U)
@@ -348,6 +399,39 @@ DeepSeekAttentionPairWorkspaceResult create_deepseek_attention_pair_workspace(
   error = cudaMemset(allocation, 0, size.bytes);
   if (error != cudaSuccess)
     return {failure(error, "DeepSeek attention pair workspace reset"), {}};
+  return {Status::success(), std::move(workspace)};
+}
+
+DeepSeekAttentionBatchWorkspaceSize deepseek_attention_batch_workspace_size(
+    std::uint32_t max_context, std::uint32_t maximum_rows) noexcept {
+  if (max_context == 0U || max_context > 1'048'576U || maximum_rows == 0U ||
+      maximum_rows > kDeepSeekMaximumSequenceRows)
+    return {{ErrorCode::invalid_argument,
+             "unsupported DeepSeek attention batch geometry"}, 0U};
+  DeepSeekAttentionBatchWorkspace sizing(nullptr, 0U, max_context,
+                                         maximum_rows);
+  sizing.map(nullptr);
+  return {Status::success(), sizing.allocation_bytes_};
+}
+
+DeepSeekAttentionBatchWorkspaceResult
+create_deepseek_attention_batch_workspace(
+    std::uint32_t max_context, std::uint32_t maximum_rows) noexcept {
+  const auto size =
+      deepseek_attention_batch_workspace_size(max_context, maximum_rows);
+  if (!size.status.ok()) return {size.status, {}};
+  void* allocation = nullptr;
+  auto error = cudaMalloc(&allocation, size.bytes);
+  if (error != cudaSuccess)
+    return {failure(error,
+                    "DeepSeek attention batch workspace allocation"), {}};
+  auto workspace = std::shared_ptr<DeepSeekAttentionBatchWorkspace>(
+      new DeepSeekAttentionBatchWorkspace(allocation, size.bytes, max_context,
+                                          maximum_rows));
+  workspace->map(allocation);
+  error = cudaMemset(allocation, 0, size.bytes);
+  if (error != cudaSuccess)
+    return {failure(error, "DeepSeek attention batch workspace reset"), {}};
   return {Status::success(), std::move(workspace)};
 }
 
@@ -943,6 +1027,285 @@ Status deepseek_attention_decode_pair(
     if (!status.ok()) return fail_after_checkpoint(status);
   }
   return Status::success();
+}
+
+Status deepseek_attention_decode_batch(
+    const DeepSeekAttentionBatchLaunch& launch) noexcept {
+  if (!launch.weights || !launch.state || !launch.workspace ||
+      !launch.streams || !launch.updated_streams || !launch.row_state ||
+      launch.rows == 0U ||
+      launch.rows > launch.workspace->maximum_rows() ||
+      launch.workspace->max_context_tokens() <
+          launch.state->max_context_tokens() ||
+      launch.epsilon <= 0.0F || launch.sinkhorn_iterations == 0U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek attention batch launch"};
+  for (std::uint32_t row = 0U; row < launch.rows; ++row) {
+    const auto& item = launch.row_state[row];
+    if (!item.cosine || !item.sine ||
+        item.position >= launch.state->max_context_tokens() ||
+        (row != 0U && item.position !=
+                          launch.row_state[0].position + row))
+      return {ErrorCode::invalid_argument,
+              "invalid DeepSeek attention batch row"};
+    const bool emits = launch.state->compress_ratio() != 0U &&
+        (item.position + 1U) % launch.state->compress_ratio() == 0U;
+    if (emits && (!item.compressed_cosine || !item.compressed_sine))
+      return {ErrorCode::invalid_argument,
+              "missing DeepSeek batch compressed-position RoPE"};
+  }
+  auto status = check_binding(*launch.weights, *launch.state);
+  if (!status.ok()) return status;
+  auto& state = *launch.state;
+  auto& workspace = *launch.workspace;
+  const auto& weights = *launch.weights;
+  const auto raw_stream = static_cast<cudaStream_t>(launch.stream);
+  const auto rows = launch.rows;
+  const auto int8_projection = [&](const Int8Matrix& matrix,
+                                   const float* input, float* output) {
+    return rows >= 16U
+               ? int8_gemm_f32_batch(
+                     matrix, input, output, rows,
+                     workspace.decoded_dense_matrix_,
+                     kMaximumDenseMatrixValues, launch.stream)
+               : gemv_batch_weight_reuse(matrix, input, output, rows,
+                                          launch.stream);
+  };
+  const auto bf16_projection = [&](const std::uint16_t* matrix,
+                                   std::uint32_t output_rows,
+                                   std::uint32_t input_columns,
+                                   const float* input, float* output) {
+    return rows >= 16U
+               ? bf16_gemm_f32_batch(
+                     matrix, output_rows, input_columns, input, output, rows,
+                     workspace.decoded_dense_matrix_,
+                     kMaximumDenseMatrixValues, launch.stream)
+               : gemv_bf16_batch(matrix, output_rows, input_columns, input,
+                                  output, rows, launch.stream);
+  };
+
+  status = deepseek_hca_pre_batch(
+      {weights.hca_function, weights.hca_base, weights.hca_scale, kHidden},
+      launch.streams, rows, workspace.collapsed_, workspace.pre_,
+      workspace.post_, workspace.comb_,
+      {workspace.hca_normalized_, workspace.hca_mixes_}, launch.epsilon,
+      launch.sinkhorn_iterations, launch.stream);
+  if (!status.ok()) return status;
+  status = rms_norm_bf16_weight_batch(
+      workspace.collapsed_, weights.attention_norm,
+      workspace.attention_input_, rows, kHidden, launch.epsilon,
+      launch.stream);
+  if (!status.ok()) return status;
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->hca_pre_norm_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek batch HCA pre/norm stop");
+  if (!status.ok()) return status;
+  status = int8_projection(weights.wq_a, workspace.attention_input_,
+                           workspace.query_rank_);
+  if (!status.ok()) return status;
+  status = rms_norm_bf16_weight_batch(
+      workspace.query_rank_, weights.query_norm, workspace.query_norm_, rows,
+      1024U, launch.epsilon, launch.stream);
+  if (!status.ok()) return status;
+  status = int8_projection(weights.wq_b, workspace.query_norm_,
+                           workspace.query_);
+  if (!status.ok()) return status;
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    query_prepare_kernel<<<kHeads, kHeadDim, 0, raw_stream>>>(
+        workspace.query_ + static_cast<std::size_t>(row) * kHeads * kHeadDim,
+        launch.row_state[row].cosine, launch.row_state[row].sine,
+        reinterpret_cast<__nv_bfloat16*>(workspace.query_bf16_) +
+            static_cast<std::size_t>(row) * kHeads * kHeadDim,
+        launch.epsilon);
+  }
+  status = int8_projection(weights.wkv, workspace.attention_input_,
+                           workspace.kv_);
+  if (!status.ok()) return status;
+  status = rms_norm_bf16_weight_batch(
+      workspace.kv_, weights.kv_norm, workspace.kv_norm_, rows, kHeadDim,
+      launch.epsilon, launch.stream);
+  if (!status.ok()) return status;
+  if (state.ratio_ != 0U) {
+    const auto width = state.ratio_ == 4U ? 1024U : 512U;
+    status = bf16_projection(
+        weights.compressor_wkv, width, kHidden, workspace.attention_input_,
+        workspace.compress_values_);
+    if (!status.ok()) return status;
+    status = bf16_projection(
+        weights.compressor_wgate, width, kHidden,
+        workspace.attention_input_, workspace.compress_scores_);
+    if (!status.ok()) return status;
+  }
+  if (state.ratio_ == 4U) {
+    status = int8_projection(weights.index_wq_b, workspace.query_norm_,
+                             workspace.index_query_);
+    if (!status.ok()) return status;
+    status = bf16_projection(
+        weights.index_compressor_wkv, 256U, kHidden,
+        workspace.attention_input_, workspace.index_compress_values_);
+    if (!status.ok()) return status;
+    status = bf16_projection(
+        weights.index_compressor_wgate, 256U, kHidden,
+        workspace.attention_input_, workspace.index_compress_scores_);
+    if (!status.ok()) return status;
+    status = bf16_projection(
+        weights.index_weights, kHeads, kHidden, workspace.attention_input_,
+        workspace.index_head_weights_);
+    if (!status.ok()) return status;
+  }
+  auto error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+    return failure(error, "DeepSeek batch projection preparation");
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->projection_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek batch projection stop");
+  if (!status.ok()) return status;
+
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    const auto position = launch.row_state[row].position;
+    const bool emits = state.ratio_ != 0U &&
+        (position + 1U) % state.ratio_ == 0U;
+    status = deepseek_compressed_kv_publish(
+        workspace.kv_norm_ + static_cast<std::size_t>(row) * kHeadDim,
+        launch.row_state[row].cosine, launch.row_state[row].sine,
+        state.kv_cache_, position % kWindow, launch.stream);
+    if (!status.ok()) return status;
+    std::uint32_t compressed_count = 0U;
+    if (state.ratio_ != 0U) {
+      const auto width = state.ratio_ == 4U ? 1024U : 512U;
+      status = deepseek_compressor_decode(
+          *state.compressor_,
+          workspace.compress_values_ + static_cast<std::size_t>(row) * width,
+          workspace.compress_scores_ + static_cast<std::size_t>(row) * width,
+          weights.compressor_ape, weights.compressor_norm,
+          workspace.compress_pooled_ +
+              static_cast<std::size_t>(row) * kHeadDim,
+          workspace.compress_output_ +
+              static_cast<std::size_t>(row) * kHeadDim,
+          position, launch.epsilon, launch.stream);
+      if (!status.ok()) return status;
+      compressed_count = (position + 1U) / state.ratio_;
+      if (emits) {
+        status = deepseek_compressed_kv_publish(
+            workspace.compress_output_ +
+                static_cast<std::size_t>(row) * kHeadDim,
+            launch.row_state[row].compressed_cosine,
+            launch.row_state[row].compressed_sine, state.kv_cache_,
+            kWindow + compressed_count - 1U, launch.stream);
+        if (!status.ok()) return status;
+      }
+    }
+    const auto window_count = std::min(position + 1U, kWindow);
+    auto* row_indices = workspace.indices_ +
+        static_cast<std::size_t>(row) * workspace.selected_per_row_;
+    window_indices_kernel<<<1U, kWindow, 0, raw_stream>>>(
+        position, window_count, row_indices);
+    auto compressed_selected = compressed_count;
+    if (state.ratio_ == 4U) {
+      status = deepseek_index_prepare(
+          workspace.index_query_ +
+              static_cast<std::size_t>(row) * kHeads * 128U,
+          launch.row_state[row].cosine, launch.row_state[row].sine,
+          workspace.index_query_bf16_ +
+              static_cast<std::size_t>(row) * kHeads * 128U,
+          kHeads, launch.stream);
+      if (!status.ok()) return status;
+      status = deepseek_compressor_decode(
+          *state.index_compressor_,
+          workspace.index_compress_values_ +
+              static_cast<std::size_t>(row) * 256U,
+          workspace.index_compress_scores_ +
+              static_cast<std::size_t>(row) * 256U,
+          weights.index_compressor_ape, weights.index_compressor_norm,
+          workspace.index_compress_pooled_ +
+              static_cast<std::size_t>(row) * 128U,
+          workspace.index_compress_output_ +
+              static_cast<std::size_t>(row) * 128U,
+          position, launch.epsilon, launch.stream);
+      if (!status.ok()) return status;
+      if (emits) {
+        status = deepseek_index_prepare(
+            workspace.index_compress_output_ +
+                static_cast<std::size_t>(row) * 128U,
+            launch.row_state[row].compressed_cosine,
+            launch.row_state[row].compressed_sine,
+            state.index_cache_ +
+                static_cast<std::size_t>(compressed_count - 1U) * 128U,
+            1U, launch.stream);
+        if (!status.ok()) return status;
+      }
+      compressed_selected = std::min(kIndexTopK, compressed_count);
+      if (compressed_selected != 0U) {
+        status = deepseek_index_topk(
+            workspace.index_query_bf16_ +
+                static_cast<std::size_t>(row) * kHeads * 128U,
+            state.index_cache_,
+            workspace.index_head_weights_ +
+                static_cast<std::size_t>(row) * kHeads,
+            compressed_count, compressed_selected,
+            workspace.index_scores_ +
+                static_cast<std::size_t>(row) *
+                    workspace.index_scores_per_row_,
+            row_indices + window_count, launch.stream, kWindow);
+        if (!status.ok()) return status;
+      }
+    } else if (compressed_count != 0U) {
+      compressed_indices_kernel<<<(compressed_count + 255U) / 256U, 256U, 0,
+                                    raw_stream>>>(
+          compressed_count, row_indices + window_count);
+    }
+    error = cudaPeekAtLastError();
+    if (error != cudaSuccess)
+      return failure(error, "DeepSeek batch attention preparation");
+    status = deepseek_sparse_attention_decode(
+        workspace.query_bf16_ +
+            static_cast<std::size_t>(row) * kHeads * kHeadDim,
+        state.kv_cache_, row_indices, window_count + compressed_selected,
+        weights.attention_sink,
+        workspace.attention_bf16_ +
+            static_cast<std::size_t>(row) * kHeads * kHeadDim,
+        kHeads, launch.stream);
+    if (!status.ok()) return status;
+  }
+  status = record_profile_event(
+      launch.profile_events ? launch.profile_events->causal_attention_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek batch causal attention stop");
+  if (!status.ok()) return status;
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    attention_output_kernel<<<kHeads, kHeadDim, 0, raw_stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(workspace.attention_bf16_) +
+            static_cast<std::size_t>(row) * kHeads * kHeadDim,
+        launch.row_state[row].cosine, launch.row_state[row].sine,
+        workspace.attention_output_ +
+            static_cast<std::size_t>(row) * kHeads * kHeadDim);
+  }
+  error = cudaPeekAtLastError();
+  if (error != cudaSuccess)
+    return failure(error, "DeepSeek batch attention output preparation");
+  status = rows >= 16U
+               ? int8_grouped_gemm_f32_batch(
+                     weights.wo_a, workspace.attention_output_,
+                     workspace.group_output_, 8U, rows,
+                     workspace.decoded_dense_matrix_,
+                     kMaximumDenseMatrixValues, launch.stream)
+               : gemv_grouped_inputs_batch_weight_reuse(
+                     weights.wo_a, workspace.attention_output_,
+                     workspace.group_output_, 8U, rows, launch.stream);
+  if (!status.ok()) return status;
+  status = int8_projection(weights.wo_b, workspace.group_output_,
+                           workspace.sublayer_);
+  if (!status.ok()) return status;
+  status = deepseek_hca_post_batch(
+      workspace.sublayer_, launch.streams, workspace.post_, workspace.comb_,
+      launch.updated_streams, rows, kHidden, launch.stream);
+  if (!status.ok()) return status;
+  return record_profile_event(
+      launch.profile_events ? launch.profile_events->output_projection_stop
+                            : nullptr,
+      raw_stream, "record DeepSeek batch output projection stop");
 }
 
 }  // namespace expert::runtime::cuda

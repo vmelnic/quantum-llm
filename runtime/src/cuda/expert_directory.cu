@@ -669,16 +669,20 @@ Status CudaExpertDirectory::publish(
           static_cast<std::size_t>(hidden) * intermediate / kExpertFp4BlockSize;
       entry.w1_fp4 =
           reinterpret_cast<const std::uint8_t*>(cuda_allocation->gate_up());
-      entry.w3_fp4 = entry.w1_fp4 + matrix_packed;
       entry.w1_ue8m0 = reinterpret_cast<const std::uint8_t*>(
           cuda_allocation->gate_up_scales());
-      entry.w3_ue8m0 = entry.w1_ue8m0 + matrix_scales;
+      if (!cuda_allocation->relu2()) {
+        entry.w3_fp4 = entry.w1_fp4 + matrix_packed;
+        entry.w3_ue8m0 = entry.w1_ue8m0 + matrix_scales;
+      }
       entry.w2_fp4 =
           reinterpret_cast<const std::uint8_t*>(cuda_allocation->down());
       entry.w2_ue8m0 = reinterpret_cast<const std::uint8_t*>(
           cuda_allocation->down_scales());
       entry.format = static_cast<std::uint32_t>(
-          DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
+          cuda_allocation->relu2()
+              ? DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32
+              : DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
     } else {
       entry.gate_up = cuda_allocation->gate_up();
       entry.gate_up_scales = cuda_allocation->gate_up_scales();

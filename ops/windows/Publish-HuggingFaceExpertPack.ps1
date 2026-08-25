@@ -6,6 +6,9 @@ param(
     [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1")]
     [string]$QuantProfile = "fp4-e2m1-ue8m0-block32-v1",
     [int64]$MaxExpertPackBytes = 4GB,
+    [int]$QualitySamplesPerTensor = 8,
+    [double]$MaximumRelativeL2 = 0.20,
+    [double]$MinimumCosine = 0.98,
     [switch]$ReclaimSourceShards
 )
 
@@ -19,6 +22,10 @@ if ($StableName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]*$') {
 }
 if ($Revision -notmatch '^[0-9a-fA-F]{40,64}$') {
     throw "Publication requires an immutable Hugging Face commit revision"
+}
+if ($QualitySamplesPerTensor -lt 3 -or $MaximumRelativeL2 -le 0 -or
+    $MinimumCosine -lt -1 -or $MinimumCosine -gt 1) {
+    throw "Invalid numerical quality parameters"
 }
 
 $snapshot = Resolve-HuggingFaceSnapshot -ModelId $ModelId -Revision $Revision
@@ -61,5 +68,13 @@ if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
 
 & (Join-Path $PSScriptRoot "Invoke-ExpertPack.ps1") `
     -Action Validate -Path $candidate
+if ($QuantProfile -eq "fp4-e2m1-ue8m0-block32-v1") {
+    & (Join-Path $PSScriptRoot "Invoke-Fp4SourceQualityGate.ps1") `
+        -ModelId $ModelId -Revision $Revision `
+        -ArtifactName ([System.IO.Path]::GetFileName($candidate)) `
+        -SamplesPerTensor $QualitySamplesPerTensor `
+        -MaximumRelativeL2 $MaximumRelativeL2 `
+        -MinimumCosine $MinimumCosine
+}
 & (Join-Path $PSScriptRoot "Promote-ModelArtifact.ps1") `
     -Candidate $candidate -Destination $destination -ExpectedProgramSchema 3

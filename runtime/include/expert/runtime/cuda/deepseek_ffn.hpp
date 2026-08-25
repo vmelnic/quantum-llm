@@ -14,7 +14,12 @@ namespace expert::runtime::cuda {
 struct DeepSeekFfnStateResult;
 struct DeepSeekFfnHybridWorkspaceResult;
 struct DeepSeekFfnPairWorkspaceResult;
+struct DeepSeekFfnBatchWorkspaceResult;
 struct DeepSeekRoutePredictionStateResult;
+struct DeepSeekFfnHybridPairExecuteLaunch;
+
+[[nodiscard]] Status deepseek_ffn_execute_pair_hybrid(
+    const DeepSeekFfnHybridPairExecuteLaunch& launch) noexcept;
 
 class DeepSeekFfnState final {
  public:
@@ -57,6 +62,8 @@ class DeepSeekFfnState final {
       const struct DeepSeekFfnFinalizeLaunch&) noexcept;
   friend Status deepseek_ffn_execute_hybrid(
       const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_pair_hybrid(
+      const struct DeepSeekFfnHybridPairExecuteLaunch&) noexcept;
   friend Status deepseek_ffn_gather_pair_routes(
       const struct DeepSeekFfnPairRouteGather&) noexcept;
   friend Status deepseek_ffn_route_pair(
@@ -268,6 +275,8 @@ class DeepSeekFfnPairWorkspace final {
       const struct DeepSeekFfnPairRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_pair(
       const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_pair_hybrid(
+      const DeepSeekFfnHybridPairExecuteLaunch&) noexcept;
   DeepSeekFfnPairWorkspace(void* allocation, std::uint64_t bytes) noexcept;
   void map(void* base) noexcept;
 
@@ -283,6 +292,134 @@ class DeepSeekFfnPairWorkspace final {
   std::int8_t *routed_q_input_{}, *routed_q_intermediate_{};
   float *routed_q_input_scales_{}, *routed_q_intermediate_scales_{};
 };
+
+class CudaCompactExpertAllocation;
+
+// Transient device tile used by exact causal prefill. Routing metadata and
+// independent selection outputs remain in stable row/top-k order; expert pages
+// are executed separately in expert-major batches.
+class DeepSeekFfnBatchWorkspace final {
+ public:
+  ~DeepSeekFfnBatchWorkspace();
+  DeepSeekFfnBatchWorkspace(const DeepSeekFfnBatchWorkspace&) = delete;
+  DeepSeekFfnBatchWorkspace& operator=(const DeepSeekFfnBatchWorkspace&) =
+      delete;
+  [[nodiscard]] std::uint64_t bytes() const noexcept { return bytes_; }
+  [[nodiscard]] std::uint32_t maximum_rows() const noexcept {
+    return maximum_rows_;
+  }
+  [[nodiscard]] const float* normalized_input() const noexcept {
+    return ffn_input_;
+  }
+  [[nodiscard]] float* normalized_input() noexcept { return ffn_input_; }
+  [[nodiscard]] const float* routing_weights() const noexcept {
+    return routing_weights_;
+  }
+  [[nodiscard]] float* routing_weights() noexcept { return routing_weights_; }
+  [[nodiscard]] const std::uint32_t* expert_indices() const noexcept {
+    return expert_indices_;
+  }
+  [[nodiscard]] std::uint32_t* expert_indices() noexcept {
+    return expert_indices_;
+  }
+  [[nodiscard]] const float* post_control() const noexcept { return post_; }
+  [[nodiscard]] float* post_control() noexcept { return post_; }
+  [[nodiscard]] const float* combination_control() const noexcept {
+    return comb_;
+  }
+  [[nodiscard]] float* combination_control() noexcept { return comb_; }
+  [[nodiscard]] float* selection_outputs() noexcept {
+    return routed_selection_outputs_;
+  }
+  [[nodiscard]] const float* selection_outputs() const noexcept {
+    return routed_selection_outputs_;
+  }
+  [[nodiscard]] float* expert_inputs() noexcept { return direct_inputs_; }
+  [[nodiscard]] float* expert_outputs() noexcept { return direct_outputs_; }
+
+ private:
+  friend DeepSeekFfnBatchWorkspaceResult
+  create_deepseek_ffn_batch_workspace(std::uint32_t) noexcept;
+  friend std::uint64_t deepseek_ffn_batch_workspace_size(
+      std::uint32_t) noexcept;
+  friend Status deepseek_ffn_route_batch(
+      const struct DeepSeekFfnBatchRouteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_packed_batch(
+      const struct DeepSeekFfnPackedBatchLaunch&) noexcept;
+  friend Status deepseek_ffn_finalize_batch(
+      const struct DeepSeekFfnBatchFinalizeLaunch&) noexcept;
+  DeepSeekFfnBatchWorkspace(void* allocation, std::uint64_t bytes,
+                            std::uint32_t maximum_rows) noexcept;
+  void map(void* base) noexcept;
+
+  void* allocation_{};
+  std::uint64_t bytes_{};
+  std::uint32_t maximum_rows_{};
+  float *hca_normalized_{}, *hca_mixes_{}, *collapsed_{}, *pre_{}, *post_{},
+      *comb_{}, *ffn_input_{}, *router_logits_{}, *routing_weights_{},
+      *routed_selection_outputs_{}, *routed_output_{}, *shared_intermediate_{},
+      *shared_output_{}, *direct_inputs_{}, *direct_gate_{}, *direct_up_{},
+      *direct_intermediate_{}, *direct_outputs_{};
+  std::uint32_t *expert_indices_{}, *shared_indices_{};
+  std::int8_t *shared_q_input_{}, *shared_q_intermediate_{},
+      *direct_q_input_{}, *direct_q_intermediate_{};
+  float *shared_q_input_scales_{}, *shared_q_intermediate_scales_{},
+      *direct_q_input_scales_{}, *direct_q_intermediate_scales_{};
+};
+
+struct DeepSeekFfnBatchWorkspaceResult final {
+  Status status;
+  std::shared_ptr<DeepSeekFfnBatchWorkspace> workspace;
+};
+
+[[nodiscard]] std::uint64_t deepseek_ffn_batch_workspace_size(
+    std::uint32_t maximum_rows) noexcept;
+[[nodiscard]] DeepSeekFfnBatchWorkspaceResult
+create_deepseek_ffn_batch_workspace(std::uint32_t maximum_rows) noexcept;
+
+struct DeepSeekFfnBatchRouteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  DeepSeekFfnState* identity_state{};
+  DeepSeekFfnBatchWorkspace* workspace{};
+  const float* streams{};              // [rows, 4, 4096]
+  const std::uint32_t* token_ids{};     // host [rows]
+  std::uint32_t rows{};
+  float epsilon{1e-6F};
+  std::uint32_t sinkhorn_iterations{20U};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_route_batch(
+    const DeepSeekFfnBatchRouteLaunch& launch) noexcept;
+
+struct DeepSeekFfnPackedBatchLaunch final {
+  const CudaCompactExpertAllocation* expert{};
+  DeepSeekFfnBatchWorkspace* workspace{};
+  const float* input{};   // device [rows, 4096]
+  float* output{};        // device [rows, 4096]
+  std::uint32_t rows{};
+  float swiglu_limit{10.0F};
+  bool bf16_intermediate{true};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_execute_packed_batch(
+    const DeepSeekFfnPackedBatchLaunch& launch) noexcept;
+
+struct DeepSeekFfnBatchFinalizeLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  DeepSeekFfnState* identity_state{};
+  DeepSeekFfnBatchWorkspace* workspace{};
+  const DeviceExpertEntry* directory_entries{};
+  const float* streams{};              // [rows, 4, 4096]
+  float* updated_streams{};            // [rows, 4, 4096]
+  std::uint32_t rows{};
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_finalize_batch(
+    const DeepSeekFfnBatchFinalizeLaunch& launch) noexcept;
 
 struct DeepSeekFfnPairWorkspaceResult final {
   Status status;
@@ -355,6 +492,8 @@ class DeepSeekFfnHybridWorkspace final {
   create_deepseek_ffn_hybrid_workspace() noexcept;
   friend Status deepseek_ffn_execute_hybrid(
       const struct DeepSeekFfnHybridExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_execute_pair_hybrid(
+      const DeepSeekFfnHybridPairExecuteLaunch&) noexcept;
   DeepSeekFfnHybridWorkspace(void* device_allocation,
                              std::uint64_t device_bytes,
                              void* host_allocation,
@@ -401,5 +540,25 @@ struct DeepSeekFfnHybridExecuteLaunch final {
 // array and are merged in stable top-k order before the shared expert/HCA post.
 [[nodiscard]] Status deepseek_ffn_execute_hybrid(
     const DeepSeekFfnHybridExecuteLaunch& launch) noexcept;
+
+struct DeepSeekFfnHybridPairExecuteLaunch final {
+  const DeepSeekFfnBinding* weights{};
+  std::array<DeepSeekFfnState*, 2U> states{};
+  DeepSeekFfnPairWorkspace* pair_workspace{};
+  const DeviceExpertEntry* directory_entries{};
+  std::array<const float*, 2U> streams{};
+  std::array<float*, 2U> updated_streams{};
+  DeepSeekFfnHybridWorkspace* hybrid_workspace{};
+  cpu::DeepSeekPackedExecutor* cpu_executor{};
+  std::span<const cpu::DeepSeekPackedWorkGroup> cpu_groups;
+  std::uint32_t experts_per_layer{257U};
+  void* stream{};
+};
+
+// Exact two-row counterpart used by MTP verification. Global selection
+// indices are row-major in [0, 12); GPU and CPU partial outputs are merged
+// against the original per-row route weights without changing top-k.
+[[nodiscard]] Status deepseek_ffn_execute_pair_hybrid(
+    const DeepSeekFfnHybridPairExecuteLaunch& launch) noexcept;
 
 }  // namespace expert::runtime::cuda

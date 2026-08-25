@@ -31,15 +31,28 @@ command -v pi >/dev/null 2>&1 || die "pi CLI is not installed or not on PATH"
 alias_file="${MODEL_ALIAS_FILE:-${script_dir}/model-aliases.tsv}"
 [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
 model_id=""
-while IFS=$'\t' read -r alias advertised_model artifact extra; do
-  [[ "${alias}" != model-aliases-v1 && -n "${alias}" ]] || continue
-  [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" ]] ||
+alias_registry_version=""
+while IFS=$'\t' read -r alias advertised_model artifact declared_kv extra; do
+  if [[ "${alias}" == model-aliases-v2 ]]; then
+    [[ -z "${advertised_model}${artifact}${declared_kv}${extra}" ]] ||
+      die "invalid model alias registry header"
+    alias_registry_version="${alias}"
+    continue
+  fi
+  [[ -n "${alias}" ]] || continue
+  [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" &&
+     ( "${declared_kv}" == artifact ||
+       "${declared_kv}" == fp8-e4m3-per-head ||
+       "${declared_kv}" == fp16 ) ]] ||
     die "invalid model alias registry row for '${alias}'"
   if [[ "${alias}" == "${selection}" ]]; then
     model_id="${advertised_model}"
     break
   fi
 done < "${alias_file}"
+
+[[ "${alias_registry_version}" == model-aliases-v2 ]] ||
+  die "unsupported model alias registry version"
 
 [[ -n "${model_id}" ]] || die "unknown model selector '${selection}'"
 

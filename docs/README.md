@@ -1,6 +1,6 @@
 # Documentation
 
-Status: authoritative documentation index, 2026-08-23.
+Status: authoritative documentation index, 2026-08-25.
 
 The repository documents the implementation that exists today, the evidence
 that has actually been measured, and the next accepted work. Detailed journals
@@ -12,11 +12,11 @@ material remains recoverable from Git history.
 
 | Document | Purpose |
 |---|---|
-| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen dense execution, DeepSeek expert paging, KV and session state |
+| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen/Ornith hybrid execution, DeepSeek expert paging, KV and session state |
 | [Production readiness](production-readiness.md) | What is usable, what is not, and the release blockers |
 | [Benchmarks](benchmarks.md) | Canonical measurements and capacity/bandwidth equations |
 | [Roadmap](roadmap.md) | Dependency-ordered work that advances the active goals |
-| [Research decisions](research-decisions.md) | Rejected mechanisms and current heterogeneous multi-GPU direction |
+| [Research decisions](research-decisions.md) | Rejected mechanisms, adopted exact-MoE work and evaluated hardware alternatives |
 
 ## Build and operate
 

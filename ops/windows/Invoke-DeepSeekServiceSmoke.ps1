@@ -64,8 +64,10 @@ if (-not $AllowSourceExtents -and
     throw "Production DeepSeek gate requires the durable compact pack"
 }
 if ([int]$info.worker_protocol -lt 4 -or
-    $info.worker_prefill.mode -ne "causal_sequential" -or
-    [int]$info.worker_prefill.chunk_tokens -ne 1 -or
+    $info.worker_prefill.mode -ne "causal_blocked_exact" -or
+    [int]$info.worker_prefill.chunk_tokens -lt 32 -or
+    [int]$info.worker_prefill.chunk_tokens -gt 512 -or
+    [int]$info.worker_prefill.chunk_tokens % 32 -ne 0 -or
     $info.worker_kv.dtype -ne "bf16" -or
     $info.worker_kv.allocation -ne "preallocated" -or
     [int]$info.worker_kv.page_tokens -lt 1 -or

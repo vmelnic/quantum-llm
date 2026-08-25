@@ -1,14 +1,16 @@
 # Production readiness
 
 Status: functional research/pilot runtime, not production-ready for the full
-262K coding objective, 2026-08-23.
+262K coding objective, 2026-08-25.
 
 ## Verdict
 
-The native Qwen and DeepSeek services work through one artifact-driven VM,
-HTTP lifecycle and Pi integration. Short-context Qwen chat, reasoning, tools,
-images, exact-F16 progressive allocation and retained-session recovery have
-passed bounded gates. DeepSeek exact expert paging and generation also work.
+The native Qwen, Ornith and DeepSeek services work through one
+artifact-driven VM and HTTP lifecycle, and all three are selectable through
+Pi. Short-context Qwen chat, reasoning, tools, images, exact-F16
+progressive allocation and retained-session recovery have passed bounded
+gates. Ornith standard expert execution and DeepSeek compact expert paging
+also pass short chat gates.
 
 The product is not ready for unrestricted real-project use at maximum context:
 
@@ -25,11 +27,12 @@ The product is not ready for unrestricted real-project use at maximum context:
 | Area | State |
 |---|---|
 | Qwen FP4 artifact | transactionally published, source/hash/format validated |
+| Ornith FP4 artifact | transactionally published, source-qualified, common chat path passed |
 | DeepSeek compact bundle | authenticated and consumable by the common VM |
 | common lifecycle | install/start/status/chat/stop with artifact aliases |
 | OpenAI API | Completions, Chat Completions, Responses, streaming and usage |
 | Anthropic adapter | Messages/count_tokens and streaming wire compatibility |
-| Pi integration | Qwen/DeepSeek selection, xhigh default, thinking on/off |
+| Pi integration | Qwen/Ornith real text and `read` tool loops; all three selectable; xhigh default and thinking control |
 | Qwen text/tools/images | bounded functional gates passed |
 | exact F16 KV | progressive 256-token pages, append growth and zero-delta reuse |
 | session retention | park/restore, transactional resume and cancel rewind |
@@ -42,11 +45,13 @@ The product is not ready for unrestricted real-project use at maximum context:
 |---|---|
 | Qwen 262K interactive use | prefill latency and exact-F16 saturated decode |
 | unrestricted coding harness | representative long tool-loop quality/reliability not qualified |
+| DeepSeek through Pi | common chat passes, but the normal project harness prefill remains too slow and the Pi gate was not completed |
+| DeepSeek cancellation recovery | cancelling a long Pi prefill can leave the worker unhealthy until service restart |
 | true parallel agents | one serialized hot slot; parking gives continuity, not concurrency |
 | multi-GPU | no per-device allocator/provider/P2P implementation |
 | public network service | no integrated TLS, rate limiting or durable edge |
 | automated recovery | long-prefix worker restart/KV exhaustion gates incomplete |
-| broad model universality | artifact/provider model is generic, but only current capability sets are executable |
+| broad model universality | artifact/provider model is generic, but only the Qwen, Ornith and DeepSeek capability sets are executable |
 
 ## Release invariants
 
@@ -67,7 +72,7 @@ The product is not ready for unrestricted real-project use at maximum context:
 1. clean local and Windows Release/CUDA tests;
 2. bounded official numerical and behavior comparisons for text, sampling,
    tools and images;
-3. real Qwen and DeepSeek `model.sh chat` smokes through the common runner;
+3. real Qwen, Ornith and DeepSeek `model.sh chat` smokes through the common runner;
 4. representative Pi coding histories with delta-only reuse;
 5. populated 262K exact-F16 Qwen prefill/decode meeting the accepted latency
    and throughput target;

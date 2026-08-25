@@ -13,6 +13,13 @@ namespace expert::runtime::cuda {
 
 enum class DeepSeekRouterKind : std::uint8_t { hash, learned };
 
+// Shared upper bound for the exact causal sequence tile. Attention, FFN and
+// the provider scheduler must accept the same row geometry; keeping separate
+// limits lets a service pass capacity planning and then fail during provider
+// construction. The value is selected by the RTX 3090 request-residency gate,
+// while callers remain free to allocate a smaller tile.
+inline constexpr std::uint32_t kDeepSeekMaximumSequenceRows = 512U;
+
 // Non-owning, geometry-checked pointers for one attention sublayer. The
 // resident model state must outlive every binding produced from it.
 struct DeepSeekAttentionBinding final {

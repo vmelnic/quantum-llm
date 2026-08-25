@@ -15,6 +15,7 @@ from .constants import (
     FORMAT_NAME,
     FORMAT_VERSION,
     FP4_QUANT_ABI_ID,
+    FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     FP4_QUANT_PROFILE,
     HASH_ALGORITHM,
@@ -78,12 +79,28 @@ def _expert_quant_abi(quant_profile: str) -> int:
     raise ValueError(f"unsupported quant profile {quant_profile!r}")
 
 
+def _expert_record_abi(adapted: AdaptedModel, quant_abi: int) -> int:
+    if not adapted.experts:
+        return quant_abi
+    gated = {expert.gate is not None for expert in adapted.experts}
+    if len(gated) != 1:
+        raise ValueError("one routed component cannot mix expert mathematics")
+    if gated == {False}:
+        if quant_abi != FP4_QUANT_ABI_ID:
+            raise ValueError("ReLU2 routed experts currently require FP4")
+        return FP4_RELU2_EXPERT_ABI_ID
+    return quant_abi
+
+
 def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> bytes:
     topology = adapted.runtime_topology
-    encoding_abi = 2 if expert_abi == FP4_QUANT_ABI_ID else 1
+    fp4_experts = expert_abi in (
+        FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
+    )
+    encoding_abi = 2 if fp4_experts else 1
     encoding = (
         "fp4.e2m1.ue8m0.block32"
-        if expert_abi == FP4_QUANT_ABI_ID
+        if fp4_experts
         else "int8.symmetric.per-row"
     )
 
@@ -683,8 +700,11 @@ def _build_manifest(
         tokenizer_metadata = {}
     config = checkpoint.config
     pack_bytes = dense_bytes + expert_bytes
-    expert_abi = _expert_quant_abi(options.quant_profile)
-    fp4 = expert_abi == FP4_QUANT_ABI_ID
+    expert_abi = _expert_record_abi(
+        adapted, _expert_quant_abi(options.quant_profile)
+    )
+    fp4 = expert_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    relu2_experts = expert_abi == FP4_RELU2_EXPERT_ABI_ID
     dense_abis = sorted({int(entry["quant_abi"]) for entry in dense})
     dense_fp4 = FP4_QUANT_ABI_ID in dense_abis
     dense_int8 = QUANT_ABI_ID in dense_abis
@@ -730,6 +750,7 @@ def _build_manifest(
             "files": source_files,
         },
         "architecture": architecture,
+        "auxiliary_tensors": sorted(adapted.auxiliary_dense),
         "model_program": model_program,
         "quantization": {
             "profile": options.quant_profile,
@@ -754,8 +775,8 @@ def _build_manifest(
                  else "expert-pack-sm86-dense-int8-row-v1")
             ),
             "quant_abi": expert_abi,
-            "gate_up_fused": has_routed,
-            "gate_up_order": ["gate", "up"],
+            "gate_up_fused": has_routed and not relu2_experts,
+            "gate_up_order": ["gate", "up"] if not relu2_experts else ["up"],
             "down_layout": "output-major-row-contiguous",
             "activation": architecture["hidden_activation"],
             "target": "cuda-sm86",
@@ -816,7 +837,7 @@ def compile_checkpoint(
     started = time.monotonic()
     source = Path(options.source).resolve()
     output = Path(options.output).resolve()
-    expert_abi = _expert_quant_abi(options.quant_profile)
+    quant_abi = _expert_quant_abi(options.quant_profile)
     if options.quant_profile not in QUANT_PROFILES:
         raise ValueError(f"unsupported quant profile {options.quant_profile!r}")
     if options.alignment < PACK_ALIGNMENT or options.alignment & (options.alignment - 1):
@@ -836,6 +857,7 @@ def compile_checkpoint(
 
     checkpoint = SafeTensorCheckpoint(source)
     adapted = adapt_checkpoint(checkpoint, options.adapter)
+    expert_abi = _expert_record_abi(adapted, quant_abi)
     if options.quant_profile not in adapted.supported_expert_quant_profiles:
         raise ValueError(
             f"adapter {adapted.family!r} does not support expert quant profile "
@@ -913,6 +935,7 @@ def compile_checkpoint(
             routed_component.intermediate_size,
             options.alignment,
             expert_abi,
+            adapted.experts[0].gate is not None,
         )
         if routed_component is not None else 0
     )
@@ -1081,9 +1104,26 @@ def refresh_runtime_model_program(
             "layer": item.layer,
             "expert": item.expert,
             "source_tensors": {
-                "gate": item.gate.name,
                 "up": item.up.name,
                 "down": item.down.name,
+                **({"gate": item.gate.name} if item.gate is not None else {}),
+            },
+            "source_regions": {
+                role: {
+                    "tensor": tensor.physical_name,
+                    "byte_offset": tensor.source_byte_offset,
+                    "bytes": tensor.nbytes,
+                    "shape": list(tensor.shape),
+                    "tensor_bytes": checkpoint.tensors[tensor.physical_name].nbytes,
+                    "tensor_shape": list(
+                        checkpoint.tensors[tensor.physical_name].shape
+                    ),
+                }
+                for role, tensor in (
+                    *(((("gate", item.gate),)) if item.gate is not None else ()),
+                    ("up", item.up),
+                    ("down", item.down),
+                )
             },
         }
         for item in adapted.experts
@@ -1093,6 +1133,7 @@ def refresh_runtime_model_program(
             "layer": item.get("layer"),
             "expert": item.get("expert"),
             "source_tensors": item.get("source_tensors"),
+            "source_regions": item.get("source_regions"),
         }
         for item in experts
         if isinstance(item, dict)
