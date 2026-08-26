@@ -1,6 +1,6 @@
 # DeepSeek compact pack v1
 
-Status: deployed routed-expert and worker-bundle contract, 2026-08-23.
+Status: deployed routed-expert and worker-bundle contract, 2026-08-26.
 
 ## Why it is separate
 

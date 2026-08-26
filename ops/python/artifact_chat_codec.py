@@ -44,6 +44,17 @@ class ArtifactCodecStreamParser:
             return text[:-held], text[-held:]
         return text, ""
 
+    @classmethod
+    def _stable_prefix_for_markers(
+            cls, text: str, markers: tuple[str, ...]) -> tuple[str, str]:
+        held = 0
+        for marker in markers:
+            _stable, pending = cls._stable_prefix(text, marker)
+            held = max(held, len(pending))
+        if held:
+            return text[:-held], text[-held:]
+        return text, ""
+
     def feed(self, delta: str) -> list[dict[str, Any]]:
         if not delta:
             return []
@@ -66,14 +77,24 @@ class ArtifactCodecStreamParser:
                 )
                 events += self._event(self.field, stable)
                 break
-            marker = self.codec.tool_calls_start_token
-            index = self.pending.find(marker)
-            if index >= 0:
+            markers = tuple(marker for marker in (
+                self.codec.tool_calls_start_token,
+                self.codec.eos_token,
+            ) if marker)
+            matches = []
+            for marker in markers:
+                index = self.pending.find(marker)
+                if index >= 0:
+                    matches.append((index, marker))
+            if matches:
+                index, _marker = min(matches, key=lambda item: item[0])
                 events += self._event("content", self.pending[:index])
                 self.pending = ""
                 self.finished = True
                 break
-            stable, self.pending = self._stable_prefix(self.pending, marker)
+            stable, self.pending = self._stable_prefix_for_markers(
+                self.pending, markers
+            )
             events += self._event("content", stable)
             break
         return events

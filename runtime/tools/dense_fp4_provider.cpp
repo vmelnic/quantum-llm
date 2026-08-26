@@ -294,6 +294,13 @@ std::uint64_t checked_product(std::span<const std::uint32_t> dimensions) {
   return result;
 }
 
+std::uint64_t checked_multiply(std::uint64_t left, std::uint64_t right,
+                               std::string_view description) {
+  if (left != 0U && right > std::numeric_limits<std::uint64_t>::max() / left)
+    throw std::runtime_error(std::string(description) + " overflows");
+  return left * right;
+}
+
 std::uint32_t align32(std::uint32_t value) {
   if (value > std::numeric_limits<std::uint32_t>::max() - 31U)
     throw std::runtime_error("tensor row is too wide");
@@ -451,6 +458,13 @@ er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
       has_capability("block.full-attention.standard-gqa.v1") ||
       has_capability(
           "block.full-attention.standard-gqa-no-position.v1");
+  const auto normalized_gated_gqa = std::any_of(
+      model.operation_program.begin(), model.operation_program.end(),
+      [](const auto& operation) {
+        return operation.capability ==
+                   "block.full-attention.output-gated.v1" &&
+               operation.abi_version >= 2U;
+      });
   const auto vision = std::any_of(
       model.operation_program.begin(), model.operation_program.end(),
       [](const auto& operation) {
@@ -460,7 +474,9 @@ er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
   if ((split_recurrent && mamba2) || !query_heads || !kv_heads ||
       query_heads % kv_heads ||
       query_heads / kv_heads >
-          (standard_gqa ? ec::kMaximumExactFp16GroupedQueryHeads : 8U) ||
+          ((standard_gqa || normalized_gated_gqa)
+               ? ec::kMaximumExactFp16GroupedQueryHeads
+               : 8U) ||
       !head_dim || head_dim > 256U ||
       head_dim % 32U || !rotary || rotary > head_dim || rotary % 2U ||
       (model.exact_decode_program.has_value() && mtp != 1U) ||
@@ -538,10 +554,10 @@ std::vector<er::KernelCapability> provider_capabilities() {
     return validate_dense_fp4_descriptor(model);
   };
   return {
-      {"embedding.lookup.fp4-block32.v1", 1U, 1U, validator},
+      {"embedding.lookup.fp4-block32.v1", 1U, 2U, validator},
       {"vision.patch-transformer-merge.fp4-block32.v1", 1U, 1U,
        validator},
-      {"block.full-attention.output-gated.v1", 1U, 1U, validator},
+      {"block.full-attention.output-gated.v1", 1U, 2U, validator},
       {"block.full-attention.standard-gqa.v1", 1U, 1U, validator},
       {"block.full-attention.standard-gqa-no-position.v1", 1U, 1U,
        validator},
@@ -552,9 +568,9 @@ std::vector<er::KernelCapability> provider_capabilities() {
       {"router.sigmoid-bias.topk.shared-relu2.v1", 1U, 1U, validator},
       {"moe.swiglu.routed.merge-shared.v1", 1U, 1U, validator},
       {"moe.relu2.routed.merge-shared.v1", 1U, 1U, validator},
-      {"ffn.swiglu.dense.fp4-block32.v1", 1U, 1U, validator},
+      {"ffn.swiglu.dense.fp4-block32.v1", 1U, 2U, validator},
       {"head.rmsnorm.argmax.fp4-block32.v1", 1U, 1U, validator},
-      {"head.rmsnorm.token-select.fp4-block32.v1", 1U, 1U, validator},
+      {"head.rmsnorm.token-select.fp4-block32.v1", 1U, 2U, validator},
       {"decode.mtp.dense-full-attention.fp4-block32.exact.v1", 1U, 1U,
        validator},
   };
@@ -1329,10 +1345,13 @@ class Fp4RoutedExperts final {
 struct PreparedOperation final : er::IPreparedOperation {
   Kernel kernel{};
   std::string capability;
+  std::uint32_t abi_version{};
   std::uint32_t logical_operation{};
   std::uint32_t logical_layer{};
   std::uint32_t component_layer{};
   std::uint32_t full_attention_slot{};
+  std::uint32_t kv_layer_slot{};
+  std::uint32_t attention_window_tokens{};
   std::uint32_t recurrent_slot{};
   std::map<std::string, std::uint64_t, std::less<>> parameters;
   std::map<std::string, const DeviceTensor*, std::less<>> tensors;
@@ -1470,6 +1489,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
           vision_spatial_merge_size_ * vision_spatial_merge_size_;
     }
     full_attention_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
+    global_kv_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
+    window_kv_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
     recurrent_slots_.assign(descriptor_.layer_program.size(), kNoSlot);
     for (const auto& operation : descriptor_.operation_program) {
       if (operation.logical_layer == er::kModelLevelOperationLayer) continue;
@@ -1478,8 +1499,30 @@ class DenseFp4Provider final : public er::IOperationProvider {
       if (operation.capability == "block.full-attention.output-gated.v1" ||
           operation.capability == "block.full-attention.standard-gqa.v1" ||
           operation.capability ==
-              "block.full-attention.standard-gqa-no-position.v1")
+              "block.full-attention.standard-gqa-no-position.v1") {
         full_attention_slots_[operation.logical_layer] = target_full_layers_++;
+        const auto window = operation.parameters.find(
+            "attention_window_tokens");
+        const auto window_tokens = window == operation.parameters.end()
+            ? 0U
+            : static_cast<std::uint32_t>(window->second);
+        if (window != operation.parameters.end() &&
+            (operation.abi_version < 2U || window->second > max_context_ ||
+             window->second > std::numeric_limits<std::uint32_t>::max()))
+          throw std::runtime_error("invalid artifact attention window");
+        if (window_tokens != 0U) {
+          if (window_tokens % kv_page_tokens_ != 0U)
+            throw std::runtime_error(
+                "attention window must align to KV pages");
+          if (window_tokens_ != 0U && window_tokens_ != window_tokens)
+            throw std::runtime_error(
+                "one provider instance requires one window geometry");
+          window_tokens_ = window_tokens;
+          window_kv_slots_[operation.logical_layer] = window_attention_layers_++;
+        } else {
+          global_kv_slots_[operation.logical_layer] = global_attention_layers_++;
+        }
+      }
       else if (operation.capability ==
                    "block.recurrent-linear-attention.split-gated-delta.v1" ||
                operation.capability == "block.mamba2.ssm.v1")
@@ -1495,16 +1538,46 @@ class DenseFp4Provider final : public er::IOperationProvider {
     const auto fp4_layer_page_bytes =
         2U * static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
         fp4_record_bytes;
-    maximum_pages_per_slot_ =
-        (max_context_ + kv_page_tokens_ - 1U) / kv_page_tokens_;
-    const auto fp16_target_page_bytes =
-        static_cast<std::uint64_t>(target_full_layers_) * 2U *
-        kv_page_tokens_ * kv_heads_ * head_dim_ * sizeof(std::uint16_t);
-    const auto fp16_full_context_bytes =
-        fp16_target_page_bytes * maximum_pages_per_slot_;
+    const auto maximum_pages =
+        (static_cast<std::uint64_t>(max_context_) + kv_page_tokens_ - 1U) /
+        kv_page_tokens_;
+    if (maximum_pages > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error("maximum KV page count overflows");
+    maximum_pages_per_slot_ = static_cast<std::uint32_t>(maximum_pages);
+    auto fp16_target_page_bytes = static_cast<std::uint64_t>(
+        global_attention_layers_);
+    for (const auto factor : std::array<std::uint64_t, 5U>{
+             2U, kv_page_tokens_, kv_heads_, head_dim_,
+             sizeof(std::uint16_t)})
+      fp16_target_page_bytes = checked_multiply(
+          fp16_target_page_bytes, factor, "global FP16 KV page size");
+    window_pages_per_slot_ = window_tokens_ == 0U
+        ? 0U
+        : window_tokens_ / kv_page_tokens_;
+    window_kv_page_bytes_ = window_attention_layers_;
+    for (const auto factor : std::array<std::uint64_t, 5U>{
+             2U, kv_page_tokens_, kv_heads_, head_dim_,
+             sizeof(std::uint16_t)})
+      window_kv_page_bytes_ = checked_multiply(
+          window_kv_page_bytes_, factor, "window FP16 KV page size");
+    window_kv_bytes_per_slot_ = checked_multiply(
+        window_kv_page_bytes_, window_pages_per_slot_,
+        "window FP16 KV slot size");
+    const auto global_context_bytes = checked_multiply(
+        fp16_target_page_bytes, maximum_pages_per_slot_,
+        "global FP16 KV context size");
+    const auto window_reservation_bytes = checked_multiply(
+        checked_multiply(2U, capacity_, "window FP16 KV reservation"),
+        window_kv_bytes_per_slot_, "window FP16 KV reservation");
+    const auto page_budget_bytes = window_reservation_bytes > kv_cache_bytes_
+        ? 0U
+        : kv_cache_bytes_ - window_reservation_bytes;
     device_resident_fp16_kv_ =
         exact_fp16_kv() && mtp_layers_ == 0U &&
-        fp16_full_context_bytes <= kv_cache_bytes_;
+        global_context_bytes <= page_budget_bytes;
+    if (window_attention_layers_ != 0U && !device_resident_fp16_kv_)
+      throw std::runtime_error(
+          "windowed exact attention must fit its mixed device KV layout");
     if (target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head) {
       const auto fp8_record_bytes =
           static_cast<std::uint64_t>(head_dim_) + sizeof(std::uint16_t);
@@ -1533,11 +1606,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
           static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     }
-    const auto maximum_service_pages =
-        static_cast<std::uint64_t>(capacity_) * maximum_pages_per_slot_;
+    const auto maximum_service_pages = checked_multiply(
+        capacity_, maximum_pages_per_slot_, "service KV page count");
     kv_page_capacity_ = kv_page_bytes_ == 0U
         ? maximum_service_pages
-        : std::min<std::uint64_t>(kv_cache_bytes_ / kv_page_bytes_,
+        : std::min<std::uint64_t>(page_budget_bytes / kv_page_bytes_,
                                   maximum_service_pages);
     if (!kv_page_capacity_)
       throw std::runtime_error("KV budget fits no physical page");
@@ -1576,6 +1649,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
       auto prepared = std::make_shared<PreparedOperation>();
       prepared->kernel = kernel_from_capability(context.operation.capability);
       prepared->capability = context.operation.capability;
+      prepared->abi_version = context.operation.abi_version;
       if (prepared->kernel == Kernel::exact_decode)
         throw std::runtime_error("exact decode is not a scalar operation");
       prepared->logical_operation = context.compiled.logical_operation;
@@ -1585,6 +1659,16 @@ class DenseFp4Provider final : public er::IOperationProvider {
       if (prepared->logical_layer != er::kModelLevelOperationLayer) {
         prepared->full_attention_slot =
             full_attention_slots_.at(prepared->logical_layer);
+        prepared->attention_window_tokens = [&] {
+          const auto found = prepared->parameters.find(
+              "attention_window_tokens");
+          return found == prepared->parameters.end()
+              ? 0U
+              : static_cast<std::uint32_t>(found->second);
+        }();
+        prepared->kv_layer_slot = prepared->attention_window_tokens == 0U
+            ? global_kv_slots_.at(prepared->logical_layer)
+            : window_kv_slots_.at(prepared->logical_layer);
         prepared->recurrent_slot = recurrent_slots_.at(prepared->logical_layer);
       }
       for (const auto& binding : context.tensors) {
@@ -1771,7 +1855,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_device_resident_fp16_kv",
              device_resident_fp16_kv() ? 1U : 0U},
             {"provider_authoritative_fp16_kv_bytes", host_kv_bytes_},
-            {"provider_parked_request_bytes", parked_session_bytes_},
+            {"provider_parked_request_bytes", parked_request_bytes_},
+            {"provider_parked_session_bytes", parked_session_bytes_},
             {"provider_request_park_calls", park_calls_},
             {"provider_request_restore_calls", restore_calls_},
             {"provider_park_device_to_host_bytes",
@@ -1779,6 +1864,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_restore_host_to_device_bytes",
              restore_host_to_device_bytes_},
             {"provider_target_kv_page_bytes", target_kv_page_bytes_},
+            {"provider_global_attention_layers", global_attention_layers_},
+            {"provider_window_attention_layers", window_attention_layers_},
+            {"provider_window_kv_tokens", window_tokens_},
+            {"provider_window_kv_bytes_per_slot",
+             window_kv_bytes_per_slot_},
             {"provider_mtp_kv_page_bytes", mtp_kv_page_bytes_},
             {"kv_allocated_pages", resident_pages},
             {"kv_physical_pages", all_kv_pages_.size()}};
@@ -1851,6 +1941,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::vector<std::uint32_t> page_indices;
     std::uint32_t logical_pages{};
     std::uint64_t page_payload_bytes{};
+    std::uint64_t window_payload_bytes{};
     std::uint64_t bytes{};
     std::uint64_t reported_bytes{};
   };
@@ -1946,6 +2037,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
       throw std::runtime_error("invalid floating-point program parameter " +
                                std::string(name));
     return result;
+  }
+
+  static float parameter_f32_or(
+      const std::map<std::string, std::uint64_t, std::less<>>& values,
+      std::string_view name, float fallback) {
+    if (!values.contains(name)) return fallback;
+    return parameter_f32(values, name);
   }
 
   std::uint32_t attribute_u32(std::string_view name) const {
@@ -2124,6 +2222,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
   void collect_gpu_phases();
   void normalize_rows(const float* input, const float* weight, float* output,
                       std::uint32_t rows);
+  void normalize_operation_input(const PreparedOperation& operation,
+                                 const float* input, float* output,
+                                 std::uint32_t rows);
+  void finish_attention_block(const PreparedOperation& operation,
+                              std::uint32_t rows);
+  void run_embedding(const PreparedOperation& operation,
+                     const std::uint32_t* tokens, std::uint32_t rows);
   void quantize_rows(const float* input, std::uint32_t rows,
                      std::uint32_t columns);
   void project_quantized(const DeviceTensor& weight, float* output,
@@ -2137,6 +2242,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
                   std::uint32_t prompt_rows, std::uint32_t tile_first,
                   std::uint32_t tile_rows, bool prepare);
   void ensure_page(std::uint32_t slot, std::uint32_t cache_position);
+  void checkpoint_window_layer(std::uint32_t slot,
+                               std::uint32_t window_layer);
+  void checkpoint_window_state(std::uint32_t slot);
+  void restore_window_checkpoint(std::uint32_t slot);
   void ensure_host_kv_page(RequestState& state, std::uint32_t cache_position);
   void trim_host_kv(RequestState& state, std::uint32_t populated_tokens)
       noexcept;
@@ -2216,6 +2325,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
   bool zero_centered_norm_{};
   std::uint32_t mtp_layers_{};
   std::uint32_t target_full_layers_{};
+  std::uint32_t global_attention_layers_{};
+  std::uint32_t window_attention_layers_{};
+  std::uint32_t window_tokens_{};
+  std::uint32_t window_pages_per_slot_{};
   std::uint32_t recurrent_layers_{};
   std::uint32_t intermediate_size_{};
   std::uint32_t expert_count_{};
@@ -2244,6 +2357,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float rope_theta_{};
   std::uint64_t kv_page_bytes_{};
   std::uint64_t target_kv_page_bytes_{};
+  std::uint64_t window_kv_page_bytes_{};
+  std::uint64_t window_kv_bytes_per_slot_{};
   std::uint64_t mtp_kv_page_offset_{};
   std::uint64_t mtp_kv_page_bytes_{};
   std::uint64_t service_kv_page_bytes_{};
@@ -2290,6 +2405,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::vector<GpuEventPair> gpu_event_pool_;
   std::size_t active_gpu_events_{};
   std::vector<std::uint32_t> full_attention_slots_;
+  std::vector<std::uint32_t> global_kv_slots_;
+  std::vector<std::uint32_t> window_kv_slots_;
   std::vector<std::uint32_t> recurrent_slots_;
   std::vector<std::shared_ptr<PreparedOperation>> prepared_target_;
   std::shared_ptr<PreparedOperation> exact_;
@@ -2391,6 +2508,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float* slot_retention_last_hidden_{};
   void** device_page_table_{};
   void** device_mtp_page_table_{};
+  void** device_window_page_table_{};
+  std::byte* window_kv_{};
+  std::byte* window_retention_kv_{};
   std::vector<std::vector<void*>> slot_pages_;
   std::vector<void*> free_kv_pages_;
   std::vector<void*> all_kv_pages_;
@@ -2402,6 +2522,12 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
     case Kernel::embedding:
       expect_shape(binding(operation, "weight"),
                    {vocabulary_size_, hidden_size_}, "FP4_E2M1");
+      if (operation.abi_version >= 2U) {
+        if (parameter_u32(operation.parameters, "output_norm_mode") != 1U)
+          throw std::runtime_error("unsupported embedding ABI 2 norm mode");
+        static_cast<void>(parameter_f32(
+            operation.parameters, "output_norm_epsilon_f32_bits"));
+      }
       break;
     case Kernel::vision: {
       if (!vision_enabled_ ||
@@ -2460,15 +2586,17 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
                    {vision_output_size_}, "F32");
       break;
     }
-    case Kernel::full_attention:
+    case Kernel::full_attention: {
       if (operation.full_attention_slot == kNoSlot)
         throw std::runtime_error("full attention has no artifact slot");
       expect_shape(binding(operation, "input_norm"), {hidden_size_}, "F32");
+      const auto separated_gate = operation.abi_version >= 2U;
       expect_shape(
           binding(operation, "query_projection"),
           {((operation.capability == "block.full-attention.standard-gqa.v1" ||
              operation.capability ==
-                 "block.full-attention.standard-gqa-no-position.v1")
+                 "block.full-attention.standard-gqa-no-position.v1" ||
+             separated_gate)
                 ? query_heads_
                 : 2U * query_heads_) * head_dim_,
            hidden_size_},
@@ -2479,7 +2607,34 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
                    {kv_heads_ * head_dim_, hidden_size_}, "FP4_E2M1");
       expect_shape(binding(operation, "output_projection"),
                    {hidden_size_, query_heads_ * head_dim_}, "FP4_E2M1");
-      if (operation.capability != "block.full-attention.standard-gqa.v1" &&
+      if (separated_gate) {
+        expect_shape(binding(operation, "gate_projection"),
+                     {query_heads_ * head_dim_, hidden_size_}, "FP4_E2M1");
+        expect_shape(binding(operation, "post_norm"), {hidden_size_}, "F32");
+        if (!device_resident_fp16_kv() ||
+            parameter_u32(operation.parameters, "input_norm_mode") > 1U ||
+            parameter_u32(operation.parameters, "qk_norm_mode") != 1U ||
+            parameter_u32(operation.parameters, "post_norm_mode") > 1U ||
+            parameter_u32(operation.parameters, "rotary_enabled") > 1U ||
+            parameter_u32(operation.parameters, "attention_window_tokens") !=
+                operation.attention_window_tokens)
+          throw std::runtime_error(
+              "output-gated attention ABI 2 contract is invalid");
+        static_cast<void>(parameter_f32(
+            operation.parameters, "input_norm_epsilon_f32_bits"));
+        static_cast<void>(parameter_f32(
+            operation.parameters, "qk_norm_epsilon_f32_bits"));
+        static_cast<void>(parameter_f32(
+            operation.parameters, "query_scale_f32_bits"));
+        static_cast<void>(parameter_f32(
+            operation.parameters, "post_norm_epsilon_f32_bits"));
+        if (parameter_u32(operation.parameters, "rotary_enabled") != 0U)
+          static_cast<void>(parameter_f32(
+              operation.parameters, "rope_theta_f32_bits"));
+        if (operation.kv_layer_slot == kNoSlot)
+          throw std::runtime_error("attention ABI 2 has no physical KV slot");
+      } else if (operation.capability !=
+                     "block.full-attention.standard-gqa.v1" &&
           operation.capability !=
               "block.full-attention.standard-gqa-no-position.v1") {
         expect_shape(binding(operation, "query_norm"), {head_dim_}, "F32");
@@ -2489,6 +2644,7 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
             "standard GQA requires device-resident exact FP16 KV");
       }
       break;
+    }
     case Kernel::recurrent_attention: {
       if (operation.recurrent_slot == kNoSlot)
         throw std::runtime_error("recurrent attention has no artifact slot");
@@ -2581,6 +2737,16 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
       break;
     case Kernel::ffn: {
       expect_shape(binding(operation, "input_norm"), {hidden_size_}, "F32");
+      if (operation.abi_version >= 2U) {
+        expect_shape(binding(operation, "post_norm"), {hidden_size_}, "F32");
+        if (parameter_u32(operation.parameters, "input_norm_mode") > 1U ||
+            parameter_u32(operation.parameters, "post_norm_mode") > 1U)
+          throw std::runtime_error("dense FFN ABI 2 norm mode is invalid");
+        static_cast<void>(parameter_f32(
+            operation.parameters, "input_norm_epsilon_f32_bits"));
+        static_cast<void>(parameter_f32(
+            operation.parameters, "post_norm_epsilon_f32_bits"));
+      }
       const auto& gate = binding(operation, "gate_projection");
       const auto& up = binding(operation, "up_projection");
       if (gate.encoding != "FP4_E2M1" || gate.shape.size() != 2U ||
@@ -2599,6 +2765,12 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
       expect_shape(binding(operation, "norm"), {hidden_size_}, "F32");
       expect_shape(binding(operation, "weight"),
                    {vocabulary_size_, hidden_size_}, "FP4_E2M1");
+      if (operation.abi_version >= 2U) {
+        static_cast<void>(parameter_f32(
+            operation.parameters, "logit_multiplier_f32_bits"));
+        static_cast<void>(parameter_f32(
+            operation.parameters, "logit_softcap_f32_bits"));
+      }
       break;
     case Kernel::exact_decode:
       throw std::runtime_error("exact decode reached scalar validation");
@@ -2972,6 +3144,34 @@ void DenseFp4Provider::allocate_state() {
   } else {
     device_mtp_page_table_ = device_page_table_;
   }
+  if (window_attention_layers_ != 0U) {
+    if (!window_kv_bytes_per_slot_ || !window_pages_per_slot_)
+      throw std::runtime_error("window KV geometry is empty");
+    const auto window_bytes = static_cast<std::size_t>(capacity_) *
+                              window_kv_bytes_per_slot_;
+    window_kv_ = device_allocate<std::byte>(allocations_, window_bytes);
+    window_retention_kv_ =
+        device_allocate<std::byte>(allocations_, window_bytes);
+    device_window_page_table_ = device_allocate<void*>(
+        allocations_, static_cast<std::size_t>(capacity_) *
+                          maximum_pages_per_slot_);
+    std::vector<void*> table(static_cast<std::size_t>(capacity_) *
+                             maximum_pages_per_slot_);
+    for (std::uint32_t slot = 0U; slot < capacity_; ++slot) {
+      auto* slot_base = window_kv_ +
+          static_cast<std::size_t>(slot) * window_kv_bytes_per_slot_;
+      for (std::uint32_t page = 0U; page < maximum_pages_per_slot_; ++page)
+        table[static_cast<std::size_t>(slot) * maximum_pages_per_slot_ + page] =
+            slot_base + static_cast<std::size_t>(page % window_pages_per_slot_) *
+                            window_kv_page_bytes_;
+    }
+    cuda_check(cudaMemcpy(device_window_page_table_, table.data(),
+                          table.size() * sizeof(table[0]),
+                          cudaMemcpyHostToDevice),
+               "publish cyclic window KV page table");
+  } else {
+    device_window_page_table_ = device_page_table_;
+  }
   slot_pages_.assign(capacity_,
                      std::vector<void*>(maximum_pages_per_slot_, nullptr));
 }
@@ -3236,6 +3436,79 @@ void DenseFp4Provider::normalize_rows(const float* input, const float* weight,
   else
     status_check(ec::rms_norm_batch(input, weight, output, rows, hidden_size_,
                                     epsilon_, nullptr));
+}
+
+void DenseFp4Provider::normalize_operation_input(
+    const PreparedOperation& operation, const float* input, float* output,
+    std::uint32_t rows) {
+  if (operation.abi_version < 2U) {
+    normalize_rows(input, binding(operation, "input_norm").f32, output, rows);
+    return;
+  }
+  const auto mode = parameter_u32(operation.parameters, "input_norm_mode");
+  const auto epsilon = parameter_f32(
+      operation.parameters, "input_norm_epsilon_f32_bits");
+  if (mode == 0U)
+    status_check(ec::rms_norm_batch(
+        input, binding(operation, "input_norm").f32, output, rows,
+        hidden_size_, epsilon, nullptr));
+  else if (mode == 1U)
+    status_check(ec::zero_centered_rms_norm_batch(
+        input, binding(operation, "input_norm").f32, output, rows,
+        hidden_size_, epsilon, nullptr));
+  else
+    throw std::runtime_error("unsupported operation input norm mode");
+}
+
+void DenseFp4Provider::finish_attention_block(
+    const PreparedOperation& operation, std::uint32_t rows) {
+  const auto values = rows * hidden_size_;
+  if (operation.abi_version < 2U) {
+    status_check(ec::add_in_place(hidden_, residual_, values, nullptr));
+    return;
+  }
+  const auto mode = parameter_u32(operation.parameters, "post_norm_mode");
+  const auto epsilon = parameter_f32(
+      operation.parameters, "post_norm_epsilon_f32_bits");
+  if (mode == 0U)
+    status_check(ec::rms_norm_batch(
+        residual_, binding(operation, "post_norm").f32, normalized_, rows,
+        hidden_size_, epsilon, nullptr));
+  else if (mode == 1U)
+    status_check(ec::zero_centered_rms_norm_batch(
+        residual_, binding(operation, "post_norm").f32, normalized_, rows,
+        hidden_size_, epsilon, nullptr));
+  else
+    throw std::runtime_error("unsupported attention post norm mode");
+  status_check(ec::add_in_place(hidden_, normalized_, values, nullptr));
+}
+
+void DenseFp4Provider::run_embedding(
+    const PreparedOperation& operation, const std::uint32_t* tokens,
+    std::uint32_t rows) {
+  if (!tokens || !rows || rows > kWorkspaceRows)
+    throw std::runtime_error("invalid embedding batch");
+  cuda_check(cudaMemcpy(output_tokens_, tokens,
+                        static_cast<std::size_t>(rows) * sizeof(tokens[0]),
+                        cudaMemcpyHostToDevice),
+             "upload embedding token batch");
+  status_check(ec::fp4_embedding_batch(
+      binding(operation, "weight").matrix(), output_tokens_, hidden_, rows,
+      nullptr));
+  if (operation.abi_version >= 2U) {
+    if (parameter_u32(operation.parameters, "output_norm_mode") != 1U)
+      throw std::runtime_error("unsupported embedding output norm mode");
+    status_check(ec::weightless_rms_norm_batch(
+        hidden_, normalized_, rows, hidden_size_,
+        parameter_f32(operation.parameters,
+                      "output_norm_epsilon_f32_bits"),
+        nullptr));
+    cuda_check(cudaMemcpy(hidden_, normalized_,
+                          static_cast<std::size_t>(rows) * hidden_size_ *
+                              sizeof(float),
+                          cudaMemcpyDeviceToDevice),
+               "apply embedding output norm");
+  }
 }
 
 void DenseFp4Provider::quantize_rows(const float* input, std::uint32_t rows,
@@ -3588,6 +3861,51 @@ void DenseFp4Provider::ensure_page(std::uint32_t slot,
   }
 }
 
+void DenseFp4Provider::checkpoint_window_layer(
+    std::uint32_t slot, std::uint32_t window_layer) {
+  if (window_attention_layers_ == 0U) return;
+  if (slot >= capacity_ || window_layer >= window_attention_layers_)
+    throw std::runtime_error("window checkpoint layer is invalid");
+  const auto layer_page_bytes =
+      2U * static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
+      head_dim_ * sizeof(std::uint16_t);
+  const auto slot_offset =
+      static_cast<std::uint64_t>(slot) * window_kv_bytes_per_slot_;
+  for (std::uint32_t page = 0U; page < window_pages_per_slot_; ++page) {
+    const auto offset = slot_offset +
+        static_cast<std::uint64_t>(page) * window_kv_page_bytes_ +
+        static_cast<std::uint64_t>(window_layer) * layer_page_bytes;
+    cuda_check(cudaMemcpy(window_retention_kv_ + offset, window_kv_ + offset,
+                          static_cast<std::size_t>(layer_page_bytes),
+                          cudaMemcpyDeviceToDevice),
+               "checkpoint window-attention layer");
+  }
+}
+
+void DenseFp4Provider::checkpoint_window_state(std::uint32_t slot) {
+  if (window_attention_layers_ == 0U) return;
+  if (slot >= capacity_)
+    throw std::runtime_error("window checkpoint slot is invalid");
+  const auto offset =
+      static_cast<std::uint64_t>(slot) * window_kv_bytes_per_slot_;
+  cuda_check(cudaMemcpy(window_retention_kv_ + offset, window_kv_ + offset,
+                        static_cast<std::size_t>(window_kv_bytes_per_slot_),
+                        cudaMemcpyDeviceToDevice),
+             "checkpoint window-attention state");
+}
+
+void DenseFp4Provider::restore_window_checkpoint(std::uint32_t slot) {
+  if (window_attention_layers_ == 0U) return;
+  if (slot >= capacity_)
+    throw std::runtime_error("window rewind slot is invalid");
+  const auto offset =
+      static_cast<std::uint64_t>(slot) * window_kv_bytes_per_slot_;
+  cuda_check(cudaMemcpy(window_kv_ + offset, window_retention_kv_ + offset,
+                        static_cast<std::size_t>(window_kv_bytes_per_slot_),
+                        cudaMemcpyDeviceToDevice),
+             "rewind window-attention state");
+}
+
 void DenseFp4Provider::ensure_host_kv_page(
     RequestState& state, std::uint32_t cache_position) {
   if (!host_authoritative_fp16_kv()) return;
@@ -3634,7 +3952,8 @@ void DenseFp4Provider::trim_host_kv(
     RequestState& state, std::uint32_t populated_tokens) noexcept {
   const auto pages = populated_tokens == 0U
       ? 0U
-      : (populated_tokens + kv_page_tokens_ - 1U) / kv_page_tokens_;
+      : (static_cast<std::uint64_t>(populated_tokens) + kv_page_tokens_ - 1U) /
+            kv_page_tokens_;
   const auto page_bytes = static_cast<std::uint64_t>(target_full_layers_) *
                           2U * kv_page_tokens_ * kv_heads_ * head_dim_ *
                           sizeof(std::uint16_t);
@@ -3686,6 +4005,102 @@ void DenseFp4Provider::run_full_attention(
   project_quantized(binding(operation, "query_projection"), query_gate_, rows);
   project_quantized(binding(operation, "key_projection"), key_, rows);
   project_quantized(binding(operation, "value_projection"), value_, rows);
+  if (operation.abi_version >= 2U) {
+    if (!device_resident_fp16_kv() || !mrope_positions.empty() ||
+        operation.kv_layer_slot == kNoSlot ||
+        cache_positions.back() >= max_context_)
+      throw std::runtime_error(
+          "normalized output-gated GQA requires device FP16 KV");
+    project_quantized(binding(operation, "gate_projection"), gate_, rows);
+    const auto windowed = operation.attention_window_tokens != 0U;
+    auto** selected_table = windowed ? device_window_page_table_
+                                     : device_page_table_;
+    if (!windowed)
+      for (const auto position : cache_positions) ensure_page(slot, position);
+    const auto* page_table = reinterpret_cast<const void* const*>(
+        selected_table + static_cast<std::size_t>(slot) *
+                             maximum_pages_per_slot_);
+    const auto rotary_enabled =
+        parameter_u32(operation.parameters, "rotary_enabled") != 0U;
+    status_check(ec::normalized_gqa_qkv_fp16_batch(
+        query_gate_, key_, value_, staged_raw_keys_, staged_raw_values_,
+        rotary_positions.front(), rows, query_heads_, kv_heads_, head_dim_,
+        rotary_dimension_,
+        parameter_f32(operation.parameters, "qk_norm_epsilon_f32_bits"),
+        parameter_f32(operation.parameters, "query_scale_f32_bits"),
+        parameter_f32_or(operation.parameters, "rope_theta_f32_bits", 1.0F),
+        rotary_enabled, nullptr));
+
+    const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
+                              query_heads_ * head_dim_;
+    const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
+                                  staged_split_tokens_ * head_dim_;
+    const auto score_values = static_cast<std::size_t>(kWorkspaceRows) *
+                              query_heads_ * staged_split_tokens_;
+    const ec::HostFp16GatedGqaAttentionWorkspace workspace{
+        staged_queries_, query_values * sizeof(std::uint16_t),
+        staged_raw_keys_, staged_kv_values * sizeof(std::uint16_t),
+        staged_raw_values_, staged_kv_values * sizeof(std::uint16_t),
+        staged_keys_, staged_kv_values * sizeof(std::uint16_t),
+        staged_values_, staged_kv_values * sizeof(std::uint16_t),
+        staged_scores_, score_values * sizeof(float),
+        staged_probabilities_, score_values * sizeof(std::uint16_t),
+        staged_accumulator_, query_values * sizeof(float), partial_maxima_,
+        static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+            sizeof(float),
+        partial_sums_, static_cast<std::size_t>(kWorkspaceRows) *
+                           query_heads_ * sizeof(float),
+        staged_split_tokens_};
+    const auto q_row_values =
+        static_cast<std::size_t>(query_heads_) * head_dim_;
+    const auto kv_row_values =
+        static_cast<std::size_t>(kv_heads_) * head_dim_;
+    const auto execute_rows = [&](std::uint32_t first_row,
+                                  std::uint32_t count) {
+      status_check(ec::store_gqa_kv_fp16_to_paged(
+          staged_raw_keys_ + static_cast<std::size_t>(first_row) *
+                                 kv_row_values,
+          staged_raw_values_ + static_cast<std::size_t>(first_row) *
+                                   kv_row_values,
+          page_table, operation.kv_layer_slot, kv_page_tokens_,
+          cache_positions[first_row], count, kv_heads_, head_dim_, nullptr));
+      ec::DeviceFp16GatedGqaAttentionLaunch launch{};
+      launch.q_and_gate = query_gate_ +
+          static_cast<std::size_t>(first_row) * q_row_values;
+      launch.output = attention_ +
+          static_cast<std::size_t>(first_row) * q_row_values;
+      launch.cache_capacity = max_context_;
+      launch.first_context_tokens = cache_positions[first_row] + 1U;
+      launch.retained_first_token = windowed &&
+              launch.first_context_tokens > operation.attention_window_tokens
+          ? launch.first_context_tokens - operation.attention_window_tokens
+          : 0U;
+      launch.rows = count;
+      launch.query_heads = query_heads_;
+      launch.kv_heads = kv_heads_;
+      launch.head_dim = head_dim_;
+      launch.device_pages = page_table;
+      launch.device_page_layer = operation.kv_layer_slot;
+      launch.device_page_tokens = kv_page_tokens_;
+      launch.device_page_count = maximum_pages_per_slot_;
+      launch.output_gated = false;
+      status_check(
+          ec::gated_gqa_attention_staged_device_fp16(launch, workspace));
+    };
+    if (windowed) {
+      // Publishing a future row can overwrite a cyclic entry still required
+      // by an earlier row in the same microbatch. Execute windowed attention
+      // row-by-row after the shared projection to preserve exact causality.
+      for (std::uint32_t row = 0U; row < rows; ++row) execute_rows(row, 1U);
+    } else {
+      execute_rows(0U, rows);
+    }
+    status_check(ec::sigmoid_product_in_place(
+        attention_, gate_, rows * query_heads_ * head_dim_, nullptr));
+    project(binding(operation, "output_projection"), attention_, residual_,
+            rows);
+    return;
+  }
   if (operation.capability == "block.full-attention.standard-gqa.v1" ||
       operation.capability ==
           "block.full-attention.standard-gqa-no-position.v1") {
@@ -4233,16 +4648,38 @@ void DenseFp4Provider::run_ffn(const PreparedOperation& operation,
                             sizeof(float),
                         cudaMemcpyDeviceToDevice),
              "retain FFN residual");
-  normalize_rows(hidden_, binding(operation, "input_norm").f32, normalized_,
-                 rows);
+  normalize_operation_input(operation, hidden_, normalized_, rows);
   quantize_rows(normalized_, rows, hidden_size_);
   project_quantized(binding(operation, "gate_projection"), gate_, rows);
   project_quantized(binding(operation, "up_projection"), up_, rows);
   status_check(ec::silu_product(gate_, up_, intermediate_,
                                 rows * intermediate_size_, nullptr));
   project(binding(operation, "down_projection"), intermediate_, hidden_, rows);
-  status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
-                                nullptr));
+  if (operation.abi_version < 2U) {
+    status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
+                                  nullptr));
+  } else {
+    const auto mode = parameter_u32(operation.parameters, "post_norm_mode");
+    const auto epsilon = parameter_f32(
+        operation.parameters, "post_norm_epsilon_f32_bits");
+    if (mode == 0U)
+      status_check(ec::rms_norm_batch(
+          hidden_, binding(operation, "post_norm").f32, normalized_, rows,
+          hidden_size_, epsilon, nullptr));
+    else if (mode == 1U)
+      status_check(ec::zero_centered_rms_norm_batch(
+          hidden_, binding(operation, "post_norm").f32, normalized_, rows,
+          hidden_size_, epsilon, nullptr));
+    else
+      throw std::runtime_error("unsupported FFN post norm mode");
+    status_check(ec::add_in_place(normalized_, residual_,
+                                  rows * hidden_size_, nullptr));
+    cuda_check(cudaMemcpy(hidden_, normalized_,
+                          static_cast<std::size_t>(rows) * hidden_size_ *
+                              sizeof(float),
+                          cudaMemcpyDeviceToDevice),
+               "commit post-normalized FFN update");
+  }
 }
 
 std::vector<std::uint32_t> DenseFp4Provider::run_head(
@@ -4257,6 +4694,12 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
   normalize_rows(head_input, binding(operation, "norm").f32, normalized_,
                  head_rows);
   project(binding(operation, "weight"), normalized_, logits_, head_rows);
+  if (operation.abi_version >= 2U)
+    status_check(ec::scaled_tanh_in_place(
+        logits_, head_rows * vocabulary_size_,
+        parameter_f32(operation.parameters, "logit_multiplier_f32_bits"),
+        parameter_f32(operation.parameters, "logit_softcap_f32_bits"),
+        nullptr));
   if (request != nullptr &&
       request_parameter(*request, "sampling_temperature_ppm") != 0U) {
     if (head_rows != 1U)
@@ -4328,13 +4771,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
           if (tokens[row] >= vocabulary_size_)
             throw std::runtime_error("target token exceeds vocabulary");
         }
-        cuda_check(cudaMemcpy(output_tokens_, tokens.data(),
-                              rows * sizeof(tokens[0]),
-                              cudaMemcpyHostToDevice),
-                   "upload target token batch");
-        status_check(ec::fp4_embedding_batch(
-            binding(operation, "weight").matrix(), output_tokens_, hidden_,
-            rows, nullptr));
+        run_embedding(operation, tokens.data(), rows);
         break;
       case Kernel::vision:
         break;
@@ -4344,8 +4781,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
                                   sizeof(float),
                               cudaMemcpyDeviceToDevice),
                    "retain target attention residual");
-        normalize_rows(hidden_, binding(operation, "input_norm").f32,
-                       normalized_, rows);
+        normalize_operation_input(operation, hidden_, normalized_, rows);
         std::array<std::uint32_t, kWorkspaceRows> rotary{};
         for (std::uint32_t row = 0U; row < rows; ++row) {
           const auto adjusted = static_cast<std::int64_t>(positions[row]) +
@@ -4358,8 +4794,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
         run_full_attention(operation, state, positions,
                            std::span(rotary).first(rows), rows,
                            operation.full_attention_slot);
-        status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
-                                      nullptr));
+        finish_attention_block(operation, rows);
         break;
       }
       case Kernel::recurrent_attention:
@@ -4709,7 +5144,13 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
     auto sequence = std::make_shared<SequenceState>();
     sequence->request = request;
     sequence->generation = invocation.request;
+    // The request flag expresses service intent.  Only arm the provider-side
+    // synchronization contract when this artifact actually published and
+    // prepared an exact-decode program; otherwise a normal target-only
+    // prefill would leave rows waiting for a synchronization the executor
+    // cannot issue.
     request->exact_decode_enabled =
+        exact_ &&
         request_parameter(invocation.request, "exact_decode_enabled") != 0U;
     const auto retention =
         invocation.request.parameters.find("retention_checkpoint_position");
@@ -4859,6 +5300,7 @@ er::Status DenseFp4Provider::checkpoint_request_state(
                    slot_last_hidden(state->slot()),
                    hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
                "checkpoint retained target hidden state");
+    checkpoint_window_state(state->slot());
     state->retention_position = next_position;
     state->retention_valid = true;
     return er::Status::success();
@@ -4900,6 +5342,7 @@ er::Status DenseFp4Provider::rewind_request_state(
                        static_cast<std::size_t>(state->slot()) * hidden_size_,
                    hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
                "rewind retained target hidden state");
+    restore_window_checkpoint(state->slot());
     if (host_authoritative_fp16_kv()) trim_host_kv(*state, next_position);
     state->current_position = next_position - 1U;
     state->current_batch_first = next_position - 1U;
@@ -4931,8 +5374,9 @@ er::RequestStateParkingResult DenseFp4Provider::park_request_state(
         state->synchronization_rows != 0U)
       throw std::runtime_error("request state is not parkable");
 
-    const auto page_count = static_cast<std::uint64_t>(
-        (next_position + kv_page_tokens_ - 1U) / kv_page_tokens_);
+    const auto page_count =
+        (static_cast<std::uint64_t>(next_position) + kv_page_tokens_ - 1U) /
+        kv_page_tokens_;
     if (host_authoritative_fp16_kv() &&
         (state->host_kv_populated_tokens < next_position ||
          state->host_kv_pages.size() < page_count))
@@ -4960,9 +5404,12 @@ er::RequestStateParkingResult DenseFp4Provider::park_request_state(
                                    kv_page_bytes_))
       throw std::runtime_error("parked KV byte count overflows");
     const auto page_bytes = resident_page_count * kv_page_bytes_;
-    if (state_bytes > std::numeric_limits<std::uint64_t>::max() - page_bytes)
+    const auto window_bytes = window_kv_bytes_per_slot_;
+    if (page_bytes > std::numeric_limits<std::uint64_t>::max() - window_bytes ||
+        state_bytes > std::numeric_limits<std::uint64_t>::max() -
+                          page_bytes - window_bytes)
       throw std::runtime_error("parked request byte count overflows");
-    const auto required_bytes = page_bytes + state_bytes;
+    const auto required_bytes = page_bytes + window_bytes + state_bytes;
     if (required_bytes > parking_ram_capacity_bytes_ ||
         host_kv_bytes_ + parked_request_bytes_ >
             parking_ram_capacity_bytes_ - required_bytes)
@@ -4981,6 +5428,7 @@ er::RequestStateParkingResult DenseFp4Provider::park_request_state(
       throw std::runtime_error("parked request geometry overflows");
     parked.logical_pages = static_cast<std::uint32_t>(page_count);
     parked.page_payload_bytes = page_bytes;
+    parked.window_payload_bytes = window_bytes;
     parked.page_indices.reserve(static_cast<std::size_t>(resident_page_count));
     parked.payload.allocate(static_cast<std::size_t>(required_bytes));
     const auto slot = state->slot();
@@ -5000,6 +5448,16 @@ er::RequestStateParkingResult DenseFp4Provider::park_request_state(
     }
 
     std::size_t payload_offset = static_cast<std::size_t>(page_bytes);
+    if (window_bytes != 0U) {
+      cuda_check(cudaMemcpyAsync(
+                     parked.payload.data + payload_offset,
+                     window_kv_ + static_cast<std::size_t>(slot) *
+                                      window_kv_bytes_per_slot_,
+                     static_cast<std::size_t>(window_bytes),
+                     cudaMemcpyDeviceToHost, parking_stream_),
+                 "park window-attention state");
+      payload_offset += static_cast<std::size_t>(window_bytes);
+    }
     const auto copy_layers = [&](const std::vector<float*>& sources,
                                  std::size_t values, std::string_view label) {
       for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
@@ -5103,8 +5561,12 @@ er::RequestStateParkingResult DenseFp4Provider::restore_request_state(
         static_cast<std::uint64_t>(parked.page_indices.size());
     if (page_count > maximum_pages_per_slot_ ||
         parked.page_payload_bytes != resident_page_count * kv_page_bytes_ ||
+        parked.window_payload_bytes != window_kv_bytes_per_slot_ ||
         parked.payload.bytes != parked.bytes)
       throw std::runtime_error("parked request blob is invalid");
+    if (parked.bytes > parked_request_bytes_ ||
+        parked.reported_bytes > parked_session_bytes_)
+      throw std::runtime_error("parked request accounting underflow");
     const auto unallocated = kv_page_capacity_ - all_kv_pages_.size();
     if (resident_page_count > free_kv_pages_.size() + unallocated)
       return {{er::ErrorCode::backpressure,
@@ -5159,6 +5621,25 @@ er::RequestStateParkingResult DenseFp4Provider::restore_request_state(
       const auto matrix_values = recurrent_matrix_values_;
       std::size_t payload_offset =
           static_cast<std::size_t>(parked.page_payload_bytes);
+      if (parked.window_payload_bytes != 0U) {
+        auto* window = window_kv_ +
+            static_cast<std::size_t>(slot) * window_kv_bytes_per_slot_;
+        cuda_check(cudaMemcpyAsync(
+                       window, parked.payload.data + payload_offset,
+                       static_cast<std::size_t>(parked.window_payload_bytes),
+                       cudaMemcpyHostToDevice, parking_stream_),
+                   "restore window-attention state");
+        cuda_check(cudaMemcpyAsync(
+                       window_retention_kv_ +
+                           static_cast<std::size_t>(slot) *
+                               window_kv_bytes_per_slot_,
+                       parked.payload.data + payload_offset,
+                       static_cast<std::size_t>(parked.window_payload_bytes),
+                       cudaMemcpyHostToDevice, parking_stream_),
+                   "initialize retained window-attention state");
+        payload_offset +=
+            static_cast<std::size_t>(parked.window_payload_bytes);
+      }
       const auto restore_layers = [&](const std::vector<float*>& destinations,
                                       std::size_t values,
                                       std::string_view label) {
@@ -5272,10 +5753,6 @@ er::RequestStateParkingResult DenseFp4Provider::restore_request_state(
     slot_rope_deltas_[slot] = state->rope_delta;
     const auto bytes = parked.bytes;
     const auto reported_bytes = parked.reported_bytes;
-    if (bytes > parked_request_bytes_)
-      throw std::runtime_error("parked request accounting underflow");
-    if (reported_bytes > parked_session_bytes_)
-      throw std::runtime_error("parked session accounting underflow");
     parked_request_bytes_ -= bytes;
     parked_session_bytes_ -= reported_bytes;
     state->parked_state.reset();
@@ -5457,13 +5934,7 @@ DenseFp4Provider::poll_program_sequence(
     bool phase_ended = false;
     std::uint32_t operation_advance = 1U;
     if (operation.kernel == Kernel::embedding) {
-      cuda_check(cudaMemcpy(output_tokens_, sequence->tokens.data() + offset,
-                            rows * sizeof(std::uint32_t),
-                            cudaMemcpyHostToDevice),
-                 "upload program-sequence token chunk");
-      status_check(ec::fp4_embedding_batch(
-          binding(operation, "weight").matrix(), output_tokens_, hidden_, rows,
-          nullptr));
+      run_embedding(operation, sequence->tokens.data() + offset, rows);
       cuda_check(cudaMemcpy(
                      tile_hidden + tile_offset * hidden_size_, hidden_,
                      hidden_bytes, cudaMemcpyDeviceToDevice),
@@ -5484,8 +5955,11 @@ DenseFp4Provider::poll_program_sequence(
                                     sizeof(float),
                                 cudaMemcpyDeviceToDevice),
                      "retain program-sequence attention residual");
-          normalize_rows(hidden_, binding(operation, "input_norm").f32,
-                         normalized_, rows);
+          if (operation.kernel == Kernel::full_attention)
+            normalize_operation_input(operation, hidden_, normalized_, rows);
+          else
+            normalize_rows(hidden_, binding(operation, "input_norm").f32,
+                           normalized_, rows);
           const auto positions = std::span(sequence->positions)
                                      .subspan(offset, rows);
           if (operation.kernel == Kernel::full_attention) {
@@ -5511,6 +5985,13 @@ DenseFp4Provider::poll_program_sequence(
                     ? std::span<const std::uint32_t>{}
                     : std::span(sequence->media.positions_thw)
                           .subspan(3U * offset, 3U * rows));
+            if (operation.attention_window_tokens != 0U &&
+                sequence->retention_position != 0U &&
+                offset + rows == static_cast<std::size_t>(
+                                     sequence->retention_position -
+                                     sequence->positions.front()))
+              checkpoint_window_layer(sequence->request->slot(),
+                                      operation.kv_layer_slot);
           } else
             run_recurrent_attention(operation, sequence->request->slot(), rows,
                                     false);
@@ -5544,8 +6025,11 @@ DenseFp4Provider::poll_program_sequence(
                            cudaMemcpyDeviceToDevice),
                        "checkpoint layer-major recurrent matrix state");
           }
-          status_check(ec::add_in_place(hidden_, residual_,
-                                        rows * hidden_size_, nullptr));
+          if (operation.kernel == Kernel::full_attention)
+            finish_attention_block(operation, rows);
+          else
+            status_check(ec::add_in_place(hidden_, residual_,
+                                          rows * hidden_size_, nullptr));
           break;
         }
         case Kernel::ffn:
@@ -5622,8 +6106,9 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
     switch (operation->kernel) {
       case Kernel::embedding: {
         state->exact_decode_enabled =
+            exact_ &&
             request_parameter(invocation.request, "exact_decode_enabled") !=
-            0U;
+                0U;
         if (state->synchronization_rows != 0U)
           throw std::runtime_error(
               "previous target batch was not synchronized");
@@ -5634,12 +6119,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
           if (tokens[row] >= vocabulary_size_)
             throw std::runtime_error("embedding token exceeds vocabulary");
         }
-        cuda_check(cudaMemcpy(output_tokens_, tokens.data(),
-                              tokens.size_bytes(), cudaMemcpyHostToDevice),
-                   "upload embedding token batch");
-        status_check(ec::fp4_embedding_batch(
-            binding(*operation, "weight").matrix(), output_tokens_, hidden_,
-            static_cast<std::uint32_t>(tokens.size()), nullptr));
+        run_embedding(*operation, tokens.data(),
+                      static_cast<std::uint32_t>(tokens.size()));
         state->current_batch_rows = static_cast<std::uint32_t>(tokens.size());
         outputs.emplace("hidden", device_hidden_value(state->current_batch_rows));
         break;
@@ -5681,8 +6162,11 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
                                   sizeof(float),
                               cudaMemcpyDeviceToDevice),
                    "retain attention residual batch");
-        normalize_rows(hidden_, binding(*operation, "input_norm").f32,
-                       normalized_, rows);
+        if (operation->kernel == Kernel::full_attention)
+          normalize_operation_input(*operation, hidden_, normalized_, rows);
+        else
+          normalize_rows(hidden_, binding(*operation, "input_norm").f32,
+                         normalized_, rows);
         if (operation->kernel == Kernel::full_attention) {
           std::array<std::uint32_t, kWorkspaceRows> rotary{};
           for (std::uint32_t row = 0U; row < rows; ++row) {
@@ -5699,8 +6183,11 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
         } else {
           run_recurrent_attention(*operation, state->slot(), rows, false);
         }
-        status_check(ec::add_in_place(
-            hidden_, residual_, rows * hidden_size_, nullptr));
+        if (operation->kernel == Kernel::full_attention)
+          finish_attention_block(*operation, rows);
+        else
+          status_check(ec::add_in_place(
+              hidden_, residual_, rows * hidden_size_, nullptr));
         outputs.emplace("hidden", device_hidden_value(rows));
         break;
       }

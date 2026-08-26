@@ -1,13 +1,13 @@
 # Expert Runtime contract
 
-Status: current VM, worker and placement contract, 2026-08-23.
+Status: current VM, worker and placement contract, 2026-08-26.
 
 ## Program and provider negotiation
 
 Every service artifact publishes `runtime-model.tsv`. The common native runner
 parses the program, validates geometry/encodings and asks registered providers
 for the declared kernel capabilities. Common code does not branch on Qwen,
-DeepSeek, layer count or upstream tensor names.
+Muse, Ornith, DeepSeek, layer count or upstream tensor names.
 
 A new checkpoint using existing operations requires a strict source adapter
 and a new artifact. New mathematics, encoding or geometry requires a provider
@@ -34,13 +34,15 @@ different state.
 
 ## Dense placement
 
-The Qwen provider owns one hot CUDA execution slot:
+The dense/hybrid FP4 provider currently owns one hot CUDA execution slot:
 
 - FP4 matrix weights are resident in VRAM;
 - activation tiles stay device-resident across the operation program;
 - recurrent state remains hot while a request executes;
-- exact target F16 KV grows as request-owned 256-token pinned-host pages;
-- bounded KV spans are staged to the GPU for full attention;
+- exact target F16 KV grows according to artifact-declared global or sliding
+  geometry; Qwen uses request-owned 256-token pinned-host pages;
+- bounded global-attention KV spans are staged to the GPU; artifact-declared
+  sliding windows remain exact cyclic windows;
 - inactive sessions retain populated pages and a compact continuation blob.
 
 MTP/draft state is allocated only when the generation policy can actually use
@@ -69,7 +71,12 @@ bytes, including fixed continuation state, rather than deriving capacity only
 from KV page count. Status reports actual allocated/populated bytes and never
 speculatively reserves a request's declared maximum.
 
-The current Python command channel/provider mutex serializes Qwen execution.
+Provider telemetry separates the copied continuation blob
+(`provider_parked_request_bytes`) from total retained-session ownership,
+including authoritative host KV (`provider_parked_session_bytes`). Both are
+instantaneous gauges, not request-attributed traffic counters.
+
+The current Python command channel/provider mutex serializes dense execution.
 `MODEL_WORKER_CAPACITY>1` can retain/admit more state but does not create
 parallel GPU kernels. Multi-device execution requires the allocator/shard/P2P
 work in [Roadmap](roadmap.md).

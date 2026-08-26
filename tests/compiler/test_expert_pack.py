@@ -509,6 +509,122 @@ def _make_hybrid_delta_fixture(root: Path, *, moe: bool = False) -> None:
     _write_safetensors(root / "model.safetensors", tensors)
 
 
+def _make_muse_glimmer_fixture(root: Path) -> None:
+    hidden, intermediate, vocab = 32, 64, 64
+    layers, heads, kv_heads, head_dim = 4, 1, 1, 32
+    vision_hidden, vision_intermediate, vision_layers = 32, 64, 2
+    patch, temporal, merge, projector = 2, 1, 2, 16
+    config = {
+        "architectures": ["MuseGlimmerForConditionalGeneration"],
+        "model_type": "muse_glimmer",
+        "out_hidden_size": vision_hidden * merge * merge,
+        "projector_hidden_act": "gelu",
+        "projector_hidden_size": projector,
+        "text_config": {
+            "attention_bias": False,
+            "final_logit_softcapping": 20.0,
+            "head_dim": head_dim,
+            "hidden_activation": "silu",
+            "hidden_size": hidden,
+            "intermediate_size": intermediate,
+            "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0],
+            "layer_types": ["sliding_attention"] * 3 + ["full_attention"],
+            "max_position_embeddings": 64,
+            "model_type": "muse_glimmer_text",
+            "num_attention_heads": heads,
+            "num_hidden_layers": layers,
+            "num_key_value_heads": kv_heads,
+            "output_multiplier": 0.19611613513818404,
+            "post_norm_eps": 1e-8,
+            "qk_scale_factor": 3.87,
+            "rms_norm_eps": 1e-5,
+            "rope_parameters": {"rope_theta": 500000.0},
+            "sliding_window": 32,
+            "tie_word_embeddings": False,
+            "vocab_size": vocab,
+        },
+        "vision_config": {
+            "hidden_act": "gelu",
+            "hidden_size": vision_hidden,
+            "intermediate_size": vision_intermediate,
+            "layer_types": ["window_attention", "full_attention"],
+            "max_position_embeddings": 16,
+            "merge_size": merge,
+            "model_type": "muse_glimmer_vision",
+            "num_attention_heads": 1,
+            "num_hidden_layers": vision_layers,
+            "patch_size": patch,
+            "patch_temporal": temporal,
+        },
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+    shapes: dict[str, tuple[int, ...]] = {
+        "model.language_model.embed_tokens.weight": (vocab, hidden),
+        "model.language_model.norm.weight": (hidden,),
+        "lm_head.weight": (vocab, hidden),
+        "model.vision_tower.patch_embedder.patch_embedding.weight":
+            (vision_hidden, 3 * temporal * patch * patch),
+        "model.vision_tower.patch_embedder.position_embedding_table.weight":
+            (16, vision_hidden),
+        "model.vision_tower.ln_pre.weight": (vision_hidden,),
+        "model.vision_tower.ln_pre.bias": (vision_hidden,),
+        "model.vision_tower.ln_post.weight": (vision_hidden,),
+        "model.vision_tower.ln_post.bias": (vision_hidden,),
+        "model.vision_adapter.fc1.weight":
+            (projector, vision_hidden * merge * merge),
+        "model.vision_adapter.fc2.weight": (projector, projector),
+        "model.vision_projection.weight": (hidden, projector),
+    }
+    for layer in range(layers):
+        prefix = f"model.language_model.layers.{layer}."
+        for norm in (
+            "input_layernorm.weight", "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+        ):
+            shapes[prefix + norm] = (hidden,)
+        for projection in ("q_proj", "gate_proj"):
+            shapes[prefix + f"self_attn.{projection}.weight"] = (
+                heads * head_dim, hidden
+            )
+        for projection in ("k_proj", "v_proj"):
+            shapes[prefix + f"self_attn.{projection}.weight"] = (
+                kv_heads * head_dim, hidden
+            )
+        shapes[prefix + "self_attn.o_proj.weight"] = (
+            hidden, heads * head_dim
+        )
+        shapes[prefix + "mlp.gate_proj.weight"] = (intermediate, hidden)
+        shapes[prefix + "mlp.up_proj.weight"] = (intermediate, hidden)
+        shapes[prefix + "mlp.down_proj.weight"] = (hidden, intermediate)
+    for layer in range(vision_layers):
+        prefix = f"model.vision_tower.layers.{layer}."
+        for norm in ("norm1", "norm2"):
+            shapes[prefix + norm + ".weight"] = (vision_hidden,)
+            shapes[prefix + norm + ".bias"] = (vision_hidden,)
+        for projection in ("q_proj", "k_proj", "v_proj", "proj"):
+            shapes[prefix + f"attn.{projection}.weight"] = (
+                vision_hidden, vision_hidden
+            )
+            shapes[prefix + f"attn.{projection}.bias"] = (vision_hidden,)
+        shapes[prefix + "mlp.fc1.weight"] = (
+            vision_intermediate, vision_hidden
+        )
+        shapes[prefix + "mlp.fc1.bias"] = (vision_intermediate,)
+        shapes[prefix + "mlp.fc2.weight"] = (
+            vision_hidden, vision_intermediate
+        )
+        shapes[prefix + "mlp.fc2.bias"] = (vision_hidden,)
+    _write_safetensors(
+        root / "model.safetensors",
+        {name: _tensor(name, shape) for name, shape in shapes.items()},
+    )
+
+
 def _make_lfm2_moe_fixture(root: Path, unknown: bool = False) -> None:
     config = {
         "_name_or_path": "synthetic/lfm2-moe",
@@ -911,6 +1027,53 @@ class ExpertPackTests(unittest.TestCase):
             self.assertIn("mtp.fc.weight", {tensor.name for tensor in adapted.dense})
             self.assertEqual(adapted.source_tensor_count,
                              len(adapted.dense) + 3 * len(adapted.experts))
+
+    def test_muse_glimmer_reuses_dense_fp4_abi2_with_windowed_kv(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            source.mkdir()
+            _make_muse_glimmer_fixture(source)
+            checkpoint = SafeTensorCheckpoint(source)
+            adapted = adapt_checkpoint(checkpoint, "muse_glimmer")
+            self.assertEqual(adapted.family, "muse_glimmer")
+            self.assertEqual(adapted.runtime_topology.components, ())
+            self.assertEqual(len(adapted.runtime_topology.layers), 4)
+            self.assertEqual(
+                [layer.block_abi for layer in adapted.runtime_topology.layers],
+                [2, 2, 2, 2],
+            )
+            self.assertIn(
+                "model.vision_tower.layers.0.attn.q_proj.weight",
+                adapted.auxiliary_dense,
+            )
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="muse_glimmer",
+                quant_profile=FP4_QUANT_PROFILE,
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            self.assertTrue(manifest["architecture"]["vision_auxiliary_only"])
+            program = (output / "runtime-model.tsv").read_text(encoding="utf-8")
+            self.assertIn(
+                "kernel\tblock.full-attention.output-gated.v1\t2", program
+            )
+            self.assertIn(
+                "operation_parameter\t1\tattention_window_tokens\t32",
+                program,
+            )
+            self.assertIn(
+                "operation_tensor\t1\tgate_projection\t"
+                "model.language_model.layers.0.self_attn.gate_proj.weight",
+                program,
+            )
+            self.assertIn(
+                "operation_parameter\t9\tlogit_softcap_f32_bits", program
+            )
 
     def test_hybrid_delta_dense_fp4_schema3_artifact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -1342,6 +1505,27 @@ class ExpertPackTests(unittest.TestCase):
                 "operation\t4\t0\tmoe.swiglu.routed.v1\t1\tdecoder\t0",
                 program,
             )
+
+    def test_runtime_artifact_rejects_duplicate_operation_parameters(
+            self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            _make_fixture(root)
+            adapted = adapt_checkpoint(SafeTensorCheckpoint(root), "olmoe")
+            topology = adapted.runtime_topology
+            duplicate = replace(
+                topology.operations[0],
+                parameters=(("mode", 1), ("mode", 2)),
+            )
+            adapted = replace(
+                adapted,
+                runtime_topology=replace(
+                    topology,
+                    operations=(duplicate, *topology.operations[1:]),
+                ),
+            )
+            with self.assertRaisesRegex(ValueError, "duplicate parameters"):
+                _runtime_model_descriptor_bytes(adapted, QUANT_ABI_ID)
 
     def test_adapter_rejects_unidentified_tensor(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

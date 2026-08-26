@@ -1,7 +1,7 @@
 # Research decisions
 
 Status: canonical negative-results and active heterogeneous-placement record,
-2026-08-25. Rejected implementations and raw generated artifacts were removed
+2026-08-26. Rejected implementations and raw generated artifacts were removed
 from the production repository so they cannot be mistaken for supported paths.
 
 ## Fixed acceptance contracts

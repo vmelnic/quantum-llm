@@ -1,6 +1,6 @@
 # OpenAI-compatible API
 
-Status: implemented compatibility surface, 2026-08-23.
+Status: implemented compatibility surface, 2026-08-26.
 
 The server implements a bounded subset of common OpenAI request/response
 shapes. It is a compatibility adapter, not the OpenAI service and not a claim

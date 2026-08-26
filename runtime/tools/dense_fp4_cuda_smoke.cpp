@@ -1614,6 +1614,188 @@ double standard_gqa_no_position_check() {
   return maximum_error;
 }
 
+struct DenseFp4Abi2KernelErrors final {
+  double weightless_rms{};
+  double sigmoid_product{};
+  double scaled_tanh{};
+  double normalized_gqa{};
+};
+
+DenseFp4Abi2KernelErrors dense_fp4_abi2_kernel_check() {
+  constexpr std::uint32_t rows = 2U;
+  constexpr std::uint32_t elements = 32U;
+  constexpr float epsilon = 1.0e-5F;
+  constexpr float multiplier = 0.19611613513818404F;
+  constexpr float softcap = 20.0F;
+  std::vector<float> input(static_cast<std::size_t>(rows) * elements);
+  std::vector<float> gate(input.size());
+  for (std::size_t index = 0U; index < input.size(); ++index) {
+    input[index] = std::sin(static_cast<float>(index + 1U) * 0.071F) * 3.0F;
+    gate[index] = std::cos(static_cast<float>(index + 3U) * 0.053F);
+  }
+
+  DeviceBuffer<float> device_input(input.size());
+  DeviceBuffer<float> device_output(input.size());
+  DeviceBuffer<float> device_gate(gate.size());
+  device_input.upload(input);
+  device_output.upload(input);
+  device_gate.upload(gate);
+  status_check(expert::runtime::cuda::weightless_rms_norm_batch(
+      device_input.get(), device_output.get(), rows, elements, epsilon,
+      nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize ABI-2 weightless RMS norm smoke");
+  const auto normalized = device_output.download();
+
+  DenseFp4Abi2KernelErrors result;
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    float square{};
+    for (std::uint32_t column = 0U; column < elements; ++column) {
+      const auto value = input[static_cast<std::size_t>(row) * elements +
+                               column];
+      square += value * value;
+    }
+    const auto inverse = 1.0F /
+        std::sqrt(square / static_cast<float>(elements) + epsilon);
+    for (std::uint32_t column = 0U; column < elements; ++column) {
+      const auto index = static_cast<std::size_t>(row) * elements + column;
+      result.weightless_rms = std::max(
+          result.weightless_rms,
+          std::abs(static_cast<double>(normalized[index] -
+                                       input[index] * inverse)));
+    }
+  }
+
+  device_output.upload(input);
+  status_check(expert::runtime::cuda::sigmoid_product_in_place(
+      device_output.get(), device_gate.get(),
+      static_cast<std::uint32_t>(input.size()), nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize ABI-2 sigmoid product smoke");
+  const auto sigmoid = device_output.download();
+  for (std::size_t index = 0U; index < input.size(); ++index) {
+    const auto expected = input[index] /
+        (1.0F + std::exp(-gate[index]));
+    result.sigmoid_product = std::max(
+        result.sigmoid_product,
+        std::abs(static_cast<double>(sigmoid[index] - expected)));
+  }
+
+  device_output.upload(input);
+  status_check(expert::runtime::cuda::scaled_tanh_in_place(
+      device_output.get(), static_cast<std::uint32_t>(input.size()),
+      multiplier, softcap, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize ABI-2 scaled tanh smoke");
+  const auto tanh_output = device_output.download();
+  for (std::size_t index = 0U; index < input.size(); ++index) {
+    const auto expected = softcap *
+        std::tanh(input[index] * multiplier / softcap);
+    result.scaled_tanh = std::max(
+        result.scaled_tanh,
+        std::abs(static_cast<double>(tanh_output[index] - expected)));
+  }
+
+  constexpr std::uint32_t query_heads = 4U;
+  constexpr std::uint32_t kv_heads = 2U;
+  constexpr std::uint32_t head_dim = 32U;
+  constexpr std::uint32_t rotary_dim = 32U;
+  constexpr std::uint32_t first_position = 11U;
+  constexpr float query_scale = 3.87F;
+  constexpr float rope_theta = 500000.0F;
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            head_dim;
+  const auto kv_values = static_cast<std::size_t>(rows) * kv_heads * head_dim;
+  std::vector<float> query(query_values);
+  std::vector<float> key(kv_values);
+  std::vector<float> value(kv_values);
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 7U) * 0.019F);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::cos(static_cast<float>(index + 5U) * 0.023F);
+    value[index] = std::sin(static_cast<float>(index + 9U) * 0.029F);
+  }
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<std::uint16_t> fp16_keys(kv_values);
+  DeviceBuffer<std::uint16_t> fp16_values(kv_values);
+  device_query.upload(query);
+  device_key.upload(key);
+  device_value.upload(value);
+  status_check(expert::runtime::cuda::normalized_gqa_qkv_fp16_batch(
+      device_query.get(), device_key.get(), device_value.get(),
+      fp16_keys.get(), fp16_values.get(), first_position, rows, query_heads,
+      kv_heads, head_dim, rotary_dim, epsilon, query_scale, rope_theta, true,
+      nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize ABI-2 normalized GQA smoke");
+  const auto actual_query = device_query.download();
+  const auto actual_key = device_key.download();
+  const auto actual_fp16_keys = fp16_keys.download();
+  const auto actual_fp16_values = fp16_values.download();
+  const auto expected_head = [&](const float* source,
+                                 std::uint32_t dimension,
+                                 std::uint32_t position,
+                                 float scale) {
+    float square{};
+    for (std::uint32_t index = 0U; index < head_dim; ++index)
+      square += source[index] * source[index];
+    const auto inverse = 1.0F /
+        std::sqrt(square / static_cast<float>(head_dim) + epsilon);
+    const auto half = rotary_dim / 2U;
+    const auto pair = dimension % half;
+    const auto angle = static_cast<float>(position) *
+        std::pow(rope_theta, -2.0F * static_cast<float>(pair) /
+                                 static_cast<float>(rotary_dim));
+    const auto current = source[dimension] * inverse * scale;
+    const auto other_index = dimension < half
+        ? dimension + half
+        : dimension - half;
+    auto other = source[other_index] * inverse * scale;
+    if (dimension < half) other = -other;
+    return current * std::cos(angle) + other * std::sin(angle);
+  };
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto base = (static_cast<std::size_t>(row) * query_heads + head) *
+                        head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto expected = expected_head(
+            query.data() + base, dimension, first_position + row,
+            query_scale);
+        result.normalized_gqa = std::max(
+            result.normalized_gqa,
+            std::abs(static_cast<double>(actual_query[base + dimension] -
+                                         expected)));
+      }
+    }
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto base = (static_cast<std::size_t>(row) * kv_heads + head) *
+                        head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto index = base + dimension;
+        const auto expected = expected_head(
+            key.data() + base, dimension, first_position + row, 1.0F);
+        result.normalized_gqa = std::max(
+            result.normalized_gqa,
+            std::abs(static_cast<double>(actual_key[index] - expected)));
+        result.normalized_gqa = std::max(
+            result.normalized_gqa,
+            std::abs(static_cast<double>(
+                __half2float(*reinterpret_cast<const __half*>(
+                    &actual_fp16_keys[index])) - expected)));
+        result.normalized_gqa = std::max(
+            result.normalized_gqa,
+            std::abs(static_cast<double>(
+                __half2float(*reinterpret_cast<const __half*>(
+                    &actual_fp16_values[index])) - value[index])));
+      }
+    }
+  }
+  return result;
+}
+
 double host_fp16_attention_check() {
   constexpr std::uint32_t rows = 3U;
   constexpr std::uint32_t query_heads = 32U;
@@ -1979,6 +2161,7 @@ int main() {
     const auto standard_gqa_ratio16_error = standard_gqa_ratio16_check();
     const auto standard_gqa_no_position_error =
         standard_gqa_no_position_check();
+    const auto abi2_errors = dense_fp4_abi2_kernel_check();
     const auto host_fp16_attention_error = host_fp16_attention_check();
     const auto resident_fp16_attention =
         resident_fp16_attention_262144_profile();
@@ -2019,6 +2202,10 @@ int main() {
                           fp8_kv_attention.output_cosine_similarity) &&
                       standard_gqa_ratio16_error < 5.0e-4 &&
                       standard_gqa_no_position_error < 5.0e-4 &&
+                      abi2_errors.weightless_rms < 2.0e-5 &&
+                      abi2_errors.sigmoid_product < 2.0e-6 &&
+                      abi2_errors.scaled_tanh < 2.0e-6 &&
+                      abi2_errors.normalized_gqa < 5.0e-4 &&
                       host_fp16_attention_error < 5.0e-4 &&
                       std::isfinite(
                           resident_fp16_attention.best_milliseconds) &&
@@ -2106,6 +2293,14 @@ int main() {
               << standard_gqa_ratio16_error
               << ",\"standard_gqa_no_position_maximum_absolute_error\":"
               << standard_gqa_no_position_error
+              << ",\"abi2_weightless_rms_maximum_absolute_error\":"
+              << abi2_errors.weightless_rms
+              << ",\"abi2_sigmoid_product_maximum_absolute_error\":"
+              << abi2_errors.sigmoid_product
+              << ",\"abi2_scaled_tanh_maximum_absolute_error\":"
+              << abi2_errors.scaled_tanh
+              << ",\"abi2_normalized_gqa_maximum_absolute_error\":"
+              << abi2_errors.normalized_gqa
               << ",\"host_fp16_attention_maximum_absolute_error\":"
               << host_fp16_attention_error
               << ",\"resident_fp16_attention_262144_best_milliseconds\":"

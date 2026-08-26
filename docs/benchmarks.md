@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-08-25. Numbers removed from this
+Status: canonical measurement ledger, 2026-08-26. Numbers removed from this
 document are historical context, not current claims.
 
 ## Metric rules
@@ -18,15 +18,17 @@ document are historical context, not current claims.
 
 ## Current repository validation
 
-Latest changed-code gate on 2026-08-25:
+Latest changed-code gate on 2026-08-26:
 
 - the official Windows Release/CUDA build compiled the common VM and both
   providers with MSVC 19.44 and CUDA 12.1;
 - Windows CTest passed 5/5 native/CUDA tests;
-- the Windows compiler/server contract suite passed 93/93 tests, including
+- the Windows compiler/server contract suite passed 101/101 tests, including
   generic compact/standard FP4 host execution, progressive session accounting
   and a prefill-sized (>32 selection) universal FP4 host work group;
-- `git diff --check` passed for the changed hybrid path.
+- the broader control-host suite passed 119 tests with 9 optional dependency
+  skips;
+- `git diff --check`, Python byte compilation and shell syntax checks passed.
 
 The control host does not have CMake installed, so no portable C++ build was
 claimed there. The Windows build is the authoritative CUDA compilation gate.
@@ -35,10 +37,11 @@ claimed there. The Windows build is the authoritative CUDA compilation gate.
 
 | Gate | Configuration | Result | Verdict |
 |---|---|---|---|
-| Qwen chat | common VM, exact F16 KV, `model.sh chat`, `hi` | 13 prompt, 10 generated, 0.981 s first visible, 1.340 s wall, 7.46 tok/s end-to-end, 25.05 tok/s after first visible | short-context regression pass |
-| Ornith chat | common VM, FP4 standard expert pages, exact F16 KV policy, `model.sh chat`, `hi` | 13 prompt, 12 generated, 0.757 s first visible, 1.483 s wall, 8.09 tok/s end-to-end, 15.15 tok/s after first visible | new-model common-path pass |
+| Qwen chat | common VM, exact F16 KV, `model.sh chat`, `hi` | 13 prompt, 10 generated, 0.957 s first visible, 1.311 s wall, 7.63 tok/s end-to-end, 25.42 tok/s after first visible | short-context regression pass |
+| Muse chat | common VM, exact mixed global/window F16 KV, `model.sh chat`, `hi` | 57 prompt, 59 generated (40 reasoning), 2.037 s first visible, 2.336 s wall, 25.26 tok/s end-to-end, `finish=stop` | text common-path pass; not a populated 131K gate |
+| Ornith chat | common VM, FP4 standard expert pages, exact F16 KV policy, `model.sh chat`, `hi` | 13 prompt, 10 generated, 1.647 s first visible, 2.255 s wall, 4.44 tok/s end-to-end, 14.82 tok/s after first visible | common-path regression pass |
 | Qwen earlier long answer | common VM, exact F16 KV, four-stanza prompt | 68 prompt, 476 generated, 2.812 s TTFT, 19.047 s wall, 29.26 tok/s after first token | short-context quality/throughput pass |
-| DeepSeek chat, exact hybrid q-star active | common VM, artifact BF16 KV, `model.sh chat`, `hi` | 5 prompt, 10 generated, 4.291 s first visible, 10.653 s wall, 0.94 tok/s end-to-end, 1.41 tok/s after first visible | common-path regression pass; q-star speedup still not proved |
+| DeepSeek chat, exact hybrid q-star active | common VM, artifact BF16 KV, `model.sh chat`, `hi` | 5 prompt, 10 generated, 4.355 s first visible, 11.227 s wall, 0.89 tok/s end-to-end, 1.31 tok/s after first visible | common-path regression pass; q-star speedup still not proved |
 | Qwen tiled prefill | exact F16, 7,052 prompt + 1 output | 23.913 s, two GPU tiles, zero host activation spill | functional pass |
 | Qwen near-maximum prefill | exact F16, 262,001 prompt + 1 output | 2,183.815 s, 43 GPU tiles, zero host activation spill | capacity pass, latency fail |
 | Qwen full maximum, historical | experimental artifact FP4 KV, 262,016 prompt + 128 output | 5,423.422 s TTFT, 5,462.672 s wall, about 3.24 tok/s after first token | capacity only; wrong KV format for exact-F16 goal |
@@ -49,6 +52,35 @@ claimed there. The Windows build is the authoritative CUDA compilation gate.
 The near-maximum exact-F16 run generated only one token. It proves the current
 prefill/capacity path and does not provide a saturated exact-F16 decode rate.
 The 3.24 tok/s result used compact artifact KV and cannot be relabelled F16.
+
+## Muse artifact and bounded text evidence
+
+```text
+source:       meta-models/Muse-Glimmer-30B
+revision:     f84ecc3a0ea984a4c04542a84269e3d065350a6e
+artifact:     ${MODEL_ROOT}/muse-glimmer-30b-fp4
+dense.qpack:  15,832,002,560 bytes
+records:      723 FP4 + 713 F32; zero INT8
+```
+
+The source gate found zero payload, scale or F32 mismatches. FP4-only cosine
+was 0.9930505 and relative L2 was 0.1177243; aggregate cosine was 0.9999981.
+On one official 68-token prompt, the first 32 generated token IDs from BF16
+decoded to the same raw prefix produced by QPack after accounting for the
+API's special-token stripping. The service then completed the bounded
+instruction with visible `ALPHA-17` and an official EOS rather than exhausting
+the output budget.
+
+The tokenizer-declared response grammar exposed two generic service bugs that
+were fixed without family branches: protocol parsing now preserves structural
+special tokens internally, and generation respects every EOS ID from
+`generation_config.json`. Streaming with artifact codecs withholds split EOS
+terminals instead of leaking them to clients. This also removed the visible
+DeepSeek EOS regression in its repeated real chat gate.
+
+This evidence qualifies short text inference only. Vision records are
+auxiliary, no Muse image path is advertised, and 131,072 positions were not
+populated or timed.
 
 ## Qwen artifact and quality evidence
 
@@ -247,10 +279,10 @@ turns. Any DeepSeek claim must therefore state cold/novel/settled placement.
 
 ## What the evidence proves
 
-- The common service, Qwen and DeepSeek paths are functional.
-- Ornith uses the same service/VM lifecycle through an artifact adapter and
-  existing hybrid routed provider; its first short chat gate is functional.
-- Qwen short-context FP4/F16 service can exceed 15 tok/s.
+- The common service and the Qwen, Muse-text, Ornith and DeepSeek paths are
+  functional for their recorded short-chat gates.
+- Qwen short-context FP4/F16 post-first-visible decode can exceed 15 tok/s;
+  the current short gate does not meet 15 tok/s end to end.
 - Exact session retention and progressive F16 allocation work for measured
   short/medium histories.
 - Qwen exact-F16 maximum prefill is still about 36 minutes and the requested

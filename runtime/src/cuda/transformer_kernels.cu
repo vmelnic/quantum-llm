@@ -1093,6 +1093,23 @@ __global__ void rms_batch_kernel(const float* input, const float* weight,
     output[index] = input[index] * inverse * weight[index];
 }
 
+__global__ void weightless_rms_batch_kernel(
+    const float* input, float* output, std::uint32_t count, float epsilon) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  input += static_cast<std::size_t>(row) * count;
+  output += static_cast<std::size_t>(row) * count;
+  float square = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    square += input[index] * input[index];
+  square = reduce_sum(square);
+  const auto inverse =
+      rsqrtf(square / static_cast<float>(count) + epsilon);
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    output[index] = input[index] * inverse;
+}
+
 __global__ void add_kernel(float* destination, const float* source,
                            std::uint32_t count) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
@@ -1373,6 +1390,22 @@ __global__ void sigmoid_scale_kernel(float* values, const float* gate,
                                      std::uint32_t count) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (i < count) values[i] *= 1.0F / (1.0F + expf(-gate[0]));
+}
+
+__global__ void sigmoid_product_kernel(float* values, const float* gate,
+                                       std::uint32_t count) {
+  const auto index =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index < count)
+    values[index] *= 1.0F / (1.0F + expf(-gate[index]));
+}
+
+__global__ void scaled_tanh_kernel(float* values, std::uint32_t count,
+                                   float multiplier, float softcap) {
+  const auto index =
+      static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
+  if (index < count)
+    values[index] = softcap * tanhf(values[index] * multiplier / softcap);
 }
 
 __global__ void qkv_rope_kernel(float* query, float* key, const float* value,
@@ -2465,6 +2498,57 @@ __global__ void standard_gqa_qkv_rope_fp16_batch_kernel(
   if (dimension >= head_dim) return;
   const auto encoded_key = standard_rope_value(
       source, dimension, rotary_dim, position, theta);
+  key_head[dimension] = encoded_key;
+  const auto target =
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim + dimension;
+  fp16_keys[target] = __float2half_rn(encoded_key);
+  fp16_values[target] = __float2half_rn(value[target]);
+}
+
+__global__ void normalized_gqa_qkv_fp16_batch_kernel(
+    float* query, float* key, const float* value, __half* fp16_keys,
+    __half* fp16_values, std::uint32_t first_rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float query_scale, float rope_theta, bool apply_rope) {
+  __shared__ float normalized[256];
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto position = first_rotary_position + row;
+  auto* query_head = query +
+      (static_cast<std::size_t>(row) * query_heads + head) * head_dim;
+  float square = dimension < head_dim
+      ? query_head[dimension] * query_head[dimension]
+      : 0.0F;
+  square = reduce_sum(square);
+  if (dimension < head_dim)
+    normalized[dimension] = query_head[dimension] *
+        rsqrtf(square / static_cast<float>(head_dim) + epsilon) * query_scale;
+  __syncthreads();
+  if (dimension < head_dim)
+    query_head[dimension] = apply_rope
+        ? standard_rope_value(normalized, dimension, rotary_dim, position,
+                              rope_theta)
+        : normalized[dimension];
+  __syncthreads();
+  if (head >= kv_heads) return;
+
+  auto* key_head = key +
+      (static_cast<std::size_t>(row) * kv_heads + head) * head_dim;
+  square = dimension < head_dim
+      ? key_head[dimension] * key_head[dimension]
+      : 0.0F;
+  square = reduce_sum(square);
+  if (dimension < head_dim)
+    normalized[dimension] = key_head[dimension] *
+        rsqrtf(square / static_cast<float>(head_dim) + epsilon);
+  __syncthreads();
+  if (dimension >= head_dim) return;
+  const auto encoded_key = apply_rope
+      ? standard_rope_value(normalized, dimension, rotary_dim, position,
+                            rope_theta)
+      : normalized[dimension];
   key_head[dimension] = encoded_key;
   const auto target =
       (static_cast<std::size_t>(row) * kv_heads + head) * head_dim + dimension;
@@ -4996,6 +5080,17 @@ Status rms_norm_batch(const float* input, const float* weight, float* output,
       input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "RMS norm batch");
 }
+Status weightless_rms_norm_batch(
+    const float* input, float* output, std::uint32_t rows,
+    std::uint32_t elements, float epsilon, void* raw) noexcept {
+  if (!input || !output || !rows || !elements || epsilon <= 0.0F)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid weightless RMS norm batch");
+  weightless_rms_batch_kernel<<<rows, kThreads, 0,
+                                static_cast<cudaStream_t>(raw)>>>(
+      input, output, elements, epsilon);
+  return checked(cudaPeekAtLastError(), "weightless RMS norm batch");
+}
 Status add_in_place(float* destination, const float* source, std::uint32_t elements, void* raw) noexcept {
   if (!destination || !source || !elements) return Status(ErrorCode::invalid_argument, "invalid add");
   add_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(destination, source, elements);
@@ -5211,6 +5306,26 @@ Status sigmoid_scale_in_place(float* values, const float* gate,
                          static_cast<cudaStream_t>(raw)>>>(values, gate,
                                                            elements);
   return checked(cudaPeekAtLastError(), "sigmoid scale");
+}
+Status sigmoid_product_in_place(float* values, const float* gate,
+                                std::uint32_t elements,
+                                void* raw) noexcept {
+  if (!values || !gate || !elements)
+    return Status(ErrorCode::invalid_argument, "invalid sigmoid product");
+  sigmoid_product_kernel<<<(elements + kThreads - 1U) / kThreads, kThreads,
+                            0, static_cast<cudaStream_t>(raw)>>>(
+      values, gate, elements);
+  return checked(cudaPeekAtLastError(), "sigmoid product");
+}
+Status scaled_tanh_in_place(float* values, std::uint32_t elements,
+                            float multiplier, float softcap,
+                            void* raw) noexcept {
+  if (!values || !elements || !(multiplier > 0.0F) || !(softcap > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid scaled tanh");
+  scaled_tanh_kernel<<<(elements + kThreads - 1U) / kThreads, kThreads, 0,
+                       static_cast<cudaStream_t>(raw)>>>(
+      values, elements, multiplier, softcap);
+  return checked(cudaPeekAtLastError(), "scaled tanh");
 }
 Status qkv_rope_cache(float* q, float* k, const float* v, const float* qw, const float* kw, float* kc, float* vc, std::uint32_t pos, std::uint32_t heads, std::uint32_t dim, float eps, float theta, void* raw) noexcept {
   if (!q || !k || !v || !qw || !kw || !kc || !vc || !heads || dim != 128 || eps <= 0 || theta <= 0) return Status(ErrorCode::invalid_argument, "invalid qkv rope");
@@ -5689,6 +5804,33 @@ Status standard_gqa_qkv_rope_fp16_batch(
       static_cast<__half*>(fp16_values), first_rotary_position,
       query_heads, kv_heads, head_dim, rotary_dim, rope_theta);
   return checked(cudaPeekAtLastError(), "FP16 standard GQA QKV batch");
+}
+Status normalized_gqa_qkv_fp16_batch(
+    float* query, float* key, const float* value,
+    void* fp16_keys, void* fp16_values,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float query_scale, float rope_theta, bool apply_rope,
+    void* raw) noexcept {
+  if (!query || !key || !value || !fp16_keys || !fp16_values || !rows ||
+      !query_heads || !kv_heads || query_heads % kv_heads ||
+      query_heads / kv_heads > kMaximumExactFp16GroupedQueryHeads ||
+      !head_dim || head_dim > kThreads || head_dim % 32U ||
+      !rotary_dim || rotary_dim > head_dim || rotary_dim % 2U ||
+      !(epsilon > 0.0F) || !(query_scale > 0.0F) ||
+      (apply_rope && !(rope_theta > 0.0F)) ||
+      first_rotary_position > 0xffffffffU - (rows - 1U))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid normalized FP16 GQA QKV batch");
+  const dim3 grid(query_heads, rows);
+  normalized_gqa_qkv_fp16_batch_kernel<<<
+      grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      query, key, value, static_cast<__half*>(fp16_keys),
+      static_cast<__half*>(fp16_values), first_rotary_position,
+      query_heads, kv_heads, head_dim, rotary_dim, epsilon, query_scale,
+      rope_theta, apply_rope);
+  return checked(cudaPeekAtLastError(), "normalized FP16 GQA QKV batch");
 }
 Status standard_gqa_kv_fp16_batch(
     const float* key, const float* value,

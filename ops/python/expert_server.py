@@ -72,6 +72,22 @@ def _worker_response_tokens(payload: Mapping[str, Any], message: str) -> list[in
     return [int(token) for token in tokens]
 
 
+def _configured_eos_token_ids(
+        generation_config: Mapping[str, Any], tokenizer_eos: Any) -> set[int]:
+    """Resolve the checkpoint's complete, validated generation stop set."""
+    value = generation_config.get("eos_token_id")
+    if value is None:
+        value = tokenizer_eos
+    if value is None:
+        return set()
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    if not values or any(
+            isinstance(token, bool) or not isinstance(token, int) or token < 0
+            for token in values):
+        raise RuntimeError("generation_config eos_token_id is invalid")
+    return set(values)
+
+
 class RequestError(ValueError):
     def __init__(self, message: str, param: str | None = None,
                  code: str = "invalid_value") -> None:
@@ -319,19 +335,28 @@ class IncrementalTokenDecoder:
     """Bounded exact tokenizer decoding with a retained token overlap."""
 
     def __init__(self, tokenizer: Any, overlap_tokens: int = 64,
-                 maximum_window_tokens: int = 256) -> None:
+                 maximum_window_tokens: int = 256,
+                 preserve_special_tokens: bool = False,
+                 suppressed_token_ids: set[int] | None = None) -> None:
         if overlap_tokens < 1 or maximum_window_tokens <= overlap_tokens:
             raise ValueError("invalid incremental token decoder window")
         self.tokenizer = tokenizer
         self.overlap_tokens = overlap_tokens
         self.maximum_window_tokens = maximum_window_tokens
+        self.preserve_special_tokens = preserve_special_tokens
+        self.suppressed_token_ids = suppressed_token_ids or set()
         self.tokens: list[int] = []
         self.emitted = ""
         self.decode_prefix = ""
 
     def _decode_raw(self, tokens: list[int]) -> str:
+        if self.suppressed_token_ids:
+            tokens = [
+                token for token in tokens
+                if token not in self.suppressed_token_ids
+            ]
         return self.tokenizer.decode(
-            tokens, skip_special_tokens=True,
+            tokens, skip_special_tokens=not self.preserve_special_tokens,
             clean_up_tokenization_spaces=False,
         )
 
@@ -1101,13 +1126,9 @@ class Application:
             seed=0,
         )
         self._validate_sampling(self.default_sampling, "generation_config")
-        eos = self.tokenizer.eos_token_id
-        if eos is None:
-            self.eos_token_ids: set[int] = set()
-        elif isinstance(eos, int):
-            self.eos_token_ids = {eos}
-        else:
-            self.eos_token_ids = {int(token) for token in eos}
+        self.eos_token_ids = _configured_eos_token_ids(
+            generation_config, self.tokenizer.eos_token_id
+        )
         self.worker = CudaWorker(args.worker, args.container, args.max_context,
                                  args.startup_timeout, args.worker_capacity,
                                  args.worker_ram_cache_gib,
@@ -2661,7 +2682,7 @@ class Application:
         "active_requests", "retained_sessions", "allocated_pages",
         "parked_sessions", "parked_pages",
         "reserved_pages", "kv_allocated_pages", "kv_reserved_pages",
-        "provider_parked_request_bytes",
+        "provider_parked_request_bytes", "provider_parked_session_bytes",
     })
 
     @staticmethod
@@ -2752,10 +2773,18 @@ class Application:
                  progress_callback: Callable[[], None] | None = None,
                  media_packet: bytes | None = None,
                  media_signature: bytes | None = None,
+                 preserve_special_tokens: bool = False,
                  ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
-        decoder = IncrementalTokenDecoder(self.tokenizer)
+        decoder = IncrementalTokenDecoder(
+            self.tokenizer,
+            preserve_special_tokens=preserve_special_tokens,
+            # Protocol markers must survive tokenizer decoding, but every
+            # declared EOS variant remains transport framing rather than
+            # visible assistant content.
+            suppressed_token_ids=self.eos_token_ids,
+        )
         started = time.monotonic()
         first_token_seconds: float | None = None
         previous_token_at: float | None = None
@@ -3259,11 +3288,15 @@ class Handler(BaseHTTPRequestHandler):
                 progress_callback=progress_callback,
                 media_packet=request.media_packet,
                 media_signature=request.media_signature,
+                preserve_special_tokens=(
+                    request.endpoint != "completion"
+                    and self.app.response_protocol is not None
+                ),
             )
         except TypeError as error:
             if not any(name in str(error) for name in (
                     "cancel_check", "cache_prefix_tokens", "sampling",
-                    "progress_callback")):
+                    "progress_callback", "preserve_special_tokens")):
                 raise
             generation = self.app.generate(
                 request.prompt_ids, request.maximum, context

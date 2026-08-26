@@ -114,6 +114,18 @@ def _resolve_model(base_url: str, configured: str) -> str:
     return active
 
 
+def _effective_maximum(base_url: str, configured: int) -> int:
+    info = _get_json(base_url, "/model-info")
+    runtime = info.get("runtime_config")
+    if not isinstance(runtime, dict):
+        raise RuntimeError("model info has no runtime configuration")
+    service_maximum = runtime.get("maximum_new_tokens")
+    if (isinstance(service_maximum, bool) or
+            not isinstance(service_maximum, int) or service_maximum <= 0):
+        raise RuntimeError("model info has no valid output limit")
+    return min(configured, service_maximum)
+
+
 def _print_info(base_url: str) -> None:
     info = _get_json(base_url, "/model-info")
     placement = info.get("worker_placement", {})
@@ -246,6 +258,7 @@ def main() -> int:
             base_url = f"http://127.0.0.1:{args.local_port}"
         _ready(base_url, args.ready_timeout)
         model = _resolve_model(base_url, args.model)
+        maximum = _effective_maximum(base_url, args.max_tokens)
         print(f"Connected to {model} at {base_url}")
         print("Commands: /help, /info, /stats, /clear, quit, exit. Ctrl+C closes.")
         messages: list[dict[str, str]] = []
@@ -279,7 +292,7 @@ def main() -> int:
             messages.append({"role": "user", "content": prompt})
             try:
                 answer, last_stats = _chat(
-                    base_url, model, messages, args.max_tokens,
+                    base_url, model, messages, maximum,
                     args.request_timeout, args.thinking,
                 )
             except RuntimeError as error:

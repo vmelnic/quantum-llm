@@ -1,6 +1,6 @@
 # Documentation
 
-Status: authoritative documentation index, 2026-08-25.
+Status: authoritative documentation index, 2026-08-26.
 
 The repository documents the implementation that exists today, the evidence
 that has actually been measured, and the next accepted work. Detailed journals
@@ -12,7 +12,7 @@ material remains recoverable from Git history.
 
 | Document | Purpose |
 |---|---|
-| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen/Ornith hybrid execution, DeepSeek expert paging, KV and session state |
+| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen/Muse dense execution, Ornith hybrid execution, DeepSeek expert paging, KV and session state |
 | [Production readiness](production-readiness.md) | What is usable, what is not, and the release blockers |
 | [Benchmarks](benchmarks.md) | Canonical measurements and capacity/bandwidth equations |
 | [Roadmap](roadmap.md) | Dependency-ordered work that advances the active goals |
@@ -36,6 +36,12 @@ material remains recoverable from Git history.
 | [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Authenticated routed-expert storage and bundle layout |
 | [OpenAI-compatible API](openai-api.md) | Models, Completions, Chat Completions and Responses |
 | [Anthropic Messages API](anthropic-api.md) | Claude-compatible wire adapter and its explicit limitations |
+
+## Reference inventories
+
+| Document | Purpose |
+|---|---|
+| [Ubuntu node10 inventory](node10-ubuntu-inventory.md) | Read-only capability record for a machine explicitly outside the active serving architecture |
 
 ## Claims policy
 

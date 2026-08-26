@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "id": "muse-text-parity",
+      "messages": [
+        {
+          "role": "user",
+          "content": "Reply with exactly ALPHA-17 and no other text."
+        }
+      ],
+      "enable_thinking": true,
+      "reasoning_effort": "xhigh",
+      "maximum_new_tokens": 256,
+      "expected": {
+        "kind": "exact_text",
+        "value": "ALPHA-17"
+      }
+    }
+  ]
+}

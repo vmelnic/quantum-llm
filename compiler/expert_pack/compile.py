@@ -119,6 +119,12 @@ def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> b
     if len(components) != len(topology.components):
         raise ValueError("runtime model has duplicate component names")
     if (
+        len(required) != len(topology.required_kernels)
+        or len({key for key, _ in topology.attributes}) !=
+        len(topology.attributes)
+    ):
+        raise ValueError("runtime model has duplicate declarations")
+    if (
         len({role for role, _ in topology.tensor_bindings}) !=
         len(topology.tensor_bindings)
         or any(name not in dense_names for _, name in topology.tensor_bindings)
@@ -182,6 +188,15 @@ def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> b
                 f"exact_decode_tensor\t{atom(role)}\t{atom(tensor_name)}"
             )
     for namespace_offset, component in enumerate(topology.components):
+        if (
+            len({key for key, _ in component.attributes}) !=
+            len(component.attributes)
+            or len({key for key, _ in component.router_parameters}) !=
+            len(component.router_parameters)
+        ):
+            raise ValueError(
+                f"component {component.name} has duplicate parameters"
+            )
         if (component.execution_capability, component.execution_abi) not in required:
             raise ValueError(
                 f"component {component.name} lacks its execution capability"
@@ -211,6 +226,10 @@ def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> b
                 f"router_parameter\t{atom(component.name)}\t{atom(key)}\t{value}"
             )
     for layer in topology.layers:
+        if len({key for key, _ in layer.parameters}) != len(layer.parameters):
+            raise ValueError(
+                f"layer {layer.logical_layer} has duplicate parameters"
+            )
         if (layer.block_capability, layer.block_abi) not in required:
             raise ValueError(
                 f"layer {layer.logical_layer} lacks its block capability"
@@ -244,6 +263,13 @@ def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> b
         value: abi for _, value, abi in topology.program_inputs
     }
     for logical_operation, operation in enumerate(topology.operations):
+        if (
+            len({key for key, _ in operation.parameters}) !=
+            len(operation.parameters)
+        ):
+            raise ValueError(
+                f"operation {logical_operation} has duplicate parameters"
+            )
         if operation.logical_layer is not None:
             if (
                 operation.logical_layer < previous_layer

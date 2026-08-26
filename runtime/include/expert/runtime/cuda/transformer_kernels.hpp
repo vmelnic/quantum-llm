@@ -157,6 +157,9 @@ struct Fp4Block32Matrix final {
     const float* input, const float* weight, float* output,
     std::uint32_t rows, std::uint32_t elements, float epsilon,
     void* stream) noexcept;
+[[nodiscard]] Status weightless_rms_norm_batch(
+    const float* input, float* output, std::uint32_t rows,
+    std::uint32_t elements, float epsilon, void* stream) noexcept;
 [[nodiscard]] Status add_in_place(float* destination, const float* source,
                                   std::uint32_t elements, void* stream) noexcept;
 [[nodiscard]] Status add_bias_in_place(float* destination, const float* bias,
@@ -229,6 +232,14 @@ struct Fp4Block32Matrix final {
                                             const float* gate,
                                             std::uint32_t elements,
                                             void* stream) noexcept;
+[[nodiscard]] Status sigmoid_product_in_place(float* values,
+                                              const float* gate,
+                                              std::uint32_t elements,
+                                              void* stream) noexcept;
+[[nodiscard]] Status scaled_tanh_in_place(float* values,
+                                          std::uint32_t elements,
+                                          float multiplier, float softcap,
+                                          void* stream) noexcept;
 
 // Normalizes Q/K, applies HF OLMoE rotary embedding, and writes K/V for the
 // current position into persistent caches [context, heads, head_dim].
@@ -547,6 +558,17 @@ using PagedFp8GatedGqaStagedPrefillWorkspace =
     std::uint32_t rows, std::uint32_t query_heads,
     std::uint32_t kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, float rope_theta, void* stream) noexcept;
+// Weightless per-head Q/K RMSNorm with an artifact-declared query scale.
+// RoPE is optional so the same operation ABI covers positional and NoPE
+// attention layers without a model-family branch.
+[[nodiscard]] Status normalized_gqa_qkv_fp16_batch(
+    float* query, float* key, const float* value,
+    void* fp16_keys, void* fp16_values,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float query_scale, float rope_theta, bool apply_rope,
+    void* stream) noexcept;
 
 // Publishes exact projected K/V rows without a positional transform. Query
 // rows remain in FP32 for the attention provider. This is a distinct ABI from

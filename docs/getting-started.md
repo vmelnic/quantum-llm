@@ -1,6 +1,6 @@
 # Getting started
 
-Status: supported setup path, 2026-08-25.
+Status: supported setup path, 2026-08-26.
 
 This project uses a POSIX control host and a self-contained Windows/CUDA
 execution host. The reference execution host is `3090box`; paths below are
@@ -91,12 +91,15 @@ The official checkpoint is compiled directly into a candidate below
   -QuantProfile fp4-e2m1-ue8m0-block32-v1
 ```
 
-`hybrid_delta` is the generic compiler adapter for checkpoints that declare
-the split-GatedDeltaNet hybrid Transformer ABI. Upstream family identifiers
-are accepted only as source metadata and do not become runtime or deployment
-names. The same command publishes Ornith by selecting its pinned official
-source and `-StableName ornith-1.5-35b-a3b-fp4`; no new service task or runner
-is created. See [Expert Pack v1](expert-pack-v1.md).
+`hybrid_delta` is the source adapter for checkpoints that declare the
+split-GatedDeltaNet hybrid Transformer ABI. Muse uses the strict
+`muse_glimmer` source adapter because its checkpoint declares different
+attention, normalization and vocabulary-head mathematics. Upstream family
+identifiers remain source metadata; both adapters publish the same executable
+program contract and neither creates a model-specific service or runner.
+Ornith is published with its pinned official source and stable name
+`ornith-1.5-35b-a3b-fp4`; Muse uses `muse-glimmer-30b-fp4`. See
+[Expert Pack v1](expert-pack-v1.md).
 
 DeepSeek uses its authenticated compact-bundle workflow documented in
 [DeepSeek compact pack v1](deepseek-compact-pack-v1.md).
@@ -112,7 +115,7 @@ DeepSeek uses its authenticated compact-bundle workflow documented in
 
 The real smoke prompt is `hi`. A successful smoke validates lifecycle and the
 common path; it is not a performance or quality qualification. Repeat the same
-commands with `ornith` and `deepseek` when changing common runtime/service
-code.
+commands with `muse`, `ornith` and `deepseek` when changing common
+runtime/service code.
 
 Continue with [Deployment](deployment.md) and [Operations](operations.md).

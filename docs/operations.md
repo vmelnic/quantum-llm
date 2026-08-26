@@ -1,6 +1,6 @@
 # Operations
 
-Status: current operator runbook, 2026-08-23.
+Status: current operator runbook, 2026-08-26.
 
 ## Observe without blocking inference
 

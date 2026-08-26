@@ -1,6 +1,6 @@
 # Deployment
 
-Status: supported single-host lifecycle, 2026-08-23.
+Status: supported single-host lifecycle, 2026-08-26.
 
 ## Deployment contract
 
@@ -14,11 +14,13 @@ renames an existing stable directory to a timestamped rollback directory,
 renames the validated candidate into place and validates it again. `.env` and
 the service must never point to a partial candidate.
 
-The two supported aliases are declared in `ops/model-aliases.tsv`:
+The supported stable selections are declared in `ops/model-aliases.tsv`:
 
 | Alias | Advertised model | Artifact relative to `MODEL_ROOT` |
 |---|---|---|
 | `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` |
+| `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` |
+| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` |
 
 Aliases select artifacts only. The server, scheduled task and VM runner remain
@@ -75,7 +77,7 @@ continuity, not parallel execution.
 2. promote it transactionally below `MODEL_ROOT`;
 3. build and run the supported test suites;
 4. start Qwen, run `hi` through `model.sh chat`, then stop it;
-5. start DeepSeek, run the same smoke, then stop it;
+5. repeat the same public smoke for Muse, Ornith and DeepSeek;
 6. verify service descendants and GPU allocations are absent;
 7. preserve the previous stable artifact until rollback is no longer needed.
 

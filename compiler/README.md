@@ -8,7 +8,11 @@ Transformers model or materializing the whole checkpoint in RAM.
 
 - `hybrid_delta`: dense or MoE hybrid Transformer checkpoints with split
   Gated DeltaNet, periodic full attention, MTP and vision metadata;
+- `muse_glimmer`: the strict official Muse-Glimmer source contract; it
+  publishes dense text ABI-2 operations and preserves vision tensors as
+  explicit auxiliary records;
 - `qwen3_next`: Qwen3-Next MoE source adapter and MTP metadata;
+- `lfm2_moe`: LFM2-MoE tensor and routed-expert source contract;
 - `olmoe`: OLMoE source adapter;
 - `deepseek_v4`: exhaustive read-only DeepSeek-V4-Flash contract used by the
   descriptor, compact-pack and independent-oracle commands.
@@ -61,6 +65,10 @@ promotes it transactionally.
 Compilation writes `<output>.partial` and resumes only when source bytes and
 options are identical. `--reclaim-source-shards` is destructive and is never
 part of the normal workflow.
+
+Muse uses the same compiler/publication flow with `--adapter muse_glimmer`.
+Its current executable program is text-only; preserved vision records do not
+constitute a callable vision operation.
 
 ## DeepSeek commands
 

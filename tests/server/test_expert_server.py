@@ -22,12 +22,14 @@ sys.modules.setdefault(
 )
 
 import ops.python.expert_server as expert_server
+from ops.python.chat_client import _effective_maximum
 from ops.python.artifact_chat_codec import ArtifactChatCodec
 from ops.python.expert_server import (
     Application, AssistantStreamParser, ContinuousDecodeBatcher, CudaWorker,
     Handler, IncrementalTextDecoder, IncrementalTokenDecoder, RequestError,
     SamplingSettings,
-    StopFilter, _text_content, _worker_response_tokens,
+    StopFilter, _configured_eos_token_ids, _text_content,
+    _worker_response_tokens,
 )
 from ops.python.response_protocols import install_declared_response_protocol
 
@@ -55,6 +57,29 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_chat_output_limit_is_capped_by_active_service(self) -> None:
+        with unittest.mock.patch(
+                "ops.python.chat_client._get_json",
+                return_value={"runtime_config": {"maximum_new_tokens": 127}},
+        ):
+            self.assertEqual(_effective_maximum("http://fixture", 1024), 127)
+            self.assertEqual(_effective_maximum("http://fixture", 64), 64)
+
+    def test_generation_config_declares_complete_eos_set(self) -> None:
+        self.assertEqual(
+            _configured_eos_token_ids(
+                {"eos_token_id": [200001, 200008]}, 200001
+            ),
+            {200001, 200008},
+        )
+        self.assertEqual(_configured_eos_token_ids({}, 7), {7})
+        self.assertEqual(
+            _configured_eos_token_ids({"eos_token_id": None}, 7), {7}
+        )
+        self.assertEqual(_configured_eos_token_ids({}, (7, 9)), {7, 9})
+        with self.assertRaisesRegex(RuntimeError, "eos_token_id is invalid"):
+            _configured_eos_token_ids({"eos_token_id": [7, True]}, 7)
+
     def test_artifact_codec_controls_thinking_tools_and_stable_prefix(self) -> None:
         observed: dict[str, object] = {}
 
@@ -148,6 +173,27 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "text": "raw<eos>", "thinking_mode": "thinking",
         })
 
+    def test_artifact_codec_stream_hides_split_eos_terminal(self) -> None:
+        module = types.SimpleNamespace(
+            encode_messages=lambda _messages, thinking_mode: thinking_mode,
+            parse_message_from_completion_text=lambda _text, thinking_mode: {
+                "role": "assistant", "content": "answer",
+            },
+            eos_token="<eos>", thinking_start_token="<think>",
+            thinking_end_token="</think>", ASSISTANT_SP_TOKEN="<A>",
+            dsml_token="DSML", tool_calls_block_name="tool_calls",
+        )
+        parser = ArtifactChatCodec(module, Path("fixture.py")).stream_parser(
+            False
+        )
+        events = parser.feed("answer<eo") + parser.feed("s>ignored")
+        _message, tail = parser.finalize()
+        events += tail
+        self.assertEqual(
+            [(event["field"], event["text"]) for event in events],
+            [("content", "answer")],
+        )
+
     def test_incremental_decoder_holds_incomplete_unicode_without_replay(self) -> None:
         decoder = IncrementalTextDecoder()
         self.assertEqual(decoder.push("Hello! \ufffd"), "Hello! ")
@@ -201,6 +247,58 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         )
         self.assertEqual(decoder.push(1), "")
         self.assertEqual(decoder.push(2), "😊")
+
+    def test_incremental_token_decoder_preserves_declared_protocol_tokens(
+            self) -> None:
+        class Tokenizer:
+            def __init__(self) -> None:
+                self.skip_special_tokens: list[bool] = []
+
+            def decode(self, tokens: list[int], **kwargs: object) -> str:
+                skip = bool(kwargs["skip_special_tokens"])
+                self.skip_special_tokens.append(skip)
+                pieces = {
+                    1: "to=self", 2: "<|message|>", 3: "reason",
+                    4: "<eos>",
+                }
+                return "".join(
+                    piece for token in tokens
+                    if not (skip and token == 2)
+                    for piece in (pieces[token],)
+                )
+
+        raw_tokenizer = Tokenizer()
+        raw = IncrementalTokenDecoder(
+            raw_tokenizer, overlap_tokens=4, maximum_window_tokens=8
+        )
+        self.assertEqual("".join(raw.push(token) for token in (1, 2, 3)),
+                         "to=selfreason")
+        self.assertTrue(all(raw_tokenizer.skip_special_tokens))
+
+        protocol_tokenizer = Tokenizer()
+        protocol = IncrementalTokenDecoder(
+            protocol_tokenizer, overlap_tokens=4, maximum_window_tokens=8,
+            preserve_special_tokens=True,
+            suppressed_token_ids={4},
+        )
+        self.assertEqual(
+            "".join(protocol.push(token) for token in (1, 2, 4, 3)),
+            "to=self<|message|>reason",
+        )
+        self.assertFalse(any(protocol_tokenizer.skip_special_tokens))
+
+    def test_incremental_token_decoder_never_exposes_suppressed_eos(self) -> None:
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return "".join({1: "answer", 2: "<eos>"}[token]
+                               for token in tokens)
+
+        decoder = IncrementalTokenDecoder(
+            Tokenizer(), overlap_tokens=4, maximum_window_tokens=8,
+            suppressed_token_ids={2},
+        )
+        self.assertEqual(decoder.push(1), "answer")
+        self.assertEqual(decoder.push(2, final=True), "")
 
     def test_incremental_token_decoder_strips_retained_context_prefix(self) -> None:
         class Tokenizer:
@@ -1771,7 +1869,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         app.observe_latency = lambda *_args, **_kwargs: None
 
         result = list(app.generate([3], 5))
-        self.assertEqual(result, [(7, "7")])
+        self.assertEqual(result, [(7, "")])
         self.assertEqual(app.worker.active_ids, set())
 
     def test_non_retained_generation_omits_checkpoint(self) -> None:
@@ -1833,7 +1931,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             cache_prefix_tokens=1,
         ))
 
-        self.assertEqual(result, [(7, "7")])
+        self.assertEqual(result, [(7, "")])
         self.assertIsNone(worker.checkpoint_tokens)
 
     def test_retained_session_resumes_with_delta_tokens(self) -> None:

@@ -1,16 +1,16 @@
 # Production readiness
 
 Status: functional research/pilot runtime, not production-ready for the full
-262K coding objective, 2026-08-25.
+262K coding objective, 2026-08-26.
 
 ## Verdict
 
-The native Qwen, Ornith and DeepSeek services work through one
-artifact-driven VM and HTTP lifecycle, and all three are selectable through
+The native Qwen, Muse, Ornith and DeepSeek services work through one
+artifact-driven VM and HTTP lifecycle, and all four are selectable through
 Pi. Short-context Qwen chat, reasoning, tools, images, exact-F16
 progressive allocation and retained-session recovery have passed bounded
-gates. Ornith standard expert execution and DeepSeek compact expert paging
-also pass short chat gates.
+gates. Muse text execution, Ornith standard expert execution and DeepSeek
+compact expert paging also pass short chat gates.
 
 The product is not ready for unrestricted real-project use at maximum context:
 
@@ -19,7 +19,7 @@ The product is not ready for unrestricted real-project use at maximum context:
 - no saturated 262K exact-F16 decode qualification exists;
 - the historical compact-KV maximum decoded at only about 3.24 tok/s;
 - Claude Code's large automatic prompt failed latency and factual behavior;
-- execution is serialized through one hot Qwen provider slot;
+- dense execution is serialized through one hot provider slot;
 - long-context failure injection and broad quality qualification remain open.
 
 ## Ready components
@@ -27,12 +27,13 @@ The product is not ready for unrestricted real-project use at maximum context:
 | Area | State |
 |---|---|
 | Qwen FP4 artifact | transactionally published, source/hash/format validated |
+| Muse FP4 artifact | transactionally published, source-qualified, text common path passed; vision auxiliary-only |
 | Ornith FP4 artifact | transactionally published, source-qualified, common chat path passed |
 | DeepSeek compact bundle | authenticated and consumable by the common VM |
 | common lifecycle | install/start/status/chat/stop with artifact aliases |
 | OpenAI API | Completions, Chat Completions, Responses, streaming and usage |
 | Anthropic adapter | Messages/count_tokens and streaming wire compatibility |
-| Pi integration | Qwen/Ornith real text and `read` tool loops; all three selectable; xhigh default and thinking control |
+| Pi integration | Qwen/Ornith real text and `read` tool loops; all four selectable; `xhigh` default and thinking control; Muse/DeepSeek full harness gates remain open |
 | Qwen text/tools/images | bounded functional gates passed |
 | exact F16 KV | progressive 256-token pages, append growth and zero-delta reuse |
 | session retention | park/restore, transactional resume and cancel rewind |
@@ -51,7 +52,7 @@ The product is not ready for unrestricted real-project use at maximum context:
 | multi-GPU | no per-device allocator/provider/P2P implementation |
 | public network service | no integrated TLS, rate limiting or durable edge |
 | automated recovery | long-prefix worker restart/KV exhaustion gates incomplete |
-| broad model universality | artifact/provider model is generic, but only the Qwen, Ornith and DeepSeek capability sets are executable |
+| broad model universality | artifact/provider model is generic, but only the Qwen, Muse-text, Ornith and DeepSeek capability sets are executable |
 
 ## Release invariants
 
@@ -72,7 +73,7 @@ The product is not ready for unrestricted real-project use at maximum context:
 1. clean local and Windows Release/CUDA tests;
 2. bounded official numerical and behavior comparisons for text, sampling,
    tools and images;
-3. real Qwen, Ornith and DeepSeek `model.sh chat` smokes through the common runner;
+3. real Qwen, Muse, Ornith and DeepSeek `model.sh chat` smokes through the common runner;
 4. representative Pi coding histories with delta-only reuse;
 5. populated 262K exact-F16 Qwen prefill/decode meeting the accepted latency
    and throughput target;

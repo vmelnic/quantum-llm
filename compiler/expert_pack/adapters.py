@@ -2167,11 +2167,15 @@ class Lfm2MoeAdapter:
         )
 
 
+from .muse_glimmer_adapter import MuseGlimmerAdapter
+
+
 ADAPTERS = {
     OlmoeAdapter.name: OlmoeAdapter(),
     Qwen3NextAdapter.name: Qwen3NextAdapter(),
     HybridDeltaAdapter.name: HybridDeltaAdapter(),
     Lfm2MoeAdapter.name: Lfm2MoeAdapter(),
+    MuseGlimmerAdapter.name: MuseGlimmerAdapter(),
 }
 
 

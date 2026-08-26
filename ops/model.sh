@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [deepseek|qwen|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|muse|ornith|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -200,6 +200,23 @@ start_model() {
   [[ -n "${model_id}" ]] || die "start requires one model"
   if is_true "${sync_on_start}"; then
     sync_remote
+  fi
+  local contract_json artifact_max_context
+  contract_json="$(run_remote Get-ModelArtifactContract.ps1 -Container "${container}")"
+  artifact_max_context="$(python3 -c '
+import json, sys
+value = json.load(sys.stdin).get("maximum_context")
+if not isinstance(value, int) or value <= 1:
+    raise SystemExit("artifact contract has no valid maximum_context")
+print(value)
+' <<<"${contract_json}")"
+  if (( max_context > artifact_max_context )); then
+    printf 'Using artifact context limit %s instead of configured %s\n' \
+      "${artifact_max_context}" "${max_context}"
+    max_context="${artifact_max_context}"
+  fi
+  if (( max_output >= max_context )); then
+    max_output=$((max_context - 1))
   fi
   run_remote Install-ServerEnvironment.ps1 -CheckOnly
   stop_all

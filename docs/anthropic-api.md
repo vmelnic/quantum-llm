@@ -1,6 +1,6 @@
 # Anthropic Messages API
 
-Status: implemented wire adapter with explicit harness limits, 2026-08-23.
+Status: implemented wire adapter with explicit harness limits, 2026-08-26.
 
 ## Endpoints
 

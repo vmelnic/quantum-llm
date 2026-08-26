@@ -1,6 +1,6 @@
 # Expert Pack v1
 
-Status: current QPack storage contract, 2026-08-23.
+Status: current QPack storage contract, 2026-08-26.
 
 ## Purpose
 

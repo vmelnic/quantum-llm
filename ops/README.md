@@ -36,14 +36,16 @@ The maintained PowerShell surface is grouped by purpose:
   `Invoke-BuildExpertRuntime.ps1`, `Install-ServerEnvironment.ps1`;
 - Hugging Face Xet: `Start-HuggingFaceModelDownload.ps1`, its worker and
   `Get-HuggingFaceModelDownload.ps1`;
-- Qwen artifact: `Invoke-SourceInventory.ps1`, `Invoke-ExpertPack.ps1`,
+- Hugging Face QPack artifacts: `Invoke-SourceInventory.ps1`,
+  `Invoke-ExpertPack.ps1`,
   `Invoke-Fp4SourceQualityGate.ps1`,
   `Publish-HuggingFaceExpertPack.ps1`, `Promote-ModelArtifact.ps1`;
 - DeepSeek artifact: `Start-DeepSeekV4FlashDownload.ps1`, descriptor/oracle
   exporters, `Invoke-DeepSeekCompactPack.ps1` and
   `Publish-DeepSeekWorkerBundle.ps1`;
-- service: `Start-ExpertServer.ps1`, `Install-ExpertServerTask.ps1`,
-  `Get-ExpertServerStatus.ps1`, `Stop-ExpertServer.ps1` and uninstall;
+- service: `Get-ModelArtifactContract.ps1`, `Start-ExpertServer.ps1`,
+  `Install-ExpertServerTask.ps1`, `Get-ExpertServerStatus.ps1`,
+  `Stop-ExpertServer.ps1` and uninstall;
 - reference behavior: the pinned Hugging Face reference environment and
   bounded behavior gates.
 
@@ -58,7 +60,8 @@ second operator path.
 - host model paths derive only from `MODEL_ROOT`;
 - artifacts are candidates until validated and transactionally promoted;
 - start checks the pinned server environment before replacing a model;
-- release gates test Qwen and DeepSeek through the same public chat path;
+- release gates test Qwen, Muse, Ornith and DeepSeek through the same public
+  chat path;
 - stop and verify process/GPU cleanup after every gate;
 - no normal script deletes a published model or Hugging Face cache.
 

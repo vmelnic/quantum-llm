@@ -1,19 +1,21 @@
 # Architecture
 
-Status: implemented architecture and explicit boundaries, 2026-08-25.
+Status: implemented architecture and explicit boundaries, 2026-08-26.
 
 ## Purpose
 
 Quantum LLM is a self-contained native inference runtime for models whose
 useful execution state does not map cleanly to a single GPU allocation. It is
-built around three concrete placements expressed through two broad access
+built around four concrete placements expressed through two broad access
 patterns:
 
 1. a dense/hybrid model such as Qwen3.8-27B, where every target-call matrix is
    hot and the difficult state is long-context KV;
-2. a hybrid sparse model such as Ornith-1.5-35B-A3B, where recurrent and dense
+2. a dense model such as Muse-Glimmer-30B, where full-attention and exact
+   sliding-window layers require different KV residency geometry;
+3. a hybrid sparse model such as Ornith-1.5-35B-A3B, where recurrent and dense
    organs remain hot while standard FP4 expert pages are routed top-8;
-3. a much larger sparse MoE model such as DeepSeek-V4-Flash, where the exact
+4. a much larger sparse MoE model such as DeepSeek-V4-Flash, where the exact
    selected expert pages are demand-paged because the routed pool exceeds RAM.
 
 The project does not claim that SSD paging makes arbitrary dense models fast.
@@ -43,7 +45,7 @@ common native VM runner -> capability binding -> request state
               +-----------+-----------+
               |                       |
        hybrid FP4 provider      compact sparse provider
-       Qwen + Ornith            DeepSeek
+       Qwen + Muse + Ornith     DeepSeek
               |                       |
        exact/paged KV           VRAM <- RAM <- NVMe
        standard experts         compact expert pages
@@ -52,9 +54,9 @@ common native VM runner -> capability binding -> request state
                   sampled/greedy tokens
 ```
 
-The common service and VM do not select Qwen, DeepSeek, a fixed layer count or
-a tensor path. The artifact declares operations and ABIs; providers advertise
-which declarations they can execute. A source adapter may understand an
+The common service and VM do not select Qwen, Muse, Ornith, DeepSeek, a fixed
+layer count or a tensor path. The artifact declares operations and ABIs;
+providers advertise which declarations they can execute. A source adapter may understand an
 upstream family because checkpoint tensor names are not universal. New
 mathematics or a new encoding requires a provider, not another HTTP server or
 launcher.
@@ -132,6 +134,33 @@ can retain short/medium histories, but if several sessions actually populate
 hundreds of thousands of F16 tokens, pinned RAM and park/restore bandwidth
 become the admission limits. `MODEL_WORKER_CAPACITY` does not remove the
 serialized Python command channel and provider mutex.
+
+## Muse-Glimmer dense execution
+
+`${MODEL_ROOT}/muse-glimmer-30b-fp4` is compiled from the pinned official
+checkpoint by a strict source adapter, then executes through the existing
+dense FP4 ABI-2 capabilities. The program declares 52 text layers, including
+39 exact 2,048-token sliding-attention layers and 13 exact global-attention
+layers, plus output-gated attention, centered RMS norms, weightless Q/K norms,
+layer-specific RoPE/NoPE and a soft-capped vocabulary head. None of those
+choices is selected by model name in the provider.
+
+The QPack contains 723 FP4 and 713 F32 records in 15,832,002,560 bytes. Exact
+F16 KV at the declared 131,072-token maximum is split by the program:
+
+```text
+13 global layers * 131,072 positions * 2(K,V) * 2 heads * 128 * 2 bytes
+  = 1,744,830,464 bytes
+39 sliding layers * 2,048 positions * 2(K,V) * 2 heads * 128 * 2 bytes
+  =    81,788,928 bytes
+total = 1,826,619,392 bytes = 1.70 GiB
+```
+
+The sliding portion is a cyclic exact window for the model's declared
+attention semantics, not KV quantization or token eviction from a global
+layer. Vision tensors are preserved and source-qualified as auxiliary records,
+but no vision operation is advertised yet; current Muse support is text-only.
+The 131K limit is declared capacity, not evidence of a populated-context gate.
 
 ## Ornith hybrid sparse execution
 

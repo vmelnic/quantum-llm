@@ -1,10 +1,10 @@
 # Pi CLI
 
-Status: maintained local coding-agent integration, 2026-08-25.
+Status: maintained local coding-agent integration, 2026-08-26.
 
 Pi is the preferred harness because it can target the local OpenAI-compatible
 service without Claude Code's fixed Claude-oriented prompt/caching behavior.
-The repository config selects Qwen by default, exposes Qwen, Ornith and
+The repository config selects Qwen by default, exposes Qwen, Muse, Ornith and
 DeepSeek, uses `xhigh` thinking and enables bounded compaction.
 
 ## Repository settings
@@ -12,14 +12,16 @@ DeepSeek, uses `xhigh` thinking and enables bounded compaction.
 `.pi/settings.json` contains:
 
 - provider `quantum-llm` and model `qwen3.8-27b-fp4`;
-- Qwen, Ornith and DeepSeek enabled at `xhigh`;
+- Qwen, Muse, Ornith and DeepSeek enabled at `xhigh`;
 - compaction with 8,192 tokens of answer headroom and 32,768 recent tokens;
 - a request timeout matching long local prefills;
 - automatic retries disabled so failures and overload are visible.
 
 The provider secret/base URL belong in Pi's user-local model registry, not in
 Git. Configure a single OpenAI-compatible provider named `quantum-llm` that
-points at the local tunnel URL and uses `EXPERT_API_KEY`.
+points at the service URL and resolves `EXPERT_API_KEY`. The maintained local
+catalog contains only the four supported models; repository settings remain
+portable and contain no secret.
 
 ## Start and use
 
@@ -44,6 +46,17 @@ For Ornith:
 ./ops/pi.sh ornith
 ```
 
+For Muse text inference:
+
+```bash
+./ops/model.sh start muse
+./ops/pi.sh muse
+```
+
+Muse currently advertises text only and an artifact-declared 131,072-token
+maximum. The lifecycle clamps the global 262K Qwen setting to that contract;
+declaring 131K does not prove it was populated or timed.
+
 `ops/pi.sh` validates the model alias and secret, then launches Pi with the
 common provider, selected advertised model and `--thinking xhigh`. Arguments
 after the model are passed through to Pi.
@@ -64,11 +77,12 @@ it becomes saturated. The runtime retains exact populated KV and feeds only a
 suffix when the prefix is unchanged. Editing/truncating an old prefix requires
 replay from the common prefix checkpoint.
 
-The Pi catalog advertises the full 262,143-token output ceiling. Pi subtracts
-its estimated active context and a 4,096-token safety margin before each
-request; the server then clamps the request again using the exact tokenized
-prompt. Neither ceiling preallocates KV. The separate 8,192-token compaction
-reserve controls when Pi compacts history and is not a model output limit.
+The Qwen, Ornith and DeepSeek Pi entries advertise the 262,143-token output
+ceiling; Muse advertises its artifact limit of 131,071. Pi subtracts its
+estimated active context and a 4,096-token safety margin before each request;
+the server then clamps the request again using the exact tokenized prompt.
+Neither ceiling preallocates KV. The separate 8,192-token compaction reserve
+controls when Pi compacts history and is not a model output limit.
 
 Multiple Pi processes may keep sessions, but the current service has one
 serialized hot provider slot. Expect queueing, not simultaneous decode. Actual
