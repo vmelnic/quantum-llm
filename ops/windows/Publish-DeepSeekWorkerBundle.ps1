@@ -6,6 +6,8 @@ param(
     [string]$MtpSet = "",
     [string]$MtpRoutedCatalog = "",
     [string]$StateDirectory = "",
+    [ValidateSet("materialized", "external")]
+    [string]$SourceExtentStorage = "materialized",
     [ValidateRange(0.001, 1000.0)][double]$CpuMillisecondsPerSelection = 9.342,
     [ValidateRange(0.001, 1000.0)][double]$GpuMillisecondsPerSelection = 0.543,
     [ValidateRange(0.001, 1000.0)][double]$H2DGigabytesPerSecond = 3.393
@@ -21,6 +23,166 @@ function Write-Utf8NoBom {
     )
     $encoding = New-Object System.Text.UTF8Encoding($false)
     [System.IO.File]::WriteAllText($Path, $Value, $encoding)
+}
+
+function Publish-MaterializedSourceExtents {
+    param(
+        [Parameter(Mandatory = $true)][string]$BundleRoot,
+        [Parameter(Mandatory = $true)][string]$SourceRoot
+    )
+
+    $sourcePrefix = [System.IO.Path]::GetFullPath($SourceRoot)
+    $sourcePrefix = $sourcePrefix.TrimEnd(
+        [System.IO.Path]::DirectorySeparatorChar) +
+        [System.IO.Path]::DirectorySeparatorChar
+    $payloadRoot = Join-Path $BundleRoot "checkpoint"
+    New-Item -ItemType Directory -Path $payloadRoot | Out-Null
+    $payloadName = "source-extents.bin"
+    $payloadPath = Join-Path $payloadRoot $payloadName
+    $descriptorRoots = @(
+        "dense",
+        "typed",
+        "shared",
+        "mtp\dense",
+        "mtp\typed",
+        "mtp\shared"
+    )
+    $descriptorFiles = @($descriptorRoots | ForEach-Object {
+        $root = Join-Path $BundleRoot $_
+        if (Test-Path -LiteralPath $root -PathType Container) {
+            Get-ChildItem -LiteralPath $root -Filter "extents.tsv" `
+                -File -Recurse
+        }
+    } | Sort-Object FullName)
+    if ($descriptorFiles.Count -eq 0) {
+        throw "DeepSeek bundle contains no materializable source extents"
+    }
+
+    $buffer = New-Object byte[] (4MB)
+    $sourceStreams = @{}
+    $sourceFiles = New-Object 'System.Collections.Generic.HashSet[string]'
+    $packedExtents = @{}
+    $descriptorCount = 0
+    $extentCount = 0
+    $uniqueExtentCount = 0
+    $logicalBytes = [int64]0
+    $output = $null
+    try {
+        $output = [System.IO.FileStream]::new(
+            $payloadPath,
+            [System.IO.FileMode]::CreateNew,
+            [System.IO.FileAccess]::Write,
+            [System.IO.FileShare]::None,
+            4MB,
+            [System.IO.FileOptions]::SequentialScan)
+        foreach ($descriptor in $descriptorFiles) {
+            $lines = @([System.IO.File]::ReadAllLines($descriptor.FullName))
+            if ($lines.Count -eq 0 -or
+                $lines[0] -ne "deepseek-compact-extents-v1") {
+                continue
+            }
+            $rewritten = New-Object 'System.Collections.Generic.List[string]'
+            $rewritten.Add($lines[0])
+            for ($lineIndex = 1; $lineIndex -lt $lines.Count; $lineIndex += 1) {
+                $line = $lines[$lineIndex]
+                if ([string]::IsNullOrWhiteSpace($line)) { continue }
+                $fields = @($line -split "`t")
+                if ($fields.Count -ne 4) {
+                    throw "Invalid DeepSeek extent row: $($descriptor.FullName)"
+                }
+                $destinationOffset = [int64]$fields[0]
+                $bytes = [int64]$fields[1]
+                $sourceOffset = [int64]$fields[2]
+                $relativeSource = [string]$fields[3]
+                if ($destinationOffset -lt 0 -or $bytes -le 0 -or
+                    $sourceOffset -lt 0 -or
+                    [System.IO.Path]::IsPathRooted($relativeSource)) {
+                    throw "Unsafe DeepSeek extent row: $($descriptor.FullName)"
+                }
+                $sourcePath = [System.IO.Path]::GetFullPath(
+                    (Join-Path $SourceRoot $relativeSource))
+                if (-not $sourcePath.StartsWith(
+                        $sourcePrefix,
+                        [System.StringComparison]::OrdinalIgnoreCase) -or
+                    -not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+                    throw "DeepSeek source extent is unavailable: $relativeSource"
+                }
+                $sourceLength = [int64](Get-Item -LiteralPath $sourcePath).Length
+                if ($sourceOffset -gt $sourceLength -or
+                    $bytes -gt $sourceLength - $sourceOffset) {
+                    throw "DeepSeek source extent exceeds its shard: $relativeSource"
+                }
+                [void]$sourceFiles.Add($relativeSource.Replace('\', '/'))
+                $key = "$sourcePath`n$sourceOffset`n$bytes"
+                if ($packedExtents.ContainsKey($key)) {
+                    $packedOffset = [int64]$packedExtents[$key]
+                } else {
+                    if (-not $sourceStreams.ContainsKey($sourcePath)) {
+                        $sourceStreams[$sourcePath] = [System.IO.FileStream]::new(
+                            $sourcePath,
+                            [System.IO.FileMode]::Open,
+                            [System.IO.FileAccess]::Read,
+                            [System.IO.FileShare]::Read,
+                            4MB,
+                            [System.IO.FileOptions]::RandomAccess)
+                    }
+                    $sourceStream = $sourceStreams[$sourcePath]
+                    [void]$sourceStream.Seek(
+                        $sourceOffset, [System.IO.SeekOrigin]::Begin)
+                    $packedOffset = [int64]$output.Position
+                    $remaining = $bytes
+                    while ($remaining -gt 0) {
+                        $take = [int][Math]::Min([int64]$buffer.Length, $remaining)
+                        $read = 0
+                        while ($read -lt $take) {
+                            $received = $sourceStream.Read(
+                                $buffer, $read, $take - $read)
+                            if ($received -le 0) {
+                                throw "Short read while materializing $relativeSource"
+                            }
+                            $read += $received
+                        }
+                        $output.Write($buffer, 0, $take)
+                        $remaining -= $take
+                    }
+                    $packedExtents[$key] = $packedOffset
+                    $uniqueExtentCount += 1
+                }
+                $rewritten.Add(
+                    "$destinationOffset`t$bytes`t$packedOffset`t$payloadName")
+                $extentCount += 1
+                $logicalBytes += $bytes
+            }
+            Write-Utf8NoBom -Path $descriptor.FullName `
+                -Value (($rewritten -join "`n") + "`n")
+            $descriptorCount += 1
+        }
+        $output.Flush($true)
+    }
+    finally {
+        if ($null -ne $output) { $output.Dispose() }
+        foreach ($stream in $sourceStreams.Values) { $stream.Dispose() }
+    }
+    if ($descriptorCount -eq 0 -or $extentCount -eq 0 -or
+        -not (Test-Path -LiteralPath $payloadPath -PathType Leaf)) {
+        throw "DeepSeek source extent materialization produced no payload"
+    }
+    $payloadBytes = [int64](Get-Item -LiteralPath $payloadPath).Length
+    if ($payloadBytes -le 0 -or $payloadBytes -gt $logicalBytes) {
+        throw "DeepSeek materialized payload accounting is invalid"
+    }
+    [PSCustomObject]@{
+        checkpoint = "checkpoint"
+        descriptor_count = $descriptorCount
+        extent_count = $extentCount
+        unique_extent_count = $uniqueExtentCount
+        source_file_count = $sourceFiles.Count
+        logical_bytes = $logicalBytes
+        payload_bytes = $payloadBytes
+        payload_path = "checkpoint/$payloadName"
+        payload_sha256 = (Get-FileHash -LiteralPath $payloadPath `
+            -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
 }
 
 $source = [System.IO.Path]::GetFullPath($Snapshot)
@@ -211,12 +373,19 @@ try {
                 -Algorithm SHA256).Hash.ToLowerInvariant()
         }
     }
+    $materialized = if ($SourceExtentStorage -eq "materialized") {
+        Publish-MaterializedSourceExtents -BundleRoot $partial `
+            -SourceRoot $source
+    } else { $null }
+    $checkpoint = if ($null -ne $materialized) {
+        [string]$materialized.checkpoint
+    } else { $source }
     New-Item -ItemType Directory -Path $state -Force | Out-Null
     $runtimeLines = @(
         "deepseek-worker-bundle-v$bundleVersion",
         "model_id`t$mainNamespace",
         "model_sha256`t$modelHash",
-        "checkpoint`t$source",
+        "checkpoint`t$checkpoint",
         "dense`tdense",
         "typed`ttyped",
         "shared`tshared",
@@ -423,6 +592,9 @@ try {
             version = $bundleVersion
             routed_storage = if ($packed) { "compact-pack" } else { "source-extents" }
             mtp_routed_storage = if ($mtpRouted) { "compact-pack" } else { $null }
+            source_extent_storage = if ($null -ne $materialized) {
+                "materialized-pack"
+            } else { "external-snapshot" }
         }
         quantization = [ordered]@{
             dense = "fp8-e4m3-ue8m0-to-sm86-int8-per-row"
@@ -462,7 +634,23 @@ try {
             } else { 0 }
             routed_shards = if ($packed) { [int]$routedManifest.shards } else { 0 }
             mtp_source_bytes = if ($mtp) { [long]$mtpManifest.source_bytes } else { 0 }
+            source_extent_logical_bytes = if ($null -ne $materialized) {
+                [int64]$materialized.logical_bytes
+            } else { 0 }
+            source_extent_payload_bytes = if ($null -ne $materialized) {
+                [int64]$materialized.payload_bytes
+            } else { 0 }
         }
+        source_extents = if ($null -ne $materialized) {
+            [ordered]@{
+                path = [string]$materialized.payload_path
+                sha256 = [string]$materialized.payload_sha256
+                descriptors = [int]$materialized.descriptor_count
+                extents = [int]$materialized.extent_count
+                unique_extents = [int]$materialized.unique_extent_count
+                source_files = [int]$materialized.source_file_count
+            }
+        } else { $null }
         indexes = [ordered]@{
             dense_sha256 = $denseHash
             experts_sha256 = $expertsHash
@@ -491,7 +679,10 @@ $result = [PSCustomObject]@{
     schema_version = 1
     output = $destination
     state_directory = $state
-    checkpoint = $source
+    checkpoint = if ($SourceExtentStorage -eq "materialized") {
+        Join-Path $destination "checkpoint"
+    } else { $source }
+    source_extent_storage = $SourceExtentStorage
     routed_catalog = $routed
     durable_routed_pack = $packed
     mtp_resource_set = $mtp

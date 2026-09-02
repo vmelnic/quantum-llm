@@ -2251,6 +2251,26 @@ void test_resource_governor_trims_before_reserving() {
           "resource governor did not release reservation credits");
 }
 
+void test_device_cache_budget_is_a_safe_provider_ceiling() {
+  auto fitted = er::fit_device_cache_budget(
+      {1000U, 200U, 100U, 100U, 700U, 300U});
+  require(fitted.status.ok() && fitted.effective_cache_bytes == 600U,
+          "device cache ceiling did not preserve fixed allocations");
+  fitted = er::fit_device_cache_budget(
+      {1000U, 200U, 100U, 100U, 400U, 300U});
+  require(fitted.status.ok() && fitted.effective_cache_bytes == 400U,
+          "device cache ceiling expanded a smaller explicit request");
+  fitted = er::fit_device_cache_budget(
+      {1000U, 400U, 200U, 150U, 500U, 300U});
+  require(!fitted.status.ok() && fitted.effective_cache_bytes == 0U,
+          "device cache ceiling admitted less than the provider minimum");
+  fitted = er::fit_device_cache_budget(
+      {1000U, std::numeric_limits<std::uint64_t>::max(), 1U, 1U, 500U,
+       300U});
+  require(!fitted.status.ok(),
+          "device cache ceiling overflowed fixed allocation accounting");
+}
+
 void test_state_machine_and_sha256() {
   require(er::cache_state_name(er::CacheState::vram_ready) == "VRAM_READY",
           "cache state name");
@@ -3613,6 +3633,7 @@ int main() {
     test_active_expert_wire_moves_only_exact_activations();
     test_routed_runtime_accepts_injected_remote_store();
     test_resource_governor_trims_before_reserving();
+    test_device_cache_budget_is_a_safe_provider_ceiling();
     test_ready_first_grouped_scheduler();
     test_concurrent_load_dedup_and_visibility();
     test_budget_eviction_refcount_and_cancellation();

@@ -50,7 +50,8 @@ class CudaExpertAllocation final : public IDeviceAllocation {
                        std::uint32_t hidden = 0,
                        std::uint32_t intermediate = 0,
                        bool packed_fp4 = false,
-                       bool relu2 = false) noexcept;
+                       bool relu2 = false,
+                       bool native_nvfp4 = false) noexcept;
   ~CudaExpertAllocation() override;
   CudaExpertAllocation(const CudaExpertAllocation&) = delete;
   CudaExpertAllocation& operator=(const CudaExpertAllocation&) = delete;
@@ -66,6 +67,7 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   [[nodiscard]] std::uint32_t intermediate() const noexcept;
   [[nodiscard]] bool packed_fp4() const noexcept;
   [[nodiscard]] bool relu2() const noexcept;
+  [[nodiscard]] bool native_nvfp4() const noexcept;
 
  private:
   std::shared_ptr<CudaExpertPool> pool_;
@@ -79,6 +81,7 @@ class CudaExpertAllocation final : public IDeviceAllocation {
   std::uint32_t intermediate_{};
   bool packed_fp4_{};
   bool relu2_{};
+  bool native_nvfp4_{};
 };
 
 class CudaCompactExpertAllocation final : public IDeviceAllocation {

@@ -70,6 +70,27 @@ struct MemoryGovernorSnapshot final {
   std::uint64_t rejected_reservations{};
 };
 
+// Computes a provider's trimmable device-cache budget after every hot,
+// non-evictable allocation has been accounted for. The configured cache is a
+// ceiling, not a promise that may overcommit the device. Providers still
+// declare their own minimum useful cache from artifact geometry.
+struct DeviceCacheBudgetRequest final {
+  std::uint64_t available_device_bytes{};
+  std::uint64_t fixed_device_bytes{};
+  std::uint64_t execution_workspace_bytes{};
+  std::uint64_t emergency_reserve_bytes{};
+  std::uint64_t requested_cache_bytes{};
+  std::uint64_t minimum_cache_bytes{};
+};
+
+struct DeviceCacheBudgetResult final {
+  Status status;
+  std::uint64_t effective_cache_bytes{};
+};
+
+[[nodiscard]] DeviceCacheBudgetResult fit_device_cache_budget(
+    const DeviceCacheBudgetRequest& request) noexcept;
+
 // One admission authority for dense state, KV/request reservations, and every
 // trimmable cache tier. reserve() first asks lower-priority tiers to yield and
 // fails closed if live storage still exceeds the physical budget.

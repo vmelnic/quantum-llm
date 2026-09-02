@@ -1,92 +1,87 @@
-# Expert Runtime contract
+# Runtime contract
 
-Status: current VM, worker and placement contract, 2026-08-26.
+Status: current VM, provider and worker contract, 2026-09-02.
 
-## Program and provider negotiation
+## Program and provider binding
 
-Every service artifact publishes `runtime-model.tsv`. The common native runner
-parses the program, validates geometry/encodings and asks registered providers
-for the declared kernel capabilities. Common code does not branch on Qwen,
-Muse, Ornith, DeepSeek, layer count or upstream tensor names.
+Every callable artifact publishes `runtime-model.tsv` in
+`expert-runtime-model-v1` format. Schema 3 describes model geometry, ordered
+operations, record references, encodings and required capabilities. The common
+runner validates the program and binds exactly one compatible provider. Missing
+or ambiguous bindings fail startup.
 
-A new checkpoint using existing operations requires a strict source adapter
-and a new artifact. New mathematics, encoding or geometry requires a provider
-implementation plus an independent numerical oracle. It does not require a
-new HTTP service, scheduled task or `model.sh` case.
+Source adapters may know upstream tensor names. Common service and VM code may
+not branch on a model family, architecture ID, layer count or absolute tensor
+path. Existing operations require only a new validated artifact; new
+mathematics or encoding requires a provider and independent numerical oracle.
 
-## Worker protocol
+## Worker lifecycle
 
-The server starts one native worker and performs a handshake that advertises
-model identity, context/output limits, provider capabilities, KV policy,
-session retention and telemetry schema. Commands cover:
+Startup performs artifact validation, provider construction, program
+preparation and a capability handshake before readiness. The handshake reports
+model identity, context/output limits, KV policy, session capabilities and
+telemetry schema.
 
-- request begin/resume and bounded prompt feed;
-- token step/generation and streaming output;
-- commit/checkpoint, rewind, retain/park, restore and drop;
-- cancellation and shutdown;
-- cached status/telemetry snapshots.
+The protocol supports request begin, bounded prompt feed, generation,
+cancellation, status and shutdown. Checkpoint, resume, rewind, retain and drop
+are sent only when the selected provider advertises exact session retention.
+DeepSeek does not; sending those commands is a protocol error.
 
-Request state transitions are transactional. Resume does not consume the
-parked state until rebind and suffix feed succeed. A zero-length suffix is
-valid. Cancellation rewinds to the last client-echoable prompt checkpoint;
-worker/protocol errors fail the request rather than silently rebuilding a
-different state.
+For retaining providers, resume is transactional: parked state is consumed
+only after rebind and suffix feed succeed, a zero-length suffix is valid, and
+failure returns to the committed client-echoable prefix. Partial assistant
+output is never silently retained after cancellation.
 
-## Dense placement
+## Placement
 
-The dense/hybrid FP4 provider currently owns one hot CUDA execution slot:
+Dense/hybrid provider:
 
-- FP4 matrix weights are resident in VRAM;
-- activation tiles stay device-resident across the operation program;
-- recurrent state remains hot while a request executes;
-- exact target F16 KV grows according to artifact-declared global or sliding
-  geometry; Qwen uses request-owned 256-token pinned-host pages;
-- bounded global-attention KV spans are staged to the GPU; artifact-declared
-  sliding windows remain exact cyclic windows;
-- inactive sessions retain populated pages and a compact continuation blob.
+- hot FP4/NVFP4 matrices and activation tiles remain on the GPU;
+- recurrent state remains in the single hot slot;
+- exact KV grows according to artifact-declared dtype and global/window/latent
+  geometry;
+- Qwen uses authoritative 256-token pinned-host F16 pages plus a bounded exact
+  device mirror;
+- inactive retaining sessions own real host bytes and a continuation blob.
 
-MTP/draft state is allocated only when the generation policy can actually use
-exact verification. Stochastic sampling currently uses target-only decode;
-paying draft prefill/KV in that mode is forbidden.
+Sparse provider:
 
-## Sparse placement
+- standard QPack experts and DeepSeek compact experts share logical page
+  identity and exact CPU/GPU execution contracts;
+- demand has priority over speculative work;
+- leases and completion events protect in-flight records;
+- RAM and VRAM retention classes isolate cold first touches from hot pages;
+- DeepSeek absent pages may require NVMe, while a complete fitting routed pool
+  such as Ornith can remain in the host bank.
 
-DeepSeek experts use immutable keys and a single state machine:
-
-```text
-absent -> SSD loading -> RAM ready -> GPU upload -> VRAM ready
-```
-
-Demand, prediction and warm work are separate priorities. Demand owns enough
-staging capacity to make progress; speculative work is bounded and
-cancellable. Protected/probationary host retention and transient/protected
-VRAM keep one-shot routes from evicting established hot records. Leases pin
-records until consuming CUDA work completes.
+MTP/draft resources are allocated only when the effective generation policy
+can use their verifier. They are never counted as free or hidden from capacity
+and throughput reports.
 
 ## Capacity and accounting
 
-Worker slots, queue entries, RAM pages, VRAM pages, staging buffers and output
-tokens are independent credits. Parking admission accounts the real stored
-bytes, including fixed continuation state, rather than deriving capacity only
-from KV page count. Status reports actual allocated/populated bytes and never
-speculatively reserves a request's declared maximum.
+Worker slots, queued requests, pinned pages, routed RAM, routed VRAM, staging
+buffers, workspaces, reserve and output tokens are independent credits. A
+configured context limit reserves none of them by itself. Admission uses actual
+owned bytes, including retained KV and continuation state.
 
-Provider telemetry separates the copied continuation blob
-(`provider_parked_request_bytes`) from total retained-session ownership,
-including authoritative host KV (`provider_parked_session_bytes`). Both are
-instantaneous gauges, not request-attributed traffic counters.
+Telemetry separates:
 
-The current Python command channel/provider mutex serializes dense execution.
-`MODEL_WORKER_CAPACITY>1` can retain/admit more state but does not create
-parallel GPU kernels. Multi-device execution requires the allocator/shard/P2P
-work in [Roadmap](roadmap.md).
+- prompt, generated, reasoning/useful tokens, TTFT and wall time;
+- exact KV pages/bytes, mirror/staging traffic, park/restore bytes;
+- routed VRAM/RAM hits, SSD misses, reload/reread bytes and storage/H2D wait;
+- CPU/GPU expert decisions, prefetch/warm work and cancellations.
 
-## Correctness boundaries
+Status and metrics use bounded snapshots and must not block on a long prefill.
+Profiling that introduces CUDA synchronization is disabled in normal serving.
 
-- unknown operation, encoding, record version or missing provider fails start;
-- missing routed experts fail the request; they are never treated as zero;
-- exact target F16 KV cannot be substituted with FP8/Q4 by policy;
-- sampling, reasoning, tool and image behavior use artifact template metadata;
-- profiling is capability-driven and disabled unless explicitly requested;
-- all model-specific source knowledge ends before the common program/runtime
-  boundary.
+## Correctness boundary
+
+- unknown fields, operations, encodings, record versions or capabilities fail;
+- selected experts are never dropped and top-k is never reduced;
+- exact target F16 KV is not silently replaced with FP8/Q4;
+- artifact sampling, template, EOS, response and media declarations are
+  authoritative unless a supported request field explicitly overrides them;
+- provider-specific session behavior is never assumed universal;
+- service success requires real execution through the declared provider, not
+  only manifest parsing.

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <string>
@@ -16,6 +17,7 @@ constexpr std::array<std::byte, 8> kMagic = {
     std::byte{'P'}, std::byte{'R'}, std::byte{'0'}, std::byte{'1'}};
 constexpr std::uint32_t kRequiredFlags = 0x0fU;
 constexpr std::uint32_t kRelu2RequiredFlags = 0x0dU;
+constexpr std::uint32_t kNvfp4RequiredFlags = 0x07U;
 constexpr std::size_t kStructuredHeaderBytes = 148;
 constexpr std::uint32_t kSectionAlignment = 256;
 
@@ -94,14 +96,19 @@ ExpertRecordValidation validate_expert_record(
   const auto reserved = read_le<std::uint32_t>(raw + 40);
   const auto record_bytes = read_le<std::uint64_t>(raw + 44);
   const bool relu2 = record_abi == kExpertRecordAbiFp4Relu2Block32;
+  const bool native_nvfp4 =
+      record_abi == kExpertRecordAbiNvfp4Block16W4A4;
 
   if (version != kExpertPackVersion || header_bytes != kExpertHeaderBytes ||
-      flags != (relu2 ? kRelu2RequiredFlags : kRequiredFlags) ||
+      flags != (native_nvfp4 ? kNvfp4RequiredFlags :
+               relu2 ? kRelu2RequiredFlags : kRequiredFlags) ||
       (record_abi != kExpertRecordAbiInt8PerRow &&
        record_abi != kExpertRecordAbiFp4Block32 &&
-       record_abi != kExpertRecordAbiFp4Relu2Block32) ||
+       record_abi != kExpertRecordAbiFp4Relu2Block32 &&
+       record_abi != kExpertRecordAbiNvfp4Block16W4A4) ||
       (expected.record_abi != 0U && record_abi != expected.record_abi) ||
-      (record_abi == kExpertRecordAbiFp4Block32 || relu2
+      (native_nvfp4 ? kExpertEncodingAbiNvfp4Block16W4A4 :
+       record_abi == kExpertRecordAbiFp4Block32 || relu2
            ? kExpertEncodingAbiFp4Block32
            : kExpertEncodingAbiInt8PerRow) != key.encoding_abi ||
       reserved != 0 ||
@@ -113,6 +120,12 @@ ExpertRecordValidation validate_expert_record(
                    "expert header/manifest ABI mismatch");
   }
   const bool fp4 = record_abi == kExpertRecordAbiFp4Block32 || relu2;
+  if (native_nvfp4 &&
+      (hidden % kExpertNvfp4BlockSize != 0U ||
+       intermediate % kExpertNvfp4BlockSize != 0U)) {
+    return failure(ErrorCode::checksum_mismatch,
+                   "NVFP4 expert geometry is not block-aligned");
+  }
   if (fp4 && (hidden % kExpertFp4BlockSize != 0 ||
               intermediate % kExpertFp4BlockSize != 0)) {
     return failure(ErrorCode::checksum_mismatch,
@@ -143,7 +156,19 @@ ExpertRecordValidation validate_expert_record(
     return failure(ErrorCode::checksum_mismatch,
                    "expert section dimensions are inconsistent");
   }
-  if (fp4) {
+  if (native_nvfp4) {
+    if (sections.gate_up_q_bytes != hidden_intermediate ||
+        sections.gate_up_scale_bytes !=
+            2ULL * (hidden_intermediate / kExpertNvfp4BlockSize +
+                    2U * sizeof(float)) ||
+        sections.down_q_bytes != hidden_intermediate / 2U ||
+        sections.down_scale_bytes !=
+            hidden_intermediate / kExpertNvfp4BlockSize +
+                2U * sizeof(float)) {
+      return failure(ErrorCode::checksum_mismatch,
+                     "NVFP4 expert section dimensions are inconsistent");
+    }
+  } else if (fp4) {
     if (sections.gate_up_q_bytes !=
             (relu2 ? hidden_intermediate / 2U : hidden_intermediate) ||
         sections.gate_up_scale_bytes !=
@@ -177,7 +202,38 @@ ExpertRecordValidation validate_expert_record(
     }
     previous_end = offset + length;
   }
-  if (fp4) {
+  if (native_nvfp4) {
+    const auto local = hidden_intermediate / kExpertNvfp4BlockSize;
+    const std::array<std::uint64_t, 3U> scale_offsets = {
+        sections.gate_up_scale_offset,
+        sections.gate_up_scale_offset + local + 2U * sizeof(float),
+        sections.down_scale_offset,
+    };
+    for (const auto offset : scale_offsets) {
+      const auto begin = bytes.begin() + static_cast<std::size_t>(offset);
+      const auto end = begin + static_cast<std::size_t>(local);
+      if (std::find_if(begin, end, [](std::byte value) {
+            const auto code = std::to_integer<std::uint8_t>(value);
+            return (code & 0x80U) != 0U || (code & 0x7fU) == 0x7fU;
+          }) != end) {
+        return failure(ErrorCode::checksum_mismatch,
+                       "NVFP4 expert contains an invalid E4M3FN scale");
+      }
+      float weight_global{};
+      float input_global{};
+      std::memcpy(&weight_global,
+                  bytes.data() + offset + local, sizeof(float));
+      std::memcpy(&input_global,
+                  bytes.data() + offset + local + sizeof(float),
+                  sizeof(float));
+      if (!std::isfinite(weight_global) ||
+          !std::isfinite(input_global) ||
+          !(weight_global > 0.0F) || !(input_global > 0.0F)) {
+        return failure(ErrorCode::checksum_mismatch,
+                       "NVFP4 expert contains an invalid global divisor");
+      }
+    }
+  } else if (fp4) {
     // UE8M0 scales must be finite (0xff is NaN) and unambiguous: the compiler
     // clamps codes to [1, 254] because code 0 decodes inconsistently between
     // toolchain and kernel paths.
@@ -223,19 +279,25 @@ ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& key,
     const PayloadRecord& expected, bool verify_payload_sha256) noexcept {
   if ((key.encoding_abi == kExpertEncodingAbiInt8PerRow ||
-       key.encoding_abi == kExpertEncodingAbiFp4Block32) &&
+       key.encoding_abi == kExpertEncodingAbiFp4Block32 ||
+       key.encoding_abi == kExpertEncodingAbiNvfp4Block16W4A4) &&
       expected.source_abi == kExpertSourceAbiExpertPackV1) {
     const auto validated = validate_expert_record(bytes, key, expected);
     SplitExpertSections split{};
     if (validated.status.ok() &&
-        key.encoding_abi == kExpertEncodingAbiFp4Block32) {
+        (key.encoding_abi == kExpertEncodingAbiFp4Block32 ||
+         key.encoding_abi == kExpertEncodingAbiNvfp4Block16W4A4)) {
       const auto& sections = validated.record.sections;
       const auto matrix_bytes =
           static_cast<std::uint64_t>(sections.hidden) *
           sections.intermediate / 2U;
+      const auto native =
+          key.encoding_abi == kExpertEncodingAbiNvfp4Block16W4A4;
       const auto scale_bytes =
           static_cast<std::uint64_t>(sections.hidden) *
-          sections.intermediate / kExpertFp4BlockSize;
+              sections.intermediate /
+              (native ? kExpertNvfp4BlockSize : kExpertFp4BlockSize) +
+          (native ? 2U * sizeof(float) : 0U);
       if (expected.record_abi == kExpertRecordAbiFp4Relu2Block32) {
         split = {
             sections.gate_up_q_offset, matrix_bytes,

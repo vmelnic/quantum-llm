@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
-env_file="${QUANTUM_LLM_ENV_FILE:-${repo_root}/.env}"
+env_file="${repo_root}/.env"
 if [[ -f "${env_file}" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|muse|ornith|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-flash|muse|ornith|mistral|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -55,7 +55,7 @@ if [[ "${selection}" == all ]]; then
 else
   [[ "${selection}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
     die "model selector must contain only letters, digits, dot, underscore or dash"
-  alias_file="${MODEL_ALIAS_FILE:-${script_dir}/model-aliases.tsv}"
+  alias_file="${script_dir}/model-aliases.tsv"
   [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
   alias_registry_version=""
   while IFS=$'\t' read -r alias advertised_model artifact declared_kv extra; do
@@ -84,10 +84,10 @@ else
     die "model alias resolves outside MODEL_ROOT"
 fi
 
-remote_host="${QUANTUM_LLM_REMOTE:-${CHAT_SSH:-}}"
+remote_host="${QUANTUM_LLM_REMOTE:-}"
 remote_root="${QUANTUM_LLM_REMOTE_ROOT:-}"
 model_root="${MODEL_ROOT:-}"
-port="${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
+port="${MODEL_PORT:-8080}"
 host_address="${MODEL_HOST:-127.0.0.1}"
 api_key="${EXPERT_API_KEY:-}"
 max_context="${MODEL_MAX_CONTEXT:-65536}"
@@ -104,12 +104,14 @@ worker_capacity="${MODEL_WORKER_CAPACITY:-1}"
 maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
 kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
 kv_page_tokens="${MODEL_KV_PAGE_TOKENS:-256}"
-kv_cache_dtype="${MODEL_KV_CACHE_DTYPE_OVERRIDE:-${alias_kv_cache_dtype:-${MODEL_KV_CACHE_DTYPE:-artifact}}}"
+kv_cache_dtype="${alias_kv_cache_dtype:-${MODEL_KV_CACHE_DTYPE:-artifact}}"
 placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
+profile_gpu_phases="${MODEL_PROFILE_GPU_PHASES:-0}"
+raw_response_trace_file="${MODEL_RAW_RESPONSE_TRACE_FILE:-}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
 container="${model_root}/${artifact_name}"
-vm_runner="${MODEL_VM_RUNNER:-${remote_root}/out/build/windows-msvc-release/runtime/Release/expert-moe-vm-runner.exe}"
+vm_runner="${remote_root}/out/build/windows-msvc-release/runtime/Release/expert-moe-vm-runner.exe"
 
 require_uint MODEL_PORT "${port}"
 require_uint MODEL_MAX_CONTEXT "${max_context}"
@@ -137,6 +139,10 @@ fi
 [[ "${placement_profile}" == latency || "${placement_profile}" == balanced ||
    "${placement_profile}" == capacity ]] ||
   die "MODEL_PLACEMENT_PROFILE must be latency, balanced, or capacity"
+case "${profile_gpu_phases}" in
+  1|true|TRUE|yes|YES|0|false|FALSE|no|NO) ;;
+  *) die "MODEL_PROFILE_GPU_PHASES must be a boolean" ;;
+esac
 [[ "${kv_cache_dtype}" == artifact ||
    "${kv_cache_dtype}" == fp8-e4m3-per-head ||
    "${kv_cache_dtype}" == fp16 ]] ||
@@ -147,7 +153,7 @@ export QUANTUM_LLM_REMOTE="${remote_host}"
 export QUANTUM_LLM_REMOTE_ROOT="${remote_root}"
 
 require_remote() {
-  [[ -n "${remote_host}" ]] || die "set QUANTUM_LLM_REMOTE or CHAT_SSH in ${env_file}"
+  [[ -n "${remote_host}" ]] || die "set QUANTUM_LLM_REMOTE in ${env_file}"
 }
 
 run_remote() {
@@ -193,7 +199,8 @@ print_config() {
     "kv_cache_mib=${kv_cache_mib}" \
     "kv_page_tokens=${kv_page_tokens}" \
     "kv_cache_dtype=${kv_cache_dtype}" \
-    "placement_profile=${placement_profile}"
+    "placement_profile=${placement_profile}" \
+    "profile_gpu_phases=${profile_gpu_phases}"
 }
 
 start_model() {
@@ -201,19 +208,35 @@ start_model() {
   if is_true "${sync_on_start}"; then
     sync_remote
   fi
-  local contract_json artifact_max_context
+  local contract_json artifact_max_context artifact_kv_bytes_per_token
   contract_json="$(run_remote Get-ModelArtifactContract.ps1 -Container "${container}")"
-  artifact_max_context="$(python3 -c '
+  read -r artifact_max_context artifact_kv_bytes_per_token < <(python3 -c '
 import json, sys
-value = json.load(sys.stdin).get("maximum_context")
-if not isinstance(value, int) or value <= 1:
+contract = json.load(sys.stdin)
+maximum = contract.get("maximum_context")
+per_token = contract.get("minimum_exact_kv_bytes_per_token", 0)
+if not isinstance(maximum, int) or maximum <= 1:
     raise SystemExit("artifact contract has no valid maximum_context")
-print(value)
-' <<<"${contract_json}")"
+if not isinstance(per_token, int) or per_token < 0:
+    raise SystemExit("artifact contract has invalid exact-KV geometry")
+print(maximum, per_token)
+' <<<"${contract_json}")
   if (( max_context > artifact_max_context )); then
     printf 'Using artifact context limit %s instead of configured %s\n' \
       "${artifact_max_context}" "${max_context}"
     max_context="${artifact_max_context}"
+  fi
+  if (( artifact_kv_bytes_per_token > 0 )); then
+    local artifact_kv_mib
+    artifact_kv_mib=$((
+      (((max_context + kv_page_tokens - 1) / kv_page_tokens) *
+        kv_page_tokens * artifact_kv_bytes_per_token + 1048575) / 1048576
+    ))
+    if (( kv_cache_mib < artifact_kv_mib )); then
+      printf 'Using artifact exact-KV minimum %s MiB instead of configured %s MiB\n' \
+        "${artifact_kv_mib}" "${kv_cache_mib}"
+      kv_cache_mib="${artifact_kv_mib}"
+    fi
   fi
   if (( max_output >= max_context )); then
     max_output=$((max_context - 1))
@@ -222,7 +245,7 @@ print(value)
   stop_all
 
   local build_id
-  build_id="${MODEL_BUILD_ID:-$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || printf development)}"
+  build_id="$(git -C "${repo_root}" rev-parse --short HEAD 2>/dev/null || printf development)"
   local common=(
     -TaskName "${task_name}"
     -HostAddress "${host_address}"
@@ -243,6 +266,12 @@ print(value)
   )
   if [[ -n "${api_key}" ]]; then
     common+=(-ApiKey "${api_key}")
+  fi
+  if is_true "${profile_gpu_phases}"; then
+    common+=(-ProfileGpuPhases)
+  fi
+  if [[ -n "${raw_response_trace_file}" ]]; then
+    common+=(-RawResponseTraceFile "${raw_response_trace_file}")
   fi
   run_remote Install-ExpertServerTask.ps1 \
     -Container "${container}" \

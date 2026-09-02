@@ -35,6 +35,7 @@ param(
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
     [string]$ModelId = "",
+    [string]$RawResponseTraceFile = "",
     [switch]$Start
 )
 
@@ -106,7 +107,8 @@ foreach ($entry in @(
     @{ Name = "Python"; Value = $Python },
     @{ Name = "ModelId"; Value = $ModelId },
     @{ Name = "ApiKey"; Value = $ApiKey },
-    @{ Name = "WorkerRouteTraceFile"; Value = $WorkerRouteTraceFile }
+    @{ Name = "WorkerRouteTraceFile"; Value = $WorkerRouteTraceFile },
+    @{ Name = "RawResponseTraceFile"; Value = $RawResponseTraceFile }
 )) {
     if ($entry.Value) {
         $taskArguments.Add("-$($entry.Name)")

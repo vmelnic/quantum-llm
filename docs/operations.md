@@ -1,84 +1,81 @@
 # Operations
 
-Status: current operator runbook, 2026-08-26.
+Status: current operator runbook, 2026-09-02.
 
-## Observe without blocking inference
+## Health and status
 
 ```bash
 ./ops/model.sh status
 ```
 
-The service exposes authenticated endpoints:
+| Endpoint | Meaning |
+|---|---|
+| `GET /health` | Python/native process liveness |
+| `GET /ready` | liveness plus admission/not-draining state |
+| `GET /model-info` | active artifact, limits, provider, KV and capabilities |
+| `GET /v1/models` | advertised active model |
+| `GET /metrics` | cached Prometheus snapshot |
 
-- `GET /health`: process and worker liveness;
-- `GET /ready`: liveness plus admission/not-draining state;
-- `GET /model-info`: artifact, limits, provider, session and KV geometry;
-- `GET /v1/models`: advertised model identity;
-- `GET /metrics`: cached Prometheus text snapshot.
+These endpoints must not wait for a long prefill. `ready=true` does not imply a
+warm cache, unused queue or achieved throughput target.
 
-These endpoints use bounded cached worker state and must not wait for a long
-prefill. `ready=true` does not mean that caches are warm or a throughput target
-has been met.
+The primary host log is `logs/expert-server.jsonl`. Startup phase events
+separate artifact loading, provider construction, program preparation and
+worker readiness. `request_telemetry` is the authoritative request record.
 
-## Diagnose a slow request
+## Diagnose latency
 
-Separate the phases and rates before changing code:
+Report before changing code:
 
-1. prompt tokens, prefill time and time to first visible token;
-2. generated target tokens and post-first-token rate;
-3. reasoning tokens versus visible answer tokens;
-4. Qwen KV pages/bytes populated, staged and restored;
-5. DeepSeek VRAM/RAM/storage hits, reread bytes and storage/H2D wait;
-6. cancellation, queue and capacity outcomes.
+1. exact prompt/prefill tokens and whether a prefix was reused;
+2. TTFT, first visible text and total wall time;
+3. generated, reasoning and visible/useful output tokens;
+4. KV dtype, populated pages/bytes, mirror/staging and restore traffic;
+5. routed VRAM/RAM hits, SSD misses, reread bytes, upload bytes and wait time;
+6. CPU/GPU expert decisions, queue/admission state and cancellation outcome.
 
-For DeepSeek, compare novel and settled routes separately. For Qwen, report
-actual populated context and KV dtype. Never infer a saturated-context result
-from a configured maximum.
-
-GPU phase profiling is diagnostic and off by default; enabling it changes the
-hot path through CUDA event collection. Keep it out of production results
-unless the result explicitly measures instrumentation overhead.
+For DeepSeek, distinguish novel from settled routes. For any 262K claim, prove
+actual populated positions. GPU phase profiling is off by default because CUDA
+event attribution can synchronize the hot path.
 
 ## Sessions and cancellation
 
-Retained sessions are keyed by the exact prompt/media prefix. A valid resume
-feeds only the suffix; an unchanged prefix performs a zero-delta resume. A
-failed suffix prefill rolls back to the committed checkpoint. Client
-cancellation preserves only the prompt that the client can echo on its next
-turn and discards partial assistant output.
+Retaining providers key sessions by exact prompt/media prefix. Matching resume
+feeds only the suffix; an unchanged prefix is zero-delta. Failed suffix feed
+rewinds to the committed prompt. Client cancellation never commits partial
+assistant output.
 
-Admission is based on real parked bytes as well as slots. A session whose
-exact F16 KV grows near 262K consumes about 16 GiB before continuation state;
-several such sessions cannot be admitted merely because each declares the
-same maximum.
+Admission accounts real parked bytes. Several clients may advertise 262K, but
+several populated 262K F16 histories cannot be inferred safe from that ceiling.
+Execution remains serialized through one hot provider slot.
+
+DeepSeek does not implement exact checkpoint/rewind/session retention. A long
+DeepSeek cancellation can leave the worker unhealthy. Check `/ready`; if it is
+not healthy, stop and restart before another request. Do not claim automatic
+recovery.
 
 ## Failure handling
 
-- HTTP 401: use the same `EXPERT_API_KEY` in the service and client.
-- HTTP 503 overloaded: all request slots, KV capacity or queue capacity are
-  occupied; do not retry in an unbounded loop.
-- readiness timeout: inspect scheduled-task state and server logs, then run
-  `model.sh stop all` before restarting.
-- worker failure: do not reuse its in-process KV/session state; restart the
-  common service and replay from a client-owned prefix.
-- artifact failure: stop, restore the timestamped rollback directory, validate
-  it, then start and smoke it through the public API.
+- `401`: client and service keys differ or are absent;
+- `400`: unsupported model/role/media/sampling/tool field; do not retry unchanged;
+- `503`: slot, queue, KV or cache admission exhausted; use bounded retry;
+- readiness timeout: inspect task state and server log, then stop before retry;
+- worker/protocol failure: discard in-process state and replay from a
+  client-owned prefix after restart;
+- artifact failure: stop, validate the known rollback, promote it, start and
+  run the real smoke.
+
+Do not locally patch the same failed mechanism more than once. After a second
+failure, stop editing and reassess the complete path.
 
 ## Cleanup
-
-`work/`, `artifacts/`, `logs/`, `out/` and Python caches are generated and
-ignored. They may be removed only after any durable measurement has been
-summarized in [Benchmarks](benchmarks.md) or
-[Research decisions](research-decisions.md). Published model artifacts below
-`MODEL_ROOT` are not scratch space and are never deleted by normal lifecycle
-commands.
-
-After any gate:
 
 ```bash
 ./ops/model.sh stop all
 ./ops/model.sh status
 ```
 
-Then inspect `nvidia-smi` on the execution host if GPU cleanup is material to
-the gate.
+Verify no Quantum LLM worker remains and model VRAM returned to the Windows
+desktop baseline. `work/`, `out/`, `logs/` and local artifacts are generated,
+but remove them only after durable results are recorded. Published artifacts
+below `MODEL_ROOT` and Hugging Face caches are not normal scratch cleanup.

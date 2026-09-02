@@ -4,8 +4,10 @@
   "defaultThinkingLevel": "xhigh",
   "enabledModels": [
     "quantum-llm/qwen3.8-27b-fp4:xhigh",
+    "quantum-llm/qwen3.8-flash-next-fp4:xhigh",
     "quantum-llm/muse-glimmer-30b-fp4:xhigh",
     "quantum-llm/ornith-1.5-35b-a3b-fp4:xhigh",
+    "quantum-llm/mistral-small-4-119b-nvfp4:xhigh",
     "quantum-llm/deepseek-v4-flash:xhigh"
   ],
   "compaction": {

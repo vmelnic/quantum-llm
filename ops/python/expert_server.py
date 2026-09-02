@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import hmac
 import json
 import os
@@ -28,14 +29,14 @@ from urllib.parse import unquote, urlsplit
 
 try:
     from .artifact_chat_codec import discover_artifact_chat_codec
-    from .response_protocols import install_declared_response_protocol
+    from .response_protocols import select_response_protocol
     from .multimodal_input import (
         MultimodalInputError, PreparedMultimodalPrompt,
         create_image_processor, load_image, prepare_multimodal_prompt,
     )
 except ImportError:  # Direct script launch from Start-ExpertServer.ps1.
     from artifact_chat_codec import discover_artifact_chat_codec
-    from response_protocols import install_declared_response_protocol
+    from response_protocols import select_response_protocol
     from multimodal_input import (
         MultimodalInputError, PreparedMultimodalPrompt,
         create_image_processor, load_image, prepare_multimodal_prompt,
@@ -103,6 +104,7 @@ class SamplingSettings:
     top_k: int
     min_p: float
     seed: int
+    presence_penalty: float = 0.0
 
     @property
     def enabled(self) -> bool:
@@ -182,11 +184,21 @@ class AssistantStreamParser:
             return "", delta
         return self._deltas(self.parser.feed(delta))
 
+    def _trace(self, output: AssistantOutput, *,
+               error: str | None = None) -> None:
+        trace = getattr(self.application, "trace_assistant_response", None)
+        if callable(trace):
+            trace(
+                self.request, "".join(self.raw_pieces), output, error=error,
+            )
+
     def finish(self) -> tuple[str, str, AssistantOutput]:
         if self.parser is None:
-            return "", "", AssistantOutput(
+            output = AssistantOutput(
                 text="", reasoning="", reasoning_complete=True, tool_calls=()
             )
+            self._trace(output)
+            return "", "", output
         try:
             message, events = self.parser.finalize()
         except (AssertionError, TypeError, ValueError,
@@ -194,12 +206,15 @@ class AssistantStreamParser:
             log("response_stream_finalize_failed",
                 protocol=self.application.response_protocol,
                 error=str(error))
-            return "", "", AssistantOutput(
+            output = AssistantOutput(
                 text="", reasoning="", reasoning_complete=False, tool_calls=()
             )
+            self._trace(output, error=str(error))
+            return "", "", output
         output = self.application.assistant_output_from_parsed_message(
             message, "".join(self.raw_pieces), fallback_text=""
         )
+        self._trace(output)
         reasoning, content = self._deltas(events)
         return reasoning, content, output
 
@@ -561,6 +576,9 @@ class CudaWorker:
         self.sampling_supported = bool(
             response.get("sampling_supported", False)
         )
+        self.sampling_presence_penalty_supported = bool(
+            response.get("sampling_presence_penalty_supported", False)
+        )
         self.mtp_resource_available = bool(
             response.get("mtp_resource_available", False)
         )
@@ -689,7 +707,12 @@ class CudaWorker:
                  self.session_park_page_capacity != 0)
             )
         )
+        sampling_contract_invalid = self.protocol >= 10 and (
+            self.sampling_presence_penalty_supported !=
+            self.sampling_supported
+        )
         if (self.protocol < 4 or descriptor_invalid or
+                sampling_contract_invalid or
                 parking_invalid or
                 self.capacity != requested_capacity or
                 self.prefill_mode not in {
@@ -702,7 +725,7 @@ class CudaWorker:
                 (prefill_chunk_tokens and
                  self.prefill_chunk_tokens > prefill_chunk_tokens) or
                 self.kv_dtype not in {
-                    "fp16", "bf16", "fp32",
+                    "fp16", "bf16", "bf16-latent", "fp32",
                     "fp4-e2m1-ue8m0-block32",
                     "fp8-e4m3-per-head",
                 } or
@@ -867,14 +890,30 @@ class CudaWorker:
 
     def _sampling_command(self, settings: SamplingSettings) -> str:
         if not self.sampling_supported:
-            if settings.enabled:
-                raise WorkerError("CUDA worker does not support sampling")
+            if settings.enabled or settings.presence_penalty != 0.0:
+                raise WorkerError(
+                    "CUDA worker does not support requested sampling"
+                )
             return ""
-        return "\tSAMPLING\t{}\t{}\t{}\t{}\t{}".format(
+        if (settings.presence_penalty != 0.0 and
+                not self.sampling_presence_penalty_supported):
+            raise WorkerError(
+                "CUDA worker does not support presence penalty"
+            )
+        if not self.sampling_presence_penalty_supported:
+            return "\tSAMPLING\t{}\t{}\t{}\t{}\t{}".format(
+                round(settings.temperature * 1_000_000),
+                round(settings.top_p * 1_000_000),
+                settings.top_k,
+                round(settings.min_p * 1_000_000),
+                settings.seed,
+            )
+        return "\tSAMPLING\t{}\t{}\t{}\t{}\t{}\t{}".format(
             round(settings.temperature * 1_000_000),
             round(settings.top_p * 1_000_000),
             settings.top_k,
             round(settings.min_p * 1_000_000),
+            round(settings.presence_penalty * 1_000_000),
             settings.seed,
         )
 
@@ -1092,19 +1131,25 @@ class Application:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
         self.manifest = json.loads((args.container / "manifest.json").read_text(encoding="utf-8"))
+        effort_map = self.manifest.get("tokenizer", {}).get(
+            "reasoning_effort_map"
+        )
+        if effort_map is not None and (
+                not isinstance(effort_map, dict) or
+                set(effort_map) != {"off", "low", "medium", "xhigh"} or
+                any(not isinstance(value, str) or not value or len(value) > 32
+                    for value in effort_map.values())):
+            raise RuntimeError("artifact tokenizer reasoning effort map is invalid")
+        self.template_reasoning_effort_map = effort_map
         self.tokenizer = AutoTokenizer.from_pretrained(
             str(args.tokenizer), local_files_only=True, trust_remote_code=False
-        )
-        self.response_protocol = install_declared_response_protocol(
-            self.tokenizer
         )
         self.artifact_chat_codec = discover_artifact_chat_codec(
             args.tokenizer
         )
-        if (self.response_protocol is None and
-                self.artifact_chat_codec is not None and
-                self.artifact_chat_codec.supports_response_parsing):
-            self.response_protocol = "artifact-chat-codec-v1"
+        self.response_protocol = select_response_protocol(
+            self.tokenizer, self.artifact_chat_codec
+        )
         generation_config_path = args.tokenizer / "generation_config.json"
         generation_config: dict[str, Any] = {}
         if generation_config_path.is_file():
@@ -1126,6 +1171,48 @@ class Application:
             seed=0,
         )
         self._validate_sampling(self.default_sampling, "generation_config")
+        self.sampling_profiles = {
+            "thinking": self.default_sampling,
+            "non_thinking": self.default_sampling,
+        }
+        artifact_sampling = self.manifest.get("tokenizer", {}).get("sampling")
+        if artifact_sampling is not None:
+            if (not isinstance(artifact_sampling, dict) or
+                    artifact_sampling.get("schema") != "sampling-profiles-v1" or
+                    not isinstance(artifact_sampling.get("profiles"), dict) or
+                    set(artifact_sampling["profiles"]) != {
+                        "thinking", "non_thinking"
+                    }):
+                raise RuntimeError("artifact sampling profiles are invalid")
+            profiles: dict[str, SamplingSettings] = {}
+            for name, profile in artifact_sampling["profiles"].items():
+                if not isinstance(profile, dict):
+                    raise RuntimeError("artifact sampling profile is invalid")
+                unsupported_penalty = (
+                    profile.get("frequency_penalty") not in (0, 0.0) or
+                    profile.get("repetition_penalty") not in (1, 1.0)
+                )
+                if unsupported_penalty:
+                    raise RuntimeError(
+                        "artifact requests unsupported sampling penalties"
+                    )
+                try:
+                    settings = SamplingSettings(
+                        temperature=float(profile["temperature"]),
+                        top_p=float(profile["top_p"]),
+                        top_k=int(profile["top_k"]),
+                        min_p=float(profile["min_p"]),
+                        seed=0,
+                        presence_penalty=float(profile["presence_penalty"]),
+                    )
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RuntimeError(
+                        "artifact sampling profile is invalid"
+                    ) from error
+                self._validate_sampling(settings, "artifact sampling profile")
+                profiles[name] = settings
+            self.sampling_profiles = profiles
+            self.default_sampling = profiles["thinking"]
         self.eos_token_ids = _configured_eos_token_ids(
             generation_config, self.tokenizer.eos_token_id
         )
@@ -1172,6 +1259,14 @@ class Application:
         self.id_lock = threading.Lock()
         self.next_id = 1
         self.draining = threading.Event()
+        self.raw_response_trace_path = args.raw_response_trace_file
+        self.raw_response_trace_lock = threading.Lock()
+        self.raw_response_trace_remaining = 32
+        if self.raw_response_trace_path is not None:
+            self.raw_response_trace_path.parent.mkdir(
+                parents=True, exist_ok=True
+            )
+            self.raw_response_trace_path.write_text("", encoding="utf-8")
         self.active = 0
         self.active_lock = threading.Lock()
         self.metric_lock = threading.Lock()
@@ -1488,11 +1583,14 @@ class Application:
             return [int(token) for token in self.tokenizer.encode(
                 prompt, add_special_tokens=False
             )]
+        template_effort = self._template_reasoning_effort(
+            reasoning_effort, enable_thinking
+        )
         ids = self.tokenizer.apply_chat_template(
             messages, tokenize=True,
             add_generation_prompt=add_generation_prompt,
             tools=list(tools) if tools else None,
-            reasoning_effort=reasoning_effort,
+            reasoning_effort=template_effort,
             enable_thinking=enable_thinking,
             preserve_thinking=preserve_thinking,
         )
@@ -1503,6 +1601,13 @@ class Application:
         if ids and isinstance(ids[0], list):
             ids = ids[0]
         return [int(token) for token in ids]
+
+    def _template_reasoning_effort(
+            self, reasoning_effort: str, enable_thinking: bool) -> str:
+        mapping = getattr(self, "template_reasoning_effort_map", None)
+        if mapping is None:
+            return reasoning_effort
+        return str(mapping[reasoning_effort if enable_thinking else "off"])
 
     @staticmethod
     def _has_images(messages: list[dict[str, Any]]) -> bool:
@@ -1535,11 +1640,14 @@ class Application:
                 "messages", "unsupported_value",
             )
         try:
+            template_effort = self._template_reasoning_effort(
+                reasoning_effort, enable_thinking
+            )
             prepared: PreparedMultimodalPrompt = prepare_multimodal_prompt(
                 self.tokenizer, self.image_processor, messages,
                 add_generation_prompt=add_generation_prompt,
                 tools=list(tools) if tools else None,
-                reasoning_effort=reasoning_effort,
+                reasoning_effort=template_effort,
                 enable_thinking=enable_thinking,
                 preserve_thinking=preserve_thinking,
                 maximum_image_pixels=self.args.maximum_image_pixels,
@@ -1556,10 +1664,15 @@ class Application:
         if self.response_protocol is None:
             return None
         codec = getattr(self, "artifact_chat_codec", None)
-        if codec is not None and codec.supports_response_parsing:
+        if self.response_protocol == "artifact-chat-codec-v1":
+            if codec is None or not codec.supports_response_parsing:
+                raise RuntimeError(
+                    "selected artifact response codec is unavailable"
+                )
             return codec.stream_parser(request.enable_thinking)
         return self.tokenizer.get_response_parser(
             prefix=request.prompt_ids,
+            tools=list(request.tools) if request.tools else None,
         )
 
     @staticmethod
@@ -1616,31 +1729,96 @@ class Application:
     def parse_assistant_output(
             self, text: str, request: GenerationRequest) -> AssistantOutput:
         if self.response_protocol is None:
-            return AssistantOutput(text=text, reasoning="",
-                                   reasoning_complete=True, tool_calls=())
+            output = AssistantOutput(
+                text=text, reasoning="", reasoning_complete=True,
+                tool_calls=(),
+            )
+            self.trace_assistant_response(request, text, output)
+            return output
         try:
             codec = getattr(self, "artifact_chat_codec", None)
-            if codec is not None and codec.supports_response_parsing:
+            if self.response_protocol == "artifact-chat-codec-v1":
+                if codec is None or not codec.supports_response_parsing:
+                    raise RuntimeError(
+                        "selected artifact response codec is unavailable"
+                    )
                 message = codec.parse(text, request.enable_thinking)
             else:
                 message = self.tokenizer.parse_response(
                     text, prefix=request.prompt_ids,
                     tools=list(request.tools) if request.tools else None,
                 )
-            return self._validated_assistant_output(message, text)
+            output = self._validated_assistant_output(message, text)
+            self.trace_assistant_response(request, text, output)
+            return output
         except (AssertionError, TypeError, ValueError,
                 json.JSONDecodeError) as error:
             log("response_parse_failed", protocol=self.response_protocol,
                 error=str(error))
-            return AssistantOutput(text=text, reasoning="",
-                                   reasoning_complete=False, tool_calls=())
+            output = AssistantOutput(
+                text=text, reasoning="", reasoning_complete=False,
+                tool_calls=(),
+            )
+            self.trace_assistant_response(
+                request, text, output, error=str(error)
+            )
+            return output
+
+    def trace_assistant_response(
+            self, request: GenerationRequest, raw_text: str,
+            output: AssistantOutput, *, error: str | None = None) -> None:
+        """Record a bounded raw-to-structured diagnostic for tool responses.
+
+        This is opt-in because native output can contain project data. The
+        trace excludes prompts and tool schemas, keeps only the final 128 KiB
+        of generated text, and stops after 32 responses per service start.
+        """
+        path = getattr(self, "raw_response_trace_path", None)
+        if path is None or not request.tools:
+            return
+        lock = getattr(self, "raw_response_trace_lock", None)
+        if lock is None:
+            return
+        with lock:
+            remaining = getattr(self, "raw_response_trace_remaining", 0)
+            if remaining <= 0:
+                return
+            self.raw_response_trace_remaining = remaining - 1
+            maximum_characters = 128 * 1024
+            raw_suffix = raw_text[-maximum_characters:]
+            record = {
+                "schema": "raw-response-trace-v1",
+                "time": time.time(),
+                "endpoint": request.endpoint,
+                "response_protocol": self.response_protocol,
+                "enable_thinking": request.enable_thinking,
+                "reasoning_effort": request.reasoning_effort,
+                "raw_sha256": hashlib.sha256(
+                    raw_text.encode("utf-8")
+                ).hexdigest(),
+                "raw_characters": len(raw_text),
+                "truncated_prefix_characters": (
+                    len(raw_text) - len(raw_suffix)
+                ),
+                "raw_suffix": raw_suffix,
+                "reasoning_complete": output.reasoning_complete,
+                "parsed_tool_calls": [
+                    {"name": call.name, "arguments": call.arguments}
+                    for call in output.tool_calls
+                ],
+                "parse_error": error,
+            }
+            with path.open("a", encoding="utf-8") as trace_file:
+                trace_file.write(json.dumps(
+                    record, separators=(",", ":"), ensure_ascii=False
+                ) + "\n")
 
     def _validated_assistant_output(
             self, message: Any, text: str) -> AssistantOutput:
         if not isinstance(message, dict):
             raise ValueError("response parser returned a non-object")
-        codec = getattr(self, "artifact_chat_codec", None)
-        if (codec is None and message.get("tool_calls") and
+        if (self.response_protocol != "artifact-chat-codec-v1" and
+                message.get("tool_calls") and
                 (text.count("<tool_call>") != text.count("</tool_call>") or
                  text.count("<function=") != text.count("</function>"))):
             raise ValueError("model emitted an incomplete tool call")
@@ -2255,6 +2433,7 @@ class Application:
             0.0 < settings.top_p <= 1.0 and
             0 <= settings.top_k <= 1_000_000 and
             0.0 <= settings.min_p <= 1.0 and
+            -2.0 <= settings.presence_penalty <= 2.0 and
             0 <= settings.seed <= 0x7fff_ffff_ffff_ffff
         )
         if not valid:
@@ -2263,8 +2442,11 @@ class Application:
             raise RequestError("sampling parameters are outside runtime limits",
                                parameter, "unsupported_value")
 
-    def _sampling(self, payload: dict[str, Any]) -> SamplingSettings:
-        defaults = self.default_sampling
+    def _sampling(self, payload: dict[str, Any],
+                  enable_thinking: bool) -> SamplingSettings:
+        defaults = self.sampling_profiles[
+            "thinking" if enable_thinking else "non_thinking"
+        ]
 
         def number(name: str, default: float) -> float:
             value = payload.get(name, default)
@@ -2286,6 +2468,9 @@ class Application:
             top_k=top_k,
             min_p=number("min_p", defaults.min_p),
             seed=seed,
+            presence_penalty=number(
+                "presence_penalty", defaults.presence_penalty
+            ),
         )
         self._validate_sampling(settings, "sampling")
         return settings
@@ -2320,8 +2505,6 @@ class Application:
 
         only("n", (None, 1), "this runtime supports n=1")
         only("best_of", (None, 1), "this runtime supports best_of=1")
-        only("presence_penalty", (None, 0, 0.0),
-             "presence_penalty is not implemented")
         only("frequency_penalty", (None, 0, 0.0),
              "frequency_penalty is not implemented")
         only("repetition_penalty", (None, 1, 1.0),
@@ -2398,7 +2581,7 @@ class Application:
             raise RequestError("chat_template_kwargs must be an object",
                                "chat_template_kwargs")
         unknown_template_kwargs = set(template_kwargs) - {
-            "enable_thinking", "preserve_thinking"
+            "enable_thinking", "preserve_thinking", "reasoning_effort"
         }
         if unknown_template_kwargs:
             raise RequestError("unsupported chat template controls",
@@ -2411,8 +2594,14 @@ class Application:
         if not isinstance(preserve_thinking, bool):
             raise RequestError("preserve_thinking must be boolean",
                                "chat_template_kwargs.preserve_thinking")
-        sampling = self._sampling(payload)
+        sampling = self._sampling(payload, enable_thinking)
         reasoning_effort = payload.get("reasoning_effort")
+        template_reasoning_effort = template_kwargs.get("reasoning_effort")
+        if reasoning_effort is not None and template_reasoning_effort is not None:
+            raise RequestError("reasoning effort was specified twice",
+                               "reasoning_effort")
+        if reasoning_effort is None:
+            reasoning_effort = template_reasoning_effort
         reasoning = payload.get("reasoning")
         if reasoning is not None:
             if not isinstance(reasoning, dict):
@@ -3069,7 +3258,25 @@ class Application:
                     "top_p": self.default_sampling.top_p,
                     "top_k": self.default_sampling.top_k,
                     "min_p": self.default_sampling.min_p,
-                    "source": "tokenizer/generation_config.json",
+                    "presence_penalty": (
+                        self.default_sampling.presence_penalty
+                    ),
+                    "profiles": {
+                        name: {
+                            "temperature": profile.temperature,
+                            "top_p": profile.top_p,
+                            "top_k": profile.top_k,
+                            "min_p": profile.min_p,
+                            "presence_penalty": profile.presence_penalty,
+                        }
+                        for name, profile in self.sampling_profiles.items()
+                    },
+                    "source": (
+                        "manifest.tokenizer.sampling"
+                        if self.manifest.get("tokenizer", {}).get("sampling")
+                        is not None
+                        else "tokenizer/generation_config.json"
+                    ),
                 },
             },
             "worker_kv": {
@@ -3130,6 +3337,8 @@ class Application:
                 ),
                 "maximum_image_patch_tokens":
                     getattr(self.args, "maximum_image_patch_tokens", 4096),
+                "raw_response_trace_enabled":
+                    getattr(self, "raw_response_trace_path", None) is not None,
             },
             "draining": self.draining.is_set(),
         }
@@ -4080,7 +4289,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model", default="expert-moe-vm"
     )
-    parser.add_argument("--build-id", default=os.environ.get("EXPERT_BUILD_ID", "development"))
+    parser.add_argument("--build-id", default="development")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--api-key", default=os.environ.get("EXPERT_API_KEY", ""))
@@ -4140,6 +4349,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--startup-timeout", type=float, default=120.0)
     parser.add_argument("--drain-timeout", type=float, default=30.0)
     parser.add_argument("--log-file", type=Path)
+    parser.add_argument("--raw-response-trace-file", type=Path)
     return parser.parse_args()
 
 

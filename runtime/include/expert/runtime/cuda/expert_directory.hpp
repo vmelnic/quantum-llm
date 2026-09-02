@@ -23,6 +23,7 @@ enum class DeviceExpertFormat : std::uint32_t {
   // geometry-generic, only the w1/w3/w2 views differ per source.
   fp4_e2m1_ue8m0_block32 = 1,
   fp4_relu2_e2m1_ue8m0_block32 = 2,
+  nvfp4_e2m1_e4m3fn_block16_w4a4 = 3,
 };
 
 // Small compute-ready metadata entry. The full model is never materialized in

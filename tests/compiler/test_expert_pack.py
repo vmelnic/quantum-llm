@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import struct
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from compiler.expert_pack.compile import (
     _runtime_model_descriptor_bytes,
     compile_checkpoint,
     refresh_runtime_model_program,
+    refresh_sampling_profiles,
 )
 from compiler.expert_pack.constants import (
     EXPERT_HEADER_STRUCT,
@@ -36,13 +38,29 @@ from compiler.expert_pack.deepseek_slice import (
     _deepseek_mtp_partition,
 )
 from compiler.expert_pack.errors import AdapterError, ValidationError
+from compiler.expert_pack.mistral4_nvfp4_adapter import _yarn_attention_scale
 from compiler.expert_pack.quality import qualify_container_against_source
 from compiler.expert_pack import quant
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
-from compiler.expert_pack.util import load_json, sha256_file
+from compiler.expert_pack.util import (
+    canonical_json_bytes, load_json, sha256_bytes, sha256_file,
+)
 from compiler.expert_pack.util import publish_directory
 from compiler.expert_pack.validate import validate_container
+
+
+class Mistral4SemanticsTest(unittest.TestCase):
+    def test_native_yarn_attention_scale(self) -> None:
+        expected_mscale = 1.0 + 0.1 * math.log(128.0)
+        expected = (128.0 ** -0.5) * expected_mscale * expected_mscale
+        self.assertAlmostEqual(
+            _yarn_attention_scale(128, 128.0, False), expected, places=12
+        )
+        self.assertAlmostEqual(
+            _yarn_attention_scale(128, 128.0, True), 128.0 ** -0.5,
+            places=12,
+        )
 
 
 def _values(name: str, count: int) -> list[float]:
@@ -69,6 +87,15 @@ def _f32_tensor(
     for dimension in shape:
         count *= dimension
     return "F32", shape, struct.pack(f"<{count}f", *_values(name, count))
+
+
+def _i64_tensor(
+    name: str, shape: tuple[int, ...]
+) -> tuple[str, tuple[int, ...], bytes]:
+    count = math.prod(shape)
+    seed = int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "little")
+    values = [((seed + index * 10007) << 25) | 1 for index in range(count)]
+    return "I64", shape, struct.pack(f"<{count}q", *values)
 
 
 def _write_safetensors(path: Path, tensors: dict[str, tuple[str, tuple[int, ...], bytes]]) -> None:
@@ -509,6 +536,228 @@ def _make_hybrid_delta_fixture(root: Path, *, moe: bool = False) -> None:
     _write_safetensors(root / "model.safetensors", tensors)
 
 
+def _make_qwen4_exp_fixture(root: Path) -> None:
+    hidden, hyper_count, lowrank = 32, 2, 32
+    hyper = hidden * hyper_count
+    layers, experts, expert_width, shared_width = 4, 2, 32, 32
+    heads, kv_heads, head_dim = 2, 1, 32
+    key_heads, value_heads, recurrent_dim = 1, 2, 32
+    layer_types = ["linear_attention"] * 3 + ["full_attention"]
+    text = {
+        "model_type": "qwen4_exp_text",
+        "attention_bias": False,
+        "attention_dropout": 0.0,
+        "eos_token_id": 1,
+        "full_attention_interval": 4,
+        "hc_count": hyper_count,
+        "hc_lowrank": lowrank,
+        "head_dim": head_dim,
+        "heads_per_ngram": 1,
+        "hidden_act": "silu",
+        "hidden_size": hidden,
+        "indexer_budget": 8,
+        "indexer_compress_ratio": 2,
+        "indexer_head_dim": 32,
+        "indexer_kv_heads": 1,
+        "indexer_n_heads": 2,
+        "layer_types": layer_types,
+        "linear_conv_kernel_dim": 2,
+        "linear_key_head_dim": recurrent_dim,
+        "linear_num_key_heads": key_heads,
+        "linear_num_value_heads": value_heads,
+        "linear_value_head_dim": recurrent_dim,
+        "make_ngram_vocab_size_divisible_by": 2,
+        "max_position_embeddings": 64,
+        "moe_intermediate_size": expert_width,
+        "mtp_num_hidden_layers": 1,
+        "ngram_size": 3,
+        "ngram_vocab_size_base": 11,
+        "num_attention_heads": heads,
+        "num_experts": experts,
+        "num_experts_per_tok": 1,
+        "num_hidden_layers": layers,
+        "num_key_value_heads": kv_heads,
+        "norm_topk_prob": True,
+        "output_gate_type": "sigmoid",
+        "partial_rotary_factor": 0.5,
+        "ple_conv_kernel_size": 2,
+        "ple_embed_dim": hidden,
+        "ple_layer_ids": [2],
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "partial_rotary_factor": 0.5,
+            "rope_theta": 10_000_000.0,
+        },
+        "shared_expert_intermediate_size": shared_width,
+        "split_ngram_parts": 2,
+        "tie_word_embeddings": False,
+        "vocab_size": 32,
+    }
+    vision = {
+        "model_type": "qwen4_exp",
+        "depth": 1,
+        "hidden_size": 32,
+        "intermediate_size": 32,
+        "num_heads": 1,
+        "num_position_embeddings": 4,
+        "out_hidden_size": hidden,
+        "in_channels": 3,
+        "patch_size": 2,
+        "spatial_merge_size": 2,
+        "temporal_patch_size": 1,
+    }
+    config = {
+        "_name_or_path": "synthetic/qwen4-exp",
+        "architectures": ["Qwen4ExpForConditionalGeneration"],
+        "model_type": "qwen4_exp",
+        "text_config": text,
+        "vision_config": vision,
+    }
+    (root / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (root / "tokenizer_config.json").write_text(
+        json.dumps({"chat_template": "{{ messages }}"}), encoding="utf-8"
+    )
+    (root / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    shapes: dict[str, tuple[int, ...]] = {
+        "model.language_model.embed_tokens.weight": (32, hidden),
+        "lm_head.weight": (32, hidden),
+        "model.language_model.hyper_connection_mixer.hc_norm.weight": (hyper,),
+        "model.language_model.hyper_connection_mixer.input_mix_weight_down.weight": (lowrank, hyper),
+        "model.language_model.hyper_connection_mixer.input_mix_weight_up.weight": (hyper, lowrank),
+    }
+    conv_dim = 2 * key_heads * recurrent_dim + value_heads * recurrent_dim
+    for layer, layer_type in enumerate(layer_types):
+        prefix = f"model.language_model.layers.{layer}."
+        for organ in ("attn_hyper_connection", "mlp_hyper_connection"):
+            organ_prefix = prefix + organ + "."
+            shapes.update({
+                organ_prefix + "hc_norm.weight": (hyper,),
+                organ_prefix + "input_mix_weight_down.weight": (lowrank, hyper),
+                organ_prefix + "input_mix_weight_up.weight": (hyper, lowrank),
+                organ_prefix + "block_inject_weight.weight": (hyper_count, hyper),
+            })
+        if layer_type == "linear_attention":
+            linear = prefix + "linear_attn."
+            shapes.update({
+                linear + "in_proj_qkv.weight": (conv_dim, hidden),
+                linear + "in_proj_z.weight": (value_heads * recurrent_dim, hidden),
+                linear + "in_proj_b.weight": (value_heads, hidden),
+                linear + "in_proj_a.weight": (value_heads, hidden),
+                linear + "conv1d.weight": (conv_dim, 1, 2),
+                linear + "dt_bias": (value_heads,),
+                linear + "A_log": (value_heads,),
+                linear + "norm.weight": (recurrent_dim,),
+                linear + "out_proj.weight": (hidden, value_heads * recurrent_dim),
+            })
+        else:
+            attention = prefix + "self_attn."
+            shapes.update({
+                attention + "q_proj.weight": (2 * heads * head_dim, hidden),
+                attention + "k_proj.weight": (kv_heads * head_dim, hidden),
+                attention + "v_proj.weight": (kv_heads * head_dim, hidden),
+                attention + "o_proj.weight": (hidden, heads * head_dim),
+                attention + "q_norm.weight": (head_dim,),
+                attention + "k_norm.weight": (head_dim,),
+                attention + "indexer.index_qk_proj.weight": (3 * 32, hidden),
+                attention + "indexer.q_layernorm.weight": (32,),
+                attention + "indexer.k_layernorm.weight": (32,),
+            })
+        mlp = prefix + "mlp."
+        shapes.update({
+            mlp + "gate.weight": (experts, hidden),
+            mlp + "shared_expert.gate_proj.weight": (shared_width, hidden),
+            mlp + "shared_expert.up_proj.weight": (shared_width, hidden),
+            mlp + "shared_expert.down_proj.weight": (hidden, shared_width),
+            mlp + "shared_expert_gate.weight": (1, hidden),
+            mlp + "experts.gate_up_proj": (experts, 2 * expert_width, hidden),
+            mlp + "experts.down_proj": (experts, hidden, expert_width),
+        })
+    ple = "model.language_model.layers.1.ple."
+    shapes.update({
+        ple + "key_proj.weight": (hyper, hidden),
+        ple + "value_proj.weight": (hidden, hidden),
+        ple + "norm_key.weight": (hyper,),
+        ple + "norm_query.weight": (hyper,),
+        ple + "norm_conv.weight": (hyper,),
+        ple + "conv1d.weight": (hyper, 1, 2),
+        ple + "ple_embedding.ngram_embedding.shard_0.weight": (12, 16),
+        ple + "ple_embedding.ngram_embedding.shard_1.weight": (12, 16),
+    })
+    i64_shapes = {
+        ple + "ple_embedding.layer_multipliers": (3,),
+        ple + "ple_embedding.ngram_heads_vocab_sizes": (2,),
+        ple + "ple_embedding.ngram_heads_offsets": (2,),
+    }
+    visual = "model.visual."
+    shapes.update({
+        visual + "patch_embed.proj.weight": (32, 3, 1, 2, 2),
+        visual + "patch_embed.proj.bias": (32,),
+        visual + "pos_embed.weight": (4, 32),
+        visual + "blocks.0.attn.qkv.weight": (96, 32),
+        visual + "blocks.0.attn.qkv.bias": (96,),
+        visual + "blocks.0.attn.proj.weight": (32, 32),
+        visual + "blocks.0.attn.proj.bias": (32,),
+        visual + "blocks.0.mlp.linear_fc1.weight": (32, 32),
+        visual + "blocks.0.mlp.linear_fc1.bias": (32,),
+        visual + "blocks.0.mlp.linear_fc2.weight": (32, 32),
+        visual + "blocks.0.mlp.linear_fc2.bias": (32,),
+        visual + "blocks.0.norm1.weight": (32,),
+        visual + "blocks.0.norm1.bias": (32,),
+        visual + "blocks.0.norm2.weight": (32,),
+        visual + "blocks.0.norm2.bias": (32,),
+        visual + "merger.norm.weight": (32,),
+        visual + "merger.norm.bias": (32,),
+        visual + "merger.linear_fc1.weight": (128, 128),
+        visual + "merger.linear_fc1.bias": (128,),
+        visual + "merger.linear_fc2.weight": (32, 128),
+        visual + "merger.linear_fc2.bias": (32,),
+    })
+    shapes.update({
+        "mtp.fc_embedding.weight": (hidden, hidden),
+        "mtp.fc_hidden.weight": (hidden, hidden),
+        "mtp.pre_fc_norm_embedding.weight": (hidden,),
+        "mtp.pre_fc_norm_hidden.weight": (hyper,),
+        "mtp.hyper_connection_mixer.hc_norm.weight": (hyper,),
+        "mtp.hyper_connection_mixer.input_mix_weight_down.weight": (lowrank, hyper),
+        "mtp.hyper_connection_mixer.input_mix_weight_up.weight": (hyper, lowrank),
+    })
+    mtp = "mtp.layers.0."
+    for organ in ("attn_hyper_connection", "mlp_hyper_connection"):
+        organ_prefix = mtp + organ + "."
+        shapes.update({
+            organ_prefix + "hc_norm.weight": (hyper,),
+            organ_prefix + "input_mix_weight_down.weight": (lowrank, hyper),
+            organ_prefix + "input_mix_weight_up.weight": (hyper, lowrank),
+            organ_prefix + "block_inject_weight.weight": (hyper_count, hyper),
+        })
+    attention = mtp + "self_attn."
+    shapes.update({
+        attention + "q_proj.weight": (2 * heads * head_dim, hidden),
+        attention + "k_proj.weight": (kv_heads * head_dim, hidden),
+        attention + "v_proj.weight": (kv_heads * head_dim, hidden),
+        attention + "o_proj.weight": (hidden, heads * head_dim),
+        attention + "q_norm.weight": (head_dim,),
+        attention + "k_norm.weight": (head_dim,),
+        attention + "indexer.index_qk_proj.weight": (3 * 32, hidden),
+        attention + "indexer.q_layernorm.weight": (32,),
+        attention + "indexer.k_layernorm.weight": (32,),
+    })
+    mtp_mlp = mtp + "mlp."
+    shapes.update({
+        mtp_mlp + "gate.weight": (experts, hidden),
+        mtp_mlp + "shared_expert.gate_proj.weight": (shared_width, hidden),
+        mtp_mlp + "shared_expert.up_proj.weight": (shared_width, hidden),
+        mtp_mlp + "shared_expert.down_proj.weight": (hidden, shared_width),
+        mtp_mlp + "shared_expert_gate.weight": (1, hidden),
+        mtp_mlp + "experts.gate_up_proj": (experts, 2 * expert_width, hidden),
+        mtp_mlp + "experts.down_proj": (experts, hidden, expert_width),
+    })
+    tensors = {name: _tensor(name, shape) for name, shape in shapes.items()}
+    tensors.update({name: _i64_tensor(name, shape) for name, shape in i64_shapes.items()})
+    _write_safetensors(root / "model.safetensors", tensors)
+
+
 def _make_muse_glimmer_fixture(root: Path) -> None:
     hidden, intermediate, vocab = 32, 64, 64
     layers, heads, kv_heads, head_dim = 4, 1, 1, 32
@@ -770,6 +1019,89 @@ def _deepseek_metadata_checkpoint() -> SimpleNamespace:
 
 
 class ExpertPackTests(unittest.TestCase):
+    def test_sampling_profiles_are_artifact_declared_and_refreshable(self) -> None:
+        profiles = {
+            "schema": "sampling-profiles-v1",
+            "profiles": {
+                "thinking": {
+                    "temperature": 1.0, "top_p": 0.95, "top_k": 20,
+                    "min_p": 0.0, "presence_penalty": 0.0,
+                    "frequency_penalty": 0.0, "repetition_penalty": 1.0,
+                },
+                "non_thinking": {
+                    "temperature": 0.7, "top_p": 0.8, "top_k": 20,
+                    "min_p": 0.0, "presence_penalty": 1.5,
+                    "frequency_penalty": 0.0, "repetition_penalty": 1.0,
+                },
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_fixture(source)
+            profile_path = root / "sampling.json"
+            profile_path.write_text(json.dumps(profiles), encoding="utf-8")
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source, output=output,
+                sampling_profiles=profile_path,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            self.assertEqual(manifest["tokenizer"]["sampling"], profiles)
+
+            # Exercise the exact metadata-only migration used by artifacts
+            # published before auxiliary/placement accounting was mandatory.
+            manifest.pop("auxiliary_tensors")
+            manifest["masses"].pop("resident_dense_bytes")
+            manifest["masses"].pop("host_mapped_dense_bytes")
+            manifest["integrity"]["content_sha256"] = ""
+            manifest["integrity"]["content_sha256"] = sha256_bytes(
+                canonical_json_bytes(manifest)
+            )
+            (output / "manifest.json").write_text(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")) +
+                "\n",
+                encoding="utf-8",
+            )
+            report = load_json(output / "conversion-report.json")
+            report["manifest_content_sha256"] = manifest["integrity"][
+                "content_sha256"
+            ]
+            (output / "conversion-report.json").write_text(
+                json.dumps(report, sort_keys=True, separators=(",", ":")) +
+                "\n",
+                encoding="utf-8",
+            )
+            (output / "COMPLETED").write_text(json.dumps({
+                "format_version": 1,
+                "manifest_content_sha256": manifest["integrity"][
+                    "content_sha256"
+                ],
+                "manifest_file_sha256": sha256_file(
+                    output / "manifest.json"
+                ),
+            }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+
+            updated = json.loads(json.dumps(profiles))
+            updated["profiles"]["non_thinking"]["temperature"] = 0.6
+            updated_path = root / "updated-sampling.json"
+            updated_path.write_text(json.dumps(updated), encoding="utf-8")
+            refreshed = root / "pack-refreshed"
+            refresh_result = refresh_sampling_profiles(
+                output, refreshed, updated_path
+            )
+            self.assertTrue(refresh_result["validation"]["valid"])
+            refreshed_manifest = load_json(refreshed / "manifest.json")
+            self.assertEqual(
+                refreshed_manifest["tokenizer"]["sampling"], updated
+            )
+            self.assertEqual(
+                [item["sha256"] for item in refreshed_manifest["packs"]],
+                [item["sha256"] for item in manifest["packs"]],
+            )
+
     def test_numpy_fp4_row_batches_match_dependency_free_bytes(self) -> None:
         try:
             import numpy  # noqa: F401
@@ -1189,6 +1521,130 @@ class ExpertPackTests(unittest.TestCase):
                 program,
             )
 
+    def test_qwen4_exp_publishes_generic_hyper_qsa_ple_program(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_qwen4_exp_fixture(source)
+            adapted = adapt_checkpoint(SafeTensorCheckpoint(source), "qwen4_exp")
+            self.assertEqual(adapted.runtime_topology.architecture_id,
+                             "hybrid-hyper-qsa-ple-moe-v1")
+            self.assertEqual(len(adapted.experts), 8)
+            self.assertEqual(len(adapted.dense_int64), 3)
+            self.assertEqual(len(adapted.host_mapped_dense), 5)
+            self.assertNotIn(
+                "model.language_model.embed_tokens.weight",
+                adapted.dense_fp4,
+            )
+            self.assertNotIn(
+                "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+                adapted.dense_fp4,
+            )
+            self.assertIn(
+                "model.language_model.layers.0.linear_attn.in_proj_a.weight",
+                adapted.dense_float32,
+            )
+            self.assertIn(
+                "model.language_model.layers.0.linear_attn.in_proj_b.weight",
+                adapted.dense_float32,
+            )
+            self.assertIn(
+                "model.language_model.layers.0.attn_hyper_connection."
+                "block_inject_weight.weight",
+                adapted.dense_float32,
+            )
+            self.assertIn(
+                "model.language_model.layers.0.linear_attn.conv1d.weight",
+                adapted.dense_fp4,
+            )
+            self.assertEqual(
+                dict(adapted.runtime_topology.attributes)[
+                    "minimum_exact_kv_bytes_per_token"
+                ],
+                (2 * 1 * 32 + 1 * 32) * 2,
+            )
+            self.assertIn(
+                "block.sparse-attention.qsa.output-gated.v1",
+                {operation.capability
+                 for operation in adapted.runtime_topology.operations},
+            )
+            recurrent = [
+                operation for operation in adapted.runtime_topology.operations
+                if operation.capability ==
+                "block.recurrent-linear-attention."
+                "split-gated-delta.no-residual.v1"
+            ]
+            self.assertEqual(len(recurrent), 3)
+            self.assertTrue(all(operation.abi == 2 for operation in recurrent))
+            self.assertTrue(all(
+                dict(operation.parameters)["output_gate_activation"] == 2
+                for operation in recurrent
+            ))
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source, output=output, adapter="qwen4_exp",
+                quant_profile=FP4_QUANT_PROFILE,
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+                source_revision="source",
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            by_name = {entry["name"]: entry for entry in manifest["tensors"]}
+            self.assertEqual(
+                manifest["quantization"]["dense_matrix_weights"],
+                "mixed-fp4-block32-and-int8-by-tensor-index",
+            )
+            self.assertEqual(
+                by_name["model.language_model.embed_tokens.weight"][
+                    "stored_dtype"
+                ],
+                "I8",
+            )
+            self.assertEqual(
+                by_name[
+                    "model.language_model.layers.0.linear_attn."
+                    "in_proj_qkv.weight"
+                ]["stored_dtype"],
+                "I8",
+            )
+            self.assertEqual(
+                by_name[
+                    "model.language_model.layers.0.linear_attn."
+                    "in_proj_a.weight"
+                ]["stored_dtype"],
+                "F32",
+            )
+            self.assertEqual(
+                by_name[
+                    "model.language_model.layers.0.attn_hyper_connection."
+                    "block_inject_weight.weight"
+                ]["stored_dtype"],
+                "F32",
+            )
+            ple_shard = next(
+                name for name in adapted.host_mapped_dense
+                if "ngram_embedding.shard_" in name
+            )
+            self.assertEqual(by_name[ple_shard]["stored_dtype"], "I8")
+            multiplier = next(name for name in adapted.dense_int64
+                              if name.endswith("layer_multipliers"))
+            self.assertEqual(by_name[multiplier]["stored_dtype"], "I64")
+            self.assertEqual(by_name[multiplier]["decoded_bytes"], 24)
+            self.assertGreater(manifest["masses"]["host_mapped_dense_bytes"], 0)
+            program = (output / "runtime-model.tsv").read_text(encoding="utf-8")
+            self.assertIn("state.hyper-connection.initialize.v1", program)
+            self.assertIn("embedding.lookup.v1", program)
+            self.assertIn("embedding.ngram-ple.v1", program)
+            self.assertIn("head.token-select.no-norm.v1", program)
+            self.assertNotIn("embedding.ngram-ple.fp4-block32.v1", program)
+            self.assertIn("router.linear-topk.shared-swiglu.no-residual.v1", program)
+            self.assertIn("\toutput_gate_activation\t2", program)
+            self.assertIn(
+                "attribute\tminimum_exact_kv_bytes_per_token\t192", program
+            )
+            self.assertNotIn("qwen4_exp", program)
+
     def test_hybrid_delta_moe_fused_experts_are_logical_fp4_pages(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1419,8 +1875,21 @@ class ExpertPackTests(unittest.TestCase):
                 program,
             )
             refreshed = root / "pack-refreshed"
+            source_names = SafeTensorCheckpoint(source).tensors
+            (source / "consolidated.safetensors.index.json").write_text(
+                json.dumps({
+                    "metadata": {},
+                    "weight_map": {
+                        name: "model.safetensors" for name in source_names
+                    },
+                }, sort_keys=True),
+                encoding="utf-8",
+            )
+            (source / "config.json").rename(source / "params.json")
             refresh_result = refresh_runtime_model_program(
-                output, refreshed, source, "lfm2_moe"
+                output, refreshed, source, "lfm2_moe",
+                config_file="params.json",
+                index_file="consolidated.safetensors.index.json",
             )
             self.assertTrue(refresh_result["validation"]["valid"])
             refreshed_manifest = load_json(refreshed / "manifest.json")

@@ -31,6 +31,27 @@ struct Fp4Block32Matrix final {
   std::uint32_t padded_columns{};
 };
 
+// Native Blackwell NVFP4 checkpoint matrix. Packed E2M1 weights retain one
+// E4M3FN scale per 16 columns. The two global values are the reciprocals of
+// the divisors stored by compressed-tensors after fail-closed host decoding.
+struct Nvfp4Block16Matrix final {
+  const std::uint8_t* weights{};
+  const std::uint8_t* scales{};
+  float weight_global_scale{};
+  float input_global_scale{};
+  std::uint32_t rows{};
+  std::uint32_t columns{};
+};
+
+[[nodiscard]] Status nvfp4_gemv_f32_batch(
+    const Nvfp4Block16Matrix& matrix, const float* input, float* output,
+    float* quantized_dequantized_input, std::uint32_t batch,
+    void* stream) noexcept;
+[[nodiscard]] Status embedding_bf16_batch(
+    const std::uint16_t* matrix, std::uint32_t rows, std::uint32_t columns,
+    const std::uint32_t* tokens, float* output, std::uint32_t batch,
+    void* stream) noexcept;
+
 [[nodiscard]] Status fp4_embedding(const Fp4Block32Matrix& matrix,
                                    std::uint32_t token, float* output,
                                    void* stream) noexcept;
@@ -133,6 +154,40 @@ struct Fp4Block32Matrix final {
     const float* input, float* output, std::uint32_t batch,
     float* decoded_matrix, std::uint64_t decoded_matrix_values,
     void* stream) noexcept;
+
+// Exact compressed-latent attention organ. Each page retains BF16
+// [kv_rank + rope_dim] values per token/layer. Algebraic absorption of the
+// BF16 up-projection avoids materializing full K/V in the cache.
+struct MlaCausalLaunch final {
+  float* query{};                 // [rows, heads, nope_dim + rope_dim]
+  float* latent{};                // [rows, kv_rank + rope_dim]
+  const std::uint16_t* kv_up{};   // [heads*(nope_dim+value_dim), kv_rank]
+  const void* const* page_table{};
+  float* output{};                // [rows, heads, value_dim]
+  float* latent_query{};          // [rows, heads, kv_rank]
+  float* partial_maxima{};        // [heads]
+  float* partial_sums{};          // [heads]
+  float* partial_outputs{};       // [heads, kv_rank]
+  std::uint32_t layer{};
+  std::uint32_t page_tokens{};
+  std::uint32_t first_position{};
+  std::uint32_t rows{};
+  std::uint32_t heads{};
+  std::uint32_t kv_rank{};
+  std::uint32_t nope_dim{};
+  std::uint32_t rope_dim{};
+  std::uint32_t value_dim{};
+  float attention_scale{};
+  float rope_theta{};
+  float rope_factor{};
+  float rope_beta_fast{};
+  float rope_beta_slow{};
+  std::uint32_t rope_original_context{};
+  float llama4_beta{};
+  void* stream{};
+};
+[[nodiscard]] Status mla_causal_latent_bf16(
+    const MlaCausalLaunch& launch) noexcept;
 [[nodiscard]] Status rms_norm(const float* input, const float* weight,
                               float* output, std::uint32_t elements,
                               float epsilon, void* stream) noexcept;
@@ -145,6 +200,13 @@ struct Fp4Block32Matrix final {
     const float* input, const std::uint16_t* weight, float* output,
     std::uint32_t rows, std::uint32_t elements, float epsilon,
     void* stream) noexcept;
+[[nodiscard]] Status rms_norm_bf16_weight_strided_batch(
+    const float* input, std::uint32_t input_stride,
+    const std::uint16_t* weight, float* output,
+    std::uint32_t output_stride, std::uint32_t rows,
+    std::uint32_t elements, float epsilon, void* stream) noexcept;
+[[nodiscard]] Status round_bf16_in_place(
+    float* values, std::uint64_t count, void* stream) noexcept;
 // Qwen3-Next stores zero-centered RMSNorm weights and applies (1 + weight).
 [[nodiscard]] Status qwen3_next_rms_norm(
     const float* input, const float* weight, float* output,
@@ -153,6 +215,51 @@ struct Fp4Block32Matrix final {
     const float* input, const float* weight, float* output,
     std::uint32_t rows, std::uint32_t elements, float epsilon,
     void* stream) noexcept;
+
+// Generic multi-stream residual primitives. Every stream owns hidden_size
+// contiguous values; norm weights are stream-specific and zero-centered.
+[[nodiscard]] Status hyper_repeat_batch(
+    const float* hidden, float* hyper_state, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams,
+    void* stream) noexcept;
+[[nodiscard]] Status hyper_group_norm_batch(
+    const float* hyper_state, const float* weight, float* normalized,
+    std::uint32_t rows, std::uint32_t hidden_size,
+    std::uint32_t streams, float epsilon, void* stream) noexcept;
+[[nodiscard]] Status hyper_prepare_mix_batch(
+    float* lowrank, std::uint32_t elements, std::uint32_t streams,
+    void* stream) noexcept;
+[[nodiscard]] Status hyper_finish_read_batch(
+    const float* normalized, float* mix_weights, float* mixed_hidden,
+    float* injection_weights, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams,
+    void* stream) noexcept;
+[[nodiscard]] Status hyper_inject_batch(
+    const float* retained, const float* hidden,
+    const float* injection_weights, float* output, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams,
+    void* stream) noexcept;
+
+// Hashed lexical feature injection. Embedding rows are already gathered and
+// decoded by the mmap-backed placement organ.
+[[nodiscard]] Status ple_gate_batch(
+    const float* normalized_key, const float* normalized_query,
+    const float* value, float* gated, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams,
+    void* stream) noexcept;
+struct PleDilatedConvLaunch final {
+  const float* input{};
+  const float* weights{};  // [streams * hidden, kernel]
+  float* state{};          // [streams * hidden, (kernel - 1) * dilation]
+  float* output{};
+  std::uint32_t rows{};
+  std::uint32_t channels{};
+  std::uint32_t kernel{};
+  std::uint32_t dilation{};
+  void* stream{};
+};
+[[nodiscard]] Status ple_dilated_conv(
+    const PleDilatedConvLaunch& launch) noexcept;
 [[nodiscard]] Status rms_norm_batch(
     const float* input, const float* weight, float* output,
     std::uint32_t rows, std::uint32_t elements, float epsilon,
@@ -268,6 +375,11 @@ struct Fp4Block32Matrix final {
     std::uint32_t hidden, std::uint32_t experts, std::uint32_t top_k,
     float* logits, float* topk_scores, std::uint32_t* topk_indices,
     void* stream) noexcept;
+[[nodiscard]] Status router_topk_normalized_logits_batch(
+    const float* logits, std::uint32_t rows, std::uint32_t experts,
+    std::uint32_t top_k, float routed_scaling_factor,
+    float* topk_scores, std::uint32_t* topk_indices,
+    void* stream) noexcept;
 
 // Sigmoid router with selection-only expert bias. Returned weights are the
 // unbiased sigmoid scores normalized over the selected experts, matching the
@@ -378,6 +490,83 @@ struct CausalShortConvLaunch final {
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, void* stream) noexcept;
+
+// QSA keeps raw index keys in the same request-owned pages as exact FP16 K/V.
+// Selection may be prepared on the host, but all attention arithmetic stays
+// on the GPU and consumes the exact artifact-declared token set.
+struct QsaIndexPrepareLaunch final {
+  float* projected_qk{};  // [rows, (query_heads + 1) * head_dim]
+  const float* query_norm_weight{};
+  const void* const* page_table{};
+  std::uint32_t page_index_offset_bytes{};
+  std::uint32_t index_layer{};
+  std::uint32_t page_tokens{};
+  std::uint32_t first_position{};
+  std::uint32_t rows{};
+  std::uint32_t query_heads{};
+  std::uint32_t head_dim{};
+  std::uint32_t rotary_dim{};
+  float epsilon{};
+  float rope_theta{};
+  void* stream{};
+};
+[[nodiscard]] Status qsa_prepare_index(
+    const QsaIndexPrepareLaunch& launch) noexcept;
+struct QsaBlockScoreLaunch final {
+  const float* query{};  // one prepared query row
+  const void* const* page_table{};
+  const float* key_norm_weight{};
+  float* scores{};
+  std::uint32_t page_index_offset_bytes{};
+  std::uint32_t index_layer{};
+  std::uint32_t page_tokens{};
+  std::uint32_t visible_tokens{};
+  std::uint32_t query_heads{};
+  std::uint32_t head_dim{};
+  std::uint32_t rotary_dim{};
+  std::uint32_t compress_ratio{};
+  float epsilon{};
+  float rope_theta{};
+  void* stream{};
+};
+[[nodiscard]] Status qsa_score_blocks(
+    const QsaBlockScoreLaunch& launch) noexcept;
+struct QsaSelectedAttentionLaunch final {
+  const float* q_and_gate{};
+  const void* const* page_table{};
+  const std::uint32_t* selected_tokens{};
+  float* output{};
+  std::uint32_t selected_count{};
+  std::uint32_t full_attention_layer{};
+  std::uint32_t page_tokens{};
+  std::uint32_t query_heads{};
+  std::uint32_t kv_heads{};
+  std::uint32_t head_dim{};
+  void* stream{};
+};
+[[nodiscard]] Status qsa_selected_attention(
+    const QsaSelectedAttentionLaunch& launch) noexcept;
+
+// Executes the same exact QSA arithmetic from one contiguous FP16 K/V
+// staging area. When selected_tokens is null, K/V is already packed in
+// selection order; otherwise the indices address a complete staged layer.
+// This is the execution primitive used by tiered QSA: the authoritative KV
+// may remain in pinned host memory while only the artifact-selected payload
+// is present on the device.
+struct QsaSelectedContiguousAttentionLaunch final {
+  const float* q_and_gate{};
+  const std::uint16_t* keys{};
+  const std::uint16_t* values{};
+  const std::uint32_t* selected_tokens{};
+  float* output{};
+  std::uint32_t selected_count{};
+  std::uint32_t query_heads{};
+  std::uint32_t kv_heads{};
+  std::uint32_t head_dim{};
+  void* stream{};
+};
+[[nodiscard]] Status qsa_selected_contiguous_attention(
+    const QsaSelectedContiguousAttentionLaunch& launch) noexcept;
 
 // Output-gated GQA with a compact FP4-E2M1/UE8M0 block-32 paged cache. Each
 // page stores all full-attention layers as K records followed by V records;
@@ -680,6 +869,11 @@ struct HostFp16GatedGqaAttentionWorkspace final {
     const DeviceFp16GatedGqaAttentionLaunch& launch,
     const HostFp16GatedGqaAttentionWorkspace& workspace) noexcept;
 
+enum class GatedDeltaOutputActivation : std::uint32_t {
+  silu = 1U,
+  sigmoid = 2U,
+};
+
 struct Qwen3NextDeltaLaunch final {
   const float* projected_qkvz{};  // [2*key_dim + 2*value_dim]
   const float* projected_ba{};    // [2*value_heads]
@@ -724,6 +918,8 @@ struct SplitGatedDeltaLaunch final {
   std::uint32_t value_head_dim{};
   std::uint32_t conv_kernel{};
   float epsilon{};
+  GatedDeltaOutputActivation output_gate_activation{
+      GatedDeltaOutputActivation::silu};
   void* stream{};
 };
 
@@ -753,6 +949,8 @@ struct SplitGatedDeltaPrefillLaunch final {
   std::uint32_t value_head_dim{};
   std::uint32_t conv_kernel{};
   float epsilon{};
+  GatedDeltaOutputActivation output_gate_activation{
+      GatedDeltaOutputActivation::silu};
   void* stream{};
 };
 
@@ -801,5 +999,11 @@ struct Mamba2BatchLaunch final {
                                  float* output_values,
                                  std::uint32_t* output_indices,
                                  void* stream) noexcept;
+
+// OpenAI/vLLM presence semantics: subtract one fixed penalty from logits for
+// tokens already emitted by the current response, before top-k/top-p/min-p.
+[[nodiscard]] Status apply_presence_penalty(
+    float* logits, const std::uint8_t* emitted, std::uint32_t count,
+    float penalty, void* stream) noexcept;
 
 }  // namespace expert::runtime::cuda

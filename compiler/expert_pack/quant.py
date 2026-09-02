@@ -79,6 +79,55 @@ def _row_geometry(view: TensorView) -> tuple[int, int, int]:
     return rows, columns, columns * element_bytes
 
 
+def _float32(value: float) -> float:
+    """Round one scalar to the canonical IEEE binary32 arithmetic domain."""
+    return struct.unpack("<f", struct.pack("<f", value))[0]
+
+
+def quantize_int8_row(
+    values: Iterable[float], columns: int
+) -> tuple[bytes, float]:
+    """Encode one symmetric INT8 row with canonical binary32 arithmetic.
+
+    Source values, the per-row scale, and division are all evaluated in
+    IEEE binary32 before nearest-ties-to-even rounding. This is the artifact
+    ABI used by the accelerated writer and must remain byte-identical when
+    NumPy is unavailable or when the source-quality gate re-encodes a row.
+    """
+    if _np is not None:
+        numeric = _np.asarray(values, dtype="<f4")
+        if numeric.size != columns:
+            raise SourceFormatError("short decoded INT8 row")
+        if not bool(_np.isfinite(numeric).all()):
+            raise SourceFormatError("non-finite weight in INT8 row")
+        maximum = float(_np.max(_np.abs(numeric), initial=0.0))
+        scale = _np.float32(maximum / 127.0 if maximum else 1.0)
+        payload = _np.clip(
+            _np.rint(numeric / scale), -127, 127
+        ).astype("i1").tobytes()
+        return payload, float(scale)
+
+    materialized: list[float] = []
+    maximum = 0.0
+    for value in values:
+        scalar = _float32(float(value))
+        if not math.isfinite(scalar):
+            raise SourceFormatError("non-finite weight in INT8 row")
+        materialized.append(scalar)
+        maximum = max(maximum, abs(scalar))
+    if len(materialized) != columns:
+        raise SourceFormatError("short decoded INT8 row")
+    scale = _float32(maximum / 127.0 if maximum else 1.0)
+    quantized = array(
+        "b",
+        (
+            max(-127, min(127, int(round(_float32(value / scale)))))
+            for value in materialized
+        ),
+    )
+    return quantized.tobytes(), scale
+
+
 def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> bytes:
     """Write row-major int8 values and return little-endian FP32 scales."""
     rows, columns, row_bytes = _row_geometry(view)
@@ -86,38 +135,12 @@ def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> 
     for row in range(rows):
         start = row * row_bytes
         values = _decode_float_row(view.raw[start : start + row_bytes], view.info.dtype)
-        if _np is not None:
-            numeric = _np.asarray(values, dtype="<f4")
-            if numeric.size != columns:
-                raise SourceFormatError(f"short decoded row in {view.info.name}")
-            if not bool(_np.isfinite(numeric).all()):
-                raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
-            maximum = float(_np.max(_np.abs(numeric), initial=0.0))
-            scale = maximum / 127.0 if maximum else 1.0
-            payload = _np.clip(_np.rint(numeric / scale), -127, 127).astype("i1").tobytes()
-            write_all(destination, payload)
-            digest.update(payload)
-            scales.extend(struct.pack("<f", scale))
-            continue
-        maximum = 0.0
-        materialized: list[float] = []
-        for value in values:
-            scalar = float(value)
-            if not math.isfinite(scalar):
-                raise SourceFormatError(f"non-finite weight in {view.info.name}, row {row}")
-            materialized.append(scalar)
-            maximum = max(maximum, abs(scalar))
-        if len(materialized) != columns:
-            raise SourceFormatError(f"short decoded row in {view.info.name}")
-        scale = maximum / 127.0 if maximum else 1.0
-        quantized = array(
-            "b",
-            (
-                max(-127, min(127, int(round(value / scale))))
-                for value in materialized
-            ),
-        )
-        payload = quantized.tobytes()
+        try:
+            payload, scale = quantize_int8_row(values, columns)
+        except SourceFormatError as error:
+            raise SourceFormatError(
+                f"{error} in {view.info.name}, row {row}"
+            ) from error
         write_all(destination, payload)
         digest.update(payload)
         scales.extend(struct.pack("<f", scale))

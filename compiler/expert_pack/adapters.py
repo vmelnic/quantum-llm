@@ -22,12 +22,24 @@ LFM2_EXPERT_PATTERN = re.compile(
 
 
 @dataclass(frozen=True)
+class NativeNvfp4MatrixSource:
+    weight: TensorInfo
+    scale: TensorInfo
+    weight_global_scale: TensorInfo
+    input_global_scale: TensorInfo
+    logical_shape: tuple[int, int]
+
+
+@dataclass(frozen=True)
 class ExpertSource:
     layer: int
     expert: int
     gate: TensorInfo | None
     up: TensorInfo
     down: TensorInfo
+    nvfp4_gate: NativeNvfp4MatrixSource | None = None
+    nvfp4_up: NativeNvfp4MatrixSource | None = None
+    nvfp4_down: NativeNvfp4MatrixSource | None = None
 
 
 @dataclass(frozen=True)
@@ -119,10 +131,30 @@ class AdaptedModel:
     # only when the selected container profile is FP4; existing adapters keep
     # their current INT8/FP32 dense representation by leaving this set empty.
     dense_fp4: frozenset[str] = frozenset()
+    # Source-native NVFP4 records retain their packed values, local E4M3FN
+    # scales and both checkpoint global divisors. They are not requantized by
+    # the container writer.
+    dense_nvfp4: tuple[NativeNvfp4MatrixSource, ...] = ()
+    # BF16 organs are copied bit-exactly and executed as BF16 by a capability
+    # that explicitly declares that encoding.
+    dense_bfloat16: frozenset[str] = frozenset()
+    # Integer metadata used by executable lookup/hash capabilities must remain
+    # bit-exact.  It is stored as raw little-endian I64 rather than being
+    # coerced through FP32 (which would corrupt values above 2**24).
+    dense_int64: frozenset[str] = frozenset()
+    # Runtime-bound tensors that are consumed directly from the authenticated
+    # mmap instead of being made device-resident.  This is a placement fact,
+    # not a model-family exception.
+    host_mapped_dense: frozenset[str] = frozenset()
     # Source tensors preserved and qualified in the artifact but intentionally
     # absent from the executable program (for example an unsupported optional
     # draft head). They are explicit, not silently dead runtime bindings.
     auxiliary_dense: frozenset[str] = frozenset()
+    # Some tokenizer artifacts expose a smaller reasoning-effort vocabulary
+    # than the common service API. Adapters may declare the exact semantic-to-
+    # template mapping; common serving code consumes it without inspecting a
+    # model family or tokenizer implementation.
+    template_reasoning_effort_map: tuple[tuple[str, str], ...] = ()
     supported_expert_quant_profiles: frozenset[str] = frozenset(QUANT_PROFILES)
 
 
@@ -2168,6 +2200,8 @@ class Lfm2MoeAdapter:
 
 
 from .muse_glimmer_adapter import MuseGlimmerAdapter
+from .mistral4_nvfp4_adapter import Mistral4Nvfp4Adapter
+from .qwen4_exp_adapter import Qwen4ExpAdapter
 
 
 ADAPTERS = {
@@ -2176,6 +2210,8 @@ ADAPTERS = {
     HybridDeltaAdapter.name: HybridDeltaAdapter(),
     Lfm2MoeAdapter.name: Lfm2MoeAdapter(),
     MuseGlimmerAdapter.name: MuseGlimmerAdapter(),
+    Mistral4Nvfp4Adapter.name: Mistral4Nvfp4Adapter(),
+    Qwen4ExpAdapter.name: Qwen4ExpAdapter(),
 }
 
 

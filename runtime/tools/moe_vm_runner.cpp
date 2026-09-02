@@ -92,6 +92,7 @@ struct SamplingSettings final {
   std::uint32_t top_p_ppm{1000000U};
   std::uint32_t top_k{};
   std::uint32_t min_p_ppm{};
+  std::int32_t presence_penalty_ppm{};
   std::uint64_t seed{};
 
   [[nodiscard]] bool enabled() const noexcept {
@@ -320,6 +321,7 @@ ServicePorts service_ports(const er::ModelDescriptor& model) {
 er::ProgramRequestContext request_context(std::uint64_t request_id,
                                           std::uint32_t reserved_context,
                                           std::uint32_t retention_position,
+                                          std::uint32_t first_output_position,
                                           const SamplingSettings& sampling) {
   er::ProgramRequestContext result;
   result.request_id = request_id;
@@ -333,6 +335,13 @@ er::ProgramRequestContext request_context(std::uint64_t request_id,
   result.parameters.emplace("sampling_top_p_ppm", sampling.top_p_ppm);
   result.parameters.emplace("sampling_top_k", sampling.top_k);
   result.parameters.emplace("sampling_min_p_ppm", sampling.min_p_ppm);
+  result.parameters.emplace(
+      "sampling_presence_penalty_biased_ppm",
+      static_cast<std::uint64_t>(
+          static_cast<std::int64_t>(sampling.presence_penalty_ppm) +
+          2'000'000LL));
+  result.parameters.emplace("sampling_first_output_position",
+                            first_output_position);
   result.parameters.emplace("sampling_seed", sampling.seed);
   result.parameters.emplace("exact_decode_enabled",
                             sampling.enabled() ? 0U : 1U);
@@ -564,7 +573,7 @@ void print_ready(const er::ModelDescriptor& descriptor,
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":9,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":10,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -601,6 +610,8 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << "\",\"gpu_phase_timing\":"
             << (profile_gpu_phases ? "true" : "false")
             << ",\"sampling_supported\":"
+            << (service.sampling_supported ? "true" : "false")
+            << ",\"sampling_presence_penalty_supported\":"
             << (service.sampling_supported ? "true" : "false")
             << ",\"mtp_resource_available\":"
             << (service.mtp_resource_available ? "true" : "false")
@@ -691,6 +702,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
       }
       auto segment_position = first_position;
       std::size_t segment_offset{};
+      bool retention_checkpointed{};
       for (std::size_t index = 0U; index < segment_count; ++index) {
         auto step = start_prefill_sequence(
             request, ports, segments[index], segment_position,
@@ -729,6 +741,10 @@ int worker_loop(er::MoeProgramExecutor& executor,
         if (segment_position == request.retention_position) {
           request.retention_predicted = request.predicted;
           request.retention_prediction_valid = true;
+          const auto checkpoint =
+              request.session.checkpoint_retention(segment_position);
+          require(checkpoint.ok(), checkpoint.message());
+          retention_checkpointed = true;
         }
       }
       program_steps += tokens.size();
@@ -748,9 +764,11 @@ int worker_loop(er::MoeProgramExecutor& executor,
         const auto retention_position = request.retention_position == 0U
                                             ? request.next_position
                                             : request.retention_position;
-        const auto checkpoint =
-            request.session.checkpoint_retention(retention_position);
-        require(checkpoint.ok(), checkpoint.message());
+        if (!retention_checkpointed) {
+          const auto checkpoint =
+              request.session.checkpoint_retention(retention_position);
+          require(checkpoint.ok(), checkpoint.message());
+        }
         request.retention_position = retention_position;
         if (retention_position == request.next_position) {
           request.retention_predicted = request.predicted;
@@ -759,6 +777,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
       }
       return;
     }
+    bool retention_checkpointed{};
     for (std::size_t offset = 0U; offset < tokens.size();) {
       auto count = std::min<std::size_t>(
           chunk_tokens, tokens.size() - offset);
@@ -819,6 +838,16 @@ int worker_loop(er::MoeProgramExecutor& executor,
         require(synchronized.ok(), synchronized.message());
       }
       offset += count;
+      const auto next_position =
+          first_position + static_cast<std::uint32_t>(offset);
+      if (module.service.session_retention &&
+          request.retention_position != 0U &&
+          next_position == request.retention_position) {
+        const auto checkpoint =
+            request.session.checkpoint_retention(next_position);
+        require(checkpoint.ok(), checkpoint.message());
+        retention_checkpointed = true;
+      }
     }
     request.next_position =
         first_position + static_cast<std::uint32_t>(tokens.size());
@@ -830,9 +859,11 @@ int worker_loop(er::MoeProgramExecutor& executor,
       const auto retention_position = request.retention_position == 0U
                                           ? request.next_position
                                           : request.retention_position;
-      const auto checkpoint =
-          request.session.checkpoint_retention(retention_position);
-      require(checkpoint.ok(), checkpoint.message());
+      if (!retention_checkpointed) {
+        const auto checkpoint =
+            request.session.checkpoint_retention(retention_position);
+        require(checkpoint.ok(), checkpoint.message());
+      }
       request.retention_position = retention_position;
       if (retention_position == request.next_position) {
         request.retention_predicted = request.predicted;
@@ -891,24 +922,29 @@ int worker_loop(er::MoeProgramExecutor& executor,
         }
         SamplingSettings sampling;
         if (field < fields.size() && fields[field] == "SAMPLING") {
-          require(field + 5U < fields.size(),
+          require(field + 6U < fields.size(),
                   "invalid BEGIN sampling marker");
           const auto temperature =
               std::stoull(std::string(fields[field + 1U]));
           const auto top_p = std::stoull(std::string(fields[field + 2U]));
           const auto top_k = std::stoull(std::string(fields[field + 3U]));
           const auto min_p = std::stoull(std::string(fields[field + 4U]));
-          sampling.seed = std::stoull(std::string(fields[field + 5U]));
+          const auto presence =
+              std::stoll(std::string(fields[field + 5U]));
+          sampling.seed = std::stoull(std::string(fields[field + 6U]));
           require(temperature <= 2000000U && top_p != 0U &&
                       top_p <= 1000000U && top_k <= descriptor.vocab_size &&
-                      min_p <= 1000000U,
+                      min_p <= 1000000U && presence >= -2000000LL &&
+                      presence <= 2000000LL,
                   "invalid BEGIN sampling values");
           sampling.temperature_ppm =
               static_cast<std::uint32_t>(temperature);
           sampling.top_p_ppm = static_cast<std::uint32_t>(top_p);
           sampling.top_k = static_cast<std::uint32_t>(top_k);
           sampling.min_p_ppm = static_cast<std::uint32_t>(min_p);
-          field += 6U;
+          sampling.presence_penalty_ppm =
+              static_cast<std::int32_t>(presence);
+          field += 7U;
         }
         require(field == fields.size(), "unknown BEGIN request fields");
         require(module.service.session_retention ||
@@ -960,6 +996,10 @@ int worker_loop(er::MoeProgramExecutor& executor,
             auto rebound = retained_request.session.rebind_request(
                 request_context(id, static_cast<std::uint32_t>(context),
                                 retained_request.retention_position,
+                                retained_request.next_position +
+                                    static_cast<std::uint32_t>(
+                                        prompt.empty() ? 0U
+                                                       : prompt.size() - 1U),
                                 retained_request.sampling));
             require(rebound.ok(), rebound.message());
             if (!prompt.empty())
@@ -1019,7 +1059,9 @@ int worker_loop(er::MoeProgramExecutor& executor,
                   "callable provider capacity is exhausted");
           auto begun = executor.begin_session(
               request_context(id, static_cast<std::uint32_t>(context),
-                              request.retention_position, request.sampling));
+                              request.retention_position,
+                              static_cast<std::uint32_t>(prompt.size() - 1U),
+                              request.sampling));
           require(begun.status.ok(), begun.status.message());
           request.session = std::move(begun.session);
           feed(id, request, prompt, 0U);

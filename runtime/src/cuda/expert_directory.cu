@@ -666,7 +666,11 @@ Status CudaExpertDirectory::publish(
       const std::size_t matrix_packed =
           static_cast<std::size_t>(hidden) * intermediate / 2U;
       const std::size_t matrix_scales =
-          static_cast<std::size_t>(hidden) * intermediate / kExpertFp4BlockSize;
+          static_cast<std::size_t>(hidden) * intermediate /
+              (cuda_allocation->native_nvfp4()
+                   ? kExpertNvfp4BlockSize
+                   : kExpertFp4BlockSize) +
+          (cuda_allocation->native_nvfp4() ? 2U * sizeof(float) : 0U);
       entry.w1_fp4 =
           reinterpret_cast<const std::uint8_t*>(cuda_allocation->gate_up());
       entry.w1_ue8m0 = reinterpret_cast<const std::uint8_t*>(
@@ -680,7 +684,9 @@ Status CudaExpertDirectory::publish(
       entry.w2_ue8m0 = reinterpret_cast<const std::uint8_t*>(
           cuda_allocation->down_scales());
       entry.format = static_cast<std::uint32_t>(
-          cuda_allocation->relu2()
+          cuda_allocation->native_nvfp4()
+              ? DeviceExpertFormat::nvfp4_e2m1_e4m3fn_block16_w4a4
+              : cuda_allocation->relu2()
               ? DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32
               : DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
     } else {

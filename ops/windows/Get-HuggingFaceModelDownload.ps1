@@ -32,6 +32,9 @@ foreach ($partial in $incomplete) {
     $incompleteBytes += [int64]$partial.Length
 }
 $snapshot = Join-Path (Join-Path $root "snapshots") ([string]$state.revision)
+$indexFile = if ($null -ne $state.PSObject.Properties["index_file"]) {
+    [string]$state.index_file
+} else { "model.safetensors.index.json" }
 $selectedFiles = @(
     if ($null -ne $state.PSObject.Properties["files"]) {
         $state.files | ForEach-Object { [string]$_ }
@@ -45,22 +48,31 @@ if ($selectedFiles.Count -gt 0) {
         else { $missingReferencedFiles += $_ }
     })
 } else {
-    $shards = @(Get-ChildItem $snapshot -Filter "model-*.safetensors" -File `
-        -ErrorAction SilentlyContinue)
+    $indexPath = Join-Path $snapshot $indexFile
+    if (Test-Path $indexPath -PathType Leaf) {
+        $index = Get-Content $indexPath -Raw | ConvertFrom-Json
+        $referenced = @(
+            $index.weight_map.PSObject.Properties.Value | Sort-Object -Unique
+        )
+        $shards = @($referenced | ForEach-Object {
+            $candidate = Join-Path $snapshot ([string]$_)
+            if (Test-Path $candidate -PathType Leaf) { Get-Item $candidate }
+            else { $missingReferencedFiles += [string]$_ }
+        })
+    } else {
+        $shards = @()
+        $missingReferencedFiles = @($indexFile)
+    }
 }
 $completeShardBytes = [int64]0
 foreach ($shard in $shards) {
     $completeShardBytes += [int64]$shard.Length
 }
-$indexPath = Join-Path $snapshot "model.safetensors.index.json"
+$indexPath = Join-Path $snapshot $indexFile
 $indexTensorBytes = [int64]0
 if ($selectedFiles.Count -eq 0 -and (Test-Path $indexPath -PathType Leaf)) {
     $index = Get-Content $indexPath -Raw | ConvertFrom-Json
     $indexTensorBytes = [int64]$index.metadata.total_size
-    $referenced = @($index.weight_map.PSObject.Properties.Value | Sort-Object -Unique)
-    $missingReferencedFiles = @($referenced | Where-Object {
-        -not (Test-Path (Join-Path $snapshot ([string]$_)) -PathType Leaf)
-    })
 }
 $exit = if (Test-Path ([string]$state.exit_status) -PathType Leaf) {
     Get-Content ([string]$state.exit_status) -Raw | ConvertFrom-Json
@@ -153,8 +165,7 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
       $selectedHashMismatches.Count -eq 0) -or
      ($selectedFiles.Count -eq 0 -and
       $indexTensorBytes -eq [int64]$state.expected_tensor_bytes -and
-      $fullIntegrityChecked -and
-      $incomplete.Count -eq 0)) -and
+      $fullIntegrityChecked)) -and
     $missingReferencedFiles.Count -eq 0
 
 [PSCustomObject]@{
@@ -169,6 +180,7 @@ $complete = $null -ne $exit -and [int]$exit.exit_code -eq 0 -and
     complete_shards = $shards.Count
     expected_shards = [int]$state.expected_shards
     files = $selectedFiles
+    index_file = $indexFile
     incomplete_transfers = $incomplete.Count
     incomplete_bytes = $incompleteBytes
     missing_referenced_files = $missingReferencedFiles.Count

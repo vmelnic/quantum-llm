@@ -21,6 +21,36 @@ std::uint64_t saturating_add(std::uint64_t left,
 
 }  // namespace
 
+DeviceCacheBudgetResult fit_device_cache_budget(
+    const DeviceCacheBudgetRequest& request) noexcept {
+  if (request.available_device_bytes == 0U ||
+      request.requested_cache_bytes == 0U ||
+      request.minimum_cache_bytes == 0U ||
+      request.requested_cache_bytes < request.minimum_cache_bytes) {
+    return {{ErrorCode::invalid_argument,
+             "invalid device cache budget request"},
+            0U};
+  }
+  const auto non_cache_bytes = saturating_add(
+      saturating_add(request.fixed_device_bytes,
+                     request.execution_workspace_bytes),
+      request.emergency_reserve_bytes);
+  if (non_cache_bytes >= request.available_device_bytes) {
+    return {{ErrorCode::backpressure,
+             "fixed device state leaves no cache capacity"},
+            0U};
+  }
+  const auto available_cache_bytes =
+      request.available_device_bytes - non_cache_bytes;
+  if (available_cache_bytes < request.minimum_cache_bytes) {
+    return {{ErrorCode::backpressure,
+             "available device cache is below the provider minimum"},
+            0U};
+  }
+  return {Status::success(),
+          std::min(request.requested_cache_bytes, available_cache_bytes)};
+}
+
 ExpertCacheMemoryTier::ExpertCacheMemoryTier(
     ExpertCache& cache, MemoryDomain domain,
     std::uint64_t protected_bytes) noexcept

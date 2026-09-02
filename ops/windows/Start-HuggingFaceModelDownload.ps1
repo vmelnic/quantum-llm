@@ -5,7 +5,10 @@ param(
     [Parameter(Mandatory = $true)][int64]$ExpectedTensorBytes,
     [Parameter(Mandatory = $true)][int]$ExpectedShards,
     [string]$Files = "",
+    [string]$ConfigFile = "config.json",
+    [string]$IndexFile = "model.safetensors.index.json",
     [int]$MaxWorkers = 4,
+    [ValidateSet(0, 1)][int]$XetHighPerformance = 1,
     [int64]$SafetyBytes = 8GB
 )
 
@@ -27,6 +30,13 @@ foreach ($file in $selectedFiles) {
         [System.IO.Path]::IsPathRooted($file) -or
         $file -match '(^|/)\.\.(/|$)' -or $file -match '[*?\[\]]') {
         throw "Files must contain comma-separated exact repository paths: $file"
+    }
+}
+foreach ($file in @($ConfigFile, $IndexFile)) {
+    if ([string]::IsNullOrWhiteSpace($file) -or
+        [System.IO.Path]::IsPathRooted($file) -or
+        $file -match '(^|/)\.\.(/|$)' -or $file -match '[*?\[\]]') {
+        throw "ConfigFile and IndexFile must be exact repository paths: $file"
     }
 }
 if ($selectedFiles.Count -gt 0 -and $selectedFiles.Count -ne $ExpectedShards) {
@@ -82,9 +92,17 @@ if ($selectedFiles.Count -gt 0) {
         }
     }
 } else {
-    foreach ($shard in @(Get-ChildItem $snapshot -Filter "model-*.safetensors" `
-            -File -ErrorAction SilentlyContinue)) {
-        $initialShardBytes += [int64]$shard.Length
+    $indexPath = Join-Path $snapshot $IndexFile
+    if (Test-Path $indexPath -PathType Leaf) {
+        $index = Get-Content $indexPath -Raw | ConvertFrom-Json
+        foreach ($relative in @(
+                $index.weight_map.PSObject.Properties.Value |
+                    Sort-Object -Unique)) {
+            $candidate = Join-Path $snapshot ([string]$relative)
+            if (Test-Path $candidate -PathType Leaf) {
+                $initialShardBytes += [int64](Get-Item $candidate).Length
+            }
+        }
     }
 }
 $cachedBytes = [int64]0
@@ -108,7 +126,9 @@ Remove-Item -LiteralPath $status -Force -ErrorAction SilentlyContinue
 $workerArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$worker`" " +
     "-HfPath `"$hf`" -ModelId $ModelId -Revision $Revision " +
     "-Files `"$Files`" " +
-    "-MaxWorkers $MaxWorkers -StdoutPath `"$stdout`" " +
+    "-ConfigFile `"$ConfigFile`" -IndexFile `"$IndexFile`" " +
+    "-MaxWorkers $MaxWorkers -XetHighPerformance $XetHighPerformance " +
+    "-StdoutPath `"$stdout`" " +
     "-StderrPath `"$stderr`" -StatusPath `"$status`""
 $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument $workerArguments
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
@@ -128,12 +148,14 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings `
     expected_tensor_bytes = $ExpectedTensorBytes
     expected_shards = $ExpectedShards
     files = $selectedFiles
+    config_file = $ConfigFile
+    index_file = $IndexFile
     initial_cached_bytes = $cachedBytes
     initial_complete_shard_bytes = $initialShardBytes
     free_bytes_before = $freeBytes
     safety_bytes = $SafetyBytes
     max_workers = $MaxWorkers
-    xet_high_performance = $true
+    xet_high_performance = [bool]$XetHighPerformance
     task_name = $taskName
     started_utc = [DateTime]::UtcNow.ToString("o")
     stdout = $stdout

@@ -1,293 +1,185 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-08-26. Numbers removed from this
-document are historical context, not current claims.
+Status: canonical measurement ledger, 2026-09-02.
 
 ## Metric rules
 
-- `TTFT` is server time from accepted request to first generated token unless
-  explicitly labelled first visible content.
-- End-to-end generation rate is `generated_tokens / wall_seconds`.
-- Post-first-token rate uses the remaining generated tokens and remaining wall
-  time. Hidden reasoning makes first visible content unsuitable for this
-  calculation.
-- Every result identifies the model, KV format, prompt size and cache state.
-- A maximum-context test must actually populate the reported positions.
-- CUDA microbenchmarks and bandwidth equations are ceilings, not service
-  throughput.
+- TTFT is server time to the first generated token unless explicitly labelled
+  first visible content.
+- Total rate is generated tokens divided by request wall time. Post-first-token
+  rate excludes TTFT and the first token.
+- Prompt, generated, reasoning and visible/useful output are distinct.
+- Configured context is not populated context. A maximum-context claim reports
+  actual positions and KV format.
+- Cold, warm, reused-prefix, novel-route and settled-route results are not
+  interchangeable.
+- Microbenchmarks and bandwidth equations are ceilings, never service results.
 
-## Current repository validation
+## Validation baseline
 
-Latest changed-code gate on 2026-08-26:
+Latest recorded changed-code gate on 2026-09-01:
 
-- the official Windows Release/CUDA build compiled the common VM and both
-  providers with MSVC 19.44 and CUDA 12.1;
-- Windows CTest passed 5/5 native/CUDA tests;
-- the Windows compiler/server contract suite passed 101/101 tests, including
-  generic compact/standard FP4 host execution, progressive session accounting
-  and a prefill-sized (>32 selection) universal FP4 host work group;
-- the broader control-host suite passed 119 tests with 9 optional dependency
-  skips;
-- `git diff --check`, Python byte compilation and shell syntax checks passed.
+- Windows Release/CUDA build completed with MSVC 19.44 and CUDA 12.1;
+- Windows CTest passed 6/6;
+- canonical compiler/server suite passed 113/113;
+- Python byte compilation, shell syntax and `git diff --check` passed.
 
-The control host does not have CMake installed, so no portable C++ build was
-claimed there. The Windows build is the authoritative CUDA compilation gate.
+The Windows build is authoritative. The build workflow uses `--clean-first`;
+an earlier mixed-object CUDA ABI failure proved that `cmake --fresh` does not
+guarantee recompilation after an internal header change.
 
-## Current service evidence
+## Current Pi wiring gate
 
-| Gate | Configuration | Result | Verdict |
-|---|---|---|---|
-| Qwen chat | common VM, exact F16 KV, `model.sh chat`, `hi` | 13 prompt, 10 generated, 0.957 s first visible, 1.311 s wall, 7.63 tok/s end-to-end, 25.42 tok/s after first visible | short-context regression pass |
-| Muse chat | common VM, exact mixed global/window F16 KV, `model.sh chat`, `hi` | 57 prompt, 59 generated (40 reasoning), 2.037 s first visible, 2.336 s wall, 25.26 tok/s end-to-end, `finish=stop` | text common-path pass; not a populated 131K gate |
-| Ornith chat | common VM, FP4 standard expert pages, exact F16 KV policy, `model.sh chat`, `hi` | 13 prompt, 10 generated, 1.647 s first visible, 2.255 s wall, 4.44 tok/s end-to-end, 14.82 tok/s after first visible | common-path regression pass |
-| Qwen earlier long answer | common VM, exact F16 KV, four-stanza prompt | 68 prompt, 476 generated, 2.812 s TTFT, 19.047 s wall, 29.26 tok/s after first token | short-context quality/throughput pass |
-| DeepSeek chat, exact hybrid q-star active | common VM, artifact BF16 KV, `model.sh chat`, `hi` | 5 prompt, 10 generated, 4.355 s first visible, 11.227 s wall, 0.89 tok/s end-to-end, 1.31 tok/s after first visible | common-path regression pass; q-star speedup still not proved |
-| Qwen tiled prefill | exact F16, 7,052 prompt + 1 output | 23.913 s, two GPU tiles, zero host activation spill | functional pass |
-| Qwen near-maximum prefill | exact F16, 262,001 prompt + 1 output | 2,183.815 s, 43 GPU tiles, zero host activation spill | capacity pass, latency fail |
-| Qwen full maximum, historical | experimental artifact FP4 KV, 262,016 prompt + 128 output | 5,423.422 s TTFT, 5,462.672 s wall, about 3.24 tok/s after first token | capacity only; wrong KV format for exact-F16 goal |
-| Qwen full maximum, FP8 | FP8 E4M3 target KV + FP4 MTP KV, 262,016 + 128 | 1,168.594 s prefill, 3.064 tok/s decode | rejected for speed and quality |
-| Qwen startup | native Windows hash path | 35.95 s from `model.sh start qwen` to ready; pack verification 11.56 s | pass |
-| introspection under load | `/metrics` during 7,052-token prefill | 0.0206 s | pass |
+Command for every row:
 
-The near-maximum exact-F16 run generated only one token. It proves the current
-prefill/capacity path and does not provide a saturated exact-F16 decode rate.
-The 3.24 tok/s result used compact artifact KV and cannot be relabelled F16.
-
-## Muse artifact and bounded text evidence
-
-```text
-source:       meta-models/Muse-Glimmer-30B
-revision:     f84ecc3a0ea984a4c04542a84269e3d065350a6e
-artifact:     ${MODEL_ROOT}/muse-glimmer-30b-fp4
-dense.qpack:  15,832,002,560 bytes
-records:      723 FP4 + 713 F32; zero INT8
+```bash
+./ops/pi.sh <alias> --no-context-files --no-tools --no-session -p hi
 ```
 
-The source gate found zero payload, scale or F32 mismatches. FP4-only cosine
-was 0.9930505 and relative L2 was 0.1177243; aggregate cosine was 0.9999981.
-On one official 68-token prompt, the first 32 generated token IDs from BF16
-decoded to the same raw prefix produced by QPack after accounting for the
-API's special-token stripping. The service then completed the bounded
-instruction with visible `ALPHA-17` and an official EOS rather than exhausting
-the output budget.
+Configuration: one RTX 3090, current artifacts, common 12 GiB routed-VRAM
+ceiling, default `xhigh`. Results are server telemetry from 2026-09-02.
 
-The tokenizer-declared response grammar exposed two generic service bugs that
-were fixed without family branches: protocol parsing now preserves structural
-special tokens internally, and generation respects every EOS ID from
-`generation_config.json`. Streaming with artifact codecs withholds split EOS
-terminals instead of leaking them to clients. This also removed the visible
-DeepSeek EOS regression in its repeated real chat gate.
+| Alias | Prefill | Generated | TTFT | Wall | Result |
+|---|---:|---:|---:|---:|---|
+| `qwen` | 5 | 33 | 0.625 s | 1.938 s | valid response |
+| `qwen-flash` | 477 | 67 | 41.829 s | 53.688 s | valid response, slow |
+| `mistral` | 439 | 67 | 54.797 s | 77.312 s | valid response, slow |
+| `muse` | 422 | 65 | 2.297 s | 4.297 s | valid response |
+| `ornith` | 439 | 34 | 3.703 s | 5.390 s | valid response |
+| `deepseek` | 504 | 256 | 81.985 s | 310.672 s | valid response, impractical latency |
 
-This evidence qualifies short text inference only. Vision records are
-auxiliary, no Muse image path is advertised, and 131,072 positions were not
-populated or timed.
+This is a lifecycle/template/API/generation gate. It is not a coding, tool,
+maximum-context or concurrency benchmark. Pi may still supply its own system
+instructions when project context and tools are disabled.
 
-## Qwen artifact and quality evidence
+DeepSeek's row also recorded 17,359 SSD misses, 232,078,442,496 cache-read
+bytes, 128,653,197,312 reread bytes, 265,354,739,712 uploaded bytes,
+23,728 RAM hits, 24,828 VRAM hits and 271.635 s storage wait. That result is
+movement-bound despite completing correctly.
 
-Published artifact:
+## Direct service evidence
 
-```text
-source:          Qwen/Qwen3.8-27B
-revision:        1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
-artifact:        ${MODEL_ROOT}/qwen3.8-27b-fp4
-dense.qpack:     14,775,390,208 bytes
-records:         1,199
-matrix format:   FP4 E2M1 + UE8M0 block-32 scales, ABI 3
-```
+These are the latest retained short-chat regressions for each artifact; they
+use `model.sh chat` and are not all from one matched performance run.
 
-The source-fidelity gate compared 666 FP4 and 533 F32 records with the pinned
-official checkpoint and found no sampled payload, scale or F32 mismatches.
-Across 159,152 sampled FP4 values, FP4-only relative L2 was 0.121706 and cosine
-similarity was 0.992577.
+| Model | Prompt/output | TTFT or first visible | Wall | Evidence boundary |
+|---|---:|---:|---:|---|
+| Qwen3.8-27B | 13 / 10 | 0.625 s | 1.015 s | current common-path short chat |
+| Qwen3.8-Flash-Next | 13 / 10 | 3.004 s visible | 5.686 s | coherent short chat only |
+| Mistral Small 4 | 541 / 13 | 58.480 s visible | 62.298 s | native NVFP4 text path; cold latency failure |
+| Muse-Glimmer | 57 / 100 | 3.540 s visible | 3.826 s | text path; 81 reasoning tokens |
+| Ornith | 13 / 10 | 0.814 s visible | 1.401 s | common routed path |
+| DeepSeek | 5 / 10 | 3.203 s | 9.672 s | exact paged path, about 1.38 tok/s after TTFT |
 
-A bounded official-BF16 behavioral corpus covered instruction following,
-reasoning, code semantics and tool output. Official and service paths passed
-4/4 cases and their prompt token counts matched (24/67/123/326). This is useful
-bounded evidence, not a broad model-quality certification.
+Qwen also generated a 476-token four-stanza answer at 29.26 tok/s after the
+first token. That is useful short-context decode evidence, not end-to-end or
+262K throughput.
 
-Functional integration gates also passed:
+## Artifact and numerical evidence
 
-- official XML tool call parsed as `get_weather({"city":"Chisinau"})` and a
-  resumed tool-result turn produced the final answer;
-- a 320x240 red image produced `Red` with one image/320 patches in telemetry;
-- Pi attached a blue PNG and produced `Blue` with one image/256 patches.
+| Artifact | Evidence |
+|---|---|
+| Qwen3.8-27B | 14,775,390,208-byte QPack, 1,199 records; 666 FP4 and 533 F32 records matched the pinned source samples; FP4-only relative L2 0.121706, cosine 0.992577; bounded official/service corpus passed 4/4 |
+| Qwen3.8-Flash-Next | 1,562 dense and 24,576 expert records in 95,915,634,688 bytes; exact QSA resident/staged/selected CUDA parity reported maximum absolute difference 0 |
+| Mistral Small 4 | pinned 13-shard official source, 70,801,904,048 tensor bytes; source-native NVFP4 values/sidecars and BF16 organs validated; corrected activation-scale oracle agrees with coherent service text |
+| Muse-Glimmer | 15,832,002,560-byte QPack, 723 FP4 + 713 F32 records; aggregate cosine 0.9999981, FP4-only cosine 0.9930505; bounded official prefix/service behavior passed |
+| Ornith | 19,229,777,920 total pack bytes, 1,731 dense and 10,240 expert records; aggregate relative L2 0.006980/cosine 0.999976, FP4-only 0.118762/0.992932 |
+| DeepSeek | 11,008 compact expert records and 147,169,738,752 routed bytes; independent source, attention, routing, expert and I/O oracles precede bundle publication |
 
-The 2026-08-24 real Pi tool-mode streaming gate used the default coding
-harness and `xhigh` reasoning.  The first implementation proved incremental
-delivery but failed after generation because the Transformers stream parser
-exposed the structural `\n\n` after `</think>`, while its authoritative final
-parse removed it.  That run generated 209 tokens but ended with a protocol
-error and zero client usage; it is a rejected result.
+Source reconstruction is necessary but not sufficient: a real provider and
+service gate remain required.
 
-The bounded final-parser reconciliation made the repeated Qwen gate pass with
-7,923 populated prompt tokens and 217 generated tokens, but it remained a
-fragile two-parser design and is no longer the active implementation. On
-2026-08-25 it was replaced by one artifact-declared parser instance per
-streamed response: its deltas are authoritative, and its own finalized message
-supplies structured tool calls. There is no independent final reparse or
-content reconciliation.
+## Qwen long-context evidence
 
-The replacement passed the normal Pi `read` loop on Qwen. The first turn used
-7,942 input and 86 output tokens, emitted `read({"path":
-"ops/model-aliases.tsv","offset":1,"limit":3})`, and Pi executed it. The
-follow-up used 8,112 input and 53 output tokens and returned
-`deepseek-v4-flash`. The contemporaneous direct `model.sh chat` regression
-used 13 prompt and 10 output tokens, reached visible text in 0.762 s, completed
-in 1.139 s, and decoded at 23.85 tok/s after first visible. These are
-short/medium-context integration results, not a 262K gate.
-
-The earlier Claude Code gate failed: its cold `hi` carried 29,487 prompt tokens,
-needed 82.875 s TTFT and 88.281 s wall. A factual request carried 29,660 prompt
-tokens and returned a fabricated Maia Sandu biography. The Anthropic wire
-adapter works, but that result rejects unrestricted Claude Code production use.
-
-## Ornith artifact and common-path evidence
-
-Published artifact:
+Current target-call weight traffic, excluding sparse embedding lookup, vision
+and MTP but including the vocabulary head:
 
 ```text
-source:                 ornith-ai/Ornith-1.5-35B-A3B
-revision:               10fbf86fed7ecee4a061f8b499a618f46001cac1
-artifact:               ${MODEL_ROOT}/ornith-1.5-35b-a3b-fp4
-adapter/runtime family: hybrid_delta / hybrid_delta_moe
-dense.qpack:            2,075,074,560 bytes
-expert files:           4 files, 17,154,703,360 bytes
-records:                1,230 dense FP4 + 501 F32 + 10,240 expert FP4
-matrix/expert format:   FP4 E2M1 + UE8M0 block-32 scales
+hot target weights             13,625,700,352 bytes = 12.690 GiB
+exact F16 KV at 262,144        17,179,869,184 bytes = 16.000 GiB
+subtotal                       30,805,569,536 bytes
+RTX 3090 physical              25,769,803,776 bytes
 ```
 
-The strict Xet inventory covered all 1,811 official BF16 source tensors and
-71,903,645,408 indexed tensor bytes. Conversion classified every source
-tensor, produced the artifact in a candidate directory, validated it, and
-promoted it atomically below `MODEL_ROOT`. The final validator reported five
-packs, 1,731 dense records, 10,240 expert records and 19,229,777,920 total pack
-bytes.
+The subtotal exceeds VRAM before recurrent state, MTP, activation workspace
+and display/emergency reserve. At the measured 12.46 GiB/s pinned link, one
+complete 16 GiB host-KV scan costs at least 1.284 s per scalar decode call.
 
-The source qualification sampled 8,282,432 values. It found zero F32, FP4
-payload or FP4-scale reconstruction mismatches. Aggregate relative L2 was
-0.006980 with cosine 0.999976; FP4-only relative L2 was 0.118762 with cosine
-0.992932. The worst sampled tensor remained within the declared gates at
-0.187530 relative L2 and 0.984286 cosine.
+| Gate | Result | Verdict |
+|---|---:|---|
+| exact F16, 7,052 prompt + 1 output | 23.913 s, two GPU tiles, zero host activation spill | functional prefill |
+| exact F16, 262,001 prompt + 1 output | 2,183.815 s, 43 GPU tiles, zero host activation spill | capacity pass, latency fail; no saturated decode rate |
+| historical compact artifact KV, 262,016 + 128 | 5,423.422 s TTFT, about 3.24 tok/s after first | wrong KV format for exact-F16 target |
+| rejected FP8 KV, 262,016 + 128 | 1,168.594 s prefill, 3.064 tok/s decode | fidelity and speed fail |
 
-The real short chat gate loaded the published artifact through the common
-service and generic VM; there is no Ornith task, runner or model-family branch.
-Request telemetry recorded 4,046 routed RAM hits, 2,005,401,600 uploaded bytes,
-2,846 CPU decisions and 1,206 GPU-upload decisions. It recorded no SSD miss or
-storage read for this request because the 15.98 GiB routed pool fits the host
-bank. This is a short-context execution and placement pass, not a populated
-262K, visual-quality or broad behavioral qualification.
+The progressive exact-F16 device mirror improved the matched bounded Pi Todo
+gate from 1,645 s to 503.240 s end-to-end and from 1,493 s to 481.563 s to
+green. The run reached 3/3 tests with about 17.8K final prompt tokens and no
+host-attention call or mirror spill. This validates short/medium-prefix
+placement; it does not change the 262K capacity inequality.
 
-The first 2026-08-25 Pi wiring gate exposed and verified removal of a
-decode-only 32-selection limit in the universal FP4 host executor. That
-reduced `--no-context-files --no-tools` check proved only prefill wiring.
+## Harness quality evidence
 
-The subsequent normal Pi project gate used 7,874 prompt tokens, generated 157
-tokens, reached first output in 24.578 s and completed in 34.937 s. It answered
-the project question without the former post-generation parser failure. The
-explicit tool-loop gate then used 7,906 prompt/101 output tokens for the
-initial turn (25.406 s TTFT, 32.156 s wall), emitted a structured `read` call,
-and Pi executed it. The retained follow-up used 230 suffix prompt tokens and
-191 output tokens (1.282 s TTFT, 14.032 s wall) and returned the requested
-`deepseek-v4-flash` value. No `response_stream_*_failed` event was present.
-This qualifies normal short/medium-context Pi text and tool wiring, not
-maximum-context throughput or broad coding quality.
+| Model/mode | Result |
+|---|---|
+| Qwen effective `medium` | synthetic Todo fixture reached 3/3 in 481.563 s with the device mirror; 503.240 s total |
+| Qwen `off` | zero reasoning, implemented code but remained 1/3 after 569 s |
+| Qwen Flash corrected `medium` | valid tools but zero edits; later reproduced an action stall beyond 1,000 s |
+| Qwen Flash `off` | zero edits and invalid generated paths; parser trace later preserved measured native arguments exactly |
+| Mistral | 14 valid/error-free tool calls, zero edits at the 30-minute cutoff |
+| Ornith | bounded project text and retained `read` loop passed |
+| Muse | no representative coding qualification |
+| DeepSeek | minimal Pi `hi` passed; representative project prefill/recovery not qualified |
 
-The same server revision passed DeepSeek `model.sh chat --thinking off` with 5
-prompt and 10 output tokens, 4.479 s first visible and 11.748 s wall (1.24
-tok/s after first visible). Its normal Pi request was stopped while still in
-the known slow harness prefill, so no DeepSeek Pi pass is claimed. The server
-initially acknowledged `model prefill was cancelled`, then its worker later
-became unhealthy while the Windows wrapper task remained running. A clean
-service restart restored `ready`, and the repeated `chat hi` passed with 4.475
-s first visible, 11.037 s wall and 1.37 tok/s after first visible. Automatic
-DeepSeek worker recovery after cancellation remains open.
+The fixture is bounded and does not establish broad coding quality. It does
+establish that minimal chat or valid tool transport cannot be promoted as an
+autonomous coding pass.
 
-## Session and multi-agent evidence
+## Sessions and multi-agent evidence
 
 | Gate | Result |
 |---|---|
-| two compact-KV sessions, one hot slot | 2 parks + 2 restores; 58 delta-prefill tokens instead of 170 complete-prompt tokens; restored greedy continuation matched fresh execution |
-| two exact-F16 sessions, one hot slot | 4 parks, 2 restores, 123 total prefill tokens (113 cold + 10 suffix), 351,952,896 parked bytes |
-| real Pi alternating sessions | about 6,741 tokens/session, 54 parked pages, 1,223,811,072 parked bytes, delta-only continuation |
-| cancellation/resume | Ctrl-C returned active count to zero; both sessions survived; next turn added only 22 prefill tokens |
-| progressive F16 growth | 200 -> 300 -> 300 token prompt used exactly 300 cumulative prefill tokens and two 256-token F16 pages; last turn was zero delta |
+| two exact-F16 sessions, one hot slot | four parks, two restores, suffix-only prefill, 351,952,896 parked bytes |
+| real alternating Pi sessions | about 6,741 tokens/session, 54 parked pages, 1,223,811,072 parked bytes |
+| cancellation/resume | active count returned to zero; committed sessions survived; next turn added only the suffix |
+| progressive F16 growth | 200 -> 300 -> 300 prompt used exactly 300 cumulative prefill tokens and two pages; last turn was zero-delta |
 
-These gates prove exact retention and progressive allocation. They do not prove
-parallel execution or several simultaneous 262K sessions. With one hot slot,
-requests time-share the GPU and populated F16 pages consume host RAM.
+These prove retention and progressive allocation, not parallel decode or
+several simultaneous populated 262K sessions.
 
-## Qwen capacity and traffic equations
+## Sparse-routing evidence
 
-The current target-call weight scan, excluding sparse embedding lookup, vision
-and MTP but including the vocabulary head, is:
+Qwen Flash phase profiling attributed 84.7% of a cold short program to routed
+MoE and about 1.2% to QSA/full attention. A historical 18 GiB cache experiment
+raised a comparable first-warm result from 5.85 to 8.30 tok/s and reduced
+storage reads, but 18 GiB is not the current common validated configuration.
+The active common ceiling is 12 GiB because DeepSeek fails preflight at 13 GiB.
 
-```text
-text FFN                         9,091,940,352 bytes
-recurrent-attention weights     2,963,472,384
-full-attention weights            891,682,816
-vocabulary head                   675,434,496
-norms/other                         3,170,304
-total                           13,625,700,352 bytes = 12.689922 GiB
-```
-
-Exact F16 target KV at 262,144 populated tokens is:
+DeepSeek cold scalar routing can select:
 
 ```text
-16 layers * 2 (K,V) * 4 heads * 256 values * 2 bytes * 262,144
-= 17,179,869,184 bytes = 16 GiB
+43 layers x 6 experts x 13,369,344 bytes = about 3.21 GiB/token
 ```
 
-Weights plus target KV are therefore 30,805,569,536 bytes before recurrent
-state, MTP, activations, workspaces and allocator/display reserve. They cannot
-be simultaneously resident on a 24 GiB RTX 3090.
+Historical matched probes:
 
-If the complete set could reside behind the RTX 3090's 936 GB/s memory system,
-the impossible zero-overhead scalar floor would be about 32.9 ms/call, or 30.4
-calls/s. Capacity prevents that placement. With exact KV in host RAM, scanning
-16 GiB over the measured 12.46 GiB/s pinned link costs about 1.284 seconds per
-scalar call before attention compute. Ordinary paging cannot meet 15 tok/s.
-
-## DeepSeek evidence
-
-The routed compact pack contains 43 artifact-declared shards, 256 experts per
-shard, 11,008 records total and 147,169,738,752 bytes. Each exact route selects
-six 13,369,344-byte records per routed layer, so an entirely cold scalar token
-requires about 3.21 GiB of routed payload before overfetch or churn.
-
-Historical matched probes establish the range, not one universal rate:
-
-| Workload | Result | Traffic state |
+| Workload | Result | Placement evidence |
 |---|---:|---|
-| settled identical prompt, 24 output tokens | 6.54-6.69 tok/s | zero SSD, about 47.8 GB H2D/request |
-| eight novel prompts, 12 output tokens each | 321.47 s total | 97.156 GiB read, 58.558 GiB reread, 315.102 GiB H2D |
-| pre-index novel suite | 0.38-0.69 tok/s, mean 0.57 | 8.2-16.8 GiB SSD/request |
-| retained six-turn suite | 0.59-0.86 tok/s, mean 0.73 | 10.3-14.0 GiB SSD on turns 2-6 |
-| pre-change GPU-only common-runner `hi` | 0.94 tok/s end-to-end, 1.42 tok/s after first visible | 850 SSD misses, 11.364 GB read, 19.265 GB uploaded |
-| exact CPU/GPU q-star common-runner `hi` | 0.96 tok/s end-to-end, 1.29 tok/s after first visible | 377 CPU decisions, 1,653 GPU decisions, 5.054 GB CPU source-weight footprint assigned |
+| settled identical prompt, 24 output | 6.54-6.69 tok/s | zero SSD, about 47.8 GB H2D/request |
+| eight novel prompts, 12 output each | 321.47 s total | 97.156 GiB read, 58.558 GiB reread, 315.102 GiB H2D |
+| novel suite before indexing | mean 0.57 tok/s | 8.2-16.8 GiB SSD/request |
+| retained six-turn suite | mean 0.73 tok/s | 10.3-14.0 GiB SSD on later turns |
+| exact CPU/GPU split short gate | 1.29 tok/s after first visible | 377 CPU and 1,653 GPU decisions; no measured throughput gain |
 
-The active q-star gate processed CPU work for 221.158 ms and preserved exact
-top-6/MTP aggregation. It reduced first-visible latency from 4.333 s to
-3.409 s, but the tiny ten-token decode fell from 1.42 to 1.29 tok/s after the
-first visible token. This proves that the mechanism is wired and exact enough
-to complete the service path; it does not prove a throughput improvement on
-the current host. No Pi measurement was run in this change.
+Demand paging makes the 147 GB pool executable. Novel routes remain movement
+bound, and the settled 10-15 tok/s target has not been reached.
 
-Task indexing removed control scans but not the expert supply bytes. MTP was
-throughput-neutral in the storage-bound regime because adjacent routes did not
-share enough experts; later compact FP4 residency made it useful on settled
-turns. Any DeepSeek claim must therefore state cold/novel/settled placement.
+## Current conclusion
 
-## What the evidence proves
-
-- The common service and the Qwen, Muse-text, Ornith and DeepSeek paths are
-  functional for their recorded short-chat gates.
-- Qwen short-context FP4/F16 post-first-visible decode can exceed 15 tok/s;
-  the current short gate does not meet 15 tok/s end to end.
-- Exact session retention and progressive F16 allocation work for measured
-  short/medium histories.
-- Qwen exact-F16 maximum prefill is still about 36 minutes and the requested
-  maximum-context interactive target is not met.
-- DeepSeek paging makes the 147 GB expert pack executable without full
-  residency, but novel routes remain movement-bound.
-- NVMe improves cold loading and disk misses; it cannot remove hot dense/KV
-  bytes from every decode call.
+- all six artifacts execute through the common service and minimal Pi gate;
+- Qwen short-context decode can exceed 15 tok/s after TTFT, but populated 262K
+  exact-F16 inference is not interactive;
+- exact retention/progressive allocation work for measured shorter histories;
+- Qwen Flash and Mistral are wired but fail practical Pi latency/quality gates;
+- DeepSeek exact paging works beyond RAM+VRAM, but novel routes remain near the
+  accepted 1 tok/s class and settled performance is below target.

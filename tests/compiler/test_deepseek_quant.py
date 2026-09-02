@@ -21,6 +21,7 @@ from compiler.expert_pack.deepseek_slice import (
     _f32_to_bf16_words,
     _deepseek_csa_ratio4_reference,
     _deepseek_hca_reference,
+    _deepseek_projection_probes,
     _exclusive_pack_lock,
     _reconstruct_compact_blocks,
 )
@@ -32,6 +33,15 @@ except ImportError:  # pragma: no cover
 
 
 class DeepSeekQuantTests(unittest.TestCase):
+    @unittest.skipIf(np is None, "NumPy fast path is optional")
+    def test_projection_probes_are_deterministic_and_non_degenerate(self) -> None:
+        first = _deepseek_projection_probes(4096)
+        second = _deepseek_projection_probes(4096)
+        self.assertEqual(first.shape, (4096, 4))
+        self.assertEqual(first.dtype, np.float32)
+        self.assertTrue(np.array_equal(first, second))
+        self.assertTrue(np.all(np.linalg.norm(first, axis=0) > 0))
+
     @unittest.skipIf(np is None, "NumPy fast path is optional")
     def test_compact_dense_candidate_schemes_are_bounded(self) -> None:
         values = np.asarray(

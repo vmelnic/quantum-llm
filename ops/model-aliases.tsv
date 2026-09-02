@@ -1,6 +1,9 @@
 model-aliases-v2
 deepseek	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact
 deepseek-v4-flash	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact
+mistral	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
+mistral-small-4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
+mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
 muse	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
 muse-glimmer	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
 muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
@@ -10,3 +13,6 @@ ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16
 qwen	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
 qwen3.8	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
 qwen3.8-27b-fp4	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
+qwen-flash	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16
+qwen3.8-flash-next	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16
+qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16

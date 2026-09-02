@@ -31,6 +31,7 @@ from .quant import (
     _fp4_block_code,
     _fp4_nearest_index,
     _fp4_pack_nibbles,
+    quantize_int8_row,
 )
 from .safetensors import SafeTensorCheckpoint, TensorInfo, TensorView
 from .util import load_json
@@ -289,6 +290,27 @@ def _qualify_f32(
     return moments, mismatches
 
 
+def _qualify_i64(
+    pack: BinaryIO, view: TensorView, entry: dict[str, Any],
+    samples_per_tensor: int,
+) -> tuple[_Moments, int]:
+    elements = math.prod(entry["source_shape"])
+    moments = _Moments()
+    mismatches = 0
+    data_offset = entry["offset"] + entry["sections"]["data"]["offset"]
+    for index in _sample_indices(entry["name"], elements, samples_per_tensor):
+        source_raw = bytes(view.raw[index * 8 : (index + 1) * 8])
+        pack.seek(data_offset + index * 8)
+        stored_raw = pack.read(8)
+        _require(len(stored_raw) == 8,
+                 f"short I64 sample read for {entry['name']}")
+        mismatches += int(source_raw != stored_raw)
+        source_value = float(struct.unpack("<q", source_raw)[0])
+        stored_value = float(struct.unpack("<q", stored_raw)[0])
+        moments.add((source_value,), (stored_value,))
+    return moments, mismatches
+
+
 def _qualify_int8(
         pack: BinaryIO, view: TensorView, entry: dict[str, Any],
         samples_per_tensor: int,
@@ -303,12 +325,7 @@ def _qualify_int8(
     scale_offset = entry["offset"] + entry["sections"]["scales"]["offset"]
     for row in _sample_indices(entry["name"], rows, samples_per_tensor):
         source = _source_values(view, row * columns, columns)
-        maximum = max((abs(value) for value in source), default=0.0)
-        expected_scale = maximum / 127.0 if maximum else 1.0
-        expected_q = bytes(
-            max(-127, min(127, int(round(value / expected_scale)))) & 0xFF
-            for value in source
-        )
+        expected_q, expected_scale = quantize_int8_row(source, columns)
         pack.seek(data_offset + row * columns)
         payload = pack.read(columns)
         pack.seek(scale_offset + row * 4)
@@ -543,9 +560,14 @@ def qualify_container_against_source(
                     int8_payload_mismatches += payload_bad
                     int8_scale_mismatches += scale_bad
                 elif entry.get("quant_abi") == 0:
-                    moments, f32_bad = _qualify_f32(
-                        pack, view, entry, samples_per_tensor
-                    )
+                    if entry.get("stored_dtype") == "I64":
+                        moments, f32_bad = _qualify_i64(
+                            pack, view, entry, samples_per_tensor
+                        )
+                    else:
+                        moments, f32_bad = _qualify_f32(
+                            pack, view, entry, samples_per_tensor
+                        )
                     f32_records += 1
                     f32_aggregate.merge(moments)
                     f32_mismatches += f32_bad

@@ -34,7 +34,8 @@ param(
     [int]$StartupTimeoutSeconds = 600,
     [int]$DrainTimeoutSeconds = 30,
     [string]$BuildId = "development",
-    [string]$LogFile = ""
+    [string]$LogFile = "",
+    [string]$RawResponseTraceFile = ""
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -97,6 +98,10 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
 [string[]]$apiKeyArguments = if ($effectiveApiKey) {
     @("--api-key", $effectiveApiKey)
 } else { @() }
+[string[]]$responseTraceArguments = if ($RawResponseTraceFile) {
+    @("--raw-response-trace-file", ([System.IO.Path]::GetFullPath(
+        $RawResponseTraceFile)))
+} else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -120,6 +125,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     @retainedRouteArguments `
     @cpuHybridArguments `
     @routeTraceArguments `
+    @responseTraceArguments `
     --microbatch-window-ms $MicrobatchWindowMs `
     --latency-window $LatencyWindow `
     --queue-timeout $QueueTimeoutSeconds `

@@ -21,6 +21,7 @@
 #include "expert/runtime/hybrid_dispatch.hpp"
 #include "expert/runtime/model_descriptor.hpp"
 #include "expert/runtime/program_executor.hpp"
+#include "expert/runtime/resource_governor.hpp"
 #include "expert/runtime/resident_expert_set.hpp"
 #include "expert/runtime/route_census.hpp"
 #include "expert/runtime/routed_expert_runtime.hpp"
@@ -798,6 +799,34 @@ class Model final : public er::IOperationProvider,
         mtp_request_bytes_ * capacity_ +
         verify_request_bytes_ * capacity_;
     constexpr std::uint64_t device_reserve_bytes = 1ULL << 30U;
+    constexpr std::uint32_t sequence_row_quantum = 32U;
+    const auto minimum_attention_size =
+        er::cuda::deepseek_attention_batch_workspace_size(
+            max_context_, sequence_row_quantum);
+    const auto minimum_ffn_bytes =
+        er::cuda::deepseek_ffn_batch_workspace_size(sequence_row_quantum);
+    require(minimum_attention_size.status.ok() && minimum_ffn_bytes != 0U,
+            "DeepSeek worker cannot size its minimum exact workspace");
+    const auto minimum_sequence_workspace_bytes =
+        minimum_attention_size.bytes + minimum_ffn_bytes +
+        2ULL * sequence_row_quantum * 4U * 4096U * sizeof(float);
+    require(capacity_ <=
+                std::numeric_limits<std::uint64_t>::max() /
+                    minimum_sequence_workspace_bytes,
+            "DeepSeek minimum workspace accounting overflow");
+    const auto minimum_cache_bytes =
+        shared_bytes +
+        (static_cast<std::uint64_t>(main_component.route_width) + 1U) *
+            routed_device_bytes +
+        mtp_reserve_bytes;
+    const auto fitted_cache = er::fit_device_cache_budget(
+        {static_cast<std::uint64_t>(free), fixed_without_sequence,
+         minimum_sequence_workspace_bytes * capacity_, device_reserve_bytes,
+         vram_bytes_, minimum_cache_bytes});
+    require(fitted_cache.status.ok(),
+            std::string("DeepSeek worker VRAM cache fit failed: ") +
+                std::string(fitted_cache.status.message()));
+    vram_bytes_ = fitted_cache.effective_cache_bytes;
     const auto reserved_without_sequence =
         fixed_without_sequence + vram_bytes_ + device_reserve_bytes;
     require(reserved_without_sequence <= free,
@@ -806,7 +835,6 @@ class Model final : public er::IOperationProvider,
                 std::to_string(reserved_without_sequence) +
                 ", free=" + std::to_string(free));
     const auto sequence_budget = free - reserved_without_sequence;
-    constexpr std::uint32_t sequence_row_quantum = 32U;
     for (std::uint32_t candidate = kMaximumSequenceTileRows;
          candidate >= sequence_row_quantum;
          candidate -= sequence_row_quantum) {
@@ -4693,6 +4721,7 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
     CallableProgramSequence& sequence) {
   constexpr std::size_t hidden = 4096U;
   constexpr std::size_t streams_per_row = kSequenceStreams * hidden;
+  constexpr std::size_t kAcquireWindow = 8U;
   const auto top_k = routed_->component().route_width;
   const auto expert_count = routed_->component().experts_per_layer;
   require(top_k == 6U && expert_count != 0U,
@@ -4700,8 +4729,8 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
 
   struct HostFrontier final {
     HostFrontier(std::size_t rows, std::size_t top_k,
-                 std::size_t tile_rows, std::size_t hidden_size,
-                 std::size_t stream_values)
+                 std::size_t tile_rows, std::size_t expert_window,
+                 std::size_t hidden_size, std::size_t stream_values)
         : primary(rows * stream_values),
           attention(rows * stream_values),
           ffn_inputs(rows * hidden_size),
@@ -4710,8 +4739,8 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
           selection_outputs(rows * top_k * hidden_size),
           post(rows * kSequenceStreams),
           combination(rows * kSequenceStreams * kSequenceStreams),
-          expert_input_tile(tile_rows * hidden_size),
-          expert_output_tile(tile_rows * hidden_size) {}
+          expert_input_window(expert_window * tile_rows * hidden_size),
+          expert_output_window(expert_window * tile_rows * hidden_size) {}
 
     PinnedBuffer<float> primary;
     PinnedBuffer<float> attention;
@@ -4721,9 +4750,10 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
     PinnedBuffer<float> selection_outputs;
     PinnedBuffer<float> post;
     PinnedBuffer<float> combination;
-    PinnedBuffer<float> expert_input_tile;
-    PinnedBuffer<float> expert_output_tile;
-  } host(kSequenceBlockRows, top_k, sequence_tile_rows_, hidden,
+    PinnedBuffer<float> expert_input_window;
+    PinnedBuffer<float> expert_output_window;
+  } host(std::min<std::size_t>(kSequenceBlockRows, sequence.tokens.size()),
+         top_k, sequence_tile_rows_, kAcquireWindow, hidden,
          streams_per_row);
 
   auto& request = *sequence.request;
@@ -4990,7 +5020,6 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
       // never pin a whole layer's unique expert set. A completed acquire owns
       // a device lease even before get(); issuing every expert at once can
       // therefore exhaust the transient VRAM class with unevictable pages.
-      constexpr std::size_t kAcquireWindow = 8U;
       std::vector<PendingExpert> pending;
       pending.reserve(kAcquireWindow);
       std::size_t next_expert = 0U;
@@ -5015,85 +5044,123 @@ er::OperationExecutionResult Model::run_callable_program_sequence(
       try {
         launch_pending();
         while (!pending.empty()) {
-          auto item = std::move(pending.front());
-          pending.erase(pending.begin());
-          const auto wait_started = std::chrono::steady_clock::now();
-          while (item.handle.wait_for(std::chrono::milliseconds(1)) !=
-                 std::future_status::ready) {
-            ensure_active();
+          struct AcquiredExpert final {
+            std::uint32_t expert{};
+            er::ExpertLease lease;
+            std::size_t first{};
+          };
+          std::vector<AcquiredExpert> wave;
+          wave.reserve(kAcquireWindow);
+          while (wave.size() < kAcquireWindow && !pending.empty()) {
+            auto item = std::move(pending.front());
+            pending.erase(pending.begin());
+            const auto wait_started = std::chrono::steady_clock::now();
+            while (item.handle.wait_for(std::chrono::milliseconds(1)) !=
+                   std::future_status::ready) {
+              ensure_active();
+            }
+            auto acquired = item.handle.get();
+            sequence_expert_wait_ns_.fetch_add(
+                static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - wait_started)
+                        .count()),
+                std::memory_order_relaxed);
+            require(acquired.status.ok() && acquired.lease,
+                    acquired.status.ok()
+                        ? "DeepSeek sequence expert lease is absent"
+                        : acquired.status.message());
+            wave.push_back(
+                {item.expert, std::move(acquired.lease), 0U});
+            launch_pending();
           }
-          auto acquired = item.handle.get();
-          sequence_expert_wait_ns_.fetch_add(
-              static_cast<std::uint64_t>(
-                  std::chrono::duration_cast<std::chrono::nanoseconds>(
-                      std::chrono::steady_clock::now() - wait_started)
-                      .count()),
-              std::memory_order_relaxed);
-          require(acquired.status.ok() && acquired.lease,
-                  acquired.status.ok()
-                      ? "DeepSeek sequence expert lease is absent"
-                      : acquired.status.message());
-          const auto* expert = dynamic_cast<
-              const er::cuda::CudaCompactExpertAllocation*>(
-              acquired.lease.get());
-          require(expert != nullptr,
-                  "DeepSeek sequence expert is not direct packed FP4");
-          launch_pending();
+
+          struct WaveTile final {
+            std::size_t wave_index{};
+            std::size_t first{};
+            std::uint32_t rows{};
+          };
           const auto execute_started = std::chrono::steady_clock::now();
-          const auto& assigned = selections[item.expert];
-          for (std::size_t first = 0U; first < assigned.size();
-               first += sequence_tile_rows_) {
+          for (;;) {
             ensure_active();
-            const auto rows = static_cast<std::uint32_t>(
-                std::min<std::size_t>(sequence_tile_rows_,
-                                     assigned.size() - first));
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-              const auto selection = assigned[first + row];
-              const auto input_row = selection / top_k;
-              std::memcpy(
-                  host.expert_input_tile.data() +
-                      static_cast<std::size_t>(row) * hidden,
-                  host.ffn_inputs.data() +
-                      static_cast<std::size_t>(input_row) * hidden,
-                  hidden * sizeof(float));
+            std::vector<WaveTile> tiles;
+            tiles.reserve(wave.size());
+            for (std::size_t wave_index = 0U; wave_index < wave.size();
+                 ++wave_index) {
+              auto& item = wave[wave_index];
+              const auto& assigned = selections[item.expert];
+              if (item.first >= assigned.size()) continue;
+              const auto rows = static_cast<std::uint32_t>(
+                  std::min<std::size_t>(sequence_tile_rows_,
+                                       assigned.size() - item.first));
+              auto* input_slot = host.expert_input_window.data() +
+                  wave_index * sequence_tile_rows_ * hidden;
+              auto* output_slot = host.expert_output_window.data() +
+                  wave_index * sequence_tile_rows_ * hidden;
+              for (std::uint32_t row = 0U; row < rows; ++row) {
+                const auto selection = assigned[item.first + row];
+                const auto input_row = selection / top_k;
+                std::memcpy(
+                    input_slot + static_cast<std::size_t>(row) * hidden,
+                    host.ffn_inputs.data() +
+                        static_cast<std::size_t>(input_row) * hidden,
+                    hidden * sizeof(float));
+              }
+              copy_async(ffn_workspace.expert_inputs(), input_slot,
+                         static_cast<std::size_t>(rows) * hidden *
+                             sizeof(float),
+                         cudaMemcpyHostToDevice,
+                         "upload DeepSeek grouped expert inputs");
+              const auto* expert = dynamic_cast<
+                  const er::cuda::CudaCompactExpertAllocation*>(
+                  item.lease.get());
+              require(expert != nullptr,
+                      "DeepSeek sequence expert is not direct packed FP4");
+              const auto status = er::cuda::deepseek_ffn_execute_packed_batch(
+                  {expert, &ffn_workspace, ffn_workspace.expert_inputs(),
+                   ffn_workspace.expert_outputs(), rows, 10.0F, true,
+                   stream});
+              require(status.ok(), status.message());
+              copy_async(output_slot, ffn_workspace.expert_outputs(),
+                         static_cast<std::size_t>(rows) * hidden *
+                             sizeof(float),
+                         cudaMemcpyDeviceToHost,
+                         "retain DeepSeek grouped expert outputs");
+              tiles.push_back({wave_index, item.first, rows});
+              item.first += rows;
             }
-            copy_async(ffn_workspace.expert_inputs(),
-                       host.expert_input_tile.data(),
-                       static_cast<std::size_t>(rows) * hidden * sizeof(float),
-                       cudaMemcpyHostToDevice,
-                       "upload DeepSeek grouped expert inputs");
-            const auto status = er::cuda::deepseek_ffn_execute_packed_batch(
-                {expert, &ffn_workspace, ffn_workspace.expert_inputs(),
-                 ffn_workspace.expert_outputs(), rows, 10.0F, true, stream});
-            require(status.ok(), status.message());
-            copy_async(host.expert_output_tile.data(),
-                       ffn_workspace.expert_outputs(),
-                       static_cast<std::size_t>(rows) * hidden * sizeof(float),
-                       cudaMemcpyDeviceToHost,
-                       "retain DeepSeek grouped expert outputs");
+            if (tiles.empty()) break;
             cuda_check(cudaStreamSynchronize(stream),
-                       "complete DeepSeek grouped expert batch");
-            for (std::uint32_t row = 0U; row < rows; ++row) {
-              const auto selection = assigned[first + row];
-              std::memcpy(
-                  host.selection_outputs.data() +
-                      static_cast<std::size_t>(selection) * hidden,
-                  host.expert_output_tile.data() +
-                      static_cast<std::size_t>(row) * hidden,
-                  hidden * sizeof(float));
+                       "complete DeepSeek grouped expert wave");
+            for (const auto& tile : tiles) {
+              const auto& item = wave[tile.wave_index];
+              const auto& assigned = selections[item.expert];
+              const auto* output_slot = host.expert_output_window.data() +
+                  tile.wave_index * sequence_tile_rows_ * hidden;
+              for (std::uint32_t row = 0U; row < tile.rows; ++row) {
+                const auto selection = assigned[tile.first + row];
+                std::memcpy(
+                    host.selection_outputs.data() +
+                        static_cast<std::size_t>(selection) * hidden,
+                    output_slot + static_cast<std::size_t>(row) * hidden,
+                    hidden * sizeof(float));
+              }
             }
           }
-          accesses.push_back(
-              {routed_->key(component_layer, item.expert),
-               static_cast<std::uint32_t>(std::min<std::size_t>(
-                   assigned.size(),
-                   std::numeric_limits<std::uint32_t>::max()))});
           sequence_expert_execute_ns_.fetch_add(
               static_cast<std::uint64_t>(
                   std::chrono::duration_cast<std::chrono::nanoseconds>(
                       std::chrono::steady_clock::now() - execute_started)
                       .count()),
               std::memory_order_relaxed);
+          for (const auto& item : wave) {
+            const auto& assigned = selections[item.expert];
+            accesses.push_back(
+                {routed_->key(component_layer, item.expert),
+                 static_cast<std::uint32_t>(std::min<std::size_t>(
+                     assigned.size(),
+                     std::numeric_limits<std::uint32_t>::max()))});
+          }
         }
       } catch (...) {
         cancel_pending();
@@ -6219,8 +6286,8 @@ make_sm86_compressed_sparse_moe_callable_provider(
         "per_request_nonblocking",
         "resident_table", "bf16", "preallocated", kv_page_tokens,
         implementation->kv_page_bytes(), implementation->kv_page_capacity(),
-        "budgeted", implementation->placement(), ram_cache_bytes,
-        vram_cache_bytes, implementation->prefetch_enabled(),
+        "budgeted", implementation->placement(), implementation->ram_bytes(),
+        implementation->vram_bytes(), implementation->prefetch_enabled(),
         implementation->prefetch_state(),
         implementation->placement() == "latency" ? 1U : 2U,
         implementation->mtp_available(), implementation->mtp_runtime_ready(),

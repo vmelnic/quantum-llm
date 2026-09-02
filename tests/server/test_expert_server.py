@@ -4,6 +4,7 @@ import contextlib
 import io
 import sys
 import socket
+import tempfile
 import time
 import unittest.mock
 import threading
@@ -31,7 +32,9 @@ from ops.python.expert_server import (
     StopFilter, _configured_eos_token_ids, _text_content,
     _worker_response_tokens,
 )
-from ops.python.response_protocols import install_declared_response_protocol
+from ops.python.response_protocols import (
+    install_declared_response_protocol, select_response_protocol,
+)
 
 
 def application_fixture() -> Application:
@@ -39,6 +42,10 @@ def application_fixture() -> Application:
     app.artifact_chat_codec = None
     app.response_protocol = None
     app.default_sampling = SamplingSettings(1.0, 0.95, 20, 0.0, 0)
+    app.sampling_profiles = {
+        "thinking": app.default_sampling,
+        "non_thinking": app.default_sampling,
+    }
     return app
 
 
@@ -356,11 +363,12 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
     def test_protocol8_serializes_request_sampling(self) -> None:
         worker = CudaWorker.__new__(CudaWorker)
         worker.sampling_supported = True
+        worker.sampling_presence_penalty_supported = True
         self.assertEqual(
             worker._sampling_command(SamplingSettings(
                 1.0, 0.95, 20, 0.0, 1234
             )),
-            "\tSAMPLING\t1000000\t950000\t20\t0\t1234",
+            "\tSAMPLING\t1000000\t950000\t20\t0\t0\t1234",
         )
 
     def test_protocol9_end_retain_returns_exact_parking_accounting(self) -> None:
@@ -381,6 +389,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
     def test_protocol9_resume_accepts_an_exact_same_prefix(self) -> None:
         worker = CudaWorker.__new__(CudaWorker)
         worker.sampling_supported = True
+        worker.sampling_presence_penalty_supported = True
         worker.active_ids = set()
         commands: list[str] = []
 
@@ -395,7 +404,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
         self.assertEqual(
             commands,
-            ["BEGIN\t7\t1024\t\tRESUME\t9\tSAMPLING\t0\t1000000\t0\t0\t1"],
+            ["BEGIN\t7\t1024\t\tRESUME\t9\tSAMPLING\t0\t1000000\t0\t0\t0\t1"],
         )
         self.assertIn(7, worker.active_ids)
 
@@ -676,6 +685,43 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(worker.experts_per_layer, 0)
         self.assertEqual(worker.route_width, 0)
         self.assertEqual(worker.expert_encoding, "")
+
+    def test_protocol10_accepts_artifact_declared_bf16_latent_kv(self) -> None:
+        ready = {
+            "type": "ready", "protocol": 10, "capacity": 1,
+            "architecture_id": "fixture.mla", "vocab_size": 64000,
+            "max_context_tokens": 262144,
+            "routed_layers": 4, "experts_per_layer": 128,
+            "route_width": 4, "expert_encoding": "nvfp4.fixture",
+            "operation_capabilities": ["block.mla.bfloat16.v1"],
+            "prefill_mode": "causal_layer_major",
+            "prefill_chunk_tokens": 128,
+            "session_retention": True, "session_parking": False,
+            "session_park_ram_bytes": 0, "session_park_page_capacity": 0,
+            "sampling_supported": True,
+            "sampling_presence_penalty_supported": True,
+            "kv_dtype": "bf16-latent",
+            "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 128, "kv_page_bytes": 4096,
+            "kv_page_capacity": 2048, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 48 << 30, "vram_cache_bytes": 12 << 30,
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process):
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"),
+                expert_server.Path("pack"), 262144, 1, 1, 48, 12,
+                2048, 128, "balanced", False,
+            )
+        self.assertEqual(worker.kv_dtype, "bf16-latent")
 
     def test_protocol7_rejects_partial_routed_geometry(self) -> None:
         ready = {
@@ -1342,6 +1388,66 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "xml-inline",
         )
 
+    def test_declared_bracket_grammar_installs_standard_response_parser(self) -> None:
+        class Tokenizer:
+            chat_template = (
+                "[INST][/INST][THINK][/THINK][TOOL_CALLS][ARGS]"
+                "[TOOL_RESULTS][/TOOL_RESULTS]"
+            )
+            response_template = None
+
+            def parse_response(self, _text: str, **_kwargs: object) -> object:
+                return {}
+
+        tokenizer = Tokenizer()
+        self.assertEqual(
+            install_declared_response_protocol(tokenizer),
+            "bracket-function-v1",
+        )
+        template = tokenizer.response_template
+        self.assertEqual(
+            template["start_anchor"], ["[/INST]", "[/TOOL_RESULTS]"]
+        )
+        self.assertTrue(template["fields"]["tool_calls"]["repeats"])
+        self.assertEqual(
+            template["fields"]["tool_calls"]["content"], "json"
+        )
+
+    def test_artifact_response_codec_precedes_checkpoint_parser(self) -> None:
+        class Tokenizer:
+            response_template = {"fields": {"content": {"content": "text"}}}
+
+        codec = types.SimpleNamespace(supports_response_parsing=True)
+        self.assertEqual(
+            select_response_protocol(Tokenizer(), codec),
+            "artifact-chat-codec-v1",
+        )
+
+    def test_standard_stream_parser_receives_prompt_and_tool_schema(self) -> None:
+        class Tokenizer:
+            def get_response_parser(self, **kwargs: object) -> object:
+                self.kwargs = kwargs
+                return object()
+
+        app = application_fixture()
+        app.response_protocol = "xml-function-v1"
+        app.tokenizer = Tokenizer()
+        tool = {"type": "function", "function": {
+            "name": "lookup", "parameters": {"type": "object",
+                "properties": {"limit": {"type": "integer"}}},
+        }}
+        request = expert_server.GenerationRequest(
+            endpoint="chat", prompt_ids=[10, 11], cache_prefix_tokens=0,
+            maximum=8, stream=True, stop=(), include_usage=False,
+            tools=(tool,),
+        )
+
+        app.response_stream_parser(request)
+
+        self.assertEqual(app.tokenizer.kwargs, {
+            "prefix": [10, 11], "tools": [tool],
+        })
+
     def test_standard_tool_schema_keyword_is_forwarded(self) -> None:
         class Tokenizer:
             def parse_response(self, _text: str, tools: object = None, *,
@@ -1365,6 +1471,49 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(parsed.text, "done")
         self.assertEqual(app.tokenizer.tools, [tool])
         self.assertEqual(app.tokenizer.prefix, [10, 11])
+
+    def test_raw_response_trace_preserves_pre_parser_tool_text(self) -> None:
+        class Tokenizer:
+            def parse_response(self, _text: str, **_kwargs: object
+                               ) -> dict[str, object]:
+                return {"role": "assistant", "tool_calls": [{
+                    "type": "function", "function": {
+                        "name": "read",
+                        "arguments": {"path": "/Users/vm/project/app.js"},
+                    },
+                }]}
+
+        with tempfile.TemporaryDirectory() as directory:
+            app = application_fixture()
+            app.response_protocol = "xml-function-v1"
+            app.tokenizer = Tokenizer()
+            app.raw_response_trace_path = Path(directory) / "trace.jsonl"
+            app.raw_response_trace_lock = threading.Lock()
+            app.raw_response_trace_remaining = 32
+            tool = {"type": "function", "function": {
+                "name": "read", "parameters": {"type": "object"},
+            }}
+            request = expert_server.GenerationRequest(
+                endpoint="chat", prompt_ids=[10], cache_prefix_tokens=0,
+                maximum=8, stream=False, stop=(), include_usage=False,
+                tools=(tool,),
+            )
+            raw = (
+                "<tool_call>\n<function=read>\n"
+                "<parameter=path>/Users/vm/project/app.js</parameter>\n"
+                "</function>\n</tool_call>"
+            )
+            output = app.parse_assistant_output(raw, request)
+            record = json.loads(
+                app.raw_response_trace_path.read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(record["raw_suffix"], raw)
+        self.assertEqual(
+            json.loads(record["parsed_tool_calls"][0]["arguments"]),
+            {"path": "/Users/vm/project/app.js"},
+        )
+        self.assertEqual(output.tool_calls[0].name, "read")
 
     def test_qwen_template_receives_xhigh_and_tools(self) -> None:
         class Tokenizer:
@@ -1403,6 +1552,115 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             self.assertEqual(call["tools"][0]["function"]["name"], "weather")
             self.assertTrue(call["enable_thinking"])
             self.assertTrue(call["preserve_thinking"])
+
+    def test_chat_template_thinking_effort_reaches_the_artifact(self) -> None:
+        class Tokenizer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def apply_chat_template(self, _messages: object,
+                                    **kwargs: object) -> list[int]:
+                self.calls.append(kwargs)
+                return [10, 11]
+
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            model="test-model", maximum_new_tokens=32, max_context=128,
+        )
+        app.tokenizer = Tokenizer()
+        request = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "weather"}],
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "preserve_thinking": True,
+                "reasoning_effort": "medium",
+            },
+            "max_completion_tokens": 8,
+        }, "chat")
+
+        self.assertEqual(request.reasoning_effort, "medium")
+        self.assertEqual(len(app.tokenizer.calls), 2)
+        for call in app.tokenizer.calls:
+            self.assertEqual(call["reasoning_effort"], "medium")
+
+        with self.assertRaisesRegex(RequestError, "specified twice"):
+            app.parse_request({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "weather"}],
+                "reasoning_effort": "xhigh",
+                "chat_template_kwargs": {"reasoning_effort": "medium"},
+                "max_completion_tokens": 8,
+            }, "chat")
+
+    def test_artifact_maps_common_effort_to_tokenizer_vocabulary(self) -> None:
+        class Tokenizer:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            def apply_chat_template(self, _messages: object,
+                                    **kwargs: object) -> list[int]:
+                self.calls.append(kwargs)
+                return [10, 11]
+
+        app = application_fixture()
+        app.tokenizer = Tokenizer()
+        app.template_reasoning_effort_map = {
+            "off": "none", "low": "high",
+            "medium": "high", "xhigh": "high",
+        }
+        app._chat_prompt_ids(
+            [{"role": "user", "content": "hi"}],
+            reasoning_effort="medium", enable_thinking=True,
+        )
+        app._chat_prompt_ids(
+            [{"role": "user", "content": "hi"}],
+            reasoning_effort="xhigh", enable_thinking=False,
+        )
+        self.assertEqual(
+            [call["reasoning_effort"] for call in app.tokenizer.calls],
+            ["high", "none"],
+        )
+
+    def test_thinking_mode_selects_artifact_profile_and_request_overrides(self) -> None:
+        class Tokenizer:
+            def apply_chat_template(self, _messages: object,
+                                    **_kwargs: object) -> list[int]:
+                return [10, 11]
+
+        app = application_fixture()
+        app.args = types.SimpleNamespace(
+            model="test-model", maximum_new_tokens=32, max_context=128,
+        )
+        app.tokenizer = Tokenizer()
+        app.sampling_profiles = {
+            "thinking": SamplingSettings(1.0, 0.95, 20, 0.0, 0, 0.0),
+            "non_thinking": SamplingSettings(0.7, 0.8, 20, 0.0, 0, 1.5),
+        }
+
+        request = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "max_completion_tokens": 8,
+        }, "chat")
+        self.assertEqual(
+            request.sampling,
+            SamplingSettings(0.7, 0.8, 20, 0.0,
+                             request.sampling.seed, 1.5),
+        )
+
+        overridden = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "temperature": 0.4,
+            "presence_penalty": -0.25,
+            "max_completion_tokens": 8,
+        }, "chat")
+        self.assertEqual(overridden.sampling.temperature, 0.4)
+        self.assertEqual(overridden.sampling.top_p, 0.8)
+        self.assertEqual(overridden.sampling.presence_penalty, -0.25)
 
     def test_responses_request_uses_artifact_sampling_contract(self) -> None:
         class Tokenizer:
@@ -1641,7 +1899,19 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "response_protocol": None,
             "sampling": {
                 "temperature": 1.0, "top_p": 0.95, "top_k": 20,
-                "min_p": 0.0,
+                "min_p": 0.0, "presence_penalty": 0.0,
+                "profiles": {
+                    "thinking": {
+                        "temperature": 1.0, "top_p": 0.95,
+                        "top_k": 20, "min_p": 0.0,
+                        "presence_penalty": 0.0,
+                    },
+                    "non_thinking": {
+                        "temperature": 1.0, "top_p": 0.95,
+                        "top_k": 20, "min_p": 0.0,
+                        "presence_penalty": 0.0,
+                    },
+                },
                 "source": "tokenizer/generation_config.json",
             },
         })

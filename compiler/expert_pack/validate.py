@@ -25,6 +25,9 @@ from .constants import (
     FP4_QUANT_PROFILE,
     FP4_UE8M0_MAX_CODE,
     FP4_UE8M0_MIN_CODE,
+    NVFP4_QUANT_ABI_ID,
+    NVFP4_QUANT_GROUP_SIZE,
+    NVFP4_QUANT_PROFILE,
     HEADER_BYTES,
     MANIFEST_SCHEMA,
     PACK_ALIGNMENT,
@@ -84,6 +87,38 @@ def _validate_ue8m0_scales(path: Path, absolute_offset: int, byte_count: int, la
     _require(
         all(FP4_UE8M0_MIN_CODE <= code <= FP4_UE8M0_MAX_CODE for code in raw),
         f"invalid {label} UE8M0 scale code",
+    )
+
+
+def _validate_e4m3fn_scale_bytes(
+    path: Path, absolute_offset: int, byte_count: int, label: str
+) -> None:
+    with path.open("rb") as handle:
+        handle.seek(absolute_offset)
+        raw = handle.read(byte_count)
+    _require(len(raw) == byte_count, f"short {label} E4M3FN scale read")
+    _require(
+        all((code & 0x7f) != 0x7f for code in raw),
+        f"non-finite {label} E4M3FN scale",
+    )
+
+
+def _validate_positive_scalar(
+    path: Path, absolute_offset: int, dtype: str, label: str
+) -> None:
+    size = 4 if dtype == "F32" else 2
+    with path.open("rb") as handle:
+        handle.seek(absolute_offset)
+        raw = handle.read(size)
+    _require(len(raw) == size, f"short {label} global scale")
+    if dtype == "F32":
+        value = struct.unpack("<f", raw)[0]
+    else:
+        bits = struct.unpack("<H", raw)[0]
+        value = struct.unpack("<f", struct.pack("<I", bits << 16))[0]
+    _require(
+        math.isfinite(value) and value > 0.0,
+        f"invalid {label} global scale",
     )
 
 
@@ -174,13 +209,59 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
         _validate_ue8m0_scales(
             path, offset + scale_offset, scale_bytes, "dense"
         )
+    elif quant_abi == NVFP4_QUANT_ABI_ID:
+        _require(flags & FLAG_SYMMETRIC, "NVFP4 dense flags are incomplete")
+        _require(rank == 2, "NVFP4 dense storage requires a matrix")
+        rows, columns = dimensions
+        _require(
+            columns % NVFP4_QUANT_GROUP_SIZE == 0,
+            "NVFP4 dense columns are not block-aligned",
+        )
+        local_bytes = rows * columns // NVFP4_QUANT_GROUP_SIZE
+        source_tensors = entry.get("source_tensors")
+        _require(
+            isinstance(source_tensors, dict)
+            and set(source_tensors) == {
+                "weight", "scale", "weight_global_scale",
+                "input_global_scale",
+            },
+            "NVFP4 dense source map is invalid",
+        )
+        _require(
+            data_bytes == rows * columns // 2,
+            "NVFP4 dense data byte count mismatch",
+        )
+        _require(scale_offset % SECTION_ALIGNMENT == 0,
+                 "unaligned NVFP4 dense scales")
+        _require(
+            scale_bytes in (local_bytes + 6, local_bytes + 8),
+            "NVFP4 dense scale byte count mismatch",
+        )
+        _validate_e4m3fn_scale_bytes(
+            path, offset + scale_offset, local_bytes, "dense"
+        )
+        _validate_positive_scalar(
+            path, offset + scale_offset + local_bytes, "F32", "weight"
+        )
+        _validate_positive_scalar(
+            path, offset + scale_offset + local_bytes + 4,
+            "F32" if scale_bytes == local_bytes + 8 else "BF16", "input"
+        )
     else:
         _require(quant_abi == 0 and scale_offset == 0 and scale_bytes == 0, "unknown dense quant ABI")
-        _require(data_bytes == elements * 4, "FP32 dense data byte count mismatch")
+        stored_dtype = entry.get("stored_dtype")
+        _require(stored_dtype in {"F32", "I64", "BF16"}, "unknown raw dense dtype")
+        element_bytes = 8 if stored_dtype == "I64" else 2 if stored_dtype == "BF16" else 4
+        _require(data_bytes == elements * element_bytes, "raw dense data byte count mismatch")
     source_dtype = entry.get("source_dtype")
     _require(source_dtype in DTYPE_BYTES, "unknown dense source dtype")
-    _require(entry.get("source_bytes") == elements * DTYPE_BYTES[source_dtype], "dense source byte mismatch")
-    _require(entry.get("decoded_bytes") == elements * 4, "dense decoded byte mismatch")
+    if quant_abi == NVFP4_QUANT_ABI_ID:
+        _require(entry.get("source_bytes") == data_bytes + scale_bytes,
+                 "NVFP4 dense source byte mismatch")
+    else:
+        _require(entry.get("source_bytes") == elements * DTYPE_BYTES[source_dtype], "dense source byte mismatch")
+    decoded_element_bytes = 8 if entry.get("stored_dtype") == "I64" else 2 if entry.get("stored_dtype") == "BF16" else 4
+    _require(entry.get("decoded_bytes") == elements * decoded_element_bytes, "dense decoded byte mismatch")
     actual_hash = _payload_hash(path, offset + HEADER_BYTES, record_bytes - HEADER_BYTES)
     _require(actual_hash == payload_hash.hex(), "dense payload/header checksum mismatch")
     _require(actual_hash == entry.get("payload_sha256"), "dense payload/manifest checksum mismatch")
@@ -224,21 +305,48 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
     _require(magic == EXPERT_MAGIC and version == FORMAT_VERSION, "unknown expert record ABI")
     _require(header_bytes == HEADER_BYTES and reserved == 0, "invalid expert header fields")
     relu2 = quant_abi == FP4_RELU2_EXPERT_ABI_ID
-    required_flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    native_nvfp4 = quant_abi == NVFP4_QUANT_ABI_ID
+    required_flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC
+    if not native_nvfp4:
+        required_flags |= FLAG_PER_ROW_SCALES
     if not relu2:
         required_flags |= FLAG_GATE_UP_FUSED
     _require(flags == required_flags, "unknown expert quant/layout ABI")
-    fp4 = quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    fp4 = quant_abi in (
+        FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID,
+        NVFP4_QUANT_ABI_ID,
+    )
     _require(
         quant_abi in (QUANT_ABI_ID, FP4_QUANT_ABI_ID,
-                      FP4_RELU2_EXPERT_ABI_ID),
+                      FP4_RELU2_EXPERT_ABI_ID, NVFP4_QUANT_ABI_ID),
         "unknown expert quant/layout ABI",
     )
     _require(layer == entry.get("layer") and expert == entry.get("expert"), "expert identity mismatch")
     _require(record_bytes == stored_bytes, "expert record/manifest size mismatch")
     first_rows = (1 if relu2 else 2) * intermediate
     _require(fused_rows == first_rows, "expert first-section row count mismatch")
-    if fp4:
+    if native_nvfp4:
+        matrix_elements = hidden * intermediate
+        _require(
+            hidden % NVFP4_QUANT_GROUP_SIZE == 0
+            and intermediate % NVFP4_QUANT_GROUP_SIZE == 0,
+            "NVFP4 expert geometry is not block-aligned",
+        )
+        _require(gate_up_q_bytes == matrix_elements,
+                 "NVFP4 gate+up byte count mismatch")
+        _require(
+            gate_up_scale_bytes ==
+            2 * (matrix_elements // NVFP4_QUANT_GROUP_SIZE + 8),
+            "NVFP4 gate+up scale byte count mismatch",
+        )
+        _require(down_q_bytes == matrix_elements // 2,
+                 "NVFP4 down byte count mismatch")
+        _require(
+            down_scale_bytes ==
+            matrix_elements // NVFP4_QUANT_GROUP_SIZE + 8,
+            "NVFP4 down scale byte count mismatch",
+        )
+    elif fp4:
         _require(
             hidden % FP4_QUANT_GROUP_SIZE == 0
             and intermediate % FP4_QUANT_GROUP_SIZE == 0,
@@ -278,7 +386,25 @@ def validate_expert_record(path: Path, entry: dict[str, Any], alignment: int) ->
         _require(section_offset >= previous_end, f"overlapping expert section {name}")
         _require(section_offset + section_bytes <= record_bytes, f"expert section exceeds record: {name}")
         previous_end = section_offset + section_bytes
-    if fp4:
+    if native_nvfp4:
+        matrix_local = hidden * intermediate // NVFP4_QUANT_GROUP_SIZE
+        for section_offset, label in (
+            (gate_up_scale_offset, "gate"),
+            (gate_up_scale_offset + matrix_local + 8, "up"),
+            (down_scale_offset, "down"),
+        ):
+            _validate_e4m3fn_scale_bytes(
+                path, offset + section_offset, matrix_local, label
+            )
+            _validate_positive_scalar(
+                path, offset + section_offset + matrix_local,
+                "F32", label + " weight",
+            )
+            _validate_positive_scalar(
+                path, offset + section_offset + matrix_local + 4,
+                "F32", label + " input",
+            )
+    elif fp4:
         _validate_ue8m0_scales(
             path, offset + gate_up_scale_offset, gate_up_scale_bytes,
             "up" if relu2 else "gate+up",
@@ -379,6 +505,7 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         FP4_QUANT_PROFILE: {
             FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
         },
+        NVFP4_QUANT_PROFILE: {NVFP4_QUANT_ABI_ID},
     }
     _require(
         profile in expected_abis and quant.get("abi_id") in expected_abis[profile],
@@ -444,6 +571,7 @@ def validate_container(root: Path | str) -> dict[str, Any]:
 
     records_by_pack: dict[str, list[tuple[str, dict[str, Any]]]] = {name: [] for name in pack_by_name}
     dense_names: set[str] = set()
+    dense_source_names: set[str] = set()
     for entry in dense:
         _require(isinstance(entry, dict), "invalid dense index entry")
         name = entry.get("name")
@@ -451,6 +579,17 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         _require(isinstance(name, str) and name not in dense_names, "duplicate/invalid dense tensor")
         _require(pack_name in pack_by_name, f"dense tensor references unknown pack: {name}")
         dense_names.add(name)
+        source_tensors = entry.get("source_tensors")
+        if source_tensors is None:
+            dense_source_names.add(name)
+        else:
+            _require(
+                isinstance(source_tensors, dict)
+                and all(isinstance(item, str)
+                        for item in source_tensors.values()),
+                "dense source tensor map is invalid",
+            )
+            dense_source_names.update(source_tensors.values())
         records_by_pack[pack_name].append(("dense", entry))
 
     auxiliary = manifest.get("auxiliary_tensors", [])
@@ -464,6 +603,7 @@ def validate_container(root: Path | str) -> dict[str, Any]:
 
     expert_keys: set[tuple[int, int]] = set()
     source_expert_names: set[str] = set()
+    source_expert_sidecar_names: set[str] = set()
     physical_source_regions: dict[
         str, tuple[int, tuple[int, ...], list[tuple[int, int]]]
     ] = {}
@@ -491,6 +631,31 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         for source_name in sources.values():
             _require(isinstance(source_name, str) and source_name not in source_expert_names, "duplicate expert source tensor")
             source_expert_names.add(source_name)
+        sidecars = entry.get("nvfp4_sidecars")
+        if entry.get("quant_abi") == NVFP4_QUANT_ABI_ID:
+            _require(
+                isinstance(sidecars, dict)
+                and set(sidecars) == {"gate", "up", "down"}
+                and all(
+                    isinstance(values, dict)
+                    and set(values) == {
+                        "scale", "weight_global_scale", "input_global_scale"
+                    }
+                    for values in sidecars.values()
+                ),
+                "NVFP4 expert sidecar map is invalid",
+            )
+            for values in sidecars.values():
+                for source_name in values.values():
+                    _require(
+                        isinstance(source_name, str)
+                        and source_name not in source_expert_names,
+                        "duplicate NVFP4 expert sidecar",
+                    )
+                    source_expert_names.add(source_name)
+                    source_expert_sidecar_names.add(source_name)
+        else:
+            _require(sidecars is None, "unexpected expert sidecars")
         regions = entry.get("source_regions")
         if regions is None:
             for role, source_name in sources.items():
@@ -596,14 +761,78 @@ def validate_container(root: Path | str) -> dict[str, Any]:
     _require(record_bytes == pack_bytes == masses.get("pack_bytes"), "pack byte accounting mismatch")
     _require(sum(entry["stored_bytes"] for entry in dense) == masses.get("dense_bytes"), "dense byte accounting mismatch")
     _require(sum(entry["stored_bytes"] for entry in experts) == masses.get("expert_bytes"), "expert byte accounting mismatch")
+    resident_dense = masses.get("resident_dense_bytes")
+    host_mapped_dense = masses.get("host_mapped_dense_bytes")
+    _require(
+        isinstance(resident_dense, int) and resident_dense >= 0
+        and isinstance(host_mapped_dense, int) and host_mapped_dense >= 0
+        and resident_dense + host_mapped_dense <= masses["dense_bytes"],
+        "dense placement byte accounting mismatch",
+    )
     source_count = manifest.get("source", {}).get("tensor_count")
     _require(
-        source_count == len(dense_names | set(physical_source_regions)),
+        source_count == len(
+            dense_source_names | source_expert_sidecar_names |
+            set(physical_source_regions)
+        ),
         "source tensor accounting mismatch",
     )
 
     tokenizer = manifest.get("tokenizer")
     _require(isinstance(tokenizer, dict) and isinstance(tokenizer.get("files"), list), "tokenizer index missing")
+    effort_map = tokenizer.get("reasoning_effort_map")
+    if effort_map is not None:
+        _require(
+            isinstance(effort_map, dict) and
+            set(effort_map) == {"off", "low", "medium", "xhigh"} and
+            all(isinstance(value, str) and value and len(value) <= 32
+                for value in effort_map.values()),
+            "tokenizer reasoning effort map is invalid",
+        )
+    sampling = tokenizer.get("sampling")
+    if sampling is not None:
+        _require(
+            isinstance(sampling, dict) and
+            sampling.get("schema") == "sampling-profiles-v1",
+            "sampling profiles have an unsupported schema",
+        )
+        profiles = sampling.get("profiles")
+        _require(
+            isinstance(profiles, dict) and
+            set(profiles) == {"thinking", "non_thinking"},
+            "sampling profiles are incomplete",
+        )
+        expected_fields = {
+            "temperature", "top_p", "top_k", "min_p",
+            "presence_penalty", "frequency_penalty", "repetition_penalty",
+        }
+        for name, profile in profiles.items():
+            _require(
+                isinstance(profile, dict) and set(profile) == expected_fields,
+                f"sampling profile {name!r} has unknown or missing fields",
+            )
+            numeric = (
+                "temperature", "top_p", "min_p", "presence_penalty",
+                "frequency_penalty", "repetition_penalty",
+            )
+            _require(
+                all(not isinstance(profile[field], bool) and
+                    isinstance(profile[field], (int, float))
+                    for field in numeric) and
+                not isinstance(profile["top_k"], bool) and
+                isinstance(profile["top_k"], int),
+                f"sampling profile {name!r} has an invalid value type",
+            )
+            _require(
+                0.0 <= float(profile["temperature"]) <= 2.0 and
+                0.0 < float(profile["top_p"]) <= 1.0 and
+                profile["top_k"] >= 0 and
+                0.0 <= float(profile["min_p"]) <= 1.0 and
+                -2.0 <= float(profile["presence_penalty"]) <= 2.0 and
+                float(profile["frequency_penalty"]) == 0.0 and
+                float(profile["repetition_penalty"]) == 1.0,
+                f"sampling profile {name!r} is outside runtime limits",
+            )
     for file_entry in tokenizer["files"]:
         _require(isinstance(file_entry, dict), "invalid tokenizer entry")
         path = _safe_child(root, file_entry.get("path"))

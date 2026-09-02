@@ -4,6 +4,8 @@ param(
     [string]$Snapshot,
     [switch]$TensorGroups,
     [string]$Adapter,
+    [string]$ConfigFile = "config.json",
+    [string]$IndexFile = "model.safetensors.index.json",
     [ValidateSet("deepseek_v4")][string]$Contract,
     [switch]$EstimateRepresentations
 )
@@ -19,7 +21,10 @@ $python = Get-PythonCommand
 
 Push-Location $script:RepoRoot
 try {
-    $arguments = @("-m", "compiler", "inspect-source", "--source", $source)
+    $arguments = @(
+        "-m", "compiler", "inspect-source", "--source", $source,
+        "--config-file", $ConfigFile, "--index-file", $IndexFile
+    )
     if ($TensorGroups) { $arguments += "--tensor-groups" }
     if ($Adapter) { $arguments += @("--adapter", $Adapter) }
     if ($Contract) { $arguments += @("--contract", $Contract) }

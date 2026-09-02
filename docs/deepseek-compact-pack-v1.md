@@ -1,74 +1,71 @@
 # DeepSeek compact pack v1
 
-Status: deployed routed-expert and worker-bundle contract, 2026-08-26.
+Status: deployed compact expert and self-contained bundle contract,
+2026-09-02.
 
-## Why it is separate
+## Purpose and geometry
 
-DeepSeek-V4-Flash stores routed experts as compact block-scaled FP8 source
-extents. The runtime's SM86 expert ABI repacks each complete expert into one
-authenticated FP4/UE8M0 record. This physical layout is different from QPack,
-but both artifacts publish the same model-program/provider and logical-page
-contracts.
+DeepSeek's source layout and paging geometry differ from QPack. The compiler
+repackages each complete routed expert into one authenticated FP4 E2M1/UE8M0
+record without changing router selection or top-k semantics.
 
-The physical formats must not be described as unified until the source ABI,
-record authentication and demand-paging geometry can be preserved without a
-model-specific execution stack.
+The main decoder contains:
 
-## Geometry and files
+```text
+43 routed layers x 256 experts = 11,008 logical pages
+13,369,344 bytes per compact record
+147,169,738,752 routed payload bytes
+```
 
-The main decoder contains 43 routed layers × 256 experts = 11,008 logical
-pages. Each compact record is 13,369,344 bytes; all routed payloads total
-147,169,738,752 bytes before indexes and bundle metadata.
-
-`pack-deepseek-routed` publishes:
-
-- one `experts-*.dsc` shard and commit descriptor per layer;
-- `catalog.tsv`, mapping layer/expert keys to one packed extent;
-- `extents.tsv`, physical path/offset/length information;
-- `manifest.json`, source identity, geometry and hashes.
-
-Packing is resumable by committed layer. A layer is accepted only after all
-256 records and hashes are durable. The main MTP layer, when enabled, is a
-separate namespace and compact pack.
+`pack-deepseek-routed` writes committed layer shards, `catalog.tsv`,
+`extents.tsv` and a manifest. Packing resumes by complete committed layer; a
+partial layer is never published. MTP routed state, when present, uses a
+separate authenticated namespace.
 
 ## Worker bundle
 
-`Publish-DeepSeekWorkerBundle.ps1` validates and combines:
+`Publish-DeepSeekWorkerBundle.ps1` validates and publishes below
+`${MODEL_ROOT}/deepseek-v4-flash`:
 
-- dense FP8 descriptor set;
-- typed BF16/F32/I64 descriptor set;
-- always-active shared-expert descriptor set;
-- main routed catalog/compact pack;
+- dense FP8 and typed BF16/F32/I64 descriptor sets;
+- always-active shared-expert descriptors;
+- main routed compact catalog and payloads;
 - tokenizer/config/encoding assets;
-- optional MTP dense/typed/shared/routed resources;
-- `runtime.tsv`, `runtime-model.tsv` schema 3 and an authenticated manifest.
+- complete optional MTP dense/typed/shared/routed resources;
+- `runtime.tsv`, schema-3 `runtime-model.tsv`, manifest and completion state.
 
-Large immutable weights may remain referenced in the pinned checkpoint while
-routed compact shards live on NVMe. All locations are captured in the
-published bundle; the common service receives only the stable bundle path
-below `MODEL_ROOT`.
+The active alias points at `deepseek-v4-flash/worker-bundle-v3`. Runtime
+dependencies are self-contained below `MODEL_ROOT`; Hugging Face cache paths
+are not serving dependencies.
 
-## Build outline
+## Publication
 
-1. inspect and validate the pinned source with the `deepseek_v4` contract;
+1. inspect the pinned source with the `deepseek_v4` contract;
 2. export dense, typed, shared and routed descriptors;
-3. pack the routed catalog with `Invoke-DeepSeekCompactPack.ps1`;
-4. build and qualify optional MTP resources as one complete namespace;
-5. run independent numeric oracles for FP8 admission, attention, HCA, routing,
-   experts and I/O;
-6. publish `worker-bundle-v3` only after every dependency is complete.
+3. pack and commit every routed layer;
+4. publish MTP only as a complete namespace;
+5. run independent FP8/admission, attention, HCA/CSA, routing, expert and I/O
+   oracles;
+6. publish `worker-bundle-v3` only after all dependencies validate;
+7. start through the common VM and run the real DeepSeek chat gate.
 
-The repository deliberately keeps the direct compact-pack command instead of
-the former background wrappers: publication state already provides the
-transaction boundary and one operator-visible command is less ambiguous.
+The direct pack command is the supported transaction boundary. Removed
+background wrappers are not an alternate operator path.
 
 ## Runtime semantics
 
-The router selects exact top-6 experts. Demand acquisition waits for all six,
-uses stable route order and weights, and never reduces top-k. Routed records
-move through SSD, protected/probationary RAM and transient/protected VRAM.
-Telemetry attributes hits, reloads, reread bytes, storage wait and H2D wait.
+The router selects exact top-6 experts. Acquisition waits for every selected
+record, preserves route order/weights and never substitutes zero or reduced
+top-k. Pages move through NVMe, retained RAM and routed VRAM under leases and
+priority classes. Telemetry attributes tier hits, reload/reread bytes, storage
+wait, uploads and CPU/GPU expert decisions.
 
-The current bundle is executable on the SM86 RTX 3090 provider. P40/P100
-providers and multi-device ownership remain roadmap work, not properties of
-this format.
+The 147 GB routed pool exceeds the current 48 GiB host cache. Demand paging is
+therefore genuine: cold routes still touch NVMe, while retained RAM-ready pages
+may execute on CPU or upload to GPU. The validated common VRAM-cache ceiling is
+12 GiB; 13 GiB fails current DeepSeek preflight after fixed allocations,
+workspace and reserve.
+
+The bundle passes current direct chat and minimal Pi wiring gates. Those gates
+do not qualify maximum context, automatic cancellation recovery or the settled
+10-15 tok/s target.

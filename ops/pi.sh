@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
-env_file="${QUANTUM_LLM_ENV_FILE:-${repo_root}/.env}"
+env_file="${repo_root}/.env"
 
 if [[ -f "${env_file}" ]]; then
   set -a
@@ -28,7 +28,7 @@ fi
   die "EXPERT_API_KEY is required in ${env_file}"
 command -v pi >/dev/null 2>&1 || die "pi CLI is not installed or not on PATH"
 
-alias_file="${MODEL_ALIAS_FILE:-${script_dir}/model-aliases.tsv}"
+alias_file="${script_dir}/model-aliases.tsv"
 [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
 model_id=""
 alias_registry_version=""

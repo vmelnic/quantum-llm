@@ -229,14 +229,55 @@ def _fp8_e4m3fn_table() -> object:
     return table
 
 
+def _deepseek_projection_probes(columns: int) -> object:
+    """Return deterministic activation-like columns for quantization gates."""
+
+    if np is None or columns <= 0:
+        raise ValueError("projection probes require NumPy and positive geometry")
+    indices = np.arange(columns, dtype=np.float32)
+    random = np.random.default_rng(0xD335E3).standard_normal(columns).astype(
+        np.float32
+    )
+    return np.stack(
+        (
+            np.sin(indices * np.float32(0.017)) * np.float32(0.2),
+            np.cos(indices * np.float32(0.013)) * np.float32(0.15),
+            random * np.float32(0.1),
+            ((indices % np.float32(257.0)) - np.float32(128.0))
+            / np.float32(1024.0),
+        ),
+        axis=1,
+    )
+
+
+def _relative_l2(error_squares: float, reference_squares: float) -> float:
+    return math.sqrt(
+        error_squares
+        / max(reference_squares, float.fromhex("0x1p-1022"))
+    )
+
+
+def _cosine_similarity(
+    dot_product: float, reference_squares: float, candidate_squares: float
+) -> float:
+    denominator = math.sqrt(reference_squares * candidate_squares)
+    return dot_product / denominator if denominator else 1.0
+
+
 def qualify_deepseek_shared_expert(
-    checkpoint: SafeTensorCheckpoint, *, layer: int, row_chunk: int = 128
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    layer: int,
+    row_chunk: int = 128,
+    torch_reference: bool = True,
+    validate_source: bool = True,
 ) -> dict[str, object]:
     """Qualify the always-active FP8 shared expert and its SM86 candidate."""
 
     if np is None:
         raise SourceFormatError("NumPy is required for DeepSeek shared qualification")
-    validate_deepseek_v4_source(checkpoint)
+    if validate_source:
+        validate_deepseek_v4_source(checkpoint)
     if not 0 <= layer < 43 or row_chunk <= 0:
         raise AdapterError("invalid DeepSeek shared expert qualification bounds")
     started = time.perf_counter()
@@ -245,6 +286,24 @@ def qualify_deepseek_shared_expert(
     source_bytes = 0
     logical_values = 0
     reference_equal = True
+    projection_results: dict[str, object] = {}
+    weight_error_squares = 0.0
+    weight_reference_squares = 0.0
+    weight_candidate_squares = 0.0
+    weight_dot_product = 0.0
+    projection_error_squares = 0.0
+    projection_reference_squares = 0.0
+    projection_candidate_squares = 0.0
+    projection_dot_product = 0.0
+    maximum_weight_error = 0.0
+    maximum_projection_error = 0.0
+    torch = None
+    if torch_reference:
+        try:
+            import torch as torch_module
+        except ImportError as error:  # pragma: no cover
+            raise SourceFormatError("PyTorch is required for FP8 reference") from error
+        torch = torch_module
     prefix = f"layers.{layer}.ffn.shared_experts"
     for projection in ("w1", "w2", "w3"):
         weight_name = f"{prefix}.{projection}.weight"
@@ -254,6 +313,17 @@ def qualify_deepseek_shared_expert(
         rows, columns = weight_info.shape
         if scale_info.shape != (rows // 128, columns // 128):
             raise SourceFormatError(f"FP8 block geometry mismatch for {projection}")
+        probes = _deepseek_projection_probes(columns)
+        local_weight_error_squares = 0.0
+        local_weight_reference_squares = 0.0
+        local_weight_candidate_squares = 0.0
+        local_weight_dot_product = 0.0
+        local_projection_error_squares = 0.0
+        local_projection_reference_squares = 0.0
+        local_projection_candidate_squares = 0.0
+        local_projection_dot_product = 0.0
+        local_maximum_weight_error = 0.0
+        local_maximum_projection_error = 0.0
         quantized_payload = bytearray()
         row_scale_payload = bytearray()
         with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
@@ -280,31 +350,121 @@ def qualify_deepseek_shared_expert(
                 )
                 if not bool(np.isfinite(decoded).all()):
                     raise SourceFormatError("shared expert decoded to a non-finite value")
-                try:
-                    import torch
-                except ImportError as error:  # pragma: no cover
-                    raise SourceFormatError("PyTorch is required for FP8 reference") from error
-                torch_weights = torch.from_numpy(weight_codes.copy()).view(
-                    torch.float8_e4m3fn
-                ).float()
-                torch_scales = torch.from_numpy(scale_codes.copy()).view(
-                    torch.float8_e8m0fnu
-                ).float().repeat_interleave(128, dim=1)
-                reference = (torch_weights * torch_scales).numpy()
-                reference_equal &= bool(
-                    np.array_equal(decoded.view(np.uint32), reference.view(np.uint32))
-                )
+                if torch_reference:
+                    torch_weights = torch.from_numpy(weight_codes.copy()).view(
+                        torch.float8_e4m3fn
+                    ).float()
+                    torch_scales = torch.from_numpy(scale_codes.copy()).view(
+                        torch.float8_e8m0fnu
+                    ).float().repeat_interleave(128, dim=1)
+                    reference = (torch_weights * torch_scales).numpy()
+                    reference_equal &= bool(
+                        np.array_equal(
+                            decoded.view(np.uint32), reference.view(np.uint32)
+                        )
+                    )
                 maxima = np.max(np.abs(decoded), axis=1)
                 row_scales = np.where(maxima > 0, maxima / 127.0, 1.0).astype("<f4")
                 quantized = np.clip(
                     np.rint(decoded / row_scales[:, None]), -127, 127
                 ).astype(np.int8)
+                reconstructed = quantized.astype(np.float32) * row_scales[:, None]
+                decoded64 = decoded.astype(np.float64)
+                reconstructed64 = reconstructed.astype(np.float64)
+                difference = decoded64 - reconstructed64
+                reference_projection = decoded @ probes
+                candidate_projection = reconstructed @ probes
+                projection_difference = (
+                    reference_projection - candidate_projection
+                ).astype(np.float64)
+                local_weight_error_squares += float(np.square(difference).sum())
+                local_weight_reference_squares += float(np.square(decoded64).sum())
+                local_weight_candidate_squares += float(
+                    np.square(reconstructed64).sum()
+                )
+                local_weight_dot_product += float(
+                    np.multiply(decoded64, reconstructed64).sum()
+                )
+                local_projection_error_squares += float(
+                    np.square(projection_difference).sum()
+                )
+                local_projection_reference_squares += float(
+                    np.square(reference_projection.astype(np.float64)).sum()
+                )
+                local_projection_candidate_squares += float(
+                    np.square(candidate_projection.astype(np.float64)).sum()
+                )
+                local_projection_dot_product += float(
+                    np.multiply(
+                        reference_projection.astype(np.float64),
+                        candidate_projection.astype(np.float64),
+                    ).sum()
+                )
+                local_maximum_weight_error = max(
+                    local_maximum_weight_error,
+                    float(np.max(np.abs(difference))),
+                )
+                local_maximum_projection_error = max(
+                    local_maximum_projection_error,
+                    float(np.max(np.abs(projection_difference))),
+                )
                 quantized_payload.extend(quantized.tobytes(order="C"))
                 row_scale_payload.extend(row_scales.tobytes(order="C"))
                 logical_values += int(decoded.size)
-            del weights, scales, weight_codes, scale_codes, decoded, reference
+            del (
+                weights,
+                scales,
+                weight_codes,
+                scale_codes,
+                decoded,
+                reconstructed,
+                decoded64,
+                reconstructed64,
+                difference,
+                reference_projection,
+                candidate_projection,
+                projection_difference,
+            )
+            if torch_reference:
+                del reference, torch_weights, torch_scales
         payloads[projection] = (bytes(quantized_payload), bytes(row_scale_payload))
         source_bytes += weight_info.nbytes + scale_info.nbytes
+        weight_error_squares += local_weight_error_squares
+        weight_reference_squares += local_weight_reference_squares
+        weight_candidate_squares += local_weight_candidate_squares
+        weight_dot_product += local_weight_dot_product
+        projection_error_squares += local_projection_error_squares
+        projection_reference_squares += local_projection_reference_squares
+        projection_candidate_squares += local_projection_candidate_squares
+        projection_dot_product += local_projection_dot_product
+        maximum_weight_error = max(
+            maximum_weight_error, local_maximum_weight_error
+        )
+        maximum_projection_error = max(
+            maximum_projection_error, local_maximum_projection_error
+        )
+        projection_results[projection] = {
+            "shape": [rows, columns],
+            "weight_relative_l2": _relative_l2(
+                local_weight_error_squares, local_weight_reference_squares
+            ),
+            "weight_cosine": _cosine_similarity(
+                local_weight_dot_product,
+                local_weight_reference_squares,
+                local_weight_candidate_squares,
+            ),
+            "weight_maximum_absolute_error": local_maximum_weight_error,
+            "projection_relative_l2": _relative_l2(
+                local_projection_error_squares,
+                local_projection_reference_squares,
+            ),
+            "projection_cosine": _cosine_similarity(
+                local_projection_dot_product,
+                local_projection_reference_squares,
+                local_projection_candidate_squares,
+            ),
+            "projection_maximum_absolute_error": local_maximum_projection_error,
+        }
     digest = hashlib.sha256()
     for projection, section in (
         ("w1", 0), ("w3", 0), ("w1", 1),
@@ -315,25 +475,51 @@ def qualify_deepseek_shared_expert(
     return {
         "format": "deepseek-v4-shared-expert-qualification-v1",
         "layer": layer,
-        "reference": "pytorch-float8-e4m3fn+float8-e8m0fnu",
-        "reference_bitwise_equal": reference_equal,
+        "reference": (
+            "pytorch-float8-e4m3fn+float8-e8m0fnu"
+            if torch_reference else None
+        ),
+        "reference_bitwise_equal": reference_equal if torch_reference else None,
         "source_bytes": source_bytes,
         "logical_values": logical_values,
         "candidate_int8_bytes": sum(len(part) for value in payloads.values() for part in value),
         "candidate_abi": "deepseek-sm86-int8-per-row-v1",
         "candidate_sha256": digest.hexdigest(),
+        "weight_relative_l2": _relative_l2(
+            weight_error_squares, weight_reference_squares
+        ),
+        "weight_cosine": _cosine_similarity(
+            weight_dot_product, weight_reference_squares, weight_candidate_squares
+        ),
+        "weight_maximum_absolute_error": maximum_weight_error,
+        "projection_relative_l2": _relative_l2(
+            projection_error_squares, projection_reference_squares
+        ),
+        "projection_cosine": _cosine_similarity(
+            projection_dot_product,
+            projection_reference_squares,
+            projection_candidate_squares,
+        ),
+        "projection_maximum_absolute_error": maximum_projection_error,
+        "projections": projection_results,
         "elapsed_seconds": elapsed,
     }
 
 
 def qualify_deepseek_fp8_matrix(
-    checkpoint: SafeTensorCheckpoint, *, name: str, row_chunk: int = 128
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    name: str,
+    row_chunk: int = 128,
+    torch_reference: bool = True,
+    validate_source: bool = True,
 ) -> dict[str, object]:
     """Qualify one block-scaled FP8 matrix for the generic SM86 dense ABI."""
 
     if np is None:
         raise SourceFormatError("NumPy is required for DeepSeek dense qualification")
-    validate_deepseek_v4_source(checkpoint)
+    if validate_source:
+        validate_deepseek_v4_source(checkpoint)
     weight_name = name + ".weight"
     scale_name = name + ".scale"
     if weight_name not in checkpoint.tensors or scale_name not in checkpoint.tensors:
@@ -354,7 +540,23 @@ def qualify_deepseek_fp8_matrix(
     row_scale_payload = bytearray()
     reference_equal = True
     squared_error = 0.0
+    reference_squares = 0.0
+    candidate_squares = 0.0
+    dot_product = 0.0
     maximum_error = 0.0
+    projection_error_squares = 0.0
+    projection_reference_squares = 0.0
+    projection_candidate_squares = 0.0
+    projection_dot_product = 0.0
+    projection_maximum_error = 0.0
+    probes = _deepseek_projection_probes(columns)
+    torch = None
+    if torch_reference:
+        try:
+            import torch as torch_module
+        except ImportError as error:  # pragma: no cover
+            raise SourceFormatError("PyTorch is required for FP8 reference") from error
+        torch = torch_module
     with checkpoint.open_tensor(weight_name) as weight_view, checkpoint.open_tensor(
         scale_name
     ) as scale_view:
@@ -379,32 +581,79 @@ def qualify_deepseek_fp8_matrix(
             )
             if not bool(np.isfinite(decoded).all()):
                 raise SourceFormatError("dense FP8 matrix decoded non-finite values")
-            try:
-                import torch
-            except ImportError as error:  # pragma: no cover
-                raise SourceFormatError("PyTorch is required for FP8 reference") from error
-            reference = (
-                torch.from_numpy(weight_codes.copy()).view(torch.float8_e4m3fn).float()
-                * torch.from_numpy(scale_codes.copy()).view(torch.float8_e8m0fnu)
-                .float().repeat_interleave(128, dim=1)
-            ).numpy()
-            reference_equal &= bool(
-                np.array_equal(decoded.view(np.uint32), reference.view(np.uint32))
-            )
+            if torch_reference:
+                reference = (
+                    torch.from_numpy(weight_codes.copy())
+                    .view(torch.float8_e4m3fn)
+                    .float()
+                    * torch.from_numpy(scale_codes.copy())
+                    .view(torch.float8_e8m0fnu)
+                    .float()
+                    .repeat_interleave(128, dim=1)
+                ).numpy()
+                reference_equal &= bool(
+                    np.array_equal(
+                        decoded.view(np.uint32), reference.view(np.uint32)
+                    )
+                )
             maxima = np.max(np.abs(decoded), axis=1)
             row_scales = np.where(maxima > 0, maxima / 127.0, 1.0).astype("<f4")
             quantized = np.clip(
                 np.rint(decoded / row_scales[:, None]), -127, 127
             ).astype(np.int8)
             reconstructed = quantized.astype(np.float32) * row_scales[:, None]
-            difference = decoded.astype(np.float64) - reconstructed.astype(np.float64)
+            decoded64 = decoded.astype(np.float64)
+            reconstructed64 = reconstructed.astype(np.float64)
+            difference = decoded64 - reconstructed64
             squared_error += float(np.square(difference).sum())
+            reference_squares += float(np.square(decoded64).sum())
+            candidate_squares += float(np.square(reconstructed64).sum())
+            dot_product += float(np.multiply(decoded64, reconstructed64).sum())
             maximum_error = max(
                 maximum_error, float(np.max(np.abs(decoded - reconstructed)))
             )
+            reference_projection = decoded @ probes
+            candidate_projection = reconstructed @ probes
+            projection_difference = (
+                reference_projection - candidate_projection
+            ).astype(np.float64)
+            projection_error_squares += float(
+                np.square(projection_difference).sum()
+            )
+            projection_reference_squares += float(
+                np.square(reference_projection.astype(np.float64)).sum()
+            )
+            projection_candidate_squares += float(
+                np.square(candidate_projection.astype(np.float64)).sum()
+            )
+            projection_dot_product += float(
+                np.multiply(
+                    reference_projection.astype(np.float64),
+                    candidate_projection.astype(np.float64),
+                ).sum()
+            )
+            projection_maximum_error = max(
+                projection_maximum_error,
+                float(np.max(np.abs(projection_difference))),
+            )
             quantized_payload.extend(quantized.tobytes(order="C"))
             row_scale_payload.extend(row_scales.tobytes(order="C"))
-        del weights, scales, weight_codes, scale_codes, decoded, reference
+        del (
+            weights,
+            scales,
+            weight_codes,
+            scale_codes,
+            decoded,
+            reconstructed,
+            decoded64,
+            reconstructed64,
+            difference,
+            reference_projection,
+            candidate_projection,
+            projection_difference,
+        )
+        if torch_reference:
+            del reference
     digest = hashlib.sha256(quantized_payload)
     digest.update(row_scale_payload)
     values = rows * columns
@@ -413,14 +662,190 @@ def qualify_deepseek_fp8_matrix(
         "format": "deepseek-v4-fp8-matrix-qualification-v1",
         "name": name,
         "shape": [rows, columns],
-        "reference_bitwise_equal": reference_equal,
+        "reference_bitwise_equal": reference_equal if torch_reference else None,
         "source_bytes": weight_info.nbytes + scale_info.nbytes,
         "candidate_int8_bytes": len(quantized_payload) + len(row_scale_payload),
         "candidate_abi": "deepseek-sm86-int8-per-row-matrix-v1",
         "candidate_sha256": digest.hexdigest(),
         "root_mean_squared_error": math.sqrt(squared_error / values),
+        "weight_relative_l2": _relative_l2(squared_error, reference_squares),
+        "weight_cosine": _cosine_similarity(
+            dot_product, reference_squares, candidate_squares
+        ),
         "maximum_absolute_error": maximum_error,
+        "projection_count": int(probes.shape[1]),
+        "projection_relative_l2": _relative_l2(
+            projection_error_squares, projection_reference_squares
+        ),
+        "projection_cosine": _cosine_similarity(
+            projection_dot_product,
+            projection_reference_squares,
+            projection_candidate_squares,
+        ),
+        "projection_maximum_absolute_error": projection_maximum_error,
         "elapsed_seconds": elapsed,
+    }
+
+
+def qualify_deepseek_int8_organs(
+    checkpoint: SafeTensorCheckpoint,
+    *,
+    layers: tuple[int, ...] = (0, 21, 42),
+    row_chunk: int = 128,
+    maximum_weight_relative_l2: float = 0.02,
+    maximum_projection_relative_l2: float = 0.02,
+    minimum_cosine: float = 0.999,
+) -> dict[str, object]:
+    """Gate the lossy FP8-to-INT8 boundary on always-active model organs."""
+
+    if not layers or len(set(layers)) != len(layers) or any(
+        isinstance(layer, bool) or not 0 <= layer < 43 for layer in layers
+    ):
+        raise AdapterError("DeepSeek organ layers must be unique values in [0, 42]")
+    if (
+        row_chunk <= 0
+        or maximum_weight_relative_l2 <= 0
+        or maximum_projection_relative_l2 <= 0
+        or not -1 <= minimum_cosine <= 1
+    ):
+        raise ValueError("invalid DeepSeek organ qualification gate")
+    validate_deepseek_v4_source(checkpoint)
+
+    dense_results: list[dict[str, object]] = []
+    shared_results: list[dict[str, object]] = []
+    failures: list[dict[str, object]] = []
+    for layer in layers:
+        prefix = f"layers.{layer}.attn."
+        names = tuple(
+            sorted(
+                name.removesuffix(".weight")
+                for name, info in checkpoint.tensors.items()
+                if name.startswith(prefix)
+                and name.endswith(".weight")
+                and info.dtype == "F8_E4M3"
+            )
+        )
+        if len(names) not in (5, 6):
+            raise SourceFormatError(
+                f"DeepSeek layer {layer} has unexpected dense FP8 organs: {names}"
+            )
+        for name in names:
+            result = qualify_deepseek_fp8_matrix(
+                checkpoint,
+                name=name,
+                row_chunk=row_chunk,
+                torch_reference=False,
+                validate_source=False,
+            )
+            dense_results.append(result)
+            for metric, actual, limit, comparison in (
+                (
+                    "weight_relative_l2",
+                    float(result["weight_relative_l2"]),
+                    maximum_weight_relative_l2,
+                    "maximum",
+                ),
+                (
+                    "projection_relative_l2",
+                    float(result["projection_relative_l2"]),
+                    maximum_projection_relative_l2,
+                    "maximum",
+                ),
+                (
+                    "weight_cosine",
+                    float(result["weight_cosine"]),
+                    minimum_cosine,
+                    "minimum",
+                ),
+                (
+                    "projection_cosine",
+                    float(result["projection_cosine"]),
+                    minimum_cosine,
+                    "minimum",
+                ),
+            ):
+                rejected = actual > limit if comparison == "maximum" else actual < limit
+                if rejected:
+                    failures.append(
+                        {
+                            "organ": name,
+                            "metric": metric,
+                            "actual": actual,
+                            comparison: limit,
+                        }
+                    )
+        shared = qualify_deepseek_shared_expert(
+            checkpoint,
+            layer=layer,
+            row_chunk=row_chunk,
+            torch_reference=False,
+            validate_source=False,
+        )
+        shared_results.append(shared)
+        shared_organs = (
+            (f"layers.{layer}.ffn.shared_experts", shared),
+        ) + tuple(
+            (
+                f"layers.{layer}.ffn.shared_experts.{projection}",
+                metrics,
+            )
+            for projection, metrics in shared["projections"].items()
+        )
+        for organ, metrics in shared_organs:
+            for metric, actual, limit, comparison in (
+            (
+                "weight_relative_l2",
+                float(metrics["weight_relative_l2"]),
+                maximum_weight_relative_l2,
+                "maximum",
+            ),
+            (
+                "projection_relative_l2",
+                float(metrics["projection_relative_l2"]),
+                maximum_projection_relative_l2,
+                "maximum",
+            ),
+            (
+                "weight_cosine",
+                float(metrics["weight_cosine"]),
+                minimum_cosine,
+                "minimum",
+            ),
+            (
+                "projection_cosine",
+                float(metrics["projection_cosine"]),
+                minimum_cosine,
+                "minimum",
+            ),
+            ):
+                rejected = (
+                    actual > limit if comparison == "maximum" else actual < limit
+                )
+                if rejected:
+                    failures.append(
+                        {
+                            "organ": organ,
+                            "metric": metric,
+                            "actual": actual,
+                            comparison: limit,
+                        }
+                    )
+    return {
+        "format": "deepseek-int8-organ-quality-v1",
+        "layers": list(layers),
+        "candidate_abis": [
+            "deepseek-sm86-int8-per-row-matrix-v1",
+            "deepseek-sm86-int8-per-row-v1",
+        ],
+        "thresholds": {
+            "maximum_weight_relative_l2": maximum_weight_relative_l2,
+            "maximum_projection_relative_l2": maximum_projection_relative_l2,
+            "minimum_cosine": minimum_cosine,
+        },
+        "valid": not failures,
+        "failures": failures,
+        "dense": dense_results,
+        "shared": shared_results,
     }
 
 
@@ -509,18 +934,7 @@ def qualify_deepseek_compact_matrix(
         }
         for variant in variants
     }
-    indices = np.arange(columns, dtype=np.float32)
-    random = np.random.default_rng(0xD335E3).standard_normal(columns).astype(np.float32)
-    probes = np.stack(
-        (
-            np.sin(indices * np.float32(0.017)) * np.float32(0.2),
-            np.cos(indices * np.float32(0.013)) * np.float32(0.15),
-            random * np.float32(0.1),
-            ((indices % np.float32(257.0)) - np.float32(128.0))
-            / np.float32(1024.0),
-        ),
-        axis=1,
-    )
+    probes = _deepseek_projection_probes(columns)
     reference_projection_squares = 0.0
     reference_weight_squares = 0.0
     table = _fp8_e4m3fn_table()

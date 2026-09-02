@@ -4,6 +4,7 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -339,6 +340,75 @@ double check_standard_gqa_attention() {
   return std::max({maximum_error(d_query.download(), expected_query),
                    maximum_error(d_key.download(), expected_key),
                    maximum_error(d_output.download(), expected_output)});
+}
+
+double check_qsa_tiered_attention() {
+  constexpr std::uint32_t query_heads = 4U;
+  constexpr std::uint32_t kv_heads = 2U;
+  constexpr std::uint32_t dim = 64U;
+  constexpr std::uint32_t page_tokens = 8U;
+  constexpr std::uint32_t layers = 2U;
+  constexpr std::uint32_t selected_count = 4U;
+  constexpr std::uint32_t selected_layer = 1U;
+  constexpr std::array<std::uint16_t, 6U> half_values{
+      0x0000U, 0x3400U, 0x3800U, 0xb400U, 0xb800U, 0x3c00U};
+  const std::vector<std::uint32_t> selected{0U, 2U, 3U, 6U};
+  const auto row_values = static_cast<std::size_t>(kv_heads) * dim;
+  const auto page_values = static_cast<std::size_t>(page_tokens) * row_values;
+  std::vector<std::uint16_t> page(layers * 2U * page_values);
+  std::vector<std::uint16_t> full_keys(page_values), full_values(page_values);
+  for (std::size_t index = 0U; index < page_values; ++index) {
+    full_keys[index] = half_values[(index * 3U + 1U) % half_values.size()];
+    full_values[index] = half_values[(index * 5U + 2U) % half_values.size()];
+  }
+  std::copy(full_keys.begin(), full_keys.end(),
+            page.begin() + selected_layer * 2U * page_values);
+  std::copy(full_values.begin(), full_values.end(),
+            page.begin() + selected_layer * 2U * page_values + page_values);
+  std::vector<std::uint16_t> packed_keys(selected_count * row_values);
+  std::vector<std::uint16_t> packed_values(selected_count * row_values);
+  for (std::size_t item = 0U; item < selected.size(); ++item) {
+    const auto source = static_cast<std::size_t>(selected[item]) * row_values;
+    std::copy_n(full_keys.begin() + source, row_values,
+                packed_keys.begin() + item * row_values);
+    std::copy_n(full_values.begin() + source, row_values,
+                packed_values.begin() + item * row_values);
+  }
+  std::vector<float> query(2U * query_heads * dim);
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = pattern(index + 1901U, 0.35F);
+
+  DeviceBuffer<std::uint16_t> d_page(page.size()),
+      d_full_keys(full_keys.size()), d_full_values(full_values.size()),
+      d_packed_keys(packed_keys.size()), d_packed_values(packed_values.size());
+  DeviceBuffer<std::uint32_t> d_selected(selected.size());
+  DeviceBuffer<float> d_query(query.size()), d_paged(query_heads * dim),
+      d_full(query_heads * dim), d_packed(query_heads * dim);
+  d_page.upload(page);
+  d_full_keys.upload(full_keys);
+  d_full_values.upload(full_values);
+  d_packed_keys.upload(packed_keys);
+  d_packed_values.upload(packed_values);
+  d_selected.upload(selected);
+  d_query.upload(query);
+  const std::vector<std::uintptr_t> table{
+      reinterpret_cast<std::uintptr_t>(d_page.get())};
+  DeviceBuffer<std::uintptr_t> d_table(table.size());
+  d_table.upload(table);
+  status_check(expert::runtime::cuda::qsa_selected_attention({
+      d_query.get(), reinterpret_cast<const void* const*>(d_table.get()),
+      d_selected.get(), d_paged.get(), selected_count, selected_layer,
+      page_tokens, query_heads, kv_heads, dim, nullptr}));
+  status_check(expert::runtime::cuda::qsa_selected_contiguous_attention({
+      d_query.get(), d_full_keys.get(), d_full_values.get(), d_selected.get(),
+      d_full.get(), selected_count, query_heads, kv_heads, dim, nullptr}));
+  status_check(expert::runtime::cuda::qsa_selected_contiguous_attention({
+      d_query.get(), d_packed_keys.get(), d_packed_values.get(), nullptr,
+      d_packed.get(), selected_count, query_heads, kv_heads, dim, nullptr}));
+  cuda_check(cudaDeviceSynchronize(), "tiered QSA synchronize");
+  const auto paged = d_paged.download();
+  return std::max(maximum_error(d_full.download(), paged),
+                  maximum_error(d_packed.download(), paged));
 }
 
 double check_compact_moe_aggregation() {
@@ -835,7 +905,9 @@ double check_split_delta() {
         d_qkv.get(), d_z.get(), d_b.get(), d_a.get(), d_weights.get(),
         d_dt.get(), d_a_log.get(), d_norm.get(), d_conv_state.get(),
         d_recurrent.get(), d_conv.get(), d_output.get(), key_heads,
-        value_heads, key_dim, value_dim, kernel, 1.0e-6F, nullptr}));
+        value_heads, key_dim, value_dim, kernel, 1.0e-6F,
+        expert::runtime::cuda::GatedDeltaOutputActivation::silu,
+        nullptr}));
   };
   run(first_qkv, first_z, first_b, first_a);
   run(second_qkv, second_z, second_b, second_a);
@@ -857,6 +929,7 @@ int main() {
     const auto sigmoid_bias_router = check_sigmoid_bias_router();
     const auto short_conv = check_causal_short_conv();
     const auto standard_gqa = check_standard_gqa_attention();
+    const auto qsa_tiered = check_qsa_tiered_attention();
     const auto compact_aggregate = check_compact_moe_aggregation();
     const auto attention = check_full_attention();
     const auto fp4_attention = check_paged_fp4_attention();
@@ -866,6 +939,7 @@ int main() {
                        batched_router < 2.0e-6 &&
                        sigmoid_bias_router < 2.0e-6 &&
                        short_conv < 2.0e-6 && standard_gqa < 2.0e-5 &&
+                       qsa_tiered < 1.0e-7 &&
                        compact_aggregate < 2.0e-6 && attention < 2.0e-4 &&
                        // The official execution dtype is BF16. This bound
                        // isolates kernel arithmetic from the separately
@@ -881,6 +955,7 @@ int main() {
               << sigmoid_bias_router
               << ",\"short_conv_max_abs\":" << short_conv
               << ",\"standard_gqa_max_abs\":" << standard_gqa
+              << ",\"qsa_tiered_max_abs\":" << qsa_tiered
               << ",\"compact_aggregate_max_abs\":" << compact_aggregate
               << ",\"full_attention_max_abs\":" << attention
               << ",\"fp4_attention_kernel_max_abs\":"

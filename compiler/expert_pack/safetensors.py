@@ -67,20 +67,31 @@ class TensorView:
 
 
 class SafeTensorCheckpoint:
-    def __init__(self, root: Path) -> None:
+    def __init__(
+        self,
+        root: Path,
+        config_file: str = "config.json",
+        index_file: str = "model.safetensors.index.json",
+    ) -> None:
         self.root = root.resolve()
         if not self.root.is_dir():
             raise SourceFormatError(f"checkpoint directory does not exist: {root}")
-        config_path = self.root / "config.json"
+        for label, name in (("config", config_file), ("index", index_file)):
+            candidate = Path(name)
+            if candidate.is_absolute() or candidate.name != name or ".." in candidate.parts:
+                raise SourceFormatError(f"unsafe {label} filename: {name!r}")
+        self.config_file = config_file
+        self.index_file = index_file
+        config_path = self.root / config_file
         if not config_path.is_file():
-            raise SourceFormatError("checkpoint has no config.json")
+            raise SourceFormatError(f"checkpoint has no {config_file}")
         self.config = load_json(config_path)
         if not isinstance(self.config, dict):
-            raise SourceFormatError("config.json must contain an object")
+            raise SourceFormatError(f"{config_file} must contain an object")
         self.tensors, self.shards = self._read_index()
 
     def _read_index(self) -> tuple[dict[str, TensorInfo], tuple[str, ...]]:
-        index_path = self.root / "model.safetensors.index.json"
+        index_path = self.root / self.index_file
         if index_path.is_file():
             index = load_json(index_path)
             weight_map = index.get("weight_map") if isinstance(index, dict) else None
@@ -183,8 +194,8 @@ class SafeTensorCheckpoint:
         )
 
     def source_files(self) -> Iterator[Path]:
-        yield self.root / "config.json"
-        index = self.root / "model.safetensors.index.json"
+        yield self.root / self.config_file
+        index = self.root / self.index_file
         if index.is_file():
             yield index
         for shard in self.shards:

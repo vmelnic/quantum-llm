@@ -206,11 +206,12 @@ CudaExpertAllocation::CudaExpertAllocation(
     const std::int8_t* gate_up,
     const float* gate_up_scales, const std::int8_t* down,
     const float* down_scales, std::uint32_t hidden,
-    std::uint32_t intermediate, bool packed_fp4, bool relu2) noexcept
+    std::uint32_t intermediate, bool packed_fp4, bool relu2,
+    bool native_nvfp4) noexcept
     : pool_(std::move(pool)), storage_(storage), bytes_(bytes), gate_up_(gate_up),
       gate_up_scales_(gate_up_scales), down_(down), down_scales_(down_scales),
       hidden_(hidden), intermediate_(intermediate), packed_fp4_(packed_fp4),
-      relu2_(relu2) {}
+      relu2_(relu2), native_nvfp4_(native_nvfp4) {}
 
 CudaExpertAllocation::~CudaExpertAllocation() {
   if (storage_ != nullptr && pool_) {
@@ -227,6 +228,9 @@ std::uint32_t CudaExpertAllocation::hidden() const noexcept { return hidden_; }
 std::uint32_t CudaExpertAllocation::intermediate() const noexcept { return intermediate_; }
 bool CudaExpertAllocation::packed_fp4() const noexcept { return packed_fp4_; }
 bool CudaExpertAllocation::relu2() const noexcept { return relu2_; }
+bool CudaExpertAllocation::native_nvfp4() const noexcept {
+  return native_nvfp4_;
+}
 
 CudaCompactExpertAllocation::CudaCompactExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
@@ -512,14 +516,22 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   }
   finish_async(std::make_shared<CudaExpertAllocation>(
                    pool_, raw, total, gate, gate_scales, down, down_scales,
-                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32
+                   (request.key.encoding_abi == kExpertEncodingAbiFp4Block32 ||
+                    request.key.encoding_abi ==
+                        kExpertEncodingAbiNvfp4Block16W4A4)
                        ? sections.hidden
                        : 0U,
-                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32
+                   (request.key.encoding_abi == kExpertEncodingAbiFp4Block32 ||
+                    request.key.encoding_abi ==
+                        kExpertEncodingAbiNvfp4Block16W4A4)
                        ? sections.intermediate
                        : 0U,
-                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32,
-                   request.record_abi == kExpertRecordAbiFp4Relu2Block32),
+                   request.key.encoding_abi == kExpertEncodingAbiFp4Block32 ||
+                       request.key.encoding_abi ==
+                           kExpertEncodingAbiNvfp4Block16W4A4,
+                   request.record_abi == kExpertRecordAbiFp4Relu2Block32,
+                   request.record_abi ==
+                       kExpertRecordAbiNvfp4Block16W4A4),
                total, Status::success());
   return operation;
 }

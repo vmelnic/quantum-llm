@@ -3,8 +3,11 @@ param(
     [Parameter(Mandatory = $true)][string]$Revision,
     [Parameter(Mandatory = $true)][string]$StableName,
     [Parameter(Mandatory = $true)][string]$Adapter,
-    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1")]
+    [string]$ConfigFile = "config.json",
+    [string]$IndexFile = "model.safetensors.index.json",
+    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
     [string]$QuantProfile = "fp4-e2m1-ue8m0-block32-v1",
+    [string]$SamplingProfiles = "",
     [int64]$MaxExpertPackBytes = 4GB,
     [int]$QualitySamplesPerTensor = 8,
     [double]$MaximumRelativeL2 = 0.20,
@@ -29,7 +32,7 @@ if ($QualitySamplesPerTensor -lt 3 -or $MaximumRelativeL2 -le 0 -or
 }
 
 $snapshot = Resolve-HuggingFaceSnapshot -ModelId $ModelId -Revision $Revision
-$indexPath = Join-Path $snapshot "model.safetensors.index.json"
+$indexPath = Join-Path $snapshot $IndexFile
 $index = Get-Content -LiteralPath $indexPath -Raw | ConvertFrom-Json
 $referenced = @($index.weight_map.PSObject.Properties.Value | Sort-Object -Unique)
 $missing = @($referenced | Where-Object {
@@ -48,7 +51,8 @@ $candidate = Join-Path $modelRoot "$StableName.candidate-$revisionTag"
 $destination = Join-Path $modelRoot $StableName
 
 & (Join-Path $PSScriptRoot "Invoke-SourceInventory.ps1") `
-    -ModelId $ModelId -Revision $Revision -Snapshot $snapshot -Adapter $Adapter
+    -ModelId $ModelId -Revision $Revision -Snapshot $snapshot -Adapter $Adapter `
+    -ConfigFile $ConfigFile -IndexFile $IndexFile
 
 if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
     $arguments = @{
@@ -58,11 +62,16 @@ if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
         SourceId = $ModelId
         SourceRevision = $Revision
         Adapter = $Adapter
+        ConfigFile = $ConfigFile
+        IndexFile = $IndexFile
         QuantProfile = $QuantProfile
         MaxExpertPackBytes = $MaxExpertPackBytes
         Resume = $true
     }
     if ($ReclaimSourceShards) { $arguments.ReclaimSourceShards = $true }
+    if (-not [string]::IsNullOrWhiteSpace($SamplingProfiles)) {
+        $arguments.SamplingProfiles = $SamplingProfiles
+    }
     & (Join-Path $PSScriptRoot "Invoke-ExpertPack.ps1") @arguments
 }
 

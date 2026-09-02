@@ -3,7 +3,7 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
-env_file="${QUANTUM_LLM_ENV_FILE:-${repo_root}/.env}"
+env_file="${repo_root}/.env"
 if [[ -f "${env_file}" ]]; then
   set -a
   # shellcheck disable=SC1090
@@ -48,13 +48,13 @@ chat_args=(
   --model "${CHAT_MODEL:-deepseek-v4-flash}"
   --max-tokens "${chat_max_tokens}"
   --local-port "${CHAT_LOCAL_PORT:-18080}"
-  --remote-port "${MODEL_PORT:-${CHAT_REMOTE_PORT:-8080}}"
+  --remote-port "${MODEL_PORT:-8080}"
   --ready-timeout "${CHAT_READY_TIMEOUT:-30}"
   --request-timeout "${chat_request_timeout}"
   --thinking "${chat_thinking}"
 )
-if [[ -n "${CHAT_SSH:-}" ]]; then
-  chat_args+=(--ssh "${CHAT_SSH}")
+if [[ -n "${QUANTUM_LLM_REMOTE:-}" ]]; then
+  chat_args+=(--ssh "${QUANTUM_LLM_REMOTE}")
 fi
 case "${CHAT_SHOW_STATS:-1}" in
   1|true|TRUE|yes|YES) chat_args+=(--show-stats) ;;

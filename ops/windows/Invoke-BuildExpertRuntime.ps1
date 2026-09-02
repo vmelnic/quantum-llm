@@ -47,7 +47,7 @@ try {
     }
     Invoke-CheckedNative -Command $cmake -Arguments $configureArguments
     Invoke-CheckedNative -Command $cmake -Arguments @(
-        "--build", "--preset", $preset
+        "--build", "--preset", $preset, "--clean-first"
     )
     Invoke-CheckedNative -Command $ctest -Arguments @(
         "--preset", $preset

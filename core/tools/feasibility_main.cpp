@@ -51,7 +51,8 @@ expert::core::ManifestResources ParseManifest(std::string_view text) {
                              .AsObject("manifest.masses");
     RequireExactKeys(masses,
         {"source_tensor_bytes", "pack_bytes", "dense_bytes", "expert_bytes",
-         "active_expert_bytes_per_token"}, {}, "manifest.masses");
+         "active_expert_bytes_per_token", "resident_dense_bytes",
+         "host_mapped_dense_bytes"}, {}, "manifest.masses");
     const auto& requirements = Required(root, "requirements", "manifest")
                                    .AsObject("manifest.requirements");
     const auto& expert_entries = Required(root, "experts", "manifest")

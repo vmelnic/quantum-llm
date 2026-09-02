@@ -73,6 +73,10 @@ struct MoeSelectionBatchLaunch final {
   float swiglu_limit{};
   bool bf16_intermediate{};
   bool enable_packed_fp4{};
+  bool enable_native_nvfp4{};
+  float* nvfp4_gate_input{};                // [rows, top_k, hidden]
+  float* nvfp4_up_input{};                  // [rows, top_k, hidden]
+  float* nvfp4_down_input{};                // [rows, top_k, intermediate]
 };
 
 struct MoeAggregateLaunch final {
@@ -87,6 +91,9 @@ struct MoeAggregateLaunch final {
   std::uint32_t hidden_size{};
   std::uint32_t top_k{};
   void* stream{};
+  // Preserve checkpoints whose expert outputs, route products, and ordered
+  // accumulation are all executed in BF16.
+  bool bf16_accumulation{};
 };
 
 // Exact Expert Pack INT8-per-row decode path. The first launch computes fused

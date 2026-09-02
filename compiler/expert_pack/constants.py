@@ -38,7 +38,15 @@ FP4_QUANT_GROUP_SIZE = 32
 FP4_UE8M0_MIN_CODE = 1
 FP4_UE8M0_MAX_CODE = 254
 
-QUANT_PROFILES = (QUANT_PROFILE, FP4_QUANT_PROFILE)
+# Native NVIDIA FP4 checkpoint encoding. Packed E2M1 values use one E4M3FN
+# scale per 16 input values plus checkpoint-stored FP32 global divisors for
+# weights and activations. Unlike the block-32 profile above, this ABI copies
+# the source payload bit-for-bit and preserves its W4A4 arithmetic.
+NVFP4_QUANT_PROFILE = "nvfp4-e2m1-e4m3fn-block16-w4a4-v1"
+NVFP4_QUANT_ABI_ID = 5
+NVFP4_QUANT_GROUP_SIZE = 16
+
+QUANT_PROFILES = (QUANT_PROFILE, FP4_QUANT_PROFILE, NVFP4_QUANT_PROFILE)
 
 DENSE_MAGIC = b"EPDENS01"
 EXPERT_MAGIC = b"EPEXPR01"

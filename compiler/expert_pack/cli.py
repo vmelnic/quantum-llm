@@ -9,6 +9,7 @@ from .adapters import ADAPTERS, adapt_checkpoint
 from .compile import (
     CompileOptions,
     compile_checkpoint,
+    refresh_sampling_profiles,
     refresh_runtime_model_program,
 )
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE, QUANT_PROFILES
@@ -34,6 +35,7 @@ from .deepseek_slice import (
     export_deepseek_shared_set,
     qualify_deepseek_expert,
     qualify_deepseek_fp8_matrix,
+    qualify_deepseek_int8_organs,
     qualify_deepseek_compact_matrix,
     qualify_deepseek_shared_expert,
 )
@@ -59,6 +61,14 @@ def _parser() -> argparse.ArgumentParser:
     compile_parser.add_argument("--max-expert-pack-bytes", type=int, default=2 * 1024**3)
     compile_parser.add_argument("--source-id")
     compile_parser.add_argument("--source-revision")
+    compile_parser.add_argument("--config-file", default="config.json")
+    compile_parser.add_argument(
+        "--index-file", default="model.safetensors.index.json"
+    )
+    compile_parser.add_argument(
+        "--sampling-profiles", type=Path,
+        help="artifact-declared thinking/non-thinking sampling defaults",
+    )
     compile_parser.add_argument("--resume", action="store_true")
     compile_parser.add_argument(
         "--reclaim-source-shards", action="store_true",
@@ -88,12 +98,28 @@ def _parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument(
         "--adapter", choices=tuple(sorted(ADAPTERS)), required=True
     )
+    refresh_parser.add_argument("--config-file", default="config.json")
+    refresh_parser.add_argument(
+        "--index-file", default="model.safetensors.index.json"
+    )
+
+    sampling_parser = commands.add_parser(
+        "refresh-sampling-profiles",
+        help="clone a valid container and replace only sampling metadata",
+    )
+    sampling_parser.add_argument("--container", type=Path, required=True)
+    sampling_parser.add_argument("--output", type=Path, required=True)
+    sampling_parser.add_argument("--profiles", type=Path, required=True)
 
     inspect_parser = commands.add_parser(
         "inspect-source",
         help="validate all SafeTensors headers and report a read-only source inventory",
     )
     inspect_parser.add_argument("--source", type=Path, required=True)
+    inspect_parser.add_argument("--config-file", default="config.json")
+    inspect_parser.add_argument(
+        "--index-file", default="model.safetensors.index.json"
+    )
     inspect_parser.add_argument(
         "--tensor-groups",
         action="store_true",
@@ -131,6 +157,7 @@ def _parser() -> argparse.ArgumentParser:
     shared_slice_parser.add_argument("--source", type=Path, required=True)
     shared_slice_parser.add_argument("--layer", type=int, default=0)
     shared_slice_parser.add_argument("--row-chunk", type=int, default=128)
+    shared_slice_parser.add_argument("--no-torch-reference", action="store_true")
     dense_slice_parser = commands.add_parser(
         "qualify-deepseek-fp8-matrix",
         help="qualify one block-scaled FP8 dense matrix",
@@ -138,6 +165,23 @@ def _parser() -> argparse.ArgumentParser:
     dense_slice_parser.add_argument("--source", type=Path, required=True)
     dense_slice_parser.add_argument("--name", required=True)
     dense_slice_parser.add_argument("--row-chunk", type=int, default=128)
+    dense_slice_parser.add_argument("--no-torch-reference", action="store_true")
+    organ_gate_parser = commands.add_parser(
+        "qualify-deepseek-int8-organs",
+        help="gate FP8-to-INT8 loss on representative always-active organs",
+    )
+    organ_gate_parser.add_argument("--source", type=Path, required=True)
+    organ_gate_parser.add_argument(
+        "--layers", type=int, nargs="+", default=(0, 21, 42)
+    )
+    organ_gate_parser.add_argument("--row-chunk", type=int, default=128)
+    organ_gate_parser.add_argument(
+        "--maximum-weight-relative-l2", type=float, default=0.02
+    )
+    organ_gate_parser.add_argument(
+        "--maximum-projection-relative-l2", type=float, default=0.02
+    )
+    organ_gate_parser.add_argument("--minimum-cosine", type=float, default=0.999)
     compact_dense_parser = commands.add_parser(
         "qualify-deepseek-compact-matrix",
         help="screen compact symmetric dense candidates without publishing an ABI",
@@ -277,6 +321,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     max_expert_pack_bytes=args.max_expert_pack_bytes,
                     source_id=args.source_id,
                     source_revision=args.source_revision,
+                    sampling_profiles=args.sampling_profiles,
+                    config_file=args.config_file,
+                    index_file=args.index_file,
                     resume=args.resume,
                     reclaim_source_shards=args.reclaim_source_shards,
                 )
@@ -293,10 +340,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         elif args.command == "refresh-model-program":
             result = refresh_runtime_model_program(
-                args.container, args.output, args.source, args.adapter
+                args.container, args.output, args.source, args.adapter,
+                config_file=args.config_file, index_file=args.index_file,
+            )
+        elif args.command == "refresh-sampling-profiles":
+            result = refresh_sampling_profiles(
+                args.container, args.output, args.profiles
             )
         elif args.command == "inspect-source":
-            checkpoint = SafeTensorCheckpoint(args.source)
+            checkpoint = SafeTensorCheckpoint(
+                args.source, config_file=args.config_file,
+                index_file=args.index_file,
+            )
             result = inspect_source(
                 checkpoint,
                 include_tensor_groups=args.tensor_groups,
@@ -348,11 +403,24 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = qualify_deepseek_shared_expert(
                 SafeTensorCheckpoint(args.source), layer=args.layer,
                 row_chunk=args.row_chunk,
+                torch_reference=not args.no_torch_reference,
             )
         elif args.command == "qualify-deepseek-fp8-matrix":
             result = qualify_deepseek_fp8_matrix(
                 SafeTensorCheckpoint(args.source), name=args.name,
                 row_chunk=args.row_chunk,
+                torch_reference=not args.no_torch_reference,
+            )
+        elif args.command == "qualify-deepseek-int8-organs":
+            result = qualify_deepseek_int8_organs(
+                SafeTensorCheckpoint(args.source),
+                layers=tuple(args.layers),
+                row_chunk=args.row_chunk,
+                maximum_weight_relative_l2=args.maximum_weight_relative_l2,
+                maximum_projection_relative_l2=(
+                    args.maximum_projection_relative_l2
+                ),
+                minimum_cosine=args.minimum_cosine,
             )
         elif args.command == "qualify-deepseek-compact-matrix":
             result = qualify_deepseek_compact_matrix(

@@ -31,11 +31,11 @@ if ($actualBytes -ne [int64]$manifest.model_program.bytes -or
     $actualHash -ne [string]$manifest.model_program.sha256) {
     throw "Model artifact program does not match its authenticated manifest"
 }
-$header = @(Get-Content -LiteralPath $program -TotalCount 2)
-if ($header.Count -ne 2 -or $header[0] -ne "expert-runtime-model-v1") {
+$lines = @(Get-Content -LiteralPath $program)
+if ($lines.Count -lt 2 -or $lines[0] -ne "expert-runtime-model-v1") {
     throw "Model artifact program header is invalid"
 }
-$model = @([string]$header[1] -split "`t")
+$model = @([string]$lines[1] -split "`t")
 [uint32]$schema = 0
 [uint32]$maximumContext = 0
 if ($model.Count -lt 6 -or $model[0] -ne "model" -or
@@ -45,10 +45,28 @@ if ($model.Count -lt 6 -or $model[0] -ne "model" -or
     throw "Model artifact program descriptor is invalid"
 }
 
+[uint64]$minimumExactKvBytesPerToken = 0
+$seenMinimumExactKvBytesPerToken = $false
+foreach ($line in $lines) {
+    $fields = @([string]$line -split "`t")
+    if ($fields.Count -ne 3 -or $fields[0] -ne "attribute" -or
+        $fields[1] -ne "minimum_exact_kv_bytes_per_token") {
+        continue
+    }
+    if ($seenMinimumExactKvBytesPerToken -or
+        -not [uint64]::TryParse(
+            $fields[2], [ref]$minimumExactKvBytesPerToken) -or
+        $minimumExactKvBytesPerToken -eq 0) {
+        throw "Model artifact exact-KV resource attribute is invalid"
+    }
+    $seenMinimumExactKvBytesPerToken = $true
+}
+
 [PSCustomObject]@{
     schema_version = 1
     program_schema = $schema
     architecture_id = $model[2]
     maximum_context = $maximumContext
+    minimum_exact_kv_bytes_per_token = $minimumExactKvBytesPerToken
     program_sha256 = $actualHash
 } | ConvertTo-Json

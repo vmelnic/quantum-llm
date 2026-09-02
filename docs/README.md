@@ -1,56 +1,49 @@
 # Documentation
 
-Status: authoritative documentation index, 2026-08-26.
+Status: canonical documentation index, 2026-09-02.
 
-The repository documents the implementation that exists today, the evidence
-that has actually been measured, and the next accepted work. Detailed journals
-for abandoned experiments were removed; their durable conclusions are
-consolidated in [Research decisions](research-decisions.md), while the original
-material remains recoverable from Git history.
+These documents describe the current implementation and measured state.
+Historical experiment journals, inactive hardware inventories and detached
+model hypotheses are intentionally excluded; durable negative results are
+condensed in [Research decisions](research-decisions.md) and remain available
+in Git history.
 
-## Start here
+## System and status
 
 | Document | Purpose |
 |---|---|
-| [Architecture](architecture.md) | System boundaries, artifact VM, Qwen/Muse dense execution, Ornith hybrid execution, DeepSeek expert paging, KV and session state |
-| [Production readiness](production-readiness.md) | What is usable, what is not, and the release blockers |
+| [Architecture](architecture.md) | Artifact VM, providers, model organs, memory tiers and failure boundaries |
+| [Production readiness](production-readiness.md) | What is usable now and what blocks promotion |
 | [Benchmarks](benchmarks.md) | Canonical measurements and capacity/bandwidth equations |
-| [Roadmap](roadmap.md) | Dependency-ordered work that advances the active goals |
-| [Research decisions](research-decisions.md) | Rejected mechanisms, adopted exact-MoE work and evaluated hardware alternatives |
+| [Roadmap](roadmap.md) | Active dependency order only |
+| [Research decisions](research-decisions.md) | Rejected mechanisms and the evidence needed to reopen them |
 
 ## Build and operate
 
 | Document | Purpose |
 |---|---|
-| [Getting started](getting-started.md) | Host prerequisites, build, artifact preparation and first service run |
-| [Deployment](deployment.md) | Stable artifact publication and the supported lifecycle |
-| [Operations](operations.md) | Health, telemetry, diagnosis, rollback and cleanup |
-| [Pi CLI](pi-cli.md) | Local coding-agent configuration, thinking control and session behavior |
+| [Getting started](getting-started.md) | Configure, build, download, publish and run |
+| [Deployment](deployment.md) | Stable artifacts, aliases, lifecycle and release sequence |
+| [Operations](operations.md) | Health, telemetry, slow requests, failure recovery and cleanup |
+| [Pi CLI](pi-cli.md) | Coding-agent configuration, context and the current harness boundary |
 
 ## Interfaces and formats
 
 | Document | Purpose |
 |---|---|
-| [Expert Runtime contract](expert-runtime.md) | Program/provider ABI, worker protocol, placement and request lifecycle |
-| [Expert Pack v1](expert-pack-v1.md) | QPack records, manifest, FP4 encoding and publication rules |
-| [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Authenticated routed-expert storage and bundle layout |
-| [OpenAI-compatible API](openai-api.md) | Models, Completions, Chat Completions and Responses |
-| [Anthropic Messages API](anthropic-api.md) | Claude-compatible wire adapter and its explicit limitations |
-
-## Reference inventories
-
-| Document | Purpose |
-|---|---|
-| [Ubuntu node10 inventory](node10-ubuntu-inventory.md) | Read-only capability record for a machine explicitly outside the active serving architecture |
+| [Runtime contract](expert-runtime.md) | Program/provider negotiation, worker lifecycle and placement |
+| [Expert Pack v1](expert-pack-v1.md) | Current QPack record/container ABI |
+| [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Current compact expert and worker-bundle layout |
+| [OpenAI-compatible API](openai-api.md) | Implemented OpenAI request/streaming surface |
+| [Anthropic Messages API](anthropic-api.md) | Implemented adapter and its harness limitations |
 
 ## Claims policy
 
-- A configured context limit is not a populated-context result.
-- A short `hi` smoke proves lifecycle and basic generation, not quality or
-  maximum-context performance.
-- Post-first-token, end-to-end and aggregate rates are different metrics.
-- Qwen FP4 storage, exact F16 KV, DeepSeek FP4 routed experts, FP8 shared
-  tensors and FP32 runtime state are always reported separately.
-- A theoretical hardware ceiling is not a service result.
-- Removed research code is not a hidden roadmap; only
-  [Roadmap](roadmap.md) is active.
+- configured context, populated context and harness overhead are different;
+- a `hi` smoke proves wiring, not quality or maximum-context performance;
+- TTFT, total wall time, useful output and hidden reasoning are reported
+  separately when available;
+- FP4, NVFP4, INT8, BF16, F16 KV and runtime intermediates are never conflated;
+- a theoretical bandwidth ceiling or microbenchmark is not service throughput;
+- only [Roadmap](roadmap.md) is active work; rejected ideas stay in the decision
+  ledger unless new measured evidence changes their prerequisite.

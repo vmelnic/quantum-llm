@@ -306,6 +306,7 @@ Status ModelArtifact::load_expert_pack_v1(
           tensor.record_offset > pack->second ||
           tensor.stored_bytes > pack->second - tensor.record_offset ||
           (tensor.encoding != "I8" && tensor.encoding != "F32" &&
+           tensor.encoding != "I64" && tensor.encoding != "BF16" &&
            tensor.encoding != "FP4_E2M1"))
         throw std::invalid_argument("dense tensor index is invalid");
       candidate.dense_tensors_.push_back(std::move(tensor));
@@ -353,17 +354,28 @@ Status ModelArtifact::load_expert_pack_v1(
                                  .AsU64("expert.decoded_bytes");
       record.hidden = component.hidden_size;
       record.intermediate = component.intermediate_size;
-      record.quant_block_size = kExpertFp4BlockSize;
       record.source_abi = component.source_abi;
       record.record_abi = u32(
           Required(item, "quant_abi", "expert").AsU64("expert.quant_abi"),
           "expert record ABI");
+      record.quant_block_size =
+          record.record_abi == kExpertRecordAbiNvfp4Block16W4A4
+              ? kExpertNvfp4BlockSize
+              : kExpertFp4BlockSize;
       record.header_bytes = kExpertHeaderBytes;
       record.alignment = kExpertPackAlignment;
       record.payload_sha256 = digest(
           Required(item, "payload_sha256", "expert")
               .AsString("expert.payload_sha256"));
-      record.device_bytes =
+      const auto native_nvfp4 =
+          record.record_abi == kExpertRecordAbiNvfp4Block16W4A4;
+      record.device_bytes = native_nvfp4
+          ? 3ULL * (static_cast<std::uint64_t>(record.hidden) *
+                        record.intermediate / 2U +
+                    static_cast<std::uint64_t>(record.hidden) *
+                        record.intermediate / kExpertNvfp4BlockSize +
+                    2U * sizeof(float))
+          :
           (record.record_abi == kExpertRecordAbiFp4Block32 ||
            record.record_abi == kExpertRecordAbiFp4Relu2Block32)
               ? fp4_device_bytes(
@@ -378,7 +390,8 @@ Status ModelArtifact::load_expert_pack_v1(
           record.source_abi != kExpertSourceAbiExpertPackV1 ||
           (record.record_abi != kExpertRecordAbiInt8PerRow &&
            record.record_abi != kExpertRecordAbiFp4Block32 &&
-           record.record_abi != kExpertRecordAbiFp4Relu2Block32))
+           record.record_abi != kExpertRecordAbiFp4Relu2Block32 &&
+           record.record_abi != kExpertRecordAbiNvfp4Block16W4A4))
         throw std::invalid_argument("expert record index is invalid");
       present[index] = true;
     }

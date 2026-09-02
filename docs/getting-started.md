@@ -1,24 +1,24 @@
 # Getting started
 
-Status: supported setup path, 2026-08-26.
+Status: supported setup path, 2026-09-02.
 
-This project uses a POSIX control host and a self-contained Windows/CUDA
-execution host. The reference execution host is `3090box`; paths below are
-examples and all model storage is resolved through `MODEL_ROOT`.
+The control host is POSIX; the execution host is the self-contained Windows
+RTX 3090 machine. The repository may live at any path. `.env` supplies the
+remote project root and the only model-storage root.
 
 ## Prerequisites
 
-The Windows host needs:
+Execution host:
 
-- Windows 11, an NVIDIA driver exposing the RTX 3090, and CUDA Toolkit 12.x;
-- Visual Studio 2022 C++ build tools and CMake 3.25 or newer;
-- Python 3 and PowerShell with permission to create a scheduled task;
-- enough NVMe space for the immutable Hugging Face snapshot, conversion
-  candidate and published artifact;
+- Windows 11, RTX 3090 driver and CUDA Toolkit 12.x;
+- Visual Studio 2022 C++ tools and CMake 3.25 or newer;
+- Python 3 and PowerShell permission to create the scheduled task;
+- NVMe capacity for the pinned checkpoint, conversion candidate and published
+  artifact;
 - OpenSSH access from the control host.
 
-The control host needs Bash, Python 3, Git and SSH. The repository itself may
-live anywhere; `.env` supplies the remote project root and model root.
+Control host: Bash, Git, Python 3 and SSH. Pi is optional and required only for
+the coding-harness path.
 
 ## Configure
 
@@ -35,17 +35,17 @@ MODEL_ROOT=D:/quantum-llm/work/models
 EXPERT_API_KEY=<random-secret>
 ```
 
-`MODEL_ROOT` is the only model-storage root. Do not put per-model absolute
-paths in scripts or source. Keep `MODEL_HOST=127.0.0.1` when accessing the
-service through the managed SSH tunnel.
+`MODEL_ROOT` is the only host-dependent model root. Do not add per-model
+absolute paths to source, scripts or scheduled tasks. Keep
+`MODEL_HOST=127.0.0.1` when clients use the SSH tunnel.
 
-Inspect the resolved non-secret configuration before changing the host:
+Inspect resolved non-secret settings:
 
 ```bash
 ./ops/model.sh config qwen
 ```
 
-## Prepare the host
+## Prepare and build
 
 ```bash
 ./ops/model.sh sync
@@ -54,15 +54,14 @@ Inspect the resolved non-secret configuration before changing the host:
 ./ops/model.sh install
 ```
 
-The build script configures the `windows-msvc-release` preset, builds the
-native runtime, runs CTest and the supported Python contract suites. Server
-dependencies are installed from pinned `requirements/server.txt` into the
-repository-owned virtual environment.
+The Windows build is authoritative for CUDA. It configures the maintained MSVC
+preset, builds with `--clean-first`, runs CTest and runs the canonical Python
+contract suites. `cmake --fresh` alone is insufficient after an internal ABI
+change because it does not guarantee stale objects were removed.
 
-## Download a checkpoint
+## Download with Hugging Face Xet
 
-Hugging Face downloads are pinned to an immutable commit and use Xet through
-the repository scripts. Supply the exact repository byte and shard inventory:
+Pin an immutable revision and the expected inventory:
 
 ```bash
 ./ops/run-on-windows-host.sh Start-HuggingFaceModelDownload.ps1 \
@@ -75,12 +74,13 @@ the repository scripts. Supply the exact repository byte and shard inventory:
 ./ops/run-on-windows-host.sh Get-HuggingFaceModelDownload.ps1
 ```
 
-Do not use ad-hoc `curl`, parallel downloaders or `HF_HUB_DISABLE_XET`.
+For nonstandard repositories, declare the actual config/index filenames. The
+worker derives shard paths from the selected index. Do not use `curl`, an
+ad-hoc downloader, invented scheduled tasks or `HF_HUB_DISABLE_XET`.
 
-## Compile and publish hybrid FP4 models
+## Compile and publish
 
-The official checkpoint is compiled directly into a candidate below
-`MODEL_ROOT`, validated, then atomically promoted:
+Example Qwen publication:
 
 ```bash
 ./ops/run-on-windows-host.sh Publish-HuggingFaceExpertPack.ps1 \
@@ -91,20 +91,21 @@ The official checkpoint is compiled directly into a candidate below
   -QuantProfile fp4-e2m1-ue8m0-block32-v1
 ```
 
-`hybrid_delta` is the source adapter for checkpoints that declare the
-split-GatedDeltaNet hybrid Transformer ABI. Muse uses the strict
-`muse_glimmer` source adapter because its checkpoint declares different
-attention, normalization and vocabulary-head mathematics. Upstream family
-identifiers remain source metadata; both adapters publish the same executable
-program contract and neither creates a model-specific service or runner.
-Ornith is published with its pinned official source and stable name
-`ornith-1.5-35b-a3b-fp4`; Muse uses `muse-glimmer-30b-fp4`. See
-[Expert Pack v1](expert-pack-v1.md).
+Active source adapters are:
 
-DeepSeek uses its authenticated compact-bundle workflow documented in
-[DeepSeek compact pack v1](deepseek-compact-pack-v1.md).
+- `hybrid_delta`: Qwen3.8-27B and Ornith;
+- `qwen4_exp`: Qwen3.8-Flash-Next;
+- `mistral4_nvfp4`: Mistral Small 4 native NVFP4;
+- `muse_glimmer`: Muse-Glimmer.
 
-## First service run
+Adapters affect compilation only. Every published artifact uses the common VM
+and service lifecycle. DeepSeek uses the descriptor/oracle/compact-bundle
+workflow in [DeepSeek compact pack v1](deepseek-compact-pack-v1.md).
+
+Publication is candidate -> validate -> promote. Never point `.env`, an alias
+or a task at `.partial`, `.candidate` or a missing artifact.
+
+## Run
 
 ```bash
 ./ops/model.sh start qwen
@@ -113,9 +114,14 @@ DeepSeek uses its authenticated compact-bundle workflow documented in
 ./ops/model.sh stop all
 ```
 
-The real smoke prompt is `hi`. A successful smoke validates lifecycle and the
-common path; it is not a performance or quality qualification. Repeat the same
-commands with `muse`, `ornith` and `deepseek` when changing common
-runtime/service code.
+The lifecycle aliases are `qwen`, `qwen-flash`, `mistral`, `muse`, `ornith`
+and `deepseek`. A real `hi` validates wiring only. For a minimal Pi check:
 
-Continue with [Deployment](deployment.md) and [Operations](operations.md).
+```bash
+./ops/model.sh start qwen
+./ops/pi.sh qwen --no-context-files --no-tools --no-session -p hi
+./ops/model.sh stop all
+```
+
+Continue with [Deployment](deployment.md), [Operations](operations.md) and
+[Pi CLI](pi-cli.md).

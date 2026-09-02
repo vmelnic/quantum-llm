@@ -152,6 +152,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_compile_features(expert-dense-fp4-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-dense-fp4-cuda-smoke PRIVATE
     expert_runtime CUDA::cudart)
+  add_executable(expert-native-nvfp4-cuda-smoke
+    tools/native_nvfp4_cuda_smoke.cpp)
+  target_compile_features(expert-native-nvfp4-cuda-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-native-nvfp4-cuda-smoke PRIVATE
+    expert_runtime CUDA::cudart)
   add_executable(expert-deepseek-admission-smoke
     tools/deepseek_admission_smoke.cpp)
   target_compile_features(expert-deepseek-admission-smoke PRIVATE cxx_std_20)
@@ -276,5 +281,9 @@ if(EXPERT_RUNTIME_BUILD_TESTS)
   if(TARGET expert-dense-fp4-cuda-smoke)
     add_test(NAME expert-dense-fp4-cuda-smoke
       COMMAND expert-dense-fp4-cuda-smoke)
+  endif()
+  if(TARGET expert-native-nvfp4-cuda-smoke)
+    add_test(NAME expert-native-nvfp4-cuda-smoke
+      COMMAND expert-native-nvfp4-cuda-smoke)
   endif()
 endif()

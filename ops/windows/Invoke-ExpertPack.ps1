@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Compile", "Validate", "RefreshModelProgram")]
+    [ValidateSet("Compile", "Validate", "RefreshModelProgram", "RefreshSamplingProfiles")]
     [string]$Action,
     [Parameter(Mandatory = $true)]
     [string]$Path,
@@ -9,7 +9,10 @@ param(
     [string]$SourceId = "local-checkpoint",
     [string]$SourceRevision = "local",
     [string]$Adapter = "olmoe",
-    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1")]
+    [string]$SamplingProfiles = "",
+    [string]$ConfigFile = "config.json",
+    [string]$IndexFile = "model.safetensors.index.json",
+    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
     [string]$QuantProfile = "int8-symmetric-per-row-v1",
     [int64]$MaxExpertPackBytes = 4GB,
     [switch]$Resume,
@@ -36,11 +39,19 @@ try {
             "--source-id", $SourceId,
             "--source-revision", $SourceRevision,
             "--adapter", $Adapter,
+            "--config-file", $ConfigFile,
+            "--index-file", $IndexFile,
             "--quant-profile", $QuantProfile,
             "--max-expert-pack-bytes", [string]$MaxExpertPackBytes
         )
         if ($Resume) { $arguments += "--resume" }
         if ($ReclaimSourceShards) { $arguments += "--reclaim-source-shards" }
+        if (-not [string]::IsNullOrWhiteSpace($SamplingProfiles)) {
+            $arguments += @(
+                "--sampling-profiles",
+                [System.IO.Path]::GetFullPath($SamplingProfiles)
+            )
+        }
     }
     elseif ($Action -eq "RefreshModelProgram") {
         if ([string]::IsNullOrWhiteSpace($Output) -or
@@ -54,7 +65,23 @@ try {
             "--container", $resolvedPath,
             "--output", $resolvedOutput,
             "--source", $resolvedSource,
-            "--adapter", $Adapter
+            "--adapter", $Adapter,
+            "--config-file", $ConfigFile,
+            "--index-file", $IndexFile
+        )
+    }
+    elseif ($Action -eq "RefreshSamplingProfiles") {
+        if ([string]::IsNullOrWhiteSpace($Output) -or
+            [string]::IsNullOrWhiteSpace($SamplingProfiles)) {
+            throw "-Output and -SamplingProfiles are required for RefreshSamplingProfiles"
+        }
+        $resolvedOutput = [System.IO.Path]::GetFullPath($Output)
+        $resolvedProfiles = [System.IO.Path]::GetFullPath($SamplingProfiles)
+        $arguments = @(
+            "-m", "compiler", "refresh-sampling-profiles",
+            "--container", $resolvedPath,
+            "--output", $resolvedOutput,
+            "--profiles", $resolvedProfiles
         )
     }
     else {

@@ -3,7 +3,11 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Files = "",
+    [string]$ConfigFile = "config.json",
+    [string]$IndexFile = "model.safetensors.index.json",
     [Parameter(Mandatory = $true)][int]$MaxWorkers,
+    [Parameter(Mandatory = $true)][ValidateSet(0, 1)]
+    [int]$XetHighPerformance,
     [Parameter(Mandatory = $true)][string]$StdoutPath,
     [Parameter(Mandatory = $true)][string]$StderrPath,
     [Parameter(Mandatory = $true)][string]$StatusPath
@@ -16,9 +20,9 @@ $failure = $null
 $integrityChecked = $false
 try {
     # huggingface_hub uses hf_xet automatically when the package is installed.
-    # High-performance mode increases concurrency without changing the Hub cache
-    # layout, resumability, or Xet content verification.
-    $env:HF_XET_HIGH_PERFORMANCE = "1"
+    # Xet remains enabled in both modes. This flag controls whether Xet may
+    # maximize internal CPU, network, buffer, and range-request concurrency.
+    $env:HF_XET_HIGH_PERFORMANCE = [string]$XetHighPerformance
     $selectedFiles = @($Files -split ',' | Where-Object { $_ } | ForEach-Object {
         $_.Trim().Replace('\', '/')
     })
@@ -28,7 +32,7 @@ try {
         # complete immutable contract in the selected path list.
         $metadataArguments = @(
             "download", $ModelId,
-            "config.json", "model.safetensors.index.json",
+            $ConfigFile, $IndexFile,
             "--revision", $Revision,
             "--max-workers", "1",
             "--no-truncate"
@@ -100,7 +104,9 @@ finally {
         model_id = $ModelId
         revision = $Revision
         files = $selectedFiles
-        xet_high_performance = $true
+        config_file = $ConfigFile
+        index_file = $IndexFile
+        xet_high_performance = [bool]$XetHighPerformance
         integrity_checked = $integrityChecked
         started_utc = $started.ToString("o")
         finished_utc = [DateTime]::UtcNow.ToString("o")

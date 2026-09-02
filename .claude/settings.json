@@ -1,0 +1,25 @@
+{
+  "model": "qwen3.8-27b-fp4",
+  "effortLevel": "xhigh",
+  "alwaysThinkingEnabled": true,
+  "apiKeyHelper": "./ops/claude-api-key.sh",
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://10.10.88.4:8080",
+    "ANTHROPIC_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_DEFAULT_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qwen3.8-27b-fp4",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "qwen3.8-27b-fp4",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION": "qwen3.8-27b-fp4",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Qwen3.8-27B FP4 on 3090box",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION": "Local Quantum LLM Anthropic-compatible service",
+    "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES": "effort,thinking",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "262144",
+    "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "262144",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "32000",
+    "CLAUDE_CODE_MAX_RETRIES": "0",
+    "API_TIMEOUT_MS": "14400000"
+  }
+}

@@ -28,6 +28,8 @@ from .constants import (
     FP4_QUANT_ABI_ID,
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
+    NVFP4_QUANT_ABI_ID,
+    NVFP4_QUANT_GROUP_SIZE,
     HEADER_BYTES,
     PACK_ALIGNMENT,
     QUANT_ABI_ID,
@@ -76,11 +78,36 @@ def dense_record_size(
     alignment: int = PACK_ALIGNMENT,
     preserve_float32: bool = False,
     quant_abi: int = QUANT_ABI_ID,
+    preserve_int64: bool = False,
+    preserve_bfloat16: bool = False,
+    native_nvfp4=None,
 ) -> int:
+    if native_nvfp4 is not None:
+        rows, columns = native_nvfp4.logical_shape
+        data_bytes = rows * columns // 2
+        scale_bytes = (
+            rows * columns // NVFP4_QUANT_GROUP_SIZE +
+            native_nvfp4.weight_global_scale.nbytes +
+            native_nvfp4.input_global_scale.nbytes
+        )
+        return align_up(
+            align_up(HEADER_BYTES + data_bytes, SECTION_ALIGNMENT) +
+            scale_bytes,
+            alignment,
+        )
     elements = 1
     for dimension in info.shape:
         elements *= dimension
+    if preserve_int64 and info.dtype != "I64":
+        raise ValueError(f"raw I64 storage requires an I64 source: {info.name}")
+    if preserve_bfloat16 and info.dtype != "BF16":
+        raise ValueError(f"raw BF16 storage requires a BF16 source: {info.name}")
+    if preserve_int64 and preserve_bfloat16:
+        raise ValueError("dense tensor cannot preserve two raw encodings")
     quantized = (
+        not preserve_int64
+        and not preserve_bfloat16
+        and
         not preserve_float32
         and (
             quant_abi == FP4_QUANT_ABI_ID
@@ -99,7 +126,9 @@ def dense_record_size(
     elif quantized:
         raise ValueError(f"unsupported dense quant ABI {quant_abi}")
     else:
-        data_bytes = elements * 4
+        data_bytes = elements * (
+            8 if preserve_int64 else 2 if preserve_bfloat16 else 4
+        )
         scale_bytes = 0
     cursor = HEADER_BYTES + data_bytes
     if scale_bytes:
@@ -123,6 +152,19 @@ def expert_record_size(
     gated: bool = True,
 ) -> int:
     cursor = HEADER_BYTES
+    if quant_abi == NVFP4_QUANT_ABI_ID:
+        if not gated:
+            raise ValueError("native NVFP4 expert ABI requires SwiGLU")
+        _check_fp4_geometry(hidden, intermediate)
+        elements = hidden * intermediate
+        cursor += elements
+        cursor = align_up(cursor, SECTION_ALIGNMENT)
+        cursor += 2 * (elements // NVFP4_QUANT_GROUP_SIZE + 8)
+        cursor = align_up(cursor, SECTION_ALIGNMENT)
+        cursor += elements // 2
+        cursor = align_up(cursor, SECTION_ALIGNMENT)
+        cursor += elements // NVFP4_QUANT_GROUP_SIZE + 8
+        return align_up(cursor, alignment)
     if quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID):
         if (quant_abi == FP4_RELU2_EXPERT_ABI_ID) == gated:
             raise ValueError("expert record ABI disagrees with expert mathematics")
@@ -156,6 +198,9 @@ def write_dense_record(
     alignment: int = PACK_ALIGNMENT,
     preserve_float32: bool = False,
     quant_abi: int = QUANT_ABI_ID,
+    preserve_int64: bool = False,
+    preserve_bfloat16: bool = False,
+    native_nvfp4=None,
 ) -> RecordResult:
     start = handle.tell()
     if start % alignment:
@@ -163,7 +208,17 @@ def write_dense_record(
     write_zeros(handle, HEADER_BYTES)
     digest = hashlib.sha256()
     data_offset = HEADER_BYTES
+    if preserve_int64 and (preserve_float32 or preserve_bfloat16 or
+                           native_nvfp4 is not None or info.dtype != "I64"):
+        raise ValueError(f"invalid raw I64 storage declaration for {info.name}")
+    if preserve_bfloat16 and (preserve_float32 or native_nvfp4 is not None or
+                              info.dtype != "BF16"):
+        raise ValueError(f"invalid raw BF16 storage declaration for {info.name}")
     quantized = (
+        not preserve_int64
+        and not preserve_bfloat16
+        and native_nvfp4 is None
+        and
         not preserve_float32
         and (
             quant_abi == FP4_QUANT_ABI_ID
@@ -171,22 +226,65 @@ def write_dense_record(
         )
     )
 
-    with checkpoint.open_tensor(info.name) as view:
-        if quantized:
-            if quant_abi == FP4_QUANT_ABI_ID:
-                before = handle.tell()
-                scales = write_fp4_block32_rows(view, handle, digest)
-                data_bytes = handle.tell() - before
-            elif quant_abi == QUANT_ABI_ID:
-                scales = write_int8_rows(view, handle, digest)
-                data_bytes = info.nbytes // (
-                    2 if info.dtype in {"F16", "BF16"} else 4
-                )
+    logical_shape = info.shape
+    source_bytes = info.nbytes
+    source_tensors: dict[str, str] | None = None
+    if native_nvfp4 is not None:
+        if quant_abi != NVFP4_QUANT_ABI_ID or native_nvfp4.weight != info:
+            raise ValueError(f"invalid native NVFP4 declaration for {info.name}")
+        rows, columns = native_nvfp4.logical_shape
+        if (columns % NVFP4_QUANT_GROUP_SIZE or info.dtype != "U8" or
+                info.shape != (rows, columns // 2) or
+                native_nvfp4.scale.dtype != "F8_E4M3" or
+                native_nvfp4.scale.shape !=
+                    (rows, columns // NVFP4_QUANT_GROUP_SIZE) or
+                native_nvfp4.weight_global_scale.dtype != "F32" or
+                native_nvfp4.weight_global_scale.shape != (1,) or
+                native_nvfp4.input_global_scale.dtype not in {"F32", "BF16"} or
+                native_nvfp4.input_global_scale.shape != (1,)):
+            raise ValueError(f"native NVFP4 source geometry is invalid: {info.name}")
+        with checkpoint.open_tensor(info) as view:
+            payload = bytes(view.raw)
+        write_all(handle, payload)
+        digest.update(payload)
+        data_bytes = len(payload)
+        sidecars = bytearray()
+        source_tensors = {}
+        for role, tensor in (
+            ("scale", native_nvfp4.scale),
+            ("weight_global_scale", native_nvfp4.weight_global_scale),
+            ("input_global_scale", native_nvfp4.input_global_scale),
+        ):
+            with checkpoint.open_tensor(tensor) as view:
+                sidecars.extend(view.raw)
+            source_bytes += tensor.nbytes
+            source_tensors[role] = tensor.name
+        source_tensors["weight"] = info.name
+        scales = bytes(sidecars)
+        logical_shape = native_nvfp4.logical_shape
+    else:
+        with checkpoint.open_tensor(info) as view:
+            if quantized:
+                if quant_abi == FP4_QUANT_ABI_ID:
+                    before = handle.tell()
+                    scales = write_fp4_block32_rows(view, handle, digest)
+                    data_bytes = handle.tell() - before
+                elif quant_abi == QUANT_ABI_ID:
+                    scales = write_int8_rows(view, handle, digest)
+                    data_bytes = info.nbytes // (
+                        2 if info.dtype in {"F16", "BF16"} else 4
+                    )
+                else:
+                    raise ValueError(f"unsupported dense quant ABI {quant_abi}")
+            elif preserve_int64 or preserve_bfloat16:
+                payload = bytes(view.raw)
+                write_all(handle, payload)
+                digest.update(payload)
+                data_bytes = len(payload)
+                scales = b""
             else:
-                raise ValueError(f"unsupported dense quant ABI {quant_abi}")
-        else:
-            data_bytes = write_float32(view, handle, digest)
-            scales = b""
+                data_bytes = write_float32(view, handle, digest)
+                scales = b""
 
     scale_offset = 0
     scale_bytes = 0
@@ -204,7 +302,18 @@ def write_dense_record(
     stored_quant_abi = 0
     stored_dtype = "F32"
     layout = "row-major-f32"
-    if quantized:
+    if preserve_int64:
+        stored_dtype = "I64"
+        layout = "row-major-i64-le"
+    elif preserve_bfloat16:
+        stored_dtype = "BF16"
+        layout = "row-major-bfloat16-le"
+    elif native_nvfp4 is not None:
+        flags |= FLAG_SYMMETRIC
+        stored_quant_abi = NVFP4_QUANT_ABI_ID
+        stored_dtype = "FP4_E2M1"
+        layout = "row-major-nvfp4-e2m1-e4m3fn-block16-w4a4"
+    elif quantized:
         flags |= FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
         stored_quant_abi = quant_abi
         if quant_abi == FP4_QUANT_ABI_ID:
@@ -213,14 +322,14 @@ def write_dense_record(
         else:
             stored_dtype = "I8"
             layout = "output-major-row-contiguous-int8"
-    dimensions = _shape5(info.shape)
+    dimensions = _shape5(logical_shape)
     header = DENSE_HEADER_STRUCT.pack(
         DENSE_MAGIC,
         FORMAT_VERSION,
         HEADER_BYTES,
         flags,
         stored_quant_abi,
-        len(info.shape),
+        len(logical_shape),
         *dimensions,
         record_bytes,
         data_offset,
@@ -236,17 +345,19 @@ def write_dense_record(
     handle.seek(start + record_bytes)
 
     elements = 1
-    for dimension in info.shape:
+    for dimension in logical_shape:
         elements *= dimension
     entry: dict[str, object] = {
         "name": info.name,
         "pack": pack_name,
         "offset": start,
         "stored_bytes": record_bytes,
-        "source_bytes": info.nbytes,
-        "decoded_bytes": elements * 4,
+        "source_bytes": source_bytes,
+        "decoded_bytes": elements * (
+            8 if preserve_int64 else 2 if preserve_bfloat16 else 4
+        ),
         "source_dtype": info.dtype,
-        "source_shape": list(info.shape),
+        "source_shape": list(logical_shape),
         "stored_dtype": stored_dtype,
         "layout": layout,
         "quant_abi": stored_quant_abi,
@@ -256,6 +367,8 @@ def write_dense_record(
             "scales": {"offset": scale_offset, "bytes": scale_bytes},
         },
     }
+    if source_tensors is not None:
+        entry["source_tensors"] = source_tensors
     return RecordResult(entry=entry, end_offset=start + record_bytes)
 
 
@@ -269,7 +382,10 @@ def write_expert_record(
     alignment: int = PACK_ALIGNMENT,
     quant_abi: int = QUANT_ABI_ID,
 ) -> RecordResult:
-    fp4 = quant_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    native_nvfp4 = quant_abi == NVFP4_QUANT_ABI_ID
+    fp4 = quant_abi in (
+        FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID, NVFP4_QUANT_ABI_ID
+    )
     gated = expert.gate is not None
     if (quant_abi == FP4_RELU2_EXPERT_ABI_ID) == gated:
         raise ValueError("expert record ABI disagrees with expert mathematics")
@@ -284,17 +400,49 @@ def write_expert_record(
     digest = hashlib.sha256()
 
     def encode(view, destination, record_digest) -> bytes:
+        if native_nvfp4:
+            raise ValueError("native NVFP4 must be copied with its sidecars")
         if fp4:
             return write_fp4_block32_rows(view, destination, record_digest)
         return write_int8_rows(view, destination, record_digest)
 
+    def copy_native(matrix) -> bytes:
+        if matrix is None:
+            raise ValueError("native NVFP4 expert sidecar is absent")
+        rows, columns = matrix.logical_shape
+        if (columns % NVFP4_QUANT_GROUP_SIZE or
+                matrix.weight.dtype != "U8" or
+                matrix.weight.shape != (rows, columns // 2) or
+                matrix.scale.dtype != "F8_E4M3" or
+                matrix.scale.shape !=
+                    (rows, columns // NVFP4_QUANT_GROUP_SIZE) or
+                matrix.weight_global_scale.dtype != "F32" or
+                matrix.weight_global_scale.shape != (1,) or
+                matrix.input_global_scale.dtype != "F32" or
+                matrix.input_global_scale.shape != (1,)):
+            raise ValueError("native NVFP4 expert geometry is invalid")
+        with checkpoint.open_tensor(matrix.weight) as view:
+            payload = bytes(view.raw)
+        write_all(handle, payload)
+        digest.update(payload)
+        sidecars = bytearray()
+        for tensor in (matrix.scale, matrix.weight_global_scale,
+                       matrix.input_global_scale):
+            with checkpoint.open_tensor(tensor) as view:
+                sidecars.extend(view.raw)
+        return bytes(sidecars)
+
     gate_up_q_offset = HEADER_BYTES
     gate_scales = b""
-    if expert.gate is not None:
-        with checkpoint.open_tensor(expert.gate) as gate:
-            gate_scales = encode(gate, handle, digest)
-    with checkpoint.open_tensor(expert.up) as up:
-        up_scales = encode(up, handle, digest)
+    if native_nvfp4:
+        gate_scales = copy_native(expert.nvfp4_gate)
+        up_scales = copy_native(expert.nvfp4_up)
+    else:
+        if expert.gate is not None:
+            with checkpoint.open_tensor(expert.gate) as gate:
+                gate_scales = encode(gate, handle, digest)
+        with checkpoint.open_tensor(expert.up) as up:
+            up_scales = encode(up, handle, digest)
     if fp4:
         gate_up_q_bytes = (2 if gated else 1) * intermediate * hidden // 2
     else:
@@ -309,8 +457,11 @@ def write_expert_record(
 
     down_q_offset = align_up(handle.tell() - start, SECTION_ALIGNMENT)
     _pad_to(handle, start + down_q_offset, digest)
-    with checkpoint.open_tensor(expert.down) as down:
-        down_scales = encode(down, handle, digest)
+    if native_nvfp4:
+        down_scales = copy_native(expert.nvfp4_down)
+    else:
+        with checkpoint.open_tensor(expert.down) as down:
+            down_scales = encode(down, handle, digest)
     down_q_bytes = hidden * intermediate // 2 if fp4 else hidden * intermediate
 
     down_scale_offset = align_up(handle.tell() - start, SECTION_ALIGNMENT)
@@ -322,7 +473,9 @@ def write_expert_record(
     record_bytes = align_up(handle.tell() - start, alignment)
     _pad_to(handle, start + record_bytes, digest)
     payload_hash = digest.digest()
-    flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+    flags = FLAG_ROW_MAJOR | FLAG_SYMMETRIC
+    if not native_nvfp4:
+        flags |= FLAG_PER_ROW_SCALES
     if gated:
         flags |= FLAG_GATE_UP_FUSED
     header = EXPERT_HEADER_STRUCT.pack(
@@ -356,6 +509,18 @@ def write_expert_record(
     source_roles = (("gate", expert.gate),) if expert.gate is not None else ()
     source_roles += (("up", expert.up), ("down", expert.down))
     source_bytes = sum(tensor.nbytes for _, tensor in source_roles)
+    if native_nvfp4:
+        source_bytes = sum(
+            tensor.nbytes
+            for matrix in (
+                expert.nvfp4_gate, expert.nvfp4_up, expert.nvfp4_down
+            )
+            if matrix is not None
+            for tensor in (
+                matrix.weight, matrix.scale, matrix.weight_global_scale,
+                matrix.input_global_scale,
+            )
+        )
     decoded_bytes = ((3 if gated else 2) * hidden * intermediate) * 4
     entry: dict[str, object] = {
         "layer": expert.layer,
@@ -372,7 +537,12 @@ def write_expert_record(
         "stored_dtype": "FP4_E2M1" if fp4 else "I8",
         "layout": (
             ("gate-rows-then-up-rows;" if gated else "up-rows;")
-            + "down-output-major;row-contiguous-fp4-e2m1-block32"
+            + (
+                "down-output-major;row-contiguous-"
+                "nvfp4-e2m1-e4m3fn-block16-w4a4"
+                if native_nvfp4 else
+                "down-output-major;row-contiguous-fp4-e2m1-block32"
+            )
             if fp4
             else "gate-rows-then-up-rows;down-output-major;row-contiguous-int8"
         ),
@@ -402,6 +572,19 @@ def write_expert_record(
             "down_scales": {"offset": down_scale_offset, "bytes": down_scale_bytes},
         },
     }
+    if native_nvfp4:
+        entry["nvfp4_sidecars"] = {
+            role: {
+                "scale": matrix.scale.name,
+                "weight_global_scale": matrix.weight_global_scale.name,
+                "input_global_scale": matrix.input_global_scale.name,
+            }
+            for role, matrix in (
+                ("gate", expert.nvfp4_gate), ("up", expert.nvfp4_up),
+                ("down", expert.nvfp4_down),
+            )
+            if matrix is not None
+        }
     return RecordResult(entry=entry, end_offset=start + record_bytes)
 
 

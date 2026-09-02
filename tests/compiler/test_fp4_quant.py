@@ -20,8 +20,11 @@ from compiler.expert_pack.constants import (
 )
 from compiler.expert_pack.deepseek_quant import decode_scaled_fp4_e2m1_row
 from compiler.expert_pack.errors import SourceFormatError
-from compiler.expert_pack.quant import write_fp4_block32_rows
-from compiler.expert_pack.quality import qualify_container_against_source
+from compiler.expert_pack.quant import write_fp4_block32_rows, write_int8_rows
+from compiler.expert_pack.quality import (
+    _qualify_int8,
+    qualify_container_against_source,
+)
 from compiler.expert_pack.safetensors import SafeTensorCheckpoint
 from compiler.expert_pack.util import load_json
 from compiler.expert_pack.validate import validate_container
@@ -56,6 +59,19 @@ def _encode(view, use_numpy):
         destination = io.BytesIO()
         digest = hashlib.sha256()
         scales = write_fp4_block32_rows(view, destination, digest)
+        return destination.getvalue(), scales, digest.digest()
+    finally:
+        quant_module._np = previous
+
+
+def _encode_int8(view, use_numpy):
+    previous = quant_module._np
+    if not use_numpy:
+        quant_module._np = None
+    try:
+        destination = io.BytesIO()
+        digest = hashlib.sha256()
+        scales = write_int8_rows(view, destination, digest)
         return destination.getvalue(), scales, digest.digest()
     finally:
         quant_module._np = previous
@@ -254,6 +270,43 @@ class Fp4Block32EncoderTests(unittest.TestCase):
                     _encode(view, use_numpy=True)
 
 
+class Int8RowEncoderTests(unittest.TestCase):
+    def test_binary32_half_boundary_is_byte_identical_without_numpy(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [2.234375, 1.1171875]
+            with _open_single_tensor(root, "w", (1, 2), values) as view:
+                fallback_payload, fallback_scales, _ = _encode_int8(
+                    view, use_numpy=False
+                )
+            self.assertEqual(fallback_payload, bytes((127, 63)))
+
+            if quant_module._np is not None:
+                with _open_single_tensor(root, "w", (1, 2), values) as view:
+                    fast_payload, fast_scales, _ = _encode_int8(
+                        view, use_numpy=True
+                    )
+                self.assertEqual(fast_payload, fallback_payload)
+                self.assertEqual(fast_scales, fallback_scales)
+
+            entry = {
+                "name": "w",
+                "source_shape": [1, 2],
+                "offset": 0,
+                "sections": {
+                    "data": {"offset": 0, "bytes": 2},
+                    "scales": {"offset": 2, "bytes": 4},
+                },
+            }
+            packed = io.BytesIO(fallback_payload + fallback_scales)
+            with _open_single_tensor(root, "w", (1, 2), values) as view:
+                _, payload_bad, scale_bad = _qualify_int8(
+                    packed, view, entry, samples_per_tensor=1
+                )
+            self.assertEqual(payload_bad, 0)
+            self.assertEqual(scale_bad, 0)
+
+
 class Fp4ExpertPackCompileTests(unittest.TestCase):
     def test_fp4_source_quality_gate_is_artifact_driven_and_detects_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -278,6 +331,7 @@ class Fp4ExpertPackCompileTests(unittest.TestCase):
             )
             self.assertTrue(result["valid"])
             self.assertEqual(result["sampled"]["fp4_payload_mismatches"], 0)
+            self.assertEqual(result["sampled"]["int8_payload_mismatches"], 0)
             self.assertEqual(result["sampled"]["f32_value_mismatches"], 0)
             self.assertFalse(result["records"]["unreferenced"])
             fp4_values = result["aggregate"]["fp4"]["values"]

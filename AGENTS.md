@@ -113,6 +113,9 @@ transfer bytes/accepted token, or real harness throughput. Stop when it fails.
   intermediates separately. Never call INT8 `INT4` or `FP4`.
 - FP4 completion requires: FP4 payload exists; the selected provider executes
   that FP4 ABI; reference numerical quality passes; real service path passes.
+- A numerical oracle MUST be independent of the runtime path it validates.
+  Do not reuse the same decoder, scale direction, layout assumption, or helper
+  on both sides and call agreement a fidelity result.
 - Demand-paging completion requires selected experts loaded on demand and
   telemetry proving actual storage/RAM/VRAM traffic. Full startup residency is
   not a paging result.
@@ -186,6 +189,25 @@ Use the Windows Release/CUDA build and CTest path when native runtime code
 changes. For universal service changes, run real `model.sh chat` gates in this
 order: new/affected model, Qwen, DeepSeek. Test Pi only when harness behavior is
 part of the goal. Do not claim unrun gates.
+
+- `cmake --fresh` resets CMake configuration; it does NOT remove stale object
+  files or libraries. The canonical Windows Release/CUDA build MUST use
+  `--clean-first` before linking deployable binaries.
+- After any C++/CUDA header, launch-structure, provider ABI, quantization ABI,
+  or worker-protocol change: stop the service, sync source, run the canonical
+  clean build, then run gates on that exact produced binary. Never reuse a
+  pre-build chat result as release evidence.
+- If a native failure appears after an ABI/header change, reproduce it once on
+  the canonical clean build before editing inference code. A failure that
+  disappears after the clean rebuild is a build-integrity defect; fix the
+  build pipeline, not model logic.
+- Changing an aggregate launch/protocol structure requires auditing every
+  producer and consumer, every aggregate initializer, and a native test that
+  executes each affected provider path. Wire or artifact layout changes also
+  require the corresponding protocol/ABI version and fail-closed validation.
+- New-model qualification order is source/reference fidelity -> native
+  numerical gate -> direct `model.sh chat` -> streaming/tool transport -> real
+  harness. Do not skip a failed stage or call parser transport a coding pass.
 
 ## 9. Canonical pointers
 

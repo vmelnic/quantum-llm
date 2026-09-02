@@ -1002,6 +1002,330 @@ __global__ void bf16_gemv_batch_reuse_kernel(
   }
 }
 
+__global__ void bf16_embedding_batch_kernel(
+    const std::uint16_t* weights, const std::uint32_t* tokens,
+    float* output, std::uint32_t rows, std::uint32_t columns) {
+  const auto request = static_cast<std::uint32_t>(blockIdx.y);
+  const auto column = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                 threadIdx.x);
+  if (column >= columns) return;
+  const auto token = tokens[request];
+  if (token >= rows) return;
+  output[static_cast<std::size_t>(request) * columns + column] =
+      __uint_as_float(static_cast<unsigned>(
+          weights[static_cast<std::size_t>(token) * columns + column]) << 16U);
+}
+
+__device__ float nvfp4_round_e2m1(float value) {
+  const auto sign = value < 0.0F ? -1.0F : 1.0F;
+  const auto magnitude = fabsf(value);
+  float rounded = 0.0F;
+  if (magnitude > 5.0F) rounded = 6.0F;
+  else if (magnitude >= 3.5F) rounded = 4.0F;
+  else if (magnitude > 2.5F) rounded = 3.0F;
+  else if (magnitude >= 1.75F) rounded = 2.0F;
+  else if (magnitude > 1.25F) rounded = 1.5F;
+  else if (magnitude >= 0.75F) rounded = 1.0F;
+  else if (magnitude > 0.25F) rounded = 0.5F;
+  return sign * rounded;
+}
+
+__device__ float nvfp4_decode_e2m1(std::uint8_t code) {
+  constexpr float levels[8] = {0.0F, 0.5F, 1.0F, 1.5F,
+                               2.0F, 3.0F, 4.0F, 6.0F};
+  const auto value = levels[code & 0x07U];
+  return (code & 0x08U) != 0U ? -value : value;
+}
+
+__device__ float nvfp4_decode_e4m3fn(std::uint8_t code) {
+  return static_cast<float>(
+      *reinterpret_cast<const __nv_fp8_e4m3*>(&code));
+}
+
+__global__ void nvfp4_quant_dequant_kernel(
+    const float* input, float* output, std::uint32_t columns,
+    float global_scale) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto column = group * 16U + threadIdx.x;
+  if (threadIdx.x >= 16U || column >= columns) return;
+  const auto base = static_cast<std::size_t>(row) * columns + group * 16U;
+  __shared__ float values[16];
+  values[threadIdx.x] = fabsf(input[base + threadIdx.x]);
+  __syncthreads();
+  for (unsigned stride = 8U; stride != 0U; stride >>= 1U) {
+    if (threadIdx.x < stride)
+      values[threadIdx.x] = fmaxf(values[threadIdx.x],
+                                  values[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  auto local = fminf(448.0F, global_scale * values[0] / 6.0F);
+  local = static_cast<float>(__nv_fp8_e4m3(local));
+  const auto source = input[base + threadIdx.x];
+  const auto scaled = local == 0.0F
+      ? 0.0F
+      : fminf(6.0F, fmaxf(-6.0F, source * global_scale / local));
+  output[base + threadIdx.x] =
+      nvfp4_round_e2m1(scaled) * local / global_scale;
+}
+
+__global__ void nvfp4_gemv_batch_reuse_kernel(
+    const std::uint8_t* weights, const std::uint8_t* scales,
+    float weight_global_scale, const float* input, float* output,
+    std::uint32_t rows, std::uint32_t columns, std::uint32_t batch) {
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(blockIdx.x) *
+                       kWarpsPerBlock + warp;
+  if (row >= rows) return;
+  const auto* row_weights = weights + static_cast<std::size_t>(row) *
+                                          columns / 2U;
+  const auto* row_scales = scales + static_cast<std::size_t>(row) *
+                                        columns / 16U;
+  float partial[kMaximumWeightReuseBatch]{};
+  for (std::uint32_t column = lane; column < columns;
+       column += kWarpSize) {
+    const auto packed = row_weights[column / 2U];
+    const auto code = static_cast<std::uint8_t>(
+        (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+    const auto weight = nvfp4_decode_e2m1(code) *
+                        nvfp4_decode_e4m3fn(row_scales[column / 16U]) *
+                        weight_global_scale;
+    for (std::uint32_t request = 0U; request < batch; ++request)
+      partial[request] += weight *
+          input[static_cast<std::size_t>(request) * columns + column];
+  }
+  for (std::uint32_t request = 0U; request < batch; ++request) {
+    const auto sum = warp_sum(partial[request]);
+    if (lane == 0U)
+      output[static_cast<std::size_t>(request) * rows + row] =
+          __bfloat162float(__float2bfloat16_rn(sum));
+  }
+}
+
+__device__ float mistral_yarn_inverse_frequency(
+    std::uint32_t pair, std::uint32_t rope_dim, float theta, float factor,
+    float beta_fast, float beta_slow, std::uint32_t original_context) {
+  const auto base = powf(theta, (2.0F * static_cast<float>(pair)) /
+                                  static_cast<float>(rope_dim));
+  const auto unscaled = 1.0F / base;
+  const auto scaled = unscaled / factor;
+  const auto denominator = 2.0F * logf(theta);
+  const auto low = fmaxf(0.0F, floorf(
+      static_cast<float>(rope_dim) *
+      logf(static_cast<float>(original_context) /
+           (beta_fast * 2.0F * 3.14159265358979323846F)) / denominator));
+  const auto high = fminf(static_cast<float>(rope_dim - 1U), ceilf(
+      static_cast<float>(rope_dim) *
+      logf(static_cast<float>(original_context) /
+           (beta_slow * 2.0F * 3.14159265358979323846F)) / denominator));
+  const auto ramp = high == low
+      ? 1.0F
+      : fminf(1.0F, fmaxf(0.0F,
+          (static_cast<float>(pair) - low) / (high - low)));
+  // YaRN keeps the low-frequency end extrapolated and transitions the
+  // high-frequency end to position interpolation.
+  return scaled * ramp + unscaled * (1.0F - ramp);
+}
+
+__device__ std::uint16_t* mla_page_value(
+    const void* const* pages, std::uint32_t layer,
+    std::uint32_t page_tokens, std::uint32_t token,
+    std::uint32_t latent_width, std::uint32_t dimension) {
+  auto* page = reinterpret_cast<std::uint16_t*>(
+      const_cast<void*>(pages[token / page_tokens]));
+  const auto half = latent_width / 2U;
+  const auto offset = token % page_tokens;
+  const auto layer_base = static_cast<std::size_t>(layer) * 2U *
+                          page_tokens * half;
+  if (dimension < half)
+    return page + layer_base + static_cast<std::size_t>(offset) * half +
+           dimension;
+  return page + layer_base + static_cast<std::size_t>(page_tokens) * half +
+         static_cast<std::size_t>(offset) * half + dimension - half;
+}
+
+__global__ void mla_query_rope_kernel(
+    float* query, std::uint32_t heads, std::uint32_t nope_dim,
+    std::uint32_t rope_dim, std::uint32_t first_position, float theta,
+    float factor, float beta_fast, float beta_slow,
+    std::uint32_t original_context, float llama_beta) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto width = nope_dim + rope_dim;
+  auto* values = query + (static_cast<std::size_t>(row) * heads + head) *
+                             width;
+  const auto position = first_position + row;
+  const auto query_scale = 1.0F + llama_beta *
+      logf(1.0F + floorf(static_cast<float>(position) /
+                         static_cast<float>(original_context)));
+  if (dimension < nope_dim)
+    values[dimension] = __bfloat162float(
+        __float2bfloat16_rn(values[dimension] * query_scale));
+  __shared__ float rope[256];
+  if (dimension < rope_dim) rope[dimension] = values[nope_dim + dimension];
+  __syncthreads();
+  if (dimension < rope_dim / 2U) {
+    const auto angle = static_cast<float>(position) *
+        mistral_yarn_inverse_frequency(
+            dimension, rope_dim, theta, factor, beta_fast, beta_slow,
+            original_context);
+    const auto even = rope[2U * dimension];
+    const auto odd = rope[2U * dimension + 1U];
+    values[nope_dim + dimension] = __bfloat162float(__float2bfloat16_rn(
+        (even * cosf(angle) - odd * sinf(angle)) * query_scale));
+    values[nope_dim + rope_dim / 2U + dimension] =
+        __bfloat162float(__float2bfloat16_rn(
+            (odd * cosf(angle) + even * sinf(angle)) * query_scale));
+  }
+}
+
+__global__ void mla_store_latent_kernel(
+    float* latent, const void* const* pages, std::uint32_t layer,
+    std::uint32_t page_tokens, std::uint32_t kv_rank,
+    std::uint32_t rope_dim, std::uint32_t first_position, float theta,
+    float factor, float beta_fast, float beta_slow,
+    std::uint32_t original_context) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto width = kv_rank + rope_dim;
+  auto* values = latent + static_cast<std::size_t>(row) * width;
+  const auto position = first_position + row;
+  __shared__ float rope[256];
+  if (dimension < rope_dim) rope[dimension] = values[kv_rank + dimension];
+  __syncthreads();
+  if (dimension < kv_rank) {
+    const auto rounded = __float2bfloat16_rn(values[dimension]);
+    *mla_page_value(pages, layer, page_tokens, position, width, dimension) =
+        __bfloat16_as_ushort(rounded);
+  }
+  if (dimension < rope_dim / 2U) {
+    const auto angle = static_cast<float>(position) *
+        mistral_yarn_inverse_frequency(
+            dimension, rope_dim, theta, factor, beta_fast, beta_slow,
+            original_context);
+    const auto even = rope[2U * dimension];
+    const auto odd = rope[2U * dimension + 1U];
+    const auto first = __float2bfloat16_rn(
+        even * cosf(angle) - odd * sinf(angle));
+    const auto second = __float2bfloat16_rn(
+        odd * cosf(angle) + even * sinf(angle));
+    *mla_page_value(pages, layer, page_tokens, position, width,
+                    kv_rank + dimension) =
+        __bfloat16_as_ushort(first);
+    *mla_page_value(pages, layer, page_tokens, position, width,
+                    kv_rank + rope_dim / 2U + dimension) =
+        __bfloat16_as_ushort(second);
+  }
+}
+
+__global__ void mla_absorb_query_kernel(
+    const float* query, const std::uint16_t* kv_up, float* latent_query,
+    std::uint32_t heads, std::uint32_t kv_rank,
+    std::uint32_t nope_dim, std::uint32_t rope_dim,
+    std::uint32_t value_dim) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto latent_dimension = static_cast<std::uint32_t>(threadIdx.x);
+  if (latent_dimension >= kv_rank) return;
+  const auto query_width = nope_dim + rope_dim;
+  const auto* query_head = query +
+      (static_cast<std::size_t>(row) * heads + head) * query_width;
+  const auto* weight = kv_up + static_cast<std::size_t>(head) *
+      (nope_dim + value_dim) * kv_rank;
+  float total = 0.0F;
+  for (std::uint32_t dimension = 0U; dimension < nope_dim; ++dimension)
+    total += query_head[dimension] *
+        __uint_as_float(static_cast<unsigned>(
+            weight[static_cast<std::size_t>(dimension) * kv_rank +
+                   latent_dimension]) << 16U);
+  latent_query[(static_cast<std::size_t>(row) * heads + head) * kv_rank +
+               latent_dimension] = total;
+}
+
+__global__ void mla_attention_kernel(
+    const float* query, const float* latent_query,
+    const std::uint16_t* kv_up, const void* const* pages, float* output,
+    std::uint32_t layer, std::uint32_t page_tokens,
+    std::uint32_t first_position, std::uint32_t heads,
+    std::uint32_t kv_rank, std::uint32_t nope_dim,
+    std::uint32_t rope_dim, std::uint32_t value_dim,
+    float attention_scale) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto width = kv_rank + rope_dim;
+  const auto query_width = nope_dim + rope_dim;
+  const auto* query_head = query +
+      (static_cast<std::size_t>(row) * heads + head) * query_width;
+  const auto* absorbed = latent_query +
+      (static_cast<std::size_t>(row) * heads + head) * kv_rank;
+  __shared__ float reduction[kThreads];
+  __shared__ float accumulator[256];
+  __shared__ float maximum;
+  __shared__ float denominator;
+  __shared__ float old_scale;
+  __shared__ float new_scale;
+  if (dimension < kv_rank) accumulator[dimension] = 0.0F;
+  if (dimension == 0U) {
+    maximum = kNegativeInfinity;
+    denominator = 0.0F;
+  }
+  __syncthreads();
+  const auto visible = first_position + row + 1U;
+  for (std::uint32_t token = 0U; token < visible; ++token) {
+    float partial = 0.0F;
+    if (dimension < kv_rank) {
+      const auto bits = *mla_page_value(
+          pages, layer, page_tokens, token, width, dimension);
+      partial += absorbed[dimension] *
+          __uint_as_float(static_cast<unsigned>(bits) << 16U);
+    }
+    if (dimension < rope_dim) {
+      const auto bits = *mla_page_value(
+          pages, layer, page_tokens, token, width, kv_rank + dimension);
+      partial += query_head[nope_dim + dimension] *
+          __uint_as_float(static_cast<unsigned>(bits) << 16U);
+    }
+    reduction[dimension] = partial;
+    __syncthreads();
+    for (unsigned stride = kThreads / 2U; stride != 0U; stride >>= 1U) {
+      if (dimension < stride)
+        reduction[dimension] += reduction[dimension + stride];
+      __syncthreads();
+    }
+    if (dimension == 0U) {
+      const auto score = reduction[0] * attention_scale;
+      const auto next_maximum = fmaxf(maximum, score);
+      old_scale = expf(maximum - next_maximum);
+      new_scale = expf(score - next_maximum);
+      denominator = denominator * old_scale + new_scale;
+      maximum = next_maximum;
+    }
+    __syncthreads();
+    if (dimension < kv_rank) {
+      const auto bits = *mla_page_value(
+          pages, layer, page_tokens, token, width, dimension);
+      const auto value = __uint_as_float(static_cast<unsigned>(bits) << 16U);
+      accumulator[dimension] = accumulator[dimension] * old_scale +
+                               value * new_scale;
+    }
+    __syncthreads();
+  }
+  if (dimension < value_dim) {
+    const auto* weight = kv_up + static_cast<std::size_t>(head) *
+        (nope_dim + value_dim) * kv_rank +
+        static_cast<std::size_t>(nope_dim + dimension) * kv_rank;
+    float total = 0.0F;
+    for (std::uint32_t latent = 0U; latent < kv_rank; ++latent)
+      total += __uint_as_float(static_cast<unsigned>(weight[latent]) << 16U) *
+               (accumulator[latent] / denominator);
+    output[(static_cast<std::size_t>(row) * heads + head) * value_dim +
+           dimension] = __bfloat162float(__float2bfloat16_rn(total));
+  }
+}
+
 __global__ void rms_kernel(const float* input, const float* weight,
                            float* output, std::uint32_t count, float epsilon) {
   float square = 0.0F;
@@ -1043,6 +1367,36 @@ __global__ void rms_bf16_weight_batch_kernel(
         __uint_as_float(static_cast<unsigned>(weight[i]) << 16U);
     output[i] = input[i] * inverse * scale;
   }
+}
+
+__global__ void rms_bf16_weight_strided_batch_kernel(
+    const float* input, std::uint32_t input_stride,
+    const std::uint16_t* weight, float* output,
+    std::uint32_t output_stride, std::uint32_t count, float epsilon) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  input += static_cast<std::size_t>(row) * input_stride;
+  output += static_cast<std::size_t>(row) * output_stride;
+  float square = 0.0F;
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x)
+    square += input[index] * input[index];
+  square = reduce_sum(square);
+  const auto inverse = rsqrtf(square / static_cast<float>(count) + epsilon);
+  for (std::uint32_t index = threadIdx.x; index < count;
+       index += blockDim.x) {
+    const auto scale = __uint_as_float(
+        static_cast<unsigned>(weight[index]) << 16U);
+    output[index] = __bfloat162float(__float2bfloat16_rn(
+        input[index] * inverse * scale));
+  }
+}
+
+__global__ void round_bf16_kernel(float* values, std::uint64_t count) {
+  for (auto index = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x +
+                    threadIdx.x;
+       index < count; index += static_cast<std::uint64_t>(blockDim.x) *
+                               gridDim.x)
+    values[index] = __bfloat162float(__float2bfloat16_rn(values[index]));
 }
 
 __global__ void qwen_rms_kernel(const float* input, const float* weight,
@@ -1593,6 +1947,14 @@ __global__ void router_select_batch_kernel(
     for (std::uint32_t slot = 0; slot < top_k; ++slot)
       scores[slot] /= selected_sum;
   }
+}
+
+__global__ void scale_router_scores_kernel(float* scores,
+                                           std::uint32_t count,
+                                           float scale) {
+  const auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                threadIdx.x);
+  if (index < count) scores[index] *= scale;
 }
 
 __global__ void sigmoid_bias_router_select_batch_kernel(
@@ -2470,6 +2832,316 @@ __device__ float standard_rope_value(const float* source,
   const float other = dimension < half ? -source[dimension + half]
                                        : source[dimension - half];
   return source[dimension] * cosf(angle) + other * sinf(angle);
+}
+
+__global__ void hyper_repeat_kernel(
+    const float* hidden, float* hyper, std::uint32_t hidden_size,
+    std::uint32_t streams) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                threadIdx.x);
+  const auto width = hidden_size * streams;
+  if (index >= width) return;
+  hyper[static_cast<std::size_t>(row) * width + index] =
+      hidden[static_cast<std::size_t>(row) * hidden_size +
+             index % hidden_size];
+}
+
+__global__ void hyper_group_norm_kernel(
+    const float* hyper, const float* weight, float* normalized,
+    std::uint32_t hidden_size, std::uint32_t streams, float epsilon) {
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = group / streams;
+  const auto stream = group % streams;
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto base = (static_cast<std::size_t>(row) * streams + stream) *
+                    hidden_size;
+  float square = 0.0F;
+  for (auto index = dimension; index < hidden_size; index += blockDim.x) {
+    const auto value = hyper[base + index];
+    square += value * value;
+  }
+  square = reduce_sum(square);
+  const auto scale = rsqrtf(square / static_cast<float>(hidden_size) + epsilon);
+  for (auto index = dimension; index < hidden_size; index += blockDim.x)
+    normalized[base + index] =
+        hyper[base + index] * scale * (1.0F + weight[stream * hidden_size + index]);
+}
+
+__global__ void hyper_prepare_mix_kernel(
+    float* values, std::uint32_t elements, std::uint32_t streams) {
+  const auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                threadIdx.x);
+  if (index >= elements) return;
+  const auto value = values[index] / static_cast<float>(streams);
+  values[index] = value / (1.0F + expf(-value));
+}
+
+__global__ void hyper_finish_read_kernel(
+    const float* normalized, float* mix_weights, float* mixed_hidden,
+    float* injection_weights, std::uint32_t hidden_size,
+    std::uint32_t streams) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto width = hidden_size * streams;
+  for (auto index = dimension; index < width; index += blockDim.x) {
+    const auto absolute = static_cast<std::size_t>(row) * width + index;
+    const auto value = mix_weights[absolute];
+    mix_weights[absolute] = 1.0F / (1.0F + expf(-value));
+  }
+  if (dimension < streams) {
+    const auto absolute = static_cast<std::size_t>(row) * streams + dimension;
+    const auto value = injection_weights[absolute] /
+                       static_cast<float>(streams);
+    injection_weights[absolute] = 2.0F / (1.0F + expf(-value));
+  }
+  __syncthreads();
+  for (auto index = dimension; index < hidden_size; index += blockDim.x) {
+    float total = 0.0F;
+    for (std::uint32_t stream = 0U; stream < streams; ++stream) {
+      const auto absolute = static_cast<std::size_t>(row) * width +
+                            stream * hidden_size + index;
+      total += mix_weights[absolute] * normalized[absolute];
+    }
+    mixed_hidden[static_cast<std::size_t>(row) * hidden_size + index] =
+        total / static_cast<float>(streams);
+  }
+}
+
+__global__ void hyper_inject_kernel(
+    const float* retained, const float* hidden,
+    const float* injection_weights, float* output,
+    std::uint32_t hidden_size, std::uint32_t streams) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                threadIdx.x);
+  const auto width = hidden_size * streams;
+  if (index >= width) return;
+  const auto stream = index / hidden_size;
+  const auto dimension = index % hidden_size;
+  const auto absolute = static_cast<std::size_t>(row) * width + index;
+  output[absolute] = retained[absolute] +
+      injection_weights[static_cast<std::size_t>(row) * streams + stream] *
+      hidden[static_cast<std::size_t>(row) * hidden_size + dimension];
+}
+
+__global__ void ple_gate_kernel(
+    const float* normalized_key, const float* normalized_query,
+    const float* value, float* gated, std::uint32_t hidden_size,
+    std::uint32_t streams) {
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = group / streams;
+  const auto stream = group % streams;
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto base = (static_cast<std::size_t>(row) * streams + stream) *
+                    hidden_size;
+  float dot = 0.0F;
+  for (auto index = dimension; index < hidden_size; index += blockDim.x)
+    dot += normalized_key[base + index] * normalized_query[base + index];
+  dot = reduce_sum(dot) / sqrtf(static_cast<float>(hidden_size));
+  const auto signed_root = copysignf(sqrtf(fmaxf(fabsf(dot), 1.0e-6F)), dot);
+  const auto scale = 1.0F / (1.0F + expf(-signed_root));
+  for (auto index = dimension; index < hidden_size; index += blockDim.x)
+    gated[base + index] = scale *
+        value[static_cast<std::size_t>(row) * hidden_size + index];
+}
+
+__global__ void ple_dilated_conv_row_kernel(
+    const float* input, const float* weights, float* state, float* output,
+    std::uint32_t row, std::uint32_t channels, std::uint32_t kernel,
+    std::uint32_t dilation) {
+  const auto channel = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
+                                                  threadIdx.x);
+  if (channel >= channels) return;
+  const auto state_len = (kernel - 1U) * dilation;
+  auto* channel_state = state + static_cast<std::size_t>(channel) * state_len;
+  const auto current = input[static_cast<std::size_t>(row) * channels + channel];
+  float sum = 0.0F;
+  for (std::uint32_t tap = 0U; tap < kernel; ++tap) {
+    const auto lag = (kernel - 1U - tap) * dilation;
+    const auto source = lag == 0U ? current : channel_state[state_len - lag];
+    sum += weights[static_cast<std::size_t>(channel) * kernel + tap] * source;
+  }
+  for (std::uint32_t index = 1U; index < state_len; ++index)
+    channel_state[index - 1U] = channel_state[index];
+  if (state_len) channel_state[state_len - 1U] = current;
+  output[static_cast<std::size_t>(row) * channels + channel] =
+      sum / (1.0F + expf(-sum));
+}
+
+__global__ void qsa_prepare_index_kernel(
+    float* projected_qk, const float* query_norm_weight,
+    const void* const* page_table, std::uint32_t page_index_offset_bytes,
+    std::uint32_t index_layer, std::uint32_t page_tokens,
+    std::uint32_t first_position, std::uint32_t query_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta) {
+  __shared__ float normalized[256];
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto position = first_position + row;
+  auto* row_projection = projected_qk +
+      static_cast<std::size_t>(row) * (query_heads + 1U) * head_dim;
+  auto* query = row_projection + static_cast<std::size_t>(head) * head_dim;
+  float square = dimension < head_dim ? query[dimension] * query[dimension]
+                                      : 0.0F;
+  square = reduce_sum(square);
+  if (dimension < head_dim)
+    normalized[dimension] = query[dimension] *
+        rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+        (1.0F + query_norm_weight[dimension]);
+  __syncthreads();
+  if (dimension < head_dim)
+    query[dimension] = standard_rope_value(
+        normalized, dimension, rotary_dim, position, rope_theta);
+  if (head != 0U || dimension >= head_dim) return;
+  auto* page = static_cast<std::uint8_t*>(
+      const_cast<void*>(page_table[position / page_tokens]));
+  auto* index_base = reinterpret_cast<__half*>(page + page_index_offset_bytes) +
+      static_cast<std::size_t>(index_layer) * page_tokens * head_dim;
+  const auto local = position % page_tokens;
+  index_base[static_cast<std::size_t>(local) * head_dim + dimension] =
+      __float2half_rn(row_projection[
+          static_cast<std::size_t>(query_heads) * head_dim + dimension]);
+}
+
+__global__ void qsa_score_blocks_kernel(
+    const float* query, const void* const* page_table,
+    const float* key_norm_weight, float* scores,
+    std::uint32_t page_index_offset_bytes, std::uint32_t index_layer,
+    std::uint32_t page_tokens, std::uint32_t query_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim,
+    std::uint32_t compress_ratio, float epsilon, float rope_theta) {
+  __shared__ float normalized[256];
+  const auto block = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto first_token = block * compress_ratio;
+  float pooled = 0.0F;
+  if (dimension < head_dim) {
+    for (std::uint32_t item = 0U; item < compress_ratio; ++item) {
+      const auto token = first_token + item;
+      const auto* page = static_cast<const std::uint8_t*>(
+          page_table[token / page_tokens]);
+      const auto* index_base = reinterpret_cast<const __half*>(
+          page + page_index_offset_bytes) +
+          static_cast<std::size_t>(index_layer) * page_tokens * head_dim;
+      pooled += __half2float(index_base[
+          static_cast<std::size_t>(token % page_tokens) * head_dim + dimension]);
+    }
+    pooled /= static_cast<float>(compress_ratio);
+  }
+  auto square = reduce_sum(pooled * pooled);
+  if (dimension < head_dim)
+    normalized[dimension] = pooled *
+        rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+        (1.0F + key_norm_weight[dimension]);
+  __syncthreads();
+  const auto key = dimension < head_dim
+      ? standard_rope_value(normalized, dimension, rotary_dim,
+                            first_token, rope_theta)
+      : 0.0F;
+  float total = 0.0F;
+  for (std::uint32_t head = 0U; head < query_heads; ++head) {
+    auto dot = dimension < head_dim
+        ? query[static_cast<std::size_t>(head) * head_dim + dimension] * key
+        : 0.0F;
+    dot = reduce_sum(dot);
+    if (dimension == 0U) total += fmaxf(dot, 0.0F);
+    __syncthreads();
+  }
+  if (dimension == 0U)
+    scores[block] = total / sqrtf(static_cast<float>(head_dim));
+}
+
+__global__ void qsa_selected_attention_kernel(
+    const float* q_and_gate, const void* const* page_table,
+    const std::uint32_t* selected_tokens, float* output,
+    std::uint32_t selected_count, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto kv_head = head / (query_heads / kv_heads);
+  const auto* query = q_and_gate +
+      static_cast<std::size_t>(head) * 2U * head_dim;
+  const auto* gate = query + head_dim;
+  float maximum = kNegativeInfinity;
+  float sum = 0.0F;
+  float accumulator = 0.0F;
+  const auto page_values = static_cast<std::size_t>(page_tokens) * kv_heads *
+                           head_dim;
+  for (std::uint32_t item = 0U; item < selected_count; ++item) {
+    const auto token = selected_tokens[item];
+    const auto* page = static_cast<const __half*>(
+        page_table[token / page_tokens]);
+    const auto* key_page = page +
+        static_cast<std::size_t>(full_attention_layer) * 2U * page_values;
+    const auto* value_page = key_page + page_values;
+    const auto offset =
+        (static_cast<std::size_t>(token % page_tokens) * kv_heads + kv_head) *
+        head_dim;
+    auto dot = dimension < head_dim
+        ? query[dimension] * __half2float(key_page[offset + dimension])
+        : 0.0F;
+    dot = reduce_sum(dot) / sqrtf(static_cast<float>(head_dim));
+    const auto next_maximum = fmaxf(maximum, dot);
+    const auto old_scale = maximum == kNegativeInfinity
+        ? 0.0F : expf(maximum - next_maximum);
+    const auto new_scale = expf(dot - next_maximum);
+    if (dimension < head_dim)
+      accumulator = accumulator * old_scale +
+          new_scale * __half2float(value_page[offset + dimension]);
+    sum = sum * old_scale + new_scale;
+    maximum = next_maximum;
+    __syncthreads();
+  }
+  if (dimension < head_dim) {
+    const auto gate_scale = 1.0F / (1.0F + expf(-gate[dimension]));
+    output[static_cast<std::size_t>(head) * head_dim + dimension] =
+        accumulator / sum * gate_scale;
+  }
+}
+
+__global__ void qsa_selected_contiguous_attention_kernel(
+    const float* q_and_gate, const __half* keys, const __half* values,
+    const std::uint32_t* selected_tokens, float* output,
+    std::uint32_t selected_count, std::uint32_t query_heads,
+    std::uint32_t kv_heads, std::uint32_t head_dim) {
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto kv_head = head / (query_heads / kv_heads);
+  const auto* query = q_and_gate +
+      static_cast<std::size_t>(head) * 2U * head_dim;
+  const auto* gate = query + head_dim;
+  float maximum = kNegativeInfinity;
+  float sum = 0.0F;
+  float accumulator = 0.0F;
+  const auto row_values = static_cast<std::size_t>(kv_heads) * head_dim;
+  for (std::uint32_t item = 0U; item < selected_count; ++item) {
+    const auto token = selected_tokens ? selected_tokens[item] : item;
+    const auto offset = static_cast<std::size_t>(token) * row_values +
+        static_cast<std::size_t>(kv_head) * head_dim;
+    auto dot = dimension < head_dim
+        ? query[dimension] * __half2float(keys[offset + dimension])
+        : 0.0F;
+    dot = reduce_sum(dot) / sqrtf(static_cast<float>(head_dim));
+    const auto next_maximum = fmaxf(maximum, dot);
+    const auto old_scale = maximum == kNegativeInfinity
+        ? 0.0F : expf(maximum - next_maximum);
+    const auto new_scale = expf(dot - next_maximum);
+    if (dimension < head_dim)
+      accumulator = accumulator * old_scale +
+          new_scale * __half2float(values[offset + dimension]);
+    sum = sum * old_scale + new_scale;
+    maximum = next_maximum;
+    __syncthreads();
+  }
+  if (dimension < head_dim) {
+    const auto gate_scale = 1.0F / (1.0F + expf(-gate[dimension]));
+    output[static_cast<std::size_t>(head) * head_dim + dimension] =
+        accumulator / sum * gate_scale;
+  }
 }
 
 __global__ void standard_gqa_qkv_rope_fp16_batch_kernel(
@@ -3697,7 +4369,7 @@ __global__ void split_delta_recurrent_kernel(
     const float* a_log, const float* norm_weight, float* recurrent,
     float* output, std::uint32_t key_heads, std::uint32_t value_heads,
     std::uint32_t key_head_dim, std::uint32_t value_head_dim,
-    float epsilon) {
+    float epsilon, std::uint32_t output_gate_activation) {
   __shared__ float query[256];
   __shared__ float key[256];
   __shared__ float per_dimension[256];
@@ -3763,9 +4435,11 @@ __global__ void split_delta_recurrent_kernel(
     const float z =
         projected_z[static_cast<std::size_t>(value_head) * value_head_dim +
                     dimension];
+    const float sigmoid = 1.0F / (1.0F + expf(-z));
+    const float gate = output_gate_activation == 2U ? sigmoid : z * sigmoid;
     output[static_cast<std::size_t>(value_head) * value_head_dim + dimension] =
         core * rsqrtf(square / static_cast<float>(value_head_dim) + epsilon) *
-        norm_weight[dimension] * (z / (1.0F + expf(-z)));
+        norm_weight[dimension] * gate;
   }
 }
 
@@ -3883,7 +4557,8 @@ __global__ void split_delta_recurrent_prefill_kernel(
     const float* a_log, const float* norm_weight, float* recurrent,
     float* output, std::uint32_t rows, std::uint32_t key_heads,
     std::uint32_t value_heads, std::uint32_t key_head_dim,
-    std::uint32_t value_head_dim, float epsilon) {
+    std::uint32_t value_head_dim, float epsilon,
+    std::uint32_t output_gate_activation) {
   __shared__ float query[256];
   __shared__ float key[256];
   __shared__ float per_dimension[256];
@@ -3963,10 +4638,12 @@ __global__ void split_delta_recurrent_prefill_kernel(
           static_cast<std::size_t>(row) * value_dim +
           static_cast<std::size_t>(value_head) * value_head_dim + dimension;
       const float z = projected_z[value_index];
+      const float sigmoid = 1.0F / (1.0F + expf(-z));
+      const float gate = output_gate_activation == 2U ? sigmoid : z * sigmoid;
       output[value_index] =
           core *
           rsqrtf(square / static_cast<float>(value_head_dim) + epsilon) *
-          norm_weight[dimension] * (z / (1.0F + expf(-z)));
+          norm_weight[dimension] * gate;
     }
     __syncthreads();
   }
@@ -4429,6 +5106,14 @@ __global__ void topk_logits_kernel(const float* values, std::uint32_t count,
     }
     __syncthreads();
   }
+}
+
+__global__ void presence_penalty_kernel(float* logits,
+                                        const std::uint8_t* emitted,
+                                        std::uint32_t count,
+                                        float penalty) {
+  const auto index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count && emitted[index] != 0U) logits[index] -= penalty;
 }
 
 struct DeviceTopology final {
@@ -4999,6 +5684,93 @@ Status gemv_bf16_batch(const std::uint16_t* matrix, std::uint32_t rows,
   }
   return checked(cudaPeekAtLastError(), "weight-reuse bf16 batched gemv");
 }
+Status embedding_bf16_batch(
+    const std::uint16_t* matrix, std::uint32_t rows,
+    std::uint32_t columns, const std::uint32_t* tokens, float* output,
+    std::uint32_t batch, void* raw) noexcept {
+  if (!matrix || !tokens || !output || !rows || !columns || !batch)
+    return {ErrorCode::invalid_argument, "invalid BF16 embedding batch"};
+  const dim3 grid((columns + kThreads - 1U) / kThreads, batch);
+  bf16_embedding_batch_kernel<<<grid, kThreads, 0,
+                                static_cast<cudaStream_t>(raw)>>>(
+      matrix, tokens, output, rows, columns);
+  return checked(cudaPeekAtLastError(), "BF16 embedding batch");
+}
+Status nvfp4_gemv_f32_batch(
+    const Nvfp4Block16Matrix& matrix, const float* input, float* output,
+    float* quantized_dequantized_input, std::uint32_t batch,
+    void* raw) noexcept {
+  if (!matrix.weights || !matrix.scales || !input || !output ||
+      !quantized_dequantized_input || !matrix.rows || !matrix.columns ||
+      matrix.columns % 16U || !batch ||
+      !(matrix.weight_global_scale > 0.0F) ||
+      !(matrix.input_global_scale > 0.0F))
+    return {ErrorCode::invalid_argument, "invalid native NVFP4 GEMV"};
+  const auto stream = static_cast<cudaStream_t>(raw);
+  const dim3 quant_grid(matrix.columns / 16U, batch);
+  nvfp4_quant_dequant_kernel<<<quant_grid, 16U, 0, stream>>>(
+      input, quantized_dequantized_input, matrix.columns,
+      matrix.input_global_scale);
+  auto status = checked(cudaPeekAtLastError(),
+                        "native NVFP4 activation quant-dequant");
+  if (!status.ok()) return status;
+  const auto blocks = (matrix.rows + kWarpsPerBlock - 1U) /
+                      kWarpsPerBlock;
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto tile = std::min(kMaximumWeightReuseBatch, batch - first);
+    nvfp4_gemv_batch_reuse_kernel<<<blocks, kThreads, 0, stream>>>(
+        matrix.weights, matrix.scales, matrix.weight_global_scale,
+        quantized_dequantized_input +
+            static_cast<std::size_t>(first) * matrix.columns,
+        output + static_cast<std::size_t>(first) * matrix.rows,
+        matrix.rows, matrix.columns, tile);
+  }
+  return checked(cudaPeekAtLastError(), "native NVFP4 GEMV");
+}
+Status mla_causal_latent_bf16(const MlaCausalLaunch& launch) noexcept {
+  const auto latent_width = launch.kv_rank + launch.rope_dim;
+  if (!launch.query || !launch.latent || !launch.kv_up ||
+      !launch.page_table || !launch.output || !launch.latent_query ||
+      !launch.rows || !launch.heads || !launch.kv_rank ||
+      launch.kv_rank > kThreads || !launch.nope_dim || !launch.rope_dim ||
+      launch.rope_dim > 256U || launch.rope_dim % 2U ||
+      latent_width % 2U || !launch.value_dim || launch.value_dim > kThreads ||
+      !std::isfinite(launch.attention_scale) ||
+      !(launch.attention_scale > 0.0F) ||
+      !launch.page_tokens || !(launch.rope_theta > 0.0F) ||
+      !(launch.rope_factor > 0.0F) || !(launch.rope_beta_fast > 0.0F) ||
+      !(launch.rope_beta_slow > 0.0F) || !launch.rope_original_context)
+    return {ErrorCode::invalid_argument, "invalid compressed MLA launch"};
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  const dim3 query_grid(launch.heads, launch.rows);
+  mla_query_rope_kernel<<<query_grid, kThreads, 0, stream>>>(
+      launch.query, launch.heads, launch.nope_dim, launch.rope_dim,
+      launch.first_position, launch.rope_theta, launch.rope_factor,
+      launch.rope_beta_fast, launch.rope_beta_slow,
+      launch.rope_original_context, launch.llama4_beta);
+  auto status = checked(cudaPeekAtLastError(), "MLA query RoPE");
+  if (!status.ok()) return status;
+  mla_store_latent_kernel<<<launch.rows, kThreads, 0, stream>>>(
+      launch.latent, launch.page_table, launch.layer, launch.page_tokens,
+      launch.kv_rank, launch.rope_dim, launch.first_position,
+      launch.rope_theta, launch.rope_factor, launch.rope_beta_fast,
+      launch.rope_beta_slow, launch.rope_original_context);
+  status = checked(cudaPeekAtLastError(), "MLA latent cache commit");
+  if (!status.ok()) return status;
+  mla_absorb_query_kernel<<<query_grid, kThreads, 0, stream>>>(
+      launch.query, launch.kv_up, launch.latent_query, launch.heads,
+      launch.kv_rank, launch.nope_dim, launch.rope_dim, launch.value_dim);
+  status = checked(cudaPeekAtLastError(), "MLA absorbed query");
+  if (!status.ok()) return status;
+  mla_attention_kernel<<<query_grid, kThreads, 0, stream>>>(
+      launch.query, launch.latent_query, launch.kv_up, launch.page_table,
+      launch.output, launch.layer, launch.page_tokens,
+      launch.first_position, launch.heads, launch.kv_rank,
+      launch.nope_dim, launch.rope_dim, launch.value_dim,
+      launch.attention_scale);
+  return checked(cudaPeekAtLastError(), "compressed MLA attention");
+}
 Status bf16_gemm_f32_batch(
     const std::uint16_t* matrix, std::uint32_t rows,
     std::uint32_t columns, const float* input, float* output,
@@ -5050,6 +5822,32 @@ Status rms_norm_bf16_weight_batch(
       input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "batched bf16-weight rms norm");
 }
+Status rms_norm_bf16_weight_strided_batch(
+    const float* input, std::uint32_t input_stride,
+    const std::uint16_t* weight, float* output,
+    std::uint32_t output_stride, std::uint32_t rows,
+    std::uint32_t elements, float epsilon, void* raw) noexcept {
+  if (!input || !weight || !output || !input_stride || !output_stride ||
+      !rows || !elements || input_stride < elements ||
+      output_stride < elements || epsilon <= 0.0F)
+    return {ErrorCode::invalid_argument,
+            "invalid strided BF16-weight RMS norm"};
+  rms_bf16_weight_strided_batch_kernel<<<
+      rows, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      input, input_stride, weight, output, output_stride, elements, epsilon);
+  return checked(cudaPeekAtLastError(),
+                 "strided BF16-weight RMS norm");
+}
+Status round_bf16_in_place(float* values, std::uint64_t count,
+                           void* raw) noexcept {
+  if (!values || !count)
+    return {ErrorCode::invalid_argument, "invalid BF16 rounding launch"};
+  const auto blocks = static_cast<unsigned>(std::min<std::uint64_t>(
+      65535U, (count + kThreads - 1U) / kThreads));
+  round_bf16_kernel<<<blocks, kThreads, 0,
+                      static_cast<cudaStream_t>(raw)>>>(values, count);
+  return checked(cudaPeekAtLastError(), "BF16 rounding launch");
+}
 Status qwen3_next_rms_norm(const float* input, const float* weight,
                            float* output, std::uint32_t elements,
                            float epsilon, void* raw) noexcept {
@@ -5070,6 +5868,90 @@ Status zero_centered_rms_norm_batch(
                                   static_cast<cudaStream_t>(raw)>>>(
       input, weight, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "zero-centered RMS norm batch");
+}
+Status hyper_repeat_batch(
+    const float* hidden, float* hyper_state, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams, void* raw) noexcept {
+  if (!hidden || !hyper_state || !rows || !hidden_size || !streams)
+    return Status(ErrorCode::invalid_argument, "invalid Hyper repeat batch");
+  const auto width = hidden_size * streams;
+  const dim3 grid((width + kThreads - 1U) / kThreads, rows);
+  hyper_repeat_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      hidden, hyper_state, hidden_size, streams);
+  return checked(cudaPeekAtLastError(), "Hyper repeat batch");
+}
+Status hyper_group_norm_batch(
+    const float* hyper_state, const float* weight, float* normalized,
+    std::uint32_t rows, std::uint32_t hidden_size,
+    std::uint32_t streams, float epsilon, void* raw) noexcept {
+  if (!hyper_state || !weight || !normalized || !rows || !hidden_size || !streams ||
+      !(epsilon > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid Hyper group norm");
+  hyper_group_norm_kernel<<<rows * streams, kThreads, 0,
+                            static_cast<cudaStream_t>(raw)>>>(
+      hyper_state, weight, normalized, hidden_size, streams, epsilon);
+  return checked(cudaPeekAtLastError(), "Hyper group norm");
+}
+Status hyper_prepare_mix_batch(
+    float* lowrank, std::uint32_t elements, std::uint32_t streams,
+    void* raw) noexcept {
+  if (!lowrank || !elements || !streams)
+    return Status(ErrorCode::invalid_argument, "invalid Hyper mix input");
+  hyper_prepare_mix_kernel<<<(elements + kThreads - 1U) / kThreads, kThreads,
+                              0, static_cast<cudaStream_t>(raw)>>>(
+      lowrank, elements, streams);
+  return checked(cudaPeekAtLastError(), "Hyper mix input");
+}
+Status hyper_finish_read_batch(
+    const float* normalized, float* mix_weights, float* mixed_hidden,
+    float* injection_weights, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams, void* raw) noexcept {
+  if (!normalized || !mix_weights || !mixed_hidden || !injection_weights ||
+      !rows || !hidden_size || !streams || streams > kThreads)
+    return Status(ErrorCode::invalid_argument, "invalid Hyper read output");
+  hyper_finish_read_kernel<<<rows, kThreads, 0,
+                             static_cast<cudaStream_t>(raw)>>>(
+      normalized, mix_weights, mixed_hidden, injection_weights,
+      hidden_size, streams);
+  return checked(cudaPeekAtLastError(), "Hyper read output");
+}
+Status hyper_inject_batch(
+    const float* retained, const float* hidden,
+    const float* injection_weights, float* output, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams, void* raw) noexcept {
+  if (!retained || !hidden || !injection_weights || !output || !rows ||
+      !hidden_size || !streams)
+    return Status(ErrorCode::invalid_argument, "invalid Hyper injection");
+  const auto width = hidden_size * streams;
+  const dim3 grid((width + kThreads - 1U) / kThreads, rows);
+  hyper_inject_kernel<<<grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+      retained, hidden, injection_weights, output, hidden_size, streams);
+  return checked(cudaPeekAtLastError(), "Hyper injection");
+}
+Status ple_gate_batch(
+    const float* normalized_key, const float* normalized_query,
+    const float* value, float* gated, std::uint32_t rows,
+    std::uint32_t hidden_size, std::uint32_t streams, void* raw) noexcept {
+  if (!normalized_key || !normalized_query || !value || !gated || !rows ||
+      !hidden_size || !streams)
+    return Status(ErrorCode::invalid_argument, "invalid PLE gate");
+  ple_gate_kernel<<<rows * streams, kThreads, 0,
+                    static_cast<cudaStream_t>(raw)>>>(
+      normalized_key, normalized_query, value, gated, hidden_size, streams);
+  return checked(cudaPeekAtLastError(), "PLE gate");
+}
+Status ple_dilated_conv(const PleDilatedConvLaunch& launch) noexcept {
+  if (!launch.input || !launch.weights || !launch.state || !launch.output ||
+      !launch.rows || !launch.channels || launch.kernel < 2U ||
+      launch.kernel > 16U || !launch.dilation)
+    return Status(ErrorCode::invalid_argument, "invalid PLE dilated convolution");
+  const auto blocks = (launch.channels + kThreads - 1U) / kThreads;
+  const auto stream = static_cast<cudaStream_t>(launch.stream);
+  for (std::uint32_t row = 0U; row < launch.rows; ++row)
+    ple_dilated_conv_row_kernel<<<blocks, kThreads, 0, stream>>>(
+        launch.input, launch.weights, launch.state, launch.output, row,
+        launch.channels, launch.kernel, launch.dilation);
+  return checked(cudaPeekAtLastError(), "PLE dilated convolution");
 }
 Status rms_norm_batch(const float* input, const float* weight, float* output,
                       std::uint32_t rows, std::uint32_t elements,
@@ -5388,6 +6270,27 @@ Status router_topk_normalized_batch(
       logits, experts, top_k, scores, indices);
   return checked(cudaPeekAtLastError(), "normalized batched router select");
 }
+Status router_topk_normalized_logits_batch(
+    const float* logits, std::uint32_t rows, std::uint32_t experts,
+    std::uint32_t top_k, float routed_scaling_factor, float* scores,
+    std::uint32_t* indices, void* raw) noexcept {
+  if (!logits || !scores || !indices || !rows || !experts || !top_k ||
+      top_k > experts || top_k > kMaximumRouterTopK ||
+      !(routed_scaling_factor > 0.0F))
+    return {ErrorCode::invalid_argument,
+            "invalid normalized router-logit batch"};
+  const auto stream = static_cast<cudaStream_t>(raw);
+  router_select_batch_kernel<<<rows, kThreads, 0, stream>>>(
+      logits, experts, top_k, scores, indices);
+  auto status = checked(cudaPeekAtLastError(),
+                        "normalized router-logit select");
+  if (!status.ok() || routed_scaling_factor == 1.0F) return status;
+  const auto count = rows * top_k;
+  scale_router_scores_kernel<<<(count + kThreads - 1U) / kThreads,
+                               kThreads, 0, stream>>>(
+      scores, count, routed_scaling_factor);
+  return checked(cudaPeekAtLastError(), "scaled router scores");
+}
 Status sigmoid_bias_router_topk_batch(
     const float* input, const float* weights, const float* expert_bias,
     std::uint32_t rows, std::uint32_t hidden, std::uint32_t experts,
@@ -5635,6 +6538,80 @@ Status qwen3_next_attention_decode_paged_fp16(
       page_tokens, query_heads, kv_heads, head_dim);
   return checked(cudaPeekAtLastError(), "paged Qwen3-Next attention");
 }
+Status qsa_prepare_index(const QsaIndexPrepareLaunch& launch) noexcept {
+  if (!launch.projected_qk || !launch.query_norm_weight ||
+      !launch.page_table || !launch.page_tokens || !launch.rows ||
+      !launch.query_heads || !launch.head_dim || launch.head_dim > kThreads ||
+      !launch.rotary_dim || launch.rotary_dim > launch.head_dim ||
+      launch.rotary_dim % 2U || !(launch.epsilon > 0.0F) ||
+      !(launch.rope_theta > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid QSA index prepare");
+  qsa_prepare_index_kernel<<<
+      dim3(launch.query_heads, launch.rows), kThreads, 0,
+      static_cast<cudaStream_t>(launch.stream)>>>(
+      launch.projected_qk, launch.query_norm_weight, launch.page_table,
+      launch.page_index_offset_bytes, launch.index_layer,
+      launch.page_tokens, launch.first_position, launch.query_heads,
+      launch.head_dim, launch.rotary_dim, launch.epsilon,
+      launch.rope_theta);
+  return checked(cudaPeekAtLastError(), "QSA index prepare");
+}
+Status qsa_score_blocks(const QsaBlockScoreLaunch& launch) noexcept {
+  if (!launch.query || !launch.page_table || !launch.key_norm_weight ||
+      !launch.scores || !launch.page_tokens || !launch.visible_tokens ||
+      !launch.query_heads || !launch.head_dim || launch.head_dim > kThreads ||
+      !launch.rotary_dim || launch.rotary_dim > launch.head_dim ||
+      launch.rotary_dim % 2U || !launch.compress_ratio ||
+      !(launch.epsilon > 0.0F) || !(launch.rope_theta > 0.0F))
+    return Status(ErrorCode::invalid_argument, "invalid QSA block scores");
+  const auto blocks = launch.visible_tokens / launch.compress_ratio;
+  if (!blocks) return Status::success();
+  qsa_score_blocks_kernel<<<blocks, kThreads, 0,
+                            static_cast<cudaStream_t>(launch.stream)>>>(
+      launch.query, launch.page_table, launch.key_norm_weight, launch.scores,
+      launch.page_index_offset_bytes, launch.index_layer,
+      launch.page_tokens, launch.query_heads, launch.head_dim,
+      launch.rotary_dim, launch.compress_ratio, launch.epsilon,
+      launch.rope_theta);
+  return checked(cudaPeekAtLastError(), "QSA block scores");
+}
+Status qsa_selected_attention(
+    const QsaSelectedAttentionLaunch& launch) noexcept {
+  if (!launch.q_and_gate || !launch.page_table || !launch.selected_tokens ||
+      !launch.output || !launch.selected_count || !launch.page_tokens ||
+      !launch.query_heads || !launch.kv_heads ||
+      launch.query_heads % launch.kv_heads || !launch.head_dim ||
+      launch.head_dim > kThreads)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid QSA selected attention");
+  qsa_selected_attention_kernel<<<
+      launch.query_heads, kThreads, 0,
+      static_cast<cudaStream_t>(launch.stream)>>>(
+      launch.q_and_gate, launch.page_table, launch.selected_tokens,
+      launch.output, launch.selected_count, launch.full_attention_layer,
+      launch.page_tokens, launch.query_heads, launch.kv_heads,
+      launch.head_dim);
+  return checked(cudaPeekAtLastError(), "QSA selected attention");
+}
+
+Status qsa_selected_contiguous_attention(
+    const QsaSelectedContiguousAttentionLaunch& launch) noexcept {
+  if (!launch.q_and_gate || !launch.keys || !launch.values ||
+      !launch.output || !launch.selected_count || !launch.query_heads ||
+      !launch.kv_heads || launch.query_heads % launch.kv_heads != 0U ||
+      !launch.head_dim || launch.head_dim > kThreads)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid contiguous QSA selected attention");
+  qsa_selected_contiguous_attention_kernel<<<
+      launch.query_heads, kThreads, 0,
+      static_cast<cudaStream_t>(launch.stream)>>>(
+      launch.q_and_gate, reinterpret_cast<const __half*>(launch.keys),
+      reinterpret_cast<const __half*>(launch.values),
+      launch.selected_tokens, launch.output, launch.selected_count,
+      launch.query_heads, launch.kv_heads, launch.head_dim);
+  return checked(cudaPeekAtLastError(),
+                 "contiguous QSA selected attention");
+}
 Status gated_gqa_qkv_rope_cache_paged_fp4(
     float* q_and_gate, float* key, const float* value,
     const float* q_norm_weight, const float* k_norm_weight, void* page,
@@ -5766,7 +6743,9 @@ Status gated_gqa_qkv_rope_fp16_batch(
     void* raw) noexcept {
   if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
       !fp16_keys || !fp16_values || !rows || !query_heads || !kv_heads ||
-      query_heads % kv_heads || query_heads / kv_heads > 8U || !head_dim ||
+      query_heads % kv_heads ||
+      query_heads / kv_heads > kMaximumExactFp16GroupedQueryHeads ||
+      !head_dim ||
       head_dim > kThreads || head_dim % 32U || !rotary_dim ||
       rotary_dim > head_dim || rotary_dim % 2U || !(epsilon > 0.0F) ||
       !(rope_theta > 0.0F) ||
@@ -6588,6 +7567,8 @@ Status qwen3_next_delta_decode(const Qwen3NextDeltaLaunch& launch) noexcept {
   return checked(cudaPeekAtLastError(), "Qwen3-Next delta recurrent");
 }
 Status split_gated_delta_decode(const SplitGatedDeltaLaunch& launch) noexcept {
+  const auto activation = static_cast<std::uint32_t>(
+      launch.output_gate_activation);
   if (!launch.projected_qkv || !launch.projected_z ||
       !launch.projected_b || !launch.projected_a || !launch.conv_weights ||
       !launch.dt_bias || !launch.a_log || !launch.norm_weight ||
@@ -6596,7 +7577,8 @@ Status split_gated_delta_decode(const SplitGatedDeltaLaunch& launch) noexcept {
       launch.value_heads % launch.key_heads || !launch.key_head_dim ||
       launch.key_head_dim > kThreads || !launch.value_head_dim ||
       launch.value_head_dim > kThreads || !launch.conv_kernel ||
-      launch.conv_kernel > 16U || launch.epsilon <= 0.0F)
+      launch.conv_kernel > 16U || launch.epsilon <= 0.0F ||
+      (activation != 1U && activation != 2U))
     return Status(ErrorCode::invalid_argument,
                   "invalid split gated-delta launch");
   const auto key_dim = launch.key_heads * launch.key_head_dim;
@@ -6615,11 +7597,13 @@ Status split_gated_delta_decode(const SplitGatedDeltaLaunch& launch) noexcept {
       launch.conv_output, launch.dt_bias, launch.a_log, launch.norm_weight,
       launch.recurrent_state, launch.output, launch.key_heads,
       launch.value_heads, launch.key_head_dim, launch.value_head_dim,
-      launch.epsilon);
+      launch.epsilon, activation);
   return checked(cudaPeekAtLastError(), "split delta recurrent");
 }
 Status split_gated_delta_prefill(
     const SplitGatedDeltaPrefillLaunch& launch) noexcept {
+  const auto activation = static_cast<std::uint32_t>(
+      launch.output_gate_activation);
   if (!launch.projected_qkv || !launch.projected_z ||
       !launch.projected_b || !launch.projected_a || !launch.conv_weights ||
       !launch.dt_bias || !launch.a_log || !launch.norm_weight ||
@@ -6629,7 +7613,7 @@ Status split_gated_delta_prefill(
       !launch.key_head_dim || launch.key_head_dim > kThreads ||
       !launch.value_head_dim || launch.value_head_dim > kThreads ||
       !launch.conv_kernel || launch.conv_kernel > 16U ||
-      launch.epsilon <= 0.0F)
+      launch.epsilon <= 0.0F || (activation != 1U && activation != 2U))
     return Status(ErrorCode::invalid_argument,
                   "invalid split gated-delta prefill launch");
   const auto key_dim = launch.key_heads * launch.key_head_dim;
@@ -6649,7 +7633,7 @@ Status split_gated_delta_prefill(
       launch.conv_output, launch.dt_bias, launch.a_log, launch.norm_weight,
       launch.recurrent_state, launch.output, launch.rows, launch.key_heads,
       launch.value_heads, launch.key_head_dim, launch.value_head_dim,
-      launch.epsilon);
+      launch.epsilon, activation);
   return checked(cudaPeekAtLastError(),
                  "split gated-delta prefill recurrent");
 }
@@ -6734,6 +7718,19 @@ Status topk_logits(const float* values, std::uint32_t count,
   topk_logits_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
       values, count, top_k, output_values, output_indices);
   return checked(cudaPeekAtLastError(), "top-k logits");
+}
+
+Status apply_presence_penalty(float* logits, const std::uint8_t* emitted,
+                              std::uint32_t count, float penalty,
+                              void* raw) noexcept {
+  if (!logits || !emitted || !count || !std::isfinite(penalty) ||
+      penalty < -2.0F || penalty > 2.0F)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid presence penalty");
+  presence_penalty_kernel<<<(count + kThreads - 1U) / kThreads, kThreads, 0,
+                              static_cast<cudaStream_t>(raw)>>>(
+      logits, emitted, count, penalty);
+  return checked(cudaPeekAtLastError(), "presence penalty");
 }
 
 }  // namespace expert::runtime::cuda

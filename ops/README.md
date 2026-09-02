@@ -1,8 +1,8 @@
 # Operations automation
 
-`ops/` contains the supported control-host and Windows-host workflows. Product
-code is in `compiler/`, `core/` and `runtime/`; generated work, logs and model
-artifacts do not belong here.
+`ops/` is the supported control-host and Windows-host surface. Runtime code is
+in `compiler/`, `core/` and `runtime/`; generated models, builds, logs and
+caches do not belong here.
 
 ## Control-host commands
 
@@ -13,57 +13,48 @@ artifacts do not belong here.
 ./ops/model.sh start qwen
 ./ops/model.sh status
 ./ops/model.sh chat qwen
+./ops/pi.sh qwen
 ./ops/model.sh stop all
-
-./ops/model.sh start deepseek
-./ops/pi.sh deepseek
 ```
 
-`model.sh` reads `.env`, resolves aliases from `model-aliases.tsv` and invokes
-one common scheduled task/native VM. It contains no family runner or per-model
-absolute storage root. Sync copies Git-visible files only and never deletes
-remote `work/`, builds or `${MODEL_ROOT}`.
+`model.sh` reads `.env`, resolves `ops/model-aliases.tsv` and controls one
+scheduled task and one common VM. `start` optionally syncs Git-visible files,
+validates the selected artifact contract, clamps limits to artifact geometry,
+stops the previous service, starts the selected artifact and waits for matching
+readiness. Sync never copies or deletes ignored model/build/cache state.
 
-`chat.sh` owns an optional SSH tunnel and streams the local API with timings.
-`pi.sh` selects the common Pi provider, exact advertised model and `xhigh`
-thinking. See [Pi CLI](../docs/pi-cli.md).
+`chat.sh` opens the optional SSH tunnel and reports prompt/output timing.
+`pi.sh` selects the same provider/model registry and defaults to `xhigh`
+thinking; all additional Pi arguments pass through unchanged.
 
 ## Windows workflows
 
-The maintained PowerShell surface is grouped by purpose:
-
-- host/build: `Invoke-Bootstrap.ps1`, `Invoke-Inventory.ps1`,
+- host and build: `Invoke-Bootstrap.ps1`, `Invoke-Inventory.ps1`,
   `Invoke-BuildExpertRuntime.ps1`, `Install-ServerEnvironment.ps1`;
-- Hugging Face Xet: `Start-HuggingFaceModelDownload.ps1`, its worker and
+- Hugging Face Xet: `Start-HuggingFaceModelDownload.ps1`,
+  `Invoke-HuggingFaceDownloadWorker.ps1`,
   `Get-HuggingFaceModelDownload.ps1`;
-- Hugging Face QPack artifacts: `Invoke-SourceInventory.ps1`,
-  `Invoke-ExpertPack.ps1`,
-  `Invoke-Fp4SourceQualityGate.ps1`,
-  `Publish-HuggingFaceExpertPack.ps1`, `Promote-ModelArtifact.ps1`;
-- DeepSeek artifact: `Start-DeepSeekV4FlashDownload.ps1`, descriptor/oracle
-  exporters, `Invoke-DeepSeekCompactPack.ps1` and
-  `Publish-DeepSeekWorkerBundle.ps1`;
+- QPack publication: `Invoke-SourceInventory.ps1`, `Invoke-ExpertPack.ps1`,
+  source-quality gates, `Publish-HuggingFaceExpertPack.ps1` and
+  `Promote-ModelArtifact.ps1`;
+- DeepSeek publication: source inspection/descriptors/oracles,
+  `Invoke-DeepSeekCompactPack.ps1` and `Publish-DeepSeekWorkerBundle.ps1`;
 - service: `Get-ModelArtifactContract.ps1`, `Start-ExpertServer.ps1`,
-  `Install-ExpertServerTask.ps1`, `Get-ExpertServerStatus.ps1`,
-  `Stop-ExpertServer.ps1` and uninstall;
-- reference behavior: the pinned Hugging Face reference environment and
-  bounded behavior gates.
+  `Install-ExpertServerTask.ps1`, `Get-ExpertServerStatus.ps1` and
+  `Stop-ExpertServer.ps1`;
+- network maintenance: `Set-WireGuardSplitTunnel.ps1` for the documented
+  split-tunnel configuration on 3090box.
 
-Former P6/Qwen3-Next deployment, Neural CPU, exact-tier and background
-compact-pack wrappers were removed. Their durable negative results live in
-[Research decisions](../docs/research-decisions.md), not in an ambiguous
-second operator path.
+## Operational invariants
 
-## Safety rules
-
-- downloads use only the pinned Xet scripts;
-- host model paths derive only from `MODEL_ROOT`;
-- artifacts are candidates until validated and transactionally promoted;
-- start checks the pinned server environment before replacing a model;
-- release gates test Qwen, Muse, Ornith and DeepSeek through the same public
-  chat path;
-- stop and verify process/GPU cleanup after every gate;
-- no normal script deletes a published model or Hugging Face cache.
+- model storage derives only from `MODEL_ROOT`;
+- downloads use the two maintained Xet entry points, never ad-hoc transfer;
+- publish candidate -> validate -> promote -> start -> real smoke -> stop;
+- the Windows Release/CUDA build uses `--clean-first`; `cmake --fresh` alone
+  does not prove objects were rebuilt after an internal ABI change;
+- a release gate ends with process and GPU cleanup;
+- no normal lifecycle command deletes a published model or Hugging Face cache.
 
 See [Getting started](../docs/getting-started.md),
-[Deployment](../docs/deployment.md) and [Operations](../docs/operations.md).
+[Deployment](../docs/deployment.md), [Operations](../docs/operations.md) and
+[Pi CLI](../docs/pi-cli.md).

@@ -18,6 +18,9 @@ from .constants import (
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     FP4_QUANT_PROFILE,
+    NVFP4_QUANT_ABI_ID,
+    NVFP4_QUANT_GROUP_SIZE,
+    NVFP4_QUANT_PROFILE,
     HASH_ALGORITHM,
     MANIFEST_SCHEMA,
     MIN_RUNTIME_VERSION,
@@ -30,7 +33,7 @@ from .constants import (
     SECTION_ALIGNMENT,
     TOKENIZER_FILES,
 )
-from .errors import ResumeError
+from .errors import ResumeError, ValidationError
 from .safetensors import SafeTensorCheckpoint
 from .util import (
     atomic_json,
@@ -59,6 +62,9 @@ class CompileOptions:
     max_expert_pack_bytes: int = 2 * 1024 * 1024 * 1024
     source_id: str | None = None
     source_revision: str | None = None
+    sampling_profiles: Path | None = None
+    config_file: str = "config.json"
+    index_file: str = "model.safetensors.index.json"
     resume: bool = False
     reclaim_source_shards: bool = False
 
@@ -71,11 +77,59 @@ def _link_or_copy(source: str, destination: str) -> str:
         return shutil.copy2(source, destination)
 
 
+_SAMPLING_PROFILE_NAMES = frozenset(("thinking", "non_thinking"))
+_SAMPLING_PROFILE_FIELDS = frozenset((
+    "temperature", "top_p", "top_k", "min_p", "presence_penalty",
+    "frequency_penalty", "repetition_penalty",
+))
+
+
+def validate_sampling_profiles(value: object) -> dict[str, object]:
+    """Validate artifact-declared, harness-overridable sampling defaults."""
+    if not isinstance(value, dict) or value.get("schema") != "sampling-profiles-v1":
+        raise ValueError("sampling profiles have an unsupported schema")
+    profiles = value.get("profiles")
+    if not isinstance(profiles, dict) or set(profiles) != _SAMPLING_PROFILE_NAMES:
+        raise ValueError("sampling profiles must declare thinking and non_thinking")
+    for name, profile in profiles.items():
+        if not isinstance(profile, dict) or set(profile) != _SAMPLING_PROFILE_FIELDS:
+            raise ValueError(f"sampling profile {name!r} has unknown or missing fields")
+        numeric = (
+            "temperature", "top_p", "min_p", "presence_penalty",
+            "frequency_penalty", "repetition_penalty",
+        )
+        if any(isinstance(profile[field], bool) or
+               not isinstance(profile[field], (int, float)) for field in numeric):
+            raise ValueError(f"sampling profile {name!r} has a non-numeric value")
+        if isinstance(profile["top_k"], bool) or not isinstance(profile["top_k"], int):
+            raise ValueError(f"sampling profile {name!r} top_k is not an integer")
+        if not (0.0 <= float(profile["temperature"]) <= 2.0 and
+                0.0 < float(profile["top_p"]) <= 1.0 and
+                int(profile["top_k"]) >= 0 and
+                0.0 <= float(profile["min_p"]) <= 1.0 and
+                -2.0 <= float(profile["presence_penalty"]) <= 2.0 and
+                float(profile["frequency_penalty"]) == 0.0 and
+                float(profile["repetition_penalty"]) == 1.0):
+            raise ValueError(f"sampling profile {name!r} is outside runtime limits")
+    return value
+
+
+def _load_sampling_profiles(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError(f"sampling profiles file is missing: {path}")
+    return validate_sampling_profiles(load_json(path))
+
+
 def _expert_quant_abi(quant_profile: str) -> int:
     if quant_profile == QUANT_PROFILE:
         return QUANT_ABI_ID
     if quant_profile == FP4_QUANT_PROFILE:
         return FP4_QUANT_ABI_ID
+    if quant_profile == NVFP4_QUANT_PROFILE:
+        return NVFP4_QUANT_ABI_ID
     raise ValueError(f"unsupported quant profile {quant_profile!r}")
 
 
@@ -89,6 +143,14 @@ def _expert_record_abi(adapted: AdaptedModel, quant_abi: int) -> int:
         if quant_abi != FP4_QUANT_ABI_ID:
             raise ValueError("ReLU2 routed experts currently require FP4")
         return FP4_RELU2_EXPERT_ABI_ID
+    if quant_abi == NVFP4_QUANT_ABI_ID:
+        if any(
+            expert.nvfp4_gate is None or expert.nvfp4_up is None or
+            expert.nvfp4_down is None
+            for expert in adapted.experts
+        ):
+            raise ValueError("native NVFP4 profile requires complete expert sidecars")
+        return NVFP4_QUANT_ABI_ID
     return quant_abi
 
 
@@ -97,11 +159,13 @@ def _runtime_model_descriptor_bytes(adapted: AdaptedModel, expert_abi: int) -> b
     fp4_experts = expert_abi in (
         FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
     )
-    encoding_abi = 2 if fp4_experts else 1
+    native_nvfp4 = expert_abi == NVFP4_QUANT_ABI_ID
+    encoding_abi = 3 if native_nvfp4 else (2 if fp4_experts else 1)
     encoding = (
-        "fp4.e2m1.ue8m0.block32"
-        if fp4_experts
-        else "int8.symmetric.per-row"
+        "nvfp4.e2m1.e4m3fn.block16.w4a4"
+        if native_nvfp4 else
+        ("fp4.e2m1.ue8m0.block32" if fp4_experts
+         else "int8.symmetric.per-row")
     )
 
     def atom(value: str) -> str:
@@ -435,6 +499,7 @@ def _source_inventory(checkpoint: SafeTensorCheckpoint) -> list[dict[str, object
 
 
 def _option_contract(options: CompileOptions, source_files: list[dict[str, object]]) -> dict[str, object]:
+    sampling_profiles = _load_sampling_profiles(options.sampling_profiles)
     return {
         "adapter": options.adapter,
         "quant_profile": options.quant_profile,
@@ -442,6 +507,9 @@ def _option_contract(options: CompileOptions, source_files: list[dict[str, objec
         "max_expert_pack_bytes": options.max_expert_pack_bytes,
         "source_id": options.source_id,
         "source_revision": options.source_revision,
+        "sampling_profiles": sampling_profiles,
+        "config_file": options.config_file,
+        "index_file": options.index_file,
         "reclaim_source_shards": options.reclaim_source_shards,
         "source_files": source_files,
     }
@@ -598,9 +666,15 @@ def _write_dense_pack(
 ) -> list[dict[str, object]]:
     temporary = partial / "dense.qpack.tmp"
     entries: list[dict[str, object]] = []
+    native_nvfp4 = {
+        matrix.weight.name: matrix for matrix in adapted.dense_nvfp4
+    }
     with temporary.open("w+b") as handle:
         for info in adapted.dense:
             dense_quant_abi = (
+                NVFP4_QUANT_ABI_ID
+                if info.name in native_nvfp4
+                else
                 FP4_QUANT_ABI_ID
                 if quant_profile == FP4_QUANT_PROFILE
                 and info.name in adapted.dense_fp4
@@ -614,6 +688,9 @@ def _write_dense_pack(
                 alignment,
                 info.name in adapted.dense_float32,
                 dense_quant_abi,
+                info.name in adapted.dense_int64,
+                info.name in adapted.dense_bfloat16,
+                native_nvfp4.get(info.name),
             )
             entries.append(result.entry)
         fsync_file(handle)
@@ -626,6 +703,8 @@ def _copy_model_metadata(checkpoint: SafeTensorCheckpoint, partial: Path) -> lis
     destination = partial / "tokenizer"
     destination.mkdir(exist_ok=True)
     names = [name for name in MODEL_CONFIG_FILES if (checkpoint.root / name).is_file()]
+    if checkpoint.config_file not in names:
+        names.append(checkpoint.config_file)
     names.extend(name for name in TOKENIZER_FILES if (checkpoint.root / name).is_file())
     tokenizer_payloads = {"tokenizer.json", "tokenizer.model", "sentencepiece.bpe.model"}
     if not tokenizer_payloads.intersection(names):
@@ -729,12 +808,21 @@ def _build_manifest(
     expert_abi = _expert_record_abi(
         adapted, _expert_quant_abi(options.quant_profile)
     )
-    fp4 = expert_abi in (FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID)
+    fp4 = expert_abi in (
+        FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID,
+        NVFP4_QUANT_ABI_ID,
+    )
+    native_nvfp4 = expert_abi == NVFP4_QUANT_ABI_ID
     relu2_experts = expert_abi == FP4_RELU2_EXPERT_ABI_ID
     dense_abis = sorted({int(entry["quant_abi"]) for entry in dense})
     dense_fp4 = FP4_QUANT_ABI_ID in dense_abis
+    dense_nvfp4 = NVFP4_QUANT_ABI_ID in dense_abis
     dense_int8 = QUANT_ABI_ID in dense_abis
-    if dense_fp4 and dense_int8:
+    if dense_nvfp4 and (dense_fp4 or dense_int8):
+        dense_weights = "mixed-native-nvfp4-and-other-quantized-tensors"
+    elif dense_nvfp4:
+        dense_weights = "native-nvfp4-e2m1-e4m3fn-block16-w4a4"
+    elif dense_fp4 and dense_int8:
         dense_weights = "mixed-fp4-block32-and-int8-by-tensor-index"
     elif dense_fp4:
         dense_weights = "fp4-e2m1-ue8m0-block32-padded"
@@ -754,6 +842,12 @@ def _build_manifest(
         int(entry["stored_bytes"])
         for entry in dense
         if entry["name"] in runtime_dense_names
+        and entry["name"] not in adapted.host_mapped_dense
+    )
+    host_mapped_dense_bytes = sum(
+        int(entry["stored_bytes"])
+        for entry in dense
+        if entry["name"] in adapted.host_mapped_dense
     )
     has_routed = bool(adapted.runtime_topology.components)
     manifest: dict[str, object] = {
@@ -782,22 +876,33 @@ def _build_manifest(
             "profile": options.quant_profile,
             "abi_id": expert_abi,
             "expert_weights": (
+                "nvfp4-e2m1-e4m3fn-block16-w4a4" if native_nvfp4 else
                 "fp4-e2m1-block32" if fp4 else "symmetric-int8"
             ) if has_routed else "none",
             "dense_matrix_weights": dense_weights,
             "dense_tensor_quant_abis": dense_abis,
             "router_and_norms": "float32",
-            "scale_dtype": "ue8m0" if fp4 else "float32",
-            "group_size": FP4_QUANT_GROUP_SIZE if fp4 else QUANT_GROUP_SIZE,
+            "scale_dtype": (
+                "float8-e4m3fn+float32-global-divisors"
+                if native_nvfp4 else "ue8m0" if fp4 else "float32"
+            ),
+            "group_size": (
+                NVFP4_QUANT_GROUP_SIZE if native_nvfp4 else
+                FP4_QUANT_GROUP_SIZE if fp4 else QUANT_GROUP_SIZE
+            ),
             "rounding": "nearest-ties-to-even",
             "zero_points": False,
         },
         "kernel_abi": {
             "id": (
-                ("expert-pack-sm86-fp4-block32-v1" if fp4
+                ("expert-pack-sm86-nvfp4-block16-w4a4-v1"
+                 if native_nvfp4 else
+                 "expert-pack-sm86-fp4-block32-v1" if fp4
                  else "expert-pack-sm86-int8-row-v1")
                 if has_routed else
-                ("expert-pack-sm86-dense-fp4-block32-v1" if dense_fp4
+                ("expert-pack-sm86-dense-nvfp4-block16-w4a4-v1"
+                 if dense_nvfp4 else
+                 "expert-pack-sm86-dense-fp4-block32-v1" if dense_fp4
                  else "expert-pack-sm86-dense-int8-row-v1")
             ),
             "quant_abi": expert_abi,
@@ -827,6 +932,8 @@ def _build_manifest(
             "dense_bytes": dense_bytes,
             "expert_bytes": expert_bytes,
             "active_expert_bytes_per_token": active_expert_bytes,
+            "resident_dense_bytes": resident_dense_bytes,
+            "host_mapped_dense_bytes": host_mapped_dense_bytes,
         },
         "requirements": {
             "resident_dense_bytes": resident_dense_bytes,
@@ -840,6 +947,11 @@ def _build_manifest(
         "tokenizer": {
             "files": metadata_files,
             "chat_template": tokenizer_metadata.get("chat_template"),
+            **({"reasoning_effort_map": dict(
+                adapted.template_reasoning_effort_map
+            )} if adapted.template_reasoning_effort_map else {}),
+            **({"sampling": _load_sampling_profiles(options.sampling_profiles)}
+               if options.sampling_profiles is not None else {}),
             "special_tokens": {
                 "bos_token_id": config.get("bos_token_id"),
                 "eos_token_id": config.get("eos_token_id"),
@@ -881,7 +993,9 @@ def compile_checkpoint(
     output.parent.mkdir(parents=True, exist_ok=True)
     partial = output.with_name(output.name + ".partial")
 
-    checkpoint = SafeTensorCheckpoint(source)
+    checkpoint = SafeTensorCheckpoint(
+        source, config_file=options.config_file, index_file=options.index_file
+    )
     adapted = adapt_checkpoint(checkpoint, options.adapter)
     expert_abi = _expert_record_abi(adapted, quant_abi)
     if options.quant_profile not in adapted.supported_expert_quant_profiles:
@@ -1063,6 +1177,8 @@ def refresh_runtime_model_program(
     output: Path,
     source: Path,
     adapter: str,
+    config_file: str = "config.json",
+    index_file: str = "model.safetensors.index.json",
 ) -> dict[str, object]:
     """Publish a cloned container with freshly compiled VM metadata only.
 
@@ -1107,7 +1223,9 @@ def refresh_runtime_model_program(
             raise ValueError("legacy source container authentication failed")
         validation = {"manifest_content_sha256": content_hash}
 
-    checkpoint = SafeTensorCheckpoint(source)
+    checkpoint = SafeTensorCheckpoint(
+        source, config_file=config_file, index_file=index_file
+    )
     adapted = adapt_checkpoint(checkpoint, adapter)
     if manifest.get("architecture") != adapted.architecture:
         raise ValueError("adapter architecture disagrees with source container")
@@ -1181,6 +1299,11 @@ def refresh_runtime_model_program(
     refreshed_manifest = load_json(partial / "manifest.json")
     refreshed_manifest["model_program"] = model_program
     tokenizer_metadata = load_json(source / "tokenizer_config.json")
+    previous_tokenizer = refreshed_manifest.get("tokenizer")
+    previous_sampling = (
+        previous_tokenizer.get("sampling")
+        if isinstance(previous_tokenizer, dict) else None
+    )
     refreshed_manifest["tokenizer"] = {
         "files": metadata_files,
         "chat_template": (
@@ -1188,6 +1311,11 @@ def refresh_runtime_model_program(
             if isinstance(tokenizer_metadata, dict)
             else None
         ),
+        **({"reasoning_effort_map": dict(
+            adapted.template_reasoning_effort_map
+        )} if adapted.template_reasoning_effort_map else {}),
+        **({"sampling": previous_sampling}
+           if previous_sampling is not None else {}),
     }
     refreshed_manifest["integrity"]["content_sha256"] = ""
     refreshed_manifest["integrity"]["content_sha256"] = sha256_bytes(
@@ -1212,6 +1340,154 @@ def refresh_runtime_model_program(
         "manifest_file_sha256": sha256_file(partial / "manifest.json"),
     }
     atomic_json(partial / "COMPLETED", marker)
+    fsync_directory(partial)
+    refreshed_validation = validate_container(partial)
+    os.replace(partial, output)
+    fsync_directory(output.parent)
+    return {
+        "output": str(output),
+        "source_container": str(container),
+        "source_manifest_content_sha256": validation[
+            "manifest_content_sha256"
+        ],
+        "manifest_content_sha256": refreshed_validation[
+            "manifest_content_sha256"
+        ],
+        "validation": refreshed_validation,
+    }
+
+
+def refresh_sampling_profiles(
+    container: Path,
+    output: Path,
+    profiles_path: Path,
+) -> dict[str, object]:
+    """Clone a valid artifact and transactionally replace sampling metadata."""
+    container = Path(container).resolve()
+    output = Path(output).resolve()
+    if output.exists():
+        raise ResumeError(f"output already exists: {output}")
+    try:
+        validation = validate_container(container)
+        legacy_metadata = False
+    except ValidationError as error:
+        manifest = load_json(container / "manifest.json")
+        legacy_top_keys = {
+            "schema", "format", "compatibility", "source", "architecture",
+            "model_program", "quantization", "kernel_abi", "alignment",
+            "tensors", "experts", "packs", "indexes", "masses",
+            "requirements", "tokenizer", "integrity",
+        }
+        if (str(error) != "unknown or missing top-level manifest fields" or
+                not isinstance(manifest, dict) or
+                set(manifest) != legacy_top_keys):
+            raise
+        integrity = manifest.get("integrity")
+        marker = load_json(container / "COMPLETED")
+        declared_hash = (
+            integrity.get("content_sha256")
+            if isinstance(integrity, dict) else None
+        )
+        unhashed = dict(manifest)
+        unhashed["integrity"] = dict(integrity) \
+            if isinstance(integrity, dict) else {}
+        unhashed["integrity"]["content_sha256"] = ""
+        if (not isinstance(declared_hash, str) or
+                sha256_bytes(canonical_json_bytes(unhashed)) != declared_hash or
+                not isinstance(marker, dict) or
+                set(marker) != {
+                    "format_version", "manifest_content_sha256",
+                    "manifest_file_sha256",
+                } or marker.get("format_version") != FORMAT_VERSION or
+                marker.get("manifest_content_sha256") != declared_hash or
+                marker.get("manifest_file_sha256") !=
+                    sha256_file(container / "manifest.json")):
+            raise ValidationError(
+                "legacy container completion metadata is invalid"
+            ) from error
+        validation = {"manifest_content_sha256": declared_hash}
+        legacy_metadata = True
+    sampling = _load_sampling_profiles(profiles_path)
+    if sampling is None:
+        raise ValueError("sampling profiles are required")
+    partial = output.with_name(output.name + ".partial")
+    if partial.exists():
+        raise ResumeError(f"partial refresh already exists: {partial}")
+
+    shutil.copytree(container, partial, copy_function=_link_or_copy)
+    manifest = load_json(partial / "manifest.json")
+    if legacy_metadata:
+        dense = manifest.get("tensors")
+        model_program = manifest.get("model_program")
+        requirements = manifest.get("requirements")
+        masses = manifest.get("masses")
+        if (not isinstance(dense, list) or
+                not isinstance(model_program, dict) or
+                not isinstance(model_program.get("path"), str) or
+                not isinstance(requirements, dict) or
+                not isinstance(masses, dict)):
+            raise ValidationError("legacy container metadata is incomplete")
+        relative_program = Path(model_program["path"])
+        if relative_program.is_absolute() or ".." in relative_program.parts:
+            raise ValidationError("legacy model program path is unsafe")
+        program_path = partial / relative_program
+        if (not program_path.is_file() or
+                program_path.stat().st_size != model_program.get("bytes") or
+                sha256_file(program_path) != model_program.get("sha256")):
+            raise ValidationError("legacy model program is not authenticated")
+        program_lines = program_path.read_text(encoding="utf-8").splitlines()
+        bound_tensors = {
+            fields[-1]
+            for line in program_lines
+            if (fields := line.split("\t")) and
+            fields[0].endswith("_tensor") and len(fields) >= 3
+        }
+        dense_names = {
+            entry.get("name") for entry in dense if isinstance(entry, dict)
+        }
+        if (None in dense_names or bound_tensors != dense_names or
+                any(line.startswith("operation\t") and
+                    ("\tembedding.ngram-ple.fp4-block32.v1\t" in line or
+                     "\tembedding.ngram-ple.v1\t" in line)
+                    for line in program_lines)):
+            raise ValidationError(
+                "legacy auxiliary or host-mapped placement requires source recompilation"
+            )
+        resident = requirements.get("resident_dense_bytes")
+        dense_bytes = masses.get("dense_bytes")
+        if (not isinstance(resident, int) or resident < 0 or
+                not isinstance(dense_bytes, int) or resident > dense_bytes):
+            raise ValidationError(
+                "legacy dense residency accounting is invalid"
+            )
+        manifest["auxiliary_tensors"] = []
+        masses["resident_dense_bytes"] = resident
+        masses["host_mapped_dense_bytes"] = 0
+    tokenizer = manifest.get("tokenizer")
+    if not isinstance(tokenizer, dict):
+        raise ValueError("container tokenizer metadata is invalid")
+    tokenizer["sampling"] = sampling
+    manifest["integrity"]["content_sha256"] = ""
+    manifest["integrity"]["content_sha256"] = sha256_bytes(
+        canonical_json_bytes(manifest)
+    )
+    atomic_json(partial / "manifest.json", manifest)
+
+    report = load_json(partial / "conversion-report.json")
+    if not isinstance(report, dict):
+        raise ValueError("container conversion report is invalid")
+    report["output"] = str(output)
+    report["manifest_content_sha256"] = manifest["integrity"][
+        "content_sha256"
+    ]
+    atomic_json(partial / "conversion-report.json", report)
+    atomic_json(partial / "COMPLETED", {
+        "format_version": FORMAT_VERSION,
+        "manifest_content_sha256": manifest["integrity"][
+            "content_sha256"
+        ],
+        "manifest_file_sha256": sha256_file(partial / "manifest.json"),
+    })
     fsync_directory(partial)
     refreshed_validation = validate_container(partial)
     os.replace(partial, output)

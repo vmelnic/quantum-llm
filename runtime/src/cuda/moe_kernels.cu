@@ -2,6 +2,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 
 #include <algorithm>
 #include <cmath>
@@ -115,6 +116,151 @@ __device__ float packed_fp4_q8_dot(const std::uint8_t* weights,
     total += static_cast<float>(dot) * decode_ue8m0(scale_code);
   }
   return warp_sum(total) * activation_scale * 0.5F;
+}
+
+__device__ float nvfp4_e2m1(std::uint8_t code) {
+  const auto magnitude = code & 0x07U;
+  const auto value = magnitude == 0U ? 0.0F
+                     : magnitude == 1U ? 0.5F
+                     : magnitude == 2U ? 1.0F
+                     : magnitude == 3U ? 1.5F
+                     : magnitude == 4U ? 2.0F
+                     : magnitude == 5U ? 3.0F
+                     : magnitude == 6U ? 4.0F : 6.0F;
+  return (code & 0x08U) != 0U ? -value : value;
+}
+
+__device__ float nvfp4_e4m3fn(std::uint8_t code) {
+  const auto negative = (code & 0x80U) != 0U;
+  const auto exponent = (code >> 3U) & 0x0fU;
+  const auto mantissa = code & 0x07U;
+  float value{};
+  if (exponent == 0U) {
+    value = ldexpf(static_cast<float>(mantissa) / 8.0F, -6);
+  } else {
+    value = ldexpf(1.0F + static_cast<float>(mantissa) / 8.0F,
+                   static_cast<int>(exponent) - 7);
+  }
+  return negative ? -value : value;
+}
+
+__device__ float nvfp4_round(float value) {
+  const auto sign = value < 0.0F ? -1.0F : 1.0F;
+  const auto x = fabsf(value);
+  const auto rounded = x > 5.0F ? 6.0F
+      : x >= 3.5F ? 4.0F : x > 2.5F ? 3.0F
+      : x >= 1.75F ? 2.0F : x > 1.25F ? 1.5F
+      : x >= 0.75F ? 1.0F : x > 0.25F ? 0.5F : 0.0F;
+  return sign * rounded;
+}
+
+__device__ float nvfp4_global_scale(const std::uint8_t* scales,
+                                    std::uint32_t rows,
+                                    std::uint32_t columns,
+                                    bool input) {
+  const auto local = static_cast<std::size_t>(rows) * columns / 16U;
+  const auto* value = reinterpret_cast<const float*>(
+      scales + local + (input ? sizeof(float) : 0U));
+  // Compressed-tensors stores reciprocal weight scale, but its activation
+  // scalar is already the large quantization multiplier consumed by
+  // ref_nvfp4_quant (input * global / local).  They deliberately have
+  // opposite directions despite sharing the `global_scale` suffix.
+  return input ? *value : 1.0F / *value;
+}
+
+__global__ void nvfp4_quantize_selected_kernel(
+    const float* input, const DeviceExpertEntry* directory,
+    std::uint32_t directory_offset, const std::uint32_t* indices,
+    const std::uint8_t* mask, float* gate_output, float* up_output,
+    std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k) {
+  const auto selection = static_cast<std::uint32_t>(blockIdx.y);
+  if ((mask && mask[selection] == 0U) || threadIdx.x >= 16U) return;
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto column = group * 16U + threadIdx.x;
+  if (column >= hidden) return;
+  const auto request = selection / top_k;
+  const auto& entry = directory[directory_offset + indices[selection]];
+  const auto* source = input + static_cast<std::size_t>(request) * hidden;
+  __shared__ float magnitudes[16];
+  magnitudes[threadIdx.x] = fabsf(source[column]);
+  __syncthreads();
+  for (unsigned stride = 8U; stride != 0U; stride >>= 1U) {
+    if (threadIdx.x < stride)
+      magnitudes[threadIdx.x] = fmaxf(magnitudes[threadIdx.x],
+                                      magnitudes[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  const auto gate_global = nvfp4_global_scale(
+      entry.w1_ue8m0, width, hidden, true);
+  auto gate_local = fminf(448.0F, gate_global * magnitudes[0] / 6.0F);
+  gate_local = static_cast<float>(__nv_fp8_e4m3(gate_local));
+  const auto gate_scaled = gate_local == 0.0F ? 0.0F
+      : fminf(6.0F, fmaxf(-6.0F,
+          source[column] * gate_global / gate_local));
+  const auto up_global = nvfp4_global_scale(
+      entry.w3_ue8m0, width, hidden, true);
+  auto up_local = fminf(448.0F, up_global * magnitudes[0] / 6.0F);
+  up_local = static_cast<float>(__nv_fp8_e4m3(up_local));
+  const auto up_scaled = up_local == 0.0F ? 0.0F
+      : fminf(6.0F, fmaxf(-6.0F,
+          source[column] * up_global / up_local));
+  const auto offset = static_cast<std::size_t>(selection) * hidden + column;
+  gate_output[offset] =
+      nvfp4_round(gate_scaled) * gate_local / gate_global;
+  up_output[offset] = nvfp4_round(up_scaled) * up_local / up_global;
+}
+
+__global__ void nvfp4_quantize_down_kernel(
+    const float* input, const DeviceExpertEntry* directory,
+    std::uint32_t directory_offset, const std::uint32_t* indices,
+    const std::uint8_t* mask, float* output, std::uint32_t hidden,
+    std::uint32_t width) {
+  const auto selection = static_cast<std::uint32_t>(blockIdx.y);
+  if ((mask && mask[selection] == 0U) || threadIdx.x >= 16U) return;
+  const auto group = static_cast<std::uint32_t>(blockIdx.x);
+  const auto column = group * 16U + threadIdx.x;
+  if (column >= width) return;
+  const auto& entry = directory[directory_offset + indices[selection]];
+  const auto* source = input + static_cast<std::size_t>(selection) * width;
+  __shared__ float magnitudes[16];
+  magnitudes[threadIdx.x] = fabsf(source[column]);
+  __syncthreads();
+  for (unsigned stride = 8U; stride != 0U; stride >>= 1U) {
+    if (threadIdx.x < stride)
+      magnitudes[threadIdx.x] = fmaxf(magnitudes[threadIdx.x],
+                                      magnitudes[threadIdx.x + stride]);
+    __syncthreads();
+  }
+  const auto global = nvfp4_global_scale(
+      entry.w2_ue8m0, hidden, width, true);
+  auto local = fminf(448.0F, global * magnitudes[0] / 6.0F);
+  local = static_cast<float>(__nv_fp8_e4m3(local));
+  const auto scaled = local == 0.0F ? 0.0F
+      : fminf(6.0F, fmaxf(-6.0F, source[column] * global / local));
+  output[static_cast<std::size_t>(selection) * width + column] =
+      nvfp4_round(scaled) * local / global;
+}
+
+__device__ float nvfp4_dot(const std::uint8_t* weights,
+                           const std::uint8_t* scales,
+                           const float* activation, std::uint32_t row,
+                           std::uint32_t rows, std::uint32_t columns) {
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto* row_weight = weights + static_cast<std::size_t>(row) *
+                                         columns / 2U;
+  const auto* row_scale = scales + static_cast<std::size_t>(row) *
+                                       columns / 16U;
+  const auto global = nvfp4_global_scale(scales, rows, columns, false);
+  float total = 0.0F;
+  for (std::uint32_t column = lane; column < columns;
+       column += kWarpSize) {
+    const auto packed = row_weight[column / 2U];
+    const auto code = static_cast<std::uint8_t>(
+        (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+    total += nvfp4_e2m1(code) * nvfp4_e4m3fn(row_scale[column / 16U]) *
+             global * activation[column];
+  }
+  return warp_sum(total);
 }
 
 __global__ void gate_up_silu(
@@ -288,7 +434,8 @@ __global__ void gate_up_silu_selection_batch(
     const std::uint32_t* indices, const std::uint8_t* mask,
     float swiglu_limit, bool bf16_intermediate,
     const std::int8_t* quantized_input,
-    const float* quantized_input_scales) {
+    const float* quantized_input_scales, const float* nvfp4_gate_input,
+    const float* nvfp4_up_input) {
   const auto selection = static_cast<std::uint32_t>(blockIdx.y);
   if (mask != nullptr && mask[selection] == 0) return;
   const auto request_row = selection / top_k;
@@ -306,6 +453,17 @@ __global__ void gate_up_silu_selection_batch(
   const bool relu2 = entry.format == static_cast<std::uint32_t>(
       DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32);
   if (entry.format == static_cast<std::uint32_t>(
+                          DeviceExpertFormat::
+                              nvfp4_e2m1_e4m3fn_block16_w4a4)) {
+    const auto offset = static_cast<std::size_t>(selection) * hidden;
+    gate_sum = nvfp4_dot(entry.w1_fp4, entry.w1_ue8m0,
+                         nvfp4_gate_input + offset, output_row, width,
+                         hidden);
+    up_sum = nvfp4_dot(entry.w3_fp4, entry.w3_ue8m0,
+                       nvfp4_up_input + offset, output_row, width, hidden);
+    gate_sum = __bfloat162float(__float2bfloat16_rn(gate_sum));
+    up_sum = __bfloat162float(__float2bfloat16_rn(up_sum));
+  } else if (entry.format == static_cast<std::uint32_t>(
                           DeviceExpertFormat::fp4_e2m1_ue8m0_block32) ||
       relu2) {
     const auto* q = quantized_input +
@@ -357,7 +515,8 @@ __global__ void down_selection_batch(
     const float* intermediate, float* selection_outputs,
     std::uint32_t hidden, std::uint32_t width,
     const std::int8_t* quantized_intermediate,
-    const float* quantized_intermediate_scales) {
+    const float* quantized_intermediate_scales,
+    const float* nvfp4_down_input) {
   const auto selection = static_cast<std::uint32_t>(blockIdx.y);
   if (mask != nullptr && mask[selection] == 0) return;
   const auto warp = threadIdx.x / kWarpSize;
@@ -370,6 +529,13 @@ __global__ void down_selection_batch(
       intermediate + static_cast<std::size_t>(selection) * width;
   float partial = 0.0F;
   if (entry.format == static_cast<std::uint32_t>(
+                          DeviceExpertFormat::
+                              nvfp4_e2m1_e4m3fn_block16_w4a4)) {
+    partial = nvfp4_dot(
+        entry.w2_fp4, entry.w2_ue8m0,
+        nvfp4_down_input + static_cast<std::size_t>(selection) * width,
+        output_row, hidden, width);
+  } else if (entry.format == static_cast<std::uint32_t>(
                           DeviceExpertFormat::fp4_e2m1_ue8m0_block32) ||
       entry.format == static_cast<std::uint32_t>(
                           DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32)) {
@@ -389,6 +555,10 @@ __global__ void down_selection_batch(
     partial *= entry.down_scales[output_row];
   }
   if (lane == 0) {
+    if (entry.format == static_cast<std::uint32_t>(
+                            DeviceExpertFormat::
+                                nvfp4_e2m1_e4m3fn_block16_w4a4))
+      partial = __bfloat162float(__float2bfloat16_rn(partial));
     selection_outputs[static_cast<std::size_t>(selection) * hidden +
                       output_row] = partial;
   }
@@ -400,7 +570,7 @@ __global__ void aggregate_selection_outputs(
     const std::uint32_t* alternate_slot_by_selection,
     const float* routing, float* output,
     std::uint32_t hidden, std::uint32_t top_k,
-    std::uint32_t value_count) {
+    std::uint32_t value_count, bool bf16_accumulation) {
   for (auto index = static_cast<std::uint32_t>(blockIdx.x * blockDim.x +
                                                threadIdx.x);
        index < value_count; index += blockDim.x * gridDim.x) {
@@ -414,7 +584,15 @@ __global__ void aggregate_selection_outputs(
           ? selection
           : static_cast<std::size_t>(alternate_slot_by_selection[selection]);
       const auto* source = primary ? selection_outputs : alternate_outputs;
-      total += routing[selection] * source[source_selection * hidden + column];
+      auto contribution =
+          routing[selection] * source[source_selection * hidden + column];
+      if (bf16_accumulation) {
+        contribution = __bfloat162float(__float2bfloat16_rn(contribution));
+        total = __bfloat162float(
+            __float2bfloat16_rn(total + contribution));
+      } else {
+        total += contribution;
+      }
     }
     output[index] = total;
   }
@@ -510,7 +688,12 @@ Status launch_moe_selection_batch(
        (launch.quantized_input == nullptr ||
         launch.quantized_input_scales == nullptr ||
         launch.quantized_intermediate == nullptr ||
-        launch.quantized_intermediate_scales == nullptr)) || launch.rows == 0 ||
+        launch.quantized_intermediate_scales == nullptr)) ||
+      (launch.enable_native_nvfp4 &&
+       (!launch.nvfp4_gate_input || !launch.nvfp4_up_input ||
+        !launch.nvfp4_down_input)) ||
+      (launch.enable_packed_fp4 && launch.enable_native_nvfp4) ||
+      launch.rows == 0 ||
       launch.hidden_size == 0 || launch.intermediate_size == 0 ||
       launch.top_k == 0 || launch.top_k > 64 ||
       launch.expert_table_size < launch.top_k) {
@@ -528,6 +711,18 @@ Status launch_moe_selection_batch(
                          "quantize routed input launch");
     if (!status.ok()) return status;
   }
+  if (launch.enable_native_nvfp4) {
+    const dim3 quant_grid(launch.hidden_size / 16U, selections);
+    nvfp4_quantize_selected_kernel<<<quant_grid, 16U, 0, stream>>>(
+        launch.input, launch.directory_entries,
+        launch.directory_layer * launch.expert_table_size,
+        launch.expert_indices, launch.selection_mask,
+        launch.nvfp4_gate_input, launch.nvfp4_up_input,
+        launch.hidden_size, launch.intermediate_size, launch.top_k);
+    status = cuda_status(cudaPeekAtLastError(),
+                         "quantize native NVFP4 routed input launch");
+    if (!status.ok()) return status;
+  }
   const dim3 gate_grid(
       (launch.intermediate_size + kWarpsPerBlock - 1U) / kWarpsPerBlock,
       selections);
@@ -537,7 +732,8 @@ Status launch_moe_selection_batch(
       launch.intermediate, launch.hidden_size, launch.intermediate_size,
       launch.top_k, launch.expert_indices, launch.selection_mask,
       launch.swiglu_limit, launch.bf16_intermediate, launch.quantized_input,
-      launch.quantized_input_scales);
+      launch.quantized_input_scales, launch.nvfp4_gate_input,
+      launch.nvfp4_up_input);
   status =
       cuda_status(cudaPeekAtLastError(), "gate_up_silu_selection launch");
   if (!status.ok()) return status;
@@ -549,6 +745,18 @@ Status launch_moe_selection_batch(
                          "quantize routed intermediate launch");
     if (!status.ok()) return status;
   }
+  if (launch.enable_native_nvfp4) {
+    const dim3 quant_grid(launch.intermediate_size / 16U, selections);
+    nvfp4_quantize_down_kernel<<<quant_grid, 16U, 0, stream>>>(
+        launch.intermediate, launch.directory_entries,
+        launch.directory_layer * launch.expert_table_size,
+        launch.expert_indices, launch.selection_mask,
+        launch.nvfp4_down_input, launch.hidden_size,
+        launch.intermediate_size);
+    status = cuda_status(cudaPeekAtLastError(),
+                         "quantize native NVFP4 routed down input launch");
+    if (!status.ok()) return status;
+  }
   const dim3 down_grid(
       (launch.hidden_size + kWarpsPerBlock - 1U) / kWarpsPerBlock,
       selections);
@@ -558,7 +766,7 @@ Status launch_moe_selection_batch(
       launch.expert_indices, launch.selection_mask, launch.intermediate,
       launch.selection_outputs, launch.hidden_size, launch.intermediate_size,
       launch.quantized_intermediate,
-      launch.quantized_intermediate_scales);
+      launch.quantized_intermediate_scales, launch.nvfp4_down_input);
   return cuda_status(cudaPeekAtLastError(), "down_selection launch");
 }
 
@@ -585,7 +793,7 @@ Status launch_moe_aggregate(const MoeAggregateLaunch& launch) noexcept {
       launch.selection_outputs, launch.alternate_outputs,
       launch.primary_mask, launch.alternate_slot_by_selection,
       launch.routing_weights, launch.output,
-      launch.hidden_size, launch.top_k, values);
+      launch.hidden_size, launch.top_k, values, launch.bf16_accumulation);
   return cuda_status(cudaPeekAtLastError(), "aggregate_selection launch");
 }
 

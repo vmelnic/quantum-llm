@@ -1,16 +1,17 @@
 # Anthropic Messages API
 
-Status: implemented wire adapter with explicit harness limits, 2026-08-26.
+Status: implemented wire adapter; Pi remains the maintained harness,
+2026-09-02.
 
 ## Endpoints
 
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 
-The adapter accepts Anthropic `user` and `assistant` message roles, a top-level
-system prompt, text/image content, tool definitions/results, streaming,
-sampling and output limits. It translates them into the same official
-artifact template and native request used by the OpenAI surface.
+The adapter accepts Anthropic user/assistant messages, top-level system text,
+supported text/image blocks, tools/tool results, streaming, sampling and output
+limits. It normalizes them into the same artifact template and native request
+used by the OpenAI surface.
 
 ```bash
 curl http://127.0.0.1:8080/v1/messages \
@@ -25,27 +26,23 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-Streaming emits Anthropic message/content block events and reports visible
-text, thinking and tool-use blocks separately. `/count_tokens` applies the
-same normalization/template path and returns the resulting input token count.
+Streaming emits Anthropic message/content-block events and separates visible
+text, thinking and tool use. `count_tokens` uses the same normalization and
+template path.
 
-## What compatibility does not mean
+## Boundary
 
-This endpoint does not turn Qwen or DeepSeek into Claude. Model behavior,
-prompt interpretation, tool reliability, reasoning quality and latency remain
-those of the selected local artifact. Claude Code also injects a large system
-prompt, repository context and tool schema; a one-word user prompt therefore
-does not represent a one-token prefill.
+Wire compatibility does not turn Qwen or DeepSeek into Claude. Model quality,
+tool reliability and latency remain those of the selected artifact. Claude
+Code injects a large Claude-oriented system/tool prompt; historical project
+gates sent roughly 29K input tokens before a one-word request and had
+unacceptable first-turn latency and factual behavior. Claude Code is therefore
+not the recommended production harness.
 
-The adapter has passed protocol/unit gates, but Claude Code on the reference
-host produced unacceptable first-turn latency and factual behavior. It is not
-the recommended production harness. Pi is the maintained local coding-agent
-integration; see [Pi CLI](pi-cli.md).
+The repository `.claude/settings.json` and `ops/claude-api-key.sh` remain a
+bounded compatibility configuration. The helper reads `EXPERT_API_KEY` from
+ignored `.env`; no secret is committed. Pi is the maintained local agent path.
 
-## Authentication and limits
-
-The configured secret is accepted as `x-api-key` or bearer authentication.
-Messages obey the same request-body, context, output, image, queue, timeout and
-KV admission limits as the OpenAI API. Unsupported roles/blocks and invalid
-thinking/tool combinations fail with Anthropic-shaped errors rather than being
-silently discarded.
+The adapter obeys the same context, body, output, image, queue and timeout
+limits as the OpenAI API. Invalid role/block/thinking/tool combinations fail
+explicitly with Anthropic-shaped errors.

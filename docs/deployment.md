@@ -1,30 +1,34 @@
 # Deployment
 
-Status: supported single-host lifecycle, 2026-08-26.
+Status: supported single-host lifecycle, 2026-09-02.
 
-## Deployment contract
+## Contract
 
-The runtime is deployed from a POSIX control host to one Windows/CUDA host.
-The target contains the project, build, server environment and all published
-model artifacts. There is no external expert owner or distributed fallback.
+The Windows target contains the synchronized project, Release/CUDA build,
+repository-owned server environment and all published artifacts. The serving
+path has no external model-state owner.
 
-Stable artifacts live at `${MODEL_ROOT}/<stable-name>`. Conversion output is a
-sibling candidate. `Promote-ModelArtifact.ps1` verifies the program identity,
-renames an existing stable directory to a timestamped rollback directory,
-renames the validated candidate into place and validates it again. `.env` and
-the service must never point to a partial candidate.
+Stable artifacts live under `${MODEL_ROOT}`. `Promote-ModelArtifact.ps1`
+validates a candidate, moves an existing stable directory to a timestamped
+rollback, promotes by rename and validates again. Rollbacks are temporary
+release safety, not permanent alternate models; remove them after the promoted
+artifact passes real gates and recovery is no longer needed.
 
-The supported stable selections are declared in `ops/model-aliases.tsv`:
+## Active aliases
 
-| Alias | Advertised model | Artifact relative to `MODEL_ROOT` |
-|---|---|---|
-| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` |
-| `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` |
-| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` |
-| `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` |
+`ops/model-aliases.tsv` is authoritative:
 
-Aliases select artifacts only. The server, scheduled task and VM runner remain
-common and capability-driven.
+| Alias | Advertised model | Path below `MODEL_ROOT` | KV selection |
+|---|---|---|---|
+| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | `fp16` |
+| `qwen-flash` | `qwen3.8-flash-next-fp4` | `qwen3.8-flash-next-fp4` | `fp16` |
+| `mistral` | `mistral-small-4-119b-nvfp4` | `mistral-small-4-119b-nvfp4` | artifact-declared |
+| `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` | `fp16` |
+| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | `fp16` |
+| `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` | artifact-declared |
+
+Aliases select an artifact and advertised ID only. The task
+`QuantumLLM-ExpertVm`, HTTP service and native VM are common.
 
 ## Lifecycle
 
@@ -38,48 +42,54 @@ common and capability-driven.
 ./ops/model.sh stop all
 ```
 
-`start` synchronizes Git-visible files by default, checks the pinned Python
-environment, stops the competing model, installs one scheduled task, waits for
-readiness and verifies the advertised model, context and output limits. Sync
-does not copy ignored `work/`, `artifacts/`, model files, logs or builds and
-does not delete remote data.
-
-`stop all` terminates the common scheduled task and processes bound to the
-configured port. Always use it after a release gate and verify that the Python
-server, native worker and GPU allocation are gone.
+`start` synchronizes Git-visible files by default, validates the artifact
+contract, clamps configured context/KV values to artifact requirements, checks
+the pinned Python environment, stops the previous service, installs one task,
+waits for readiness and verifies model/limit identity. Sync never transfers or
+deletes ignored model, build, log or cache state.
 
 ## Network and authentication
 
-The safe default is loopback on the Windows host plus the SSH tunnel opened by
-`chat.sh` or another local client. If `MODEL_HOST` is non-loopback,
-`EXPERT_API_KEY` is mandatory. The server provides bearer authentication but
-not TLS, rate limiting or a public-network security boundary; place those at a
-trusted edge before exposing it.
+The safe default is loopback on 3090box plus the tunnel used by the local
+client. A non-loopback `MODEL_HOST` requires `EXPERT_API_KEY`. The native edge
+does not provide TLS or public rate limiting; add them at a trusted proxy before
+public exposure.
+
+The reference host uses WireGuard only for `10.10.88.0/24`; public traffic,
+including Hugging Face Xet, uses Ethernet. Routing all traffic through the
+WireGuard tunnel can starve SSH/RDP during downloads. The maintained
+`Set-WireGuardSplitTunnel.ps1` transaction validates the private route, public
+route and direct HTTPS before committing.
 
 ## Resource policy
 
-The public limits are configured once in `.env`:
+The current common baseline is:
 
-- `MODEL_MAX_CONTEXT` and `MODEL_MAX_OUTPUT_TOKENS`;
-- request body, image pixels and image patch tokens;
-- RAM/VRAM cache budgets and KV page size/dtype;
-- worker slots and waiting requests;
-- generation timeout and placement profile.
+```text
+one RTX 3090
+MODEL_RAM_CACHE_GIB=48
+MODEL_VRAM_CACHE_GIB=12
+MODEL_WORKER_CAPACITY=1
+MODEL_KV_PAGE_TOKENS=256
+MODEL_PLACEMENT_PROFILE=balanced
+```
 
-Qwen exact target KV uses `MODEL_KV_CACHE_DTYPE=fp16`. A 262K maximum is an
-admission ceiling, not an upfront allocation and not evidence of acceptable
-latency. Several retained sessions share one hot provider slot; parking gives
-continuity, not parallel execution.
+The 12 GiB VRAM value is a cache ceiling, not a reservation. DeepSeek fails
+preflight at 13 GiB after fixed allocations, workspace and the 1 GiB reserve;
+do not raise the common value without real Qwen and DeepSeek chat gates plus
+cleanup. Model context is also a ceiling: pages grow only for populated tokens.
 
 ## Release sequence
 
-1. validate the candidate artifact and its source/quantization quality;
-2. promote it transactionally below `MODEL_ROOT`;
-3. build and run the supported test suites;
-4. start Qwen, run `hi` through `model.sh chat`, then stop it;
-5. repeat the same public smoke for Muse, Ornith and DeepSeek;
-6. verify service descendants and GPU allocations are absent;
-7. preserve the previous stable artifact until rollback is no longer needed.
+1. validate source identity, candidate completion, hashes, format and numerical
+   quality;
+2. promote the candidate transactionally;
+3. run the clean Windows Release/CUDA build, CTest and canonical Python suite;
+4. run `model.sh chat` with `hi` for the affected model, then Qwen and DeepSeek;
+5. for universal releases, repeat for every claimed active model;
+6. run Pi only when harness behavior is part of the release;
+7. stop the service and verify worker/process/GPU cleanup;
+8. remove obsolete rollback/candidate directories after the stable artifact is
+   accepted.
 
-Do not promote a microbenchmark, metadata parser or resident-mode result as a
-demand-paging or production release result.
+Parser, manifest and microkernel tests never replace the real service gate.
