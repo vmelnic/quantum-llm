@@ -1,6 +1,6 @@
 # OpenAI-compatible API
 
-Status: implemented bounded compatibility surface, 2026-09-02.
+Status: implemented bounded compatibility surface, 2026-09-12.
 
 The server implements common OpenAI request/response shapes. It is not the
 OpenAI service and does not promise behavior for unlisted fields.
@@ -46,6 +46,13 @@ The parser validates bounded temperature, top-p, top-k, min-p, supported
 penalties, stop rules, `reasoning_effort` and `enable_thinking`. Artifact
 sampling/template/EOS metadata supplies defaults; explicit supported request
 fields override them per key.
+
+For chat requests, `reasoning_effort` accepts `low`, `medium` or `xhigh`.
+Thinking-off is not the string `reasoning_effort: "off"`; use:
+
+```json
+{"chat_template_kwargs": {"enable_thinking": false}}
+```
 
 Tools are passed into the official artifact template. One artifact-declared
 parser converts native output into standard events. The client executes tools

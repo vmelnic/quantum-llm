@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 expert::runtime::CreateExecutionProviderModuleResult
 make_sm86_dense_moe_callable_provider(
@@ -25,7 +26,11 @@ make_sm86_hybrid_delta_moe_callable_provider(
     const std::filesystem::path& artifact_root, std::uint32_t max_context,
     std::uint32_t capacity, std::uint64_t ram_cache_bytes,
     std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
-    std::uint32_t kv_page_tokens, std::string_view placement_profile);
+    std::uint32_t kv_page_tokens, std::string_view placement_profile,
+    bool discover_active_expert_devices,
+    std::vector<int> active_expert_devices,
+    std::uint64_t active_expert_device_cache_bytes,
+    std::uint64_t active_expert_host_cache_bytes);
 
 namespace {
 
@@ -65,7 +70,7 @@ int main(int argc, char** argv) {
     if (!created.status.ok()) {
       created = make_sm86_hybrid_delta_moe_callable_provider(
           root, 4096U, 1U, 4ULL << 30U, 13ULL << 30U, 2ULL << 30U,
-          256U, "balanced");
+          256U, "balanced", false, {}, 0U, 0U);
     }
     if (!created.status.ok())
       throw std::runtime_error(

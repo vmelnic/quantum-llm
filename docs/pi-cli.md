@@ -1,6 +1,6 @@
 # Pi CLI
 
-Status: maintained coding-harness integration, 2026-09-02.
+Status: maintained coding-harness integration, 2026-09-12.
 
 Pi is the preferred local harness because it can call the repository's
 OpenAI-compatible endpoint without Claude Code's fixed Claude-oriented prompt.
@@ -33,9 +33,13 @@ should contain only these project models:
 ./ops/pi.sh qwen
 ```
 
-Replace the alias with `qwen-flash`, `mistral`, `muse`, `ornith` or
-`deepseek`. `ops/pi.sh` validates the alias/key, selects the common provider and
-model ID, defaults to `--thinking xhigh`, and forwards remaining arguments.
+Replace the alias with `qwen-f16`, `qwen-flash`, `mistral`, `muse`, `ornith`,
+`ornith-k1` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
+URL, then checks the running model ID and explicit KV codec through
+`/model-info` before launching Pi. It defaults to `--thinking xhigh` and
+forwards remaining arguments. The operational `qwen` alias and experimental
+`ornith-k1` alias require K1; `qwen-f16` and `ornith` are their explicit
+exact-F16 reference aliases.
 
 Minimal wiring gate:
 
@@ -44,22 +48,13 @@ Minimal wiring gate:
   --no-context-files --no-tools --no-session -p hi
 ```
 
-## Current minimal Pi evidence
+## Current evidence
 
-On 2026-09-02 all six models returned valid text with default `xhigh` and no
-context files, tools or session. Server telemetry is authoritative:
-
-| Alias | Prefill | Generated | TTFT | Wall | Verdict |
-|---|---:|---:|---:|---:|---|
-| `qwen` | 5 | 33 | 0.625 s | 1.938 s | pass |
-| `qwen-flash` | 477 | 67 | 41.829 s | 53.688 s | pass, slow |
-| `mistral` | 439 | 67 | 54.797 s | 77.312 s | pass, slow |
-| `muse` | 422 | 65 | 2.297 s | 4.297 s | pass |
-| `ornith` | 439 | 34 | 3.703 s | 5.390 s | pass |
-| `deepseek` | 504 | 256 | 81.985 s | 310.672 s | pass, impractical for trivial Pi turn |
-
-This table proves Pi/API/template/generation wiring only. It does not qualify
-tool use, coding quality, long context or concurrency.
+All six advertised model IDs and `ornith-k1` pass the no-context/no-tools/
+no-session `hi` wiring gate. Qwen and Muse are responsive in that gate; Flash,
+Mistral and especially DeepSeek are slow. Exact timings live only in
+[Benchmarks](benchmarks.md). Wiring does not qualify tools, coding quality,
+long context or concurrency.
 
 ## Thinking and sampling
 
@@ -90,7 +85,6 @@ Several Pi processes may queue and retain compatible sessions, but the current
 service has one hot execution slot. They do not decode concurrently. DeepSeek
 does not retain exact sessions, so its history must be replayed.
 
-Representative coding qualification remains separate. Dense Qwen completed
-the bounded Todo fixture at effective `medium`, but took 503.240 seconds; Flash
-and Mistral made zero edits in their recorded gates. Ornith passed a bounded
-read loop. Muse and DeepSeek are not qualified as production coding agents.
+Representative coding qualification remains separate. Qwen passed the bounded
+Todo fixture but with poor wall time; Flash and Mistral made zero edits; Ornith
+K1+fit reached only 2/3 tests. Muse and DeepSeek are not coding-qualified.

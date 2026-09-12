@@ -1,125 +1,119 @@
 # Quantum LLM
 
-Quantum LLM is a native Windows/CUDA inference runtime for running controlled
-LLM artifacts on one RTX 3090 when model state must be placed deliberately
-across VRAM, host RAM and NVMe.
+## Measured snapshot
 
-The runtime treats a model as executable organs rather than one opaque weight
-file:
+Primary RTX 3090, current published artifacts; P100 results are labelled.
+Payload size excludes tokenizer, indexes and publication scratch. TTFT/rates
+come from the documented direct-chat conditions, not model startup.
 
-- dense matrices, routers and recurrent state are hot and stay beside GPU
-  compute;
-- exact attention KV is request-owned and allocated progressively;
-- routed MoE experts are immutable logical pages and may move through
-  NVMe -> RAM -> VRAM only when selected;
-- the artifact declares topology, operations, geometry, encodings, tokenizer
-  behavior and provider capabilities;
-- the common service and VM select providers from those declarations, not from
-  model-family branches.
+| Model | Validated payload | Context ceiling | Short TTFT | Short decode | Populated-context evidence |
+|---|---:|---:|---:|---:|---|
+| Qwen3.8-27B | 14.78 GB QPack | 262,144 | 0.827 s (`off`) | 30.92 tok/s after first | 262,016: 546.173 s K1; 2,278.082 s F16 |
+| Qwen3.8-Flash-Next | 95.92 GB | 262,144 | 27.642 s (`off`) | 0.58 tok/s after first | not measured at maximum |
+| Mistral Small 4 | 70.80 GB source tensors | 262,144 | 271.256 s (`off`) | 1.12 tok/s after first | not measured at maximum |
+| Muse-Glimmer-30B | 15.83 GB QPack | 131,072 | 2.559 s (`off`) | 18.49 tok/s end-to-end | not measured at maximum |
+| Ornith-1.5-35B-A3B | 19.23 GB pack | 262,144 | 4.590 s (K1+fit cold) | 2.73 tok/s cold; 7.42 next turn | not measured at maximum |
+| DeepSeek V4 Flash | 147.17 GB routed experts + fixed organs | 262,144 | 12.953 s (`off`, novel) | 0.55 tok/s novel; 6.54-6.69 settled primary | not measured at maximum |
 
-The current artifact registry exposes six selections through the same service:
+The context ceiling is only an admission limit. Of these paths, only Qwen has
+a recorded 262,016-token populated gate. K1 is a lossy experimental KV format;
+exact IEEE F16 remains the Qwen fidelity target. Full conditions and less
+favorable results are in [Benchmarks](docs/benchmarks.md).
 
-| Alias | Artifact | Current execution |
-|---|---|---|
-| `qwen` | `qwen3.8-27b-fp4` | resident FP4 weights, hybrid recurrent/full attention, progressive exact F16 KV, image input |
-| `qwen-flash` | `qwen3.8-flash-next-fp4` | Hyper/Gated DeltaNet/QSA/PLE plus exact top-10 paged FP4 experts |
-| `mistral` | `mistral-small-4-119b-nvfp4` | source-native block-16 NVFP4 MoE, BF16 organs and latent KV |
-| `muse` | `muse-glimmer-30b-fp4` | dense FP4 text path with exact global and sliding-window F16 KV; 131K artifact limit |
-| `ornith` | `ornith-1.5-35b-a3b-fp4` | hybrid recurrent/attention path with exact top-8 FP4 experts |
-| `deepseek` | `deepseek-v4-flash` | resident dense/shared organs and exact top-6 experts demand-paged through NVMe/RAM/VRAM |
+## What this is
 
-## Why it exists
+Quantum LLM is a native Windows/CUDA inference runtime for deliberate model
+placement across RTX 3090 VRAM, host RAM and NVMe. It treats a model as an
+artifact-declared executable program rather than a family-specific runner:
 
-General runtimes already solve broad local inference well. This project exists
-for a narrower problem: make representation, placement, transfer and execution
-decisions explicit and measurable for models that do not fit a simple
-all-resident layout.
+- dense weights, recurrent state and active attention state stay near compute;
+- selected MoE experts are immutable logical pages that may move through
+  NVMe, RAM and VRAM without reducing top-k;
+- topology, tensor roles, operations, quantization and tokenizer behavior come
+  from the artifact;
+- one authenticated service and native VM bind those declarations to available
+  providers.
 
 ```text
-official checkpoint
-        |
-        v
-strict source adapter
-        |
-        v
-validated artifact under ${MODEL_ROOT}
-  manifest + hashes + tokenizer/processor assets
-  QPack or compact expert payloads
-  runtime-model.tsv executable program
-        |
-        v
-common authenticated HTTP service
-        |
-        v
-common native VM -> capability provider -> VRAM / RAM / NVMe
+official checkpoint -> strict source adapter -> validated artifact
+                    -> common HTTP service -> native artifact VM
+                    -> GPU / RAM / NVMe placement
 ```
 
-This separation matters because ordinary offload is not a universal speed
-solution. Dense weights and all retained K/V in full attention are hot every
-decode call; moving them over PCIe or NVMe only recovers capacity. Unselected
-MoE experts are genuinely cold, so exact demand paging is valid for DeepSeek
-and similar sparse programs.
+The project exists for controlled inference experiments that ordinary model
+offload hides: exact byte attribution, fail-closed artifact ABIs, progressive
+request state and genuine sparse-expert paging. Its demonstrated advantage is
+control and observability, not higher throughput than mature resident-model
+servers.
 
-## Current status
+## Runtime boundary
 
-The implementation is functional research/pilot software, not production-ready
-for the maximum-context target. All six aliases pass a minimal real Pi CLI
-`hi` gate without project context, tools or session state. Short Qwen, Muse and
-Ornith requests are responsive; Qwen Flash, Mistral and especially DeepSeek
-remain slow through Pi. The latest exact-F16 Qwen near-maximum prefill populated
-262,001 prompt tokens in 2,183.815 seconds and generated one token; saturated
-262K decode at the approximately 15 useful tok/s target is not qualified.
-
-See [Benchmarks](docs/benchmarks.md) for measurements and
-[Production readiness](docs/production-readiness.md) for the release boundary.
-
-## Comparison
-
-| Runtime | Best fit | Quantum LLM boundary |
+| Runtime | Main strength | Difference here |
 |---|---|---|
-| [Ollama](https://github.com/ollama/ollama) | simple local model lifecycle | Quantum LLM exposes executable artifact ABIs and tier traffic rather than a desktop model catalog |
-| [llama.cpp](https://github.com/ggml-org/llama.cpp) | portable GGUF inference and CPU/GPU offload | Quantum LLM is narrower, native SM86, and separates hot dense/KV organs from pageable experts |
-| [vLLM](https://docs.vllm.ai/) | resident/distributed throughput, batching and PagedAttention | Quantum LLM targets one controlled host where sparse expert storage participates in execution |
-| [KTransformers](https://github.com/kvcache-ai/ktransformers) | heterogeneous CPU/GPU MoE execution | Quantum LLM adds an authenticated NVMe tier and fail-closed artifact/program contracts, but is less mature |
-| [AirLLM](https://github.com/lyogavin/airllm) | capacity through sequential dense-layer loading | Quantum LLM does not use dense-layer streaming as a decode-throughput claim |
-| [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | expert offload, prefetch and activation-aware MoE serving | The overlap is substantial; Quantum LLM's useful distinction is exact byte/tier attribution and one artifact-driven VM, not SSD offload by itself |
+| [Ollama](https://github.com/ollama/ollama) | simple local model lifecycle | this project exposes artifact operations and tier traffic |
+| [llama.cpp](https://github.com/ggml-org/llama.cpp) | portable GGUF CPU/GPU inference | this project is narrower, native CUDA and expert-page oriented |
+| [vLLM](https://docs.vllm.ai/) | batching, PagedAttention and resident/distributed throughput | this project targets one controlled host and storage-backed sparse experts |
+| [KTransformers](https://github.com/kvcache-ai/ktransformers) | heterogeneous CPU/GPU MoE execution | this project adds authenticated artifact and NVMe page contracts, but is less mature |
+| [AirLLM](https://github.com/lyogavin/airllm) | capacity through layer-wise loading | this project does not present dense layer streaming as decode acceleration |
+| [MoE-Infinity](https://github.com/EfficientMoE/MoE-Infinity) | expert offload and prefetch | the overlap is substantial; this project emphasizes one artifact VM and exact tier telemetry |
 
-The honest current advantage is control and observability, not a demonstrated
-throughput win over mature resident-model servers.
+## Current scope
+
+The common service exposes these aliases:
+
+| Alias | Artifact/policy |
+|---|---|
+| `qwen` | Qwen3.8-27B with experimental resident K1 KV |
+| `qwen-f16` | the same artifact with exact progressive F16 KV |
+| `qwen-flash` | Qwen3.8-Flash-Next, exact top-10 routed FP4 experts |
+| `mistral` | Mistral Small 4, source-native NVFP4/BF16 |
+| `muse` | Muse-Glimmer, dense FP4 with F16 global/sliding KV |
+| `ornith` / `ornith-k1` | Ornith with exact F16 or experimental K1+fit |
+| `deepseek` | DeepSeek compact top-6 experts demand-paged through NVMe/RAM/VRAM |
+
+Two installed P100s can execute compatible Flash/DeepSeek experts, but current
+end-to-end measurements do not justify enabling them for performance. Dense
+Qwen does not use them.
 
 ## Quick start
 
 ```bash
 cp .env.example .env
-# Configure QUANTUM_LLM_REMOTE, QUANTUM_LLM_REMOTE_ROOT, MODEL_ROOT and API key.
+# Set QUANTUM_LLM_REMOTE, QUANTUM_LLM_REMOTE_ROOT, MODEL_ROOT and API key.
 ./ops/model.sh install
 ./ops/model.sh start qwen
 ./ops/model.sh chat qwen
 ./ops/model.sh stop all
 ```
 
-Replace `qwen` with `qwen-flash`, `mistral`, `muse`, `ornith` or `deepseek`.
-For the coding harness:
+Thinking can be selected when opening direct chat:
+
+```bash
+./ops/model.sh chat deepseek --thinking off
+```
+
+For the maintained coding harness:
 
 ```bash
 ./ops/model.sh start qwen
 ./ops/pi.sh qwen
 ```
 
-Start with the [documentation index](docs/README.md).
+Start with the [documentation index](docs/README.md). The runtime is functional
+research/pilot software; see [Production readiness](docs/production-readiness.md)
+before treating an API smoke as a deployment result.
 
 ## Repository map
 
 | Path | Responsibility |
 |---|---|
-| `compiler/` | strict checkpoint adapters, compilation and artifact validation |
+| `compiler/` | strict source adapters, compilation and artifact validation |
 | `core/` | artifact and feasibility contracts |
 | `runtime/` | VM, providers, caches, worker protocol and CUDA kernels |
 | `ops/` | download, build, publication, service and client workflows |
 | `tests/` | compiler, service and runtime contracts |
-| `docs/` | current architecture, evidence, operations, decisions and roadmap |
+| `docs/` | architecture, evidence, operations, decisions and roadmap |
 
 `work/`, `out/`, `logs/`, `artifacts/`, model files and Hugging Face caches are
-generated state, not source. Model weights are not included; users remain
-responsible for model licenses. Source code is licensed under
-[Apache License 2.0](LICENSE).
+generated state. Model weights are not included; users remain responsible for
+model licenses. Source code is licensed under [Apache License 2.0](LICENSE).

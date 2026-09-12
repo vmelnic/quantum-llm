@@ -1,7 +1,7 @@
 # DeepSeek compact pack v1
 
 Status: deployed compact expert and self-contained bundle contract,
-2026-09-02.
+2026-09-12.
 
 ## Purpose and geometry
 

@@ -6,6 +6,7 @@
 #include "expert/core/json.hpp"
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cuda/deepseek_decode.hpp"
+#include "expert/runtime/cuda/active_expert_device_executor.hpp"
 #include "expert/runtime/cuda/deepseek_model.hpp"
 #include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/deepseek_mtp_request.hpp"
@@ -655,6 +656,9 @@ class Model final : public er::IOperationProvider,
         bool enable_cpu_fallback,
         std::filesystem::path route_trace_path,
         std::size_t route_trace_max_steps,
+        std::vector<int> active_expert_devices = {},
+        std::uint64_t active_expert_device_cache_bytes = 0U,
+        std::uint64_t active_expert_host_cache_bytes = 0U,
         std::shared_ptr<const er::ActiveExpertOwnerDirectory> remote_owners =
             std::make_shared<const er::ActiveExpertOwnerDirectory>())
       : bundle_(load_bundle(root)), max_context_(max_context),
@@ -669,6 +673,10 @@ class Model final : public er::IOperationProvider,
                             enable_cpu_fallback),
         route_trace_path_(std::move(route_trace_path)),
         route_trace_max_steps_(route_trace_max_steps),
+        active_expert_devices_(std::move(active_expert_devices)),
+        active_expert_device_cache_bytes_(
+            active_expert_device_cache_bytes),
+        active_expert_host_cache_bytes_(active_expert_host_cache_bytes),
         remote_owners_(std::move(remote_owners)) {
     require(max_context_ >= 2U && capacity_ != 0U && ram_bytes_ != 0U &&
                 vram_bytes_ != 0U && kv_cache_bytes_ != 0U &&
@@ -678,6 +686,12 @@ class Model final : public er::IOperationProvider,
     callable_provider_slots_.assign(capacity_, false);
     require(route_trace_path_.empty() || route_trace_max_steps_ != 0U,
             "DeepSeek route tracing requires a positive step bound");
+    require(active_expert_devices_.empty() ==
+                    (active_expert_device_cache_bytes_ == 0U) &&
+                active_expert_devices_.empty() ==
+                    (active_expert_host_cache_bytes_ == 0U) &&
+                active_expert_host_cache_bytes_ < ram_bytes_,
+            "secondary CUDA expert tier has invalid cache budgets");
     const auto& main_component =
         required_component(bundle_.descriptor, "decoder");
     compression_ratios_.reserve(main_component.layer_count);
@@ -745,6 +759,8 @@ class Model final : public er::IOperationProvider,
     // the exact scalar program's routed-expert budgets.
     const auto mtp_reserve_bytes =
         mtp_enabled_ ? mtp_cache_bytes_ : 0ULL;
+    require(active_expert_host_cache_bytes_ + mtp_reserve_bytes < ram_bytes_,
+            "secondary CUDA expert host cache exhausts the RAM budget");
     const auto request_size = er::cuda::deepseek_request_state_size(
         max_context_, compression_ratios_);
     require(request_size.status.ok(), request_size.status.message());
@@ -873,10 +889,25 @@ class Model final : public er::IOperationProvider,
     require(GlobalMemoryStatusEx(&memory) != 0,
             "inspect DeepSeek worker RAM failed");
     constexpr std::uint64_t operating_system_reserve = 4ULL << 30U;
+    // A verification pair contributes six selections to each of two P100s.
+    // Eight slots admit the whole per-device wave while preserving a small
+    // burst margin for another queued request.
+    constexpr std::uint32_t active_expert_staging_slots = 8U;
+    const auto active_expert_output_bytes =
+        static_cast<std::uint64_t>(active_expert_devices_.size()) *
+        active_expert_staging_slots * active_expert_staging_slots *
+        main_component.hidden_size * sizeof(float);
+    const auto active_expert_staging_bytes =
+        static_cast<std::uint64_t>(active_expert_devices_.size()) *
+            (active_expert_staging_slots + 1U) *
+            representative->stored_bytes +
+        active_expert_output_bytes;
     require(ram_bytes_ <= std::numeric_limits<std::uint64_t>::max() -
                               staging * staging_slots -
+                              active_expert_staging_bytes -
                               operating_system_reserve &&
                 ram_bytes_ + staging * staging_slots +
+                        active_expert_staging_bytes +
                         operating_system_reserve <=
                     memory.ullAvailPhys,
             "DeepSeek worker RAM preflight failed");
@@ -897,6 +928,36 @@ class Model final : public er::IOperationProvider,
               mtp_artifacts_.typed, *mtp_model_);
       require(mtp_model_status.ok(), mtp_model_status.message());
     }
+    if (!active_expert_devices_.empty()) {
+      er::cuda::ActiveExpertDeviceExecutorConfig executor_config;
+      executor_config.model_content_hash = bundle_.descriptor.content_hash;
+      executor_config.component = main_component;
+      executor_config.device_ordinals = active_expert_devices_;
+      executor_config.device_cache_bytes_per_device =
+          active_expert_device_cache_bytes_;
+      executor_config.device_reserve_bytes_per_device = device_reserve_bytes;
+      executor_config.host_cache_bytes_total =
+          active_expert_host_cache_bytes_;
+      executor_config.staging_slots_per_device =
+          active_expert_staging_slots;
+      executor_config.input_abi = remote_expert_input_abi;
+      executor_config.output_abi = remote_expert_output_abi;
+      executor_config.activation_clamp = 10.0F;
+      executor_config.round_intermediate_to_bf16 = true;
+      auto created = er::cuda::create_active_expert_device_executor(
+          std::move(executor_config), catalog_, storage_);
+      require(created.status.ok() && created.executor,
+              created.status.ok()
+                  ? "secondary CUDA expert executor returned no ownership"
+                  : created.status.message());
+      auto owners = std::make_shared<er::ActiveExpertOwnerDirectory>();
+      const auto registered = owners->add(
+          {main_component.namespace_id, 0U, main_component.layer_count, 0U,
+           main_component.experts_per_layer, created.executor});
+      require(registered.ok(), registered.message());
+      active_device_executor_ = std::move(created.executor);
+      remote_owners_ = std::move(owners);
+    }
     directory_ = std::make_shared<er::cuda::CudaExpertDirectory>(
         main_component.namespace_id, main_component.encoding_abi,
         main_component.layer_count,
@@ -907,7 +968,8 @@ class Model final : public er::IOperationProvider,
         er::cuda::CudaExpertUploaderOptions{
             0U, true, 0U, true});
     er::ExpertCacheConfig cache_config;
-    const auto target_ram_bytes = ram_bytes_ - mtp_reserve_bytes;
+    const auto target_ram_bytes =
+        ram_bytes_ - mtp_reserve_bytes - active_expert_host_cache_bytes_;
     const auto target_vram_bytes = vram_bytes_ - mtp_reserve_bytes;
     route_trace_record_bytes_ = representative->stored_bytes;
     route_trace_device_bytes_ = routed_device_bytes;
@@ -1747,6 +1809,7 @@ class Model final : public er::IOperationProvider,
                       ? "callable verify controller returned no ownership"
                       : controller.status.message());
           state->verify_controller = std::move(controller.controller);
+          configure_active_controller(state->verify_controller);
           const auto configured =
               state->verify_controller->configure_verify(state->verify);
           require(configured.ok(), configured.message());
@@ -2111,6 +2174,7 @@ class Model final : public er::IOperationProvider,
     require(controller.status.ok() && controller.controller,
             controller.status.message());
     request->controller = std::move(controller.controller);
+    configure_active_controller(request->controller);
     if (mtp_enabled_) {
       auto verify = er::cuda::create_deepseek_verify_state(
           request->state, verify_request_bytes_);
@@ -2721,6 +2785,29 @@ class Model final : public er::IOperationProvider,
         callable_remote_owner_execution_ns_.load(std::memory_order_relaxed);
     result.callable_remote_transport_wait_ns =
         callable_remote_transport_wait_ns_.load(std::memory_order_relaxed);
+    if (active_device_executor_) {
+      const auto active = active_device_executor_->telemetry();
+      result.callable_remote_resolves = active.requests;
+      result.callable_remote_selections_launched = active.requests;
+      result.callable_remote_selections_completed = active.completed;
+      result.callable_remote_errors = active.failed;
+      result.callable_remote_cancellations = active.cancelled;
+      result.callable_remote_activation_tx_bytes =
+          active.activation_input_bytes;
+      result.callable_remote_activation_rx_bytes =
+          active.activation_output_bytes;
+      result.callable_remote_weight_tx_bytes = active.weight_transport_bytes;
+      result.callable_remote_owner_weight_read_bytes =
+          active.owner_weight_read_bytes;
+      result.callable_remote_owner_storage_read_bytes =
+          active.owner_storage_read_bytes;
+      result.callable_remote_owner_ram_read_bytes =
+          active.owner_ram_read_bytes;
+      result.callable_remote_owner_vram_read_bytes =
+          active.owner_vram_read_bytes;
+      result.callable_remote_owner_execution_ns = active.owner_execution_ns;
+      result.callable_remote_transport_wait_ns = active.transport_wait_ns;
+    }
     result.warm_start_candidates =
         warm_candidates_count_.load(std::memory_order_relaxed);
     result.warm_start_loaded = warm_loaded_.load(std::memory_order_relaxed);
@@ -2965,6 +3052,20 @@ class Model final : public er::IOperationProvider,
       "expert.swiglu.input.f32.host.v1";
   static constexpr std::string_view remote_expert_output_abi =
       "expert.swiglu.output.f32.host.v1";
+
+  void configure_active_controller(
+      const std::shared_ptr<er::cuda::DeepSeekDecodeController>& controller) {
+    if (!active_device_executor_) return;
+    er::cuda::DeepSeekActiveExpertConfig config;
+    config.executor = active_device_executor_;
+    config.model_content_hash = bundle_.descriptor.content_hash;
+    config.component = routed_->component();
+    config.input_abi = remote_expert_input_abi;
+    config.output_abi = remote_expert_output_abi;
+    const auto configured =
+        controller->configure_active_experts(std::move(config));
+    require(configured.ok(), configured.message());
+  }
 
   void observe_storage_prediction(bool selected) noexcept {
     if (selected) {
@@ -4363,6 +4464,9 @@ class Model final : public er::IOperationProvider,
         maximum_entries,
         std::min<std::uint32_t>(32U,
                                 routed_->component().experts_per_layer));
+    std::erase_if(warm_candidates_, [this](const auto& item) {
+      return remote_owners_ && remote_owners_->owns(item.key);
+    });
     // The census is hottest-first. Background admission runs coldest-first so
     // the final bounded recency order leaves the hottest evidence newest.
     std::reverse(warm_candidates_.begin(), warm_candidates_.end());
@@ -4590,6 +4694,10 @@ class Model final : public er::IOperationProvider,
   bool retain_previous_route_{};
   std::filesystem::path route_trace_path_;
   std::size_t route_trace_max_steps_{};
+  std::vector<int> active_expert_devices_;
+  std::uint64_t active_expert_device_cache_bytes_{};
+  std::uint64_t active_expert_host_cache_bytes_{};
+  std::shared_ptr<er::IActiveExpertExecutor> active_device_executor_;
   std::shared_ptr<const er::ActiveExpertOwnerDirectory> remote_owners_;
   std::ofstream route_trace_;
   std::uint64_t route_trace_record_bytes_{};
@@ -6258,9 +6366,20 @@ make_sm86_compressed_sparse_moe_callable_provider(
     std::uint32_t capacity, std::uint64_t ram_cache_bytes,
     std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
     std::uint32_t kv_page_tokens, std::string_view placement_profile,
+    bool discover_active_expert_devices,
+    std::vector<int> active_expert_devices,
+    std::uint64_t active_expert_device_cache_bytes,
+    std::uint64_t active_expert_host_cache_bytes,
     std::shared_ptr<const expert::runtime::ActiveExpertOwnerDirectory>
         remote_owners) {
   try {
+    if (discover_active_expert_devices)
+      active_expert_devices =
+          er::cuda::discover_pascal_active_expert_devices();
+    if (active_expert_devices.empty()) {
+      active_expert_device_cache_bytes = 0U;
+      active_expert_host_cache_bytes = 0U;
+    }
     // Callable requests release exact route leases after each routed
     // operation. Reserving the legacy scheduler's full previous-route tier
     // therefore strands one route per layer without providing its pin/reuse
@@ -6274,7 +6393,9 @@ make_sm86_compressed_sparse_moe_callable_provider(
         std::string(placement_profile), false, true,
         callable_retains_previous_route, callable_cpu_fallback,
         callable_cpu_fallback,
-        std::filesystem::path{}, 0U, std::move(remote_owners));
+        std::filesystem::path{}, 0U, std::move(active_expert_devices),
+        active_expert_device_cache_bytes, active_expert_host_cache_bytes,
+        std::move(remote_owners));
     implementation->start_background_warm();
     implementation->wait_background_warm();
     expert::runtime::ExecutionProviderModule module;

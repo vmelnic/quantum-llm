@@ -1332,6 +1332,9 @@ class HybridDeltaAdapter:
         norm_bits = _float32_bits(epsilon)
         rope_bits = _float32_bits(rope_theta)
         full_layers = sum(value == "full_attention" for value in layer_types)
+        exact_kv_bytes_per_token = (
+            full_layers * 2 * kv_heads * head_dim * DTYPE_BYTES["F16"]
+        )
         architecture = {
             "family": runtime_family,
             "model_type": runtime_family,
@@ -1685,6 +1688,7 @@ class HybridDeltaAdapter:
             ("kv_heads", kv_heads),
             ("head_dim", head_dim),
             ("full_attention_layers", full_layers),
+            ("minimum_exact_kv_bytes_per_token", exact_kv_bytes_per_token),
             ("linear_conv_kernel", conv_kernel),
             ("linear_key_head_dim", key_head_dim),
             ("linear_value_head_dim", value_head_dim),

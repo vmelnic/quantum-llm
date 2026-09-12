@@ -366,6 +366,7 @@ struct ExecutionProviderModule final {
     bool session_parking{};
     std::uint64_t session_park_ram_bytes{};
     std::uint64_t session_park_page_capacity{};
+    std::string routed_vram_policy{"fixed"};
   } service;
   ExecutionProviderDefinition definition;
   std::shared_ptr<IModelTensorStore> tensor_store;
@@ -373,6 +374,10 @@ struct ExecutionProviderModule final {
   // service loop can publish request/runtime evidence without learning model
   // families or provider-specific telemetry structs.
   std::function<std::map<std::string, std::uint64_t, std::less<>>()> telemetry;
+  // Optional post-prepare hook. It runs after every immutable tensor is bound
+  // and before readiness is published, so resource fitting observes the
+  // provider's real fixed CUDA footprint rather than a model-name estimate.
+  std::function<Status(ServiceContract&)> finalize_service;
 };
 
 struct CreateExecutionProviderModuleResult final {

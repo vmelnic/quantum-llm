@@ -1,6 +1,7 @@
 #include "expert/runtime/adaptive_placement.hpp"
 #include "expert/runtime/buffer_pool.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
+#include "expert/runtime/cuda/active_expert_device_executor.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/cuda/moe_kernels.hpp"
 #include "expert/runtime/cuda/transformer_kernels.hpp"
@@ -557,7 +558,10 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
                  std::uint64_t kv_cache_bytes = 2ULL << 30U,
                  std::uint32_t kv_page_tokens = 256,
                  std::string_view placement_profile = "balanced",
-                 std::uint32_t prefill_chunk_tokens = 0)
+                 std::uint32_t prefill_chunk_tokens = 0,
+                 std::vector<int> active_expert_devices = {},
+                 std::uint64_t active_expert_device_cache_bytes = 0U,
+                 std::uint64_t active_expert_host_cache_bytes = 0U)
       : root_(root), max_context_(max_context), capacity_(capacity),
         ram_cache_bytes_(ram_cache_bytes),
         vram_cache_bytes_(vram_cache_bytes), kv_cache_bytes_(kv_cache_bytes),
@@ -676,6 +680,41 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
     const auto slot_bytes = static_cast<std::size_t>(max_expert_record_bytes_);
     const auto slot_count = std::max<std::size_t>(top_k_ * 2U, 32U);
     storage_ = std::make_shared<expert::runtime::WindowsIocpStorage>(4);
+    if (!active_expert_devices.empty()) {
+      if (active_expert_device_cache_bytes == 0U ||
+          active_expert_host_cache_bytes == 0U ||
+          active_expert_host_cache_bytes >= ram_cache_bytes_)
+        throw std::runtime_error(
+            "secondary expert devices require bounded device/host caches");
+      expert::runtime::cuda::ActiveExpertDeviceExecutorConfig executor_config;
+      executor_config.model_content_hash = model_hash_;
+      executor_config.component = component;
+      executor_config.device_ordinals = std::move(active_expert_devices);
+      executor_config.device_cache_bytes_per_device =
+          active_expert_device_cache_bytes;
+      executor_config.device_reserve_bytes_per_device = 1ULL << 30U;
+      executor_config.host_cache_bytes_total = active_expert_host_cache_bytes;
+      executor_config.staging_slots_per_device =
+          std::max<std::uint32_t>(8U, (top_k_ + 1U) / 2U + 2U);
+      executor_config.input_abi = std::string(kActiveExpertInputAbi);
+      executor_config.output_abi = std::string(kActiveExpertOutputAbi);
+      executor_config.activation_clamp = 0.0F;
+      executor_config.round_intermediate_to_bf16 = false;
+      auto created =
+          expert::runtime::cuda::create_active_expert_device_executor(
+              std::move(executor_config), *catalog_, storage_);
+      if (!created.status.ok() || !created.executor)
+        throw std::runtime_error(
+            created.status.ok()
+                ? "secondary expert executor returned no implementation"
+                : std::string(created.status.message()));
+      active_device_executor_ = std::move(created.executor);
+      active_expert_host_cache_bytes_ = active_expert_host_cache_bytes;
+    } else if (active_expert_device_cache_bytes != 0U ||
+               active_expert_host_cache_bytes != 0U) {
+      throw std::runtime_error(
+          "secondary expert cache configured without devices");
+    }
     uploader_ = std::make_shared<expert::runtime::cuda::CudaExpertUploader>();
     directory_ =
         std::make_shared<expert::runtime::cuda::CudaExpertDirectory>(
@@ -706,11 +745,13 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
                                  std::uint64_t maximum) {
       return std::min(capacity / 8U, maximum);
     };
+    const auto local_ram_cache_bytes =
+        ram_cache_bytes_ - active_expert_host_cache_bytes_;
     cache_ = std::make_unique<expert::runtime::ExpertCache>(
-        expert::runtime::ExpertCacheConfig{budget(ram_cache_bytes),
+        expert::runtime::ExpertCacheConfig{budget(local_ram_cache_bytes),
                                             budget(vram_cache_bytes), true,
                                             {layers_, 1,
-                                             shared_burst(ram_cache_bytes,
+                                             shared_burst(local_ram_cache_bytes,
                                                           2ULL << 30U),
                                              shared_burst(vram_cache_bytes,
                                                           1ULL << 30U)}},
@@ -1266,6 +1307,11 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
   cpu_executor_telemetry() const noexcept {
     return cpu_executor_->telemetry();
   }
+  std::optional<expert::runtime::ActiveExpertExecutorTelemetry>
+  active_expert_telemetry() const noexcept {
+    if (!active_device_executor_) return std::nullopt;
+    return active_device_executor_->telemetry();
+  }
   void settle_placement() {
     status_check(placement_->quiesce(std::chrono::seconds(30)));
   }
@@ -1415,6 +1461,10 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
   }
 
  private:
+  static constexpr std::string_view kActiveExpertInputAbi =
+      "expert.swiglu.input.f32.host.v1";
+  static constexpr std::string_view kActiveExpertOutputAbi =
+      "expert.swiglu.output.f32.host.v1";
   static constexpr std::uint32_t kFullAttention = 0U;
   static constexpr std::uint32_t kDeltaAttention = 1U;
   static constexpr std::uint32_t kRouter = 2U;
@@ -1938,6 +1988,11 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
       throw std::runtime_error(
           "routed operation disagrees with the artifact layer program");
 
+    if (active_device_executor_) {
+      run_active_device_routed_moe(routed, positions, state_slots, rows);
+      return;
+    }
+
     // Launch the directory plan on the same stream right behind the router;
     // its results are consumed through a completion event instead of a
     // stream-wide host synchronization.
@@ -2351,6 +2406,145 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
     phase_.expert_compute_ns += elapsed_ns(expert_started);
   }
 
+  void run_active_device_routed_moe(
+      const expert::runtime::CompiledOperationProgram& routed,
+      std::span<const std::uint32_t> positions,
+      std::span<const std::uint32_t> state_slots,
+      std::uint32_t rows) {
+    if (rows != 1U)
+      throw std::runtime_error(
+          "secondary expert execution requires single-row exact routing");
+    const auto logical_layer = routed.logical_layer;
+    const auto layer = routed.component_layer;
+    const auto hidden_bytes =
+        static_cast<std::uint64_t>(hidden_) * sizeof(float);
+    const auto event_ns = [](cudaEvent_t begin, cudaEvent_t end) {
+      float milliseconds = 0.0F;
+      cuda_check(cudaEventElapsedTime(&milliseconds, begin, end),
+                 "measure CUDA phase");
+      return static_cast<std::uint64_t>(milliseconds * 1'000'000.0F);
+    };
+    const auto attention_ns =
+        event_ns(layer_start_event_, attention_done_event_);
+    phase_.attention_delta_ns += attention_ns;
+    const auto shared_ns =
+        event_ns(attention_done_event_, shared_done_event_);
+    const auto router_ns = event_ns(shared_done_event_, router_done_event_);
+    phase_.shared_expert_ns += shared_ns;
+    phase_.router_ns += router_ns;
+    phase_.shared_router_ns += shared_ns + router_ns;
+    phase_.dense_router_ns += attention_ns + shared_ns + router_ns;
+
+    const auto expert_started = std::chrono::steady_clock::now();
+    cuda_check(cudaEventRecord(expert_start_events_[logical_layer]),
+               "record secondary expert lane start");
+    cuda_check(cudaMemcpy(host_normalized_, normalized_, hidden_bytes,
+                          cudaMemcpyDeviceToHost),
+               "stage secondary expert activation");
+    cuda_check(cudaMemcpy(host_routing_indices_, routing_indices_,
+                          static_cast<std::size_t>(top_k_) *
+                              sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost),
+               "copy secondary expert route");
+
+    const auto request_id =
+        next_active_request_id_.fetch_add(1U, std::memory_order_relaxed);
+    std::vector<expert::runtime::ActiveExpertExecutionHandle> handles;
+    handles.reserve(top_k_);
+    const auto& component = model_descriptor_.routed_components.front();
+    for (std::uint32_t selection = 0U; selection < top_k_; ++selection) {
+      const auto expert = host_routing_indices_[selection];
+      if (expert >= experts_)
+        throw std::runtime_error("secondary expert route is out of range");
+      expert::runtime::ActiveExpertExecutionRequest request;
+      request.identity = {model_hash_, routed_->key(layer, expert),
+                          component.execution_capability,
+                          component.execution_abi, component.source_abi};
+      request.invocation.request_id = request_id;
+      request.invocation.invocation_id = selection + 1U;
+      request.invocation.selection_index = selection;
+      request.invocation.route_width = top_k_;
+      request.invocation.input = {
+          std::string(kActiveExpertInputAbi), "host.pinned",
+          workspace_lifetime_,
+          reinterpret_cast<const std::byte*>(host_normalized_), hidden_bytes};
+      request.invocation.output_abi = kActiveExpertOutputAbi;
+      request.invocation.output_bytes = hidden_bytes;
+      auto handle = active_device_executor_->execute(std::move(request));
+      if (!handle.valid())
+        throw std::runtime_error(
+            "secondary expert executor rejected exact route");
+      handles.push_back(std::move(handle));
+    }
+
+    std::vector<bool> completed(top_k_, false);
+    std::uint32_t remaining = top_k_;
+    while (remaining != 0U) {
+      bool progressed = false;
+      for (std::uint32_t selection = 0U; selection < top_k_; ++selection) {
+        if (completed[selection]) continue;
+        auto result = handles[selection].poll();
+        if (!result) continue;
+        progressed = true;
+        if (!result->status.ok())
+          throw std::runtime_error(std::string(result->status.message()));
+        if (result->identity.key !=
+                routed_->key(layer, host_routing_indices_[selection]) ||
+            result->request_id != request_id ||
+            result->invocation_id != selection + 1U ||
+            result->selection_index != selection ||
+            !result->output.valid() ||
+            result->output.abi != kActiveExpertOutputAbi ||
+            result->output.bytes != hidden_bytes ||
+            result->evidence.weight_transport_bytes != 0U)
+          throw std::runtime_error(
+              "secondary expert result violates exact correlation");
+        std::memcpy(host_cpu_selection_output_ +
+                        static_cast<std::size_t>(selection) * hidden_,
+                    result->output.data,
+                    static_cast<std::size_t>(hidden_bytes));
+        completed[selection] = true;
+        --remaining;
+      }
+      if (!progressed) std::this_thread::yield();
+    }
+
+    const auto output_bytes = static_cast<std::size_t>(top_k_) * hidden_bytes;
+    cuda_check(cudaMemcpy(cpu_selection_output_device_,
+                          host_cpu_selection_output_, output_bytes,
+                          cudaMemcpyHostToDevice),
+               "import secondary expert outputs");
+    std::vector<std::uint8_t> primary_mask(top_k_, 0U);
+    std::vector<std::uint32_t> alternate_slots(top_k_);
+    std::iota(alternate_slots.begin(), alternate_slots.end(), 0U);
+    cuda_check(cudaMemcpy(gpu_selection_mask_, primary_mask.data(),
+                          primary_mask.size(), cudaMemcpyHostToDevice),
+               "copy secondary expert mask");
+    cuda_check(cudaMemcpy(cpu_slot_by_selection_, alternate_slots.data(),
+                          alternate_slots.size() * sizeof(std::uint32_t),
+                          cudaMemcpyHostToDevice),
+               "copy secondary expert slots");
+    status_check(expert::runtime::cuda::launch_moe_aggregate({
+        moe_selection_output_, cpu_selection_output_device_,
+        gpu_selection_mask_, cpu_slot_by_selection_, routing_scores_,
+        moe_output_, top_k_, rows, hidden_, top_k_, nullptr}));
+    status_check(expert::runtime::cuda::add_in_place(
+        moe_output_, shared_output_, rows * hidden_, nullptr));
+    if (moe_trace_ && moe_trace_->selected(logical_layer))
+      moe_trace_->append(logical_layer, normalized_, moe_output_,
+                         routing_indices_, routing_scores_, positions,
+                         state_slots, trace_sequence_ids_);
+    status_check(expert::runtime::cuda::add_in_place(
+        hidden_state_, moe_output_, rows * hidden_, nullptr));
+    cuda_check(cudaEventRecord(expert_done_events_[logical_layer]),
+               "record secondary expert lane done");
+    cuda_check(cudaStreamSynchronize(nullptr),
+               "complete secondary expert layer");
+    gpu_selections_by_layer_[logical_layer] = 0U;
+    phase_.cpu_result_h2d_bytes += output_bytes;
+    phase_.expert_compute_ns += elapsed_ns(expert_started);
+  }
+
   std::filesystem::path root_;
   std::uint32_t max_context_{}, capacity_{}, full_attention_layers_{};
   std::uint32_t prefill_chunk_tokens_{}, workspace_rows_{};
@@ -2370,6 +2564,7 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
   std::uint64_t ram_cache_bytes_{}, vram_cache_bytes_{}, kv_cache_bytes_{},
       kv_page_bytes_{}, kv_page_capacity_{}, kv_allocated_pages_{},
       kv_reserved_pages_{};
+  std::uint64_t active_expert_host_cache_bytes_{};
   std::uint32_t kv_page_tokens_{}, max_kv_pages_per_slot_{};
   std::string placement_profile_;
   std::uint64_t directory_vram_hits_{};
@@ -2406,6 +2601,9 @@ class Qwen3NextModel final : public expert::runtime::IOperationProvider,
   std::unique_ptr<expert::runtime::cpu::ExpertExecutor> cpu_executor_;
   std::unique_ptr<expert::runtime::AdaptivePlacementPlanner> placement_;
   std::unique_ptr<expert::runtime::HybridDispatchPlanner> dispatch_;
+  std::shared_ptr<expert::runtime::IActiveExpertExecutor>
+      active_device_executor_;
+  std::atomic<std::uint64_t> next_active_request_id_{1U};
   float *hidden_state_{}, *normalized_{}, *residual_{}, *query_gate_{}, *key_{},
       *value_{}, *attention_{}, *projected_qkvz_{}, *projected_ba_{},
       *delta_output_{}, *conv_output_{}, *shared_gate_{}, *shared_up_{},
@@ -3385,11 +3583,24 @@ make_sm86_hybrid_delta_moe_callable_provider(
     const std::filesystem::path& artifact_root, std::uint32_t max_context,
     std::uint32_t capacity, std::uint64_t ram_cache_bytes,
     std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
-    std::uint32_t kv_page_tokens, std::string_view placement_profile) {
+    std::uint32_t kv_page_tokens, std::string_view placement_profile,
+    bool discover_active_expert_devices,
+    std::vector<int> active_expert_devices,
+    std::uint64_t active_expert_device_cache_bytes,
+    std::uint64_t active_expert_host_cache_bytes) {
   try {
+    if (discover_active_expert_devices)
+      active_expert_devices =
+          expert::runtime::cuda::discover_pascal_active_expert_devices();
+    if (active_expert_devices.empty()) {
+      active_expert_device_cache_bytes = 0U;
+      active_expert_host_cache_bytes = 0U;
+    }
     auto implementation = std::make_shared<Qwen3NextModel>(
         artifact_root, max_context, ram_cache_bytes, vram_cache_bytes,
-        capacity, kv_cache_bytes, kv_page_tokens, placement_profile, 1U);
+        capacity, kv_cache_bytes, kv_page_tokens, placement_profile, 1U,
+        std::move(active_expert_devices), active_expert_device_cache_bytes,
+        active_expert_host_cache_bytes);
     expert::runtime::ExecutionProviderModule module;
     module.definition = {"sm86-hybrid-delta-moe", 100U,
                          provider_capabilities(), implementation};
@@ -3408,7 +3619,7 @@ make_sm86_hybrid_delta_moe_callable_provider(
     module.telemetry = [implementation] {
       const auto cache = implementation->telemetry();
       const auto phase = implementation->phase_telemetry();
-      return std::map<std::string, std::uint64_t, std::less<>>{
+      auto result = std::map<std::string, std::uint64_t, std::less<>>{
           {"cache_vram_hits", cache.acquire_vram_hits},
           {"cache_ram_hits", cache.acquire_ram_hits},
           {"cache_ssd_misses", cache.acquire_ssd_misses},
@@ -3418,6 +3629,24 @@ make_sm86_hybrid_delta_moe_callable_provider(
           {"cache_upload_wait_ns", cache.upload_wait_ns},
           {"forward_calls", phase.forward_calls},
           {"forward_wall_ns", phase.forward_wall_ns}};
+      if (const auto active = implementation->active_expert_telemetry()) {
+        result.emplace("active_expert_requests", active->requests);
+        result.emplace("active_expert_completed", active->completed);
+        result.emplace("active_expert_failed", active->failed);
+        result.emplace("active_expert_input_bytes",
+                       active->activation_input_bytes);
+        result.emplace("active_expert_output_bytes",
+                       active->activation_output_bytes);
+        result.emplace("active_expert_storage_bytes",
+                       active->owner_storage_read_bytes);
+        result.emplace("active_expert_ram_bytes",
+                       active->owner_ram_read_bytes);
+        result.emplace("active_expert_vram_bytes",
+                       active->owner_vram_read_bytes);
+        result.emplace("active_expert_execution_ns",
+                       active->owner_execution_ns);
+      }
+      return result;
     };
     return {expert::runtime::Status::success(), std::move(module)};
   } catch (const std::exception& error) {

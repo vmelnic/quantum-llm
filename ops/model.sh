@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-flash|muse|ornith|mistral|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -47,6 +47,7 @@ extra_arguments=("${@:3}")
 model_id="${selection}"
 artifact_name="${selection}"
 alias_kv_cache_dtype=""
+alias_routed_vram_policy="fixed"
 task_name="QuantumLLM-ExpertVm"
 if [[ "${selection}" == all ]]; then
   model_id=""
@@ -58,9 +59,9 @@ else
   alias_file="${script_dir}/model-aliases.tsv"
   [[ -f "${alias_file}" ]] || die "model alias registry is missing: ${alias_file}"
   alias_registry_version=""
-  while IFS=$'\t' read -r alias advertised_model artifact declared_kv extra; do
-    if [[ "${alias}" == model-aliases-v2 ]]; then
-      [[ -z "${advertised_model}${artifact}${declared_kv}${extra}" ]] ||
+  while IFS=$'\t' read -r alias advertised_model artifact declared_kv declared_vram extra; do
+    if [[ "${alias}" == model-aliases-v3 ]]; then
+      [[ -z "${advertised_model}${artifact}${declared_kv}${declared_vram}${extra}" ]] ||
         die "invalid model alias registry header"
       alias_registry_version="${alias}"
       continue
@@ -69,16 +70,19 @@ else
     [[ -z "${extra}" && -n "${advertised_model}" && -n "${artifact}" &&
        ( "${declared_kv}" == artifact ||
          "${declared_kv}" == fp8-e4m3-per-head ||
-         "${declared_kv}" == fp16 ) ]] ||
+         "${declared_kv}" == fp4-e2m1-ue8m0-block32-key-outlier1 ||
+         "${declared_kv}" == fp16 ) &&
+       ( "${declared_vram}" == fixed || "${declared_vram}" == fit ) ]] ||
       die "invalid model alias registry row for '${alias}'"
     if [[ "${alias}" == "${selection}" ]]; then
       model_id="${advertised_model}"
       artifact_name="${artifact}"
       alias_kv_cache_dtype="${declared_kv}"
+      alias_routed_vram_policy="${declared_vram}"
       break
     fi
   done < "${alias_file}"
-  [[ "${alias_registry_version}" == model-aliases-v2 ]] ||
+  [[ "${alias_registry_version}" == model-aliases-v3 ]] ||
     die "unsupported model alias registry version"
   [[ "${artifact_name}" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*$ ]] ||
     die "model alias resolves outside MODEL_ROOT"
@@ -100,6 +104,10 @@ max_image_patch_tokens="${MODEL_MAX_IMAGE_PATCH_TOKENS:-4096}"
 sync_on_start="${MODEL_SYNC_ON_START:-1}"
 ram_cache_gib="${MODEL_RAM_CACHE_GIB:-48}"
 vram_cache_gib="${MODEL_VRAM_CACHE_GIB:-12}"
+routed_vram_policy="${alias_routed_vram_policy}"
+active_expert_devices="${MODEL_ACTIVE_EXPERT_DEVICES:-}"
+active_expert_device_cache_gib="${MODEL_ACTIVE_EXPERT_DEVICE_CACHE_GIB:-0}"
+active_expert_host_cache_gib="${MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB:-0}"
 worker_capacity="${MODEL_WORKER_CAPACITY:-1}"
 maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
 kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
@@ -130,6 +138,20 @@ require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
 require_uint MODEL_MAXIMUM_QUEUE "${maximum_queue}"
 require_uint MODEL_KV_CACHE_MIB "${kv_cache_mib}"
 require_uint MODEL_KV_PAGE_TOKENS "${kv_page_tokens}"
+if [[ -n "${active_expert_devices}" ]]; then
+  [[ "${active_expert_devices}" == auto ||
+     "${active_expert_devices}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
+    die "MODEL_ACTIVE_EXPERT_DEVICES must be auto or a comma-separated CUDA ordinal list"
+  require_uint MODEL_ACTIVE_EXPERT_DEVICE_CACHE_GIB \
+    "${active_expert_device_cache_gib}"
+  require_uint MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB \
+    "${active_expert_host_cache_gib}"
+  (( active_expert_host_cache_gib < ram_cache_gib )) ||
+    die "MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB must be smaller than MODEL_RAM_CACHE_GIB"
+elif [[ "${active_expert_device_cache_gib}" != 0 ||
+        "${active_expert_host_cache_gib}" != 0 ]]; then
+  die "active expert cache budgets require MODEL_ACTIVE_EXPERT_DEVICES"
+fi
 [[ "${host_address}" =~ ^[A-Za-z0-9:.%-]+$ ]] ||
   die "MODEL_HOST contains unsupported characters"
 if [[ "${host_address}" != 127.0.0.1 && "${host_address}" != ::1 &&
@@ -145,8 +167,9 @@ case "${profile_gpu_phases}" in
 esac
 [[ "${kv_cache_dtype}" == artifact ||
    "${kv_cache_dtype}" == fp8-e4m3-per-head ||
+   "${kv_cache_dtype}" == fp4-e2m1-ue8m0-block32-key-outlier1 ||
    "${kv_cache_dtype}" == fp16 ]] ||
-  die "MODEL_KV_CACHE_DTYPE must be artifact, fp8-e4m3-per-head, or fp16"
+  die "MODEL_KV_CACHE_DTYPE must be artifact, fp8-e4m3-per-head, fp4-e2m1-ue8m0-block32-key-outlier1, or fp16"
 (( max_output < max_context )) || die "MODEL_MAX_OUTPUT_TOKENS must be smaller than MODEL_MAX_CONTEXT"
 
 export QUANTUM_LLM_REMOTE="${remote_host}"
@@ -195,6 +218,10 @@ print_config() {
     "runner=${vm_runner}" \
     "ram_cache_gib=${ram_cache_gib}" \
     "vram_cache_gib=${vram_cache_gib}" \
+    "routed_vram_policy=${routed_vram_policy}" \
+    "active_expert_devices=${active_expert_devices}" \
+    "active_expert_device_cache_gib=${active_expert_device_cache_gib}" \
+    "active_expert_host_cache_gib=${active_expert_host_cache_gib}" \
     "worker_capacity=${worker_capacity}" \
     "kv_cache_mib=${kv_cache_mib}" \
     "kv_page_tokens=${kv_page_tokens}" \
@@ -270,6 +297,13 @@ print(maximum, per_token)
   if is_true "${profile_gpu_phases}"; then
     common+=(-ProfileGpuPhases)
   fi
+  if [[ -n "${active_expert_devices}" ]]; then
+    common+=(
+      -WorkerActiveExpertDevices "${active_expert_devices}"
+      -WorkerActiveExpertDeviceCacheGiB "${active_expert_device_cache_gib}"
+      -WorkerActiveExpertHostCacheGiB "${active_expert_host_cache_gib}"
+    )
+  fi
   if [[ -n "${raw_response_trace_file}" ]]; then
     common+=(-RawResponseTraceFile "${raw_response_trace_file}")
   fi
@@ -281,6 +315,7 @@ print(maximum, per_token)
     -WorkerCapacity "${worker_capacity}" \
     -WorkerRamCacheGiB "${ram_cache_gib}" \
     -WorkerVramCacheGiB "${vram_cache_gib}" \
+    -WorkerRoutedVramPolicy "${routed_vram_policy}" \
     "${common[@]}"
   local status_args=(
     -Port "${port}"

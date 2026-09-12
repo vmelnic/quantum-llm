@@ -1,18 +1,20 @@
-model-aliases-v2
-deepseek	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact
-deepseek-v4-flash	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact
-mistral	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
-mistral-small-4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
-mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact
-muse	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
-muse-glimmer	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
-muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16
-ornith	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16
-ornith-1.5	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16
-ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16
-qwen	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
-qwen3.8	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
-qwen3.8-27b-fp4	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16
-qwen-flash	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16
-qwen3.8-flash-next	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16
-qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16
+model-aliases-v3
+deepseek	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact	fixed
+deepseek-v4-flash	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact	fixed
+mistral	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed
+mistral-small-4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed
+mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed
+muse	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16	fixed
+muse-glimmer	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16	fixed
+muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	muse-glimmer-30b-fp4	fp16	fixed
+ornith	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16	fixed
+ornith-k1	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp4-e2m1-ue8m0-block32-key-outlier1	fit
+ornith-1.5	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16	fixed
+ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	fp16	fixed
+qwen	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp4-e2m1-ue8m0-block32-key-outlier1	fixed
+qwen3.8	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp4-e2m1-ue8m0-block32-key-outlier1	fixed
+qwen3.8-27b-fp4	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp4-e2m1-ue8m0-block32-key-outlier1	fixed
+qwen-f16	qwen3.8-27b-fp4	qwen3.8-27b-fp4	fp16	fixed
+qwen-flash	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16	fixed
+qwen3.8-flash-next	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16	fixed
+qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	qwen3.8-flash-next-fp4	fp16	fixed

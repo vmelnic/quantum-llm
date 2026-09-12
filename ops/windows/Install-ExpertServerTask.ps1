@@ -13,11 +13,16 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [ValidateSet("fixed", "fit")]
+    [string]$WorkerRoutedVramPolicy = "fixed",
+    [string]$WorkerActiveExpertDevices = "",
+    [int]$WorkerActiveExpertDeviceCacheGiB = 0,
+    [int]$WorkerActiveExpertHostCacheGiB = 0,
     [ValidateSet("latency", "balanced", "capacity")]
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
-    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp16")]
+    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
@@ -47,6 +52,11 @@ if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $MaximumBodyMiB -lt 1 -or $MaximumImagePixels -lt 65536 -or
     $MaximumImagePatchTokens -lt 256) {
     throw "Invalid service limits"
+}
+$activeExpertConfigured = -not [string]::IsNullOrWhiteSpace($WorkerActiveExpertDevices)
+if ($activeExpertConfigured -ne ($WorkerActiveExpertDeviceCacheGiB -gt 0) -or
+    $activeExpertConfigured -ne ($WorkerActiveExpertHostCacheGiB -gt 0)) {
+    throw "Secondary expert devices and cache budgets must be configured together"
 }
 if (-not $TaskName) { $TaskName = "QuantumLLM-ExpertVm" }
 if (-not $Container -or -not $Runner) {
@@ -85,6 +95,7 @@ $taskArguments.AddRange([string[]]@(
     "-WorkerCapacity", [string]$WorkerCapacity,
     "-WorkerRamCacheGiB", [string]$WorkerRamCacheGiB,
     "-WorkerVramCacheGiB", [string]$WorkerVramCacheGiB,
+    "-WorkerRoutedVramPolicy", (Quote-TaskArgument $WorkerRoutedVramPolicy),
     "-PlacementProfile", (Quote-TaskArgument $PlacementProfile),
     "-WorkerKvCacheMiB", [string]$WorkerKvCacheMiB,
     "-WorkerKvPageTokens", [string]$WorkerKvPageTokens,
@@ -100,6 +111,14 @@ $taskArguments.AddRange([string[]]@(
     "-DrainTimeoutSeconds", [string]$DrainTimeoutSeconds,
     "-BuildId", (Quote-TaskArgument $BuildId)
 ))
+if ($activeExpertConfigured) {
+    $taskArguments.Add("-WorkerActiveExpertDevices")
+    $taskArguments.Add((Quote-TaskArgument $WorkerActiveExpertDevices))
+    $taskArguments.Add("-WorkerActiveExpertDeviceCacheGiB")
+    $taskArguments.Add([string]$WorkerActiveExpertDeviceCacheGiB)
+    $taskArguments.Add("-WorkerActiveExpertHostCacheGiB")
+    $taskArguments.Add([string]$WorkerActiveExpertHostCacheGiB)
+}
 foreach ($entry in @(
     @{ Name = "Container"; Value = $Container },
     @{ Name = "Tokenizer"; Value = $Tokenizer },
@@ -132,13 +151,12 @@ if ($WorkerRouteTraceFile) {
 $action = New-ScheduledTaskAction -Execute "powershell.exe" `
     -Argument ($taskArguments -join " ")
 $identity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-$trigger = New-ScheduledTaskTrigger -AtLogOn -User $identity
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
 $principal = New-ScheduledTaskPrincipal -UserId $identity `
     -LogonType Interactive -RunLevel Limited
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger `
+Register-ScheduledTask -TaskName $TaskName -Action $action `
     -Settings $settings -Principal $principal -Force | Out-Null
 if ($Start) { Start-ScheduledTask -TaskName $TaskName }
 
@@ -154,7 +172,11 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     maximum_image_patch_tokens = $MaximumImagePatchTokens
     model_input = $Container
     placement_profile = $PlacementProfile
+    routed_vram_policy = $WorkerRoutedVramPolicy
     worker_kv_cache_dtype = $WorkerKvCacheDtype
+    worker_active_expert_devices = $WorkerActiveExpertDevices
+    worker_active_expert_device_cache_gib = $WorkerActiveExpertDeviceCacheGiB
+    worker_active_expert_host_cache_gib = $WorkerActiveExpertHostCacheGiB
     profile_gpu_phases = [bool]$ProfileGpuPhases
     retained_route_policy = if ($DisableRetainedRoute) {
         "disabled"

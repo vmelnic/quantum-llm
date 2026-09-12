@@ -1419,6 +1419,12 @@ class ExpertPackTests(unittest.TestCase):
             self.assertEqual(
                 adapted.architecture["family"], "hybrid_delta_dense"
             )
+            self.assertEqual(
+                dict(adapted.runtime_topology.attributes)[
+                    "minimum_exact_kv_bytes_per_token"
+                ],
+                2 * 1 * 16 * 2,
+            )
             self.assertEqual(adapted.architecture["num_hidden_layers"], 4)
             self.assertEqual(adapted.source_tensor_count, len(adapted.dense))
             self.assertEqual(adapted.experts, ())

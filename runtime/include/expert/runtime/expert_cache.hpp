@@ -349,6 +349,12 @@ class ExpertCache final {
   [[nodiscard]] TelemetrySnapshot telemetry() const noexcept;
   [[nodiscard]] CacheUsage usage() const noexcept;
 
+  // Startup-only resource fitting. The cache may change its device ceiling
+  // before the first device reservation; once any expert VRAM is reserved the
+  // contract is immutable and the call fails closed.
+  [[nodiscard]] Status configure_vram_budget(
+      TierBudget budget, std::uint64_t transient_bytes);
+
   // Evicts every currently unreferenced copy and returns bytes released.
   std::uint64_t trim();
   // Trims each tier independently until it reaches the requested target or

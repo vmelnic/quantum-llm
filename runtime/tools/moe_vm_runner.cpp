@@ -1,4 +1,5 @@
 #include "expert/runtime/model_artifact.hpp"
+#include "expert/runtime/cuda/active_expert_device_executor.hpp"
 #include "expert/runtime/expert_store.hpp"
 #include "expert/runtime/program_executor.hpp"
 #include "expert/runtime/worker_contract.hpp"
@@ -43,18 +44,21 @@ er::WorkerProviderDefinition make_sm86_hybrid_delta_moe_provider();
 er::CreateExecutionProviderModuleResult
 make_sm86_hybrid_delta_moe_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
-    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view);
+    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view, bool,
+    std::vector<int>, std::uint64_t, std::uint64_t);
 er::WorkerProviderDefinition make_sm86_dense_fp4_provider();
 er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
     std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
-    std::string_view, bool);
+    std::string_view, std::string_view, bool, bool, std::vector<int>,
+    std::uint64_t, std::uint64_t);
 #ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
 er::WorkerProviderDefinition make_sm86_compressed_sparse_moe_provider();
 er::CreateExecutionProviderModuleResult
 make_sm86_compressed_sparse_moe_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
     std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
+    bool, std::vector<int>, std::uint64_t, std::uint64_t,
     std::shared_ptr<const er::ActiveExpertOwnerDirectory>);
 #endif
 
@@ -433,6 +437,11 @@ std::uint64_t page_count(std::uint32_t tokens, std::uint32_t page_tokens) {
 er::ExecutionProviderModule create_module(
     const er::ModelArtifact& artifact, const std::filesystem::path& root,
     const er::WorkerLaunchOptions& options) {
+  auto active_expert_devices = options.active_expert_devices;
+  if (options.discover_active_expert_devices)
+    active_expert_devices =
+        er::cuda::discover_pascal_active_expert_devices();
+
   std::vector<ModuleFactory> factories;
   // Deployment ownership is common runtime data. An empty directory preserves
   // exact local placement; configured transports can populate the same object
@@ -460,7 +469,10 @@ er::ExecutionProviderModule create_module(
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
                options.kv_cache_mib << 20U, options.kv_page_tokens,
                options.kv_cache_dtype, options.placement_profile,
-               options.profile_gpu_phases);
+               options.routed_vram_policy,
+               options.profile_gpu_phases, false, active_expert_devices,
+               options.active_expert_device_cache_gib << 30U,
+               options.active_expert_host_cache_gib << 30U);
          }});
   }
   {
@@ -472,7 +484,10 @@ er::ExecutionProviderModule create_module(
                root, options.max_context, options.capacity,
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
                options.kv_cache_mib << 20U, options.kv_page_tokens,
-               options.placement_profile);
+               options.placement_profile,
+               false, active_expert_devices,
+               options.active_expert_device_cache_gib << 30U,
+               options.active_expert_host_cache_gib << 30U);
          }});
   }
 #ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
@@ -485,7 +500,11 @@ er::ExecutionProviderModule create_module(
                root, options.max_context, options.capacity,
                options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
                options.kv_cache_mib << 20U, options.kv_page_tokens,
-               options.placement_profile, active_expert_owners);
+               options.placement_profile,
+               false, active_expert_devices,
+               options.active_expert_device_cache_gib << 30U,
+               options.active_expert_host_cache_gib << 30U,
+               active_expert_owners);
          }});
   }
 #endif
@@ -547,12 +566,15 @@ void validate_service_contract(
               service.kv_page_bytes != 0U && service.kv_page_capacity != 0U &&
               (service.placement_mode == "budgeted" ||
                service.placement_mode == "resident") &&
+              service.routed_vram_policy == options.routed_vram_policy &&
               ((service.placement_mode == "budgeted" &&
                 service.placement_profile == options.placement_profile &&
                 service.ram_cache_bytes != 0U &&
                 service.ram_cache_bytes <= (options.ram_cache_gib << 30U) &&
                 service.vram_cache_bytes != 0U &&
-                service.vram_cache_bytes <= (options.vram_cache_gib << 30U)) ||
+                (service.routed_vram_policy == "fit" ||
+                 service.vram_cache_bytes <=
+                     (options.vram_cache_gib << 30U))) ||
                (service.placement_mode == "resident" &&
                 service.placement_profile == "resident" &&
                 service.ram_cache_bytes == 0U &&
@@ -573,7 +595,7 @@ void print_ready(const er::ModelDescriptor& descriptor,
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":10,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":11,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -634,6 +656,8 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << service.placement_profile << "\",\"ram_cache_bytes\":"
             << service.ram_cache_bytes << ",\"vram_cache_bytes\":"
             << service.vram_cache_bytes
+            << ",\"routed_vram_policy\":\""
+            << service.routed_vram_policy << '"'
             << ",\"placement_prefetch_enabled\":"
             << (service.placement_prefetch_enabled ? "true" : "false")
             << ",\"placement_prefetch_state\":\""
@@ -1371,6 +1395,10 @@ int main(int argc, char** argv) {
                     (std::numeric_limits<std::uint64_t>::max() >> 30U) &&
                 parsed.options.vram_cache_gib <=
                     (std::numeric_limits<std::uint64_t>::max() >> 30U) &&
+                parsed.options.active_expert_device_cache_gib <=
+                    (std::numeric_limits<std::uint64_t>::max() >> 30U) &&
+                parsed.options.active_expert_host_cache_gib <=
+                    (std::numeric_limits<std::uint64_t>::max() >> 30U) &&
                 parsed.options.kv_cache_mib <=
                     (std::numeric_limits<std::uint64_t>::max() >> 20U),
             "worker resource byte count overflows");
@@ -1386,8 +1414,6 @@ int main(int argc, char** argv) {
     startup_phase("provider_create_begin");
     auto module = create_module(artifact, root, parsed.options);
     startup_phase("provider_create_complete");
-    validate_service_contract(artifact.model(), module, parsed.options);
-
     er::ExecutionProviderRegistry registry;
     status = registry.add(module.definition);
     require(status.ok(), status.message());
@@ -1401,6 +1427,13 @@ int main(int argc, char** argv) {
         executor);
     require(status.ok(), status.message());
     startup_phase("program_prepare_complete");
+    if (module.finalize_service) {
+      startup_phase("provider_finalize_begin");
+      status = module.finalize_service(module.service);
+      require(status.ok(), status.message());
+      startup_phase("provider_finalize_complete");
+    }
+    validate_service_contract(artifact.model(), module, parsed.options);
     startup_phase("worker_ready");
     return worker_loop(executor, artifact.model(), module, parsed.options);
   } catch (const std::exception& error) {

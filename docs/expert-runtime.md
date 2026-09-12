@@ -1,6 +1,6 @@
 # Runtime contract
 
-Status: current VM, provider and worker contract, 2026-09-02.
+Status: current VM, provider and worker contract, 2026-09-12.
 
 ## Program and provider binding
 

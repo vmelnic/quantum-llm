@@ -1,6 +1,6 @@
 # Getting started
 
-Status: supported setup path, 2026-09-02.
+Status: supported setup path, 2026-09-12.
 
 The control host is POSIX; the execution host is the self-contained Windows
 RTX 3090 machine. The repository may live at any path. `.env` supplies the
@@ -114,8 +114,10 @@ or a task at `.partial`, `.candidate` or a missing artifact.
 ./ops/model.sh stop all
 ```
 
-The lifecycle aliases are `qwen`, `qwen-flash`, `mistral`, `muse`, `ornith`
-and `deepseek`. A real `hi` validates wiring only. For a minimal Pi check:
+The lifecycle aliases are `qwen`, `qwen-f16`, `qwen-flash`, `mistral`, `muse`,
+`ornith`, `ornith-k1` and `deepseek`. `qwen` and `ornith-k1` select
+experimental K1 KV; `qwen-f16` and `ornith` preserve their exact-F16 reference
+paths. A real `hi` validates wiring only. For a minimal Pi check:
 
 ```bash
 ./ops/model.sh start qwen

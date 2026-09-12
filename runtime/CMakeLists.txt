@@ -121,6 +121,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     src/cuda/deepseek_typed_set.cpp
     src/cuda/expert_directory.cu
     src/cuda/expert_uploader.cu
+    src/cuda/flash_attention.cu
     src/cuda/moe_kernels.cu
     src/cuda/transformer_kernels.cu)
   target_compile_definitions(expert_runtime PUBLIC EXPERT_RUNTIME_HAS_CUDA_COMPUTE=1)
@@ -128,11 +129,58 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
   target_compile_options(expert_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
+  set_source_files_properties(src/cuda/flash_attention.cu PROPERTIES
+    COMPILE_OPTIONS
+      "--expt-relaxed-constexpr;--expt-extended-lambda;--use_fast_math;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__;-U__CUDA_NO_BFLOAT16_CONVERSIONS__")
+  target_include_directories(expert_runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flash_attention/shim
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flash_attention/csrc/flash_attn/src
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/flash_attention/csrc/cutlass/include)
   target_link_libraries(expert_runtime PRIVATE CUDA::cudart CUDA::cublas)
   set_target_properties(expert_runtime PROPERTIES
     CUDA_ARCHITECTURES 86
     CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON)
+  add_executable(expert-pascal-moe-route-gate
+    tools/pascal_moe_route_gate.cu)
+  target_compile_definitions(expert-pascal-moe-route-gate PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
+  target_compile_options(expert-pascal-moe-route-gate PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
+  target_link_libraries(expert-pascal-moe-route-gate PRIVATE CUDA::cudart)
+  set_target_properties(expert-pascal-moe-route-gate PROPERTIES
+    CUDA_ARCHITECTURES 60
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON)
+  add_executable(expert-pascal-resident-mlp-gate
+    tools/pascal_resident_mlp_gate.cu)
+  target_compile_definitions(expert-pascal-resident-mlp-gate PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
+  target_compile_options(expert-pascal-resident-mlp-gate PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
+  target_link_libraries(expert-pascal-resident-mlp-gate PRIVATE
+    expert_runtime CUDA::cudart CUDA::cublas)
+  set_target_properties(expert-pascal-resident-mlp-gate PROPERTIES
+    CUDA_ARCHITECTURES 60
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON)
+  add_library(expert-pascal-active-expert STATIC
+    src/cuda/active_expert_device_executor.cu)
+  target_compile_definitions(expert-pascal-active-expert PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
+  target_compile_options(expert-pascal-active-expert PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--allow-unsupported-compiler>)
+  target_link_libraries(expert-pascal-active-expert PUBLIC
+    expert_runtime CUDA::cudart)
+  set_target_properties(expert-pascal-active-expert PROPERTIES
+    CUDA_ARCHITECTURES "60;61"
+    CUDA_STANDARD 20
+    CUDA_STANDARD_REQUIRED ON)
+  add_executable(expert-pascal-active-expert-gate
+    tools/pascal_active_expert_gate.cpp)
+  target_compile_features(expert-pascal-active-expert-gate PRIVATE cxx_std_20)
+  target_link_libraries(expert-pascal-active-expert-gate PRIVATE
+    expert_runtime expert-pascal-active-expert CUDA::cudart)
   add_executable(expert-cuda-moe-smoke tools/cuda_moe_smoke.cpp)
   target_compile_features(expert-cuda-moe-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-cuda-moe-smoke PRIVATE expert_runtime CUDA::cudart)
@@ -206,7 +254,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     add_executable(expert-deepseek-worker tools/deepseek_worker.cpp)
     target_compile_features(expert-deepseek-worker PRIVATE cxx_std_20)
     target_link_libraries(expert-deepseek-worker PRIVATE
-      expert_runtime expert_core CUDA::cudart)
+      expert_runtime expert_core expert-pascal-active-expert CUDA::cudart)
     add_library(expert-sm86-compressed-sparse-moe-provider OBJECT
       tools/deepseek_worker.cpp)
     target_compile_features(expert-sm86-compressed-sparse-moe-provider PRIVATE
@@ -256,14 +304,15 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
       EXPERT_VM_HAS_DEEPSEEK_PROVIDER=1)
   endif()
   target_compile_features(expert-moe-vm-runner PRIVATE cxx_std_20)
-  target_link_libraries(expert-moe-vm-runner PRIVATE expert_runtime expert_core CUDA::cudart)
+  target_link_libraries(expert-moe-vm-runner PRIVATE
+    expert_runtime expert_core expert-pascal-active-expert CUDA::cudart)
   add_executable(expert-callable-vm-smoke
     tools/callable_vm_smoke.cpp
     $<TARGET_OBJECTS:expert-sm86-dense-moe-provider>
     $<TARGET_OBJECTS:expert-sm86-hybrid-delta-moe-provider>)
   target_compile_features(expert-callable-vm-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-callable-vm-smoke PRIVATE
-    expert_runtime expert_core CUDA::cudart)
+    expert_runtime expert_core expert-pascal-active-expert CUDA::cudart)
 endif()
 
 if(EXPERT_RUNTIME_BUILD_TESTS)

@@ -3,15 +3,25 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cstring>
 #include <set>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace expert::runtime::cuda {
 namespace {
 
 constexpr std::size_t kStreamValues = 4U * 4096U;
+constexpr std::uint32_t kHidden = 4096U;
+constexpr std::uint32_t kRouteWidth = 6U;
+constexpr std::uint32_t kRoutedExperts = 256U;
+constexpr std::uint32_t kSharedExperts = 1U;
+constexpr std::uint32_t kIntermediate = 2048U;
+
+std::atomic<std::uint64_t> next_active_expert_request_id{1U};
 
 Status cuda_status(cudaError_t error, const char* operation) {
   if (error == cudaSuccess) return Status::success();
@@ -94,6 +104,46 @@ Status DeepSeekDecodeController::configure_verify(
   return Status::success();
 }
 
+Status DeepSeekDecodeController::configure_active_experts(
+    DeepSeekActiveExpertConfig config) noexcept {
+  if (active_ || active_expert_config_.executor || !config.executor ||
+      config.input_abi.empty() || config.output_abi.empty() ||
+      config.component.layer_count != request_->layer_count() ||
+      config.component.hidden_size != kHidden ||
+      config.component.intermediate_size != kIntermediate ||
+      config.component.route_width != kRouteWidth ||
+      config.component.experts_per_layer != kRoutedExperts ||
+      config.component.shared_experts_per_layer != kSharedExperts ||
+      config.component.namespace_id == 0U ||
+      config.component.execution_capability.empty() ||
+      config.component.execution_abi == 0U ||
+      config.component.source_abi == 0U ||
+      config.component.encoding_abi == 0U ||
+      std::all_of(config.model_content_hash.begin(),
+                  config.model_content_hash.end(),
+                  [](std::byte value) { return value == std::byte{}; }))
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek active-expert controller configuration"};
+  void* allocation{};
+  constexpr auto values =
+      static_cast<std::size_t>(2U + 2U * kRouteWidth) * kHidden;
+  const auto allocated = cudaHostAlloc(
+      &allocation, values * sizeof(float), cudaHostAllocPortable);
+  if (allocated != cudaSuccess)
+    return cuda_status(allocated, "allocate DeepSeek active-expert staging");
+  active_expert_host_owner_ = std::shared_ptr<void>(
+      allocation, [](void* pointer) { static_cast<void>(cudaFreeHost(pointer)); });
+  active_expert_inputs_host_ = static_cast<float*>(allocation);
+  active_expert_outputs_host_ = active_expert_inputs_host_ + 2U * kHidden;
+  active_expert_request_id_ =
+      next_active_expert_request_id.fetch_add(1U, std::memory_order_relaxed);
+  if (active_expert_request_id_ == 0U)
+    active_expert_request_id_ =
+        next_active_expert_request_id.fetch_add(1U, std::memory_order_relaxed);
+  active_expert_config_ = std::move(config);
+  return Status::success();
+}
+
 Status DeepSeekDecodeController::stage_cpu_placements(
     std::span<const DeepSeekCpuExpertPlacement> placements) noexcept {
   if (!active_ || !waiting_for_experts_ || !cpu_executor_ ||
@@ -139,6 +189,7 @@ Status DeepSeekDecodeController::begin(
   rope_ = launch.rope;
   position_ = launch.position;
   token_id_ = launch.token_id;
+  active_expert_deadline_ = launch.deadline;
   current_layer_ = launch.first_layer;
   layer_limit_ = layer_limit;
   route_trace_.clear();
@@ -173,6 +224,7 @@ Status DeepSeekDecodeController::begin_verify_pair(
   pair_rope_ = launch.rope;
   pair_positions_ = launch.positions;
   pair_token_ids_ = launch.token_ids;
+  active_expert_deadline_ = launch.deadline;
   current_layer_ = launch.first_layer;
   layer_limit_ = layer_limit;
   route_trace_.clear();
@@ -200,6 +252,7 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::fail(
   active_ = false;
   waiting_for_experts_ = false;
   complete_ = false;
+  active_expert_deadline_ = std::chrono::steady_clock::time_point::max();
   clear_cpu_placements();
   if (pair_mode_ && verify_) {
     const auto aborted = verify_->abort_transaction(stream_);
@@ -307,6 +360,189 @@ DeepSeekDecodeController::poll_plan() noexcept {
   return execute_plan(std::move(polled.plan));
 }
 
+DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_active_plan(
+    std::span<const std::uint32_t> routed_experts) noexcept {
+  struct PendingSelection final {
+    ActiveExpertIdentity identity;
+    std::uint64_t invocation_id{};
+    std::uint32_t flat_selection{};
+    std::uint32_t row_selection{};
+    ActiveExpertExecutionHandle handle;
+  };
+
+  try {
+    const auto rows = pair_mode_ ? 2U : 1U;
+    const auto selections = rows * kRouteWidth;
+    if (!active_expert_config_.executor || !active_expert_host_owner_ ||
+        routed_experts.size() != selections || pin_id_ == 0U)
+      return fail({ErrorCode::internal,
+                   "DeepSeek active-expert plan violates its route contract"});
+
+    const auto bytes = static_cast<std::uint64_t>(kHidden) * sizeof(float);
+    constexpr auto maximum_owner_wait = std::chrono::minutes(5);
+    const auto local_deadline =
+        std::chrono::steady_clock::now() + maximum_owner_wait;
+    const auto owner_deadline =
+        active_expert_deadline_ == std::chrono::steady_clock::time_point::max()
+            ? local_deadline
+            : std::min(active_expert_deadline_, local_deadline);
+    const auto* device_input = pair_mode_
+        ? verify_->ffn_workspace()->normalized_input()
+        : request_->layer(current_layer_).ffn_state->normalized_input();
+    auto error = cudaMemcpyAsync(
+        active_expert_inputs_host_, device_input,
+        static_cast<std::size_t>(rows) * bytes, cudaMemcpyDeviceToHost,
+        static_cast<cudaStream_t>(stream_));
+    if (error == cudaSuccess)
+      error = cudaStreamSynchronize(static_cast<cudaStream_t>(stream_));
+    if (error != cudaSuccess)
+      return fail(cuda_status(error,
+                              "stage DeepSeek active-expert activation"));
+
+    std::vector<PendingSelection> pending;
+    pending.reserve(selections);
+    const std::shared_ptr<const void> input_owner = active_expert_host_owner_;
+    for (std::uint32_t selection = 0U; selection < selections; ++selection) {
+      ActiveExpertIdentity identity;
+      identity.model_content_hash = active_expert_config_.model_content_hash;
+      identity.key = {active_expert_config_.component.namespace_id,
+                      current_layer_, routed_experts[selection],
+                      active_expert_config_.component.encoding_abi};
+      identity.capability =
+          active_expert_config_.component.execution_capability;
+      identity.execution_abi =
+          active_expert_config_.component.execution_abi;
+      identity.source_abi = active_expert_config_.component.source_abi;
+
+      ActiveExpertInvocation invocation;
+      invocation.request_id = active_expert_request_id_;
+      invocation.invocation_id = next_active_expert_invocation_++;
+      invocation.selection_index = selection % kRouteWidth;
+      invocation.route_width = kRouteWidth;
+      invocation.deadline = owner_deadline;
+      invocation.input = {
+          active_expert_config_.input_abi, "host.pinned", input_owner,
+          reinterpret_cast<const std::byte*>(
+              active_expert_inputs_host_ +
+              static_cast<std::size_t>(selection / kRouteWidth) * kHidden),
+          bytes};
+      invocation.output_abi = active_expert_config_.output_abi;
+      invocation.output_bytes = bytes;
+      const auto invocation_id = invocation.invocation_id;
+      const auto row_selection = invocation.selection_index;
+      auto handle = active_expert_config_.executor->execute(
+          {identity, std::move(invocation)});
+      if (!handle.valid()) {
+        for (auto& item : pending) item.handle.cancel();
+        return fail({ErrorCode::backpressure,
+                     "active-expert owner rejected a DeepSeek selection"});
+      }
+      pending.push_back({std::move(identity), invocation_id, selection,
+                         row_selection, std::move(handle)});
+    }
+
+    std::uint32_t completed = 0U;
+    while (completed < selections) {
+      if (std::chrono::steady_clock::now() >= owner_deadline) {
+        for (auto& item : pending)
+          if (item.handle.valid()) item.handle.cancel();
+        return fail({ErrorCode::deadline_exceeded,
+                     "DeepSeek active-expert owner deadline expired"});
+      }
+      bool progressed = false;
+      for (auto& item : pending) {
+        if (!item.handle.valid()) continue;
+        auto result = item.handle.poll();
+        if (!result) continue;
+        progressed = true;
+        if (!result->status.ok() || result->identity != item.identity ||
+            result->request_id != active_expert_request_id_ ||
+            result->invocation_id != item.invocation_id ||
+            result->selection_index != item.row_selection ||
+            !result->output.valid() ||
+            result->output.abi != active_expert_config_.output_abi ||
+            result->output.bytes != bytes ||
+            result->evidence.weight_transport_bytes != 0U) {
+          for (auto& other : pending)
+            if (other.handle.valid()) other.handle.cancel();
+          return fail(result->status.ok()
+                          ? Status{ErrorCode::checksum_mismatch,
+                                   "DeepSeek active-expert correlation mismatch"}
+                          : Status{result->status.code(),
+                                   std::string(result->status.message())});
+        }
+        std::memcpy(active_expert_outputs_host_ +
+                        static_cast<std::size_t>(item.flat_selection) *
+                            kHidden,
+                    result->output.data, static_cast<std::size_t>(bytes));
+        item.handle = {};
+        ++completed;
+      }
+      if (!progressed) std::this_thread::yield();
+    }
+
+    Status status = Status::success();
+    if (pair_mode_) {
+      for (std::uint32_t selection = 0U; selection < selections; ++selection) {
+        status = deepseek_ffn_import_pair_selection_output(
+            {verify_->ffn_workspace(), selection,
+             active_expert_outputs_host_ +
+                 static_cast<std::size_t>(selection) * kHidden,
+             bytes, stream_});
+        if (!status.ok()) return fail(status);
+      }
+      const auto view = verify_->layer(current_layer_);
+      status = deepseek_ffn_finalize_pair(
+          {view.ffn_weights, view.ffn_states, verify_->ffn_workspace(),
+           directory_->device_entries(),
+           {request_->streams_b_, verify_->speculative_streams_b_},
+           {request_->streams_a_, verify_->speculative_streams_a_},
+           directory_->experts_per_layer(), stream_});
+    } else {
+      const auto view = request_->layer(current_layer_);
+      for (std::uint32_t selection = 0U; selection < selections; ++selection) {
+        status = deepseek_ffn_import_selection_output(
+            {view.ffn_state, selection,
+             active_expert_outputs_host_ +
+                 static_cast<std::size_t>(selection) * kHidden,
+             bytes, stream_});
+        if (!status.ok()) return fail(status);
+      }
+      const DeepSeekFfnExecuteLaunch::ProfileEvents profile{
+          ffn_routed_stop_event_, ffn_aggregate_stop_event_,
+          ffn_shared_stop_event_, ffn_merge_stop_event_};
+      status = deepseek_ffn_finalize(
+          {view.ffn_weights, view.ffn_state, directory_->device_entries(),
+           request_->streams_b_, request_->streams_a_,
+           directory_->experts_per_layer(), stream_,
+           ffn_start_event_ ? &profile : nullptr});
+    }
+    if (!status.ok()) return fail(status);
+
+    const auto release = directory_->release_pins_async(pin_id_, stream_);
+    pin_id_ = 0U;
+    if (!release.ok()) return fail(release);
+    const auto completed_layer = current_layer_++;
+    waiting_for_experts_ = false;
+    clear_cpu_placements();
+    const auto progress = current_layer_ == layer_limit_
+        ? DeepSeekDecodeProgress::token_complete
+        : DeepSeekDecodeProgress::layer_complete;
+    if (progress == DeepSeekDecodeProgress::token_complete) {
+      active_ = false;
+      complete_ = true;
+    }
+    return {Status::success(), progress, completed_layer, {}, {},
+            std::vector<std::uint32_t>(routed_experts.begin(),
+                                       routed_experts.end()),
+            rows, true};
+  } catch (const std::exception& error) {
+    return fail({ErrorCode::internal,
+                 std::string("execute DeepSeek active experts: ") +
+                     error.what()});
+  }
+}
+
 DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
     DirectoryPlanResult plan) noexcept {
   const auto view = request_->layer(current_layer_);
@@ -335,6 +571,8 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
                           plan.selected_experts.begin() + 7U,
                           plan.selected_experts.begin() + 13U);
     pin_id_ = plan.pin_id;
+    if (active_expert_config_.executor)
+      return execute_active_plan(routed_experts);
     std::vector<std::uint32_t> uncovered_missing;
     std::vector<cpu::DeepSeekPackedWorkGroup> cpu_groups;
     uncovered_missing.reserve(plan.missing_experts.size());
@@ -426,6 +664,8 @@ DeepSeekDecodeAdvanceResult DeepSeekDecodeController::execute_plan(
   std::vector<std::uint32_t> routed_experts(
       plan.selected_experts.begin(), plan.selected_experts.begin() + 6U);
   pin_id_ = plan.pin_id;
+  if (active_expert_config_.executor)
+    return execute_active_plan(routed_experts);
   std::vector<std::uint32_t> uncovered_missing;
   std::vector<cpu::DeepSeekPackedWorkGroup> cpu_groups;
   uncovered_missing.reserve(plan.missing_experts.size());
@@ -738,6 +978,7 @@ Status DeepSeekDecodeController::cancel() noexcept {
   active_ = false;
   waiting_for_experts_ = false;
   complete_ = false;
+  active_expert_deadline_ = std::chrono::steady_clock::time_point::max();
   clear_cpu_placements();
   if (pair_mode_ && verify_) {
     const auto aborted = verify_->abort_transaction(stream_);

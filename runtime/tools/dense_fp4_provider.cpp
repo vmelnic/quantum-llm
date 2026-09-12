@@ -1,4 +1,5 @@
 #include "expert/runtime/buffer_pool.hpp"
+#include "expert/runtime/cuda/active_expert_device_executor.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
 #include "expert/runtime/cuda/expert_uploader.hpp"
 #include "expert/runtime/cuda/moe_kernels.hpp"
@@ -61,11 +62,16 @@ constexpr std::string_view kTokenAbi = "batch.token-id.u32.host.v1";
 constexpr std::string_view kPositionAbi = "batch.position.u32.host.v1";
 constexpr std::string_view kMultimodalAbi =
     "request.multimodal.fp32.host.v1";
-// Prefill reuses each decoded SM86 FP4 weight tile across four 128-row Tensor
-// Core tiles, while scalar/speculative decode retains the lower-latency DP4A
-// path. The provider publishes this geometry through its service contract;
-// no model-family branch selects it.
-constexpr std::uint32_t kWorkspaceRows = 512U;
+constexpr std::string_view kActiveExpertInputAbi =
+    "expert.swiglu.input.f32.host.v1";
+constexpr std::string_view kActiveExpertOutputAbi =
+    "expert.swiglu.output.f32.host.v1";
+// The artifact geometry and selected KV format determine whether the bounded
+// paged FlashAttention path can use a wider prefill microbatch. Stack-backed
+// protocol arrays use the maximum; device allocations and execution use the
+// per-provider value. No model-family branch selects the width.
+constexpr std::uint32_t kDefaultWorkspaceRows = 512U;
+constexpr std::uint32_t kMaximumWorkspaceRows = 1024U;
 constexpr std::uint32_t kMaximumVisionPatches = 4096U;
 constexpr std::uint32_t kMaximumGpuSamplingTopK = 64U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
@@ -74,6 +80,7 @@ constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 enum class TargetKvEncoding : std::uint8_t {
   artifact_native,
   fp8_e4m3_per_head,
+  fp4_key_outlier1,
   fp16
 };
 
@@ -81,6 +88,8 @@ TargetKvEncoding target_kv_encoding(std::string_view value) {
   if (value == "artifact") return TargetKvEncoding::artifact_native;
   if (value == "fp8-e4m3-per-head")
     return TargetKvEncoding::fp8_e4m3_per_head;
+  if (value == "fp4-e2m1-ue8m0-block32-key-outlier1")
+    return TargetKvEncoding::fp4_key_outlier1;
   if (value == "fp16") return TargetKvEncoding::fp16;
   throw std::runtime_error("unsupported target KV cache dtype");
 }
@@ -131,7 +140,7 @@ std::span<const std::uint32_t> host_u32_batch(
   if (!value.valid() || value.abi != abi || value.memory_domain != "host" ||
       value.bytes == 0U ||
       value.bytes % sizeof(std::uint32_t) != 0U ||
-      value.bytes / sizeof(std::uint32_t) > kWorkspaceRows ||
+      value.bytes / sizeof(std::uint32_t) > kMaximumWorkspaceRows ||
       reinterpret_cast<std::uintptr_t>(value.data) %
               alignof(std::uint32_t) !=
           0U)
@@ -878,7 +887,10 @@ class Fp4RoutedExperts final {
   Fp4RoutedExperts(std::shared_ptr<er::ModelArtifact> artifact,
                    std::uint64_t ram_cache_bytes,
                    std::uint64_t vram_cache_bytes,
-                   std::uint32_t maximum_rows)
+                   std::uint32_t maximum_rows,
+                   std::vector<int> active_expert_devices,
+                   std::uint64_t active_expert_device_cache_bytes,
+                   std::uint64_t active_expert_host_cache_bytes)
       : artifact_(std::move(artifact)) {
     if (!artifact_ || artifact_->model().routed_components.size() != 1U ||
         !ram_cache_bytes || !vram_cache_bytes || !maximum_rows)
@@ -910,6 +922,7 @@ class Fp4RoutedExperts final {
     catalog_ = &artifact_component->catalog;
     std::uint64_t maximum_record_bytes{};
     std::uint64_t total_record_bytes{};
+    std::uint64_t total_device_bytes{};
     for (std::uint32_t layer = 0U; layer < component_.layer_count; ++layer) {
       for (std::uint32_t expert = 0U;
            expert < component_.experts_per_layer; ++expert) {
@@ -922,16 +935,71 @@ class Fp4RoutedExperts final {
             std::numeric_limits<std::uint64_t>::max() - total_record_bytes)
           throw std::runtime_error("routed FP4 catalog size overflows");
         total_record_bytes += record->stored_bytes;
+        const auto record_device_bytes =
+            record->device_bytes == 0U ? record->stored_bytes
+                                       : record->device_bytes;
+        if (record_device_bytes >
+            std::numeric_limits<std::uint64_t>::max() - total_device_bytes)
+          throw std::runtime_error("routed FP4 device size overflows");
+        total_device_bytes += record_device_bytes;
       }
     }
     if (!maximum_record_bytes ||
         maximum_record_bytes > std::numeric_limits<std::size_t>::max())
       throw std::runtime_error("routed FP4 record geometry is invalid");
+    const bool active_compatible =
+        component_.encoding_abi == er::kExpertEncodingAbiFp4Block32 &&
+        component_.encoding == "fp4.e2m1.ue8m0.block32" && swiglu;
+    if (!active_compatible) {
+      active_expert_devices.clear();
+      active_expert_device_cache_bytes = 0U;
+      active_expert_host_cache_bytes = 0U;
+    }
+    if (!active_expert_devices.empty() &&
+        (!active_expert_device_cache_bytes ||
+         !active_expert_host_cache_bytes ||
+         active_expert_host_cache_bytes >= ram_cache_bytes))
+      throw std::runtime_error(
+          "secondary expert devices require bounded cache budgets");
+    if (active_expert_devices.empty()) {
+      active_expert_device_cache_bytes = 0U;
+      active_expert_host_cache_bytes = 0U;
+    }
+    active_expert_host_cache_bytes_ = active_expert_host_cache_bytes;
+    const auto local_ram_cache_bytes =
+        ram_cache_bytes - active_expert_host_cache_bytes_;
     host_cache_capacity_bytes_ =
-        std::min(ram_cache_bytes, total_record_bytes);
+        std::min(local_ram_cache_bytes, total_record_bytes);
+    device_pool_bytes_ = total_device_bytes;
+    vram_cache_capacity_bytes_ = vram_cache_bytes;
     whole_pool_host_ = host_cache_capacity_bytes_ == total_record_bytes;
 
     storage_ = std::make_shared<er::WindowsIocpStorage>(4U);
+    if (!active_expert_devices.empty()) {
+      ec::ActiveExpertDeviceExecutorConfig executor_config;
+      executor_config.model_content_hash = artifact_->model().content_hash;
+      executor_config.component = component_;
+      executor_config.device_ordinals = std::move(active_expert_devices);
+      executor_config.device_cache_bytes_per_device =
+          active_expert_device_cache_bytes;
+      executor_config.device_reserve_bytes_per_device = 1ULL << 30U;
+      executor_config.host_cache_bytes_total =
+          active_expert_host_cache_bytes_;
+      executor_config.staging_slots_per_device = std::max<std::uint32_t>(
+          8U, (component_.route_width + 1U) / 2U + 2U);
+      executor_config.input_abi = std::string(kActiveExpertInputAbi);
+      executor_config.output_abi = std::string(kActiveExpertOutputAbi);
+      executor_config.activation_clamp = 0.0F;
+      executor_config.round_intermediate_to_bf16 = false;
+      auto created = ec::create_active_expert_device_executor(
+          std::move(executor_config), *catalog_, storage_);
+      if (!created.status.ok() || !created.executor)
+        throw std::runtime_error(
+            created.status.ok()
+                ? "secondary expert executor returned no implementation"
+                : std::string(created.status.message()));
+      active_device_executor_ = std::move(created.executor);
+    }
     uploader_ = std::make_shared<ec::CudaExpertUploader>();
     directory_ = std::make_shared<ec::CudaExpertDirectory>(
         component_.namespace_id, component_.encoding_abi,
@@ -1099,7 +1167,29 @@ class Fp4RoutedExperts final {
   }
 
   [[nodiscard]] std::uint64_t host_cache_capacity_bytes() const noexcept {
-    return host_cache_capacity_bytes_;
+    return host_cache_capacity_bytes_ + active_expert_host_cache_bytes_;
+  }
+
+  [[nodiscard]] std::uint64_t device_pool_bytes() const noexcept {
+    return device_pool_bytes_;
+  }
+
+  [[nodiscard]] std::uint64_t vram_cache_capacity_bytes() const noexcept {
+    return vram_cache_capacity_bytes_;
+  }
+
+  void configure_vram_cache_capacity(std::uint64_t capacity) {
+    if (!capacity)
+      throw std::runtime_error("fitted routed VRAM cache is empty");
+    const auto budget = [](std::uint64_t bytes) {
+      return er::TierBudget{
+          bytes, bytes,
+          bytes - std::min<std::uint64_t>(bytes / 8U, 1ULL << 30U)};
+    };
+    const auto transient =
+        std::min<std::uint64_t>(capacity / 4U, 2ULL << 30U);
+    status_check(cache_->configure_vram_budget(budget(capacity), transient));
+    vram_cache_capacity_bytes_ = capacity;
   }
 
   [[nodiscard]] bool host_bank_page_locked() const noexcept {
@@ -1131,6 +1221,11 @@ class Fp4RoutedExperts final {
                            !nvfp4_down_input)) || !output)
       throw std::runtime_error("invalid routed FP4 execution request");
     std::lock_guard execution_lock(execution_mutex_);
+    if (active_device_executor_ && rows == 1U) {
+      execute_active(layer, input, routing_weights, routing_indices,
+                     selection_output, output);
+      return;
+    }
     poll_gpu_observation();
     refresh_transfer_observation();
     const auto selection_count = rows * component_.route_width;
@@ -1400,7 +1495,125 @@ class Fp4RoutedExperts final {
     return planner_->telemetry();
   }
 
+  [[nodiscard]] std::optional<er::ActiveExpertExecutorTelemetry>
+  active_telemetry() const noexcept {
+    if (!active_device_executor_) return std::nullopt;
+    return active_device_executor_->telemetry();
+  }
+
  private:
+  void execute_active(std::uint32_t layer, const float* input,
+                      const float* routing_weights,
+                      const std::uint32_t* routing_indices,
+                      float* selection_output, float* output) {
+    const auto hidden_bytes =
+        static_cast<std::uint64_t>(component_.hidden_size) * sizeof(float);
+    const auto route_bytes = static_cast<std::size_t>(component_.route_width) *
+                             sizeof(std::uint32_t);
+    std::vector<std::uint32_t> selected(component_.route_width);
+    cuda_check(cudaMemcpy(host_input_, input,
+                          static_cast<std::size_t>(hidden_bytes),
+                          cudaMemcpyDeviceToHost),
+               "stage secondary expert activation");
+    cuda_check(cudaMemcpy(selected.data(), routing_indices, route_bytes,
+                          cudaMemcpyDeviceToHost),
+               "stage secondary expert route");
+
+    const auto request_id =
+        next_active_request_id_.fetch_add(1U, std::memory_order_relaxed);
+    std::vector<er::ActiveExpertExecutionHandle> handles;
+    handles.reserve(component_.route_width);
+    for (std::uint32_t selection = 0U;
+         selection < component_.route_width; ++selection) {
+      const auto expert = selected[selection];
+      if (expert >= component_.experts_per_layer)
+        throw std::runtime_error("secondary expert route is out of range");
+      er::ActiveExpertExecutionRequest request;
+      request.identity = {
+          artifact_->model().content_hash, routed_->key(layer, expert),
+          component_.execution_capability, component_.execution_abi,
+          component_.source_abi};
+      request.invocation.request_id = request_id;
+      request.invocation.invocation_id = selection + 1U;
+      request.invocation.selection_index = selection;
+      request.invocation.route_width = component_.route_width;
+      request.invocation.input = {
+          std::string(kActiveExpertInputAbi), "host.pinned",
+          active_lifetime_, reinterpret_cast<const std::byte*>(host_input_),
+          hidden_bytes};
+      request.invocation.output_abi = kActiveExpertOutputAbi;
+      request.invocation.output_bytes = hidden_bytes;
+      auto handle = active_device_executor_->execute(std::move(request));
+      if (!handle.valid())
+        throw std::runtime_error(
+            "secondary expert executor rejected exact route");
+      handles.push_back(std::move(handle));
+    }
+
+    std::vector<bool> completed(component_.route_width, false);
+    auto remaining = component_.route_width;
+    while (remaining != 0U) {
+      bool progressed = false;
+      for (std::uint32_t selection = 0U;
+           selection < component_.route_width; ++selection) {
+        if (completed[selection]) continue;
+        auto result = handles[selection].poll();
+        if (!result) continue;
+        progressed = true;
+        if (!result->status.ok())
+          throw std::runtime_error(std::string(result->status.message()));
+        if (result->identity.key != routed_->key(layer, selected[selection]) ||
+            result->request_id != request_id ||
+            result->invocation_id != selection + 1U ||
+            result->selection_index != selection ||
+            !result->output.valid() ||
+            result->output.abi != kActiveExpertOutputAbi ||
+            result->output.bytes != hidden_bytes ||
+            result->evidence.weight_transport_bytes != 0U)
+          throw std::runtime_error(
+              "secondary expert result violates exact correlation");
+        std::memcpy(host_alternate_output_ +
+                        static_cast<std::size_t>(selection) *
+                            component_.hidden_size,
+                    result->output.data,
+                    static_cast<std::size_t>(hidden_bytes));
+        completed[selection] = true;
+        --remaining;
+      }
+      if (!progressed) std::this_thread::yield();
+    }
+
+    const auto output_bytes =
+        static_cast<std::size_t>(component_.route_width) * hidden_bytes;
+    cuda_check(cudaMemcpyAsync(device_alternate_output_,
+                               host_alternate_output_, output_bytes,
+                               cudaMemcpyHostToDevice,
+                               host_transfer_stream_),
+               "import secondary expert outputs");
+    cuda_check(cudaEventRecord(host_output_ready_event_,
+                               host_transfer_stream_),
+               "record secondary expert outputs");
+    cuda_check(cudaStreamWaitEvent(execution_stream_, host_output_ready_event_,
+                                   0U),
+               "join secondary expert outputs");
+    std::vector<std::uint8_t> primary_mask(component_.route_width, 0U);
+    std::vector<std::uint32_t> alternate_slots(component_.route_width);
+    std::iota(alternate_slots.begin(), alternate_slots.end(), 0U);
+    cuda_check(cudaMemcpyAsync(device_primary_mask_, primary_mask.data(),
+                               primary_mask.size(), cudaMemcpyHostToDevice,
+                               execution_stream_),
+               "stage secondary expert mask");
+    cuda_check(cudaMemcpyAsync(device_alternate_slots_,
+                               alternate_slots.data(), route_bytes,
+                               cudaMemcpyHostToDevice, execution_stream_),
+               "stage secondary expert slots");
+    launch_aggregate_graph(selection_output, routing_weights, output, 1U);
+    cuda_check(cudaEventRecord(execution_done_event_, execution_stream_),
+               "record secondary expert completion");
+    cuda_check(cudaStreamWaitEvent(nullptr, execution_done_event_, 0U),
+               "join secondary expert completion");
+  }
+
   void launch_selection_graph(
       std::uint32_t layer, const float* input, const float* routing_weights,
       float* intermediate, float* selection_output,
@@ -1558,6 +1771,10 @@ class Fp4RoutedExperts final {
   std::unique_ptr<er::RoutedExpertRuntime> routed_;
   std::unique_ptr<er::HybridDispatchPlanner> planner_;
   std::unique_ptr<er::cpu::Fp4HostExecutor> cpu_;
+  std::shared_ptr<er::IActiveExpertExecutor> active_device_executor_;
+  std::shared_ptr<const void> active_lifetime_{
+      this, [](const void*) noexcept {}};
+  std::atomic<std::uint64_t> next_active_request_id_{1U};
   std::shared_ptr<er::MonotonicHostAllocator> host_arena_;
   std::mutex execution_mutex_;
   cudaStream_t host_transfer_stream_{};
@@ -1589,6 +1806,9 @@ class Fp4RoutedExperts final {
   bool host_bank_page_locked_{};
   bool relu2_{};
   std::uint64_t host_cache_capacity_bytes_{};
+  std::uint64_t active_expert_host_cache_bytes_{};
+  std::uint64_t device_pool_bytes_{};
+  std::uint64_t vram_cache_capacity_bytes_{};
 };
 
 struct PreparedOperation final : er::IPreparedOperation {
@@ -1622,7 +1842,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
                    std::uint32_t kv_page_tokens,
                    std::string_view kv_cache_dtype,
                    std::string_view placement_profile,
-                   bool profile_gpu_phases)
+                   std::string_view routed_vram_policy,
+                   bool profile_gpu_phases,
+                   std::vector<int> active_expert_devices,
+                   std::uint64_t active_expert_device_cache_bytes,
+                   std::uint64_t active_expert_host_cache_bytes)
       : artifact_(std::move(artifact)),
         descriptor_(artifact_ ? artifact_->model() : er::ModelDescriptor{}),
         tensor_store_(std::move(tensor_store)),
@@ -1631,12 +1855,15 @@ class DenseFp4Provider final : public er::IOperationProvider {
         kv_cache_bytes_(kv_cache_bytes), kv_page_tokens_(kv_page_tokens),
         target_kv_encoding_(target_kv_encoding(kv_cache_dtype)),
         capacity_placement_(placement_profile != "latency"),
+        fit_routed_vram_(routed_vram_policy == "fit"),
         profile_gpu_phases_(profile_gpu_phases),
         device_lifetime_(std::make_shared<std::uint8_t>(0U)) {
     status_check(validate_dense_fp4_descriptor(descriptor_));
     if (!artifact_ || !tensor_store_ || !tensor_store_->valid() || !capacity_ ||
         !max_context_ || max_context_ > descriptor_.max_context_tokens ||
-        !kv_cache_bytes_ || !kv_page_tokens_)
+        !kv_cache_bytes_ || !kv_page_tokens_ ||
+        (routed_vram_policy != "fixed" && routed_vram_policy != "fit") ||
+        (fit_routed_vram_ && descriptor_.routed_components.empty()))
       throw std::runtime_error("invalid dense FP4 provider launch contract");
     hidden_size_ = descriptor_.hidden_size;
     vocabulary_size_ = descriptor_.vocab_size;
@@ -1916,6 +2143,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
         exact_fp16_kv() && mtp_layers_ == 0U &&
         !qsa_tiered_ &&
         global_context_bytes <= page_budget_bytes;
+    compact_flash_prefill_ =
+        !exact_fp16_kv() && !qsa_enabled_ && !mla_enabled_ &&
+        head_dim_ == 256U && query_heads_ != 0U && kv_heads_ != 0U &&
+        query_heads_ % kv_heads_ == 0U;
+    workspace_rows_ = compact_flash_prefill_ ? kMaximumWorkspaceRows
+                                              : kDefaultWorkspaceRows;
     if (qsa_enabled_ && !device_resident_fp16_kv_ && !qsa_tiered_)
       throw std::runtime_error(
           "latency-profile QSA requires exact FP16 KV and index to fit in VRAM");
@@ -1945,6 +2178,20 @@ class DenseFp4Provider final : public er::IOperationProvider {
       target_kv_page_bytes_ =
           static_cast<std::uint64_t>(target_full_layers_) *
           fp8_layer_page_bytes;
+      mtp_kv_page_offset_ = target_kv_page_bytes_;
+      mtp_kv_page_bytes_ =
+          static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
+      kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
+    } else if (target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1) {
+      const auto key_record_bytes = fp4_record_bytes +
+          static_cast<std::uint64_t>(head_dim_ / 32U) *
+              sizeof(std::uint32_t);
+      const auto layer_page_bytes =
+          static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
+          (key_record_bytes + fp4_record_bytes);
+      target_kv_page_bytes_ =
+          static_cast<std::uint64_t>(target_full_layers_) *
+          layer_page_bytes;
       mtp_kv_page_offset_ = target_kv_page_bytes_;
       mtp_kv_page_bytes_ =
           static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
@@ -2012,7 +2259,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
             "authoritative KV leaves no RAM for routed experts");
       routed_experts_ = std::make_unique<Fp4RoutedExperts>(
           artifact_, ram_cache_bytes_ - host_state_reservation,
-          vram_cache_bytes_, kWorkspaceRows);
+          vram_cache_bytes_, workspace_rows_,
+          std::move(active_expert_devices),
+          active_expert_device_cache_bytes,
+          active_expert_host_cache_bytes);
       parking_ram_capacity_bytes_ =
           ram_cache_bytes_ - routed_experts_->host_cache_capacity_bytes();
     } else {
@@ -2045,6 +2295,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
       if (page) static_cast<void>(cudaFree(page));
     for (auto* page : all_target_mirror_pages_)
       if (page) static_cast<void>(cudaFree(page));
+    release_staged_dense_weights();
+    if (logits_) static_cast<void>(cudaFree(logits_));
     for (auto* allocation : allocations_)
       if (allocation) static_cast<void>(cudaFree(allocation));
   }
@@ -2213,6 +2465,21 @@ class DenseFp4Provider final : public er::IOperationProvider {
   [[nodiscard]] std::uint32_t kv_page_tokens() const noexcept {
     return kv_page_tokens_;
   }
+  [[nodiscard]] std::uint32_t prefill_batch_rows() const noexcept {
+    return workspace_rows_;
+  }
+  [[nodiscard]] std::uint64_t effective_vram_cache_bytes() const noexcept {
+    return routed_experts_ ? routed_experts_->vram_cache_capacity_bytes()
+                           : vram_cache_bytes_;
+  }
+  er::Status finalize_startup() noexcept {
+    try {
+      initialize_execution();
+      return er::Status::success();
+    } catch (const std::exception& error) {
+      return {er::ErrorCode::internal, error.what()};
+    }
+  }
   [[nodiscard]] bool exact_fp16_kv() const noexcept {
     return target_kv_encoding_ == TargetKvEncoding::fp16;
   }
@@ -2225,9 +2492,11 @@ class DenseFp4Provider final : public er::IOperationProvider {
   [[nodiscard]] std::string_view target_kv_dtype() const noexcept {
     if (mla_enabled_) return "bf16-latent";
     if (exact_fp16_kv()) return "fp16";
-    return target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head
-               ? "fp8-e4m3-per-head"
-               : "fp4-e2m1-ue8m0-block32";
+    if (target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head)
+      return "fp8-e4m3-per-head";
+    if (target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1)
+      return "fp4-e2m1-ue8m0-block32-key-outlier1";
+    return "fp4-e2m1-ue8m0-block32";
   }
   [[nodiscard]] std::map<std::string, std::uint64_t, std::less<>> telemetry()
       const {
@@ -2252,12 +2521,27 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_program_sequence_host_bytes",
              program_sequence_host_bytes_},
             {"provider_program_sequence_tile_rows", sequence_tile_rows_},
+            {"provider_workspace_rows", workspace_rows_},
+            {"provider_compact_flash_prefill",
+             compact_flash_prefill_ ? 1U : 0U},
             {"provider_sampling_gpu_calls", sampling_gpu_calls_},
             {"provider_sampling_host_calls", sampling_host_calls_},
             {"provider_sampling_logit_transfer_bytes",
              sampling_logit_transfer_bytes_},
             {"provider_staged_dense_weight_bytes",
+             staged_dense_weights_ ? staged_dense_weight_capacity_bytes_ : 0U},
+            {"provider_staged_dense_weight_capacity_bytes",
              staged_dense_weight_capacity_bytes_},
+            {"provider_staged_dense_weight_decode_bytes",
+             staged_dense_weight_decode_bytes_},
+            {"provider_staged_dense_weight_gemm_calls",
+             staged_dense_weight_gemm_calls_},
+            {"provider_staged_dense_weight_low_memory_fallbacks",
+             staged_dense_weight_low_memory_fallbacks_},
+            {"provider_logits_workspace_rows", logits_capacity_rows_},
+            {"provider_logits_workspace_bytes",
+             static_cast<std::uint64_t>(logits_capacity_rows_) *
+                 vocabulary_size_ * sizeof(float)},
             {"provider_gpu_measured_batches", gpu_measured_batches_},
             {"provider_gpu_embedding_ns",
              gpu_phase_ns_[static_cast<std::size_t>(GpuPhase::embedding)]},
@@ -2376,6 +2660,26 @@ class DenseFp4Provider final : public er::IOperationProvider {
       result.emplace("routed_h2d_bytes_per_second",
                      static_cast<std::uint64_t>(
                          std::llround(hybrid.h2d_bytes_per_second)));
+      if (const auto active = routed_experts_->active_telemetry()) {
+        result.emplace("active_expert_requests", active->requests);
+        result.emplace("active_expert_completed", active->completed);
+        result.emplace("active_expert_failed", active->failed);
+        result.emplace("active_expert_cancelled", active->cancelled);
+        result.emplace("active_expert_input_bytes",
+                       active->activation_input_bytes);
+        result.emplace("active_expert_output_bytes",
+                       active->activation_output_bytes);
+        result.emplace("active_expert_weight_bytes",
+                       active->owner_weight_read_bytes);
+        result.emplace("active_expert_storage_bytes",
+                       active->owner_storage_read_bytes);
+        result.emplace("active_expert_ram_bytes",
+                       active->owner_ram_read_bytes);
+        result.emplace("active_expert_vram_bytes",
+                       active->owner_vram_read_bytes);
+        result.emplace("active_expert_execution_ns",
+                       active->owner_execution_ns);
+      }
     }
     return result;
   }
@@ -2489,6 +2793,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::uint32_t retention_position{};
     std::atomic<bool> cancelled{};
     bool vision_prepared{};
+    bool staging_disabled{};
     bool terminal{};
   };
 
@@ -2846,9 +3151,19 @@ class DenseFp4Provider final : public er::IOperationProvider {
       er::ExactDecodeExecutionResult result) const;
   [[nodiscard]] std::optional<er::OperationExecutionResult>
   poll_program_sequence(const std::shared_ptr<SequenceState>& sequence);
-  void stage_operation_weights(const PreparedOperation& operation);
-  void activate_staged_weights(const PreparedOperation& operation);
+  [[nodiscard]] bool stage_operation_weights(
+      const PreparedOperation& operation);
+  [[nodiscard]] bool ensure_staged_dense_weights();
+  void release_staged_dense_weights() noexcept;
+  [[nodiscard]] bool activate_staged_weights(
+      const PreparedOperation& operation);
   void deactivate_staged_weights() noexcept;
+  [[nodiscard]] std::uint64_t pending_sequence_kv_bytes(
+      const SequenceState& sequence,
+      const PreparedOperation& operation) const;
+  [[nodiscard]] bool sequence_staging_has_headroom(
+      SequenceState& sequence, const PreparedOperation& operation);
+  void ensure_logits_capacity(std::uint32_t rows);
   [[nodiscard]] const er::ExecutionValue& invocation_input(
       const PreparedOperation& operation,
       const er::OperationInvocation& invocation,
@@ -2951,9 +3266,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t parking_ram_capacity_bytes_{};
   std::uint64_t kv_cache_bytes_{};
   std::uint32_t kv_page_tokens_{};
+  std::uint32_t workspace_rows_{kDefaultWorkspaceRows};
   TargetKvEncoding target_kv_encoding_{TargetKvEncoding::artifact_native};
   bool capacity_placement_{};
+  bool fit_routed_vram_{};
   bool device_resident_fp16_kv_{};
+  bool compact_flash_prefill_{};
   std::uint32_t hidden_size_{};
   std::uint32_t vocabulary_size_{};
   std::uint32_t query_heads_{};
@@ -3133,6 +3451,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::size_t staged_dense_weight_capacity_bytes_{};
   std::size_t staged_dense_input_capacity_bytes_{};
   std::size_t staged_int8_weight_capacity_values_{};
+  std::size_t staged_score_capacity_values_{};
+  std::size_t staged_probability_capacity_values_{};
+  std::uint64_t staged_dense_weight_decode_bytes_{};
+  std::uint64_t staged_dense_weight_gemm_calls_{};
+  std::uint64_t staged_dense_weight_low_memory_fallbacks_{};
+  std::uint32_t logits_capacity_rows_{};
 
   // Workspace and state are declared below with the execution methods.
   float* hidden_{};
@@ -3788,10 +4112,56 @@ void DenseFp4Provider::initialize_execution() {
        vision_patch_dimension_, vision_hidden_size_,
        vision_intermediate_size_, vision_merged_width_}));
   staged_dense_input_capacity_bytes_ =
-      static_cast<std::size_t>(kWorkspaceRows) * maximum_columns *
+      static_cast<std::size_t>(workspace_rows_) * maximum_columns *
       sizeof(std::uint16_t);
   allocate_workspace();
   allocate_state();
+  if (fit_routed_vram_ && routed_experts_) {
+    if (!all_kv_pages_.empty() || !all_target_mirror_pages_.empty())
+      throw std::runtime_error(
+          "routed VRAM fitting must precede dynamic KV allocation");
+    const auto future_kv_bytes = checked_multiply(
+        kv_page_capacity_, kv_page_bytes_, "future device KV reservation");
+    const auto future_mirror_bytes = checked_multiply(
+        target_mirror_page_capacity_, host_fp16_target_page_bytes_,
+        "future target mirror reservation");
+    const auto maximum_logits_bytes = checked_multiply(
+        checked_multiply(workspace_rows_, vocabulary_size_,
+                         "maximum logits workspace values"),
+        sizeof(float), "maximum logits workspace bytes");
+    const auto current_logits_bytes = checked_multiply(
+        checked_multiply(logits_capacity_rows_, vocabulary_size_,
+                         "current logits workspace values"),
+        sizeof(float), "current logits workspace bytes");
+    const auto future_logits_bytes =
+        maximum_logits_bytes - current_logits_bytes;
+    std::size_t free_bytes{};
+    std::size_t total_bytes{};
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes),
+               "inspect routed VRAM fit headroom");
+    const auto emergency_reserve = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(total_bytes) / 8U, 1ULL << 30U);
+    auto withheld = future_kv_bytes;
+    if (future_mirror_bytes >
+        std::numeric_limits<std::uint64_t>::max() - withheld)
+      throw std::runtime_error("routed VRAM fit reservation overflows");
+    withheld += future_mirror_bytes;
+    if (future_logits_bytes >
+        std::numeric_limits<std::uint64_t>::max() - withheld)
+      throw std::runtime_error("routed VRAM fit reservation overflows");
+    withheld += future_logits_bytes;
+    if (emergency_reserve >
+        std::numeric_limits<std::uint64_t>::max() - withheld)
+      throw std::runtime_error("routed VRAM fit reservation overflows");
+    withheld += emergency_reserve;
+    if (static_cast<std::uint64_t>(free_bytes) <= withheld)
+      throw std::runtime_error(
+          "fixed CUDA organs and dynamic state leave no routed VRAM cache");
+    const auto fitted = std::min<std::uint64_t>(
+        routed_experts_->device_pool_bytes(),
+        static_cast<std::uint64_t>(free_bytes) - withheld);
+    routed_experts_->configure_vram_cache_capacity(fitted);
+  }
   initialized_ = true;
 }
 
@@ -3822,64 +4192,64 @@ void DenseFp4Provider::allocate_workspace() {
        vision_hidden_size_,
        vision_intermediate_size_, vision_merged_width_});
   const auto padded_columns = align32(maximum_columns);
-  hidden_ = device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+  hidden_ = device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   const auto hidden_row_bytes =
       static_cast<std::uint64_t>(hidden_size_) * sizeof(float);
   const auto minimum_sequence_bytes =
-      static_cast<std::uint64_t>(capacity_) * kWorkspaceRows *
+      static_cast<std::uint64_t>(capacity_) * workspace_rows_ *
       hidden_row_bytes;
   const auto desired_sequence_bytes = std::max<std::uint64_t>(
       minimum_sequence_bytes,
       std::min<std::uint64_t>(128ULL << 20U, vram_cache_bytes_ / 64U));
   auto rows_per_slot = desired_sequence_bytes /
       (static_cast<std::uint64_t>(capacity_) * hidden_row_bytes);
-  rows_per_slot = std::max<std::uint64_t>(kWorkspaceRows, rows_per_slot);
-  rows_per_slot -= rows_per_slot % kWorkspaceRows;
+  rows_per_slot = std::max<std::uint64_t>(workspace_rows_, rows_per_slot);
+  rows_per_slot -= rows_per_slot % workspace_rows_;
   sequence_tile_rows_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
       rows_per_slot, std::numeric_limits<std::uint32_t>::max()));
   sequence_hidden_ = device_allocate<float>(
       allocations_, static_cast<std::size_t>(capacity_) *
                         sequence_tile_rows_ * hidden_size_);
   normalized_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
-  residual_ = device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+      device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
+  residual_ = device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   if (hyper_enabled_) {
     hyper_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     hyper_normalized_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     hyper_lowrank_values_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           hyper_lowrank_);
     hyper_mix_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     hyper_injection_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_count_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_count_);
   }
   if (ple_enabled_) {
     ple_embeddings_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           ple_embedding_width_);
     ple_key_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_key_norm_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_query_norm_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_value_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hidden_size_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hidden_size_);
     ple_gated_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_conv_norm_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_conv_output_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * hyper_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * hyper_width_);
     ple_host_embeddings_.resize(
-        static_cast<std::size_t>(kWorkspaceRows) * ple_embedding_width_);
+        static_cast<std::size_t>(workspace_rows_) * ple_embedding_width_);
   }
   if (qsa_enabled_) {
     qsa_projected_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           (qsa_index_heads_ + 1U) * qsa_index_head_dim_);
     const auto maximum_blocks =
         (max_context_ + qsa_compress_ratio_ - 1U) / qsa_compress_ratio_;
@@ -3916,85 +4286,84 @@ void DenseFp4Provider::allocate_workspace() {
     }
   }
   query_gate_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * query_width);
+      device_allocate<float>(allocations_, workspace_rows_ * query_width);
   if (mla_enabled_) {
     mla_query_rank_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           q_lora_rank_);
     mla_latent_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           (kv_lora_rank_ + qk_rope_head_dim_));
     mla_latent_query_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+        allocations_, static_cast<std::size_t>(workspace_rows_) *
                           query_heads_ * kv_lora_rank_);
   }
-  key_ = device_allocate<float>(allocations_, kWorkspaceRows * key_value_width);
-  value_ = device_allocate<float>(allocations_, kWorkspaceRows * key_value_width);
+  key_ = device_allocate<float>(allocations_, workspace_rows_ * key_value_width);
+  value_ = device_allocate<float>(allocations_, workspace_rows_ * key_value_width);
   attention_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * attention_width);
+      device_allocate<float>(allocations_, workspace_rows_ * attention_width);
   projected_qkv_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * recurrent_projection);
+      device_allocate<float>(allocations_, workspace_rows_ * recurrent_projection);
   projected_z_ =
       device_allocate<float>(allocations_,
-                             kWorkspaceRows * std::max(1U, value_dimension));
+                             workspace_rows_ * std::max(1U, value_dimension));
   projected_b_ =
       device_allocate<float>(allocations_,
-                             kWorkspaceRows * std::max(1U, value_heads_));
+                             workspace_rows_ * std::max(1U, value_heads_));
   projected_a_ =
       device_allocate<float>(allocations_,
-                             kWorkspaceRows * std::max(1U, value_heads_));
+                             workspace_rows_ * std::max(1U, value_heads_));
   conv_output_ =
       device_allocate<float>(allocations_,
-                             kWorkspaceRows * recurrent_conv_output);
+                             workspace_rows_ * recurrent_conv_output);
   delta_output_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * recurrent_output);
+      device_allocate<float>(allocations_, workspace_rows_ * recurrent_output);
   gate_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * workspace_intermediate);
+      device_allocate<float>(allocations_, workspace_rows_ * workspace_intermediate);
   up_ = device_allocate<float>(allocations_,
-                               kWorkspaceRows * workspace_intermediate);
+                               workspace_rows_ * workspace_intermediate);
   intermediate_ =
       device_allocate<float>(allocations_,
-                             kWorkspaceRows * workspace_intermediate);
+                             workspace_rows_ * workspace_intermediate);
   if (routed_experts_) {
     shared_output_ =
-        device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
-    shared_scalar_ = device_allocate<float>(allocations_, kWorkspaceRows);
+        device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
+    shared_scalar_ = device_allocate<float>(allocations_, workspace_rows_);
     router_logits_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * expert_count_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * expert_count_);
     routing_scores_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_);
     routing_indices_ = device_allocate<std::uint32_t>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_);
     moe_intermediate_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_ *
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_ *
                           expert_width_);
     moe_selection_output_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_ *
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_ *
                           hidden_size_);
     moe_output_ =
-        device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+        device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
     moe_q8_intermediate_ = device_allocate<std::int8_t>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_ *
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_ *
                           expert_width_);
     moe_q8_intermediate_scales_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kWorkspaceRows) * route_width_);
+        allocations_, static_cast<std::size_t>(workspace_rows_) * route_width_);
     if (routed_experts_->component().encoding_abi ==
         er::kExpertEncodingAbiNvfp4Block16W4A4) {
       moe_nvfp4_gate_input_ = device_allocate<float>(
-          allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+          allocations_, static_cast<std::size_t>(workspace_rows_) *
                             route_width_ * hidden_size_);
       moe_nvfp4_up_input_ = device_allocate<float>(
-          allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+          allocations_, static_cast<std::size_t>(workspace_rows_) *
                             route_width_ * hidden_size_);
       moe_nvfp4_down_input_ = device_allocate<float>(
-          allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+          allocations_, static_cast<std::size_t>(workspace_rows_) *
                             route_width_ * expert_width_);
     }
   }
-  logits_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * vocabulary_size_);
+  ensure_logits_capacity(1U);
   output_tokens_ =
-      device_allocate<std::uint32_t>(allocations_, kWorkspaceRows);
+      device_allocate<std::uint32_t>(allocations_, workspace_rows_);
   sampling_top_logits_ = device_allocate<float>(
       allocations_, kMaximumGpuSamplingTopK);
   sampling_top_tokens_ = device_allocate<std::uint32_t>(
@@ -4002,10 +4371,10 @@ void DenseFp4Provider::allocate_workspace() {
   sampling_presence_ = device_allocate<std::uint8_t>(
       allocations_, static_cast<std::size_t>(capacity_) * vocabulary_size_);
   q8_ = device_allocate<std::int8_t>(allocations_,
-                                     kWorkspaceRows * padded_columns);
-  q8_scales_ = device_allocate<float>(allocations_, kWorkspaceRows);
+                                     workspace_rows_ * padded_columns);
+  q8_scales_ = device_allocate<float>(allocations_, workspace_rows_);
   nvfp4_input_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(kWorkspaceRows) *
+      allocations_, static_cast<std::size_t>(workspace_rows_) *
                         maximum_columns);
   if (vision_enabled_) {
     const auto maximum_merged_rows = kMaximumVisionPatches /
@@ -4045,10 +4414,6 @@ void DenseFp4Provider::allocate_workspace() {
     vision_interpolation_weights_ = device_allocate<float>(
         allocations_, 4U * kMaximumVisionPatches);
   }
-  if (staged_dense_weight_capacity_bytes_ != 0U)
-    staged_dense_weights_ = device_allocate<std::uint16_t>(
-        allocations_, staged_dense_weight_capacity_bytes_ /
-                          sizeof(std::uint16_t));
   if (staged_int8_weight_capacity_values_ != 0U)
     staged_int8_weights_ = device_allocate<float>(
         allocations_, staged_int8_weight_capacity_values_);
@@ -4058,7 +4423,7 @@ void DenseFp4Provider::allocate_workspace() {
   attention_maximum_splits_ =
       (max_context_ + kAttentionSplitTokens - 1U) / kAttentionSplitTokens;
   const auto attention_state_rows =
-      std::max(attention_maximum_splits_, kWorkspaceRows);
+      std::max(attention_maximum_splits_, workspace_rows_);
   partial_maxima_ = device_allocate<float>(
       allocations_, static_cast<std::size_t>(attention_state_rows) *
                         query_heads_);
@@ -4070,12 +4435,21 @@ void DenseFp4Provider::allocate_workspace() {
                         query_heads_ * head_dim_);
   staged_split_tokens_ = std::min(kStagedPrefillSplitTokens, max_context_);
   const auto staged_query_values =
-      static_cast<std::size_t>(kWorkspaceRows) * query_heads_ * head_dim_;
+      static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
   const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
                                 staged_split_tokens_ * head_dim_;
-  const auto staged_score_values =
-      static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+  const auto full_score_values =
+      static_cast<std::size_t>(workspace_rows_) * query_heads_ *
       staged_split_tokens_;
+  staged_score_capacity_values_ = compact_flash_prefill_
+      ? staged_query_values
+      : full_score_values;
+  // The paged FlashAttention path does not materialize probabilities, but the
+  // common workspace contract requires a non-null pointer for fail-closed
+  // validation. Exact-F16 and unsupported geometries retain the full arena.
+  staged_probability_capacity_values_ = compact_flash_prefill_
+      ? 1U
+      : full_score_values;
   staged_queries_ =
       device_allocate<std::uint16_t>(allocations_, staged_query_values);
   if (exact_fp16_kv()) {
@@ -4097,21 +4471,22 @@ void DenseFp4Provider::allocate_workspace() {
   staged_values_ =
       device_allocate<std::uint16_t>(allocations_, staged_kv_values);
   staged_scores_ =
-      device_allocate<float>(allocations_, staged_score_values);
+      device_allocate<float>(allocations_, staged_score_capacity_values_);
   staged_probabilities_ =
-      device_allocate<std::uint16_t>(allocations_, staged_score_values);
+      device_allocate<std::uint16_t>(
+          allocations_, staged_probability_capacity_values_);
   staged_accumulator_ =
       device_allocate<float>(allocations_, staged_query_values);
   mtp_embedding_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+      device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   mtp_embedding_norm_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+      device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   mtp_hidden_norm_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * hidden_size_);
+      device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   mtp_fusion_input_ =
-      device_allocate<float>(allocations_, kWorkspaceRows * 2U * hidden_size_);
+      device_allocate<float>(allocations_, workspace_rows_ * 2U * hidden_size_);
   slot_target_hidden_batch_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(capacity_) * kWorkspaceRows *
+      allocations_, static_cast<std::size_t>(capacity_) * workspace_rows_ *
                         hidden_size_);
 }
 
@@ -4163,7 +4538,8 @@ void DenseFp4Provider::allocate_state() {
                         static_cast<std::size_t>(capacity_) *
                             maximum_pages_per_slot_ * sizeof(void*)),
              "zero FP4 KV page table");
-  if (target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head &&
+  if ((target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head ||
+       target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1) &&
       mtp_layers_ != 0U) {
     device_mtp_page_table_ = device_allocate<void*>(
         allocations_, static_cast<std::size_t>(capacity_) *
@@ -4377,7 +4753,7 @@ er::Status DenseFp4Provider::rebind_request_state(
 
 er::ExecutionValue DenseFp4Provider::device_hidden_value(
     std::uint32_t rows) const {
-  if (!rows || rows > kWorkspaceRows)
+  if (!rows || rows > workspace_rows_)
     throw std::runtime_error("invalid FP4 hidden batch size");
   return {std::string(kHiddenAbi), "cuda.device", device_lifetime_,
           reinterpret_cast<const std::byte*>(hidden_),
@@ -4452,7 +4828,7 @@ std::uint32_t DenseFp4Provider::require_hidden_value(
   if (value.abi != kHiddenAbi || value.memory_domain != "cuda.device" ||
       value.data != reinterpret_cast<const std::byte*>(hidden_) ||
       value.bytes % row_bytes != 0U || value.bytes / row_bytes == 0U ||
-      value.bytes / row_bytes > kWorkspaceRows)
+      value.bytes / row_bytes > workspace_rows_)
     throw std::runtime_error("hidden-state execution ABI mismatch");
   return static_cast<std::uint32_t>(value.bytes / row_bytes);
 }
@@ -4605,7 +4981,7 @@ void DenseFp4Provider::finish_attention_block(
 void DenseFp4Provider::run_embedding(
     const PreparedOperation& operation, const std::uint32_t* tokens,
     std::uint32_t rows) {
-  if (!tokens || !rows || rows > kWorkspaceRows)
+  if (!tokens || !rows || rows > workspace_rows_)
     throw std::runtime_error("invalid embedding batch");
   cuda_check(cudaMemcpy(output_tokens_, tokens,
                         static_cast<std::size_t>(rows) * sizeof(tokens[0]),
@@ -4646,7 +5022,7 @@ void DenseFp4Provider::run_embedding(
 
 void DenseFp4Provider::run_hyper_read(
     const PreparedOperation& operation, std::uint32_t rows, bool reduce) {
-  if (!hyper_enabled_ || !rows || rows > kWorkspaceRows ||
+  if (!hyper_enabled_ || !rows || rows > workspace_rows_ ||
       (reduce && operation.kernel != Kernel::hyper_reduce) ||
       (!reduce && operation.kernel != Kernel::hyper_read))
     throw std::runtime_error("invalid Hyper read batch");
@@ -4680,7 +5056,7 @@ void DenseFp4Provider::run_ple(
     std::span<const std::uint32_t> tokens, std::uint32_t rows) {
   if (!ple_enabled_ || operation.kernel != Kernel::ple ||
       operation.ple_slot >= ple_layers_ || rows == 0U ||
-      rows > kWorkspaceRows || tokens.size() != rows ||
+      rows > workspace_rows_ || tokens.size() != rows ||
       state.ple_history.size() !=
           static_cast<std::size_t>(ple_layers_) *
               (ple_ngram_size_ - 1U))
@@ -4779,9 +5155,10 @@ void DenseFp4Provider::quantize_rows(const float* input, std::uint32_t rows,
                                      align32(columns), nullptr));
 }
 
-void DenseFp4Provider::stage_operation_weights(
+bool DenseFp4Provider::stage_operation_weights(
     const PreparedOperation& operation) {
-  if (staged_operation_ == &operation) return;
+  if (staged_operation_ == &operation) return staged_dense_weights_ != nullptr;
+  if (!ensure_staged_dense_weights()) return false;
   staged_weight_bindings_.clear();
   std::set<const DeviceTensor*> unique;
   auto* cursor = reinterpret_cast<std::byte*>(staged_dense_weights_);
@@ -4806,16 +5183,124 @@ void DenseFp4Provider::stage_operation_weights(
     used += bytes;
   }
   staged_operation_ = &operation;
+  staged_dense_weight_decode_bytes_ += used;
+  return true;
 }
 
-void DenseFp4Provider::activate_staged_weights(
+bool DenseFp4Provider::ensure_staged_dense_weights() {
+  if (staged_dense_weights_ || staged_dense_weight_capacity_bytes_ == 0U)
+    return staged_dense_weights_ != nullptr;
+  std::size_t free_bytes{};
+  std::size_t total_bytes{};
+  cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes),
+             "inspect staged dense weight headroom");
+  const auto reserve_bytes = std::min<std::uint64_t>(
+      static_cast<std::uint64_t>(total_bytes) / 8U, 1ULL << 30U);
+  if (staged_dense_weight_capacity_bytes_ >
+          std::numeric_limits<std::uint64_t>::max() - reserve_bytes ||
+      static_cast<std::uint64_t>(free_bytes) <
+          reserve_bytes + staged_dense_weight_capacity_bytes_)
+    return false;
+  void* allocation{};
+  const auto error =
+      cudaMalloc(&allocation, staged_dense_weight_capacity_bytes_);
+  if (error == cudaErrorMemoryAllocation) {
+    static_cast<void>(cudaGetLastError());
+    return false;
+  }
+  cuda_check(error, "allocate staged dense weight workspace");
+  staged_dense_weights_ = static_cast<std::uint16_t*>(allocation);
+  return true;
+}
+
+void DenseFp4Provider::release_staged_dense_weights() noexcept {
+  deactivate_staged_weights();
+  staged_weight_bindings_.clear();
+  staged_operation_ = nullptr;
+  if (staged_dense_weights_)
+    static_cast<void>(cudaFree(staged_dense_weights_));
+  staged_dense_weights_ = nullptr;
+}
+
+bool DenseFp4Provider::activate_staged_weights(
     const PreparedOperation& operation) {
-  stage_operation_weights(operation);
+  if (!stage_operation_weights(operation)) return false;
   active_staged_weights_ = staged_weight_bindings_;
+  return true;
 }
 
 void DenseFp4Provider::deactivate_staged_weights() noexcept {
   active_staged_weights_.clear();
+}
+
+std::uint64_t DenseFp4Provider::pending_sequence_kv_bytes(
+    const SequenceState& sequence,
+    const PreparedOperation& operation) const {
+  if (operation.kernel != Kernel::full_attention || kv_page_bytes_ == 0U)
+    return 0U;
+  const auto slot = sequence.request->slot();
+  std::uint64_t pages{};
+  auto previous = std::numeric_limits<std::uint32_t>::max();
+  for (std::size_t row = 0U; row < sequence.tile_rows; ++row) {
+    const auto position = sequence.positions[sequence.tile_first + row];
+    const auto page = position / kv_page_tokens_;
+    if (page == previous) continue;
+    previous = page;
+    if (!slot_pages_.at(slot).at(page)) ++pages;
+  }
+  return checked_multiply(pages, kv_page_bytes_,
+                          "pending sequence KV bytes");
+}
+
+bool DenseFp4Provider::sequence_staging_has_headroom(
+    SequenceState& sequence, const PreparedOperation& operation) {
+  if (sequence.staging_disabled) return false;
+  std::size_t free_bytes{};
+  std::size_t total_bytes{};
+  cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes),
+             "inspect sequence staging headroom");
+  const auto reserve_bytes = std::min<std::uint64_t>(
+      static_cast<std::uint64_t>(total_bytes) / 8U, 1ULL << 30U);
+  const auto pending_kv = pending_sequence_kv_bytes(sequence, operation);
+  auto required = reserve_bytes;
+  if (pending_kv > std::numeric_limits<std::uint64_t>::max() - required)
+    throw std::runtime_error("sequence staging headroom overflows");
+  required += pending_kv;
+  if (!staged_dense_weights_) {
+    if (staged_dense_weight_capacity_bytes_ >
+        std::numeric_limits<std::uint64_t>::max() - required)
+      throw std::runtime_error("sequence staging allocation overflows");
+    required += staged_dense_weight_capacity_bytes_;
+  }
+  if (static_cast<std::uint64_t>(free_bytes) >= required) return true;
+  release_staged_dense_weights();
+  sequence.staging_disabled = true;
+  ++staged_dense_weight_low_memory_fallbacks_;
+  return false;
+}
+
+void DenseFp4Provider::ensure_logits_capacity(std::uint32_t rows) {
+  if (rows == 0U || rows > workspace_rows_)
+    throw std::runtime_error("invalid logits workspace row count");
+  if (rows <= logits_capacity_rows_) return;
+  const auto values = checked_multiply(
+      rows, vocabulary_size_, "logits workspace values");
+  const auto bytes = checked_multiply(
+      values, sizeof(float), "logits workspace bytes");
+  if (bytes > std::numeric_limits<std::size_t>::max())
+    throw std::runtime_error("logits workspace exceeds address space");
+  void* replacement{};
+  cuda_check(cudaMalloc(&replacement, static_cast<std::size_t>(bytes)),
+             "allocate logits workspace");
+  if (logits_) {
+    const auto released = cudaFree(logits_);
+    if (released != cudaSuccess) {
+      static_cast<void>(cudaFree(replacement));
+      cuda_check(released, "release previous logits workspace");
+    }
+  }
+  logits_ = static_cast<float*>(replacement);
+  logits_capacity_rows_ = rows;
 }
 
 void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
@@ -4858,12 +5343,13 @@ void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
   }
   const auto matrix = weight.matrix();
   const auto staged = active_staged_weights_.find(&weight);
-  if (rows > 8U && staged != active_staged_weights_.end())
+  if (rows > 8U && staged != active_staged_weights_.end()) {
+    ++staged_dense_weight_gemm_calls_;
     status_check(ec::bf16_gemm_q8_block32(
         matrix, staged->second.data, staged->second.bytes, q8_, q8_scales_,
         staged_dense_input_, staged_dense_input_capacity_bytes_, output, rows,
         nullptr));
-  else if (rows > 8U)
+  } else if (rows > 8U)
     status_check(ec::fp4_gemm_q8_block32(
         matrix, q8_, q8_scales_, output, rows, nullptr));
   else if (rows > 1U)
@@ -4888,8 +5374,8 @@ void DenseFp4Provider::project_vision(const DeviceTensor& weight,
   if (!rows || rows > kMaximumVisionPatches)
     throw std::runtime_error("vision projection row count is invalid");
   const auto matrix = weight.matrix();
-  for (std::uint32_t first = 0U; first < rows; first += kWorkspaceRows) {
-    const auto chunk = std::min(kWorkspaceRows, rows - first);
+  for (std::uint32_t first = 0U; first < rows; first += workspace_rows_) {
+    const auto chunk = std::min(workspace_rows_, rows - first);
     project(weight, input + static_cast<std::size_t>(first) * matrix.columns,
             output + static_cast<std::size_t>(first) * matrix.rows, chunk);
   }
@@ -4999,8 +5485,8 @@ void DenseFp4Provider::run_vision(const PreparedOperation& operation,
 
   const auto& patch = binding(operation, "patch_projection");
   for (std::uint32_t first = 0U; first < media.patch_count;
-       first += kWorkspaceRows) {
-    const auto rows = std::min(kWorkspaceRows, media.patch_count - first);
+       first += workspace_rows_) {
+    const auto rows = std::min(workspace_rows_, media.patch_count - first);
     status_check(ec::gemv_f32_batch(
         patch.dequantized, vision_hidden_size_, vision_patch_dimension_,
         vision_pixels_ + static_cast<std::size_t>(first) *
@@ -5469,7 +5955,7 @@ void DenseFp4Provider::run_full_attention(
     std::uint32_t full_attention_slot,
     std::span<const std::uint32_t> mrope_positions) {
   const auto slot = state.slot();
-  if (!rows || rows > kWorkspaceRows || cache_positions.size() != rows ||
+  if (!rows || rows > workspace_rows_ || cache_positions.size() != rows ||
       rotary_positions.size() != rows ||
       (!mrope_positions.empty() && mrope_positions.size() != 3U * rows))
     throw std::runtime_error("invalid full-attention microbatch");
@@ -5779,12 +6265,11 @@ void DenseFp4Provider::run_full_attention(
         parameter_f32_or(operation.parameters, "rope_theta_f32_bits", 1.0F),
         rotary_enabled, nullptr));
 
-    const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
+    const auto query_values = static_cast<std::size_t>(workspace_rows_) *
                               query_heads_ * head_dim_;
     const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
                                   staged_split_tokens_ * head_dim_;
-    const auto score_values = static_cast<std::size_t>(kWorkspaceRows) *
-                              query_heads_ * staged_split_tokens_;
+    const auto score_values = staged_score_capacity_values_;
     const ec::HostFp16GatedGqaAttentionWorkspace workspace{
         staged_queries_, query_values * sizeof(std::uint16_t),
         staged_raw_keys_, staged_kv_values * sizeof(std::uint16_t),
@@ -5792,11 +6277,12 @@ void DenseFp4Provider::run_full_attention(
         staged_keys_, staged_kv_values * sizeof(std::uint16_t),
         staged_values_, staged_kv_values * sizeof(std::uint16_t),
         staged_scores_, score_values * sizeof(float),
-        staged_probabilities_, score_values * sizeof(std::uint16_t),
+        staged_probabilities_,
+        staged_probability_capacity_values_ * sizeof(std::uint16_t),
         staged_accumulator_, query_values * sizeof(float), partial_maxima_,
-        static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ *
             sizeof(float),
-        partial_sums_, static_cast<std::size_t>(kWorkspaceRows) *
+        partial_sums_, static_cast<std::size_t>(workspace_rows_) *
                            query_heads_ * sizeof(float),
         staged_split_tokens_};
     const auto q_row_values =
@@ -5875,12 +6361,11 @@ void DenseFp4Provider::run_full_attention(
         kv_page_tokens_, cache_positions.front(), rows, kv_heads_, head_dim_,
         nullptr));
 
-    const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
+    const auto query_values = static_cast<std::size_t>(workspace_rows_) *
                               query_heads_ * head_dim_;
     const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
                                   staged_split_tokens_ * head_dim_;
-    const auto score_values = static_cast<std::size_t>(kWorkspaceRows) *
-                              query_heads_ * staged_split_tokens_;
+    const auto score_values = staged_score_capacity_values_;
     const ec::HostFp16GatedGqaAttentionWorkspace workspace{
         staged_queries_, query_values * sizeof(std::uint16_t),
         staged_raw_keys_, staged_kv_values * sizeof(std::uint16_t),
@@ -5888,11 +6373,12 @@ void DenseFp4Provider::run_full_attention(
         staged_keys_, staged_kv_values * sizeof(std::uint16_t),
         staged_values_, staged_kv_values * sizeof(std::uint16_t),
         staged_scores_, score_values * sizeof(float),
-        staged_probabilities_, score_values * sizeof(std::uint16_t),
+        staged_probabilities_,
+        staged_probability_capacity_values_ * sizeof(std::uint16_t),
         staged_accumulator_, query_values * sizeof(float), partial_maxima_,
-        static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ *
             sizeof(float),
-        partial_sums_, static_cast<std::size_t>(kWorkspaceRows) *
+        partial_sums_, static_cast<std::size_t>(workspace_rows_) *
                            query_heads_ * sizeof(float),
         staged_split_tokens_};
     ec::DeviceFp16GatedGqaAttentionLaunch launch{};
@@ -6018,12 +6504,11 @@ void DenseFp4Provider::run_full_attention(
       staged_device_context_ = cache_positions.front() + rows;
     }
     const auto first_context_tokens = cache_positions.front() + 1U;
-    const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
+    const auto query_values = static_cast<std::size_t>(workspace_rows_) *
                               query_heads_ * head_dim_;
     const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
                                   staged_split_tokens_ * head_dim_;
-    const auto score_values = static_cast<std::size_t>(kWorkspaceRows) *
-                              query_heads_ * staged_split_tokens_;
+    const auto score_values = staged_score_capacity_values_;
     const ec::HostFp16GatedGqaAttentionWorkspace workspace{
         staged_queries_, query_values * sizeof(std::uint16_t),
         staged_raw_keys_, staged_kv_values * sizeof(std::uint16_t),
@@ -6031,11 +6516,12 @@ void DenseFp4Provider::run_full_attention(
         staged_keys_, staged_kv_values * sizeof(std::uint16_t),
         staged_values_, staged_kv_values * sizeof(std::uint16_t),
         staged_scores_, score_values * sizeof(float),
-        staged_probabilities_, score_values * sizeof(std::uint16_t),
+        staged_probabilities_,
+        staged_probability_capacity_values_ * sizeof(std::uint16_t),
         staged_accumulator_, query_values * sizeof(float), partial_maxima_,
-        static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ *
             sizeof(float),
-        partial_sums_, static_cast<std::size_t>(kWorkspaceRows) *
+        partial_sums_, static_cast<std::size_t>(workspace_rows_) *
                            query_heads_ * sizeof(float),
         staged_split_tokens_};
     if (mirrored) {
@@ -6106,12 +6592,11 @@ void DenseFp4Provider::run_full_attention(
         full_attention_slot, kv_page_tokens_, cache_positions.front(), rows,
         kv_heads_, head_dim_, nullptr));
 
-    const auto query_values = static_cast<std::size_t>(kWorkspaceRows) *
+    const auto query_values = static_cast<std::size_t>(workspace_rows_) *
                               query_heads_ * head_dim_;
     const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
                                   staged_split_tokens_ * head_dim_;
-    const auto score_values = static_cast<std::size_t>(kWorkspaceRows) *
-                              query_heads_ * staged_split_tokens_;
+    const auto score_values = staged_score_capacity_values_;
     const ec::HostFp16GatedGqaAttentionWorkspace workspace{
         staged_queries_, query_values * sizeof(std::uint16_t),
         staged_raw_keys_, staged_kv_values * sizeof(std::uint16_t),
@@ -6119,11 +6604,12 @@ void DenseFp4Provider::run_full_attention(
         staged_keys_, staged_kv_values * sizeof(std::uint16_t),
         staged_values_, staged_kv_values * sizeof(std::uint16_t),
         staged_scores_, score_values * sizeof(float),
-        staged_probabilities_, score_values * sizeof(std::uint16_t),
+        staged_probabilities_,
+        staged_probability_capacity_values_ * sizeof(std::uint16_t),
         staged_accumulator_, query_values * sizeof(float), partial_maxima_,
-        static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ *
             sizeof(float),
-        partial_sums_, static_cast<std::size_t>(kWorkspaceRows) *
+        partial_sums_, static_cast<std::size_t>(workspace_rows_) *
                            query_heads_ * sizeof(float),
         staged_split_tokens_};
     status_check(ec::gated_gqa_attention_staged_device_fp16(
@@ -6143,7 +6629,9 @@ void DenseFp4Provider::run_full_attention(
     throw std::runtime_error("invalid paged full-attention slot");
   const auto target_fp8 =
       target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head;
-  const auto mixed_mtp = target_fp8 &&
+  const auto target_fp4_key_outlier1 =
+      target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1;
+  const auto mixed_mtp = (target_fp8 || target_fp4_key_outlier1) &&
                          full_attention_slot >= target_full_layers_;
   const auto physical_layer =
       mixed_mtp ? full_attention_slot - target_full_layers_
@@ -6159,6 +6647,10 @@ void DenseFp4Provider::run_full_attention(
   if (!mrope_positions.empty()) {
     if (target_fp8 && !mixed_mtp)
       status_check(ec::store_gqa_kv_paged_fp8_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_fp4_key_outlier1 && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_fp4_key_outlier1_batch(
           key_, value_, page_table, physical_layer, kv_page_tokens_,
           cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
     else
@@ -6186,6 +6678,24 @@ void DenseFp4Provider::run_full_attention(
           partial_outputs_, cache_positions.front() + 1U, physical_layer,
           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
           kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
+    } else if (target_fp4_key_outlier1 && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(
+            ec::gated_gqa_qkv_rope_cache_paged_fp4_key_outlier1_at(
+                query_gate_, key_, value_,
+                binding(operation, "query_norm").f32,
+                binding(operation, "key_norm").f32, page, physical_layer,
+                kv_page_tokens_, cache_positions.front(),
+                rotary_positions.front(), query_heads_, kv_heads_, head_dim_,
+                rotary_dimension_, epsilon_, rope_theta_, nullptr));
+      status_check(ec::
+                       gated_gqa_attention_decode_paged_fp4_key_outlier1_tensor_core(
+                           {query_gate_, page_table, attention_,
+                            partial_maxima_, partial_sums_, partial_outputs_,
+                            cache_positions.front() + 1U, physical_layer,
+                            kv_page_tokens_, query_heads_, kv_heads_,
+                            head_dim_, kAttentionSplitTokens,
+                            attention_maximum_splits_, nullptr}));
     } else {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_at(
@@ -6210,6 +6720,17 @@ void DenseFp4Provider::run_full_attention(
           kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
           rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
           epsilon_, rope_theta_, nullptr));
+    } else if (target_fp4_key_outlier1 && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(
+            ec::gated_gqa_qkv_rope_cache_paged_fp4_key_outlier1_batch(
+                query_gate_, key_, value_,
+                binding(operation, "query_norm").f32,
+                binding(operation, "key_norm").f32, page_table,
+                physical_layer, kv_page_tokens_, cache_positions.front(),
+                rotary_positions.front(), rows, query_heads_, kv_heads_,
+                head_dim_, rotary_dimension_, epsilon_, rope_theta_,
+                nullptr));
     } else {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_batch(
@@ -6228,6 +6749,10 @@ void DenseFp4Provider::run_full_attention(
       if (target_fp8 && !mixed_mtp)
         status_check(
             ec::gated_gqa_attention_microbatch_paged_fp8_tensor_core(launch));
+      else if (target_fp4_key_outlier1 && !mixed_mtp)
+        status_check(ec::
+                         gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
+                             launch));
       else
         status_check(
             ec::gated_gqa_attention_microbatch_paged_fp4_tensor_core(launch));
@@ -6239,28 +6764,31 @@ void DenseFp4Provider::run_full_attention(
           head_dim_, kAttentionSplitTokens,
           attention_maximum_splits_, nullptr};
       const auto query_values =
-          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ * head_dim_;
+          static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
       const auto kv_values = static_cast<std::size_t>(kv_heads_) *
                              staged_split_tokens_ * head_dim_;
-      const auto score_values =
-          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
-          staged_split_tokens_;
+      const auto score_values = staged_score_capacity_values_;
       const ec::PagedFp4GatedGqaStagedPrefillWorkspace workspace{
           staged_queries_, query_values * sizeof(std::uint16_t),
           staged_keys_, kv_values * sizeof(std::uint16_t),
           staged_values_, kv_values * sizeof(std::uint16_t),
           staged_scores_, score_values * sizeof(float),
-          staged_probabilities_, score_values * sizeof(std::uint16_t),
+          staged_probabilities_,
+          staged_probability_capacity_values_ * sizeof(std::uint16_t),
           staged_accumulator_, query_values * sizeof(float), partial_maxima_,
-          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+          static_cast<std::size_t>(workspace_rows_) * query_heads_ *
               sizeof(float),
           partial_sums_,
-          static_cast<std::size_t>(kWorkspaceRows) * query_heads_ *
+          static_cast<std::size_t>(workspace_rows_) * query_heads_ *
               sizeof(float),
           staged_split_tokens_};
       if (target_fp8 && !mixed_mtp)
         status_check(ec::gated_gqa_attention_staged_prefill_paged_fp8(
             launch, workspace));
+      else if (target_fp4_key_outlier1 && !mixed_mtp)
+        status_check(
+            ec::gated_gqa_attention_staged_prefill_paged_fp4_key_outlier1(
+                launch, workspace));
       else
         status_check(ec::gated_gqa_attention_staged_prefill_paged_fp4(
             launch, workspace));
@@ -6329,9 +6857,14 @@ void DenseFp4Provider::run_recurrent_attention(
         binding(operation, "output_norm").f32,
         recurrent_conv(operation.recurrent_slot, slot),
         recurrent_matrix(operation.recurrent_slot, slot), conv_output_,
-        delta_output_, rows, key_heads_, value_heads_, key_head_dim_,
-        value_head_dim_, conv_kernel_, epsilon_, output_gate_activation,
-        nullptr}));
+        delta_output_, gate_,
+        static_cast<std::size_t>(workspace_rows_) *
+            std::max({intermediate_size_, shared_intermediate_size_,
+                      expert_width_, mamba_heads_ * mamba_head_dim_,
+                      hyper_lowrank_, ple_embedding_width_}) *
+            sizeof(float),
+        rows, key_heads_, value_heads_, key_head_dim_, value_head_dim_,
+        conv_kernel_, epsilon_, output_gate_activation, nullptr}));
     project(binding(operation, "output_projection"), delta_output_, residual_,
             rows);
     return;
@@ -6377,7 +6910,7 @@ void DenseFp4Provider::run_recurrent_attention(
 
 void DenseFp4Provider::run_router(const PreparedOperation& operation,
                                   std::uint32_t rows) {
-  if (!routed_experts_ || !rows || rows > kWorkspaceRows)
+  if (!routed_experts_ || !rows || rows > workspace_rows_)
     throw std::runtime_error("invalid routed FP4 router batch");
   if (operation.capability ==
       "router.softmax-topk.shared-swiglu.nvfp4-block16.v1") {
@@ -6464,7 +6997,7 @@ void DenseFp4Provider::run_router(const PreparedOperation& operation,
 
 void DenseFp4Provider::run_routed_moe(const PreparedOperation& operation,
                                       std::uint32_t rows) {
-  if (!routed_experts_ || !rows || rows > kWorkspaceRows)
+  if (!routed_experts_ || !rows || rows > workspace_rows_)
     throw std::runtime_error("invalid routed FP4 MoE batch");
   routed_experts_->execute(
       operation.component_layer, normalized_, routing_scores_,
@@ -6543,6 +7076,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
     const er::ProgramRequestContext* request, RequestState* state,
     std::uint32_t sample_position, bool terminal_only) {
   const auto head_rows = terminal_only ? 1U : rows;
+  ensure_logits_capacity(head_rows);
   const auto* head_input =
       terminal_only
           ? hidden_ + static_cast<std::size_t>(rows - 1U) * hidden_size_
@@ -6658,21 +7192,24 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
 std::vector<std::uint32_t> DenseFp4Provider::run_target(
     RequestState& state, std::span<const std::uint32_t> tokens,
     std::span<const std::uint32_t> positions, bool transactional_second) {
-  if (tokens.empty() || tokens.size() > kWorkspaceRows ||
+  if (tokens.empty() || tokens.size() > workspace_rows_ ||
       tokens.size() != positions.size())
     throw std::runtime_error("invalid target-model microbatch");
   const auto rows = static_cast<std::uint32_t>(tokens.size());
   const auto slot = state.slot();
   std::vector<std::uint32_t> result;
-  for (const auto& operation_pointer : prepared_target_) {
-    const auto& operation = *operation_pointer;
-    const auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
-    const auto stage = rows > 8U && operation.kernel != Kernel::embedding &&
-                       operation.kernel != Kernel::vision &&
-                       operation.kernel != Kernel::head &&
-                       operation.kernel != Kernel::routed_moe;
-    if (stage) activate_staged_weights(operation);
-    switch (operation.kernel) {
+  try {
+    for (const auto& operation_pointer : prepared_target_) {
+      const auto& operation = *operation_pointer;
+      const auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
+      const auto stage_candidate =
+          rows > 8U && operation.kernel != Kernel::embedding &&
+          operation.kernel != Kernel::vision &&
+          operation.kernel != Kernel::head &&
+          operation.kernel != Kernel::routed_moe;
+      const auto staged =
+          stage_candidate && activate_staged_weights(operation);
+      switch (operation.kernel) {
       case Kernel::hyper_initialize:
       case Kernel::ple:
       case Kernel::hyper_read:
@@ -6696,7 +7233,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
                               cudaMemcpyDeviceToDevice),
                    "retain target attention residual");
         normalize_operation_input(operation, hidden_, normalized_, rows);
-        std::array<std::uint32_t, kWorkspaceRows> rotary{};
+        std::array<std::uint32_t, kMaximumWorkspaceRows> rotary{};
         for (std::uint32_t row = 0U; row < rows; ++row) {
           const auto adjusted = static_cast<std::int64_t>(positions[row]) +
                                 slot_rope_deltas_.at(slot);
@@ -6739,11 +7276,16 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
         break;
       case Kernel::exact_decode:
         throw std::runtime_error("exact service appeared in scalar program");
+      }
+      if (staged) deactivate_staged_weights();
+      end_gpu_phase(phase_event);
+      if (operation.kernel == Kernel::head) collect_gpu_phases();
     }
-    if (stage) deactivate_staged_weights();
-    end_gpu_phase(phase_event);
-    if (operation.kernel == Kernel::head) collect_gpu_phases();
+  } catch (...) {
+    release_staged_dense_weights();
+    throw;
   }
+  release_staged_dense_weights();
   if (result.size() != rows)
     throw std::runtime_error("target program produced no token head");
   return result;
@@ -6792,7 +7334,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
     const float* previous_hidden,
     std::span<const std::uint32_t> rotary_positions, bool produce_logits) {
   if (!exact_ || !mtp_attention_ || !mtp_ffn_ || tokens.empty() ||
-      tokens.size() > kWorkspaceRows || tokens.size() != rotary_positions.size() ||
+      tokens.size() > workspace_rows_ || tokens.size() != rotary_positions.size() ||
       state.mtp_length + tokens.size() > max_context_)
     throw std::runtime_error("invalid MTP microbatch");
   const auto rows = static_cast<std::uint32_t>(tokens.size());
@@ -6832,8 +7374,8 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
              "retain MTP attention residual");
   normalize_rows(hidden_, binding(*mtp_attention_, "input_norm").f32,
                  normalized_, rows);
-  std::array<std::uint32_t, kWorkspaceRows> cache_positions{};
-  std::array<std::uint32_t, 3U * kWorkspaceRows> mrope_positions{};
+  std::array<std::uint32_t, kMaximumWorkspaceRows> cache_positions{};
+  std::array<std::uint32_t, 3U * kMaximumWorkspaceRows> mrope_positions{};
   for (std::uint32_t row = 0U; row < rows; ++row)
     cache_positions[row] = state.mtp_length + row;
   for (std::uint32_t row = 0U;
@@ -6877,6 +7419,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
              "retain final MTP hidden state");
   normalize_rows(final_hidden, binding(*exact_, "draft_norm").f32,
                  normalized_, 1U);
+  ensure_logits_capacity(1U);
   project(binding(*exact_, "output_head"), normalized_, logits_, 1U);
   status_check(ec::argmax_batch(logits_, vocabulary_size_, 1U,
                                 output_tokens_, nullptr));
@@ -7798,6 +8341,8 @@ DenseFp4Provider::poll_program_sequence(
     const std::shared_ptr<SequenceState>& sequence) {
   if (!sequence || sequence->terminal) return std::nullopt;
   if (sequence->cancelled.load()) {
+    std::lock_guard lock(mutex_);
+    release_staged_dense_weights();
     sequence->terminal = true;
     sequence->hidden.clear();
     return er::OperationExecutionResult{
@@ -7874,7 +8419,7 @@ DenseFp4Provider::poll_program_sequence(
       auto* retained_hidden = slot_target_hidden_batch_ +
                               static_cast<std::size_t>(
                                   sequence->request->slot()) *
-                                  kWorkspaceRows * hidden_size_;
+                                  workspace_rows_ * hidden_size_;
       cuda_check(cudaMemcpy(retained_hidden, hidden_,
                             hidden_size_ * sizeof(float),
                             cudaMemcpyDeviceToDevice),
@@ -7921,6 +8466,7 @@ DenseFp4Provider::poll_program_sequence(
       prefill_tokens_ += total_rows;
       ++program_sequence_batches_;
       program_sequence_tokens_ += total_rows;
+      release_staged_dense_weights();
       sequence->terminal = true;
       return result;
     }
@@ -7942,7 +8488,7 @@ DenseFp4Provider::poll_program_sequence(
     }
 
     auto chunk_rows = std::min<std::size_t>(
-        kWorkspaceRows, sequence->tile_rows - sequence->next_row);
+        workspace_rows_, sequence->tile_rows - sequence->next_row);
     if (sequence->retention_position != 0U) {
       const auto checkpoint_offset = static_cast<std::size_t>(
           sequence->retention_position - sequence->positions.front());
@@ -7973,8 +8519,20 @@ DenseFp4Provider::poll_program_sequence(
                             tile_hidden + tile_offset * hidden_size_,
                             hidden_bytes, cudaMemcpyDeviceToDevice),
                  "load program-sequence hidden tile");
-      const auto single_tile = total_rows <= sequence_tile_rows_;
-      if (single_tile) activate_staged_weights(operation);
+      const auto stage_candidate =
+          rows > 8U && staged_dense_weight_capacity_bytes_ != 0U &&
+          operation.kernel != Kernel::routed_moe;
+      if (stage_candidate && sequence->next_row == 0U)
+        static_cast<void>(
+            sequence_staging_has_headroom(*sequence, operation));
+      auto staged = false;
+      if (stage_candidate && !sequence->staging_disabled) {
+        staged = activate_staged_weights(operation);
+        if (!staged) {
+          sequence->staging_disabled = true;
+          ++staged_dense_weight_low_memory_fallbacks_;
+        }
+      }
       switch (operation.kernel) {
         case Kernel::hyper_initialize:
         case Kernel::ple:
@@ -7998,7 +8556,7 @@ DenseFp4Provider::poll_program_sequence(
           const auto positions = std::span(sequence->positions)
                                      .subspan(offset, rows);
           if (operation.kernel == Kernel::full_attention) {
-            std::array<std::uint32_t, kWorkspaceRows> adjusted{};
+            std::array<std::uint32_t, kMaximumWorkspaceRows> adjusted{};
             auto rotary = positions;
             if (sequence->media.positions_thw.empty() &&
                 sequence->request->rope_delta != 0) {
@@ -8100,7 +8658,7 @@ DenseFp4Provider::poll_program_sequence(
           throw std::runtime_error(
               "invalid operation in program-sequence hidden phase");
       }
-      if (single_tile) deactivate_staged_weights();
+      if (staged) deactivate_staged_weights();
       cuda_check(cudaMemcpy(
                      tile_hidden + tile_offset * hidden_size_, hidden_,
                      hidden_bytes, cudaMemcpyDeviceToDevice),
@@ -8116,7 +8674,7 @@ DenseFp4Provider::poll_program_sequence(
     }
     return std::nullopt;
   } catch (const std::exception& error) {
-    deactivate_staged_weights();
+    release_staged_dense_weights();
     sequence->terminal = true;
     sequence->hidden.clear();
     active_gpu_events_ = 0U;
@@ -8283,7 +8841,7 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
                            normalized_, rows);
         }
         if (operation->kernel == Kernel::full_attention) {
-          std::array<std::uint32_t, kWorkspaceRows> rotary{};
+          std::array<std::uint32_t, kMaximumWorkspaceRows> rotary{};
           for (std::uint32_t row = 0U; row < rows; ++row) {
             const auto adjusted = static_cast<std::int64_t>(positions[row]) +
                                   state->rope_delta;
@@ -8384,7 +8942,7 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
           throw std::runtime_error("head batch width changed in program");
         auto* retained_hidden =
             slot_target_hidden_batch_ +
-            static_cast<std::size_t>(state->slot()) * kWorkspaceRows *
+            static_cast<std::size_t>(state->slot()) * workspace_rows_ *
                 hidden_size_;
         cuda_check(cudaMemcpy(retained_hidden, hidden_,
                               static_cast<std::size_t>(rows) * hidden_size_ *
@@ -8469,7 +9027,7 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
     const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
     if (!operation || operation != exact_.get() || !state ||
         synchronization.next_tokens.empty() ||
-        synchronization.next_tokens.size() > kWorkspaceRows ||
+        synchronization.next_tokens.size() > workspace_rows_ ||
         state->synchronization_consumed > state->synchronization_rows ||
         synchronization.next_tokens.size() >
             state->synchronization_rows - state->synchronization_consumed ||
@@ -8489,7 +9047,7 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
     const auto synchronized_row = state->synchronization_consumed;
     auto* retained_hidden =
         slot_target_hidden_batch_ +
-        static_cast<std::size_t>(state->slot()) * kWorkspaceRows *
+        static_cast<std::size_t>(state->slot()) * workspace_rows_ *
             hidden_size_;
     const float* previous_hidden{};
     if (!state->sequence_target_hidden.empty()) {
@@ -8531,7 +9089,7 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
                                                   .first_target_position -
                                               1U);
     if (mtp_rows != 0U) {
-      std::array<std::uint32_t, kWorkspaceRows> positions{};
+      std::array<std::uint32_t, kMaximumWorkspaceRows> positions{};
       for (std::uint32_t row = 0U; row < mtp_rows; ++row)
         positions[row] =
             synchronization.first_target_position + row + 1U;
@@ -8657,8 +9215,18 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     std::uint32_t capacity, std::uint64_t ram_cache_bytes,
     std::uint64_t vram_cache_bytes, std::uint64_t kv_cache_bytes,
     std::uint32_t kv_page_tokens, std::string_view kv_cache_dtype,
-    std::string_view placement_profile, bool profile_gpu_phases) {
+    std::string_view placement_profile, std::string_view routed_vram_policy,
+    bool profile_gpu_phases, bool discover_active_expert_devices,
+    std::vector<int> active_expert_devices,
+    std::uint64_t active_expert_device_cache_bytes,
+    std::uint64_t active_expert_host_cache_bytes) {
   try {
+    if (discover_active_expert_devices)
+      active_expert_devices = ec::discover_pascal_active_expert_devices();
+    if (active_expert_devices.empty()) {
+      active_expert_device_cache_bytes = 0U;
+      active_expert_host_cache_bytes = 0U;
+    }
     auto artifact = std::make_shared<er::ModelArtifact>();
     auto status = er::ModelArtifact::load(artifact_root, *artifact);
     if (!status.ok()) return {status, {}};
@@ -8673,7 +9241,10 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     auto implementation = std::make_shared<DenseFp4Provider>(
         artifact, tensor_store, max_context, capacity, ram_cache_bytes,
         vram_cache_bytes, kv_cache_bytes, kv_page_tokens, kv_cache_dtype,
-        placement_profile, profile_gpu_phases);
+        placement_profile, routed_vram_policy, profile_gpu_phases,
+        std::move(active_expert_devices),
+        active_expert_device_cache_bytes,
+        active_expert_host_cache_bytes);
     er::ExecutionProviderModule module;
     module.definition = {"sm86-dense-fp4", 200U, provider_capabilities(),
                          implementation};
@@ -8681,7 +9252,7 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const auto mtp = artifact->model().exact_decode_program.has_value();
     module.service = {
         "causal_layer_major",
-        kWorkspaceRows,
+        implementation->prefill_batch_rows(),
         implementation->supports_request_state_retention(),
         "per_request_nonblocking",
         "artifact",
@@ -8715,7 +9286,15 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
             ? implementation->parking_ram_capacity_bytes() /
                   implementation->kv_page_bytes()
             : 0U;
+    module.service.routed_vram_policy = std::string(routed_vram_policy);
     module.telemetry = [implementation] { return implementation->telemetry(); };
+    module.finalize_service = [implementation](auto& service) {
+      auto status = implementation->finalize_startup();
+      if (status.ok())
+        service.vram_cache_bytes =
+            implementation->effective_vram_cache_bytes();
+      return status;
+    };
     return {er::Status::success(), std::move(module)};
   } catch (const std::exception& error) {
     return {{er::ErrorCode::internal, error.what()}, {}};

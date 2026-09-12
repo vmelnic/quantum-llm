@@ -13,11 +13,16 @@ param(
     [int]$WorkerCapacity = 4,
     [int]$WorkerRamCacheGiB = 48,
     [int]$WorkerVramCacheGiB = 18,
+    [ValidateSet("fixed", "fit")]
+    [string]$WorkerRoutedVramPolicy = "fixed",
+    [string]$WorkerActiveExpertDevices = "",
+    [int]$WorkerActiveExpertDeviceCacheGiB = 0,
+    [int]$WorkerActiveExpertHostCacheGiB = 0,
     [ValidateSet("latency", "balanced", "capacity")]
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
-    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp16")]
+    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
@@ -83,6 +88,13 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
 [string[]]$profileArguments = if ($ProfileGpuPhases) {
     "--profile-gpu-phases"
 } else { @() }
+[string[]]$activeExpertArguments = if ($WorkerActiveExpertDevices) {
+    @(
+        "--worker-active-expert-devices", $WorkerActiveExpertDevices,
+        "--worker-active-expert-device-cache-gib", [string]$WorkerActiveExpertDeviceCacheGiB,
+        "--worker-active-expert-host-cache-gib", [string]$WorkerActiveExpertHostCacheGiB
+    )
+} else { @() }
 [string[]]$retainedRouteArguments = if ($DisableRetainedRoute) {
     "--disable-worker-retained-route"
 } else { @() }
@@ -117,6 +129,8 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-capacity $WorkerCapacity `
     --worker-ram-cache-gib $WorkerRamCacheGiB `
     --worker-vram-cache-gib $WorkerVramCacheGiB `
+    --worker-routed-vram-policy $WorkerRoutedVramPolicy `
+    @activeExpertArguments `
     --placement-profile $PlacementProfile `
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `

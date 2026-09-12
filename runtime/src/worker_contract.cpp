@@ -7,6 +7,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace expert::runtime {
 namespace {
@@ -37,6 +38,29 @@ std::string required_value(
     throw std::invalid_argument("required worker option is absent: --" +
                                 std::string(name));
   return *found->second;
+}
+
+std::vector<int> device_list(std::string_view text) {
+  std::vector<int> result;
+  std::size_t first = 0U;
+  while (first < text.size()) {
+    const auto separator = text.find(',', first);
+    const auto part = text.substr(
+        first, separator == std::string_view::npos ? text.size() - first
+                                                   : separator - first);
+    const auto value = unsigned_integer(part);
+    if (value > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+      throw std::invalid_argument("active expert device is outside int range");
+    result.push_back(static_cast<int>(value));
+    if (separator == std::string_view::npos) break;
+    first = separator + 1U;
+  }
+  if (result.empty())
+    throw std::invalid_argument("active expert device list is empty");
+  std::sort(result.begin(), result.end());
+  if (std::adjacent_find(result.begin(), result.end()) != result.end())
+    throw std::invalid_argument("active expert device is duplicated");
+  return result;
 }
 
 }  // namespace
@@ -79,6 +103,8 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
         unsigned_integer(required_value(raw, "ram-cache-gib"));
     options.vram_cache_gib =
         unsigned_integer(required_value(raw, "vram-cache-gib"));
+    if (const auto found = raw.find("routed-vram-policy"); found != raw.end())
+      options.routed_vram_policy = required_value(raw, "routed-vram-policy");
     options.capacity = u32(required_value(raw, "capacity"));
     options.kv_cache_mib =
         unsigned_integer(required_value(raw, "kv-cache-mib"));
@@ -88,6 +114,8 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
     options.placement_profile = required_value(raw, "placement-profile");
     if (options.ram_cache_gib == 0U || options.vram_cache_gib == 0U ||
         options.kv_cache_mib == 0U ||
+        (options.routed_vram_policy != "fixed" &&
+         options.routed_vram_policy != "fit") ||
         (options.placement_profile != "latency" &&
          options.placement_profile != "balanced" &&
          options.placement_profile != "capacity"))
@@ -107,14 +135,41 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
             "boolean worker option profile-gpu-phases has a value");
       options.profile_gpu_phases = true;
     }
+    if (const auto found = raw.find("active-expert-devices");
+        found != raw.end()) {
+      const auto devices = required_value(raw, "active-expert-devices");
+      if (devices == "auto")
+        options.discover_active_expert_devices = true;
+      else
+        options.active_expert_devices = device_list(devices);
+    }
+    if (const auto found = raw.find("active-expert-device-cache-gib");
+        found != raw.end())
+      options.active_expert_device_cache_gib = unsigned_integer(
+          required_value(raw, "active-expert-device-cache-gib"));
+    if (const auto found = raw.find("active-expert-host-cache-gib");
+        found != raw.end())
+      options.active_expert_host_cache_gib = unsigned_integer(
+          required_value(raw, "active-expert-host-cache-gib"));
+    const bool active_expert_tier_configured =
+        options.discover_active_expert_devices ||
+        !options.active_expert_devices.empty();
+    if (active_expert_tier_configured !=
+            (options.active_expert_device_cache_gib != 0U) ||
+        active_expert_tier_configured !=
+            (options.active_expert_host_cache_gib != 0U))
+      throw std::invalid_argument(
+          "active expert devices and cache budgets must be configured together");
 
     constexpr std::string_view common_names[]{
         "max-context",          "ram-cache-gib",
-        "vram-cache-gib",      "capacity",
+        "vram-cache-gib",      "routed-vram-policy", "capacity",
         "kv-cache-mib",        "kv-page-tokens",
         "kv-cache-dtype",
         "placement-profile",   "prefill-chunk-limit",
-        "placement-settle-steps", "profile-gpu-phases"};
+        "placement-settle-steps", "profile-gpu-phases",
+        "active-expert-devices", "active-expert-device-cache-gib",
+        "active-expert-host-cache-gib"};
     for (auto& [name, value] : raw) {
       if (std::find(std::begin(common_names), std::end(common_names), name) ==
           std::end(common_names))

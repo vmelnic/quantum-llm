@@ -224,13 +224,13 @@ Status ActiveExpertOwnerDirectory::add(RemoteExpertOwnerRange range) noexcept {
   try {
     if (range.namespace_id == 0U || range.layer_count == 0U ||
         range.expert_count == 0U || !range.executor ||
-        !range.executor->remote() || range.executor->owner().empty() ||
+        range.executor->owner().empty() ||
         range.first_layer >
             std::numeric_limits<std::uint32_t>::max() - range.layer_count ||
         range.first_expert >
             std::numeric_limits<std::uint32_t>::max() - range.expert_count)
       return {ErrorCode::invalid_argument,
-              "remote expert owner range is invalid"};
+              "active expert owner range is invalid"};
     const auto layer_end = range.first_layer + range.layer_count;
     const auto expert_end = range.first_expert + range.expert_count;
     for (const auto& existing : ranges_) {
@@ -247,13 +247,13 @@ Status ActiveExpertOwnerDirectory::add(RemoteExpertOwnerRange range) noexcept {
           existing.first_expert < expert_end;
       if (layer_overlap && expert_overlap)
         return {ErrorCode::invalid_argument,
-                "remote expert owner ranges overlap"};
+                "active expert owner ranges overlap"};
     }
     ranges_.push_back(std::move(range));
     return Status::success();
   } catch (const std::exception& error) {
     return {ErrorCode::internal,
-            std::string("remote expert owner registration failed: ") +
+            std::string("active expert owner registration failed: ") +
                 error.what()};
   }
 }

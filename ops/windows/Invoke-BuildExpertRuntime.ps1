@@ -2,7 +2,9 @@ param(
     [ValidateSet("Release", "Debug")]
     [string]$Configuration = "Release",
     [bool]$EnableCudaPinned = $true,
-    [bool]$EnableCudaCompute = $true
+    [bool]$EnableCudaCompute = $true,
+    [ValidateRange(1, 256)]
+    [int]$ParallelJobs = [Environment]::ProcessorCount
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -47,7 +49,8 @@ try {
     }
     Invoke-CheckedNative -Command $cmake -Arguments $configureArguments
     Invoke-CheckedNative -Command $cmake -Arguments @(
-        "--build", "--preset", $preset, "--clean-first"
+        "--build", "--preset", $preset, "--clean-first",
+        "--parallel", $ParallelJobs.ToString()
     )
     Invoke-CheckedNative -Command $ctest -Arguments @(
         "--preset", $preset
@@ -70,6 +73,7 @@ $result = [PSCustomObject]@{
     configuration = $Configuration
     cuda_pinned = $EnableCudaPinned
     cuda_compute = $EnableCudaCompute
+    parallel_jobs = $ParallelJobs
     build_root = Join-Path $script:RepoRoot "out\build\$preset"
     status = "pass"
 }

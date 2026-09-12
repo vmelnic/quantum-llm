@@ -64,6 +64,28 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_request_telemetry_preserves_provider_configuration(self) -> None:
+        before = {
+            "provider_gpu_ffn_ns": 100,
+            "provider_workspace_rows": 1024,
+            "provider_compact_flash_prefill": 1,
+            "allocated_pages": 12,
+        }
+        after = {
+            "provider_gpu_ffn_ns": 140,
+            "provider_workspace_rows": 1024,
+            "provider_compact_flash_prefill": 1,
+            "allocated_pages": 20,
+        }
+        self.assertEqual(
+            Application._request_telemetry_fields(before, after),
+            {
+                "provider_gpu_ffn_ns": 40,
+                "provider_workspace_rows": 1024,
+                "provider_compact_flash_prefill": 1,
+            },
+        )
+
     def test_chat_output_limit_is_capped_by_active_service(self) -> None:
         with unittest.mock.patch(
                 "ops.python.chat_client._get_json",
@@ -722,6 +744,51 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 2048, 128, "balanced", False,
             )
         self.assertEqual(worker.kv_dtype, "bf16-latent")
+
+    def test_protocol11_accepts_fitted_routed_vram_above_fixed_ceiling(
+            self) -> None:
+        ready = {
+            "type": "ready", "protocol": 11, "capacity": 1,
+            "architecture_id": "fixture.routed", "vocab_size": 64000,
+            "max_context_tokens": 262144,
+            "routed_layers": 10, "experts_per_layer": 256,
+            "route_width": 8, "expert_encoding": "fp4.fixture",
+            "operation_capabilities": ["moe.fixture.v1"],
+            "prefill_mode": "causal_layer_major",
+            "prefill_chunk_tokens": 1024,
+            "session_retention": True, "session_parking": False,
+            "session_park_ram_bytes": 0, "session_park_page_capacity": 0,
+            "sampling_supported": True,
+            "sampling_presence_penalty_supported": True,
+            "kv_dtype": "fp4-e2m1-ue8m0-block32-key-outlier1",
+            "kv_allocation": "paged_on_demand",
+            "kv_page_tokens": 256, "kv_page_bytes": 1556480,
+            "kv_page_capacity": 1024, "placement_mode": "budgeted",
+            "placement_profile": "balanced",
+            "ram_cache_bytes": 18 << 30,
+            "vram_cache_bytes": 16 << 30,
+            "routed_vram_policy": "fit",
+            "placement_prefetch_enabled": False,
+            "placement_prefetch_state": "disabled",
+            "placement_minimum_observations": 2,
+        }
+        process = unittest.mock.MagicMock()
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(json.dumps(ready) + "\n")
+        process.stderr = io.StringIO()
+        with unittest.mock.patch.object(
+                expert_server.subprocess, "Popen", return_value=process
+        ) as popen:
+            worker = CudaWorker(
+                expert_server.Path("provider.exe"),
+                expert_server.Path("pack"), 262144, 1, 1, 48, 12,
+                5136, 256, "balanced", False,
+                kv_cache_dtype="fp4-e2m1-ue8m0-block32-key-outlier1",
+                routed_vram_policy="fit",
+            )
+        self.assertEqual(worker.vram_cache_bytes, 16 << 30)
+        self.assertEqual(worker.routed_vram_policy, "fit")
+        self.assertIn("--routed-vram-policy=fit", popen.call_args.args[0])
 
     def test_protocol7_rejects_partial_routed_geometry(self) -> None:
         ready = {
@@ -1749,6 +1816,31 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             server_side.close()
             client_side.close()
 
+    def test_generation_error_is_not_written_after_client_disconnect(self) -> None:
+        handler = Handler.__new__(Handler)
+        handler._client_disconnected = lambda: True
+        handler._sse = lambda _payload: self.fail(
+            "a disconnected client must not receive another SSE event"
+        )
+
+        self.assertFalse(handler._send_generation_error(
+            "chat", True, 500, "generation failed", "server_error",
+            "generation_failed",
+        ))
+
+    def test_generation_error_absorbs_disconnect_during_sse_write(self) -> None:
+        handler = Handler.__new__(Handler)
+        handler._client_disconnected = lambda: False
+
+        def disconnected_write(_payload: object) -> None:
+            raise ConnectionResetError("peer reset")
+
+        handler._sse = disconnected_write
+        self.assertFalse(handler._send_generation_error(
+            "chat", True, 500, "generation failed", "server_error",
+            "generation_failed",
+        ))
+
     def test_context_credits_are_bounded_and_reusable(self) -> None:
         app = application_fixture()
         app.worker = types.SimpleNamespace(
@@ -1877,6 +1969,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         })
         self.assertEqual(info["worker_placement"], {
             "mode": "budgeted", "profile": "capacity",
+            "routed_vram_policy": "fixed",
             "ram_cache_bytes": 48 << 30,
             "vram_cache_bytes": 18 << 30, "prefetch_enabled": False,
             "prefetch_state": "disabled",

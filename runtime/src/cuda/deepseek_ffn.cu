@@ -658,7 +658,42 @@ Status deepseek_ffn_execute_pair(
       kTopK, launch.experts_per_layer, launch.stream,
       launch.directory_entries, layer, 10.0F, true, true});
   if (!status.ok()) return status;
-  status = launch_moe_aggregate({
+  return deepseek_ffn_finalize_pair(launch);
+}
+
+Status deepseek_ffn_import_pair_selection_output(
+    const DeepSeekFfnPairSelectionImportLaunch& launch) noexcept {
+  constexpr std::uint32_t kSelections = 2U * kTopK;
+  if (!launch.workspace || !launch.host_output ||
+      launch.selection_index >= kSelections ||
+      launch.host_output_bytes != kHidden * sizeof(float))
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek remote pair selection output"};
+  const auto error = cudaMemcpyAsync(
+      launch.workspace->routed_selection_outputs_ +
+          static_cast<std::size_t>(launch.selection_index) * kHidden,
+      launch.host_output, launch.host_output_bytes, cudaMemcpyHostToDevice,
+      static_cast<cudaStream_t>(launch.stream));
+  return error == cudaSuccess
+             ? Status::success()
+             : failure(error, "import DeepSeek remote pair selection output");
+}
+
+Status deepseek_ffn_finalize_pair(
+    const DeepSeekFfnPairExecuteLaunch& launch) noexcept {
+  if (!launch.weights || !launch.states[0] || !launch.states[1] ||
+      !launch.workspace || !launch.directory_entries || !launch.streams[0] ||
+      !launch.streams[1] || !launch.updated_streams[0] ||
+      !launch.updated_streams[1] || launch.experts_per_layer != 257U)
+    return {ErrorCode::invalid_argument,
+            "invalid DeepSeek pair FFN finalize launch"};
+  for (auto* state : launch.states) {
+    const auto checked = check_binding(*launch.weights, *state);
+    if (!checked.ok()) return checked;
+  }
+  auto& workspace = *launch.workspace;
+  const auto layer = launch.weights->layer;
+  auto status = launch_moe_aggregate({
       workspace.routed_selection_outputs_, nullptr, nullptr, nullptr,
       workspace.routing_weights_, workspace.routed_output_, 0U, 2U, kHidden,
       kTopK, launch.stream});

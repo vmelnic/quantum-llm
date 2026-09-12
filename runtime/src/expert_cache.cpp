@@ -1935,6 +1935,22 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     return {ram_bytes, vram_bytes};
   }
 
+  Status configure_vram_budget(TierBudget budget,
+                               std::uint64_t transient_bytes) {
+    auto lock = acquire_lock();
+    if (shutting_down)
+      return {ErrorCode::cancelled, "expert cache is shutting down"};
+    if (!valid_budget(budget) || transient_bytes >= budget.high_watermark_bytes)
+      return {ErrorCode::invalid_argument,
+              "invalid fitted expert VRAM budget"};
+    if (vram_bytes != 0U)
+      return {ErrorCode::invalid_argument,
+              "expert VRAM budget cannot change after first admission"};
+    config.vram = budget;
+    config.placement.vram_transient_bytes = transient_bytes;
+    return Status::success();
+  }
+
   void shutdown() noexcept {
     std::vector<OperationId> reads;
     std::vector<OperationId> uploads;
@@ -2216,6 +2232,11 @@ TelemetrySnapshot ExpertCache::telemetry() const noexcept {
 CacheUsage ExpertCache::usage() const noexcept {
   const auto snapshot = core_->metrics.snapshot();
   return {snapshot.ram_bytes, snapshot.vram_bytes};
+}
+
+Status ExpertCache::configure_vram_budget(TierBudget budget,
+                                          std::uint64_t transient_bytes) {
+  return core_->configure_vram_budget(budget, transient_bytes);
 }
 
 std::uint64_t ExpertCache::trim() {

@@ -436,6 +436,30 @@ struct DeepSeekDecodeScheduler::Core final {
       const DeepSeekDecodeAdvanceResult& result) {
     auto status = reconcile_working_set(request, result);
     if (!status.ok()) return status;
+    if (result.active_expert_external) {
+      if (hybrid.route_census) {
+        const auto route_width = routed.component().route_width;
+        for (std::uint32_t row = 0U; row < result.route_rows; ++row) {
+          const auto first =
+              result.routed_experts.begin() + row * route_width;
+          if (row == 0U)
+            attribute_predictions(
+                result.layer,
+                std::span<const std::uint32_t>(first, first + route_width));
+          const auto observed = hybrid.route_census->observe(
+              result.layer,
+              std::span<const std::uint32_t>(first, first + route_width));
+          if (!observed.ok()) return copied_status(observed);
+          ++metrics.route_observations;
+        }
+      }
+      if (auto* retained = layer_working_set(request, result.layer))
+        retained->clear();
+      request.leases.clear();
+      request.host_leases.clear();
+      request.cpu_experts.clear();
+      return Status::success();
+    }
     std::vector<ExpertAccess> route_accesses;
     route_accesses.reserve(result.routed_experts.size());
     for (const auto expert : result.routed_experts) {

@@ -1,84 +1,72 @@
 # Production readiness
 
 Status: functional research/pilot runtime; not production-ready for the full
-maximum-context coding objective, 2026-09-02.
+maximum-context coding objective, 2026-09-12.
 
 ## Verdict
 
-All six active artifacts start through one task/VM and return valid text through
-both direct chat and the minimal Pi gate. Qwen text/reasoning/tools/image input,
-exact progressive F16 KV and retained-session recovery have bounded evidence.
-Muse and Ornith pass short text paths. Mistral's native NVFP4 and Qwen Flash's
-extended program are callable. DeepSeek's self-contained exact paging bundle is
-callable from NVMe/RAM/VRAM.
+All six artifacts start through the common task/VM and return text through
+direct chat and minimal Pi wiring. Artifact validation, lifecycle, bounded API
+limits, telemetry, exact sparse routing and cleanup are functional.
 
-That is not yet production readiness:
+The complete product goal is not ready:
 
-- Qwen populated 262,001 exact-F16 prompt tokens in 2,183.815 s and generated
-  only one token; saturated 262K decode at approximately 15 useful tok/s is
-  unqualified;
-- one hot provider slot serializes agents;
-- Flash and Mistral pass wiring but fail current coding latency/quality gates;
-- minimal DeepSeek Pi `hi` took 310.672 s and moved hundreds of GB through the
-  cache hierarchy;
-- DeepSeek cancellation may require manual restart;
-- long-prefix failure injection, durable supervision and a hardened network
-  edge are incomplete.
+- Qwen exact-F16 populated 262,016 tokens but took 2,278.082 s; K1 took
+  546.173 s but changes fidelity;
+- one hot provider slot serializes all agents;
+- Qwen Flash and Mistral are callable but fail coding latency/behavior gates;
+- Ornith K1+fit failed its coding fixture 2/3 after 1,832.80 s;
+- DeepSeek novel routes remain near 1 tok/s, settled throughput is below target
+  and some cancellations require restart;
+- durable supervision, long-prefix failure recovery and a hardened network
+  edge remain incomplete.
 
 ## Ready components
 
-| Area | State |
+| Area | Current boundary |
 |---|---|
-| artifacts | six active artifacts under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
-| common lifecycle | alias-driven install/start/status/chat/stop through one task and VM |
-| QPack execution | block-32 FP4 and source-native block-16 NVFP4 providers execute real service paths |
-| DeepSeek paging | exact top-6, stable aggregation and measured NVMe/RAM/VRAM traffic |
-| exact KV allocation | artifact-declared dtype/geometry, progressive pages and Qwen exact device mirror |
-| retained sessions | transactional suffix resume/rewind for providers that advertise it |
-| APIs | bounded OpenAI and Anthropic-compatible streaming surfaces |
-| Pi wiring | all six aliases pass the no-context/no-tools/no-session `hi` gate |
-| introspection | bounded health/readiness/model/metrics paths and request telemetry |
+| artifacts | six stable artifacts under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
+| lifecycle | alias-driven install/start/status/chat/stop through one task and VM |
+| execution | declared QPack FP4, native NVFP4/BF16 and DeepSeek compact experts execute real service paths |
+| paging | exact top-k/stable merge with measured NVMe/RAM/VRAM traffic |
+| KV/session state | artifact-declared progressive allocation; transactional retention only where advertised |
+| APIs | bounded OpenAI- and Anthropic-compatible streaming surfaces |
+| harness wiring | all advertised models pass minimal Pi `hi`; this is not coding qualification |
+| introspection | bounded health/readiness/model/metrics and per-request telemetry |
 
-## Open blockers
+## Release blockers
 
-| Area | Blocker |
+| Area | Required result |
 |---|---|
-| Qwen 262K target | capacity inequality, 36-minute exact prefill and no saturated 15 tok/s decode pass |
-| real coding harness | only bounded Qwen/Ornith evidence; long real-project quality and wall time unqualified |
-| Qwen Flash | slow startup/short Pi latency and repeated zero-edit action failure |
-| Mistral | coherent native execution but high TTFT and zero edits in the recorded coding gate |
-| Muse | text only; no populated 131K or representative coding gate |
-| DeepSeek | novel movement cost, minimal Pi latency, settled rate below 10-15 and manual recovery after some cancellations |
-| concurrency | one serialized hot slot; parking is continuity, not simultaneous decode |
-| public service | no integrated TLS, public rate limiting, durable log retention or complete supervisor recovery |
-| multi-GPU | not implemented and not part of the current one-3090 acceptance host |
+| Qwen 262K | populated exact-F16 real-harness prefill and about 15 useful tok/s |
+| harness | reliable representative coding, tools, compaction and retained-prefix behavior |
+| Flash/Mistral/Ornith/Muse | each model's documented latency, quality and populated-context gate |
+| DeepSeek | 10-15 tok/s settled, honest novel-route telemetry and automatic unhealthy-worker recovery |
+| concurrency | admission and continuity under real competing sessions; current decode remains serialized |
+| operations | durable supervisor/logs/metrics, tested rollback, TLS and rate limiting |
+| P100 | no release dependency: exact routes work, but measured throughput is worse than the preferred paths |
 
 ## Release invariants
 
 - `MODEL_ROOT` is the only host-dependent model-storage root.
-- The current common routed-VRAM ceiling is 12 GiB. Do not raise it without
-  Qwen and DeepSeek chat plus cleanup; DeepSeek currently fails at 13 GiB.
-- Qwen/Muse/Ornith/Flash execute declared FP4 payloads; Mistral executes native
-  NVFP4; format names are never substituted.
-- Exact target F16 KV is not replaced with FP8/Q4 without explicit fidelity
-  approval and a separate quality gate.
-- DeepSeek preserves exact router/top-k and receives no unsupported session
-  commands.
-- Windows Release/CUDA verification is clean-first.
-- `ready=true` is an admission/liveness state, not an SLO.
-- Every release gate ends with service/process/GPU cleanup.
+- The common fixed routed-VRAM ceiling is 12 GiB; startup fitting is admitted
+  only after accounting maximum future state and reserve.
+- Format and fidelity names remain exact; K1 is a lossy opt-in, while exact F16
+  remains the Qwen acceptance target.
+- DeepSeek keeps exact router/top-k/stable aggregation and receives no
+  unsupported session commands.
+- Native releases use a clean-first Windows CUDA build.
+- `ready=true` proves liveness/admission, not warm state or an SLO.
+- Every gate ends with process and device-memory cleanup.
 
-## Promotion evidence still required
+## Promotion gate
 
-1. clean Windows Release/CUDA and canonical Python tests;
-2. official-reference numerical/behavior gates for the changed capabilities;
-3. real common-path chat smokes for the affected model, Qwen and DeepSeek, plus
-   every model claimed universal by the release;
-4. representative Pi project histories, tools, compaction and suffix reuse;
-5. populated maximum-context prefill/decode meeting the accepted model target;
-6. large-prefix timeout/cancellation/restart/KV-pressure recovery;
-7. authenticated TLS/rate-limited edge, supervision, observability and tested
-   rollback.
+1. clean Windows Release/CUDA build, CTest and canonical Python tests;
+2. independent numerical/reference gates for every changed capability;
+3. real chat for the affected model, Qwen and DeepSeek, plus every model claimed
+   universal;
+4. representative Pi gate when harness behavior changed;
+5. populated-context and failure-recovery gates relevant to the release;
+6. stop and verify process/GPU cleanup.
 
-See [Benchmarks](benchmarks.md) for evidence and [Roadmap](roadmap.md) for the
-active order.
+Measurements: [Benchmarks](benchmarks.md). Active work: [Roadmap](roadmap.md).

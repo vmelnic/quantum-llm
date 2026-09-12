@@ -1,6 +1,6 @@
 # Deployment
 
-Status: supported single-host lifecycle, 2026-09-02.
+Status: supported single-host lifecycle, 2026-09-12.
 
 ## Contract
 
@@ -20,14 +20,16 @@ artifact passes real gates and recovery is no longer needed.
 
 | Alias | Advertised model | Path below `MODEL_ROOT` | KV selection |
 |---|---|---|---|
-| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | `fp16` |
+| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
+| `qwen-f16` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | exact `fp16` reference |
 | `qwen-flash` | `qwen3.8-flash-next-fp4` | `qwen3.8-flash-next-fp4` | `fp16` |
 | `mistral` | `mistral-small-4-119b-nvfp4` | `mistral-small-4-119b-nvfp4` | artifact-declared |
 | `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` | `fp16` |
 | `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | `fp16` |
+| `ornith-k1` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` | artifact-declared |
 
-Aliases select an artifact and advertised ID only. The task
+Aliases select an artifact, advertised ID and required KV policy. The task
 `QuantumLLM-ExpertVm`, HTTP service and native VM are common.
 
 ## Lifecycle
@@ -73,6 +75,14 @@ MODEL_WORKER_CAPACITY=1
 MODEL_KV_PAGE_TOKENS=256
 MODEL_PLACEMENT_PROFILE=balanced
 ```
+
+Compatible sparse artifacts may opt into the two local P100s with
+`MODEL_ACTIVE_EXPERT_DEVICES`, `MODEL_ACTIVE_EXPERT_DEVICE_CACHE_GIB` and
+`MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB`. These settings carve the declared host
+budget from `MODEL_RAM_CACHE_GIB`; they are ignored by providers whose artifact
+does not bind the capability. Leave this disabled for normal performance:
+Flash regressed and DeepSeek remained slower than its best settled primary
+path. The executor is retained only as an exact capacity experiment.
 
 The 12 GiB VRAM value is a cache ceiling, not a reservation. DeepSeek fails
 preflight at 13 GiB after fixed allocations, workspace and the 1 GiB reserve;

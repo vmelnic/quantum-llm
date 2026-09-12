@@ -1,6 +1,6 @@
 # Operations
 
-Status: current operator runbook, 2026-09-02.
+Status: current operator runbook, 2026-09-12.
 
 ## Health and status
 

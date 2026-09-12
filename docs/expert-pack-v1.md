@@ -1,6 +1,6 @@
 # Expert Pack v1
 
-Status: current QPack container and record ABI, 2026-09-02.
+Status: current QPack container and record ABI, 2026-09-12.
 
 ## Container
 

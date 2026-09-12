@@ -1,7 +1,7 @@
 # Anthropic Messages API
 
 Status: implemented wire adapter; Pi remains the maintained harness,
-2026-09-02.
+2026-09-12.
 
 ## Endpoints
 

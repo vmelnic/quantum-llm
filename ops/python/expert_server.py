@@ -489,12 +489,17 @@ class CudaWorker:
                  retain_previous_route: bool | None = None,
                  enable_cpu_hybrid: bool | None = None,
                  route_trace_file: Path | None = None,
-                 route_trace_max_steps: int = 4096) -> None:
+                 route_trace_max_steps: int = 4096,
+                 active_expert_devices: str = "",
+                 active_expert_device_cache_gib: int = 0,
+                 active_expert_host_cache_gib: int = 0,
+                 routed_vram_policy: str = "fixed") -> None:
         command = [
             str(executable), str(container), "--worker",
             f"--max-context={max_context}",
             f"--ram-cache-gib={ram_cache_gib}",
             f"--vram-cache-gib={vram_cache_gib}",
+            f"--routed-vram-policy={routed_vram_policy}",
             f"--capacity={requested_capacity}",
             f"--kv-cache-mib={kv_cache_mib}",
             f"--kv-page-tokens={kv_page_tokens}",
@@ -517,6 +522,14 @@ class CudaWorker:
             command.extend((
                 f"--route-trace-file={route_trace_file}",
                 f"--route-trace-max-steps={route_trace_max_steps}",
+            ))
+        if active_expert_devices:
+            command.extend((
+                f"--active-expert-devices={active_expert_devices}",
+                "--active-expert-device-cache-gib="
+                f"{active_expert_device_cache_gib}",
+                "--active-expert-host-cache-gib="
+                f"{active_expert_host_cache_gib}",
             ))
         self.process = subprocess.Popen(
             command,
@@ -615,6 +628,9 @@ class CudaWorker:
         self.placement_mode = str(response.get("placement_mode", "budgeted"))
         self.ram_cache_bytes = int(response.get("ram_cache_bytes", 0))
         self.vram_cache_bytes = int(response.get("vram_cache_bytes", 0))
+        self.routed_vram_policy = str(
+            response.get("routed_vram_policy", "fixed")
+        )
         self.placement_prefetch_enabled = bool(
             response.get("placement_prefetch_enabled", False)
         )
@@ -637,7 +653,10 @@ class CudaWorker:
                 (
                     self.placement_profile != placement_profile or
                     not 0 < self.ram_cache_bytes <= ram_cache_gib << 30 or
-                    not 0 < self.vram_cache_bytes <= vram_cache_gib << 30 or
+                    not 0 < self.vram_cache_bytes or
+                    (routed_vram_policy == "fixed" and
+                     self.vram_cache_bytes > vram_cache_gib << 30) or
+                    self.routed_vram_policy != routed_vram_policy or
                     self.placement_prefetch_state not in
                         {"disabled", "observing", "ready"} or
                     self.placement_prefetch_enabled !=
@@ -659,7 +678,9 @@ class CudaWorker:
                     self.placement_minimum_observations != 0
                 )
             ) or
-            self.placement_mode not in {"budgeted", "resident"}
+            self.placement_mode not in {"budgeted", "resident"} or
+            (self.protocol >= 11 and
+             self.routed_vram_policy not in {"fixed", "fit"})
         )
         routed_descriptor_present = (
             self.routed_layers != 0 or self.experts_per_layer != 0 or
@@ -727,6 +748,7 @@ class CudaWorker:
                 self.kv_dtype not in {
                     "fp16", "bf16", "bf16-latent", "fp32",
                     "fp4-e2m1-ue8m0-block32",
+                    "fp4-e2m1-ue8m0-block32-key-outlier1",
                     "fp8-e4m3-per-head",
                 } or
                 self.kv_allocation not in {"paged_on_demand", "preallocated"} or
@@ -1231,7 +1253,11 @@ class Application:
                                   else None),
                                  True if args.enable_worker_cpu_hybrid else None,
                                  args.worker_route_trace_file,
-                                 args.worker_route_trace_max_steps)
+                                 args.worker_route_trace_max_steps,
+                                 args.worker_active_expert_devices,
+                                 args.worker_active_expert_device_cache_gib,
+                                 args.worker_active_expert_host_cache_gib,
+                                 args.worker_routed_vram_policy)
         self.vision_capability = (
             "vision.patch-transformer-merge.fp4-block32.v1"
         )
@@ -2873,6 +2899,35 @@ class Application:
         "reserved_pages", "kv_allocated_pages", "kv_reserved_pages",
         "provider_parked_request_bytes", "provider_parked_session_bytes",
     })
+    _TELEMETRY_CONFIGURATION_KEYS = frozenset({
+        "provider_workspace_rows", "provider_compact_flash_prefill",
+    })
+
+    @classmethod
+    def _request_telemetry_fields(
+            cls, before: dict[str, Any], after: dict[str, Any],
+            ) -> dict[str, int]:
+        fields = {
+            key: after[key] - before[key]
+            for key in before.keys() & after.keys()
+            if key not in cls._TELEMETRY_GAUGE_KEYS and
+            key not in cls._TELEMETRY_CONFIGURATION_KEYS and
+            isinstance(before[key], int) and
+            not isinstance(before[key], bool) and
+            isinstance(after[key], int) and
+            not isinstance(after[key], bool) and
+            after[key] >= before[key]
+        }
+        # Provider configuration is stable rather than monotonic. Preserve the
+        # current value in every request record so a zero delta cannot conceal
+        # which execution path actually served the request.
+        fields.update({
+            key: after[key]
+            for key in cls._TELEMETRY_CONFIGURATION_KEYS
+            if isinstance(after.get(key), int) and
+            not isinstance(after[key], bool)
+        })
+        return fields
 
     @staticmethod
     def _capacity_error(error: Exception) -> bool:
@@ -3152,16 +3207,7 @@ class Application:
                     session is not None:
                 self._drop_worker_session(session.key)
             stats_after = self.worker_stats()
-            deltas = {
-                key: stats_after[key] - stats_before[key]
-                for key in stats_before.keys() & stats_after.keys()
-                if key not in self._TELEMETRY_GAUGE_KEYS and
-                isinstance(stats_before[key], int) and
-                not isinstance(stats_before[key], bool) and
-                isinstance(stats_after[key], int) and
-                not isinstance(stats_after[key], bool) and
-                stats_after[key] >= stats_before[key]
-            }
+            deltas = self._request_telemetry_fields(stats_before, stats_after)
             log("request_telemetry", request_id=request_id, resumed=resumed,
                 prefill_tokens=prefill_tokens,
                 generated_tokens=len(generated), finished=finished,
@@ -3231,6 +3277,9 @@ class Application:
             "worker_placement": {
                 "mode": self.worker.placement_mode,
                 "profile": self.worker.placement_profile,
+                "routed_vram_policy": getattr(
+                    self.worker, "routed_vram_policy", "fixed"
+                ),
                 "ram_cache_bytes": self.worker.ram_cache_bytes,
                 "vram_cache_bytes": self.worker.vram_cache_bytes,
                 "prefetch_enabled": self.worker.placement_prefetch_enabled,
@@ -3317,6 +3366,18 @@ class Application:
                 "worker_capacity": self.args.worker_capacity,
                 "worker_ram_cache_gib": self.args.worker_ram_cache_gib,
                 "worker_vram_cache_gib": self.args.worker_vram_cache_gib,
+                "worker_routed_vram_policy":
+                    getattr(self.args, "worker_routed_vram_policy", "fixed"),
+                "worker_active_expert_devices":
+                    getattr(self.args, "worker_active_expert_devices", ""),
+                "worker_active_expert_device_cache_gib":
+                    getattr(
+                        self.args, "worker_active_expert_device_cache_gib", 0
+                    ),
+                "worker_active_expert_host_cache_gib":
+                    getattr(
+                        self.args, "worker_active_expert_host_cache_gib", 0
+                    ),
                 "placement_profile": self.args.placement_profile,
                 "worker_kv_cache_mib": self.args.worker_kv_cache_mib,
                 "worker_kv_page_tokens": self.args.worker_kv_page_tokens,
@@ -3444,6 +3505,36 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b"event: " + event.encode() + b"\n")
         self.wfile.write(b"data: " + encoded + b"\n\n")
         self.wfile.flush()
+
+    def _send_generation_error(
+        self, endpoint: str, stream_started: bool, status: int,
+        message: str, kind: str, code: str,
+    ) -> bool:
+        """Return false when the peer vanished before the error was delivered."""
+        if self._client_disconnected():
+            return False
+        try:
+            if not stream_started:
+                if endpoint == "anthropic":
+                    self._anthropic_error(status, message, "api_error")
+                else:
+                    self._error(status, message, kind, code=code)
+            elif endpoint == "anthropic":
+                self._anthropic_sse("error", {
+                    "type": "error", "error": {
+                        "type": "api_error", "message": message,
+                    },
+                })
+            elif endpoint == "responses":
+                self._sse({"type": "error", "code": code,
+                           "message": message, "param": None})
+            else:
+                self._sse({"error": {"message": message,
+                           "type": kind, "param": None, "code": code}})
+                self._sse("[DONE]")
+        except ConnectionError:
+            return False
+        return True
 
     def _model(self) -> dict[str, Any]:
         return {
@@ -4223,58 +4314,29 @@ class Handler(BaseHTTPRequestHandler):
                         ),
                         "service_tier": "default"})
             self.app.increment("completed")
-        except (BrokenPipeError, ConnectionResetError):
+        except ConnectionError:
             self.app.increment("cancelled")
             log("request_cancelled", id=request_uuid, reason="client_disconnect")
         except TimeoutError as error:
-            self.app.increment("failed")
-            if not stream_started:
-                if endpoint == "anthropic":
-                    self._anthropic_error(
-                        HTTPStatus.GATEWAY_TIMEOUT, str(error), "api_error"
-                    )
-                else:
-                    self._error(HTTPStatus.GATEWAY_TIMEOUT, str(error), "timeout_error")
-            elif endpoint == "anthropic":
-                self._anthropic_sse("error", {
-                    "type": "error", "error": {
-                        "type": "api_error", "message": str(error),
-                    },
-                })
-            elif endpoint == "responses":
-                self._sse({"type": "error", "code": "generation_timeout",
-                           "message": str(error), "param": None})
+            if self._send_generation_error(
+                    endpoint, stream_started, HTTPStatus.GATEWAY_TIMEOUT,
+                    str(error), "timeout_error", "generation_timeout"):
+                self.app.increment("failed")
             else:
-                self._sse({"error": {"message": str(error),
-                           "type": "timeout_error", "param": None,
-                           "code": "generation_timeout"}})
-                self._sse("[DONE]")
+                self.app.increment("cancelled")
+                log("request_cancelled", id=request_uuid,
+                    reason="client_disconnect", error=repr(error))
         except Exception as error:
-            self.app.increment("failed")
-            log("request_failed", id=request_uuid, error=repr(error))
-            if not stream_started:
-                if endpoint == "anthropic":
-                    self._anthropic_error(
-                        HTTPStatus.INTERNAL_SERVER_ERROR,
-                        "generation failed", "api_error",
-                    )
-                else:
-                    self._error(HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed",
-                                "server_error", code="generation_failed")
-            elif endpoint == "anthropic":
-                self._anthropic_sse("error", {
-                    "type": "error", "error": {
-                        "type": "api_error", "message": "generation failed",
-                    },
-                })
-            elif endpoint == "responses":
-                self._sse({"type": "error", "code": "generation_failed",
-                           "message": "generation failed", "param": None})
+            if self._send_generation_error(
+                    endpoint, stream_started,
+                    HTTPStatus.INTERNAL_SERVER_ERROR, "generation failed",
+                    "server_error", "generation_failed"):
+                self.app.increment("failed")
+                log("request_failed", id=request_uuid, error=repr(error))
             else:
-                self._sse({"error": {"message": "generation failed",
-                           "type": "server_error", "param": None,
-                           "code": "generation_failed"}})
-                self._sse("[DONE]")
+                self.app.increment("cancelled")
+                log("request_cancelled", id=request_uuid,
+                    reason="client_disconnect", error=repr(error))
         finally:
             self.app.release_request_context(context)
             self.app.release_worker_slot()
@@ -4300,6 +4362,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-ram-cache-gib", type=int, default=48)
     parser.add_argument("--worker-vram-cache-gib", type=int, default=12)
     parser.add_argument(
+        "--worker-routed-vram-policy", choices=("fixed", "fit"),
+        default="fixed",
+    )
+    parser.add_argument("--worker-active-expert-devices", default="")
+    parser.add_argument(
+        "--worker-active-expert-device-cache-gib", type=int, default=0
+    )
+    parser.add_argument(
+        "--worker-active-expert-host-cache-gib", type=int, default=0
+    )
+    parser.add_argument(
         "--placement-profile", choices=("latency", "balanced", "capacity"),
         default="balanced",
     )
@@ -4307,7 +4380,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
     parser.add_argument(
         "--worker-kv-cache-dtype", default="artifact",
-        choices=("artifact", "fp8-e4m3-per-head", "fp16"),
+        choices=(
+            "artifact",
+            "fp8-e4m3-per-head",
+            "fp4-e2m1-ue8m0-block32-key-outlier1",
+            "fp16",
+        ),
     )
     parser.add_argument(
         "--worker-prefill-chunk-tokens", type=int, default=0,
@@ -4361,6 +4439,8 @@ def main() -> int:
     if (args.maximum_queue < 0 or args.max_context < 2 or
         args.maximum_new_tokens < 1 or args.worker_capacity < 1 or
         args.worker_ram_cache_gib < 1 or args.worker_vram_cache_gib < 1 or
+        args.worker_active_expert_device_cache_gib < 0 or
+        args.worker_active_expert_host_cache_gib < 0 or
         args.worker_kv_cache_mib < 1 or args.worker_kv_page_tokens < 1 or
         args.worker_prefill_chunk_tokens < 0 or
         (args.worker_placement_settle_steps is not None and
@@ -4370,6 +4450,15 @@ def main() -> int:
         args.maximum_image_patch_tokens < 256 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):
         raise SystemExit("invalid service limits")
+    active_expert_configured = bool(args.worker_active_expert_devices)
+    if (active_expert_configured !=
+            (args.worker_active_expert_device_cache_gib > 0) or
+            active_expert_configured !=
+            (args.worker_active_expert_host_cache_gib > 0)):
+        raise SystemExit(
+            "secondary expert devices and cache budgets must be configured "
+            "together"
+        )
     if (args.host not in {"127.0.0.1", "::1", "localhost"} and
             not args.api_key):
         raise SystemExit("--api-key or EXPERT_API_KEY is required for non-loopback bind")

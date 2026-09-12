@@ -1,8 +1,10 @@
 #pragma once
 
+#include "expert/runtime/active_expert_executor.hpp"
 #include "expert/runtime/cuda/deepseek_request.hpp"
 #include "expert/runtime/cuda/deepseek_verify.hpp"
 #include "expert/runtime/cuda/expert_directory.hpp"
+#include "expert/runtime/model_descriptor.hpp"
 
 #include <array>
 #include <chrono>
@@ -33,6 +35,8 @@ struct DeepSeekDecodeBegin final {
   // useful for pipeline ownership and independently qualified slices.
   std::uint32_t first_layer{};
   std::uint32_t layer_limit{};
+  std::chrono::steady_clock::time_point deadline{
+      std::chrono::steady_clock::time_point::max()};
 };
 
 struct DeepSeekVerifyBegin final {
@@ -41,6 +45,8 @@ struct DeepSeekVerifyBegin final {
   std::array<std::uint32_t, 2U> token_ids{};
   std::uint32_t first_layer{};
   std::uint32_t layer_limit{};
+  std::chrono::steady_clock::time_point deadline{
+      std::chrono::steady_clock::time_point::max()};
 };
 
 enum class DeepSeekDecodeProgress : std::uint8_t {
@@ -65,6 +71,10 @@ struct DeepSeekDecodeAdvanceResult final {
   // two consecutive top-6 rows; duplicates across rows are valid and share one
   // directory pin transaction.
   std::uint32_t route_rows{1U};
+  // The routed experts ran at an activation-only owner. The scheduler must
+  // retain route census feedback, but must not attribute the route to or pin
+  // pages in the primary device cache.
+  bool active_expert_external{};
 };
 
 struct DeepSeekRouteTraceEntry final {
@@ -77,6 +87,17 @@ struct DeepSeekCpuExpertPlacement final {
   std::uint32_t expert{};
   std::span<const std::byte> record_bytes;
   DeepSeekCompactSections sections;
+};
+
+// Artifact identity and the selected activation-only executor for the routed
+// component. Routing, route weights, stable aggregation, shared experts and
+// HCA remain owned by the primary DeepSeek provider.
+struct DeepSeekActiveExpertConfig final {
+  std::shared_ptr<IActiveExpertExecutor> executor;
+  Sha256Digest model_content_hash{};
+  RoutedExpertComponentDescriptor component;
+  std::string input_abi;
+  std::string output_abi;
 };
 
 struct DeepSeekDecodeControllerResult;
@@ -127,6 +148,8 @@ class DeepSeekDecodeController final {
       std::shared_ptr<DeepSeekFfnHybridWorkspace> workspace) noexcept;
   [[nodiscard]] Status configure_verify(
       std::shared_ptr<DeepSeekVerifyState> verify) noexcept;
+  [[nodiscard]] Status configure_active_experts(
+      DeepSeekActiveExpertConfig config) noexcept;
   // Profiling mode records and synchronizes CUDA events at the two existing
   // per-layer dependency boundaries. It is opt-in because the extra events
   // intentionally perturb production scheduling.
@@ -170,6 +193,8 @@ class DeepSeekDecodeController final {
   [[nodiscard]] DeepSeekDecodeAdvanceResult poll_plan() noexcept;
   [[nodiscard]] DeepSeekDecodeAdvanceResult execute_plan(
       DirectoryPlanResult plan) noexcept;
+  [[nodiscard]] DeepSeekDecodeAdvanceResult execute_active_plan(
+      std::span<const std::uint32_t> routed_experts) noexcept;
   void clear_cpu_placements() noexcept;
 
   std::shared_ptr<DeepSeekRequestState> request_;
@@ -190,6 +215,14 @@ class DeepSeekDecodeController final {
   std::shared_ptr<cpu::DeepSeekPackedExecutor> cpu_executor_;
   std::shared_ptr<DeepSeekFfnHybridWorkspace> hybrid_workspace_;
   std::vector<DeepSeekCpuExpertPlacement> cpu_placements_;
+  DeepSeekActiveExpertConfig active_expert_config_;
+  std::shared_ptr<void> active_expert_host_owner_;
+  float* active_expert_inputs_host_{};
+  float* active_expert_outputs_host_{};
+  std::uint64_t active_expert_request_id_{};
+  std::uint64_t next_active_expert_invocation_{1U};
+  std::chrono::steady_clock::time_point active_expert_deadline_{
+      std::chrono::steady_clock::time_point::max()};
   DeepSeekDecodeTelemetry telemetry_;
   void* attention_start_event_{};
   void* attention_stop_event_{};

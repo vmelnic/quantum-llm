@@ -316,6 +316,14 @@ struct PleDilatedConvLaunch final {
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
     std::uint32_t first_cache_position, std::uint32_t rows,
     std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+// FP4 block-32 K/V with the largest-magnitude K value in every block retained
+// separately as FP16. The aligned four-byte correction record stores its
+// block-local index and value. V uses the ordinary FP4 block-32 encoding.
+[[nodiscard]] Status store_gqa_kv_paged_fp4_key_outlier1_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
 [[nodiscard]] Status store_gqa_kv_paged_fp8_batch(
     const float* key, const float* value, const void* const* page_table,
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
@@ -603,6 +611,25 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
     float rope_theta, void* stream) noexcept;
 
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_fp4_key_outlier1_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_fp4_key_outlier1_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
 // Output-gated GQA with E4M3 K/V values and one FP16 dynamic scale per
 // [token, kv-head, K-or-V] record. The cache remains paged and token-major;
 // attention dequantizes to BF16 and accumulates Tensor Core products in FP32.
@@ -652,6 +679,13 @@ struct PagedFp4GatedGqaAttentionLaunch final {
 // evaluated as matrix rows while retaining exact context and top-k behavior.
 [[nodiscard]] Status gated_gqa_attention_decode_paged_fp4_tensor_core(
     const PagedFp4GatedGqaAttentionLaunch& launch) noexcept;
+
+using PagedFp4KeyOutlier1GatedGqaAttentionLaunch =
+    PagedFp4GatedGqaAttentionLaunch;
+
+[[nodiscard]] Status
+gated_gqa_attention_decode_paged_fp4_key_outlier1_tensor_core(
+    const PagedFp4KeyOutlier1GatedGqaAttentionLaunch& launch) noexcept;
 
 using PagedFp8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
 
@@ -703,6 +737,10 @@ struct PagedFp4GatedGqaStagedPrefillWorkspace final {
 using PagedFp8GatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
 using PagedFp8GatedGqaStagedPrefillWorkspace =
     PagedFp4GatedGqaStagedPrefillWorkspace;
+using PagedFp4KeyOutlier1GatedGqaPrefillLaunch =
+    PagedFp4GatedGqaPrefillLaunch;
+using PagedFp4KeyOutlier1GatedGqaStagedPrefillWorkspace =
+    PagedFp4GatedGqaStagedPrefillWorkspace;
 
 // Exact causal microbatch attention. Positions times grouped query heads must
 // fit one 16-row WMMA tile so packed K/V is shared across both dimensions.
@@ -711,6 +749,10 @@ using PagedFp8GatedGqaStagedPrefillWorkspace =
 
 [[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp8_tensor_core(
     const PagedFp8GatedGqaPrefillLaunch& launch) noexcept;
+
+[[nodiscard]] Status
+gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
+    const PagedFp4KeyOutlier1GatedGqaPrefillLaunch& launch) noexcept;
 
 // Exact causal attention for a contiguous prefill chunk. One block shares
 // every decoded K/V record between up to eight adjacent query rows.
@@ -727,6 +769,11 @@ using PagedFp8GatedGqaStagedPrefillWorkspace =
 [[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp8(
     const PagedFp8GatedGqaPrefillLaunch& launch,
     const PagedFp8GatedGqaStagedPrefillWorkspace& workspace) noexcept;
+
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp4_key_outlier1(
+    const PagedFp4KeyOutlier1GatedGqaPrefillLaunch& launch,
+    const PagedFp4KeyOutlier1GatedGqaStagedPrefillWorkspace& workspace)
+    noexcept;
 
 // Output-gated GQA backed by an authoritative FP16 host cache. K/V remains
 // token-major in pinned host memory; the staged provider copies one bounded
@@ -942,6 +989,11 @@ struct SplitGatedDeltaPrefillLaunch final {
   float* recurrent_state{};
   float* conv_output{};          // [rows, conv_dim]
   float* output{};               // [rows, value_dim]
+  // Scratch for a value-major FP32 recurrent state plus beta/decay rows. The
+  // optimized path is selected only when this artifact-independent capacity
+  // is present; otherwise execution falls back to the scalar reference path.
+  float* recurrent_workspace{};
+  std::size_t recurrent_workspace_bytes{};
   std::uint32_t rows{};
   std::uint32_t key_heads{};
   std::uint32_t value_heads{};
@@ -955,7 +1007,8 @@ struct SplitGatedDeltaPrefillLaunch final {
 };
 
 // Advances one request's causal convolution and recurrent state for a whole
-// chunk in two launches instead of invoking the decode kernels per token.
+// chunk. A sufficiently large scratch span enables the FP32 warp-parallel
+// recurrent implementation; unsupported geometries use the scalar reference.
 [[nodiscard]] Status split_gated_delta_prefill(
     const SplitGatedDeltaPrefillLaunch& launch) noexcept;
 

@@ -1,12 +1,12 @@
 # Documentation
 
-Status: canonical documentation index, 2026-09-02.
+Status: canonical documentation index, 2026-09-12.
 
-These documents describe the current implementation and measured state.
-Historical experiment journals, inactive hardware inventories and detached
-model hypotheses are intentionally excluded; durable negative results are
-condensed in [Research decisions](research-decisions.md) and remain available
-in Git history.
+These documents describe the current implementation and measured state. Each
+fact has one canonical owner: architecture describes mechanisms, benchmarks
+records measurements, research decisions records rejected directions, roadmap
+contains active work and production readiness defines the release boundary.
+Historical journals and detached hypotheses remain in Git history.
 
 ## System and status
 

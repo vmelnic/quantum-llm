@@ -1,38 +1,29 @@
 # Research decisions
 
-Status: canonical rejection and prerequisite ledger, 2026-09-02.
+Status: canonical decision and rejection ledger, 2026-09-12.
 
-This document exists to prevent repeating failed mechanisms under new names.
-Only new measured evidence that changes capacity, bandwidth, fidelity or an
-acceptance inequality can reopen a rejected direction.
+This file prevents failed mechanisms from returning under new names. Detailed
+measurements live in [Benchmarks](benchmarks.md). Reopen a rejection only when
+new evidence changes its capacity, bandwidth, fidelity or acceptance bound.
 
 ## Fixed targets
 
-Qwen3.8-27B:
-
 ```text
-host                 one RTX 3090
-artifact             official model compiled to declared FP4 ABI
-context              262,144 actually populated positions
-KV                   exact IEEE F16 semantics
-reasoning default    xhigh
-harness              real coding agent
-target               approximately 15 useful output tok/s
+Qwen3.8-27B
+  host        one RTX 3090
+  context     262,144 actually populated positions
+  KV          exact IEEE F16
+  harness     real coding agent, default xhigh
+  target      about 15 useful output tok/s
+
+DeepSeek
+  host        same self-contained machine; NVMe+RAM+VRAM allowed
+  routing     exact router, top-k and stable aggregation
+  novel       about 1 tok/s acceptable
+  settled     10-15 useful tok/s
 ```
 
-DeepSeek:
-
-```text
-host                 same self-contained machine
-placement            NVMe + RAM + VRAM allowed
-routing              exact router, top-k and stable aggregation
-novel routes         about 1 tok/s acceptable
-settled target       10-15 useful tok/s
-```
-
-## Governing capacity gate
-
-For Qwen at 262K:
+The Qwen feasibility inequality is currently negative:
 
 ```text
 hot target weights             13,625,700,352 bytes
@@ -43,125 +34,123 @@ measured pinned PCIe link       12.46 GiB/s
 full host-KV scan floor             1.284 s/call
 ```
 
-Ordinary paging cannot reach 15 tok/s. A new mechanism must first prove one of:
+Ordinary offload cannot reach 15 tok/s. A new runtime proposal must first prove
+one of: enough compute-local capacity, lossless residency below the practical
+bit threshold, or enough exact accepted tokens per full-KV traffic unit after
+complete proposer/verifier cost.
 
-- enough compute-local high-bandwidth capacity for complete hot state and
-  reserve;
-- lossless residency below the practical bit threshold;
-- at least 20 useful exact accepted tokens per amortized full-KV traffic unit,
-  including complete proposer/verifier cost and state.
+## Accepted bounded mechanisms
 
-Fail this equation before adding runtime infrastructure.
-
-## Accepted, bounded mechanisms
-
-### Progressive exact-F16 device mirror
-
-Implemented for Qwen shorter prefixes. Host F16 pages remain authoritative; a
-bounded exact device mirror removes unnecessary PCIe scans while populated KV
-fits, then spills atomically to the exact host path. It improved the matched
-Todo gate from 1,645 s to 503.240 s. It does not change the 262K inequality.
-
-### Exact sparse expert paging
-
-Valid for MoE because unselected experts are cold. DeepSeek exact paging makes
-its 147 GB routed pool executable beyond RAM+VRAM. Demand priority, retention
-classes, exact CPU/GPU split and stable merge remain useful. Novel routes still
-pay storage/PCIe traffic.
-
-### FreeToken-derived CPU/GPU split
-
-The runtime adopted logical all-layer caching, measured CPU/GPU assignment,
-concurrent exact partial execution and stable merge. Ornith can hold its entire
-routed pool in the host bank; DeepSeek cannot. The first DeepSeek service gate
-proved execution but did not improve short post-TTFT rate (1.29 versus
-1.42 tok/s), so no paper-level throughput claim is made.
-
-### Exact QSA tiering
-
-Qwen Flash keeps the exact raw index on GPU and stores exact F16 QSA payload in
-progressive host pages under balanced/capacity placement. Selected payload is
-staged without changing the model's selected set. CUDA parity reported zero
-maximum absolute difference. Short profiling showed routed MoE at 84.7% and
-QSA/full attention near 1.2%, so further QSA optimization is gated by a real
-populated-context trace that makes it dominant.
-
-## Rejected mechanisms
-
-| Direction | Measured/derived prerequisite | Decision |
+| Mechanism | Accepted scope | Boundary |
 |---|---|---|
-| FP8 target KV | 262K prefill 1,168.594 s, decode 3.064 tok/s and factual-quality failure | rejected: wrong fidelity and too slow |
-| Q4 target KV | user-confirmed quality degradation | rejected for exact-F16 target |
-| dense layer streaming/AirLLM path | 12.690 GiB hot weights / 12.46 GiB/s >= 1.018 s/call before KV/compute | capacity only, not decode throughput |
-| static lossless weight+KV coding | ideal total still 1,123,844,072 bytes over physical VRAM before runtime overhead | rejected |
-| reversible F16 transforms | 13.265926 bits/value measured versus 11.617612 practical threshold | rejected |
-| Huffman/Zstd/zlib/LZ4 | best held-out raw-F16 Huffman 13.719539 bits/value | rejected |
-| exact tiered MTP tree | 4.565 accepted/cycle with proposer + transfer floor; optimistic 2.8 tok/s | rejected |
-| FP4-KV block-Jacobi proposer | 3.25 accepted/cycle; corrected ceiling 1.55 tok/s | rejected |
-| prompt n-gram/copy proposer | 3.8485 useful/cycle; none reached required 24 | rejected |
-| pagewise exact KV refinement | one-head lower bound 2,029.014 MiB/call versus 272.822 MiB budget | rejected by 7.437x |
-| staged single-GPU exact attention | 5.73516 ms/layer x 16 = 91.76256 ms before other work | cannot be the complete 15 tok/s solution |
-| CPU F16 V-tail | 226.279 ms/call at 12 threads | even ideal 2-token amplification below target |
-| all-K-resident/selective-V | about 25,922 MiB before V staging | exceeds physical VRAM |
-| pageable-to-pinned expert bounce | extra 1.385 GB copy and worse upload wait, no cold gain | removed |
-| Neural CPU replacement | failed structural/correctness boundary | experiment removed |
+| progressive exact-F16 mirror | Qwen prefixes that fit the disposable device mirror | preserves F16; does not solve 262K capacity |
+| exact sparse-expert paging | DeepSeek and compatible MoE selected pages | makes models executable beyond RAM+VRAM; novel routes remain movement-bound |
+| measured CPU/GPU expert split | exact selected experts and stable merge | first DeepSeek gate did not improve throughput |
+| exact QSA tiering | Qwen Flash exact index plus selected F16 payload | QSA was only about 1.2% of measured short execution |
+| startup routed-cache fitting | artifact-neutral, before first expert admission, after future-state reservation | admitted for `ornith-k1`; not a global cache increase |
+| lazy dense/logits workspaces | allocate only the rows/operation requested | saved about 994 MiB; arithmetic unchanged |
 
-## Rejected DeepSeek paths
+## Experimental K1 exception
 
-- Whole-prompt exact layer-major state required about 176 GiB for the routed
-  selection streams at 1,048,576 tokens.
-- Eight 131,072-token blocks reduced routed-weight traffic but still required
-  about 23.516 TiB exact activation traffic.
-- A real 1M-token attempt remained in block one after roughly 6.5 minutes.
-- Exact two-row batching left one 131K block incomplete after more than
-  14 minutes; width tuning was stopped.
+K1 stores block-32 FP4 values and FP4 keys with one aligned FP16 outlier
+correction per key block. It is lossy. The operational `qwen` and
+`ornith-k1` aliases opt into it; `qwen-f16` and `ornith` are fidelity references.
 
-`layer_major_prefill`, `causal_layer_major` and row-width tuning are not active
-maximum-context solutions.
+For Qwen at 262,144 positions:
 
-The shared-expert INT8 block-128 experiment is also rejected. One projection
-improved numerically, but the runtime attempt generated incoherent text and the
-artifact oracle still described the old layout. It was rolled back. Reopening
-requires a complete artifact-derived CPU/CUDA hot-slot oracle before any
-service edit.
+```text
+F16 target KV                 16.0000 GiB
+K1 target KV                   4.7500 GiB
+K1 target + MTP pages          5.015625 GiB
+K1 attention, 16 layers       29.0161 ms (repeat)
+K1 populated decode           14.39 tok/s after first token
+```
 
-## Parked model-changing directions
+A deterministic populated-262,016 request returned the same 47 output tokens
+under K1 and F16; K1 took 546.173 s and F16 2,278.082 s. Both made the same
+arithmetic error. One parity case is not a quality corpus, so K1 does not
+satisfy the exact-F16 goal and cannot be described as lossless.
 
-### Native binary/ternary models
+Promotion requires explicit acceptance of changed fidelity plus reproducible
+long-context retrieval, reasoning and coding comparisons against F16. Until
+then K1 is an operational experiment, not the target semantics.
 
-Bonsai demonstrates trained/transformed 1.125-bit and ternary models, not a
-lossless Qwen FP4-to-Q1 conversion. A binary 27B geometry could leave room for
-262K exact F16 KV on 24 GiB, but reported quality is materially below FP16 and
-no RTX 3090 262K exact-F16 coding gate exists. Keep it as an optional different
-model with explicit quality approval, not an optimization of Qwen3.8.
+## Rejected general mechanisms
 
-### Local/fast-weight/episodic memory
+| Direction | Failed prerequisite | Decision |
+|---|---|---|
+| FP8 target KV | 262K prefill 1,168.594 s, decode 3.064 tok/s and factual failure | wrong fidelity and too slow |
+| Q4 target KV | user-confirmed material quality degradation | rejected for exact-F16 goal |
+| uniform K8/V4 KV | 34.7668 ms for 16 attention layers versus 32.5 ms budget, before overhead | rejected before service integration |
+| dense layer streaming/AirLLM | 12.690 GiB hot weights / 12.46 GiB/s >=1.018 s/call | capacity mechanism only |
+| static lossless weight+KV coding | ideal result still 1,123,844,072 bytes over VRAM before runtime state | insufficient capacity |
+| reversible F16 transforms | 13.265926 bits/value measured versus 11.617612 required | insufficient compression |
+| Huffman/Zstd/zlib/LZ4 | best held-out Huffman 13.719539 bits/value | insufficient compression |
+| exact MTP tree | 4.565 accepted/cycle; optimistic ceiling 2.8 tok/s | insufficient amplification |
+| FP4-KV block-Jacobi | 3.25 accepted/cycle; corrected ceiling 1.55 tok/s | insufficient amplification |
+| prompt n-gram/copy | 3.8485 useful/cycle versus 24 required | insufficient acceptance |
+| exact page refinement | 2,029.014 MiB/call versus 272.822 MiB budget | traffic exceeds bound 7.437x |
+| staged single-GPU exact attention | 91.763 ms for 16 layers before other work | misses complete 15 tok/s budget |
+| CPU F16 V-tail | 226.279 ms/call at 12 threads | too slow |
+| all-K-resident/selective-V | about 25,922 MiB before V staging | exceeds VRAM |
+| pageable-to-pinned expert bounce | extra 1.385 GB copy and worse upload wait | removed |
+| neural CPU replacement | failed structural/correctness boundary | removed |
 
-Exact local attention plus gradient-free fast-weight state plus routed episodic
-pages changes model semantics and requires training or substantial continued
-training. Existing checkpoints cannot be losslessly converted. There is no
-training budget or causal page-selection quality gate in this project, so the
-hypothesis is parked and removed from the active documentation set.
+## Rejected DeepSeek work
 
-### Nemotron generic FP4 conversion
+- Whole-prompt layer-major routing required about 176 GiB of selection streams
+  at 1,048,576 tokens.
+- Blocking into eight 131,072-token segments still required about 23.516 TiB
+  of exact activation traffic.
+- A real 1M-token attempt remained in block one after about 6.5 minutes.
+- Exact two-row batching left one 131K block incomplete after 14 minutes.
+- Shared-expert block-128 INT8 generated incoherent text and lacked a matching
+  artifact oracle.
 
-The BF16 Nemotron-H generic FP4 conversion passed a weak `hi` smoke but failed a
-normal instruction after correcting no-position attention. NVIDIA's deployment
-recipe uses materially different NVFP4/FP8 assignments. The adapter/artifact
-path was rejected; reconsider only an explicitly approved official-NVFP4
-integration with its real encodings.
+Do not reintroduce `layer_major_prefill`, `causal_layer_major`, row-width
+tuning or the shared INT8 layout without a new quantitative prerequisite.
 
-## Qwen Flash behavioral decision
+## P100 decision
 
-Corrected sampling/effort propagation and a raw native-to-structured parser
-trace removed the two suspected transport errors. Flash still produced zero
-edits and prolonged reasoning-to-action stalls on the bounded Todo task. Do not
-spend more runtime work tuning thinking or the parser as a quality fix without
-new checkpoint, quantization or numerical evidence.
+The installed RTX 3090 and two P100s have no CUDA peer access; every boundary
+uses pinned host memory.
 
-## Hardware boundary
+| Placement | Measurement | Required | Decision |
+|---|---:|---:|---|
+| Qwen exact KV split | 77.101 ms attention compute-only | <=32 ms | reject |
+| Qwen compact dense shard | 35.939 ms/card before integration | <=20 ms | reject |
+| Qwen lossless resident FP16 MLP shard | 50.871 ms auxiliary wall; 307.7/311.0 GB/s | >=500 GB/s/card | reject |
+| Qwen Flash selected experts | 0.20 tok/s vs 0.37 primary | faster than primary | reject for speed |
+| DeepSeek selected experts | 3.18 tok/s settled | >=10 tok/s | reject for speed |
 
-Multi-GPU organ placement may become useful only after compatible hardware is
-actually installed. Compute must follow state: KV beside attention compute and
-expert pages beside expert compute. P100/P40 and remote owners are not present
-and are not part of the active one-3090 architecture.
+The P100 executor may remain an optional exact capacity path for compatible
+routed components. It is not a throughput default, a dense-Qwen provider or a
+reason to extend Pascal kernels without a newly passing end-to-end inequality.
+
+## Model-specific parked work
+
+- **Qwen Flash behavior:** corrected sampling/effort propagation and native
+  parser tracing did not fix zero-edit/action-stall behavior. Do not tune the
+  parser or thinking again without checkpoint, quantization or numerical
+  evidence.
+- **Bonsai/binary/ternary:** these are differently trained models, not lossless
+  Qwen FP4 conversions. They require explicit model/quality approval.
+- **Local/fast-weight/episodic memory:** changes model semantics and requires
+  training; it is a model-research hypothesis, not inference optimization.
+- **Nemotron generic FP4:** weak `hi` passed, normal instruction failed. Reopen
+  only for an official NVFP4 integration with its actual encodings.
+
+## Reopening rule
+
+Before implementation, record the exact model, populated context, formats,
+hardware and useful-output target, then calculate:
+
+```text
+weights + recurrent state + KV + draft/MTP + workspace + reserve
+bytes touched per call and per accepted token
+GPU + RAM + PCIe + NVMe lower bounds
+acceptance * proposer/verifier cost, if speculative
+```
+
+If the resulting capacity, latency, traffic or fidelity prerequisite fails,
+stop before runtime code.

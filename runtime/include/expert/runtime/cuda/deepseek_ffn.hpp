@@ -261,6 +261,9 @@ class DeepSeekFfnPairWorkspace final {
   [[nodiscard]] const std::uint32_t* expert_indices() const noexcept {
     return expert_indices_;
   }
+  [[nodiscard]] const float* normalized_input() const noexcept {
+    return ffn_input_;
+  }
   [[nodiscard]] static constexpr std::uint32_t selection_count() noexcept {
     return 14U;
   }
@@ -274,6 +277,10 @@ class DeepSeekFfnPairWorkspace final {
   friend Status deepseek_ffn_route_pair(
       const struct DeepSeekFfnPairRouteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_pair(
+      const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
+  friend Status deepseek_ffn_import_pair_selection_output(
+      const struct DeepSeekFfnPairSelectionImportLaunch&) noexcept;
+  friend Status deepseek_ffn_finalize_pair(
       const struct DeepSeekFfnPairExecuteLaunch&) noexcept;
   friend Status deepseek_ffn_execute_pair_hybrid(
       const DeepSeekFfnHybridPairExecuteLaunch&) noexcept;
@@ -472,6 +479,25 @@ struct DeepSeekFfnPairExecuteLaunch final {
 // Routed and shared experts execute as two-row batches; HCA post remains
 // causal-row local because its mutable stream state is request-owned.
 [[nodiscard]] Status deepseek_ffn_execute_pair(
+    const DeepSeekFfnPairExecuteLaunch& launch) noexcept;
+
+// Imports one exact externally executed pair selection. Flat selection slots
+// are row-major: [row0 top-k, row1 top-k]. Route weights remain on the primary
+// device and are applied by deepseek_ffn_finalize_pair().
+struct DeepSeekFfnPairSelectionImportLaunch final {
+  DeepSeekFfnPairWorkspace* workspace{};
+  std::uint32_t selection_index{};
+  const float* host_output{};
+  std::uint64_t host_output_bytes{};
+  void* stream{};
+};
+
+[[nodiscard]] Status deepseek_ffn_import_pair_selection_output(
+    const DeepSeekFfnPairSelectionImportLaunch& launch) noexcept;
+
+// Completes exact stable aggregation, the always-resident shared expert and
+// HCA post after all 12 routed pair outputs have been imported.
+[[nodiscard]] Status deepseek_ffn_finalize_pair(
     const DeepSeekFfnPairExecuteLaunch& launch) noexcept;
 
 class DeepSeekFfnHybridWorkspace final {

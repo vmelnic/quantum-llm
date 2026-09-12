@@ -30,9 +30,10 @@ enum class ExpertPlacementKind : std::uint8_t {
   remote,
 };
 
-// Ownership token for one remotely executable logical expert page. The lease
-// binds immutable artifact identity to the universal activation-only execution
-// contract; it never exposes or transports the expert weights.
+// Ownership token for one externally owned logical expert page. The owner may
+// be an in-process secondary accelerator or a transport-backed executor. The
+// lease binds immutable artifact identity to the universal activation-only
+// execution contract; it never exposes or transports the expert weights.
 class IRemoteExpertLease {
  public:
   virtual ~IRemoteExpertLease() = default;
@@ -137,7 +138,8 @@ struct RemoteExpertOwnerRange final {
 };
 
 // Runtime placement table. Ranges are deployment data, not model-family
-// cases. Overlap is rejected so one logical page has at most one remote owner.
+// cases. Overlap is rejected so one logical page has at most one execution
+// owner. The executor itself declares whether a wire transport is involved.
 class ActiveExpertOwnerDirectory final {
  public:
   [[nodiscard]] Status add(RemoteExpertOwnerRange range) noexcept;
@@ -162,9 +164,9 @@ struct ActiveExpertComponentContract final {
   std::uint32_t source_abi{};
 };
 
-// Resolves logical pages to executable remote leases. The payload record is
+// Resolves logical pages to executable owner leases. The payload record is
 // used only to validate source identity; no path, extent, or weight byte is
-// exposed to the remote executor.
+// exposed to the executor.
 class RemoteExpertStore final : public IExpertStore {
  public:
   RemoteExpertStore(ActiveExpertComponentContract contract,

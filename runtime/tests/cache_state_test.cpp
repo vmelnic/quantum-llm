@@ -1064,6 +1064,7 @@ void test_universal_worker_launch_preserves_provider_extensions() {
       std::string_view{"--max-context=131072"},
       std::string_view{"--ram-cache-gib=96"},
       std::string_view{"--vram-cache-gib=18"},
+      std::string_view{"--routed-vram-policy=fit"},
       std::string_view{"--capacity=3"},
       std::string_view{"--kv-cache-mib=3072"},
       std::string_view{"--kv-page-tokens=128"},
@@ -1071,18 +1072,43 @@ void test_universal_worker_launch_preserves_provider_extensions() {
       std::string_view{"--placement-profile=balanced"},
       std::string_view{"--prefill-chunk-limit=512"},
       std::string_view{"--profile-gpu-phases"},
+      std::string_view{"--active-expert-devices=1,2"},
+      std::string_view{"--active-expert-device-cache-gib=14"},
+      std::string_view{"--active-expert-host-cache-gib=32"},
       std::string_view{"--provider-fp4-pipeline=vendor-x"},
       std::string_view{"--provider-background-compile"}};
   const auto parsed = er::parse_worker_launch_options(arguments);
   require(parsed.status.ok() && parsed.options.max_context == 131072U &&
               parsed.options.capacity == 3U &&
+              parsed.options.routed_vram_policy == "fit" &&
               parsed.options.kv_cache_dtype == "fp8-e4m3-per-head" &&
               parsed.options.prefill_chunk_limit == 512U &&
               parsed.options.profile_gpu_phases &&
+              !parsed.options.discover_active_expert_devices &&
+              parsed.options.active_expert_devices ==
+                  std::vector<int>({1, 2}) &&
+              parsed.options.active_expert_device_cache_gib == 14U &&
+              parsed.options.active_expert_host_cache_gib == 32U &&
               parsed.options.extensions.at("provider-fp4-pipeline") ==
                   "vendor-x" &&
               !parsed.options.extensions.at("provider-background-compile"),
           "universal worker launch lost an opaque provider extension");
+  constexpr std::array auto_devices{
+      std::string_view{"--max-context=131072"},
+      std::string_view{"--ram-cache-gib=48"},
+      std::string_view{"--vram-cache-gib=12"},
+      std::string_view{"--capacity=1"},
+      std::string_view{"--kv-cache-mib=5120"},
+      std::string_view{"--kv-page-tokens=256"},
+      std::string_view{"--placement-profile=balanced"},
+      std::string_view{"--active-expert-devices=auto"},
+      std::string_view{"--active-expert-device-cache-gib=14"},
+      std::string_view{"--active-expert-host-cache-gib=32"}};
+  const auto auto_parsed = er::parse_worker_launch_options(auto_devices);
+  require(auto_parsed.status.ok() &&
+              auto_parsed.options.discover_active_expert_devices &&
+              auto_parsed.options.active_expert_devices.empty(),
+          "universal worker launch rejected automatic secondary discovery");
   constexpr std::array duplicate{
       std::string_view{"--max-context=1"},
       std::string_view{"--max-context=2"}};
@@ -1606,6 +1632,22 @@ struct Harness final {
   }
 };
 
+void test_vram_budget_fits_only_before_first_device_admission() {
+  Harness harness(8192U, 2U, 8192U);
+  require(harness.cache
+              .configure_vram_budget({16384U, 16384U, 12288U}, 4096U)
+              .ok(),
+          "empty expert cache rejected a fitted VRAM budget");
+  const auto fixture = make_record(73U, 0U);
+  auto handle = harness.cache.acquire(fixture.key, fixture.record);
+  auto result = harness.finish(handle, fixture);
+  require(result.lease &&
+              !harness.cache
+                   .configure_vram_budget({32768U, 32768U, 28672U}, 4096U)
+                   .ok(),
+          "expert cache changed its VRAM contract after admission");
+}
+
 void test_expert_store_resolves_complete_ordered_union() {
   Harness harness(16'384, 2, 16'384);
   const auto first = make_record(31, 0);
@@ -2038,6 +2080,13 @@ void test_active_expert_wire_moves_only_exact_activations() {
                   er::ErrorCode::checksum_mismatch &&
               remote->telemetry().checksum_failures == 1U,
           "remote active-expert executor accepted a corrupt response");
+
+  er::ActiveExpertOwnerDirectory local_owners;
+  require(local_owners
+              .add({0xa700U, 0U, 43U, 0U, 256U, local})
+              .ok() &&
+              local_owners.find(request.identity.key) == local,
+          "active-expert owner directory rejected an in-process executor");
 
   er::ActiveExpertOwnerDirectory owners;
   require(owners
@@ -3616,6 +3665,7 @@ int main() {
     test_schema_v2_expresses_model_derived_hybrid_moe_topology();
     test_generic_expert_catalog_uses_descriptor_cardinality();
     test_universal_worker_launch_preserves_provider_extensions();
+    test_vram_budget_fits_only_before_first_device_admission();
     test_deepseek_fp8_shared_admission_validation();
     test_fp4_block32_admission_validation();
     test_fp4_relu2_block32_admission_validation();
