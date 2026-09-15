@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled

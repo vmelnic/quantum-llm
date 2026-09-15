@@ -950,7 +950,7 @@ class HybridDeltaAdapter:
     _UPSTREAM_MOE_MODEL_TYPE = "qwen3_5_moe"
     _UPSTREAM_DENSE_TEXT_TYPE = "qwen3_5_text"
     _UPSTREAM_MOE_TEXT_TYPE = "qwen3_5_moe_text"
-    _UPSTREAM_DENSE_VISION_TYPE = "qwen3_5_vision"
+    _UPSTREAM_DENSE_VISION_TYPE = "qwen3_5"
     _UPSTREAM_MOE_VISION_TYPE = "qwen3_5_moe_vision"
 
     def adapt(self, checkpoint: SafeTensorCheckpoint) -> AdaptedModel:

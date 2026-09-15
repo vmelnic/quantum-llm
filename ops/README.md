@@ -26,8 +26,9 @@ readiness. Sync never copies or deletes ignored model/build/cache state.
 `chat.sh` opens the optional SSH tunnel and reports prompt/output timing.
 `pi.sh` selects the same provider/model registry, verifies the running model
 and explicit KV codec through `/model-info`, and defaults to `xhigh` thinking;
-all additional Pi arguments pass through unchanged. `qwen` and `ornith-k1`
-select K1 while `qwen-f16` and `ornith` preserve the exact-F16 reference paths.
+all additional Pi arguments pass through unchanged. `qwen`,
+`qwen-abliterated` and `ornith-k1` select K1 while `qwen-f16` and `ornith`
+preserve the exact-F16 reference paths.
 
 ## Windows workflows
 

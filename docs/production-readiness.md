@@ -1,13 +1,15 @@
 # Production readiness
 
 Status: functional research/pilot runtime; not production-ready for the full
-maximum-context coding objective, 2026-09-12.
+maximum-context coding objective, 2026-09-15.
 
 ## Verdict
 
-All six artifacts start through the common task/VM and return text through
-direct chat and minimal Pi wiring. Artifact validation, lifecycle, bounded API
-limits, telemetry, exact sparse routing and cleanup are functional.
+All seven artifacts start through the common task/VM and return text through
+direct chat and minimal Pi wiring. The seventh is a third-party abliterated
+Qwen artifact; its coding, behavioral quality and maximum-context behavior
+remain unqualified. Artifact validation, lifecycle, bounded API limits,
+telemetry, exact sparse routing and cleanup are functional.
 
 The complete product goal is not ready:
 
@@ -25,13 +27,13 @@ The complete product goal is not ready:
 
 | Area | Current boundary |
 |---|---|
-| artifacts | six stable artifacts under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
+| artifacts | seven stable artifacts under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
 | lifecycle | alias-driven install/start/status/chat/stop through one task and VM |
 | execution | declared QPack FP4, native NVFP4/BF16 and DeepSeek compact experts execute real service paths |
 | paging | exact top-k/stable merge with measured NVMe/RAM/VRAM traffic |
 | KV/session state | artifact-declared progressive allocation; transactional retention only where advertised |
 | APIs | bounded OpenAI- and Anthropic-compatible streaming surfaces |
-| harness wiring | all advertised models pass minimal Pi `hi`; this is not coding qualification |
+| harness wiring | all seven advertised models pass minimal Pi `hi`; this is not coding or behavioral qualification |
 | introspection | bounded health/readiness/model/metrics and per-request telemetry |
 
 ## Release blockers

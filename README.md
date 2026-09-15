@@ -9,6 +9,7 @@ come from the documented direct-chat conditions, not model startup.
 | Model | Validated payload | Context ceiling | Short TTFT | Short decode | Populated-context evidence |
 |---|---:|---:|---:|---:|---|
 | Qwen3.8-27B | 14.78 GB QPack | 262,144 | 0.827 s (`off`) | 30.92 tok/s after first | 262,016: 546.173 s K1; 2,278.082 s F16 |
+| Qwen3.8-27B Abliterated | 14.78 GB QPack | 262,144 | 0.910 s (`off`) | 25.33 tok/s after first | not measured at maximum; third-party weights |
 | Qwen3.8-Flash-Next | 95.92 GB | 262,144 | 27.642 s (`off`) | 0.58 tok/s after first | not measured at maximum |
 | Mistral Small 4 | 70.80 GB source tensors | 262,144 | 271.256 s (`off`) | 1.12 tok/s after first | not measured at maximum |
 | Muse-Glimmer-30B | 15.83 GB QPack | 131,072 | 2.559 s (`off`) | 18.49 tok/s end-to-end | not measured at maximum |
@@ -64,6 +65,7 @@ The common service exposes these aliases:
 | Alias | Artifact/policy |
 |---|---|
 | `qwen` | Qwen3.8-27B with experimental resident K1 KV |
+| `qwen-abliterated` | third-party Qwen3.8-27B Abliterated with experimental resident K1 KV |
 | `qwen-f16` | the same artifact with exact progressive F16 KV |
 | `qwen-flash` | Qwen3.8-Flash-Next, exact top-10 routed FP4 experts |
 | `mistral` | Mistral Small 4, source-native NVFP4/BF16 |

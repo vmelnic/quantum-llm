@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-09-12.
+Status: canonical measurement ledger, 2026-09-15.
 
 ## Reporting rules
 
@@ -23,12 +23,14 @@ shell syntax and `git diff --check` passed. The Windows binary is authoritative.
 
 ### Matched direct `hi`
 
-Build `ea1106d`, fresh start per model, `--thinking off`; model startup is not
-included. Every response was coherent and ended normally.
+The original six rows use build `ea1106d`; Qwen Abliterated uses build
+`e77f8e1`. Each used a fresh model start and `--thinking off`; model startup is
+not included. Every response was coherent and ended normally.
 
 | Model | KV | Prompt/output/reasoning | First-visible | Wall | End-to-end | After-first |
 |---|---|---:|---:|---:|---:|---:|
 | Qwen3.8-27B | K1 | 13/10/0 | 0.827 s | 1.118 s | 8.95 tok/s | 30.92 tok/s |
+| Qwen3.8-27B Abliterated | K1 | 13/10/0 | 0.910 s | 1.265 s | 7.90 tok/s | 25.33 tok/s |
 | Qwen3.8-Flash-Next | F16 | 13/10/0 | 27.642 s | 43.028 s | 0.23 tok/s | 0.58 tok/s |
 | Mistral Small 4 | native BF16 MLA | 541/13/0 | 271.256 s | 281.948 s | 0.05 tok/s | 1.12 tok/s |
 | Muse-Glimmer | F16 global/sliding | 57/53/34 | 2.559 s | 2.866 s | 18.49 tok/s | not separable |
@@ -47,14 +49,16 @@ One RTX 3090, 12 GiB routed-VRAM ceiling, default `xhigh`, 2026-09-02.
 | Alias | Prefill | Generated | TTFT | Wall | Result |
 |---|---:|---:|---:|---:|---|
 | `qwen` | 5 | 33 | 0.625 s | 1.938 s | pass |
+| `qwen-abliterated` | not captured | not captured | not captured | 5.495 s client | pass |
 | `qwen-flash` | 477 | 67 | 41.829 s | 53.688 s | pass, slow |
 | `mistral` | 439 | 67 | 54.797 s | 77.312 s | pass, slow |
 | `muse` | 422 | 65 | 2.297 s | 4.297 s | pass |
 | `ornith` | 439 | 34 | 3.703 s | 5.390 s | pass |
 | `deepseek` | 504 | 256 | 81.985 s | 310.672 s | pass, impractical |
 
-Pi may add system instructions even with project context/tools disabled. This
-table qualifies API/template/generation wiring only.
+Pi may add system instructions even with project context/tools disabled. The
+abliterated row was run on 2026-09-15 and only client wall time was captured.
+This table qualifies API/template/generation wiring only.
 
 ### Coding harness
 
@@ -81,6 +85,7 @@ failure, not merely a cutoff.
 | Artifact | Validated evidence |
 |---|---|
 | Qwen3.8-27B | 14,775,390,208-byte QPack, 1,199 records; FP4 relative L2 0.121706, cosine 0.992577; bounded official/service corpus 4/4 |
+| Qwen3.8-27B Abliterated | 14,775,390,208-byte QPack, 1,199 records; independent FP4 relative L2 0.121710, cosine 0.992577; direct and minimal-Pi `hi` passed, coding and maximum context unqualified |
 | Qwen3.8-Flash-Next | 1,562 dense + 24,576 expert records, 95,915,634,688 bytes; exact QSA resident/staged/selected CUDA parity, max error 0 |
 | Mistral Small 4 | 70,801,904,048 source tensor bytes; native NVFP4 sidecars and BF16 organs validated |
 | Muse-Glimmer | 15,832,002,560-byte QPack; aggregate cosine 0.9999981, FP4 cosine 0.9930505 |

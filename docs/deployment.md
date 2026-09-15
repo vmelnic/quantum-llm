@@ -21,6 +21,7 @@ artifact passes real gates and recovery is no longer needed.
 | Alias | Advertised model | Path below `MODEL_ROOT` | KV selection |
 |---|---|---|---|
 | `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
+| `qwen-abliterated` | `qwen3.8-27b-abliterated-fp4` | `qwen3.8-27b-abliterated-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
 | `qwen-f16` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | exact `fp16` reference |
 | `qwen-flash` | `qwen3.8-flash-next-fp4` | `qwen3.8-flash-next-fp4` | `fp16` |
 | `mistral` | `mistral-small-4-119b-nvfp4` | `mistral-small-4-119b-nvfp4` | artifact-declared |

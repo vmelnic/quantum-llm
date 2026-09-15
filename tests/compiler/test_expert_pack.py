@@ -336,7 +336,7 @@ def _make_hybrid_delta_fixture(root: Path, *, moe: bool = False) -> None:
     else:
         text["intermediate_size"] = 32
     vision = {
-        "model_type": "qwen3_5_moe_vision" if moe else "qwen3_5_vision",
+        "model_type": "qwen3_5_moe_vision" if moe else "qwen3_5",
         "depth": 1,
         "hidden_size": 32,
         "intermediate_size": 48,

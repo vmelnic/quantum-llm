@@ -1,6 +1,6 @@
 # Pi CLI
 
-Status: maintained coding-harness integration, 2026-09-12.
+Status: maintained coding-harness integration, 2026-09-15.
 
 Pi is the preferred local harness because it can call the repository's
 OpenAI-compatible endpoint without Claude Code's fixed Claude-oriented prompt.
@@ -11,7 +11,7 @@ necessarily a five-token model prefill.
 ## Configuration
 
 Repository `.pi/settings.json` selects provider `quantum-llm`, Qwen by default,
-all six active advertised IDs, `xhigh` thinking, disabled automatic retries and
+all seven active advertised IDs, `xhigh` thinking, disabled automatic retries and
 a request timeout matching long local prefills. Compaction keeps 32,768 recent
 tokens and reserves 8,192 tokens for the next answer/summary.
 
@@ -20,6 +20,7 @@ The base URL and secret live in Pi's user-local registry
 should contain only these project models:
 
 - `qwen3.8-27b-fp4`;
+- `qwen3.8-27b-abliterated-fp4`;
 - `qwen3.8-flash-next-fp4`;
 - `mistral-small-4-119b-nvfp4`;
 - `muse-glimmer-30b-fp4`;
@@ -33,13 +34,13 @@ should contain only these project models:
 ./ops/pi.sh qwen
 ```
 
-Replace the alias with `qwen-f16`, `qwen-flash`, `mistral`, `muse`, `ornith`,
-`ornith-k1` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
+Replace the alias with `qwen-abliterated`, `qwen-f16`, `qwen-flash`, `mistral`,
+`muse`, `ornith`, `ornith-k1` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
 URL, then checks the running model ID and explicit KV codec through
 `/model-info` before launching Pi. It defaults to `--thinking xhigh` and
-forwards remaining arguments. The operational `qwen` alias and experimental
-`ornith-k1` alias require K1; `qwen-f16` and `ornith` are their explicit
-exact-F16 reference aliases.
+forwards remaining arguments. The operational `qwen`, `qwen-abliterated` and
+experimental `ornith-k1` aliases require K1; `qwen-f16` and `ornith` are the
+explicit exact-F16 reference aliases for the official artifacts.
 
 Minimal wiring gate:
 
@@ -50,11 +51,11 @@ Minimal wiring gate:
 
 ## Current evidence
 
-All six advertised model IDs and `ornith-k1` pass the no-context/no-tools/
-no-session `hi` wiring gate. Qwen and Muse are responsive in that gate; Flash,
-Mistral and especially DeepSeek are slow. Exact timings live only in
-[Benchmarks](benchmarks.md). Wiring does not qualify tools, coding quality,
-long context or concurrency.
+All seven advertised model IDs and `ornith-k1` pass the
+no-context/no-tools/no-session `hi` wiring gate. Qwen, Qwen Abliterated and
+Muse are responsive in that gate; Flash, Mistral and especially DeepSeek are
+slow. Exact timings live only in [Benchmarks](benchmarks.md). Wiring does not
+qualify tools, coding quality, long context or concurrency.
 
 ## Thinking and sampling
 

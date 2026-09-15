@@ -83,7 +83,7 @@ converge at the executable-program, logical-page and provider boundaries.
 
 | Alias | Program and representation | Request state | Callable scope |
 |---|---|---|---|
-| `qwen` / `qwen-f16` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices | `qwen` selects experimental resident K1 KV; `qwen-f16` selects progressive exact F16 KV with a bounded disposable VRAM mirror | text, reasoning, tools and image understanding |
+| `qwen` / `qwen-f16` / `qwen-abliterated` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated alias selects separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select experimental resident K1 KV; `qwen-f16` selects progressive exact F16 KV with a bounded disposable VRAM mirror | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only |
 | `qwen-flash` | 48 layers; 36 Gated DeltaNet, 12 QSA, Hyper, PLE, 512 experts/layer, exact top-10 FP4 routing; scalar decode may execute the selected standard-FP4 experts on local P100s | recurrent state plus progressive exact F16 QSA K/V; compact index retained on device where declared | text/reasoning/tools; P100 execution is exact but slower than the primary path in the measured short chat; quality and long-context performance remain unqualified |
 | `mistral` | source-native block-16 E2M1/E4M3FN NVFP4 W4A4 MoE plus BF16 organs | artifact-declared BF16 MLA latent KV pages | text/reasoning/tools; auxiliary multimodal records are not callable support |
 | `muse` | 52-layer dense FP4 text model with global and exact 2,048-token sliding attention | exact F16 global pages plus cyclic exact F16 sliding windows; artifact maximum 131,072 | text only; preserved vision records are auxiliary |
@@ -107,9 +107,9 @@ target because all full-attention KV remains hot.
 K1 (`fp4-e2m1-ue8m0-block32-key-outlier1`) is a separate lossy KV policy:
 values use block-32 FP4; keys add one FP16 largest-magnitude correction per
 block. At Qwen's 262,144-position ceiling it reduces target KV from 16 GiB to
-4.75 GiB, or 5.015625 GiB including MTP pages. The `qwen` and `ornith-k1`
-aliases opt into K1; `qwen-f16` and `ornith` remain exact-F16 references. K1 is
-never reported as exact F16.
+4.75 GiB, or 5.015625 GiB including MTP pages. The `qwen`,
+`qwen-abliterated` and `ornith-k1` aliases opt into K1; `qwen-f16` and
+`ornith` remain exact-F16 references. K1 is never reported as exact F16.
 
 For compact non-F16 Qwen attention, prefill uses the vendored official
 FlashAttention implementation over artifact-sized paged segments. Gated

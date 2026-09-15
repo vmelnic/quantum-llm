@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: active dependency order, 2026-09-12. Measurements belong in
+Status: active dependency order, 2026-09-15. Measurements belong in
 [Benchmarks](benchmarks.md); failed ideas belong in
 [Research decisions](research-decisions.md).
 
@@ -8,7 +8,7 @@ Status: active dependency order, 2026-09-12. Measurements belong in
 
 - one self-contained Windows host, one primary RTX 3090, one service task and
   one artifact-driven VM;
-- six artifacts and eight user-facing aliases from `ops/model-aliases.tsv`;
+- seven artifacts and the aliases declared by `ops/model-aliases.tsv`;
 - exact declared routing/top-k/aggregation and honest FP4/NVFP4/BF16/F16 names;
 - 12 GiB common fixed routed-VRAM ceiling; 13 GiB fails DeepSeek preflight;
 - `MODEL_ROOT` as the only host-dependent model root;
@@ -73,6 +73,7 @@ kernel again without a complete design that first proves <=100 ms/token.
 
 | Artifact | Next meaningful gate |
 |---|---|
+| Qwen Abliterated | explicit behavioral/coding comparison before any quality claim |
 | Qwen Flash | official operation parity, then representative coding; P100 route is not an accelerator |
 | Mistral | identify and reduce measured TTFT before another coding run |
 | Muse | populated 131K text and representative tools; vision remains auxiliary |

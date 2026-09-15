@@ -53,8 +53,11 @@ complete proposer/verifier cost.
 ## Experimental K1 exception
 
 K1 stores block-32 FP4 values and FP4 keys with one aligned FP16 outlier
-correction per key block. It is lossy. The operational `qwen` and
-`ornith-k1` aliases opt into it; `qwen-f16` and `ornith` are fidelity references.
+correction per key block. It is lossy. The operational `qwen`,
+`qwen-abliterated` and `ornith-k1` aliases opt into it; `qwen-f16` and
+`ornith` are fidelity references. The abliterated alias is a separately
+qualified third-party weight artifact with the same dense geometry; its
+behavioral quality is not inferred from the official model.
 
 For Qwen at 262,144 positions:
 
