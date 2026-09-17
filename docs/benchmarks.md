@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-09-15.
+Status: canonical measurement ledger, 2026-09-17.
 
 ## Reporting rules
 
@@ -36,6 +36,13 @@ not included. Every response was coherent and ended normally.
 | Muse-Glimmer | F16 global/sliding | 57/53/34 | 2.559 s | 2.866 s | 18.49 tok/s | not separable |
 | Ornith | F16 | 13/10/0 | 12.977 s | 22.342 s | 0.45 tok/s | 0.96 tok/s |
 | DeepSeek | native | 5/10/0 | 12.953 s | 29.181 s | 0.34 tok/s | 0.55 tok/s |
+
+The exact hierarchical top-k change was measured separately on 2026-09-17
+after a clean build. Qwen returned the same coherent `hi` response at
+13/10/0 tokens, 0.689 s first-visible, 0.890 s wall and 44.86 tok/s
+after-first. The comparable prior Qwen row was 30.92 tok/s. The mandatory
+DeepSeek regression returned a coherent 5/10/0 response at 3.190 s
+first-visible, 9.244 s wall and 1.49 tok/s after-first.
 
 Muse emitted hidden reasoning despite the off request, which is current
 artifact-template behavior. These rows prove service wiring, not coding or
@@ -132,6 +139,7 @@ correct 5,136 MiB page pool and later workspace correction produced:
 |---|---:|---:|---:|---:|---|
 | corrected capacity | 262,016/128 | 1,277.250/1,286.094 s | 14.36 tok/s | 105 MiB | all logical pages released |
 | corrected workspace | 262,016/128 | 1,277.750/1,286.578 s | 14.39 tok/s | 1,095 MiB | all logical pages released |
+| exact hierarchical top-k | 262,016/128 | 536.469/543.907 s | 17.07 tok/s | not sampled | request completed; worker stopped and cleared |
 
 Lazy one-row logits and request-scoped dense staging released about 994 MiB
 without changing arithmetic.
@@ -160,6 +168,38 @@ arithmetic error.
 The 4.171x wall-time ratio and single identical output do not establish general
 K1/F16 equivalence. Exact F16 remains the target; `qwen` is an operational K1
 opt-in and `qwen-f16` is the reference alias.
+
+### K1 kernel optimization gate
+
+The populated-context attention baseline was 29.0161 ms across 16 layers. A
+64-bit packed-load candidate preserved all numerical gates and reduced the
+microbenchmark to 28.758 ms, only 0.89%; it missed the <=26.190 ms prerequisite
+for 15 generated tokens/s. A 512-thread corrective launch regressed to 30.9719
+ms. A later token-striped decode layout reduced excessive shared wavefronts
+from 36.44M to 11.27M but reached only 28.5245 ms because global accesses
+returned to 75% excessive sectors. All three changes were removed, so none of
+these numbers is service throughput or a promoted optimization.
+
+### Exact sampling optimization
+
+The artifact's recommended sampling profile uses `top_k=20` over a
+248,320-token vocabulary. Nsight Systems showed that the original single-block
+selection rescanned the full vocabulary once per rank and cost 406.572 ms over
+41 decode calls, or 9.916 ms/call. This exceeded the 2.826 ms/token saving
+required to move the populated K1 result from 14.39 to 15 tok/s.
+
+The replacement partitions the vocabulary into deterministic 4,096-item
+ranges, reduces one candidate per range, and performs an exact final reduction
+for every rank. An independent CPU sort, including tied logits and NaNs,
+matched all 20 token ids. The final clean native smoke measured 0.423 ms/call; the
+whole-worker trace measured 10.583 ms over 41 calls, or 0.258 ms/call. Values,
+tie order and NaN exclusion are unchanged.
+
+The real populated-context gate above reached 17.07 tok/s post-first, an 18.6%
+improvement over 14.39 tok/s. Short chat reached 44.86 tok/s post-first versus
+30.92 tok/s previously. This is an exact sampling-path improvement, not an
+attention, KV-quality or prefill result: K1 remains lossy and cold 262K TTFT
+remained 536.469 s.
 
 ## Sparse MoE evidence
 
@@ -238,6 +278,43 @@ P100s are not a demonstrated throughput tier.
 
 These prove retained continuity, not simultaneous decode. Recorded release
 gates stopped the service and returned device memory to desktop baselines.
+
+### Real Pi retained-prefix observation, 2026-09-17
+
+A large Pi transcript reached the service immediately after a fresh Qwen
+process. Pi supplied the transcript again, but the provider had no retained
+state from the previous process, so the first request was correctly reported
+as a cold runtime request. The immediately following turn found the exact
+retained prefix and prefilled only its suffix:
+
+| Runtime request | Resumed | Provider prefill | Output | TTFT/wall | Park/restore evidence |
+|---|---:|---:|---:|---:|---:|
+| fresh-process transcript | no | 120,192 | 8,586 | 171.718/545.640 s | retained 120,187 tokens; parked 2,630,774,784 bytes |
+| next Pi turn | yes | 9,035 | 220 | 17.578/27.765 s | restored 2,630,774,784 bytes; retained 129,217 tokens; parked 2,814,849,024 bytes |
+
+At the time of this earlier observation, the existing cache worked only across
+turns in one live service process, including hybrid recurrent state. Pi's own
+transcript resume was not equivalent to a provider state hit; the durable
+restart path is measured separately below.
+
+### Durable Pi continuation, 2026-09-17
+
+The provider-backed NVMe continuation store was then tested with a real Pi
+session, a complete Qwen service restart, and the next Pi turn. This is a
+small-session functionality gate, not a 262K throughput claim.
+
+| Stage | Retained prefix | Durable bytes | Restore / provider prefill | TTFT / wall |
+|---|---:|---:|---:|---:|
+| initial Pi turn | 443 tokens | 169,443,798 | no restore / 450 tokens | 1.031 / 1.312 s |
+| after complete restart | 443 tokens | 169,443,798 | 0.203 s / 34 tokens | 0.625 / 0.938 s |
+
+At restart, `retained=0` and `disk_retained=1`: the snapshot consumed no
+session RAM until the exact prefix matched. The service logged one provider
+restore of 169,439,232 bytes and then atomically committed the new generation.
+Metadata corruption and byte-bounded LRU eviction are covered by the server
+contract suite. A fixed-seed, `temperature=0` parity gate produced
+`PARITY-BETA` both live and after a complete restart/restoration of the same
+snapshot. A large real coding-session gate remains unrun.
 
 ## Current conclusion
 

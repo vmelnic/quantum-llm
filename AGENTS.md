@@ -29,6 +29,11 @@ are normative. Keep this file compact; durable evidence belongs in `docs/`.
 - Before editing, state the active invariants: model, format, context, fidelity,
   execution mode, hardware, and universal-vs-specific scope.
 - Never guess when code, artifacts, telemetry, or docs can answer.
+- Default to `xhigh`; token ceilings are runaway guards, not depth targets.
+  Keep a compact checkpoint of verified facts, gates, blocker and next action.
+  After failure, resume there and redo only invalidated dependencies. Restart
+  from zero ONLY when an upstream invariant was disproved; stop reasoning paths
+  that repeat without new evidence.
 
 Mandatory change cycle:
 

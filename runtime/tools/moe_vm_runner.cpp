@@ -548,6 +548,10 @@ void validate_service_contract(
               service.session_parking ==
                   module.definition.implementation
                       ->supports_request_state_parking() &&
+              service.session_persistence ==
+                  module.definition.implementation
+                      ->supports_request_state_persistence() &&
+              (!service.session_persistence || service.session_parking) &&
               (!service.session_parking ||
                (service.session_retention &&
                 service.session_park_ram_bytes != 0U &&
@@ -595,7 +599,7 @@ void print_ready(const er::ModelDescriptor& descriptor,
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":11,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":12,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -623,6 +627,8 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << (service.session_retention ? "true" : "false")
             << ",\"session_parking\":"
             << (service.session_parking ? "true" : "false")
+            << ",\"session_persistence\":"
+            << (service.session_persistence ? "true" : "false")
             << ",\"session_park_ram_bytes\":"
             << service.session_park_ram_bytes
             << ",\"session_park_page_capacity\":"
@@ -1318,6 +1324,120 @@ int worker_loop(er::MoeProgramExecutor& executor,
         const auto key = std::stoull(std::string(fields[1]));
         require(retained.erase(key) == 1U, "unknown retained session");
         std::cout << "{\"type\":\"dropped\"}\n" << std::flush;
+      } else if (fields[0] == "SAVE") {
+        require(fields.size() == 4U, "invalid SAVE");
+        require(module.service.session_persistence,
+                "callable provider does not support session persistence");
+        const auto key = std::stoull(std::string(fields[1]));
+        const auto generation = std::stoull(std::string(fields[3]));
+        const auto found = retained.find(key);
+        require(found != retained.end() && generation != 0U,
+                "unknown retained session or invalid generation");
+        const auto path = std::filesystem::path(std::string(fields[2]));
+        require(!path.empty(), "snapshot path is empty");
+        const auto saved = found->second.session.save_retention_snapshot(
+            path, generation);
+        require(saved.status.ok(), saved.status.message());
+        const auto& request = found->second;
+        std::cout << "{\"type\":\"saved\",\"generation\":"
+                  << saved.generation << ",\"populated_pages\":"
+                  << saved.populated_pages << ",\"logical_bytes\":"
+                  << saved.logical_bytes << ",\"written_bytes\":"
+                  << saved.written_bytes << ",\"next_position\":"
+                  << request.next_position << ",\"predicted\":"
+                  << request.predicted << ",\"retention_predicted\":"
+                  << request.retention_predicted
+                  << ",\"retention_prediction_valid\":"
+                  << (request.retention_prediction_valid ? "true" : "false")
+                  << ",\"sampling_temperature_ppm\":"
+                  << request.sampling.temperature_ppm
+                  << ",\"sampling_top_p_ppm\":"
+                  << request.sampling.top_p_ppm
+                  << ",\"sampling_top_k\":" << request.sampling.top_k
+                  << ",\"sampling_min_p_ppm\":"
+                  << request.sampling.min_p_ppm
+                  << ",\"sampling_presence_penalty_ppm\":"
+                  << request.sampling.presence_penalty_ppm
+                  << ",\"sampling_seed\":" << request.sampling.seed
+                  << "}\n" << std::flush;
+      } else if (fields[0] == "LOAD") {
+        require(fields.size() == 15U, "invalid LOAD");
+        require(module.service.session_persistence,
+                "callable provider does not support session persistence");
+        const auto key = std::stoull(std::string(fields[1]));
+        const auto path = std::filesystem::path(std::string(fields[2]));
+        const auto generation = std::stoull(std::string(fields[3]));
+        const auto next_position = std::stoull(std::string(fields[4]));
+        const auto populated_pages = std::stoull(std::string(fields[5]));
+        const auto predicted = std::stoull(std::string(fields[6]));
+        const auto retention_predicted =
+            std::stoull(std::string(fields[7]));
+        const auto retention_valid = std::stoull(std::string(fields[8]));
+        SamplingSettings sampling;
+        sampling.temperature_ppm = static_cast<std::uint32_t>(
+            std::stoull(std::string(fields[9])));
+        sampling.top_p_ppm = static_cast<std::uint32_t>(
+            std::stoull(std::string(fields[10])));
+        sampling.top_k = static_cast<std::uint32_t>(
+            std::stoull(std::string(fields[11])));
+        sampling.min_p_ppm = static_cast<std::uint32_t>(
+            std::stoull(std::string(fields[12])));
+        sampling.presence_penalty_ppm = static_cast<std::int32_t>(
+            std::stoll(std::string(fields[13])));
+        sampling.seed = std::stoull(std::string(fields[14]));
+        require(key != 0U && !retained.contains(key) && !path.empty() &&
+                    generation != 0U && next_position != 0U &&
+                    next_position <= options.max_context &&
+                    populated_pages != 0U &&
+                    populated_pages <= module.service.session_park_page_capacity &&
+                    predicted < descriptor.vocab_size &&
+                    retention_predicted < descriptor.vocab_size &&
+                    retention_valid <= 1U && sampling.top_p_ppm != 0U &&
+                    sampling.top_p_ppm <= 1000000U &&
+                    sampling.temperature_ppm <= 2000000U &&
+                    sampling.top_k <= descriptor.vocab_size &&
+                    sampling.min_p_ppm <= 1000000U &&
+                    sampling.presence_penalty_ppm >= -2000000 &&
+                    sampling.presence_penalty_ppm <= 2000000,
+                "persisted session metadata is invalid");
+        auto loaded = executor.begin_session_from_snapshot(
+            request_context(key, options.max_context,
+                            static_cast<std::uint32_t>(next_position),
+                            static_cast<std::uint32_t>(next_position),
+                            sampling),
+            path, generation, static_cast<std::uint32_t>(next_position));
+        require(loaded.status.ok(), loaded.status.message());
+        ActiveRequest request;
+        request.session = std::move(loaded.session);
+        request.predicted = static_cast<std::uint32_t>(predicted);
+        request.retention_predicted =
+            static_cast<std::uint32_t>(retention_predicted);
+        request.next_position = static_cast<std::uint32_t>(next_position);
+        request.context_limit = options.max_context;
+        request.retention_position =
+            static_cast<std::uint32_t>(next_position);
+        request.reserved_pages = populated_pages;
+        request.retention_prediction_valid = retention_valid != 0U;
+        request.sampling = sampling;
+        retained.emplace(key, std::move(request));
+        std::cout << "{\"type\":\"loaded\",\"key\":" << key
+                  << ",\"generation\":" << generation
+                  << ",\"retained_tokens\":" << next_position
+                  << "}\n" << std::flush;
+      } else if (fields[0] == "PRUNE") {
+        require(fields.size() == 4U, "invalid PRUNE");
+        require(module.service.session_persistence,
+                "callable provider does not support session persistence");
+        const auto key = std::stoull(std::string(fields[1]));
+        const auto generation = std::stoull(std::string(fields[3]));
+        const auto found = retained.find(key);
+        require(found != retained.end() && generation != 0U,
+                "unknown retained session or invalid generation");
+        const auto status = found->second.session.prune_retention_snapshots(
+            std::filesystem::path(std::string(fields[2])), generation);
+        require(status.ok(), status.message());
+        std::cout << "{\"type\":\"pruned\",\"generation\":"
+                  << generation << "}\n" << std::flush;
       } else if (fields[0] == "STATS") {
         require(fields.size() == 1U, "invalid STATS");
         std::uint64_t reserved_pages{};

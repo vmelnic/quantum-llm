@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: active dependency order, 2026-09-15. Measurements belong in
+Status: active dependency order, 2026-09-17. Measurements belong in
 [Benchmarks](benchmarks.md); failed ideas belong in
 [Research decisions](research-decisions.md).
 
@@ -49,6 +49,19 @@ matched 262,016-token case took 546.173 s under K1 and 2,278.082 s under F16.
 Do not add another codec until K1 receives a broader retrieval/reasoning/coding
 quality decision. If K1 is accepted, optimize only the measured full-shape
 dominants: 250.365 s attention, 178.069 s dense FFN and 116.299 s recurrent.
+
+Persistent, codec-preserving Qwen session snapshots are implemented behind the
+provider capability: immutable content-addressed NVMe chunks plus a
+transactional manifest store the selected KV codec, recurrent/hidden state,
+exact artifact/tokenizer/template/media identity and token prefix. A real Pi
+restart/resume gate restored 443 K1 tokens from 169,443,798 bytes in 0.203 s
+and prefilled only a 34-token suffix. Automatic TTL/LRU and explicit
+`model.sh clear-cache <model>` cleanup are available.
+
+The K1 deterministic uninterrupted-versus-restored next-token parity gate has
+passed. Still required is a real large coding-session measurement. This is a
+resume optimization only: it cannot improve the first cold prefill and is not
+arbitrary KV injection.
 
 Do not reopen ordinary offload, rejected speculative proposers or P100 KV/
 dense sharding without a new prerequisite that changes their failed math.

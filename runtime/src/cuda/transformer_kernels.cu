@@ -5362,48 +5362,89 @@ __global__ void argmax_batch_kernel(const float* values, std::uint32_t count,
   if (threadIdx.x == 0) output[request] = best_indices[0];
 }
 
-__global__ void topk_logits_kernel(const float* values, std::uint32_t count,
-                                   std::uint32_t top_k,
-                                   float* output_values,
-                                   std::uint32_t* output_indices) {
+constexpr std::uint32_t kTopKItemsPerBlock = 4096U;
+
+__global__ void topk_logits_partials_kernel(
+    const float* values, std::uint32_t count, std::uint32_t rank,
+    const std::uint32_t* selected_indices, float* partial_values,
+    std::uint32_t* partial_indices) {
   __shared__ float best_values[kThreads];
   __shared__ std::uint32_t best_indices[kThreads];
-  for (std::uint32_t rank = 0U; rank < top_k; ++rank) {
-    float best = kNegativeInfinity;
-    std::uint32_t index = 0xffffffffU;
-    for (std::uint32_t item = threadIdx.x; item < count;
-         item += blockDim.x) {
-      bool selected = false;
-      for (std::uint32_t previous = 0U; previous < rank; ++previous)
-        selected = selected || output_indices[previous] == item;
-      const auto value = values[item];
-      if (!selected && !isnan(value) &&
-          (value > best || (value == best && item < index))) {
-        best = value;
-        index = item;
+  const auto first = static_cast<std::uint32_t>(blockIdx.x) *
+                     kTopKItemsPerBlock;
+  const auto last = min(count, first + kTopKItemsPerBlock);
+  float best = kNegativeInfinity;
+  std::uint32_t index = 0xffffffffU;
+  for (std::uint32_t item = first + threadIdx.x; item < last;
+       item += blockDim.x) {
+    bool selected = false;
+    for (std::uint32_t previous = 0U; previous < rank; ++previous)
+      selected = selected || selected_indices[previous] == item;
+    const auto value = values[item];
+    if (!selected && !isnan(value) &&
+        (value > best || (value == best && item < index))) {
+      best = value;
+      index = item;
+    }
+  }
+  best_values[threadIdx.x] = best;
+  best_indices[threadIdx.x] = index;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      const auto other_value = best_values[threadIdx.x + stride];
+      const auto other_index = best_indices[threadIdx.x + stride];
+      if (other_value > best_values[threadIdx.x] ||
+          (other_value == best_values[threadIdx.x] &&
+           other_index < best_indices[threadIdx.x])) {
+        best_values[threadIdx.x] = other_value;
+        best_indices[threadIdx.x] = other_index;
       }
     }
-    best_values[threadIdx.x] = best;
-    best_indices[threadIdx.x] = index;
     __syncthreads();
-    for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
-      if (threadIdx.x < stride) {
-        const auto other_value = best_values[threadIdx.x + stride];
-        const auto other_index = best_indices[threadIdx.x + stride];
-        if (other_value > best_values[threadIdx.x] ||
-            (other_value == best_values[threadIdx.x] &&
-             other_index < best_indices[threadIdx.x])) {
-          best_values[threadIdx.x] = other_value;
-          best_indices[threadIdx.x] = other_index;
-        }
+  }
+  if (threadIdx.x == 0U) {
+    partial_values[blockIdx.x] = best_values[0];
+    partial_indices[blockIdx.x] = best_indices[0];
+  }
+}
+
+__global__ void topk_logits_reduce_kernel(
+    const float* partial_values, const std::uint32_t* partial_indices,
+    std::uint32_t partial_count, std::uint32_t rank, float* output_values,
+    std::uint32_t* output_indices) {
+  __shared__ float best_values[kThreads];
+  __shared__ std::uint32_t best_indices[kThreads];
+  float best = kNegativeInfinity;
+  std::uint32_t index = 0xffffffffU;
+  for (std::uint32_t item = threadIdx.x; item < partial_count;
+       item += blockDim.x) {
+    const auto value = partial_values[item];
+    const auto candidate = partial_indices[item];
+    if (value > best || (value == best && candidate < index)) {
+      best = value;
+      index = candidate;
+    }
+  }
+  best_values[threadIdx.x] = best;
+  best_indices[threadIdx.x] = index;
+  __syncthreads();
+  for (unsigned stride = blockDim.x / 2; stride != 0; stride >>= 1U) {
+    if (threadIdx.x < stride) {
+      const auto other_value = best_values[threadIdx.x + stride];
+      const auto other_index = best_indices[threadIdx.x + stride];
+      if (other_value > best_values[threadIdx.x] ||
+          (other_value == best_values[threadIdx.x] &&
+           other_index < best_indices[threadIdx.x])) {
+        best_values[threadIdx.x] = other_value;
+        best_indices[threadIdx.x] = other_index;
       }
-      __syncthreads();
-    }
-    if (threadIdx.x == 0U) {
-      output_values[rank] = best_values[0];
-      output_indices[rank] = best_indices[0];
     }
     __syncthreads();
+  }
+  if (threadIdx.x == 0U) {
+    output_values[rank] = best_values[0];
+    output_indices[rank] = best_indices[0];
   }
 }
 
@@ -8253,13 +8294,33 @@ Status argmax_batch(const float* values, std::uint32_t count,
 
 Status topk_logits(const float* values, std::uint32_t count,
                    std::uint32_t top_k, float* output_values,
-                   std::uint32_t* output_indices, void* raw) noexcept {
+                   std::uint32_t* output_indices,
+                   const TopKLogitsWorkspace& workspace,
+                   void* raw) noexcept {
+  const auto partial_count = topk_logits_workspace_items(count);
   if (!values || !count || !top_k || top_k > 64U || top_k > count ||
-      !output_values || !output_indices)
+      !output_values || !output_indices || !workspace.values ||
+      !workspace.indices ||
+      workspace.values_bytes < partial_count * sizeof(float) ||
+      workspace.indices_bytes < partial_count * sizeof(std::uint32_t))
     return Status(ErrorCode::invalid_argument, "invalid top-k logits");
-  topk_logits_kernel<<<1, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      values, count, top_k, output_values, output_indices);
+  const auto stream = static_cast<cudaStream_t>(raw);
+  for (std::uint32_t rank = 0U; rank < top_k; ++rank) {
+    topk_logits_partials_kernel<<<
+        static_cast<unsigned>(partial_count), kThreads, 0, stream>>>(
+        values, count, rank, output_indices, workspace.values,
+        workspace.indices);
+    topk_logits_reduce_kernel<<<1, kThreads, 0, stream>>>(
+        workspace.values, workspace.indices,
+        static_cast<std::uint32_t>(partial_count), rank, output_values,
+        output_indices);
+  }
   return checked(cudaPeekAtLastError(), "top-k logits");
+}
+
+std::size_t topk_logits_workspace_items(std::uint32_t count) noexcept {
+  return (static_cast<std::size_t>(count) + kTopKItemsPerBlock - 1U) /
+         kTopKItemsPerBlock;
 }
 
 Status apply_presence_penalty(float* logits, const std::uint8_t* emitted,

@@ -1045,12 +1045,23 @@ struct Mamba2BatchLaunch final {
                                   std::uint32_t* output,
                                   void* stream) noexcept;
 
+struct TopKLogitsWorkspace final {
+  float* values{};
+  std::size_t values_bytes{};
+  std::uint32_t* indices{};
+  std::size_t indices_bytes{};
+};
+
+[[nodiscard]] std::size_t topk_logits_workspace_items(
+    std::uint32_t count) noexcept;
+
 // Deterministic descending top-k over one logit row. NaNs are excluded and
 // equal logits are ordered by the lower token id, matching host sampling.
 [[nodiscard]] Status topk_logits(const float* values, std::uint32_t count,
                                  std::uint32_t top_k,
                                  float* output_values,
                                  std::uint32_t* output_indices,
+                                 const TopKLogitsWorkspace& workspace,
                                  void* stream) noexcept;
 
 // OpenAI/vLLM presence semantics: subtract one fixed penalty from logits for

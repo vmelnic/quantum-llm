@@ -10,6 +10,7 @@ import json
 import os
 import queue
 import select
+import shutil
 import signal
 import socket
 import subprocess
@@ -275,6 +276,13 @@ class Session:
     last_used: float
     media_signature: bytes | None = None
     parked_bytes: int = 0
+    persistent_id: str | None = None
+    snapshot_generation: int = 0
+    snapshot_path: Path | None = None
+    snapshot_metadata: dict[str, int | bool] | None = None
+    disk_bytes: int = 0
+    resident: bool = True
+    persistent_last_used: float = 0.0
 
 
 @dataclass
@@ -576,6 +584,9 @@ class CudaWorker:
         self.prefill_chunk_tokens = int(response.get("prefill_chunk_tokens", 0))
         self.session_retention = bool(response.get("session_retention", False))
         self.session_parking = bool(response.get("session_parking", False))
+        self.session_persistence = bool(
+            response.get("session_persistence", False)
+        )
         self.session_park_ram_bytes = int(
             response.get("session_park_ram_bytes", 0)
         )
@@ -728,13 +739,17 @@ class CudaWorker:
                  self.session_park_page_capacity != 0)
             )
         )
+        persistence_invalid = self.protocol >= 12 and (
+            self.session_persistence and
+            (not self.session_retention or not self.session_parking)
+        )
         sampling_contract_invalid = self.protocol >= 10 and (
             self.sampling_presence_penalty_supported !=
             self.sampling_supported
         )
         if (self.protocol < 4 or descriptor_invalid or
                 sampling_contract_invalid or
-                parking_invalid or
+                parking_invalid or persistence_invalid or
                 self.capacity != requested_capacity or
                 self.prefill_mode not in {
                     "causal_blocked_exact",
@@ -973,6 +988,66 @@ class CudaWorker:
         response = self._command(f"DROP\t{session_key}")
         if response.get("type") != "dropped":
             raise WorkerError("unexpected DROP response")
+
+    @staticmethod
+    def _snapshot_path(path: Path) -> str:
+        value = str(path.resolve())
+        if not value or any(marker in value for marker in ("\t", "\n", "\r")):
+            raise WorkerError("session snapshot path is not protocol safe")
+        return value
+
+    def save_session(self, session_key: int, path: Path,
+                     generation: int) -> dict[str, int | bool]:
+        response = self._command(
+            f"SAVE\t{session_key}\t{self._snapshot_path(path)}\t{generation}"
+        )
+        if response.get("type") != "saved" or \
+                int(response.get("generation", 0)) != generation:
+            raise WorkerError("unexpected SAVE response")
+        keys = (
+            "generation", "populated_pages", "logical_bytes",
+            "written_bytes", "next_position", "predicted",
+            "retention_predicted", "retention_prediction_valid",
+            "sampling_temperature_ppm", "sampling_top_p_ppm",
+            "sampling_top_k", "sampling_min_p_ppm",
+            "sampling_presence_penalty_ppm", "sampling_seed",
+        )
+        return {key: response[key] for key in keys}
+
+    def load_session(self, session_key: int, path: Path, generation: int,
+                     metadata: Mapping[str, Any]) -> None:
+        values = (
+            int(metadata["next_position"]),
+            int(metadata["populated_pages"]),
+            int(metadata["predicted"]),
+            int(metadata["retention_predicted"]),
+            1 if bool(metadata["retention_prediction_valid"]) else 0,
+            int(metadata["sampling_temperature_ppm"]),
+            int(metadata["sampling_top_p_ppm"]),
+            int(metadata["sampling_top_k"]),
+            int(metadata["sampling_min_p_ppm"]),
+            int(metadata["sampling_presence_penalty_ppm"]),
+            int(metadata["sampling_seed"]),
+        )
+        response = self._command(
+            "LOAD\t{}\t{}\t{}\t{}".format(
+                session_key, self._snapshot_path(path), generation,
+                "\t".join(str(value) for value in values),
+            )
+        )
+        if (response.get("type") != "loaded" or
+                int(response.get("key", 0)) != session_key or
+                int(response.get("generation", 0)) != generation):
+            raise WorkerError("unexpected LOAD response")
+
+    def prune_session(self, session_key: int, path: Path,
+                      generation: int) -> None:
+        response = self._command(
+            f"PRUNE\t{session_key}\t{self._snapshot_path(path)}\t{generation}"
+        )
+        if response.get("type") != "pruned" or \
+                int(response.get("generation", 0)) != generation:
+            raise WorkerError("unexpected PRUNE response")
 
     def next(self, request_id: int, final: bool) -> list[int]:
         response = self._command(f"NEXT\t{request_id}\t{1 if final else 0}")
@@ -1281,7 +1356,39 @@ class Application:
         self.kv_reserved_pages = 0
         self.session_lock = threading.Lock()
         self.sessions: OrderedDict[int, Session] = OrderedDict()
+        self.disk_sessions: OrderedDict[str, Session] = OrderedDict()
         self.next_session_key = 1
+        identity_payload = {
+            "schema": "persistent-session-v1",
+            "artifact": self.manifest.get("integrity", {}).get(
+                "content_sha256", ""
+            ),
+            "dense": self.manifest.get("indexes", {}).get(
+                "dense_sha256", ""
+            ),
+            "kv_dtype": self.worker.kv_dtype,
+            "kv_page_tokens": self.worker.kv_page_tokens,
+            "response_protocol": self.response_protocol,
+            "tokenizer_class": type(self.tokenizer).__name__,
+            "tokenizer_size": len(self.tokenizer),
+            "special_tokens": self.tokenizer.special_tokens_map,
+            "chat_template": getattr(self.tokenizer, "chat_template", None),
+        }
+        self.session_cache_identity = hashlib.sha256(
+            json.dumps(identity_payload, sort_keys=True, separators=(",", ":"),
+                       ensure_ascii=False, default=str).encode("utf-8")
+        ).hexdigest()
+        self.session_cache_root = args.session_cache_root
+        self.session_cache_enabled = bool(
+            self.retention_enabled() and
+            getattr(self.worker, "session_persistence", False) and
+            self.session_cache_root is not None and
+            args.session_cache_bytes > 0
+        )
+        if self.session_cache_enabled:
+            self.session_cache_root.mkdir(parents=True, exist_ok=True)
+            self._load_persistent_sessions()
+            self._cleanup_persistent_sessions()
         self.id_lock = threading.Lock()
         self.next_id = 1
         self.draining = threading.Event()
@@ -1364,6 +1471,249 @@ class Application:
         return (not self.args.disable_session_retention and
                 getattr(self.worker, "session_retention", False))
 
+    def _session_cache_directory(self, persistent_id: str) -> Path:
+        if (not persistent_id or len(persistent_id) != 32 or
+                any(character not in "0123456789abcdef"
+                    for character in persistent_id)):
+            raise ValueError("persistent session id is invalid")
+        assert self.session_cache_root is not None
+        return self.session_cache_root / persistent_id
+
+    @staticmethod
+    def _directory_bytes(path: Path) -> int:
+        total = 0
+        try:
+            for item in path.rglob("*"):
+                if item.is_file():
+                    total += item.stat().st_size
+        except OSError:
+            return 0
+        return total
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Mapping[str, Any]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        candidate = path.with_name(path.name + ".partial")
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        with candidate.open("wb") as output:
+            output.write(encoded)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(candidate, path)
+
+    @staticmethod
+    def _metadata_digest(payload: Mapping[str, Any]) -> str:
+        authenticated = {
+            key: value for key, value in payload.items()
+            if key != "metadata_sha256"
+        }
+        return hashlib.sha256(json.dumps(
+            authenticated, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+
+    def _remove_persistent_session(self, session: Session,
+                                   reason: str) -> None:
+        if session.persistent_id is None:
+            return
+        with self.session_lock:
+            self.disk_sessions.pop(session.persistent_id, None)
+        if session.snapshot_path is not None:
+            shutil.rmtree(session.snapshot_path, ignore_errors=True)
+        log("session_snapshot_removed", persistent_id=session.persistent_id,
+            tokens=len(session.tokens), bytes=session.disk_bytes,
+            reason=reason)
+
+    def _load_persistent_sessions(self) -> None:
+        assert self.session_cache_root is not None
+        now = time.time()
+        loaded: list[Session] = []
+        for directory in self.session_cache_root.iterdir():
+            if not directory.is_dir():
+                if ".partial" in directory.name:
+                    try:
+                        directory.unlink()
+                    except OSError:
+                        pass
+                continue
+            metadata_path = directory / "session.json"
+            try:
+                payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+                if (not isinstance(payload, dict) or
+                        not hmac.compare_digest(
+                            str(payload.get("metadata_sha256", "")),
+                            self._metadata_digest(payload))):
+                    raise ValueError("persistent session checksum mismatch")
+                persistent_id = str(payload["persistent_id"])
+                if (payload.get("schema") != "persistent-session-v1" or
+                        directory != self._session_cache_directory(
+                            persistent_id) or
+                        payload.get("identity") != self.session_cache_identity):
+                    raise ValueError("persistent session identity mismatch")
+                generation = int(payload["generation"])
+                tokens = payload["tokens"]
+                pages = int(payload["pages"])
+                parked_bytes = int(payload["parked_bytes"])
+                last_used_epoch = float(payload["last_used_epoch"])
+                worker_metadata = payload["worker_metadata"]
+                signature_hex = payload.get("media_signature")
+                if (generation < 1 or not isinstance(tokens, list) or
+                        not 0 < len(tokens) <= self.args.max_context or
+                        any(not isinstance(token, int) or
+                            isinstance(token, bool) or token < 0 or
+                            token >= self.worker.vocab_size
+                            for token in tokens) or
+                        pages != self._context_pages(len(tokens)) or
+                        parked_bytes <= 0 or
+                        not isinstance(worker_metadata, dict) or
+                        int(worker_metadata.get("generation", 0)) !=
+                            generation or
+                        int(worker_metadata.get("next_position", 0)) !=
+                            len(tokens)):
+                    raise ValueError("persistent session metadata is invalid")
+                media_signature = (
+                    bytes.fromhex(signature_hex)
+                    if isinstance(signature_hex, str) else None
+                )
+                loaded.append(Session(
+                    key=0, tokens=[int(token) for token in tokens],
+                    pages=pages, last_used=time.monotonic(),
+                    media_signature=media_signature,
+                    parked_bytes=parked_bytes,
+                    persistent_id=persistent_id,
+                    snapshot_generation=generation,
+                    snapshot_path=directory,
+                    snapshot_metadata={
+                        key: value for key, value in worker_metadata.items()
+                        if isinstance(value, (int, bool))
+                    },
+                    disk_bytes=self._directory_bytes(directory),
+                    resident=False, persistent_last_used=last_used_epoch,
+                ))
+            except Exception as error:
+                shutil.rmtree(directory, ignore_errors=True)
+                log("session_snapshot_rejected", path=str(directory),
+                    error=str(error))
+        loaded.sort(key=lambda session: session.persistent_last_used)
+        with self.session_lock:
+            for session in loaded:
+                assert session.persistent_id is not None
+                self.disk_sessions[session.persistent_id] = session
+        log("session_snapshot_index_loaded", sessions=len(loaded),
+            bytes=sum(session.disk_bytes for session in loaded))
+
+    def _cleanup_persistent_sessions(self) -> None:
+        if not getattr(self, "session_cache_enabled", False):
+            return
+        now = time.time()
+        ttl = self.args.session_cache_ttl_seconds
+        expired: list[Session] = []
+        with self.session_lock:
+            live_ids = {
+                session.persistent_id for session in self.sessions.values()
+                if session.persistent_id is not None
+            }
+            for persistent_id, session in list(self.disk_sessions.items()):
+                if (ttl > 0 and now - session.persistent_last_used > ttl and
+                        persistent_id not in live_ids):
+                    expired.append(self.disk_sessions.pop(persistent_id))
+            total = sum(session.disk_bytes
+                        for session in self.disk_sessions.values())
+            while total > self.args.session_cache_bytes:
+                candidate = next((
+                    (key, value) for key, value in self.disk_sessions.items()
+                    if key not in live_ids
+                ), None)
+                if candidate is None:
+                    break
+                key, session = candidate
+                self.disk_sessions.pop(key)
+                total -= session.disk_bytes
+                expired.append(session)
+        for session in expired:
+            if session.snapshot_path is not None:
+                shutil.rmtree(session.snapshot_path, ignore_errors=True)
+            log("session_snapshot_evicted",
+                persistent_id=session.persistent_id,
+                tokens=len(session.tokens), bytes=session.disk_bytes)
+
+    def _persist_session(self, session: Session,
+                         previous: Session | None) -> None:
+        if not getattr(self, "session_cache_enabled", False):
+            return
+        persistent_id = (
+            previous.persistent_id
+            if previous is not None and previous.persistent_id is not None
+            else uuid.uuid4().hex
+        )
+        previous_generation = (
+            previous.snapshot_generation if previous is not None else 0
+        )
+        generation = max(previous_generation + 1, time.time_ns())
+        directory = self._session_cache_directory(persistent_id)
+        worker_metadata = self.worker.save_session(
+            session.key, directory, generation
+        )
+        if (int(worker_metadata["next_position"]) != len(session.tokens) or
+                int(worker_metadata["populated_pages"]) != session.pages or
+                int(worker_metadata["logical_bytes"]) !=
+                    session.parked_bytes):
+            raise WorkerError("persisted session accounting mismatch")
+        now = time.time()
+        metadata = {
+            "schema": "persistent-session-v1",
+            "identity": self.session_cache_identity,
+            "persistent_id": persistent_id,
+            "generation": generation,
+            "tokens": session.tokens,
+            "pages": session.pages,
+            "parked_bytes": session.parked_bytes,
+            "media_signature": (
+                session.media_signature.hex()
+                if session.media_signature is not None else None
+            ),
+            "last_used_epoch": now,
+            "worker_metadata": worker_metadata,
+        }
+        metadata["metadata_sha256"] = self._metadata_digest(metadata)
+        self._write_json_atomic(directory / "session.json", metadata)
+        try:
+            self.worker.prune_session(session.key, directory, generation)
+        except Exception as error:
+            # The committed generation remains valid. Stale immutable blobs
+            # cost disk space but cannot change which snapshot is selected.
+            log("session_snapshot_prune_failed",
+                persistent_id=persistent_id, generation=generation,
+                error=str(error))
+        session.persistent_id = persistent_id
+        session.snapshot_generation = generation
+        session.snapshot_path = directory
+        session.snapshot_metadata = worker_metadata
+        session.persistent_last_used = now
+        session.disk_bytes = self._directory_bytes(directory)
+        durable = Session(
+            key=0, tokens=list(session.tokens), pages=session.pages,
+            last_used=time.monotonic(),
+            media_signature=session.media_signature,
+            parked_bytes=session.parked_bytes,
+            persistent_id=persistent_id,
+            snapshot_generation=generation,
+            snapshot_path=directory,
+            snapshot_metadata=dict(worker_metadata),
+            disk_bytes=session.disk_bytes, resident=False,
+            persistent_last_used=now,
+        )
+        with self.session_lock:
+            self.disk_sessions.pop(persistent_id, None)
+            self.disk_sessions[persistent_id] = durable
+        log("session_snapshot_committed", persistent_id=persistent_id,
+            generation=generation, tokens=len(session.tokens),
+            logical_bytes=session.parked_bytes,
+            written_bytes=int(worker_metadata["written_bytes"]),
+            disk_bytes=session.disk_bytes)
+        self._cleanup_persistent_sessions()
+
     def _context_pages(self, context_tokens: int) -> int:
         return (context_tokens + self.worker.kv_page_tokens - 1) // \
             self.worker.kv_page_tokens
@@ -1427,33 +1777,74 @@ class Application:
                         session.media_signature == media_signature and
                         (best is None or length > len(best.tokens))):
                     best = session
-            if best is not None:
+            best_disk_id: str | None = None
+            if getattr(self, "session_cache_enabled", False):
+                for persistent_id, session in getattr(
+                        self, "disk_sessions", {}).items():
+                    length = len(session.tokens)
+                    if (length <= len(prompt_ids) and
+                            prompt_ids[:length] == session.tokens and
+                            session.media_signature == media_signature and
+                            (best is None or length > len(best.tokens))):
+                        best = session
+                        best_disk_id = persistent_id
+            if best is not None and best.resident:
                 del self.sessions[best.key]
+            elif best_disk_id is not None:
+                self.disk_sessions.pop(best_disk_id)
         return best
 
     def store_session(self, session_key: int, tokens: list[int],
                       pages: int,
                       media_signature: bytes | None = None,
-                      parked_bytes: int = 0) -> None:
+                      parked_bytes: int = 0,
+                      persistent_source: Session | None = None) -> Session:
         duplicates: list[Session] = []
+        stored = Session(
+            key=session_key, tokens=tokens, pages=pages,
+            last_used=time.monotonic(), media_signature=media_signature,
+            parked_bytes=parked_bytes,
+            persistent_id=(persistent_source.persistent_id
+                           if persistent_source is not None else None),
+            snapshot_generation=(persistent_source.snapshot_generation
+                                 if persistent_source is not None else 0),
+            snapshot_path=(persistent_source.snapshot_path
+                           if persistent_source is not None else None),
+            snapshot_metadata=(persistent_source.snapshot_metadata
+                               if persistent_source is not None else None),
+            disk_bytes=(persistent_source.disk_bytes
+                        if persistent_source is not None else 0),
+            persistent_last_used=(persistent_source.persistent_last_used
+                                  if persistent_source is not None else 0.0),
+        )
         with self.session_lock:
             for key, session in list(self.sessions.items()):
                 if (session.tokens == tokens and
                         session.media_signature == media_signature):
                     duplicates.append(self.sessions.pop(key))
-            self.sessions[session_key] = Session(
-                key=session_key, tokens=tokens, pages=pages,
-                last_used=time.monotonic(), media_signature=media_signature,
-                parked_bytes=parked_bytes,
-            )
+            self.sessions[session_key] = stored
         for duplicate in duplicates:
             self._drop_worker_session(duplicate.key)
             self.release_context_credits(duplicate.pages)
+        return stored
+
+    def _return_disk_session(self, session: Session) -> None:
+        if session.persistent_id is None:
+            return
+        session.key = 0
+        session.resident = False
+        with self.session_lock:
+            disk_sessions = getattr(self, "disk_sessions", None)
+            if disk_sessions is not None:
+                disk_sessions.pop(session.persistent_id, None)
+                disk_sessions[session.persistent_id] = session
 
     def abandon_session(self, session: Session) -> None:
         """Drop a checked-out session whose request never started."""
-        self._drop_worker_session(session.key)
-        self.release_context_credits(session.pages)
+        if session.resident:
+            self._drop_worker_session(session.key)
+            self.release_context_credits(session.pages)
+        self._return_disk_session(session)
 
     def allocate_session_key(self) -> int:
         with self.session_lock:
@@ -1466,6 +1857,38 @@ class Application:
                                 media_signature: bytes | None = None,
                                 ) -> RequestContext | None:
         session = self.checkout_session(prompt_ids, media_signature)
+        if session is not None and not session.resident:
+            while not self._acquire_pages(session.pages):
+                if not self.evict_lru_session():
+                    self._return_disk_session(session)
+                    session = None
+                    break
+            if session is not None:
+                key = self.allocate_session_key()
+                try:
+                    assert session.snapshot_path is not None
+                    assert session.snapshot_metadata is not None
+                    started = time.monotonic()
+                    self.worker.load_session(
+                        key, session.snapshot_path,
+                        session.snapshot_generation,
+                        session.snapshot_metadata,
+                    )
+                    session.key = key
+                    session.resident = True
+                    log("session_snapshot_restored",
+                        persistent_id=session.persistent_id,
+                        generation=session.snapshot_generation,
+                        tokens=len(session.tokens),
+                        logical_bytes=session.parked_bytes,
+                        wall_seconds=time.monotonic() - started)
+                except Exception as error:
+                    self.release_context_credits(session.pages)
+                    log("session_snapshot_restore_failed",
+                        persistent_id=session.persistent_id,
+                        error=str(error))
+                    self._return_disk_session(session)
+                    session = None
         # The provider allocates execution KV on demand. Admission therefore
         # carries only an already-parked prefix; speculative output capacity
         # is never reserved as if it were populated state.
@@ -1495,6 +1918,7 @@ class Application:
             self.release_context_credits(context.held_pages)
         if context.session is not None:
             self._drop_worker_session(context.session.key)
+            self._return_disk_session(context.session)
 
     def worker_stats(self, refresh: bool = True) -> dict[str, int]:
         lock = getattr(self, "_worker_stats_lock", None)
@@ -3000,11 +3424,19 @@ class Application:
             raise WorkerError(
                 "retained-session RAM credits changed during parking"
             )
-        self.store_session(
+        stored = self.store_session(
             session_key, visible_tokens[:retained_tokens], retained_pages,
-            media_signature, parked_bytes,
+            media_signature, parked_bytes, persistent_source=session,
         )
         context.retained = True
+        try:
+            self._persist_session(stored, session)
+        except Exception as error:
+            # Persistence is a durable acceleration tier. A failed write must
+            # never invalidate the exact in-RAM retained state that already
+            # passed the provider's checkpoint gate.
+            log("session_snapshot_save_failed", key=session_key,
+                error=str(error))
         log("session_retained", key=session_key, tokens=retained_tokens,
             resumed=resumed)
         return True
@@ -3105,6 +3537,7 @@ class Application:
                         self.store_session(
                             session.key, session.tokens, session.pages,
                             session.media_signature, session.parked_bytes,
+                            persistent_source=session,
                         )
                         context.retained = True
                         log("session_resume_rolled_back", key=session.key,
@@ -3226,6 +3659,14 @@ class Application:
             session_parked_bytes = sum(
                 session.parked_bytes for session in self.sessions.values()
             )
+            disk_sessions = getattr(self, "disk_sessions", {})
+            disk_session_count = len(disk_sessions)
+            disk_session_tokens = sum(
+                len(session.tokens) for session in disk_sessions.values()
+            )
+            disk_session_bytes = sum(
+                session.disk_bytes for session in disk_sessions.values()
+            )
         # Introspection must remain available during a long layer-major
         # prefill.  The worker command stream is deliberately serialized, so
         # querying STATS here would otherwise block behind the GPU request.
@@ -3342,6 +3783,12 @@ class Application:
                 "parking_enabled": getattr(
                     self.worker, "session_parking", False
                 ),
+                "persistence_supported": getattr(
+                    self.worker, "session_persistence", False
+                ),
+                "persistence_enabled": getattr(
+                    self, "session_cache_enabled", False
+                ),
                 "park_ram_bytes": getattr(
                     self.worker, "session_park_ram_bytes", 0
                 ),
@@ -3352,6 +3799,15 @@ class Application:
                 "retained_tokens": session_tokens,
                 "reserved_pages": session_pages,
                 "parked_bytes": session_parked_bytes,
+                "disk_retained": disk_session_count,
+                "disk_retained_tokens": disk_session_tokens,
+                "disk_bytes": disk_session_bytes,
+                "disk_byte_limit": getattr(
+                    self.args, "session_cache_bytes", 0
+                ),
+                "disk_ttl_seconds": getattr(
+                    self.args, "session_cache_ttl_seconds", 0.0
+                ),
             },
             "worker_runtime": {
                 **runtime_stats,
@@ -3388,6 +3844,14 @@ class Application:
                     self.args.worker_prefill_chunk_tokens,
                 "session_retention": self.retention_enabled(),
                 "session_idle_seconds": self.args.session_idle_seconds,
+                "session_cache_enabled": getattr(
+                    self, "session_cache_enabled", False
+                ),
+                "session_cache_bytes": getattr(
+                    self.args, "session_cache_bytes", 0
+                ),
+                "session_cache_ttl_seconds":
+                    getattr(self.args, "session_cache_ttl_seconds", 0.0),
                 "microbatch_window_ms": self.args.microbatch_window_ms,
                 "latency_window": self.args.latency_window,
                 "queue_timeout_seconds": self.args.queue_timeout,
@@ -4398,6 +4862,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--disable-session-retention", action="store_true")
     parser.add_argument("--session-idle-seconds", type=float, default=1800.0)
+    parser.add_argument("--session-cache-root", type=Path)
+    parser.add_argument("--session-cache-bytes", type=int, default=0)
+    parser.add_argument(
+        "--session-cache-ttl-seconds", type=float, default=604800.0
+    )
     parser.add_argument("--profile-gpu-phases", action="store_true")
     parser.add_argument(
         "--disable-worker-retained-route", action="store_true",
@@ -4445,7 +4914,11 @@ def main() -> int:
         args.worker_prefill_chunk_tokens < 0 or
         (args.worker_placement_settle_steps is not None and
          args.worker_placement_settle_steps < 0) or
-        args.session_idle_seconds < 0 or args.maximum_body_bytes < 1 or
+        args.session_idle_seconds < 0 or args.session_cache_bytes < 0 or
+        args.session_cache_ttl_seconds < 0 or
+        ((args.session_cache_root is None) !=
+         (args.session_cache_bytes == 0)) or
+        args.maximum_body_bytes < 1 or
         args.maximum_image_pixels < 65536 or
         args.maximum_image_patch_tokens < 256 or
         args.microbatch_window_ms < 0 or args.latency_window < 1):

@@ -2738,22 +2738,95 @@ ResidentFp16AttentionProfile resident_fp16_attention_262144_profile() {
   return result;
 }
 
-bool topk_logits_check() {
+struct TopKLogitsProfile final {
+  bool pass{};
+  double milliseconds{};
+};
+
+TopKLogitsProfile topk_logits_check() {
   const std::vector<float> logits{
       1.0F, 7.0F, std::numeric_limits<float>::quiet_NaN(), 7.0F,
       -2.0F, 4.5F, 4.5F, 9.0F, 0.0F};
   DeviceBuffer<float> device_logits(logits.size());
   DeviceBuffer<float> device_values(5U);
   DeviceBuffer<std::uint32_t> device_indices(5U);
+  const auto workspace_items =
+      expert::runtime::cuda::topk_logits_workspace_items(logits.size());
+  DeviceBuffer<float> workspace_values(workspace_items);
+  DeviceBuffer<std::uint32_t> workspace_indices(workspace_items);
   device_logits.upload(logits);
   status_check(expert::runtime::cuda::topk_logits(
       device_logits.get(), static_cast<std::uint32_t>(logits.size()), 5U,
-      device_values.get(), device_indices.get(), nullptr));
+      device_values.get(), device_indices.get(),
+      {workspace_values.get(), workspace_items * sizeof(float),
+       workspace_indices.get(), workspace_items * sizeof(std::uint32_t)},
+      nullptr));
   cuda_check(cudaDeviceSynchronize(), "synchronize top-k logits smoke");
   const auto values = device_values.download();
   const auto indices = device_indices.download();
-  return indices == std::vector<std::uint32_t>({7U, 1U, 3U, 5U, 6U}) &&
-         values == std::vector<float>({9.0F, 7.0F, 7.0F, 4.5F, 4.5F});
+  const auto small_pass =
+      indices == std::vector<std::uint32_t>({7U, 1U, 3U, 5U, 6U}) &&
+      values == std::vector<float>({9.0F, 7.0F, 7.0F, 4.5F, 4.5F});
+
+  constexpr std::uint32_t vocabulary = 248320U;
+  constexpr std::uint32_t top_k = 20U;
+  constexpr std::uint32_t iterations = 32U;
+  std::vector<float> large_logits(vocabulary);
+  for (std::uint32_t index = 0U; index < vocabulary; ++index)
+    large_logits[index] =
+        std::sin(static_cast<float>(index) * 0.0137F) +
+        0.37F * std::cos(static_cast<float>(index) * 0.0071F);
+  large_logits[19U] = 7.0F;
+  large_logits[127U] = 7.0F;
+  large_logits[1021U] = std::numeric_limits<float>::quiet_NaN();
+  std::vector<std::uint32_t> expected(vocabulary);
+  for (std::uint32_t index = 0U; index < vocabulary; ++index)
+    expected[index] = index;
+  std::stable_sort(expected.begin(), expected.end(), [&](auto left, auto right) {
+    const auto left_value = large_logits[left];
+    const auto right_value = large_logits[right];
+    if (std::isnan(left_value)) return false;
+    if (std::isnan(right_value)) return true;
+    if (left_value != right_value) return left_value > right_value;
+    return left < right;
+  });
+  expected.resize(top_k);
+
+  DeviceBuffer<float> large_device_logits(vocabulary);
+  DeviceBuffer<float> large_device_values(top_k);
+  DeviceBuffer<std::uint32_t> large_device_indices(top_k);
+  const auto large_workspace_items =
+      expert::runtime::cuda::topk_logits_workspace_items(vocabulary);
+  DeviceBuffer<float> large_workspace_values(large_workspace_items);
+  DeviceBuffer<std::uint32_t> large_workspace_indices(large_workspace_items);
+  large_device_logits.upload(large_logits);
+  const expert::runtime::cuda::TopKLogitsWorkspace large_workspace{
+      large_workspace_values.get(), large_workspace_items * sizeof(float),
+      large_workspace_indices.get(),
+      large_workspace_items * sizeof(std::uint32_t)};
+  for (std::uint32_t warmup = 0U; warmup < 3U; ++warmup)
+    status_check(expert::runtime::cuda::topk_logits(
+        large_device_logits.get(), vocabulary, top_k,
+        large_device_values.get(), large_device_indices.get(),
+        large_workspace, nullptr));
+  cudaEvent_t start{}, stop{};
+  cuda_check(cudaEventCreate(&start), "create top-k start event");
+  cuda_check(cudaEventCreate(&stop), "create top-k stop event");
+  cuda_check(cudaEventRecord(start), "record top-k start");
+  for (std::uint32_t iteration = 0U; iteration < iterations; ++iteration)
+    status_check(expert::runtime::cuda::topk_logits(
+        large_device_logits.get(), vocabulary, top_k,
+        large_device_values.get(), large_device_indices.get(),
+        large_workspace, nullptr));
+  cuda_check(cudaEventRecord(stop), "record top-k stop");
+  cuda_check(cudaEventSynchronize(stop), "synchronize top-k stop");
+  float total_milliseconds{};
+  cuda_check(cudaEventElapsedTime(&total_milliseconds, start, stop),
+             "measure top-k elapsed time");
+  static_cast<void>(cudaEventDestroy(start));
+  static_cast<void>(cudaEventDestroy(stop));
+  return {small_pass && large_device_indices.download() == expected,
+          static_cast<double>(total_milliseconds) / iterations};
 }
 
 bool presence_penalty_check() {
@@ -2777,7 +2850,7 @@ bool presence_penalty_check() {
 int main() {
   try {
     const auto error = numerical_check();
-    const auto topk_pass = topk_logits_check();
+    const auto topk = topk_logits_check();
     const auto presence_penalty_pass = presence_penalty_check();
     const auto delta_error = delta_prefill_check();
     const auto attention_error = attention_prefill_check();
@@ -2813,7 +2886,8 @@ int main() {
                  item.kv_gb_per_second > 0.0 &&
                  item.maximum_absolute_difference < 2.0e-4;
         });
-    const bool pass = topk_pass && presence_penalty_pass &&
+    const bool pass = topk.pass && topk.milliseconds <= 7.09 &&
+                      presence_penalty_pass &&
                       error < 2.0e-4 &&
                       delta_error < 2.0e-5 &&
                       attention_error < 2.0e-4 &&
@@ -2920,6 +2994,10 @@ int main() {
                           32.5 &&
                       attention_profiles_pass;
     std::cout << "{\"pass\":" << (pass ? "true" : "false")
+              << ",\"topk_logits_pass\":"
+              << (topk.pass ? "true" : "false")
+              << ",\"topk_logits_248320_milliseconds\":"
+              << topk.milliseconds
               << ",\"presence_penalty_pass\":"
               << (presence_penalty_pass ? "true" : "false")
               << ",\"maximum_absolute_error\":" << error

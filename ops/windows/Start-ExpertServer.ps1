@@ -24,6 +24,9 @@ param(
     [int]$WorkerKvPageTokens = 256,
     [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
+    [string]$SessionCacheRoot = "",
+    [int]$SessionCacheGiB = 0,
+    [int]$SessionCacheTtlSeconds = 604800,
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -114,6 +117,16 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     @("--raw-response-trace-file", ([System.IO.Path]::GetFullPath(
         $RawResponseTraceFile)))
 } else { @() }
+[string[]]$sessionCacheArguments = if ($SessionCacheGiB -gt 0) {
+    if (-not $SessionCacheRoot) {
+        throw "SessionCacheRoot is required when SessionCacheGiB is positive"
+    }
+    @(
+        "--session-cache-root", ([System.IO.Path]::GetFullPath($SessionCacheRoot)),
+        "--session-cache-bytes", [string]([int64]$SessionCacheGiB * 1GB),
+        "--session-cache-ttl-seconds", [string]$SessionCacheTtlSeconds
+    )
+} else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -135,6 +148,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
     --worker-kv-cache-dtype $WorkerKvCacheDtype `
+    @sessionCacheArguments `
     @profileArguments `
     @retainedRouteArguments `
     @cpuHybridArguments `

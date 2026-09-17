@@ -12,6 +12,7 @@
 #include "expert/runtime/model_tensor_store.hpp"
 #include "expert/runtime/program_executor.hpp"
 #include "expert/runtime/routed_expert_runtime.hpp"
+#include "expert/runtime/sha256.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 #include "expert/runtime/worker_provider.hpp"
 
@@ -27,6 +28,7 @@
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <future>
 #include <iostream>
 #include <limits>
@@ -42,6 +44,7 @@
 #include <string_view>
 #include <thread>
 #include <type_traits>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -93,6 +96,371 @@ TargetKvEncoding target_kv_encoding(std::string_view value) {
   if (value == "fp16") return TargetKvEncoding::fp16;
   throw std::runtime_error("unsupported target KV cache dtype");
 }
+
+constexpr std::uint64_t kDenseSnapshotMagic = 0x3150414e534d5651ULL;
+constexpr std::uint32_t kDenseSnapshotVersion = 1U;
+constexpr std::size_t kSnapshotChunkBytes = 4U << 20U;
+constexpr std::uint32_t kMaximumSnapshotVectorItems = 4U << 20U;
+
+std::string digest_hex(const er::Sha256Digest& digest) {
+  constexpr char digits[] = "0123456789abcdef";
+  std::string result(digest.size() * 2U, '0');
+  for (std::size_t index = 0U; index < digest.size(); ++index) {
+    const auto value = std::to_integer<unsigned>(digest[index]);
+    result[2U * index] = digits[value >> 4U];
+    result[2U * index + 1U] = digits[value & 15U];
+  }
+  return result;
+}
+
+class SnapshotEncoder final {
+ public:
+  void u8(std::uint8_t value) {
+    bytes_.push_back(static_cast<std::byte>(value));
+  }
+  void u32(std::uint32_t value) {
+    for (unsigned shift = 0U; shift != 32U; shift += 8U)
+      bytes_.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
+  }
+  void i32(std::int32_t value) {
+    u32(std::bit_cast<std::uint32_t>(value));
+  }
+  void u64(std::uint64_t value) {
+    for (unsigned shift = 0U; shift != 64U; shift += 8U)
+      bytes_.push_back(static_cast<std::byte>((value >> shift) & 0xffU));
+  }
+  void raw(std::span<const std::byte> value) {
+    bytes_.insert(bytes_.end(), value.begin(), value.end());
+  }
+  template <typename T>
+  void vector(const std::vector<T>& values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    if (values.size() > std::numeric_limits<std::uint32_t>::max())
+      throw std::runtime_error("snapshot vector is too large");
+    u32(static_cast<std::uint32_t>(values.size()));
+    raw({reinterpret_cast<const std::byte*>(values.data()),
+         values.size() * sizeof(T)});
+  }
+  [[nodiscard]] std::span<const std::byte> view() const noexcept {
+    return bytes_;
+  }
+  [[nodiscard]] std::vector<std::byte> finish() && {
+    return std::move(bytes_);
+  }
+
+ private:
+  std::vector<std::byte> bytes_;
+};
+
+class SnapshotDecoder final {
+ public:
+  explicit SnapshotDecoder(std::span<const std::byte> bytes) : bytes_(bytes) {}
+  bool u8(std::uint8_t& value) noexcept {
+    if (cursor_ == bytes_.size()) return false;
+    value = std::to_integer<std::uint8_t>(bytes_[cursor_++]);
+    return true;
+  }
+  bool u32(std::uint32_t& value) noexcept {
+    if (bytes_.size() - cursor_ < 4U) return false;
+    value = 0U;
+    for (unsigned shift = 0U; shift != 32U; shift += 8U)
+      value |= std::to_integer<std::uint32_t>(bytes_[cursor_++]) << shift;
+    return true;
+  }
+  bool i32(std::int32_t& value) noexcept {
+    std::uint32_t bits{};
+    if (!u32(bits)) return false;
+    value = std::bit_cast<std::int32_t>(bits);
+    return true;
+  }
+  bool u64(std::uint64_t& value) noexcept {
+    if (bytes_.size() - cursor_ < 8U) return false;
+    value = 0U;
+    for (unsigned shift = 0U; shift != 64U; shift += 8U)
+      value |= std::to_integer<std::uint64_t>(bytes_[cursor_++]) << shift;
+    return true;
+  }
+  bool raw(std::size_t size, std::span<const std::byte>& value) noexcept {
+    if (size > bytes_.size() - cursor_) return false;
+    value = bytes_.subspan(cursor_, size);
+    cursor_ += size;
+    return true;
+  }
+  template <typename T>
+  bool vector(std::vector<T>& values) {
+    static_assert(std::is_trivially_copyable_v<T>);
+    std::uint32_t count{};
+    if (!u32(count) || count > kMaximumSnapshotVectorItems ||
+        static_cast<std::uint64_t>(count) * sizeof(T) >
+            bytes_.size() - cursor_)
+      return false;
+    values.resize(count);
+    if (count != 0U)
+      std::memcpy(values.data(), bytes_.data() + cursor_,
+                  static_cast<std::size_t>(count) * sizeof(T));
+    cursor_ += static_cast<std::size_t>(count) * sizeof(T);
+    return true;
+  }
+  [[nodiscard]] bool empty() const noexcept { return cursor_ == bytes_.size(); }
+
+ private:
+  std::span<const std::byte> bytes_;
+  std::size_t cursor_{};
+};
+
+struct SnapshotChunk final {
+  er::Sha256Digest digest{};
+  std::uint32_t bytes{};
+};
+
+struct DenseSnapshotManifest final {
+  std::uint64_t generation{};
+  er::Sha256Digest model_hash{};
+  std::uint32_t max_context{};
+  std::uint32_t page_tokens{};
+  std::uint64_t page_bytes{};
+  std::uint64_t host_page_bytes{};
+  std::uint32_t current_position{};
+  std::uint32_t current_batch_first{};
+  std::uint32_t current_batch_rows{};
+  std::uint32_t synchronization_first{};
+  std::uint32_t synchronization_rows{};
+  std::uint32_t synchronization_consumed{};
+  std::uint32_t mtp_length{};
+  std::uint32_t synchronized_token{};
+  std::uint32_t draft_token{};
+  std::uint32_t retention_position{};
+  std::int32_t rope_delta{};
+  bool draft_valid{};
+  bool retention_valid{};
+  bool exact_decode_enabled{};
+  std::uint32_t host_kv_populated_tokens{};
+  std::uint32_t logical_pages{};
+  std::uint64_t page_payload_bytes{};
+  std::uint64_t window_payload_bytes{};
+  std::uint64_t parked_bytes{};
+  std::uint64_t reported_bytes{};
+  std::vector<std::uint32_t> page_indices;
+  std::vector<std::uint32_t> prompt_mrope_positions;
+  std::vector<float> sequence_target_hidden;
+  std::vector<std::uint32_t> ple_history;
+  std::vector<std::uint32_t> ple_retention_history;
+  std::uint32_t host_page_count{};
+  std::uint64_t logical_data_bytes{};
+  std::vector<SnapshotChunk> chunks;
+};
+
+std::filesystem::path snapshot_manifest_path(
+    const std::filesystem::path& root, std::uint64_t generation) {
+  return root / ("manifest-" + std::to_string(generation) + ".qsc");
+}
+
+void write_atomic_file(const std::filesystem::path& destination,
+                       std::span<const std::byte> bytes,
+                       std::uint64_t nonce) {
+  std::filesystem::create_directories(destination.parent_path());
+  auto candidate = destination;
+  candidate += ".partial-" + std::to_string(nonce);
+  {
+    std::ofstream output(candidate, std::ios::binary | std::ios::trunc);
+    if (!output) throw std::runtime_error("cannot create snapshot candidate");
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
+    output.flush();
+    if (!output) throw std::runtime_error("cannot write snapshot candidate");
+  }
+  std::error_code error;
+  std::filesystem::rename(candidate, destination, error);
+  if (error) {
+    std::filesystem::remove(candidate);
+    throw std::runtime_error("cannot publish snapshot candidate: " +
+                             error.message());
+  }
+}
+
+std::vector<std::byte> read_file(const std::filesystem::path& path,
+                                 std::uint64_t maximum) {
+  std::error_code error;
+  const auto size = std::filesystem::file_size(path, error);
+  if (error || size == 0U || size > maximum ||
+      size > std::numeric_limits<std::size_t>::max())
+    throw std::runtime_error("snapshot file size is invalid");
+  std::vector<std::byte> bytes(static_cast<std::size_t>(size));
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("cannot open snapshot file");
+  input.read(reinterpret_cast<char*>(bytes.data()),
+             static_cast<std::streamsize>(bytes.size()));
+  if (!input || input.peek() != std::ifstream::traits_type::eof())
+    throw std::runtime_error("cannot read complete snapshot file");
+  return bytes;
+}
+
+std::vector<std::byte> encode_snapshot_manifest(
+    const DenseSnapshotManifest& value) {
+  SnapshotEncoder output;
+  output.u64(kDenseSnapshotMagic);
+  output.u32(kDenseSnapshotVersion);
+  output.u64(value.generation);
+  output.raw(value.model_hash);
+  output.u32(value.max_context);
+  output.u32(value.page_tokens);
+  output.u64(value.page_bytes);
+  output.u64(value.host_page_bytes);
+  output.u32(value.current_position);
+  output.u32(value.current_batch_first);
+  output.u32(value.current_batch_rows);
+  output.u32(value.synchronization_first);
+  output.u32(value.synchronization_rows);
+  output.u32(value.synchronization_consumed);
+  output.u32(value.mtp_length);
+  output.u32(value.synchronized_token);
+  output.u32(value.draft_token);
+  output.u32(value.retention_position);
+  output.i32(value.rope_delta);
+  output.u8(value.draft_valid ? 1U : 0U);
+  output.u8(value.retention_valid ? 1U : 0U);
+  output.u8(value.exact_decode_enabled ? 1U : 0U);
+  output.u32(value.host_kv_populated_tokens);
+  output.u32(value.logical_pages);
+  output.u64(value.page_payload_bytes);
+  output.u64(value.window_payload_bytes);
+  output.u64(value.parked_bytes);
+  output.u64(value.reported_bytes);
+  output.vector(value.page_indices);
+  output.vector(value.prompt_mrope_positions);
+  output.vector(value.sequence_target_hidden);
+  output.vector(value.ple_history);
+  output.vector(value.ple_retention_history);
+  output.u32(value.host_page_count);
+  output.u64(value.logical_data_bytes);
+  if (value.chunks.size() > std::numeric_limits<std::uint32_t>::max())
+    throw std::runtime_error("snapshot has too many chunks");
+  output.u32(static_cast<std::uint32_t>(value.chunks.size()));
+  for (const auto& chunk : value.chunks) {
+    output.raw(chunk.digest);
+    output.u32(chunk.bytes);
+  }
+  const auto digest = er::sha256(output.view());
+  output.raw(digest);
+  return std::move(output).finish();
+}
+
+DenseSnapshotManifest decode_snapshot_manifest(
+    std::span<const std::byte> encoded) {
+  if (encoded.size() < 32U)
+    throw std::runtime_error("snapshot manifest is truncated");
+  const auto authenticated = encoded.first(encoded.size() - 32U);
+  const auto stored = encoded.last(32U);
+  er::Sha256Digest stored_digest{};
+  std::copy(stored.begin(), stored.end(), stored_digest.begin());
+  if (!er::constant_time_equal(er::sha256(authenticated), stored_digest))
+    throw std::runtime_error("snapshot manifest checksum mismatch");
+  SnapshotDecoder input(authenticated);
+  DenseSnapshotManifest value;
+  std::uint64_t magic{};
+  std::uint32_t version{};
+  std::span<const std::byte> hash;
+  std::uint8_t draft{};
+  std::uint8_t retention{};
+  std::uint8_t exact{};
+  std::uint32_t chunks{};
+  if (!input.u64(magic) || !input.u32(version) ||
+      magic != kDenseSnapshotMagic || version != kDenseSnapshotVersion ||
+      !input.u64(value.generation) ||
+      !input.raw(value.model_hash.size(), hash) ||
+      !input.u32(value.max_context) || !input.u32(value.page_tokens) ||
+      !input.u64(value.page_bytes) || !input.u64(value.host_page_bytes) ||
+      !input.u32(value.current_position) ||
+      !input.u32(value.current_batch_first) ||
+      !input.u32(value.current_batch_rows) ||
+      !input.u32(value.synchronization_first) ||
+      !input.u32(value.synchronization_rows) ||
+      !input.u32(value.synchronization_consumed) ||
+      !input.u32(value.mtp_length) ||
+      !input.u32(value.synchronized_token) ||
+      !input.u32(value.draft_token) ||
+      !input.u32(value.retention_position) || !input.i32(value.rope_delta) ||
+      !input.u8(draft) || !input.u8(retention) || !input.u8(exact) ||
+      draft > 1U || retention > 1U || exact > 1U ||
+      !input.u32(value.host_kv_populated_tokens) ||
+      !input.u32(value.logical_pages) ||
+      !input.u64(value.page_payload_bytes) ||
+      !input.u64(value.window_payload_bytes) ||
+      !input.u64(value.parked_bytes) ||
+      !input.u64(value.reported_bytes) ||
+      !input.vector(value.page_indices) ||
+      !input.vector(value.prompt_mrope_positions) ||
+      !input.vector(value.sequence_target_hidden) ||
+      !input.vector(value.ple_history) ||
+      !input.vector(value.ple_retention_history) ||
+      !input.u32(value.host_page_count) ||
+      !input.u64(value.logical_data_bytes) || !input.u32(chunks) ||
+      chunks > kMaximumSnapshotVectorItems)
+    throw std::runtime_error("snapshot manifest layout is invalid");
+  std::copy(hash.begin(), hash.end(), value.model_hash.begin());
+  value.draft_valid = draft != 0U;
+  value.retention_valid = retention != 0U;
+  value.exact_decode_enabled = exact != 0U;
+  value.chunks.resize(chunks);
+  for (auto& chunk : value.chunks) {
+    std::span<const std::byte> digest;
+    if (!input.raw(chunk.digest.size(), digest) || !input.u32(chunk.bytes) ||
+        chunk.bytes == 0U || chunk.bytes > kSnapshotChunkBytes)
+      throw std::runtime_error("snapshot chunk record is invalid");
+    std::copy(digest.begin(), digest.end(), chunk.digest.begin());
+  }
+  if (!input.empty())
+    throw std::runtime_error("snapshot manifest has trailing data");
+  return value;
+}
+
+class ContentAddressedSnapshotWriter final {
+ public:
+  ContentAddressedSnapshotWriter(std::filesystem::path root,
+                                 std::uint64_t generation)
+      : root_(std::move(root)), generation_(generation) {
+    buffer_.reserve(kSnapshotChunkBytes);
+    std::filesystem::create_directories(root_);
+  }
+  void append(std::span<const std::byte> bytes) {
+    while (!bytes.empty()) {
+      const auto count = std::min(kSnapshotChunkBytes - buffer_.size(),
+                                  bytes.size());
+      buffer_.insert(buffer_.end(), bytes.begin(), bytes.begin() + count);
+      bytes = bytes.subspan(count);
+      if (buffer_.size() == kSnapshotChunkBytes) flush();
+    }
+  }
+  std::vector<SnapshotChunk> finish() {
+    if (!buffer_.empty()) flush();
+    return std::move(chunks_);
+  }
+  [[nodiscard]] std::uint64_t written_bytes() const noexcept {
+    return written_bytes_;
+  }
+
+ private:
+  void flush() {
+    const auto digest = er::sha256(buffer_);
+    const auto path = root_ / (digest_hex(digest) + ".blob");
+    std::error_code error;
+    const auto existing = std::filesystem::file_size(path, error);
+    if (error || existing != buffer_.size()) {
+      if (!error)
+        throw std::runtime_error("snapshot blob size conflicts with digest");
+      write_atomic_file(path, buffer_, generation_);
+      written_bytes_ += buffer_.size();
+    }
+    chunks_.push_back(
+        {digest, static_cast<std::uint32_t>(buffer_.size())});
+    buffer_.clear();
+  }
+  std::filesystem::path root_;
+  std::uint64_t generation_{};
+  std::vector<std::byte> buffer_;
+  std::vector<SnapshotChunk> chunks_;
+  std::uint64_t written_bytes_{};
+};
 
 enum class Kernel : std::uint8_t {
   embedding,
@@ -2437,6 +2805,21 @@ class DenseFp4Provider final : public er::IOperationProvider {
   er::RequestStateParkingResult restore_request_state(
       const std::shared_ptr<er::IOperationProviderRequestState>& state)
       override;
+  [[nodiscard]] bool supports_request_state_persistence()
+      const noexcept override {
+    return supports_request_state_parking();
+  }
+  er::RequestStateSnapshotResult save_request_state_snapshot(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      const std::filesystem::path& root,
+      std::uint64_t generation) override;
+  er::RequestStateSnapshotResult load_request_state_snapshot(
+      const std::shared_ptr<er::IOperationProviderRequestState>& state,
+      const std::filesystem::path& root,
+      std::uint64_t generation) override;
+  er::Status prune_request_state_snapshots(
+      const std::filesystem::path& root,
+      std::uint64_t generation) override;
   er::Status synchronize_exact_decode(
       const er::IPreparedOperation& operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& state,
@@ -3526,6 +3909,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t* output_tokens_{};
   float* sampling_top_logits_{};
   std::uint32_t* sampling_top_tokens_{};
+  float* sampling_top_partial_logits_{};
+  std::uint32_t* sampling_top_partial_tokens_{};
+  std::size_t sampling_top_partial_items_{};
   std::uint8_t* sampling_presence_{};
   std::int8_t* q8_{};
   float* q8_scales_{};
@@ -4368,6 +4754,12 @@ void DenseFp4Provider::allocate_workspace() {
       allocations_, kMaximumGpuSamplingTopK);
   sampling_top_tokens_ = device_allocate<std::uint32_t>(
       allocations_, kMaximumGpuSamplingTopK);
+  sampling_top_partial_items_ =
+      ec::topk_logits_workspace_items(vocabulary_size_);
+  sampling_top_partial_logits_ = device_allocate<float>(
+      allocations_, sampling_top_partial_items_);
+  sampling_top_partial_tokens_ = device_allocate<std::uint32_t>(
+      allocations_, sampling_top_partial_items_);
   sampling_presence_ = device_allocate<std::uint8_t>(
       allocations_, static_cast<std::size_t>(capacity_) * vocabulary_size_);
   q8_ = device_allocate<std::int8_t>(allocations_,
@@ -7145,7 +7537,12 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
     } else if (top_k != 0U && top_k <= kMaximumGpuSamplingTopK) {
       status_check(ec::topk_logits(
           logits_, vocabulary_size_, static_cast<std::uint32_t>(top_k),
-          sampling_top_logits_, sampling_top_tokens_, nullptr));
+          sampling_top_logits_, sampling_top_tokens_,
+          {sampling_top_partial_logits_,
+           sampling_top_partial_items_ * sizeof(float),
+           sampling_top_partial_tokens_,
+           sampling_top_partial_items_ * sizeof(std::uint32_t)},
+          nullptr));
       std::vector<float> host_logits(static_cast<std::size_t>(top_k));
       std::vector<std::uint32_t> host_tokens(
           static_cast<std::size_t>(top_k));
@@ -8336,6 +8733,301 @@ er::RequestStateParkingResult DenseFp4Provider::restore_request_state(
   }
 }
 
+er::RequestStateSnapshotResult
+DenseFp4Provider::save_request_state_snapshot(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    const std::filesystem::path& root, std::uint64_t generation) {
+  try {
+    std::lock_guard lock(mutex_);
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || !state->parked() || state->slot() != kNoSlot ||
+        generation == 0U || root.empty())
+      throw std::runtime_error("request state is not persistable");
+    const auto& parked = *state->parked_state;
+    if (parked.payload.bytes != parked.bytes ||
+        parked.page_payload_bytes !=
+            parked.page_indices.size() * kv_page_bytes_ ||
+        state->host_kv_bytes !=
+            state->host_kv_pages.size() * host_fp16_target_page_bytes_ ||
+        parked.reported_bytes != parked.bytes + state->host_kv_bytes)
+      throw std::runtime_error("parked request accounting is inconsistent");
+
+    DenseSnapshotManifest manifest;
+    manifest.generation = generation;
+    manifest.model_hash = descriptor_.content_hash;
+    manifest.max_context = max_context_;
+    manifest.page_tokens = kv_page_tokens_;
+    manifest.page_bytes = kv_page_bytes_;
+    manifest.host_page_bytes = host_fp16_target_page_bytes_;
+    manifest.current_position = state->current_position;
+    manifest.current_batch_first = state->current_batch_first;
+    manifest.current_batch_rows = state->current_batch_rows;
+    manifest.synchronization_first = state->synchronization_first;
+    manifest.synchronization_rows = state->synchronization_rows;
+    manifest.synchronization_consumed = state->synchronization_consumed;
+    manifest.mtp_length = state->mtp_length;
+    manifest.synchronized_token = state->synchronized_token;
+    manifest.draft_token = state->draft_token;
+    manifest.retention_position = state->retention_position;
+    manifest.rope_delta = state->rope_delta;
+    manifest.draft_valid = state->draft_valid;
+    manifest.retention_valid = state->retention_valid;
+    manifest.exact_decode_enabled = state->exact_decode_enabled;
+    manifest.host_kv_populated_tokens = state->host_kv_populated_tokens;
+    manifest.logical_pages = parked.logical_pages;
+    manifest.page_payload_bytes = parked.page_payload_bytes;
+    manifest.window_payload_bytes = parked.window_payload_bytes;
+    manifest.parked_bytes = parked.bytes;
+    manifest.reported_bytes = parked.reported_bytes;
+    manifest.page_indices = parked.page_indices;
+    manifest.prompt_mrope_positions = state->prompt_mrope_positions;
+    manifest.sequence_target_hidden = state->sequence_target_hidden;
+    manifest.ple_history = state->ple_history;
+    manifest.ple_retention_history = state->ple_retention_history;
+    manifest.host_page_count =
+        static_cast<std::uint32_t>(state->host_kv_pages.size());
+    manifest.logical_data_bytes = parked.bytes + state->host_kv_bytes;
+
+    ContentAddressedSnapshotWriter writer(root / "blobs", generation);
+    writer.append({parked.payload.data,
+                   static_cast<std::size_t>(parked.payload.bytes)});
+    for (const auto& page : state->host_kv_pages) {
+      if (!page.allocation)
+        throw std::runtime_error("authoritative host KV page is absent");
+      writer.append({reinterpret_cast<const std::byte*>(page.allocation),
+                     static_cast<std::size_t>(
+                         host_fp16_target_page_bytes_)});
+    }
+    manifest.chunks = writer.finish();
+    const auto manifest_bytes = encode_snapshot_manifest(manifest);
+    const auto manifest_path = snapshot_manifest_path(root, generation);
+    write_atomic_file(manifest_path, manifest_bytes, generation);
+    return {er::Status::success(), generation, parked.logical_pages,
+            manifest.logical_data_bytes,
+            writer.written_bytes() + manifest_bytes.size()};
+  } catch (const std::exception& error) {
+    return {{er::ErrorCode::internal, error.what()}, 0U, 0U, 0U, 0U};
+  }
+}
+
+er::RequestStateSnapshotResult
+DenseFp4Provider::load_request_state_snapshot(
+    const std::shared_ptr<er::IOperationProviderRequestState>& opaque_state,
+    const std::filesystem::path& root, std::uint64_t generation) {
+  std::vector<HostKvPage> host_pages;
+  try {
+    const auto state = std::dynamic_pointer_cast<RequestState>(opaque_state);
+    if (!state || state->parked() || state->slot() >= capacity_ ||
+        generation == 0U || root.empty())
+      throw std::runtime_error("snapshot load request state is invalid");
+    const auto manifest_bytes = read_file(
+        snapshot_manifest_path(root, generation), 64U << 20U);
+    auto manifest = decode_snapshot_manifest(manifest_bytes);
+    if (manifest.generation != generation ||
+        !er::constant_time_equal(manifest.model_hash,
+                                 descriptor_.content_hash) ||
+        manifest.max_context != max_context_ ||
+        manifest.page_tokens != kv_page_tokens_ ||
+        manifest.page_bytes != kv_page_bytes_ ||
+        manifest.host_page_bytes != host_fp16_target_page_bytes_ ||
+        manifest.retention_position == 0U ||
+        manifest.retention_position > max_context_ ||
+        manifest.current_position + 1U != manifest.retention_position ||
+        !manifest.retention_valid || manifest.current_batch_rows != 0U ||
+        manifest.synchronization_rows != 0U)
+      throw std::runtime_error("snapshot identity or request state mismatches");
+    const auto expected_pages =
+        (static_cast<std::uint64_t>(manifest.retention_position) +
+         kv_page_tokens_ - 1U) /
+        kv_page_tokens_;
+    const auto expected_host_bytes =
+        static_cast<std::uint64_t>(manifest.host_page_count) *
+        host_fp16_target_page_bytes_;
+    const auto expected_page_payload =
+        static_cast<std::uint64_t>(manifest.page_indices.size()) *
+        kv_page_bytes_;
+    if (manifest.logical_pages != expected_pages ||
+        manifest.logical_pages > maximum_pages_per_slot_ ||
+        manifest.page_payload_bytes != expected_page_payload ||
+        manifest.window_payload_bytes != window_kv_bytes_per_slot_ ||
+        manifest.logical_data_bytes !=
+            manifest.parked_bytes + expected_host_bytes ||
+        manifest.reported_bytes != manifest.logical_data_bytes ||
+        (host_authoritative_fp16_kv()
+             ? manifest.host_page_count != expected_pages ||
+                   manifest.host_kv_populated_tokens <
+                       manifest.retention_position
+             : manifest.host_page_count != 0U ||
+                   manifest.host_kv_populated_tokens != 0U) ||
+        (!host_authoritative_fp16_kv() &&
+         manifest.page_indices.size() != expected_pages))
+      throw std::runtime_error("snapshot storage geometry is invalid");
+    for (std::size_t index = 0U; index < manifest.page_indices.size(); ++index)
+      if (manifest.page_indices[index] >= expected_pages ||
+          (index != 0U && manifest.page_indices[index - 1U] >=
+                              manifest.page_indices[index]))
+        throw std::runtime_error("snapshot page index is invalid");
+    std::uint64_t chunk_bytes{};
+    for (const auto& chunk : manifest.chunks) {
+      if (chunk_bytes > std::numeric_limits<std::uint64_t>::max() -
+                            chunk.bytes)
+        throw std::runtime_error("snapshot chunk bytes overflow");
+      chunk_bytes += chunk.bytes;
+    }
+    if (chunk_bytes != manifest.logical_data_bytes ||
+        manifest.parked_bytes > std::numeric_limits<std::size_t>::max())
+      throw std::runtime_error("snapshot chunk coverage is invalid");
+
+    ParkedRequestState parked;
+    parked.logical_pages = manifest.logical_pages;
+    parked.page_payload_bytes = manifest.page_payload_bytes;
+    parked.window_payload_bytes = manifest.window_payload_bytes;
+    parked.bytes = manifest.parked_bytes;
+    parked.reported_bytes = manifest.reported_bytes;
+    parked.page_indices = manifest.page_indices;
+    parked.payload.allocate(static_cast<std::size_t>(parked.bytes));
+    host_pages.reserve(manifest.host_page_count);
+    for (std::uint32_t index = 0U; index < manifest.host_page_count; ++index) {
+      void* allocation{};
+      cuda_check(cudaHostAlloc(
+                     &allocation,
+                     static_cast<std::size_t>(host_fp16_target_page_bytes_),
+                     cudaHostAllocPortable),
+                 "allocate persisted authoritative FP16 KV page");
+      host_pages.push_back({static_cast<std::uint16_t*>(allocation)});
+    }
+
+    std::uint64_t cursor{};
+    for (const auto& chunk : manifest.chunks) {
+      const auto path = root / "blobs" /
+                        (digest_hex(chunk.digest) + ".blob");
+      const auto bytes = read_file(path, kSnapshotChunkBytes);
+      if (bytes.size() != chunk.bytes ||
+          !er::constant_time_equal(er::sha256(bytes), chunk.digest))
+        throw std::runtime_error("snapshot data chunk is corrupt");
+      std::size_t source{};
+      while (source < bytes.size()) {
+        if (cursor < parked.bytes) {
+          const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+              parked.bytes - cursor, bytes.size() - source));
+          std::memcpy(parked.payload.data + cursor, bytes.data() + source,
+                      count);
+          cursor += count;
+          source += count;
+          continue;
+        }
+        const auto host_cursor = cursor - parked.bytes;
+        const auto page_index = host_cursor / host_fp16_target_page_bytes_;
+        const auto page_offset = host_cursor % host_fp16_target_page_bytes_;
+        if (page_index >= host_pages.size())
+          throw std::runtime_error("snapshot data exceeds declared payload");
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+            host_fp16_target_page_bytes_ - page_offset,
+            bytes.size() - source));
+        std::memcpy(
+            reinterpret_cast<std::byte*>(host_pages[page_index].allocation) +
+                page_offset,
+            bytes.data() + source, count);
+        cursor += count;
+        source += count;
+      }
+    }
+    if (cursor != manifest.logical_data_bytes)
+      throw std::runtime_error("snapshot data is truncated");
+
+    // A newly created provider state owns an empty execution slot. Release it
+    // before installing the independently validated parked state.
+    release_slot(state->slot());
+    {
+      std::lock_guard lock(mutex_);
+      if (manifest.parked_bytes > parking_ram_capacity_bytes_ ||
+          host_kv_bytes_ + parked_request_bytes_ >
+              parking_ram_capacity_bytes_ - manifest.parked_bytes ||
+          expected_host_bytes > parking_ram_capacity_bytes_ -
+                                    manifest.parked_bytes -
+                                    host_kv_bytes_ - parked_request_bytes_)
+        throw std::runtime_error(
+            "persisted request exceeds host parking capacity");
+      state->slot_ = kNoSlot;
+      state->current_position = manifest.current_position;
+      state->current_batch_first = manifest.current_batch_first;
+      state->current_batch_rows = manifest.current_batch_rows;
+      state->synchronization_first = manifest.synchronization_first;
+      state->synchronization_rows = manifest.synchronization_rows;
+      state->synchronization_consumed = manifest.synchronization_consumed;
+      state->mtp_length = manifest.mtp_length;
+      state->synchronized_token = manifest.synchronized_token;
+      state->draft_token = manifest.draft_token;
+      state->retention_position = manifest.retention_position;
+      state->rope_delta = manifest.rope_delta;
+      state->prompt_mrope_positions =
+          std::move(manifest.prompt_mrope_positions);
+      state->sequence_target_hidden =
+          std::move(manifest.sequence_target_hidden);
+      state->ple_history = std::move(manifest.ple_history);
+      state->ple_retention_history =
+          std::move(manifest.ple_retention_history);
+      state->draft_valid = manifest.draft_valid;
+      state->retention_valid = manifest.retention_valid;
+      state->exact_decode_enabled = manifest.exact_decode_enabled;
+      state->host_kv_pages = std::move(host_pages);
+      state->host_kv_populated_tokens =
+          manifest.host_kv_populated_tokens;
+      state->host_kv_bytes = expected_host_bytes;
+      state->target_mirror_enabled = false;
+      state->parked_state.emplace(std::move(parked));
+      host_kv_bytes_ += expected_host_bytes;
+      parked_request_bytes_ += manifest.parked_bytes;
+      parked_session_bytes_ += manifest.reported_bytes;
+    }
+    return {er::Status::success(), generation, manifest.logical_pages,
+            manifest.logical_data_bytes, 0U};
+  } catch (const std::exception& error) {
+    for (auto& page : host_pages)
+      if (page.allocation) static_cast<void>(cudaFreeHost(page.allocation));
+    return {{er::ErrorCode::internal, error.what()}, 0U, 0U, 0U, 0U};
+  }
+}
+
+er::Status DenseFp4Provider::prune_request_state_snapshots(
+    const std::filesystem::path& root, std::uint64_t generation) {
+  try {
+    if (generation == 0U || root.empty())
+      throw std::runtime_error("snapshot prune generation is invalid");
+    const auto manifest_path = snapshot_manifest_path(root, generation);
+    const auto manifest = decode_snapshot_manifest(
+        read_file(manifest_path, 64U << 20U));
+    if (manifest.generation != generation ||
+        !er::constant_time_equal(manifest.model_hash,
+                                 descriptor_.content_hash))
+      throw std::runtime_error("snapshot prune identity mismatch");
+    std::unordered_set<std::string> live;
+    live.reserve(manifest.chunks.size());
+    for (const auto& chunk : manifest.chunks)
+      live.insert(digest_hex(chunk.digest) + ".blob");
+    std::error_code error;
+    for (const auto& item : std::filesystem::directory_iterator(root)) {
+      const auto name = item.path().filename().string();
+      if (item.is_regular_file() &&
+          name.starts_with("manifest-") && item.path() != manifest_path)
+        std::filesystem::remove(item.path(), error);
+      if (name.find(".partial-") != std::string::npos)
+        std::filesystem::remove_all(item.path(), error);
+    }
+    const auto blobs = root / "blobs";
+    if (std::filesystem::exists(blobs))
+      for (const auto& item : std::filesystem::directory_iterator(blobs)) {
+        const auto name = item.path().filename().string();
+        if ((item.is_regular_file() && !live.contains(name)) ||
+            name.find(".partial-") != std::string::npos)
+          std::filesystem::remove(item.path(), error);
+      }
+    return er::Status::success();
+  } catch (const std::exception& error) {
+    return {er::ErrorCode::internal, error.what()};
+  }
+}
+
 std::optional<er::OperationExecutionResult>
 DenseFp4Provider::poll_program_sequence(
     const std::shared_ptr<SequenceState>& sequence) {
@@ -9277,6 +9969,9 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     module.service.session_parking =
         implementation->supports_request_state_parking() &&
         implementation->parking_ram_capacity_bytes() != 0U;
+    module.service.session_persistence =
+        module.service.session_parking &&
+        implementation->supports_request_state_persistence();
     module.service.session_park_ram_bytes =
         module.service.session_parking
             ? implementation->parking_ram_capacity_bytes()

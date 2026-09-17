@@ -24,6 +24,9 @@ param(
     [int]$WorkerKvPageTokens = 256,
     [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
+    [string]$SessionCacheRoot = "",
+    [int]$SessionCacheGiB = 0,
+    [int]$SessionCacheTtlSeconds = 604800,
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -49,6 +52,9 @@ param(
 if ($WorkerCapacity -lt 1 -or $StartupTimeoutSeconds -lt 1 -or
     $MaximumContext -lt 2 -or $MaximumNewTokens -lt 1 -or
     $WorkerKvCacheMiB -lt 1 -or $WorkerKvPageTokens -lt 1 -or
+    $SessionCacheGiB -lt 0 -or $SessionCacheTtlSeconds -lt 0 -or
+    (($SessionCacheGiB -gt 0) -ne
+        (-not [string]::IsNullOrWhiteSpace($SessionCacheRoot))) -or
     $MaximumBodyMiB -lt 1 -or $MaximumImagePixels -lt 65536 -or
     $MaximumImagePatchTokens -lt 256) {
     throw "Invalid service limits"
@@ -100,6 +106,8 @@ $taskArguments.AddRange([string[]]@(
     "-WorkerKvCacheMiB", [string]$WorkerKvCacheMiB,
     "-WorkerKvPageTokens", [string]$WorkerKvPageTokens,
     "-WorkerKvCacheDtype", (Quote-TaskArgument $WorkerKvCacheDtype),
+    "-SessionCacheGiB", [string]$SessionCacheGiB,
+    "-SessionCacheTtlSeconds", [string]$SessionCacheTtlSeconds,
     "-MicrobatchWindowMs", $MicrobatchWindowMs.ToString([Globalization.CultureInfo]::InvariantCulture),
     "-LatencyWindow", [string]$LatencyWindow,
     "-QueueTimeoutSeconds", $QueueTimeoutSeconds.ToString([Globalization.CultureInfo]::InvariantCulture),
@@ -111,6 +119,10 @@ $taskArguments.AddRange([string[]]@(
     "-DrainTimeoutSeconds", [string]$DrainTimeoutSeconds,
     "-BuildId", (Quote-TaskArgument $BuildId)
 ))
+if ($SessionCacheRoot) {
+    $taskArguments.Add("-SessionCacheRoot")
+    $taskArguments.Add((Quote-TaskArgument $SessionCacheRoot))
+}
 if ($activeExpertConfigured) {
     $taskArguments.Add("-WorkerActiveExpertDevices")
     $taskArguments.Add((Quote-TaskArgument $WorkerActiveExpertDevices))
@@ -174,6 +186,9 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     placement_profile = $PlacementProfile
     routed_vram_policy = $WorkerRoutedVramPolicy
     worker_kv_cache_dtype = $WorkerKvCacheDtype
+    session_cache_root = $SessionCacheRoot
+    session_cache_gib = $SessionCacheGiB
+    session_cache_ttl_seconds = $SessionCacheTtlSeconds
     worker_active_expert_devices = $WorkerActiveExpertDevices
     worker_active_expert_device_cache_gib = $WorkerActiveExpertDeviceCacheGiB
     worker_active_expert_host_cache_gib = $WorkerActiveExpertHostCacheGiB

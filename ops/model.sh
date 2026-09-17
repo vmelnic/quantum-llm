@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|clear-cache|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -116,6 +116,8 @@ kv_cache_dtype="${alias_kv_cache_dtype:-${MODEL_KV_CACHE_DTYPE:-artifact}}"
 placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
 profile_gpu_phases="${MODEL_PROFILE_GPU_PHASES:-0}"
 raw_response_trace_file="${MODEL_RAW_RESPONSE_TRACE_FILE:-}"
+session_cache_gib="${MODEL_SESSION_CACHE_GIB:-64}"
+session_cache_ttl_seconds="${MODEL_SESSION_CACHE_TTL_SECONDS:-604800}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
 container="${model_root}/${artifact_name}"
@@ -138,6 +140,10 @@ require_uint MODEL_WORKER_CAPACITY "${worker_capacity}"
 require_uint MODEL_MAXIMUM_QUEUE "${maximum_queue}"
 require_uint MODEL_KV_CACHE_MIB "${kv_cache_mib}"
 require_uint MODEL_KV_PAGE_TOKENS "${kv_page_tokens}"
+[[ "${session_cache_gib}" =~ ^[0-9]+$ ]] ||
+  die "MODEL_SESSION_CACHE_GIB must be a non-negative integer"
+[[ "${session_cache_ttl_seconds}" =~ ^[0-9]+$ ]] ||
+  die "MODEL_SESSION_CACHE_TTL_SECONDS must be a non-negative integer"
 if [[ -n "${active_expert_devices}" ]]; then
   [[ "${active_expert_devices}" == auto ||
      "${active_expert_devices}" =~ ^[0-9]+(,[0-9]+)*$ ]] ||
@@ -227,7 +233,9 @@ print_config() {
     "kv_page_tokens=${kv_page_tokens}" \
     "kv_cache_dtype=${kv_cache_dtype}" \
     "placement_profile=${placement_profile}" \
-    "profile_gpu_phases=${profile_gpu_phases}"
+    "profile_gpu_phases=${profile_gpu_phases}" \
+    "session_cache_gib=${session_cache_gib}" \
+    "session_cache_ttl_seconds=${session_cache_ttl_seconds}"
 }
 
 start_model() {
@@ -291,6 +299,13 @@ print(maximum, per_token)
     -BuildId "${build_id}"
     -Start
   )
+  if (( session_cache_gib > 0 )); then
+    common+=(
+      -SessionCacheRoot "${model_root}/.session-cache/${artifact_name}"
+      -SessionCacheGiB "${session_cache_gib}"
+      -SessionCacheTtlSeconds "${session_cache_ttl_seconds}"
+    )
+  fi
   if [[ -n "${api_key}" ]]; then
     common+=(-ApiKey "${api_key}")
   fi
@@ -370,6 +385,12 @@ case "${action}" in
       chat_command_args+=("${extra_arguments[@]}")
     fi
     exec "${script_dir}/chat.sh" "${chat_command_args[@]}"
+    ;;
+  clear-cache)
+    [[ -n "${model_id}" ]] || die "clear-cache requires one model"
+    [[ -n "${artifact_name}" ]] || die "clear-cache requires one model artifact"
+    run_remote Clear-ExpertSessionCache.ps1 \
+      -ModelRoot "${model_root}" -ArtifactName "${artifact_name}"
     ;;
   config)
     print_config

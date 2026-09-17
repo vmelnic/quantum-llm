@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <optional>
@@ -109,6 +110,19 @@ struct RequestStateParkingResult final {
   Status status;
   std::uint64_t populated_pages{};
   std::uint64_t parked_bytes{};
+};
+
+// Exact provider state persisted outside the worker process. `logical_bytes`
+// is the complete continuation payload; `written_bytes` counts newly created
+// content-addressed data during this save. Providers must publish a generation
+// atomically and reject every identity, geometry, checksum, or partial-write
+// mismatch while loading it.
+struct RequestStateSnapshotResult final {
+  Status status;
+  std::uint64_t generation{};
+  std::uint64_t populated_pages{};
+  std::uint64_t logical_bytes{};
+  std::uint64_t written_bytes{};
 };
 
 struct OperationExecutionResult final {
@@ -288,6 +302,32 @@ class IOperationProvider {
              "operation provider has no request-state restore implementation"},
             0U, 0U};
   }
+  [[nodiscard]] virtual bool supports_request_state_persistence()
+      const noexcept {
+    return false;
+  }
+  [[nodiscard]] virtual RequestStateSnapshotResult save_request_state_snapshot(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      const std::filesystem::path&, std::uint64_t) {
+    return {{ErrorCode::invalid_argument,
+             "operation provider has no request-state persistence "
+             "implementation"},
+            0U, 0U, 0U, 0U};
+  }
+  [[nodiscard]] virtual RequestStateSnapshotResult load_request_state_snapshot(
+      const std::shared_ptr<IOperationProviderRequestState>&,
+      const std::filesystem::path&, std::uint64_t) {
+    return {{ErrorCode::invalid_argument,
+             "operation provider has no request-state persistence "
+             "implementation"},
+            0U, 0U, 0U, 0U};
+  }
+  [[nodiscard]] virtual Status prune_request_state_snapshots(
+      const std::filesystem::path&, std::uint64_t) {
+    return {ErrorCode::invalid_argument,
+            "operation provider has no request-state persistence "
+            "implementation"};
+  }
   [[nodiscard]] virtual PrepareOperationResult prepare_exact_decode(
       const ExactDecodePreparationContext&) {
     return {{ErrorCode::invalid_argument,
@@ -364,6 +404,10 @@ struct ExecutionProviderModule final {
     // Parking releases an execution slot while retaining exact request state
     // in host memory. It is capability-driven and independent of model family.
     bool session_parking{};
+    // Persistence is meaningful only together with exact retention and host
+    // parking. The common runner exposes disk commands only when every bound
+    // provider implements this capability.
+    bool session_persistence{};
     std::uint64_t session_park_ram_bytes{};
     std::uint64_t session_park_page_capacity{};
     std::string routed_vram_policy{"fixed"};
@@ -454,6 +498,12 @@ class ProgramExecutionSession final {
   [[nodiscard]] RequestStateParkingResult park_retention(
       std::uint32_t next_position) const noexcept;
   [[nodiscard]] RequestStateParkingResult restore_retention() const noexcept;
+  [[nodiscard]] RequestStateSnapshotResult save_retention_snapshot(
+      const std::filesystem::path& root,
+      std::uint64_t generation) const noexcept;
+  [[nodiscard]] Status prune_retention_snapshots(
+      const std::filesystem::path& root,
+      std::uint64_t generation) const noexcept;
   [[nodiscard]] Status rebind_request(
       ProgramRequestContext request) const noexcept;
   [[nodiscard]] Status begin_retention_transaction() const noexcept;
@@ -481,6 +531,10 @@ class ProgramExecutionSession final {
   using RetentionControl = std::function<Status(std::uint32_t)>;
   using Park = std::function<RequestStateParkingResult(std::uint32_t)>;
   using Restore = std::function<RequestStateParkingResult()>;
+  using SaveSnapshot = std::function<RequestStateSnapshotResult(
+      const std::filesystem::path&, std::uint64_t)>;
+  using PruneSnapshots = std::function<Status(
+      const std::filesystem::path&, std::uint64_t)>;
   using Rebind = std::function<Status(ProgramRequestContext)>;
   using TransactionControl = std::function<Status()>;
   using ExactDecodeAvailable = std::function<bool()>;
@@ -495,7 +549,8 @@ class ProgramExecutionSession final {
       Execute execute, SequenceAvailable sequence_available,
       ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
       RetentionControl rewind_retention, Park park_retention,
-      Restore restore_retention, Rebind rebind,
+      Restore restore_retention, SaveSnapshot save_snapshot,
+      PruneSnapshots prune_snapshots, Rebind rebind,
       TransactionControl begin_transaction,
       TransactionControl end_transaction,
       ExactDecodeAvailable exact_available,
@@ -529,6 +584,9 @@ class MoeProgramExecutor final {
       ProgramExecutionRequest request) const noexcept;
   [[nodiscard]] BeginProgramExecutionSessionResult begin_session(
       ProgramRequestContext request) const noexcept;
+  [[nodiscard]] BeginProgramExecutionSessionResult begin_session_from_snapshot(
+      ProgramRequestContext request, const std::filesystem::path& root,
+      std::uint64_t generation, std::uint32_t next_position) const noexcept;
   [[nodiscard]] bool valid() const noexcept;
 
  private:

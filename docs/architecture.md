@@ -201,6 +201,17 @@ single hot GPU slot. Resume feeds only the suffix when the client prefix
 matches; unchanged prefixes are valid zero-delta resumes. Failed suffix feed or
 cancellation rolls back to the last client-echoable committed prompt.
 
+For providers that advertise `session_persistence`, the same complete parked
+state can survive a service restart. Qwen writes immutable 4 MiB SHA-256 chunks
+and a transactional manifest below
+`${MODEL_ROOT}/.session-cache/<artifact>`. The manifest binds the artifact,
+tokenizer/template, selected KV codec, media identity and exact token prefix.
+At boot only the metadata index is loaded; no session RAM or GPU pages are
+reserved until an exact client prefix selects an entry. TTL and byte-budget LRU
+remove inactive entries; `./ops/model.sh clear-cache <model>` removes only the
+selected artifact cache. NVMe is an on-resume load tier, never an active decode
+KV tier.
+
 This is continuity, not parallel decode. The Python command channel and hot
 provider slot are serialized. Multiple Pi processes may queue and retain short
 histories, but several actually populated 262K F16 contexts compete for real

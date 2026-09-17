@@ -31,7 +31,7 @@ The complete product goal is not ready:
 | lifecycle | alias-driven install/start/status/chat/stop through one task and VM |
 | execution | declared QPack FP4, native NVFP4/BF16 and DeepSeek compact experts execute real service paths |
 | paging | exact top-k/stable merge with measured NVMe/RAM/VRAM traffic |
-| KV/session state | artifact-declared progressive allocation; transactional retention only where advertised |
+| KV/session state | artifact-declared progressive allocation; Qwen provider supports transactional RAM parking and durable, lazy NVMe restart/resume with TTL/LRU and explicit per-artifact cleanup |
 | APIs | bounded OpenAI- and Anthropic-compatible streaming surfaces |
 | harness wiring | all seven advertised models pass minimal Pi `hi`; this is not coding or behavioral qualification |
 | introspection | bounded health/readiness/model/metrics and per-request telemetry |

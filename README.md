@@ -85,8 +85,17 @@ cp .env.example .env
 ./ops/model.sh install
 ./ops/model.sh start qwen
 ./ops/model.sh chat qwen
+# Optional: remove only Qwen's durable restart/resume snapshots.
+./ops/model.sh clear-cache qwen
 ./ops/model.sh stop all
 ```
+
+Qwen's provider can retain an exact completed Pi prefix across a service
+restart in `${MODEL_ROOT}/.session-cache/qwen3.8-27b-fp4`. The configured
+default is 64 GiB with a seven-day TTL; change `MODEL_SESSION_CACHE_GIB` and
+`MODEL_SESSION_CACHE_TTL_SECONDS` in `.env`. This removes repeated prefill only
+when the resumed transcript has an exact compatible prefix; it does not speed
+the first prefill.
 
 Thinking can be selected when opening direct chat:
 

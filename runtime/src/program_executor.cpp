@@ -260,6 +260,8 @@ struct ProgramExecutionSession::Core final {
   RetentionControl rewind_retention;
   Park park_retention;
   Restore restore_retention;
+  SaveSnapshot save_snapshot;
+  PruneSnapshots prune_snapshots;
   Rebind rebind;
   TransactionControl begin_transaction;
   TransactionControl end_transaction;
@@ -395,6 +397,41 @@ RequestStateParkingResult ProgramExecutionSession::restore_retention()
   }
 }
 
+RequestStateSnapshotResult ProgramExecutionSession::save_retention_snapshot(
+    const std::filesystem::path& root,
+    std::uint64_t generation) const noexcept {
+  if (!valid() || !core_->save_snapshot)
+    return {{ErrorCode::cancelled, "model execution session is closed"},
+            0U, 0U, 0U, 0U};
+  try {
+    return core_->save_snapshot(root, generation);
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state snapshot save failed: ") +
+                 error.what()},
+            0U, 0U, 0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state snapshot save failed"},
+            0U, 0U, 0U, 0U};
+  }
+}
+
+Status ProgramExecutionSession::prune_retention_snapshots(
+    const std::filesystem::path& root,
+    std::uint64_t generation) const noexcept {
+  if (!valid() || !core_->prune_snapshots)
+    return {ErrorCode::cancelled, "model execution session is closed"};
+  try {
+    return core_->prune_snapshots(root, generation);
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("request-state snapshot prune failed: ") +
+                error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "request-state snapshot prune failed"};
+  }
+}
+
 Status ProgramExecutionSession::rebind_request(
     ProgramRequestContext request) const noexcept {
   if (!valid() || !core_->rebind)
@@ -501,7 +538,8 @@ ProgramExecutionSession ProgramExecutionSession::from_callbacks(
     Execute execute, SequenceAvailable sequence_available,
     ExecuteSequence execute_sequence, RetentionControl checkpoint_retention,
     RetentionControl rewind_retention, Park park_retention,
-    Restore restore_retention, Rebind rebind,
+    Restore restore_retention, SaveSnapshot save_snapshot,
+    PruneSnapshots prune_snapshots, Rebind rebind,
     TransactionControl begin_transaction,
     TransactionControl end_transaction,
     ExactDecodeAvailable exact_available,
@@ -509,7 +547,8 @@ ProgramExecutionSession ProgramExecutionSession::from_callbacks(
     ExecuteExactDecode execute_exact, Cancel cancel) {
   if (!execute || !sequence_available || !execute_sequence ||
       !checkpoint_retention || !rewind_retention || !park_retention ||
-      !restore_retention || !rebind || !begin_transaction ||
+      !restore_retention || !save_snapshot || !prune_snapshots || !rebind ||
+      !begin_transaction ||
       !end_transaction ||
       !exact_available || !synchronize_exact || !execute_exact || !cancel)
     return {};
@@ -521,6 +560,8 @@ ProgramExecutionSession ProgramExecutionSession::from_callbacks(
   core->rewind_retention = std::move(rewind_retention);
   core->park_retention = std::move(park_retention);
   core->restore_retention = std::move(restore_retention);
+  core->save_snapshot = std::move(save_snapshot);
+  core->prune_snapshots = std::move(prune_snapshots);
   core->rebind = std::move(rebind);
   core->begin_transaction = std::move(begin_transaction);
   core->end_transaction = std::move(end_transaction);
@@ -586,6 +627,15 @@ struct MoeProgramExecutor::Core final {
     [[nodiscard]] RequestStateParkingResult park_retention(
         std::uint32_t next_position) noexcept;
     [[nodiscard]] RequestStateParkingResult restore_retention() noexcept;
+    [[nodiscard]] RequestStateSnapshotResult save_snapshot(
+        const std::filesystem::path& root,
+        std::uint64_t generation) noexcept;
+    [[nodiscard]] RequestStateSnapshotResult load_snapshot(
+        const std::filesystem::path& root, std::uint64_t generation,
+        std::uint32_t next_position) noexcept;
+    [[nodiscard]] Status prune_snapshots(
+        const std::filesystem::path& root,
+        std::uint64_t generation) noexcept;
     [[nodiscard]] bool exact_available() const noexcept;
     [[nodiscard]] Status synchronize_exact(
         std::span<const std::uint32_t> next_tokens,
@@ -1222,6 +1272,188 @@ MoeProgramExecutor::Core::SessionState::restore_retention() noexcept {
   }
 }
 
+RequestStateSnapshotResult
+MoeProgramExecutor::Core::SessionState::save_snapshot(
+    const std::filesystem::path& root,
+    std::uint64_t generation) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed)
+      return {{ErrorCode::cancelled, "model execution session is closed"},
+              0U, 0U, 0U, 0U};
+    if (active)
+      return {{ErrorCode::backpressure,
+               "model execution session already has an active step"},
+              0U, 0U, 0U, 0U};
+    if (!parked || generation == 0U || root.empty())
+      return {{ErrorCode::invalid_argument,
+               "only parked request state can be persisted"},
+              0U, 0U, 0U, 0U};
+
+    const auto provider_for = [this](std::uint32_t registry_index) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      return prepared == program->prepared.end()
+                 ? program->exact_decode &&
+                           program->exact_decode->provider_registry_index ==
+                               registry_index
+                       ? program->exact_decode->provider
+                       : std::shared_ptr<IOperationProvider>{}
+                 : prepared->provider;
+    };
+    std::uint64_t pages{};
+    std::uint64_t logical{};
+    std::uint64_t written{};
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto implementation = provider_for(registry_index);
+      if (!implementation ||
+          !implementation->supports_request_state_persistence())
+        return {{ErrorCode::invalid_argument,
+                 "request-state persistence is not supported by every "
+                 "provider"},
+                0U, 0U, 0U, 0U};
+      const auto result = implementation->save_request_state_snapshot(
+          state, root / ("provider-" + std::to_string(registry_index)),
+          generation);
+      if (!result.status.ok()) return result;
+      if (pages > std::numeric_limits<std::uint64_t>::max() -
+                      result.populated_pages ||
+          logical > std::numeric_limits<std::uint64_t>::max() -
+                        result.logical_bytes ||
+          written > std::numeric_limits<std::uint64_t>::max() -
+                        result.written_bytes)
+        return {{ErrorCode::internal,
+                 "request-state snapshot accounting overflowed"},
+                0U, 0U, 0U, 0U};
+      pages += result.populated_pages;
+      logical += result.logical_bytes;
+      written += result.written_bytes;
+    }
+    return {Status::success(), generation, pages, logical, written};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state snapshot save failed: ") +
+                 error.what()},
+            0U, 0U, 0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state snapshot save failed"},
+            0U, 0U, 0U, 0U};
+  }
+}
+
+RequestStateSnapshotResult
+MoeProgramExecutor::Core::SessionState::load_snapshot(
+    const std::filesystem::path& root, std::uint64_t generation,
+    std::uint32_t next_position) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed || active || parked || generation == 0U || root.empty() ||
+        next_position == 0U)
+      return {{ErrorCode::invalid_argument,
+               "request-state snapshot load target is invalid"},
+              0U, 0U, 0U, 0U};
+    const auto provider_for = [this](std::uint32_t registry_index) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      return prepared == program->prepared.end()
+                 ? program->exact_decode &&
+                           program->exact_decode->provider_registry_index ==
+                               registry_index
+                       ? program->exact_decode->provider
+                       : std::shared_ptr<IOperationProvider>{}
+                 : prepared->provider;
+    };
+    std::uint64_t pages{};
+    std::uint64_t logical{};
+    for (const auto& [registry_index, state] : provider_states) {
+      const auto implementation = provider_for(registry_index);
+      if (!implementation ||
+          !implementation->supports_request_state_persistence())
+        return {{ErrorCode::invalid_argument,
+                 "request-state persistence is not supported by every "
+                 "provider"},
+                0U, 0U, 0U, 0U};
+      const auto result = implementation->load_request_state_snapshot(
+          state, root / ("provider-" + std::to_string(registry_index)),
+          generation);
+      if (!result.status.ok()) return result;
+      if (pages > std::numeric_limits<std::uint64_t>::max() -
+                      result.populated_pages ||
+          logical > std::numeric_limits<std::uint64_t>::max() -
+                        result.logical_bytes)
+        return {{ErrorCode::internal,
+                 "request-state snapshot accounting overflowed"},
+                0U, 0U, 0U, 0U};
+      pages += result.populated_pages;
+      logical += result.logical_bytes;
+    }
+    parked = true;
+    parked_position = next_position;
+    parked_pages = pages;
+    parked_bytes = logical;
+    return {Status::success(), generation, pages, logical, 0U};
+  } catch (const std::exception& error) {
+    return {{ErrorCode::internal,
+             std::string("request-state snapshot load failed: ") +
+                 error.what()},
+            0U, 0U, 0U, 0U};
+  } catch (...) {
+    return {{ErrorCode::internal, "request-state snapshot load failed"},
+            0U, 0U, 0U, 0U};
+  }
+}
+
+Status MoeProgramExecutor::Core::SessionState::prune_snapshots(
+    const std::filesystem::path& root,
+    std::uint64_t generation) noexcept {
+  try {
+    std::lock_guard lock(mutex);
+    if (closed || active || generation == 0U || root.empty())
+      return {ErrorCode::invalid_argument,
+              "request-state snapshot prune target is invalid"};
+    const auto provider_for = [this](std::uint32_t registry_index) {
+      const auto prepared = std::find_if(
+          program->prepared.begin(), program->prepared.end(),
+          [registry_index](const Core::PreparedInstruction& item) {
+            return item.provider_registry_index == registry_index;
+          });
+      return prepared == program->prepared.end()
+                 ? program->exact_decode &&
+                           program->exact_decode->provider_registry_index ==
+                               registry_index
+                       ? program->exact_decode->provider
+                       : std::shared_ptr<IOperationProvider>{}
+                 : prepared->provider;
+    };
+    for (const auto& [registry_index, state] : provider_states) {
+      (void)state;
+      const auto implementation = provider_for(registry_index);
+      if (!implementation ||
+          !implementation->supports_request_state_persistence())
+        return {ErrorCode::invalid_argument,
+                "request-state persistence is not supported by every "
+                "provider"};
+      const auto status = implementation->prune_request_state_snapshots(
+          root / ("provider-" + std::to_string(registry_index)),
+          generation);
+      if (!status.ok()) return copy_status(status);
+    }
+    return Status::success();
+  } catch (const std::exception& error) {
+    return {ErrorCode::internal,
+            std::string("request-state snapshot prune failed: ") +
+                error.what()};
+  } catch (...) {
+    return {ErrorCode::internal, "request-state snapshot prune failed"};
+  }
+}
+
 bool MoeProgramExecutor::Core::SessionState::exact_available() const noexcept {
   return program && program->exact_decode.has_value();
 }
@@ -1641,8 +1873,75 @@ BeginProgramExecutionSessionResult MoeProgramExecutor::begin_session(
         return state->park_retention(position);
       },
       [state] { return state->restore_retention(); },
+      [state](const std::filesystem::path& root, std::uint64_t generation) {
+        return state->save_snapshot(root, generation);
+      },
+      [state](const std::filesystem::path& root, std::uint64_t generation) {
+        return state->prune_snapshots(root, generation);
+      },
       [state](ProgramRequestContext request) {
         return state->rebind(std::move(request));
+      },
+      [state] { return state->begin_transaction(); },
+      [state] { return state->end_transaction(); },
+      [state] { return state->exact_available(); },
+      [state](std::span<const std::uint32_t> tokens,
+              std::uint32_t position, bool draft) {
+        return state->synchronize_exact(tokens, position, draft);
+      },
+      [state](std::uint32_t token, std::uint32_t position,
+              std::uint32_t context) {
+        return state->start_exact(token, position, context);
+      },
+      [state] { state->cancel(); });
+  if (!session.valid()) {
+    state->cancel();
+    return {{ErrorCode::internal,
+             "model execution session handle construction failed"},
+            {}};
+  }
+  return {Status::success(), std::move(session)};
+}
+
+BeginProgramExecutionSessionResult
+MoeProgramExecutor::begin_session_from_snapshot(
+    ProgramRequestContext request, const std::filesystem::path& root,
+    std::uint64_t generation, std::uint32_t next_position) const noexcept {
+  auto begun = Core::begin(core_, std::move(request));
+  if (!begun.status.ok()) return {copy_status(begun.status), {}};
+  auto state = std::move(begun.session);
+  const auto loaded = state->load_snapshot(
+      root, generation, next_position);
+  if (!loaded.status.ok()) {
+    state->cancel();
+    return {copy_status(loaded.status), {}};
+  }
+  auto session = ProgramExecutionSession::from_callbacks(
+      [state](std::map<std::string, ExecutionValue, std::less<>> inputs) {
+        return state->start(std::move(inputs), false);
+      },
+      [state] { return state->sequence_available(); },
+      [state](std::map<std::string, ExecutionValue, std::less<>> inputs) {
+        return state->start_sequence(std::move(inputs));
+      },
+      [state](std::uint32_t position) {
+        return state->checkpoint_retention(position);
+      },
+      [state](std::uint32_t position) {
+        return state->rewind_retention(position);
+      },
+      [state](std::uint32_t position) {
+        return state->park_retention(position);
+      },
+      [state] { return state->restore_retention(); },
+      [state](const std::filesystem::path& path, std::uint64_t selected) {
+        return state->save_snapshot(path, selected);
+      },
+      [state](const std::filesystem::path& path, std::uint64_t selected) {
+        return state->prune_snapshots(path, selected);
+      },
+      [state](ProgramRequestContext replacement) {
+        return state->rebind(std::move(replacement));
       },
       [state] { return state->begin_transaction(); },
       [state] { return state->end_transaction(); },

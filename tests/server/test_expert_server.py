@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+from collections import OrderedDict
 import io
 import sys
 import socket
@@ -64,6 +65,61 @@ class FakeWorker:
 
 
 class ContinuousDecodeBatcherTests(unittest.TestCase):
+    def test_persistent_session_index_rejects_corruption_and_evicts_lru(self) -> None:
+        """Disk snapshots are lazy, checksum-gated, and bounded independently of RAM."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            app = Application.__new__(Application)
+            app.args = types.SimpleNamespace(
+                max_context=64, session_cache_ttl_seconds=0.0,
+                session_cache_bytes=600,
+            )
+            app.worker = types.SimpleNamespace(vocab_size=32, kv_page_tokens=4)
+            app.session_cache_root = root
+            app.session_cache_identity = "fixture-identity"
+            app.session_cache_enabled = True
+            app.session_lock = threading.Lock()
+            app.disk_sessions = OrderedDict()
+            app.sessions = OrderedDict()
+
+            def write_snapshot(identifier: str, bytes_on_disk: int) -> Path:
+                directory = root / identifier
+                directory.mkdir()
+                payload = {
+                    "schema": "persistent-session-v1",
+                    "identity": app.session_cache_identity,
+                    "persistent_id": identifier,
+                    "generation": 1,
+                    "tokens": [1, 2, 3],
+                    "pages": 1,
+                    "parked_bytes": 12,
+                    "last_used_epoch": 1.0,
+                    "worker_metadata": {"generation": 1, "next_position": 3},
+                    "media_signature": None,
+                }
+                payload["metadata_sha256"] = app._metadata_digest(payload)
+                (directory / "session.json").write_text(
+                    json.dumps(payload), encoding="utf-8"
+                )
+                (directory / "state.bin").write_bytes(b"x" * bytes_on_disk)
+                return directory
+
+            oldest = write_snapshot("a" * 32, 80)
+            newest = write_snapshot("b" * 32, 80)
+            corrupt = root / ("c" * 32)
+            corrupt.mkdir()
+            (corrupt / "session.json").write_text("not-json", encoding="utf-8")
+
+            app._load_persistent_sessions()
+            self.assertEqual(list(app.disk_sessions), ["a" * 32, "b" * 32])
+            self.assertFalse(corrupt.exists())
+
+            app._cleanup_persistent_sessions()
+            self.assertNotIn("a" * 32, app.disk_sessions)
+            self.assertIn("b" * 32, app.disk_sessions)
+            self.assertFalse(oldest.exists())
+            self.assertTrue(newest.exists())
+
     def test_request_telemetry_preserves_provider_configuration(self) -> None:
         before = {
             "provider_gpu_ffn_ns": 100,
@@ -1963,9 +2019,14 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         info = app.info()
         self.assertEqual(info["worker_sessions"], {
             "enabled": False, "parking_enabled": False,
+            "persistence_supported": False,
+            "persistence_enabled": False,
             "park_ram_bytes": 0, "park_page_capacity": 0,
             "retained": 0, "retained_tokens": 0,
             "reserved_pages": 0, "parked_bytes": 0,
+            "disk_retained": 0, "disk_retained_tokens": 0,
+            "disk_bytes": 0, "disk_byte_limit": 0,
+            "disk_ttl_seconds": 0.0,
         })
         self.assertEqual(info["worker_placement"], {
             "mode": "budgeted", "profile": "capacity",
