@@ -27,6 +27,7 @@ param(
     [string]$SessionCacheRoot = "",
     [int]$SessionCacheGiB = 0,
     [int]$SessionCacheTtlSeconds = 604800,
+    [switch]$DisableSessionRetention,
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -123,6 +124,9 @@ if ($SessionCacheRoot) {
     $taskArguments.Add("-SessionCacheRoot")
     $taskArguments.Add((Quote-TaskArgument $SessionCacheRoot))
 }
+if ($DisableSessionRetention) {
+    $taskArguments.Add("-DisableSessionRetention")
+}
 if ($activeExpertConfigured) {
     $taskArguments.Add("-WorkerActiveExpertDevices")
     $taskArguments.Add((Quote-TaskArgument $WorkerActiveExpertDevices))
@@ -189,6 +193,7 @@ if ($Start) { Start-ScheduledTask -TaskName $TaskName }
     session_cache_root = $SessionCacheRoot
     session_cache_gib = $SessionCacheGiB
     session_cache_ttl_seconds = $SessionCacheTtlSeconds
+    session_retention_disabled = [bool]$DisableSessionRetention
     worker_active_expert_devices = $WorkerActiveExpertDevices
     worker_active_expert_device_cache_gib = $WorkerActiveExpertDeviceCacheGiB
     worker_active_expert_host_cache_gib = $WorkerActiveExpertHostCacheGiB

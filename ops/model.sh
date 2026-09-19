@@ -118,6 +118,7 @@ profile_gpu_phases="${MODEL_PROFILE_GPU_PHASES:-0}"
 raw_response_trace_file="${MODEL_RAW_RESPONSE_TRACE_FILE:-}"
 session_cache_gib="${MODEL_SESSION_CACHE_GIB:-64}"
 session_cache_ttl_seconds="${MODEL_SESSION_CACHE_TTL_SECONDS:-604800}"
+disable_session_retention="${MODEL_DISABLE_SESSION_RETENTION:-0}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
 container="${model_root}/${artifact_name}"
@@ -170,6 +171,10 @@ fi
 case "${profile_gpu_phases}" in
   1|true|TRUE|yes|YES|0|false|FALSE|no|NO) ;;
   *) die "MODEL_PROFILE_GPU_PHASES must be a boolean" ;;
+esac
+case "${disable_session_retention}" in
+  1|true|TRUE|yes|YES|0|false|FALSE|no|NO) ;;
+  *) die "MODEL_DISABLE_SESSION_RETENTION must be a boolean" ;;
 esac
 [[ "${kv_cache_dtype}" == artifact ||
    "${kv_cache_dtype}" == fp8-e4m3-per-head ||
@@ -235,7 +240,8 @@ print_config() {
     "placement_profile=${placement_profile}" \
     "profile_gpu_phases=${profile_gpu_phases}" \
     "session_cache_gib=${session_cache_gib}" \
-    "session_cache_ttl_seconds=${session_cache_ttl_seconds}"
+    "session_cache_ttl_seconds=${session_cache_ttl_seconds}" \
+    "disable_session_retention=${disable_session_retention}"
 }
 
 start_model() {
@@ -305,6 +311,9 @@ print(maximum, per_token)
       -SessionCacheGiB "${session_cache_gib}"
       -SessionCacheTtlSeconds "${session_cache_ttl_seconds}"
     )
+  fi
+  if is_true "${disable_session_retention}"; then
+    common+=(-DisableSessionRetention)
   fi
   if [[ -n "${api_key}" ]]; then
     common+=(-ApiKey "${api_key}")

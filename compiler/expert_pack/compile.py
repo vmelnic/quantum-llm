@@ -43,6 +43,7 @@ from .util import (
     load_json,
     sha256_bytes,
     sha256_file,
+    publish_directory,
     write_all,
 )
 from .validate import validate_container, validate_dense_record, validate_expert_record
@@ -1354,6 +1355,217 @@ def refresh_runtime_model_program(
             "manifest_content_sha256"
         ],
         "validation": refreshed_validation,
+    }
+
+
+_DENSE_MTP_EXACT_V1 = (
+    "decode.mtp.dense-full-attention.fp4-block32.exact.v1"
+)
+_DENSE_MTP_EXACT_V2 = (
+    "decode.mtp.dense-full-attention.fp4-block32.exact.v2"
+)
+
+
+def _upgrade_dense_mtp_program_bytes(
+    payload: bytes,
+    *,
+    draft_depth: int,
+    draft_vocabulary_size: int,
+) -> bytes:
+    """Upgrade only the generic dense-MTP exact-decode record from ABI 1 to 2."""
+    if draft_depth not in (3, 4):
+        raise ValueError("dense MTP draft depth must be 3 or 4")
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeError as error:
+        raise ValueError("runtime model program is not UTF-8") from error
+    if not lines or lines[0] != "expert-runtime-model-v1":
+        raise ValueError("runtime model program format is unsupported")
+
+    records = [line.split("\t") for line in lines]
+    model_records = [fields for fields in records if fields[0] == "model"]
+    if len(model_records) != 1 or len(model_records[0]) != 6:
+        raise ValueError("runtime model program has an invalid model record")
+    try:
+        schema = int(model_records[0][1])
+        target_vocabulary_size = int(model_records[0][3])
+    except ValueError as error:
+        raise ValueError("runtime model program has a non-integer model record") from error
+    if schema != 3 or target_vocabulary_size <= 0:
+        raise ValueError("dense MTP migration requires model program schema 3")
+    if not 0 < draft_vocabulary_size <= target_vocabulary_size:
+        raise ValueError(
+            "draft vocabulary size must be positive and no larger than target vocabulary"
+        )
+
+    mtp_attributes = [
+        fields for fields in records
+        if len(fields) >= 2 and fields[:2] == ["attribute", "mtp_layers"]
+    ]
+    if mtp_attributes != [["attribute", "mtp_layers", "1"]]:
+        raise ValueError("dense MTP v1 migration requires one source MTP layer")
+
+    old_kernel = ["kernel", _DENSE_MTP_EXACT_V1, "1"]
+    new_kernel = ["kernel", _DENSE_MTP_EXACT_V2, "2"]
+    old_decode = ["exact_decode", _DENSE_MTP_EXACT_V1, "1", "2"]
+    new_decode = [
+        "exact_decode", _DENSE_MTP_EXACT_V2, "2", str(draft_depth + 1)
+    ]
+    if any(_DENSE_MTP_EXACT_V2 in fields for fields in records):
+        raise ValueError("container already declares the dense MTP v2 contract")
+    if records.count(old_kernel) != 1 or records.count(old_decode) != 1:
+        raise ValueError("container does not declare the exact dense MTP v1 contract")
+
+    parameter_records = [
+        fields for fields in records if fields[0] == "exact_decode_parameter"
+    ]
+    if (any(len(fields) != 3 for fields in parameter_records) or
+            {fields[1]: fields[2] for fields in parameter_records} != {
+                "draft_layers": "1",
+                "embedding_first": "1",
+                "post_norm": "1",
+            } or len(parameter_records) != 3):
+        raise ValueError("dense MTP v1 parameters do not match the migratable contract")
+
+    tensor_records = [
+        fields for fields in records if fields[0] == "exact_decode_tensor"
+    ]
+    if (not tensor_records or any(len(fields) != 3 for fields in tensor_records) or
+            not any(fields[1].startswith("layer.0.") for fields in tensor_records) or
+            any(fields[1].startswith("layer.") and
+                not fields[1].startswith("layer.0.")
+                for fields in tensor_records)):
+        raise ValueError("dense MTP v1 tensor roles are not a single reusable layer")
+
+    upgraded: list[list[str]] = []
+    for fields in records:
+        if fields == old_kernel:
+            upgraded.append(new_kernel)
+        elif fields == old_decode:
+            upgraded.append(new_decode)
+        elif fields == ["exact_decode_parameter", "draft_layers", "1"]:
+            upgraded.extend([
+                ["exact_decode_parameter", "source_mtp_layers", "1"],
+                ["exact_decode_parameter", "draft_depth", str(draft_depth)],
+                [
+                    "exact_decode_parameter", "draft_vocabulary_size",
+                    str(draft_vocabulary_size),
+                ],
+                ["exact_decode_parameter", "mtp_kv_encoding", "1"],
+            ])
+        else:
+            upgraded.append(fields)
+    return ("\n".join("\t".join(fields) for fields in upgraded) + "\n").encode(
+        "utf-8"
+    )
+
+
+def upgrade_dense_mtp_program(
+    container: Path,
+    output: Path,
+    *,
+    draft_depth: int = 4,
+    draft_vocabulary_size: int = 65_536,
+) -> dict[str, object]:
+    """Publish an authenticated program-only dense-MTP ABI v1-to-v2 migration."""
+    container = Path(container).resolve()
+    output = Path(output).resolve()
+    try:
+        output.relative_to(container)
+    except ValueError:
+        pass
+    else:
+        raise ValueError("output must not be inside the immutable source container")
+    if output.exists():
+        raise ResumeError(f"output already exists: {output}")
+    partial = output.with_name(output.name + ".partial")
+    if partial.exists():
+        raise ResumeError(f"partial migration already exists: {partial}")
+
+    validation = validate_container(container)
+    manifest = load_json(container / "manifest.json")
+    if not isinstance(manifest, dict):
+        raise ValueError("source container manifest is invalid")
+    model_program = manifest.get("model_program")
+    if (not isinstance(model_program, dict) or
+            not isinstance(model_program.get("path"), str)):
+        raise ValueError("source container model program metadata is invalid")
+    relative_program = Path(model_program["path"])
+    if relative_program.is_absolute() or ".." in relative_program.parts:
+        raise ValueError("source container model program path is unsafe")
+    source_program = container / relative_program
+    source_payload = source_program.read_bytes()
+    upgraded_payload = _upgrade_dense_mtp_program_bytes(
+        source_payload,
+        draft_depth=draft_depth,
+        draft_vocabulary_size=draft_vocabulary_size,
+    )
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(container, partial, copy_function=_link_or_copy)
+    migrated_program = partial / relative_program
+    temporary_program = migrated_program.with_name(migrated_program.name + ".tmp")
+    with temporary_program.open("wb") as handle:
+        write_all(handle, upgraded_payload)
+        fsync_file(handle)
+    os.replace(temporary_program, migrated_program)
+    fsync_directory(migrated_program.parent)
+
+    migrated_manifest = load_json(partial / "manifest.json")
+    migrated_manifest["model_program"] = {
+        "format": "expert-runtime-model-v1",
+        "path": relative_program.as_posix(),
+        "bytes": len(upgraded_payload),
+        "sha256": sha256_bytes(upgraded_payload),
+    }
+    migrated_manifest["integrity"]["content_sha256"] = ""
+    migrated_manifest["integrity"]["content_sha256"] = sha256_bytes(
+        canonical_json_bytes(migrated_manifest)
+    )
+    atomic_json(partial / "manifest.json", migrated_manifest)
+
+    report = load_json(partial / "conversion-report.json")
+    if not isinstance(report, dict):
+        raise ValueError("container conversion report is invalid")
+    report["output"] = str(output)
+    report["manifest_content_sha256"] = migrated_manifest["integrity"][
+        "content_sha256"
+    ]
+    report["model_program_migration"] = {
+        "source_capability": _DENSE_MTP_EXACT_V1,
+        "target_capability": _DENSE_MTP_EXACT_V2,
+        "source_program_sha256": sha256_bytes(source_payload),
+        "target_program_sha256": sha256_bytes(upgraded_payload),
+        "source_mtp_layers": 1,
+        "draft_depth": draft_depth,
+        "draft_vocabulary_size": draft_vocabulary_size,
+        "mtp_kv_encoding": 1,
+    }
+    atomic_json(partial / "conversion-report.json", report)
+    atomic_json(partial / "COMPLETED", {
+        "format_version": FORMAT_VERSION,
+        "manifest_content_sha256": migrated_manifest["integrity"][
+            "content_sha256"
+        ],
+        "manifest_file_sha256": sha256_file(partial / "manifest.json"),
+    })
+    fsync_directory(partial)
+    migrated_validation = validate_container(partial)
+    publish_directory(partial, output)
+    return {
+        "output": str(output),
+        "source_container": str(container),
+        "source_manifest_content_sha256": validation[
+            "manifest_content_sha256"
+        ],
+        "manifest_content_sha256": migrated_validation[
+            "manifest_content_sha256"
+        ],
+        "source_program_sha256": sha256_bytes(source_payload),
+        "target_program_sha256": sha256_bytes(upgraded_payload),
+        "draft_depth": draft_depth,
+        "draft_vocabulary_size": draft_vocabulary_size,
+        "validation": migrated_validation,
     }
 
 

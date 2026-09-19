@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)]
-    [ValidateSet("Compile", "Validate", "RefreshModelProgram", "RefreshSamplingProfiles")]
+    [ValidateSet("Compile", "Validate", "RefreshModelProgram", "RefreshSamplingProfiles", "UpgradeDenseMtpProgram")]
     [string]$Action,
     [Parameter(Mandatory = $true)]
     [string]$Path,
@@ -16,7 +16,11 @@ param(
     [string]$QuantProfile = "int8-symmetric-per-row-v1",
     [int64]$MaxExpertPackBytes = 4GB,
     [switch]$Resume,
-    [switch]$ReclaimSourceShards
+    [switch]$ReclaimSourceShards,
+    [ValidateSet(3, 4)]
+    [int]$DraftDepth = 4,
+    [ValidateRange(1, 2147483647)]
+    [int]$DraftVocabularySize = 65536
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -82,6 +86,19 @@ try {
             "--container", $resolvedPath,
             "--output", $resolvedOutput,
             "--profiles", $resolvedProfiles
+        )
+    }
+    elseif ($Action -eq "UpgradeDenseMtpProgram") {
+        if ([string]::IsNullOrWhiteSpace($Output)) {
+            throw "-Output is required for UpgradeDenseMtpProgram"
+        }
+        $resolvedOutput = [System.IO.Path]::GetFullPath($Output)
+        $arguments = @(
+            "-m", "compiler", "upgrade-dense-mtp-program",
+            "--container", $resolvedPath,
+            "--output", $resolvedOutput,
+            "--draft-depth", [string]$DraftDepth,
+            "--draft-vocabulary-size", [string]$DraftVocabularySize
         )
     }
     else {

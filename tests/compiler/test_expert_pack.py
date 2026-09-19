@@ -4,6 +4,7 @@ import hashlib
 import io
 import json
 import math
+import shutil
 import struct
 import tempfile
 import unittest
@@ -19,6 +20,7 @@ from compiler.expert_pack.compile import (
     compile_checkpoint,
     refresh_runtime_model_program,
     refresh_sampling_profiles,
+    upgrade_dense_mtp_program,
 )
 from compiler.expert_pack.constants import (
     EXPERT_HEADER_STRUCT,
@@ -1434,8 +1436,15 @@ class ExpertPackTests(unittest.TestCase):
             self.assertIsNotNone(adapted.runtime_topology.exact_decode)
             self.assertEqual(
                 adapted.runtime_topology.exact_decode.maximum_emitted_tokens,
-                2,
+                5,
             )
+            exact_parameters = dict(
+                adapted.runtime_topology.exact_decode.parameters
+            )
+            self.assertEqual(exact_parameters["source_mtp_layers"], 1)
+            self.assertEqual(exact_parameters["draft_depth"], 4)
+            self.assertEqual(exact_parameters["draft_vocabulary_size"], 64)
+            self.assertEqual(exact_parameters["mtp_kv_encoding"], 1)
             self.assertIn(
                 "model.visual.patch_embed.proj.weight", adapted.dense_fp4
             )
@@ -1514,7 +1523,7 @@ class ExpertPackTests(unittest.TestCase):
             )
             self.assertIn(
                 "exact_decode\t"
-                "decode.mtp.dense-full-attention.fp4-block32.exact.v1\t1\t2",
+                "decode.mtp.dense-full-attention.fp4-block32.exact.v2\t2\t5",
                 program,
             )
             self.assertIn(
@@ -1526,6 +1535,128 @@ class ExpertPackTests(unittest.TestCase):
                 "mtp.layers.0.self_attn.q_proj.weight",
                 program,
             )
+
+    def test_dense_mtp_program_only_upgrade_is_transactional(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            current = root / "current"
+            compile_checkpoint(CompileOptions(
+                source=source,
+                output=current,
+                adapter="hybrid_delta",
+                quant_profile=FP4_QUANT_PROFILE,
+                max_expert_pack_bytes=PACK_ALIGNMENT,
+            ))
+
+            legacy = root / "legacy"
+            shutil.copytree(current, legacy)
+            legacy_program_path = legacy / "runtime-model.tsv"
+            lines = legacy_program_path.read_text(encoding="utf-8").splitlines()
+            legacy_lines: list[str] = []
+            for line in lines:
+                if line == (
+                    "kernel\tdecode.mtp.dense-full-attention.fp4-block32."
+                    "exact.v2\t2"
+                ):
+                    legacy_lines.append(
+                        "kernel\tdecode.mtp.dense-full-attention.fp4-block32."
+                        "exact.v1\t1"
+                    )
+                elif line == (
+                    "exact_decode\tdecode.mtp.dense-full-attention."
+                    "fp4-block32.exact.v2\t2\t5"
+                ):
+                    legacy_lines.append(
+                        "exact_decode\tdecode.mtp.dense-full-attention."
+                        "fp4-block32.exact.v1\t1\t2"
+                    )
+                elif line == "exact_decode_parameter\tsource_mtp_layers\t1":
+                    legacy_lines.append(
+                        "exact_decode_parameter\tdraft_layers\t1"
+                    )
+                elif line.startswith((
+                    "exact_decode_parameter\tdraft_depth\t",
+                    "exact_decode_parameter\tdraft_vocabulary_size\t",
+                    "exact_decode_parameter\tmtp_kv_encoding\t",
+                )):
+                    continue
+                else:
+                    legacy_lines.append(line)
+            legacy_payload = ("\n".join(legacy_lines) + "\n").encode("utf-8")
+            legacy_program_path.write_bytes(legacy_payload)
+            legacy_manifest = load_json(legacy / "manifest.json")
+            legacy_manifest["model_program"]["bytes"] = len(legacy_payload)
+            legacy_manifest["model_program"]["sha256"] = sha256_bytes(
+                legacy_payload
+            )
+            legacy_manifest["integrity"]["content_sha256"] = ""
+            legacy_manifest["integrity"]["content_sha256"] = sha256_bytes(
+                canonical_json_bytes(legacy_manifest)
+            )
+            (legacy / "manifest.json").write_text(
+                json.dumps(legacy_manifest, ensure_ascii=False, sort_keys=True,
+                           indent=2) + "\n",
+                encoding="utf-8",
+            )
+            legacy_report = load_json(legacy / "conversion-report.json")
+            legacy_report["manifest_content_sha256"] = legacy_manifest[
+                "integrity"
+            ]["content_sha256"]
+            (legacy / "conversion-report.json").write_text(
+                json.dumps(legacy_report, ensure_ascii=False, sort_keys=True,
+                           indent=2) + "\n",
+                encoding="utf-8",
+            )
+            (legacy / "COMPLETED").write_text(json.dumps({
+                "format_version": legacy_manifest["format"]["version"],
+                "manifest_content_sha256": legacy_manifest["integrity"][
+                    "content_sha256"
+                ],
+                "manifest_file_sha256": sha256_file(legacy / "manifest.json"),
+            }, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+            self.assertTrue(validate_container(legacy)["valid"])
+
+            original_manifest = load_json(legacy / "manifest.json")
+            original_program = legacy_program_path.read_bytes()
+            migrated = root / "migrated"
+            result = upgrade_dense_mtp_program(
+                legacy,
+                migrated,
+                draft_depth=4,
+                draft_vocabulary_size=64,
+            )
+            self.assertTrue(result["validation"]["valid"])
+            self.assertEqual(legacy_program_path.read_bytes(), original_program)
+            upgraded = (migrated / "runtime-model.tsv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "exact_decode\tdecode.mtp.dense-full-attention."
+                "fp4-block32.exact.v2\t2\t5",
+                upgraded,
+            )
+            self.assertIn(
+                "exact_decode_parameter\tdraft_vocabulary_size\t64", upgraded
+            )
+            migrated_manifest = load_json(migrated / "manifest.json")
+            self.assertEqual(
+                migrated_manifest["packs"], original_manifest["packs"]
+            )
+            self.assertEqual(
+                migrated_manifest["tokenizer"]["files"],
+                original_manifest["tokenizer"]["files"],
+            )
+            with self.assertRaisesRegex(ValueError, "already declares"):
+                upgrade_dense_mtp_program(
+                    migrated,
+                    root / "invalid-second-upgrade",
+                    draft_depth=4,
+                    draft_vocabulary_size=64,
+                )
+
 
     def test_qwen4_exp_publishes_generic_hyper_qsa_ple_program(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

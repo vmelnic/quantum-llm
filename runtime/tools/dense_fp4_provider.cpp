@@ -13,6 +13,7 @@
 #include "expert/runtime/program_executor.hpp"
 #include "expert/runtime/routed_expert_runtime.hpp"
 #include "expert/runtime/sha256.hpp"
+#include "expert/runtime/speculative_sampling.hpp"
 #include "expert/runtime/windows_iocp_storage.hpp"
 #include "expert/runtime/worker_provider.hpp"
 
@@ -77,6 +78,7 @@ constexpr std::uint32_t kDefaultWorkspaceRows = 512U;
 constexpr std::uint32_t kMaximumWorkspaceRows = 1024U;
 constexpr std::uint32_t kMaximumVisionPatches = 4096U;
 constexpr std::uint32_t kMaximumGpuSamplingTopK = 64U;
+constexpr std::uint32_t kMaximumExactDecodeRows = 5U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
 constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 
@@ -85,6 +87,12 @@ enum class TargetKvEncoding : std::uint8_t {
   fp8_e4m3_per_head,
   fp4_key_outlier1,
   fp16
+};
+
+enum class RecurrentCheckpointMode : std::uint8_t {
+  none,
+  after_first,
+  every_row,
 };
 
 TargetKvEncoding target_kv_encoding(std::string_view value) {
@@ -98,7 +106,7 @@ TargetKvEncoding target_kv_encoding(std::string_view value) {
 }
 
 constexpr std::uint64_t kDenseSnapshotMagic = 0x3150414e534d5651ULL;
-constexpr std::uint32_t kDenseSnapshotVersion = 1U;
+constexpr std::uint32_t kDenseSnapshotVersion = 2U;
 constexpr std::size_t kSnapshotChunkBytes = 4U << 20U;
 constexpr std::uint32_t kMaximumSnapshotVectorItems = 4U << 20U;
 
@@ -213,6 +221,11 @@ struct SnapshotChunk final {
   std::uint32_t bytes{};
 };
 
+struct MtpPrediction final {
+  std::uint32_t token{};
+  er::SamplingDistribution distribution;
+};
+
 struct DenseSnapshotManifest final {
   std::uint64_t generation{};
   er::Sha256Digest model_hash{};
@@ -229,6 +242,10 @@ struct DenseSnapshotManifest final {
   std::uint32_t mtp_length{};
   std::uint32_t synchronized_token{};
   std::uint32_t draft_token{};
+  std::vector<std::uint32_t> draft_tokens;
+  std::vector<std::uint32_t> draft_distribution_offsets;
+  std::vector<std::uint32_t> draft_distribution_tokens;
+  std::vector<double> draft_distribution_probabilities;
   std::uint32_t retention_position{};
   std::int32_t rope_delta{};
   bool draft_valid{};
@@ -315,6 +332,10 @@ std::vector<std::byte> encode_snapshot_manifest(
   output.u32(value.mtp_length);
   output.u32(value.synchronized_token);
   output.u32(value.draft_token);
+  output.vector(value.draft_tokens);
+  output.vector(value.draft_distribution_offsets);
+  output.vector(value.draft_distribution_tokens);
+  output.vector(value.draft_distribution_probabilities);
   output.u32(value.retention_position);
   output.i32(value.rope_delta);
   output.u8(value.draft_valid ? 1U : 0U);
@@ -379,6 +400,10 @@ DenseSnapshotManifest decode_snapshot_manifest(
       !input.u32(value.mtp_length) ||
       !input.u32(value.synchronized_token) ||
       !input.u32(value.draft_token) ||
+      !input.vector(value.draft_tokens) ||
+      !input.vector(value.draft_distribution_offsets) ||
+      !input.vector(value.draft_distribution_tokens) ||
+      !input.vector(value.draft_distribution_probabilities) ||
       !input.u32(value.retention_position) || !input.i32(value.rope_delta) ||
       !input.u8(draft) || !input.u8(retention) || !input.u8(exact) ||
       draft > 1U || retention > 1U || exact > 1U ||
@@ -701,13 +726,6 @@ std::uint64_t request_parameter(const er::ProgramRequestContext& request,
   return found->second;
 }
 
-std::uint64_t splitmix64(std::uint64_t value) noexcept {
-  value += 0x9e3779b97f4a7c15ULL;
-  value = (value ^ (value >> 30U)) * 0xbf58476d1ce4e5b9ULL;
-  value = (value ^ (value >> 27U)) * 0x94d049bb133111ebULL;
-  return value ^ (value >> 31U);
-}
-
 std::uint32_t sample_sorted_candidates(
     std::span<const float> logits, std::span<const std::uint32_t> candidates,
     const er::ProgramRequestContext& request, std::uint32_t position) {
@@ -716,64 +734,18 @@ std::uint32_t sample_sorted_candidates(
   const auto top_p_ppm = request_parameter(request, "sampling_top_p_ppm");
   const auto min_p_ppm = request_parameter(request, "sampling_min_p_ppm");
   const auto seed = request_parameter(request, "sampling_seed");
-  if (logits.empty() || logits.size() != candidates.size() ||
-      temperature_ppm == 0U ||
-      temperature_ppm > 2'000'000U || top_p_ppm == 0U ||
-      top_p_ppm > 1'000'000U || min_p_ppm > 1'000'000U ||
-      !std::isfinite(logits.front()))
-    throw std::runtime_error("invalid token sampling contract");
-
-  const auto inverse_temperature =
-      1'000'000.0 / static_cast<double>(temperature_ppm);
-  const auto maximum = static_cast<double>(logits.front());
-  const auto minimum_relative =
-      static_cast<double>(min_p_ppm) / 1'000'000.0;
-  std::vector<double> weights;
-  weights.reserve(candidates.size());
-  std::vector<std::uint32_t> retained_candidates;
-  retained_candidates.reserve(candidates.size());
-  std::size_t retained{};
-  double total{};
-  for (std::size_t index = 0U; index < candidates.size(); ++index) {
-    const auto logit = static_cast<double>(logits[index]);
-    const auto weight = std::isfinite(logit)
-                            ? std::exp((logit - maximum) * inverse_temperature)
-                            : 0.0;
-    if (weight < minimum_relative) continue;
-    retained_candidates.push_back(candidates[index]);
-    ++retained;
-    weights.push_back(weight);
-    total += weight;
+  try {
+    const auto distribution = er::make_sampling_distribution(
+        logits, candidates, static_cast<std::uint32_t>(temperature_ppm),
+        static_cast<std::uint32_t>(top_p_ppm),
+        static_cast<std::uint32_t>(min_p_ppm));
+    return er::sample_distribution(
+        distribution,
+        er::counter_uniform(seed, position, 0U));
+  } catch (const std::exception& error) {
+    throw std::runtime_error(std::string("invalid token sampling contract: ") +
+                             error.what());
   }
-  if (!retained || !std::isfinite(total) || !(total > 0.0))
-    throw std::runtime_error("token sampling distribution is empty");
-
-  const auto top_p = static_cast<double>(top_p_ppm) / 1'000'000.0;
-  double cumulative{};
-  std::size_t nucleus = weights.size();
-  for (std::size_t index = 0U; index < weights.size(); ++index) {
-    cumulative += weights[index] / total;
-    if (cumulative >= top_p) {
-      nucleus = index + 1U;
-      break;
-    }
-  }
-  weights.resize(nucleus);
-  retained_candidates.resize(nucleus);
-  total = std::accumulate(weights.begin(), weights.end(), 0.0);
-
-  const auto random_bits = splitmix64(
-      seed ^ (static_cast<std::uint64_t>(position) *
-              0xd2b74407b1ce6e93ULL));
-  const auto uniform = static_cast<double>(random_bits >> 11U) *
-                       (1.0 / 9007199254740992.0);
-  const auto threshold = uniform * total;
-  cumulative = 0.0;
-  for (std::size_t index = 0U; index < weights.size(); ++index) {
-    cumulative += weights[index];
-    if (threshold < cumulative) return retained_candidates[index];
-  }
-  return retained_candidates.back();
 }
 
 std::uint32_t sample_token(std::span<const float> logits,
@@ -1046,6 +1018,8 @@ std::vector<er::KernelCapability> provider_capabilities() {
       {"head.rmsnorm.token-select.bfloat16.v1", 1U, 1U, validator},
       {"decode.mtp.dense-full-attention.fp4-block32.exact.v1", 1U, 1U,
        validator},
+      {"decode.mtp.dense-full-attention.fp4-block32.exact.v2", 2U, 2U,
+       validator},
   };
 }
 
@@ -1104,7 +1078,9 @@ Kernel kernel_from_capability(std::string_view capability) {
       capability == "head.rmsnorm.token-select.bfloat16.v1")
     return Kernel::head;
   if (capability ==
-      "decode.mtp.dense-full-attention.fp4-block32.exact.v1")
+          "decode.mtp.dense-full-attention.fp4-block32.exact.v1" ||
+      capability ==
+          "decode.mtp.dense-full-attention.fp4-block32.exact.v2")
     return Kernel::exact_decode;
   throw std::runtime_error("unsupported dense FP4 capability");
 }
@@ -2338,6 +2314,28 @@ class DenseFp4Provider final : public er::IOperationProvider {
     epsilon_ = attribute_f32("norm_epsilon_f32_bits");
     rope_theta_ = attribute_f32("rope_theta_f32_bits");
     mtp_layers_ = attribute_u32("mtp_layers");
+    if (descriptor_.exact_decode_program) {
+      const auto& exact = *descriptor_.exact_decode_program;
+      exact_decode_abi_ = exact.abi_version;
+      if (exact.abi_version == 1U) {
+        draft_depth_ = 1U;
+        draft_vocabulary_size_ = vocabulary_size_;
+      } else if (exact.abi_version == 2U) {
+        draft_depth_ = parameter_u32(exact.parameters, "draft_depth");
+        draft_vocabulary_size_ =
+            parameter_u32(exact.parameters, "draft_vocabulary_size");
+        mtp_q8_kv_ =
+            parameter_u32(exact.parameters, "mtp_kv_encoding") == 1U;
+        if (parameter_u32(exact.parameters, "source_mtp_layers") != 1U ||
+            draft_depth_ < 3U || draft_depth_ > 4U ||
+            draft_vocabulary_size_ == 0U ||
+            draft_vocabulary_size_ > vocabulary_size_ || !mtp_q8_kv_)
+          throw std::runtime_error(
+              "exact-decode ABI 2 parameters are unsupported");
+      } else {
+        throw std::runtime_error("unsupported exact-decode ABI");
+      }
+    }
     if (!descriptor_.routed_components.empty()) {
       const auto& component = descriptor_.routed_components.front();
       expert_count_ = component.experts_per_layer;
@@ -2452,6 +2450,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
     const auto fp4_layer_page_bytes =
         2U * static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
         fp4_record_bytes;
+    const auto q8_record_bytes =
+        static_cast<std::uint64_t>(head_dim_) + sizeof(std::uint16_t);
+    const auto q8_layer_page_bytes =
+        2U * static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
+        q8_record_bytes;
+    const auto mtp_layer_page_bytes =
+        mtp_q8_kv_ ? q8_layer_page_bytes : fp4_layer_page_bytes;
     const auto maximum_pages =
         (static_cast<std::uint64_t>(max_context_) + kv_page_tokens_ - 1U) /
         kv_page_tokens_;
@@ -2548,7 +2553,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
           fp8_layer_page_bytes;
       mtp_kv_page_offset_ = target_kv_page_bytes_;
       mtp_kv_page_bytes_ =
-          static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
+          static_cast<std::uint64_t>(mtp_layers_) * mtp_layer_page_bytes;
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     } else if (target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1) {
       const auto key_record_bytes = fp4_record_bytes +
@@ -2562,7 +2567,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
           layer_page_bytes;
       mtp_kv_page_offset_ = target_kv_page_bytes_;
       mtp_kv_page_bytes_ =
-          static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
+          static_cast<std::uint64_t>(mtp_layers_) * mtp_layer_page_bytes;
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     } else if (device_resident_fp16_kv()) {
       qsa_index_page_offset_ = static_cast<std::uint32_t>(
@@ -2582,7 +2587,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
       }
       mtp_kv_page_offset_ = target_kv_page_bytes_;
       mtp_kv_page_bytes_ =
-          static_cast<std::uint64_t>(mtp_layers_) * fp4_layer_page_bytes;
+          static_cast<std::uint64_t>(mtp_layers_) * mtp_layer_page_bytes;
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     }
     const auto maximum_service_pages = checked_multiply(
@@ -2741,12 +2746,29 @@ class DenseFp4Provider final : public er::IOperationProvider {
   er::PrepareOperationResult prepare_exact_decode(
       const er::ExactDecodePreparationContext& context) override {
     try {
+      const auto legacy =
+          context.program.capability ==
+              "decode.mtp.dense-full-attention.fp4-block32.exact.v1" &&
+          context.program.abi_version == 1U &&
+          context.compiled.maximum_emitted_tokens == 2U &&
+          parameter_u32(context.compiled.parameters, "draft_layers") == 1U;
+      const auto multi =
+          context.program.capability ==
+              "decode.mtp.dense-full-attention.fp4-block32.exact.v2" &&
+          context.program.abi_version == 2U &&
+          context.compiled.maximum_emitted_tokens == draft_depth_ + 1U &&
+          parameter_u32(context.compiled.parameters, "source_mtp_layers") ==
+              1U &&
+          parameter_u32(context.compiled.parameters, "draft_depth") ==
+              draft_depth_ &&
+          parameter_u32(context.compiled.parameters,
+                        "draft_vocabulary_size") ==
+              draft_vocabulary_size_ &&
+          parameter_u32(context.compiled.parameters, "mtp_kv_encoding") ==
+              1U;
       if (context.model.content_hash != descriptor_.content_hash ||
-          context.program.capability !=
-              "decode.mtp.dense-full-attention.fp4-block32.exact.v1" ||
-          context.program.abi_version != 1U ||
-          context.compiled.maximum_emitted_tokens != 2U ||
-          parameter_u32(context.compiled.parameters, "draft_layers") != 1U ||
+          (!legacy && !multi) ||
+          context.program.abi_version != exact_decode_abi_ ||
           parameter_u32(context.compiled.parameters, "embedding_first") != 1U ||
           parameter_u32(context.compiled.parameters, "post_norm") != 1U)
         throw std::runtime_error("unsupported exact-decode artifact contract");
@@ -2895,7 +2917,24 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_exact_sync_batches", exact_sync_batches_},
             {"provider_exact_sync_tokens", exact_sync_tokens_},
             {"provider_exact_calls", exact_calls_},
+            {"provider_exact_target_batches", exact_target_batches_},
             {"provider_accepted_drafts", accepted_drafts_},
+            {"provider_accepted_depth_0", accepted_depth_calls_[0]},
+            {"provider_accepted_depth_1", accepted_depth_calls_[1]},
+            {"provider_accepted_depth_2", accepted_depth_calls_[2]},
+            {"provider_accepted_depth_3", accepted_depth_calls_[3]},
+            {"provider_accepted_depth_4", accepted_depth_calls_[4]},
+            {"provider_speculative_recurrent_checkpoint_bytes",
+             speculative_recurrent_checkpoint_bytes_},
+            {"provider_speculative_recurrent_restores",
+             speculative_recurrent_restores_},
+            {"provider_exact_decode_abi", exact_decode_abi_},
+            {"provider_mtp_draft_depth", draft_depth_},
+            {"provider_mtp_draft_vocabulary_size",
+             draft_vocabulary_size_},
+            {"provider_mtp_q8_kv", mtp_q8_kv_ ? 1U : 0U},
+            {"provider_fused_multiquery_attention_calls",
+             fused_multiquery_attention_calls_},
             {"provider_program_sequence_batches", program_sequence_batches_},
             {"provider_program_sequence_tokens", program_sequence_tokens_},
             {"provider_program_sequence_tiles", program_sequence_tiles_},
@@ -3138,6 +3177,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
     std::uint32_t mtp_length{};
     std::uint32_t synchronized_token{};
     std::uint32_t draft_token{};
+    std::vector<MtpPrediction> draft_predictions;
     std::uint32_t retention_position{};
     std::int32_t rope_delta{};
     std::vector<std::uint32_t> prompt_mrope_positions;
@@ -3547,6 +3587,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   [[nodiscard]] bool sequence_staging_has_headroom(
       SequenceState& sequence, const PreparedOperation& operation);
   void ensure_logits_capacity(std::uint32_t rows);
+  void ensure_sequence_workspace();
+  void release_sequence_workspace() noexcept;
   [[nodiscard]] const er::ExecutionValue& invocation_input(
       const PreparedOperation& operation,
       const er::OperationInvocation& invocation,
@@ -3613,7 +3655,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
                           std::span<const std::uint32_t> mrope_positions = {});
   void run_recurrent_attention(const PreparedOperation& operation,
                                std::uint32_t slot, std::uint32_t rows,
-                               bool checkpoint_after_first);
+                               RecurrentCheckpointMode checkpoint_mode);
   void run_router(const PreparedOperation& operation, std::uint32_t rows);
   void run_routed_moe(const PreparedOperation& operation,
                       std::uint32_t rows);
@@ -3626,13 +3668,28 @@ class DenseFp4Provider final : public er::IOperationProvider {
                                       bool terminal_only = false);
   std::vector<std::uint32_t> run_target(
       RequestState& state, std::span<const std::uint32_t> tokens,
-      std::span<const std::uint32_t> positions, bool transactional_second);
-  std::vector<std::uint32_t> run_mtp(
+      std::span<const std::uint32_t> positions,
+      RecurrentCheckpointMode checkpoint_mode);
+  std::optional<MtpPrediction> run_mtp(
       RequestState& state, std::span<const std::uint32_t> tokens,
       const float* previous_hidden,
-      std::span<const std::uint32_t> rotary_positions, bool produce_logits);
+      std::span<const std::uint32_t> rotary_positions, bool produce_logits,
+      const er::ProgramRequestContext* request = nullptr,
+      const std::uint8_t* presence = nullptr,
+      std::uint32_t sample_position = 0U,
+      std::uint32_t random_stream = 1U);
+  void extend_mtp_rollout(RequestState& state,
+                          const er::ProgramRequestContext& request,
+                          MtpPrediction first,
+                          std::uint32_t context_limit);
+  er::SamplingDistribution distribution_from_logits(
+      float* row_logits, std::uint32_t vocabulary,
+      const er::ProgramRequestContext& request, const std::uint8_t* presence);
+  void project_fp4_prefix(const DeviceTensor& weight, const float* input,
+                          float* output, std::uint32_t matrix_rows);
   void restore_recurrent_checkpoint(std::uint32_t slot);
-  void checkpoint_recurrent_state(std::uint32_t slot);
+  void restore_speculative_recurrent_checkpoint(std::uint32_t slot,
+                                                std::uint32_t row);
   float* slot_last_hidden(std::uint32_t slot) const;
   float* recurrent_conv(std::uint32_t recurrent_slot,
                         std::uint32_t request_slot) const;
@@ -3717,6 +3774,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t ple_layers_{};
   std::size_t ple_conv_state_values_{};
   std::uint32_t mtp_layers_{};
+  std::uint32_t exact_decode_abi_{};
+  std::uint32_t draft_depth_{};
+  std::uint32_t draft_vocabulary_size_{};
+  bool mtp_q8_kv_{};
   std::uint32_t target_full_layers_{};
   std::uint32_t global_attention_layers_{};
   std::uint32_t window_attention_layers_{};
@@ -3791,7 +3852,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t exact_sync_batches_{};
   std::uint64_t exact_sync_tokens_{};
   std::uint64_t exact_calls_{};
+  std::uint64_t exact_target_batches_{};
   std::uint64_t accepted_drafts_{};
+  std::array<std::uint64_t, kMaximumExactDecodeRows> accepted_depth_calls_{};
+  std::uint64_t speculative_recurrent_checkpoint_bytes_{};
+  std::uint64_t speculative_recurrent_restores_{};
+  std::uint64_t fused_multiquery_attention_calls_{};
   std::uint64_t program_sequence_batches_{};
   std::uint64_t program_sequence_tokens_{};
   std::uint64_t program_sequence_tiles_{};
@@ -3844,6 +3910,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   // Workspace and state are declared below with the execution methods.
   float* hidden_{};
   float* sequence_hidden_{};
+  std::size_t sequence_hidden_values_{};
   std::uint32_t sequence_tile_rows_{};
   float* normalized_{};
   float* residual_{};
@@ -3913,6 +3980,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t* sampling_top_partial_tokens_{};
   std::size_t sampling_top_partial_items_{};
   std::uint8_t* sampling_presence_{};
+  std::uint8_t* sampling_proposal_presence_{};
   std::int8_t* q8_{};
   float* q8_scales_{};
   float* nvfp4_input_{};
@@ -3946,6 +4014,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::vector<float*> recurrent_matrix_state_;
   std::vector<float*> recurrent_conv_checkpoint_;
   std::vector<float*> recurrent_matrix_checkpoint_;
+  std::vector<float*> recurrent_conv_speculative_checkpoint_;
+  std::vector<float*> recurrent_matrix_speculative_checkpoint_;
   std::vector<float*> recurrent_conv_retention_checkpoint_;
   std::vector<float*> recurrent_matrix_retention_checkpoint_;
   std::vector<float*> ple_conv_state_;
@@ -4593,9 +4663,10 @@ void DenseFp4Provider::allocate_workspace() {
   rows_per_slot -= rows_per_slot % workspace_rows_;
   sequence_tile_rows_ = static_cast<std::uint32_t>(std::min<std::uint64_t>(
       rows_per_slot, std::numeric_limits<std::uint32_t>::max()));
+  sequence_hidden_values_ = static_cast<std::size_t>(capacity_) *
+                            sequence_tile_rows_ * hidden_size_;
   sequence_hidden_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(capacity_) *
-                        sequence_tile_rows_ * hidden_size_);
+      allocations_, sequence_hidden_values_);
   normalized_ =
       device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   residual_ = device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
@@ -4762,6 +4833,8 @@ void DenseFp4Provider::allocate_workspace() {
       allocations_, sampling_top_partial_items_);
   sampling_presence_ = device_allocate<std::uint8_t>(
       allocations_, static_cast<std::size_t>(capacity_) * vocabulary_size_);
+  sampling_proposal_presence_ =
+      device_allocate<std::uint8_t>(allocations_, vocabulary_size_);
   q8_ = device_allocate<std::int8_t>(allocations_,
                                      workspace_rows_ * padded_columns);
   q8_scales_ = device_allocate<float>(allocations_, workspace_rows_);
@@ -4815,7 +4888,10 @@ void DenseFp4Provider::allocate_workspace() {
   attention_maximum_splits_ =
       (max_context_ + kAttentionSplitTokens - 1U) / kAttentionSplitTokens;
   const auto attention_state_rows =
-      std::max(attention_maximum_splits_, workspace_rows_);
+      std::max<std::uint64_t>(
+          workspace_rows_,
+          static_cast<std::uint64_t>(kMaximumExactDecodeRows) *
+              attention_maximum_splits_);
   partial_maxima_ = device_allocate<float>(
       allocations_, static_cast<std::size_t>(attention_state_rows) *
                         query_heads_);
@@ -4823,8 +4899,8 @@ void DenseFp4Provider::allocate_workspace() {
       allocations_, static_cast<std::size_t>(attention_state_rows) *
                         query_heads_);
   partial_outputs_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_maximum_splits_) *
-                        query_heads_ * head_dim_);
+      allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
+                        attention_maximum_splits_ * query_heads_ * head_dim_);
   staged_split_tokens_ = std::min(kStagedPrefillSplitTokens, max_context_);
   const auto staged_query_values =
       static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
@@ -4899,6 +4975,8 @@ void DenseFp4Provider::allocate_state() {
   recurrent_matrix_state_.resize(recurrent_layers_);
   recurrent_conv_checkpoint_.resize(recurrent_layers_);
   recurrent_matrix_checkpoint_.resize(recurrent_layers_);
+  recurrent_conv_speculative_checkpoint_.resize(recurrent_layers_);
+  recurrent_matrix_speculative_checkpoint_.resize(recurrent_layers_);
   recurrent_conv_retention_checkpoint_.resize(recurrent_layers_);
   recurrent_matrix_retention_checkpoint_.resize(recurrent_layers_);
   for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
@@ -4910,6 +4988,12 @@ void DenseFp4Provider::allocate_state() {
         device_allocate<float>(allocations_, capacity_ * conv_values);
     recurrent_matrix_checkpoint_[layer] =
         device_allocate<float>(allocations_, capacity_ * matrix_values);
+    recurrent_conv_speculative_checkpoint_[layer] = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(capacity_) *
+                          kMaximumExactDecodeRows * conv_values);
+    recurrent_matrix_speculative_checkpoint_[layer] = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(capacity_) *
+                          kMaximumExactDecodeRows * matrix_values);
     recurrent_conv_retention_checkpoint_[layer] =
         device_allocate<float>(allocations_, capacity_ * conv_values);
     recurrent_matrix_retention_checkpoint_[layer] =
@@ -5695,6 +5779,25 @@ void DenseFp4Provider::ensure_logits_capacity(std::uint32_t rows) {
   logits_capacity_rows_ = rows;
 }
 
+void DenseFp4Provider::ensure_sequence_workspace() {
+  if (sequence_hidden_) return;
+  if (!sequence_hidden_values_)
+    throw std::runtime_error("sequence workspace geometry is empty");
+  sequence_hidden_ =
+      device_allocate<float>(allocations_, sequence_hidden_values_);
+}
+
+void DenseFp4Provider::release_sequence_workspace() noexcept {
+  if (!sequence_hidden_) return;
+  const auto allocation = sequence_hidden_;
+  const auto released = cudaFree(allocation);
+  if (released != cudaSuccess) return;
+  const auto found = std::find(allocations_.begin(), allocations_.end(),
+                               static_cast<void*>(allocation));
+  if (found != allocations_.end()) *found = nullptr;
+  sequence_hidden_ = nullptr;
+}
+
 void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
                                          const float* input, float* output,
                                          std::uint32_t rows) {
@@ -5758,6 +5861,18 @@ void DenseFp4Provider::project(const DeviceTensor& weight, const float* input,
       weight.quant_abi == er::kExpertQuantAbiFp4Block32)
     quantize_rows(input, rows, weight.matrix_columns());
   project_quantized(weight, input, output, rows);
+}
+
+void DenseFp4Provider::project_fp4_prefix(const DeviceTensor& weight,
+                                          const float* input, float* output,
+                                          std::uint32_t matrix_rows) {
+  auto matrix = weight.matrix();
+  if (!matrix_rows || matrix_rows > matrix.rows)
+    throw std::runtime_error("FP4 projection prefix is invalid");
+  matrix.rows = matrix_rows;
+  quantize_rows(input, 1U, matrix.columns);
+  status_check(ec::fp4_gemv_q8_batch(
+      matrix, q8_, q8_scales_, output, 1U, nullptr));
 }
 
 void DenseFp4Provider::project_vision(const DeviceTensor& weight,
@@ -7023,8 +7138,10 @@ void DenseFp4Provider::run_full_attention(
       target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head;
   const auto target_fp4_key_outlier1 =
       target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1;
-  const auto mixed_mtp = (target_fp8 || target_fp4_key_outlier1) &&
-                         full_attention_slot >= target_full_layers_;
+  const auto mtp_q8 = mtp_q8_kv_ && mtp_attention_.get() == &operation;
+  const auto mixed_mtp =
+      (target_fp8 || target_fp4_key_outlier1 || mtp_q8) &&
+      full_attention_slot >= target_full_layers_;
   const auto physical_layer =
       mixed_mtp ? full_attention_slot - target_full_layers_
                 : full_attention_slot;
@@ -7037,7 +7154,11 @@ void DenseFp4Provider::run_full_attention(
     ensure_page(slot, cache_positions[row]);
   }
   if (!mrope_positions.empty()) {
-    if (target_fp8 && !mixed_mtp)
+    if (mtp_q8)
+      status_check(ec::store_gqa_kv_paged_q8_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_fp8 && !mixed_mtp)
       status_check(ec::store_gqa_kv_paged_fp8_batch(
           key_, value_, page_table, physical_layer, kv_page_tokens_,
           cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
@@ -7056,7 +7177,21 @@ void DenseFp4Provider::run_full_attention(
     if (mixed_mtp)
       page = static_cast<void*>(static_cast<std::byte*>(page) +
                                 mtp_kv_page_offset_);
-    if (target_fp8 && !mixed_mtp) {
+    if (mtp_q8) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q8_at(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
+            rope_theta_, nullptr));
+      status_check(ec::gated_gqa_attention_decode_paged_q8_tensor_core({
+          query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
+          partial_outputs_, cache_positions.front() + 1U, physical_layer,
+          kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+          kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
+    } else if (target_fp8 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_at(
           query_gate_, key_, value_,
@@ -7104,7 +7239,16 @@ void DenseFp4Provider::run_full_attention(
           kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
     }
   } else {
-    if (target_fp8 && !mixed_mtp) {
+    if (mtp_q8) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q8_batch(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page_table, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
+            epsilon_, rope_theta_, nullptr));
+    } else if (target_fp8 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_batch(
           query_gate_, key_, value_, binding(operation, "query_norm").f32,
@@ -7132,13 +7276,17 @@ void DenseFp4Provider::run_full_attention(
           rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
           epsilon_, rope_theta_, nullptr));
     }
-    if (rows * (query_heads_ / kv_heads_) <= 16U) {
+    if (rows * (query_heads_ / kv_heads_) <= 32U) {
+      ++fused_multiquery_attention_calls_;
       const ec::PagedFp4GatedGqaPrefillLaunch launch{
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, rows,
           physical_layer, kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
           kAttentionSplitTokens, attention_maximum_splits_, nullptr};
-      if (target_fp8 && !mixed_mtp)
+      if (mtp_q8)
+        status_check(
+            ec::gated_gqa_attention_microbatch_paged_q8_tensor_core(launch));
+      else if (target_fp8 && !mixed_mtp)
         status_check(
             ec::gated_gqa_attention_microbatch_paged_fp8_tensor_core(launch));
       else if (target_fp4_key_outlier1 && !mixed_mtp)
@@ -7174,7 +7322,10 @@ void DenseFp4Provider::run_full_attention(
           static_cast<std::size_t>(workspace_rows_) * query_heads_ *
               sizeof(float),
           staged_split_tokens_};
-      if (target_fp8 && !mixed_mtp)
+      if (mtp_q8)
+        status_check(ec::gated_gqa_attention_staged_prefill_paged_q8(
+            launch, workspace));
+      else if (target_fp8 && !mixed_mtp)
         status_check(ec::gated_gqa_attention_staged_prefill_paged_fp8(
             launch, workspace));
       else if (target_fp4_key_outlier1 && !mixed_mtp)
@@ -7192,9 +7343,9 @@ void DenseFp4Provider::run_full_attention(
 
 void DenseFp4Provider::run_recurrent_attention(
     const PreparedOperation& operation, std::uint32_t slot,
-    std::uint32_t rows, bool checkpoint_after_first) {
+    std::uint32_t rows, RecurrentCheckpointMode checkpoint_mode) {
   if (operation.capability == "block.mamba2.ssm.v1") {
-    if (checkpoint_after_first)
+    if (checkpoint_mode != RecurrentCheckpointMode::none)
       throw std::runtime_error(
           "Mamba2 does not advertise transactional draft checkpoints");
     quantize_rows(normalized_, rows, hidden_size_);
@@ -7240,7 +7391,22 @@ void DenseFp4Provider::run_recurrent_attention(
       ? static_cast<ec::GatedDeltaOutputActivation>(
             parameter_u32(operation.parameters, "output_gate_activation"))
       : ec::GatedDeltaOutputActivation::silu;
-  if (rows > 1U && !checkpoint_after_first) {
+  if (rows > 1U &&
+      checkpoint_mode != RecurrentCheckpointMode::after_first) {
+    const auto checkpoint_every_row =
+        checkpoint_mode == RecurrentCheckpointMode::every_row;
+    auto* conv_checkpoints = checkpoint_every_row
+        ? recurrent_conv_speculative_checkpoint_.at(
+              operation.recurrent_slot) +
+              static_cast<std::size_t>(slot) * kMaximumExactDecodeRows *
+                  conv_state_values
+        : nullptr;
+    auto* matrix_checkpoints = checkpoint_every_row
+        ? recurrent_matrix_speculative_checkpoint_.at(
+              operation.recurrent_slot) +
+              static_cast<std::size_t>(slot) * kMaximumExactDecodeRows *
+                  matrix_state_values
+        : nullptr;
     status_check(ec::split_gated_delta_prefill({
         projected_qkv_, projected_z_, projected_b_, projected_a_,
         binding(operation, "convolution").dequantized,
@@ -7255,6 +7421,7 @@ void DenseFp4Provider::run_recurrent_attention(
                       expert_width_, mamba_heads_ * mamba_head_dim_,
                       hyper_lowrank_, ple_embedding_width_}) *
             sizeof(float),
+        conv_checkpoints, matrix_checkpoints,
         rows, key_heads_, value_heads_, key_head_dim_, value_head_dim_,
         conv_kernel_, epsilon_, output_gate_activation, nullptr}));
     project(binding(operation, "output_projection"), delta_output_, residual_,
@@ -7277,7 +7444,8 @@ void DenseFp4Provider::run_recurrent_attention(
         delta_output_ + static_cast<std::size_t>(row) * value_dimension,
         key_heads_, value_heads_, key_head_dim_, value_head_dim_, conv_kernel_,
         epsilon_, output_gate_activation, nullptr}));
-    if (checkpoint_after_first && row == 0U) {
+    if (checkpoint_mode == RecurrentCheckpointMode::after_first &&
+        row == 0U) {
       auto* conv_checkpoint =
           recurrent_conv_checkpoint_.at(operation.recurrent_slot) +
           static_cast<std::size_t>(slot) * conv_state_values;
@@ -7463,6 +7631,68 @@ void DenseFp4Provider::run_ffn(const PreparedOperation& operation,
   }
 }
 
+er::SamplingDistribution DenseFp4Provider::distribution_from_logits(
+    float* row_logits, std::uint32_t vocabulary,
+    const er::ProgramRequestContext& request, const std::uint8_t* presence) {
+  if (!row_logits || !vocabulary || vocabulary > vocabulary_size_)
+    throw std::runtime_error("sampling logit row is invalid");
+  const auto biased_presence = request_parameter(
+      request, "sampling_presence_penalty_biased_ppm");
+  if (biased_presence > 4'000'000U)
+    throw std::runtime_error("sampling presence penalty is invalid");
+  const auto presence_penalty =
+      (static_cast<double>(biased_presence) - 2'000'000.0) / 1'000'000.0;
+  if (presence_penalty != 0.0) {
+    if (!presence)
+      throw std::runtime_error("sampling presence state is absent");
+    status_check(ec::apply_presence_penalty(
+        row_logits, presence, vocabulary,
+        static_cast<float>(presence_penalty), nullptr));
+  }
+  const auto temperature = request_parameter(
+      request, "sampling_temperature_ppm");
+  if (temperature == 0U) {
+    status_check(ec::argmax(row_logits, vocabulary, output_tokens_, nullptr));
+    std::uint32_t token{};
+    cuda_check(cudaMemcpy(&token, output_tokens_, sizeof(token),
+                          cudaMemcpyDeviceToHost),
+               "copy exact greedy token");
+    return {{{token, 1.0}}};
+  }
+  const auto top_k = request_parameter(request, "sampling_top_k");
+  if (top_k == 0U || top_k > kMaximumGpuSamplingTopK || top_k > vocabulary)
+    throw std::runtime_error(
+        "sampled exact decode requires bounded nonzero top-k");
+  status_check(ec::topk_logits(
+      row_logits, vocabulary, static_cast<std::uint32_t>(top_k),
+      sampling_top_logits_, sampling_top_tokens_,
+      {sampling_top_partial_logits_,
+       sampling_top_partial_items_ * sizeof(float),
+       sampling_top_partial_tokens_,
+       sampling_top_partial_items_ * sizeof(std::uint32_t)},
+      nullptr));
+  std::vector<float> host_logits(static_cast<std::size_t>(top_k));
+  std::vector<std::uint32_t> host_tokens(static_cast<std::size_t>(top_k));
+  cuda_check(cudaMemcpy(host_logits.data(), sampling_top_logits_,
+                        host_logits.size() * sizeof(host_logits[0]),
+                        cudaMemcpyDeviceToHost),
+             "copy speculative top-k logits");
+  cuda_check(cudaMemcpy(host_tokens.data(), sampling_top_tokens_,
+                        host_tokens.size() * sizeof(host_tokens[0]),
+                        cudaMemcpyDeviceToHost),
+             "copy speculative top-k tokens");
+  ++sampling_gpu_calls_;
+  sampling_logit_transfer_bytes_ +=
+      host_logits.size() * sizeof(host_logits[0]) +
+      host_tokens.size() * sizeof(host_tokens[0]);
+  return er::make_sampling_distribution(
+      host_logits, host_tokens, static_cast<std::uint32_t>(temperature),
+      static_cast<std::uint32_t>(
+          request_parameter(request, "sampling_top_p_ppm")),
+      static_cast<std::uint32_t>(
+          request_parameter(request, "sampling_min_p_ppm")));
+}
+
 std::vector<std::uint32_t> DenseFp4Provider::run_head(
     const PreparedOperation& operation, std::uint32_t rows,
     const er::ProgramRequestContext* request, RequestState* state,
@@ -7588,12 +7818,19 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
 
 std::vector<std::uint32_t> DenseFp4Provider::run_target(
     RequestState& state, std::span<const std::uint32_t> tokens,
-    std::span<const std::uint32_t> positions, bool transactional_second) {
+    std::span<const std::uint32_t> positions,
+    RecurrentCheckpointMode checkpoint_mode) {
   if (tokens.empty() || tokens.size() > workspace_rows_ ||
       tokens.size() != positions.size())
     throw std::runtime_error("invalid target-model microbatch");
   const auto rows = static_cast<std::uint32_t>(tokens.size());
   const auto slot = state.slot();
+  ++exact_target_batches_;
+  if (checkpoint_mode == RecurrentCheckpointMode::every_row) {
+    speculative_recurrent_checkpoint_bytes_ +=
+        static_cast<std::uint64_t>(rows) * recurrent_layers_ *
+        (recurrent_conv_values_ + recurrent_matrix_values_) * sizeof(float);
+  }
   std::vector<std::uint32_t> result;
   try {
     for (const auto& operation_pointer : prepared_target_) {
@@ -7653,8 +7890,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
                    "retain target recurrent residual");
         normalize_rows(hidden_, binding(operation, "input_norm").f32,
                        normalized_, rows);
-        run_recurrent_attention(operation, slot, rows,
-                                transactional_second && rows == 2U);
+        run_recurrent_attention(operation, slot, rows, checkpoint_mode);
         status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
                                       nullptr));
         break;
@@ -7707,29 +7943,37 @@ void DenseFp4Provider::restore_recurrent_checkpoint(std::uint32_t slot) {
   }
 }
 
-void DenseFp4Provider::checkpoint_recurrent_state(std::uint32_t slot) {
+void DenseFp4Provider::restore_speculative_recurrent_checkpoint(
+    std::uint32_t slot, std::uint32_t row) {
+  if (slot >= capacity_ || row >= kMaximumExactDecodeRows)
+    throw std::runtime_error("invalid speculative recurrent checkpoint");
+  ++speculative_recurrent_restores_;
   const auto conv_values = recurrent_conv_values_;
   const auto matrix_values = recurrent_matrix_values_;
   for (std::uint32_t layer = 0U; layer < recurrent_layers_; ++layer) {
     cuda_check(cudaMemcpy(
-                   recurrent_conv_checkpoint_[layer] +
-                       static_cast<std::size_t>(slot) * conv_values,
                    recurrent_conv(layer, slot),
+                   recurrent_conv_speculative_checkpoint_[layer] +
+                       (static_cast<std::size_t>(slot) *
+                            kMaximumExactDecodeRows +
+                        row) * conv_values,
                    conv_values * sizeof(float), cudaMemcpyDeviceToDevice),
-               "checkpoint exact-tier recurrent convolution state");
-    cuda_check(cudaMemcpy(
-                   recurrent_matrix_checkpoint_[layer] +
-                       static_cast<std::size_t>(slot) * matrix_values,
-                   recurrent_matrix(layer, slot),
-                   matrix_values * sizeof(float), cudaMemcpyDeviceToDevice),
-               "checkpoint exact-tier recurrent matrix state");
+               "restore speculative recurrent convolution state");
+    status_check(ec::restore_split_gated_delta_recurrent_checkpoint(
+        recurrent_matrix_speculative_checkpoint_[layer] +
+            (static_cast<std::size_t>(slot) * kMaximumExactDecodeRows + row) *
+                matrix_values,
+        recurrent_matrix(layer, slot), value_heads_, key_head_dim_,
+        value_head_dim_, nullptr));
   }
 }
 
-std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
+std::optional<MtpPrediction> DenseFp4Provider::run_mtp(
     RequestState& state, std::span<const std::uint32_t> tokens,
     const float* previous_hidden,
-    std::span<const std::uint32_t> rotary_positions, bool produce_logits) {
+    std::span<const std::uint32_t> rotary_positions, bool produce_logits,
+    const er::ProgramRequestContext* request, const std::uint8_t* presence,
+    std::uint32_t sample_position, std::uint32_t random_stream) {
   if (!exact_ || !mtp_attention_ || !mtp_ffn_ || tokens.empty() ||
       tokens.size() > workspace_rows_ || tokens.size() != rotary_positions.size() ||
       state.mtp_length + tokens.size() > max_context_)
@@ -7804,7 +8048,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
   state.mtp_length += rows;
   if (!produce_logits) {
     end_gpu_phase(phase_event);
-    return {};
+    return std::nullopt;
   }
   const auto* final_hidden =
       hidden_ + static_cast<std::size_t>(rows - 1U) * hidden_size_;
@@ -7817,16 +8061,78 @@ std::vector<std::uint32_t> DenseFp4Provider::run_mtp(
   normalize_rows(final_hidden, binding(*exact_, "draft_norm").f32,
                  normalized_, 1U);
   ensure_logits_capacity(1U);
-  project(binding(*exact_, "output_head"), normalized_, logits_, 1U);
-  status_check(ec::argmax_batch(logits_, vocabulary_size_, 1U,
-                                output_tokens_, nullptr));
-  std::vector<std::uint32_t> result(1U);
-  cuda_check(cudaMemcpy(result.data(), output_tokens_, sizeof(result[0]),
-                        cudaMemcpyDeviceToHost),
-             "copy final MTP draft token");
+  const auto draft_vocabulary =
+      exact_decode_abi_ >= 2U ? draft_vocabulary_size_ : vocabulary_size_;
+  if (draft_vocabulary == vocabulary_size_)
+    project(binding(*exact_, "output_head"), normalized_, logits_, 1U);
+  else
+    project_fp4_prefix(binding(*exact_, "output_head"), normalized_, logits_,
+                       draft_vocabulary);
+  MtpPrediction result;
+  if (request) {
+    result.distribution = distribution_from_logits(
+        logits_, draft_vocabulary, *request, presence);
+    result.token = er::sample_distribution(
+        result.distribution,
+        er::counter_uniform(
+            request_parameter(*request, "sampling_seed"), sample_position,
+            random_stream));
+  } else {
+    status_check(ec::argmax(logits_, draft_vocabulary, output_tokens_,
+                            nullptr));
+    cuda_check(cudaMemcpy(&result.token, output_tokens_, sizeof(result.token),
+                          cudaMemcpyDeviceToHost),
+               "copy final MTP draft token");
+    result.distribution.entries.push_back({result.token, 1.0});
+  }
   end_gpu_phase(phase_event);
   collect_gpu_phases();
   return result;
+}
+
+void DenseFp4Provider::extend_mtp_rollout(
+    RequestState& state, const er::ProgramRequestContext& request,
+    MtpPrediction first, std::uint32_t context_limit) {
+  if (exact_decode_abi_ < 2U || draft_depth_ == 0U ||
+      context_limit > max_context_ || state.mtp_length >= context_limit ||
+      !(first.distribution.probability(first.token) > 0.0))
+    throw std::runtime_error("invalid MTP rollout root");
+  state.draft_predictions.clear();
+  state.draft_predictions.reserve(draft_depth_);
+  const auto committed_length = state.mtp_length;
+  if (committed_length + 1U >= context_limit)
+    throw std::runtime_error("MTP rollout root exceeds context");
+  state.draft_predictions.push_back(std::move(first));
+  cuda_check(cudaMemset(sampling_proposal_presence_ +
+                            state.draft_predictions.back().token,
+                        1, 1),
+             "mark speculative proposal presence");
+  while (state.draft_predictions.size() < draft_depth_ &&
+         state.mtp_length + 2U < context_limit) {
+    cuda_check(cudaMemcpy(
+                   mtp_rollout_previous_hidden_,
+                   slot_mtp_last_hidden_ +
+                       static_cast<std::size_t>(state.slot()) * hidden_size_,
+                   hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
+               "retain MTP rollout hidden state");
+    const auto sample_position = state.mtp_length;
+    const std::array token{state.draft_predictions.back().token};
+    const std::array rotary_position{state.mtp_length + 1U};
+    auto prediction = run_mtp(
+        state, token, mtp_rollout_previous_hidden_, rotary_position, true,
+        &request, sampling_proposal_presence_, sample_position,
+        1U + static_cast<std::uint32_t>(state.draft_predictions.size()));
+    if (!prediction)
+      throw std::runtime_error("MTP rollout produced no proposal");
+    state.draft_predictions.push_back(std::move(*prediction));
+    cuda_check(cudaMemset(sampling_proposal_presence_ +
+                              state.draft_predictions.back().token,
+                          1, 1),
+               "mark speculative proposal presence");
+  }
+  state.draft_token = state.draft_predictions.front().token;
+  state.draft_valid = !state.draft_predictions.empty();
+  state.mtp_length = committed_length;
 }
 
 bool DenseFp4Provider::supports_program_sequence(
@@ -8002,6 +8308,7 @@ er::OperationExecutionHandle DenseFp4Provider::execute_program_sequence(
         invocation.operations.size() != prepared_target_.size() ||
         invocation.inputs.size() != invocation.program.inputs.size())
       throw std::runtime_error("dense FP4 program-sequence contract is invalid");
+    ensure_sequence_workspace();
 
     auto sequence = std::make_shared<SequenceState>();
     sequence->request = request;
@@ -8244,6 +8551,7 @@ er::Status DenseFp4Provider::rewind_request_state(
     state->synchronization_rows = 0U;
     state->synchronization_consumed = 0U;
     state->draft_valid = false;
+    state->draft_predictions.clear();
     state->sequence_target_hidden.clear();
     return er::Status::success();
   } catch (const std::exception& error) {
@@ -8768,6 +9076,18 @@ DenseFp4Provider::save_request_state_snapshot(
     manifest.mtp_length = state->mtp_length;
     manifest.synchronized_token = state->synchronized_token;
     manifest.draft_token = state->draft_token;
+    manifest.draft_distribution_offsets.push_back(0U);
+    for (const auto& prediction : state->draft_predictions) {
+      manifest.draft_tokens.push_back(prediction.token);
+      for (const auto& entry : prediction.distribution.entries) {
+        manifest.draft_distribution_tokens.push_back(entry.token);
+        manifest.draft_distribution_probabilities.push_back(
+            entry.probability);
+      }
+      manifest.draft_distribution_offsets.push_back(
+          static_cast<std::uint32_t>(
+              manifest.draft_distribution_tokens.size()));
+    }
     manifest.retention_position = state->retention_position;
     manifest.rope_delta = state->rope_delta;
     manifest.draft_valid = state->draft_valid;
@@ -8836,6 +9156,51 @@ DenseFp4Provider::load_request_state_snapshot(
         !manifest.retention_valid || manifest.current_batch_rows != 0U ||
         manifest.synchronization_rows != 0U)
       throw std::runtime_error("snapshot identity or request state mismatches");
+    if (manifest.draft_distribution_tokens.size() !=
+            manifest.draft_distribution_probabilities.size() ||
+        manifest.draft_distribution_offsets.size() !=
+            manifest.draft_tokens.size() + 1U ||
+        manifest.draft_distribution_offsets.empty() ||
+        manifest.draft_distribution_offsets.front() != 0U ||
+        manifest.draft_distribution_offsets.back() !=
+            manifest.draft_distribution_tokens.size() ||
+        manifest.draft_tokens.size() > 4U ||
+        manifest.draft_distribution_tokens.size() > 4U *
+            kMaximumGpuSamplingTopK)
+      throw std::runtime_error("snapshot draft distributions are invalid");
+    std::vector<MtpPrediction> draft_predictions;
+    draft_predictions.reserve(manifest.draft_tokens.size());
+    for (std::size_t index = 0U; index < manifest.draft_tokens.size();
+         ++index) {
+      const auto first = manifest.draft_distribution_offsets[index];
+      const auto last = manifest.draft_distribution_offsets[index + 1U];
+      if (first >= last || first > last ||
+          last > manifest.draft_distribution_tokens.size() ||
+          manifest.draft_tokens[index] >= vocabulary_size_)
+        throw std::runtime_error("snapshot draft distribution is malformed");
+      MtpPrediction prediction;
+      prediction.token = manifest.draft_tokens[index];
+      prediction.distribution.entries.reserve(last - first);
+      for (auto item = first; item < last; ++item) {
+        const auto token = manifest.draft_distribution_tokens[item];
+        const auto probability =
+            manifest.draft_distribution_probabilities[item];
+        if (token >= vocabulary_size_)
+          throw std::runtime_error("snapshot draft token is invalid");
+        prediction.distribution.entries.push_back({token, probability});
+      }
+      static_cast<void>(
+          er::sample_distribution(prediction.distribution, 0.0));
+      if (!(prediction.distribution.probability(prediction.token) > 0.0))
+        throw std::runtime_error("snapshot proposal has zero probability");
+      draft_predictions.push_back(std::move(prediction));
+    }
+    if ((exact_decode_abi_ >= 2U && manifest.draft_valid &&
+         (draft_predictions.empty() ||
+          draft_predictions.size() > draft_depth_)) ||
+        (!manifest.draft_valid && !draft_predictions.empty()) ||
+        (exact_decode_abi_ < 2U && !draft_predictions.empty()))
+      throw std::runtime_error("snapshot draft depth disagrees with artifact");
     const auto expected_pages =
         (static_cast<std::uint64_t>(manifest.retention_position) +
          kv_page_tokens_ - 1U) /
@@ -8958,6 +9323,7 @@ DenseFp4Provider::load_request_state_snapshot(
       state->mtp_length = manifest.mtp_length;
       state->synchronized_token = manifest.synchronized_token;
       state->draft_token = manifest.draft_token;
+      state->draft_predictions = std::move(draft_predictions);
       state->retention_position = manifest.retention_position;
       state->rope_delta = manifest.rope_delta;
       state->prompt_mrope_positions =
@@ -9143,6 +9509,7 @@ DenseFp4Provider::poll_program_sequence(
         sequence->request->sequence_target_hidden.clear();
         sequence->request->mtp_length = sequence->request->current_position + 1U;
         sequence->request->draft_valid = false;
+        sequence->request->draft_predictions.clear();
       }
 
       auto owner = std::make_shared<std::vector<std::uint32_t>>(
@@ -9159,6 +9526,7 @@ DenseFp4Provider::poll_program_sequence(
       ++program_sequence_batches_;
       program_sequence_tokens_ += total_rows;
       release_staged_dense_weights();
+      if (mtp_q8_kv_) release_sequence_workspace();
       sequence->terminal = true;
       return result;
     }
@@ -9279,7 +9647,7 @@ DenseFp4Provider::poll_program_sequence(
                                       operation.kv_layer_slot);
           } else
             run_recurrent_attention(operation, sequence->request->slot(), rows,
-                                    false);
+                                    RecurrentCheckpointMode::none);
           if (operation.kernel == Kernel::recurrent_attention &&
               sequence->retention_position != 0U &&
               offset + rows == static_cast<std::size_t>(
@@ -9546,7 +9914,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
                              std::span(rotary).first(rows), rows,
                              operation->full_attention_slot);
         } else {
-          run_recurrent_attention(*operation, state->slot(), rows, false);
+          run_recurrent_attention(*operation, state->slot(), rows,
+                                  RecurrentCheckpointMode::none);
         }
         if (no_residual)
           cuda_check(cudaMemcpy(hidden_, residual_,
@@ -9657,6 +10026,7 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
           state->synchronization_consumed = 0U;
           state->mtp_length = state->current_position + 1U;
           state->draft_valid = false;
+          state->draft_predictions.clear();
         }
         auto owner =
             std::make_shared<std::vector<std::uint32_t>>(
@@ -9770,6 +10140,7 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
                "commit synchronized target hidden state");
     state->synchronization_consumed += rows;
     state->draft_valid = false;
+    state->draft_predictions.clear();
     state->synchronized_token = synchronization.next_tokens.back();
 
     const auto mtp_rows = synchronization.first_target_position + 1U >=
@@ -9787,14 +10158,39 @@ er::Status DenseFp4Provider::synchronize_exact_decode_batch(
             synchronization.first_target_position + row + 1U;
       const auto produce_draft = synchronization.produce_final_draft &&
                                  mtp_rows == rows;
-      auto drafts = run_mtp(
+      if (produce_draft && exact_decode_abi_ >= 2U)
+        cuda_check(cudaMemcpy(
+                       sampling_proposal_presence_,
+                       sampling_presence_ +
+                           static_cast<std::size_t>(state->slot()) *
+                               vocabulary_size_,
+                       vocabulary_size_, cudaMemcpyDeviceToDevice),
+                   "initialize speculative proposal presence");
+      const auto sample_position =
+          synchronization.first_target_position + mtp_rows;
+      auto draft = run_mtp(
           *state, synchronization.next_tokens.first(mtp_rows), previous_hidden,
-          std::span(positions).first(mtp_rows), produce_draft);
+          std::span(positions).first(mtp_rows), produce_draft,
+          produce_draft && exact_decode_abi_ >= 2U
+              ? &synchronization.request
+              : nullptr,
+          produce_draft && exact_decode_abi_ >= 2U
+              ? sampling_proposal_presence_
+              : nullptr,
+          sample_position, 1U);
       if (produce_draft) {
-        if (drafts.size() != 1U)
+        if (!draft)
           throw std::runtime_error("MTP synchronization produced no draft");
-        state->draft_token = drafts.front();
-        state->draft_valid = true;
+        if (exact_decode_abi_ >= 2U) {
+          const auto context_limit = static_cast<std::uint32_t>(
+              request_parameter(synchronization.request,
+                                "reserved_context_tokens"));
+          extend_mtp_rollout(*state, synchronization.request,
+                             std::move(*draft), context_limit);
+        } else {
+          state->draft_token = draft->token;
+          state->draft_valid = true;
+        }
       }
     }
     ++exact_sync_batches_;
@@ -9827,12 +10223,162 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
         invocation.context_limit > max_context_)
       throw std::runtime_error("exact MTP invocation stream is invalid");
 
+    if (exact_decode_abi_ >= 2U) {
+      if (state->draft_predictions.empty() ||
+          state->draft_predictions.size() > draft_depth_ ||
+          state->draft_predictions.size() + 1U >
+              kMaximumExactDecodeRows ||
+          invocation.position + state->draft_predictions.size() >=
+              invocation.context_limit)
+        throw std::runtime_error("multi-draft MTP state is invalid");
+      const auto proposal_count = state->draft_predictions.size();
+      std::vector<std::uint32_t> target_tokens;
+      std::vector<std::uint32_t> target_positions;
+      target_tokens.reserve(proposal_count + 1U);
+      target_positions.reserve(proposal_count + 1U);
+      target_tokens.push_back(invocation.guaranteed_token);
+      target_positions.push_back(invocation.position);
+      for (std::size_t index = 0U; index < proposal_count; ++index) {
+        const auto& proposal = state->draft_predictions[index];
+        if (!(proposal.distribution.probability(proposal.token) > 0.0))
+          throw std::runtime_error("MTP proposal has zero draft mass");
+        target_tokens.push_back(proposal.token);
+        target_positions.push_back(
+            invocation.position + static_cast<std::uint32_t>(index) + 1U);
+      }
+
+      static_cast<void>(
+          run_target(*state, target_tokens, target_positions,
+                     RecurrentCheckpointMode::every_row));
+      cuda_check(cudaMemcpy(
+                     sampling_proposal_presence_,
+                     sampling_presence_ +
+                         static_cast<std::size_t>(state->slot()) *
+                             vocabulary_size_,
+                     vocabulary_size_, cudaMemcpyDeviceToDevice),
+                 "initialize target verification presence");
+      std::vector<er::SamplingDistribution> target_distributions;
+      target_distributions.reserve(proposal_count + 1U);
+      for (std::size_t row = 0U; row <= proposal_count; ++row) {
+        target_distributions.push_back(distribution_from_logits(
+            logits_ + row * vocabulary_size_, vocabulary_size_,
+            invocation.request, sampling_proposal_presence_));
+        if (row < proposal_count)
+          cuda_check(cudaMemset(
+                         sampling_proposal_presence_ +
+                             state->draft_predictions[row].token,
+                         1, 1),
+                     "advance target verification presence");
+      }
+
+      const auto seed =
+          request_parameter(invocation.request, "sampling_seed");
+      std::size_t accepted{};
+      std::uint32_t next_token{};
+      bool rejected{};
+      for (; accepted < proposal_count; ++accepted) {
+        const auto& proposal = state->draft_predictions[accepted];
+        const auto decision = er::rejection_sample(
+            proposal.token, target_distributions[accepted],
+            proposal.distribution,
+            er::counter_uniform(
+                seed,
+                invocation.position + static_cast<std::uint32_t>(accepted),
+                100U, static_cast<std::uint32_t>(accepted)),
+            er::counter_uniform(
+                seed,
+                invocation.position + static_cast<std::uint32_t>(accepted),
+                200U, static_cast<std::uint32_t>(accepted)));
+        if (!decision.accepted) {
+          next_token = decision.token;
+          rejected = true;
+          break;
+        }
+      }
+      if (!rejected)
+        next_token = er::sample_distribution(
+            target_distributions.back(),
+            er::counter_uniform(
+                seed,
+                invocation.position + static_cast<std::uint32_t>(accepted),
+                300U));
+
+      if (rejected) {
+        restore_speculative_recurrent_checkpoint(
+            state->slot(), static_cast<std::uint32_t>(accepted));
+      }
+      cuda_check(cudaMemcpy(
+                     slot_last_hidden(state->slot()),
+                     hidden_ + accepted * hidden_size_,
+                     hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
+                 "commit sampled target hidden state");
+
+      auto* emitted_presence = sampling_presence_ +
+          static_cast<std::size_t>(state->slot()) * vocabulary_size_;
+      for (std::size_t index = 0U; index < accepted; ++index)
+        cuda_check(cudaMemset(
+                       emitted_presence +
+                           state->draft_predictions[index].token,
+                       1, 1),
+                   "commit accepted proposal presence");
+      cuda_check(cudaMemset(emitted_presence + next_token, 1, 1),
+                 "commit sampled next-token presence");
+
+      std::vector<std::uint32_t> mtp_tokens;
+      std::vector<std::uint32_t> mtp_positions;
+      mtp_tokens.reserve(accepted + 1U);
+      mtp_positions.reserve(accepted + 1U);
+      for (std::size_t index = 0U; index < accepted; ++index)
+        mtp_tokens.push_back(state->draft_predictions[index].token);
+      mtp_tokens.push_back(next_token);
+      for (std::size_t index = 0U; index < mtp_tokens.size(); ++index)
+        mtp_positions.push_back(
+            invocation.position + static_cast<std::uint32_t>(index) + 1U);
+      const auto positions_advanced =
+          static_cast<std::uint32_t>(accepted + 1U);
+      const auto future_exact =
+          invocation.position + positions_advanced + 1U <
+          invocation.context_limit;
+      state->mtp_length = invocation.position;
+      state->draft_valid = false;
+      state->draft_predictions.clear();
+      cuda_check(cudaMemcpy(sampling_proposal_presence_, emitted_presence,
+                            vocabulary_size_, cudaMemcpyDeviceToDevice),
+                 "initialize next MTP rollout presence");
+      auto first = run_mtp(
+          *state, mtp_tokens, hidden_, mtp_positions, future_exact,
+          future_exact ? &invocation.request : nullptr,
+          future_exact ? sampling_proposal_presence_ : nullptr,
+          invocation.position + positions_advanced, 1U);
+      if (future_exact) {
+        if (!first)
+          throw std::runtime_error("next MTP rollout produced no root");
+        extend_mtp_rollout(*state, invocation.request, std::move(*first),
+                           invocation.context_limit);
+      }
+      state->synchronized_token = next_token;
+
+      er::ExactDecodeExecutionResult result;
+      result.status = er::Status::success();
+      result.emitted_tokens.push_back(invocation.guaranteed_token);
+      for (std::size_t index = 0U; index < accepted; ++index)
+        result.emitted_tokens.push_back(target_tokens[index + 1U]);
+      result.next_token = next_token;
+      result.positions_advanced = positions_advanced;
+      ++exact_calls_;
+      accepted_drafts_ += accepted;
+      ++accepted_depth_calls_.at(accepted);
+      program_steps_ += positions_advanced;
+      return completed_exact(std::move(result));
+    }
+
     const std::array target_tokens{invocation.guaranteed_token,
                                    state->draft_token};
     const std::array target_positions{invocation.position,
                                       invocation.position + 1U};
     const auto target_outputs =
-        run_target(*state, target_tokens, target_positions, true);
+        run_target(*state, target_tokens, target_positions,
+                   RecurrentCheckpointMode::after_first);
     if (target_outputs.size() != 2U)
       throw std::runtime_error("two-position target verification is incomplete");
     const bool accepted = target_outputs[0] == state->draft_token;
@@ -9848,6 +10394,7 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
                "commit exact target hidden state");
 
     state->draft_valid = false;
+    state->draft_predictions.clear();
     const auto future_exact =
         invocation.position + positions_advanced + 1U <
         invocation.context_limit;
@@ -9858,7 +10405,9 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
       auto drafts = run_mtp(*state, mtp_tokens, hidden_, mtp_positions,
                             future_exact);
       if (future_exact) {
-        state->draft_token = drafts.back();
+        if (!drafts)
+          throw std::runtime_error("legacy MTP produced no draft");
+        state->draft_token = drafts->token;
         state->draft_valid = true;
       }
     } else if (!accepted) {
@@ -9867,7 +10416,9 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
       auto drafts = run_mtp(*state, mtp_tokens, hidden_, mtp_positions,
                             future_exact && !accepted);
       if (future_exact) {
-        state->draft_token = drafts.back();
+        if (!drafts)
+          throw std::runtime_error("legacy MTP produced no draft");
+        state->draft_token = drafts->token;
         state->draft_valid = true;
       }
     } else {
@@ -9888,6 +10439,7 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
     result.positions_advanced = positions_advanced;
     ++exact_calls_;
     accepted_drafts_ += accepted ? 1U : 0U;
+    ++accepted_depth_calls_.at(accepted ? 1U : 0U);
     program_steps_ += positions_advanced;
     return completed_exact(std::move(result));
   } catch (const std::exception& error) {

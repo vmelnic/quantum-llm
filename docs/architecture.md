@@ -132,6 +132,24 @@ within that sequence, and released on success, cancellation or failure. A
 multi-tile maximum-context prefill never allocates that staging arena. Runtime
 telemetry reports capacity and currently resident bytes separately.
 
+Exact-decode ABI 2 is an artifact-declared experimental capability, not an
+exact-F16 qualification. It rolls one source MTP layer recurrently for a declared
+depth of three or four, keeps the target vocabulary head unchanged, and may
+limit only the draft head to an artifact-declared prefix. Its proposer K/V is
+signed Q8 with one FP16 scale per token/head/vector; target K/V retains the
+selected target codec. Before a speculative cycle it checkpoints recurrent
+and proposer state, verifies the guaranteed token plus all draft positions in
+one target batch, applies exact sampled `p/q` rejection and residual
+correction, then commits or restores/replays the accepted prefix. The compact
+attention kernel loads each K/V tile once and evaluates all speculative queries
+inside that tile. This capability remains available for research artifacts,
+and the operational K1 experiment uses it. The target pass exports a recurrent
+checkpoint after every verified row, so exact `p/q` rejection restores the
+selected row without a second target execution. The measured 32K/128K gates
+improved to 26.19/23.89 useful tok/s, but the 262K two-point extrapolation is
+21.39 tok/s; it is therefore implemented and deployable, not a 40-50 tok/s
+completion claim.
+
 ## Sparse expert state
 
 Every expert is identified by artifact namespace, component, layer, expert ID

@@ -27,6 +27,7 @@ param(
     [string]$SessionCacheRoot = "",
     [int]$SessionCacheGiB = 0,
     [int]$SessionCacheTtlSeconds = 604800,
+    [switch]$DisableSessionRetention,
     [switch]$ProfileGpuPhases,
     [switch]$DisableRetainedRoute,
     [switch]$EnableCpuHybrid,
@@ -127,6 +128,9 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
         "--session-cache-ttl-seconds", [string]$SessionCacheTtlSeconds
     )
 } else { @() }
+[string[]]$sessionRetentionArguments = if ($DisableSessionRetention) {
+    "--disable-session-retention"
+} else { @() }
 
 & $pythonCommand.Source $server `
     --worker $worker `
@@ -149,6 +153,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-kv-page-tokens $WorkerKvPageTokens `
     --worker-kv-cache-dtype $WorkerKvCacheDtype `
     @sessionCacheArguments `
+    @sessionRetentionArguments `
     @profileArguments `
     @retainedRouteArguments `
     @cpuHybridArguments `

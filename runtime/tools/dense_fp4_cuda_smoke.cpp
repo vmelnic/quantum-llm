@@ -11,8 +11,10 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -361,6 +363,10 @@ double delta_prefill_check() {
   DeviceBuffer<float> scalar_output(static_cast<std::size_t>(rows) * value_dim);
   scalar_conv_state.upload(zero_conv);
   scalar_recurrent.upload(zero_recurrent);
+  std::vector<float> scalar_conv_checkpoints(
+      static_cast<std::size_t>(rows) * zero_conv.size());
+  std::vector<float> scalar_recurrent_checkpoints(
+      static_cast<std::size_t>(rows) * zero_recurrent.size());
   for (std::uint32_t row = 0U; row < rows; ++row) {
     status_check(expert::runtime::cuda::split_gated_delta_decode({
         device_qkv.get() + static_cast<std::size_t>(row) * conv_dim,
@@ -375,6 +381,14 @@ double delta_prefill_check() {
         epsilon,
         expert::runtime::cuda::GatedDeltaOutputActivation::sigmoid,
         nullptr}));
+    const auto conv_snapshot = scalar_conv_state.download();
+    const auto recurrent_snapshot = scalar_recurrent.download();
+    std::copy(conv_snapshot.begin(), conv_snapshot.end(),
+              scalar_conv_checkpoints.begin() +
+                  static_cast<std::size_t>(row) * zero_conv.size());
+    std::copy(recurrent_snapshot.begin(), recurrent_snapshot.end(),
+              scalar_recurrent_checkpoints.begin() +
+                  static_cast<std::size_t>(row) * zero_recurrent.size());
   }
 
   DeviceBuffer<float> batch_conv_state(zero_conv.size());
@@ -384,6 +398,10 @@ double delta_prefill_check() {
   DeviceBuffer<float> batch_output(static_cast<std::size_t>(rows) * value_dim);
   DeviceBuffer<float> batch_recurrent_workspace(
       recurrent_values + 2U * static_cast<std::size_t>(rows) * value_heads);
+  DeviceBuffer<float> batch_conv_checkpoints(
+      static_cast<std::size_t>(rows) * zero_conv.size());
+  DeviceBuffer<float> batch_recurrent_checkpoints(
+      static_cast<std::size_t>(rows) * zero_recurrent.size());
   batch_conv_state.upload(zero_conv);
   batch_recurrent.upload(zero_recurrent);
   status_check(expert::runtime::cuda::split_gated_delta_prefill({
@@ -394,6 +412,7 @@ double delta_prefill_check() {
       batch_recurrent_workspace.get(),
       (recurrent_values +
        2U * static_cast<std::size_t>(rows) * value_heads) * sizeof(float),
+      batch_conv_checkpoints.get(), batch_recurrent_checkpoints.get(),
       rows, key_heads, value_heads, key_head_dim, value_head_dim, conv_kernel,
       epsilon,
       expert::runtime::cuda::GatedDeltaOutputActivation::sigmoid,
@@ -412,6 +431,20 @@ double delta_prefill_check() {
   compare(scalar_output.download(), batch_output.download());
   compare(scalar_conv_state.download(), batch_conv_state.download());
   compare(scalar_recurrent.download(), batch_recurrent.download());
+  compare(scalar_conv_checkpoints, batch_conv_checkpoints.download());
+  DeviceBuffer<float> restored_recurrent_checkpoint(zero_recurrent.size());
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    status_check(expert::runtime::cuda::
+                     restore_split_gated_delta_recurrent_checkpoint(
+                         batch_recurrent_checkpoints.get() +
+                             static_cast<std::size_t>(row) * recurrent_values,
+                         restored_recurrent_checkpoint.get(), value_heads,
+                         key_head_dim, value_head_dim, nullptr));
+    compare(std::span<const float>(scalar_recurrent_checkpoints)
+                .subspan(static_cast<std::size_t>(row) * recurrent_values,
+                         recurrent_values),
+            restored_recurrent_checkpoint.download());
+  }
   return maximum_error;
 }
 
@@ -789,6 +822,296 @@ Fp8KvAttentionCheck fp8_kv_attention_check() {
   result.output_mean_absolute_difference /= reference_output.size();
   result.output_cosine_similarity =
       dot / std::sqrt(reference_square * candidate_square);
+  return result;
+}
+
+struct Q8KvAttentionCheck final {
+  double layout_maximum_byte_difference{};
+  double independent_oracle_maximum_absolute_difference{};
+  double five_query_maximum_absolute_difference{};
+};
+
+double q8_five_query_microbatch_check() {
+  constexpr std::uint32_t context_tokens = 16U;
+  constexpr std::uint32_t first_context_tokens = 12U;
+  constexpr std::uint32_t rows = 5U;
+  constexpr std::uint32_t query_heads = 6U;
+  constexpr std::uint32_t kv_heads = 1U;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t page_tokens = context_tokens;
+  constexpr std::uint32_t record_bytes =
+      head_dim + sizeof(std::uint16_t);
+  constexpr std::uint32_t page_bytes =
+      2U * page_tokens * kv_heads * record_bytes;
+  constexpr std::uint32_t query_width =
+      2U * query_heads * head_dim;
+
+  std::vector<float> key(
+      static_cast<std::size_t>(context_tokens) * head_dim);
+  std::vector<float> value(key.size());
+  std::vector<float> query(static_cast<std::size_t>(rows) * query_width);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::sin(static_cast<float>(index + 31U) * 0.013F) *
+                 (0.19F + static_cast<float>(index % 11U) * 0.009F);
+    value[index] = std::cos(static_cast<float>(index + 23U) * 0.017F) *
+                   (0.17F + static_cast<float>(index % 9U) * 0.011F);
+  }
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 7U) * 0.005F) *
+                   0.37F;
+
+  // Independent Q8 encoder/dequantizer used only by the CPU oracle.
+  const auto decode = [](const std::vector<float>& source) {
+    std::vector<float> result(source.size());
+    for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+      float maximum{};
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        maximum = std::max(
+            maximum,
+            std::abs(source[static_cast<std::size_t>(token) * head_dim +
+                            dimension]));
+      const auto scale = binary16_value(binary16_bits(
+          std::max(maximum / 127.0F, std::ldexp(1.0F, -24))));
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto index =
+            static_cast<std::size_t>(token) * head_dim + dimension;
+        const auto encoded = std::max(
+            -127, std::min(127, static_cast<int>(
+                std::nearbyint(source[index] / scale))));
+        result[index] = static_cast<float>(encoded) * scale;
+      }
+    }
+    return result;
+  };
+  const auto decoded_key = decode(key);
+  const auto decoded_value = decode(value);
+
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<std::uint8_t> device_page(page_bytes);
+  DeviceBuffer<void*> device_page_table(1U);
+  DeviceBuffer<float> device_output(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  DeviceBuffer<float> partial_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_sums(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_outputs(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  device_key.upload(key);
+  device_value.upload(value);
+  device_query.upload(query);
+  cuda_check(cudaMemset(device_page.get(), 0, page_bytes),
+             "initialize five-query Q8 page");
+  device_page_table.upload(std::vector<void*>{device_page.get()});
+  status_check(expert::runtime::cuda::store_gqa_kv_paged_q8_batch(
+      device_key.get(), device_value.get(),
+      reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+      page_tokens, 0U, context_tokens, kv_heads, head_dim, nullptr));
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_microbatch_paged_q8_tensor_core(
+          {device_query.get(),
+           reinterpret_cast<const void* const*>(device_page_table.get()),
+           device_output.get(), partial_maxima.get(), partial_sums.get(),
+           partial_outputs.get(), first_context_tokens, rows, 0U,
+           page_tokens, query_heads, kv_heads, head_dim, context_tokens, 1U,
+           nullptr}));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize five-query Q8 microbatch check");
+
+  std::vector<float> expected(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    const auto visible_tokens = first_context_tokens + row;
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto* head_query = query.data() +
+          (static_cast<std::size_t>(row) * query_heads + head) *
+              2U * head_dim;
+      std::vector<float> scores(visible_tokens);
+      auto maximum = -std::numeric_limits<float>::infinity();
+      for (std::uint32_t token = 0U; token < visible_tokens; ++token) {
+        float dot{};
+        for (std::uint32_t dimension = 0U; dimension < head_dim;
+             ++dimension)
+          dot += rounded_bf16(head_query[dimension]) *
+                 rounded_bf16(decoded_key[
+                     static_cast<std::size_t>(token) * head_dim +
+                     dimension]);
+        scores[token] = dot / std::sqrt(static_cast<float>(head_dim));
+        maximum = std::max(maximum, scores[token]);
+      }
+      std::vector<float> probabilities(visible_tokens);
+      float denominator{};
+      for (std::uint32_t token = 0U; token < visible_tokens; ++token) {
+        probabilities[token] =
+            rounded_bf16(std::exp(scores[token] - maximum));
+        denominator += probabilities[token];
+      }
+      for (std::uint32_t dimension = 0U; dimension < head_dim;
+           ++dimension) {
+        float numerator{};
+        for (std::uint32_t token = 0U; token < visible_tokens; ++token)
+          numerator += probabilities[token] *
+              rounded_bf16(decoded_value[
+                  static_cast<std::size_t>(token) * head_dim + dimension]);
+        const auto gate = head_query[head_dim + dimension];
+        expected[(static_cast<std::size_t>(row) * query_heads + head) *
+                     head_dim +
+                 dimension] =
+            (numerator / denominator) / (1.0F + std::exp(-gate));
+      }
+    }
+  }
+  const auto actual = device_output.download();
+  double maximum_difference{};
+  for (std::size_t index = 0U; index < actual.size(); ++index)
+    maximum_difference = std::max(
+        maximum_difference,
+        std::abs(static_cast<double>(actual[index]) - expected[index]));
+  return maximum_difference;
+}
+
+Q8KvAttentionCheck q8_kv_attention_check() {
+  constexpr std::uint32_t rows = 8U;
+  constexpr std::uint32_t query_heads = 8U;
+  constexpr std::uint32_t kv_heads = 1U;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t page_tokens = rows;
+  constexpr std::uint32_t record_bytes =
+      head_dim + sizeof(std::uint16_t);
+  constexpr std::uint32_t page_bytes =
+      2U * page_tokens * kv_heads * record_bytes;
+  constexpr std::uint32_t query_width = 2U * query_heads * head_dim;
+
+  std::vector<float> key(static_cast<std::size_t>(rows) * head_dim);
+  std::vector<float> value(key.size());
+  std::vector<float> query(query_width);
+  for (std::size_t index = 0U; index < key.size(); ++index) {
+    key[index] = std::sin(static_cast<float>(index + 11U) * 0.019F) *
+                 (0.2F + static_cast<float>(index % 13U) * 0.017F);
+    value[index] = std::cos(static_cast<float>(index + 17U) * 0.023F) *
+                   (0.15F + static_cast<float>(index % 7U) * 0.013F);
+  }
+  for (std::size_t index = 0U; index < query.size(); ++index)
+    query[index] = std::sin(static_cast<float>(index + 5U) * 0.007F) * 0.4F;
+
+  // Independent record encoder. It deliberately does not call or share a
+  // scale/layout helper with the CUDA implementation under test.
+  std::vector<std::uint8_t> expected_page(page_bytes);
+  std::vector<float> decoded_key(key.size());
+  std::vector<float> decoded_value(value.size());
+  const auto encode_kind = [&](const std::vector<float>& source,
+                               std::vector<float>& decoded,
+                               std::size_t kind_offset) {
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+      float maximum{};
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        maximum = std::max(
+            maximum,
+            std::abs(source[static_cast<std::size_t>(row) * head_dim +
+                            dimension]));
+      const auto scale_bits = binary16_bits(
+          std::max(maximum / 127.0F, std::ldexp(1.0F, -24)));
+      const auto record_scale = binary16_value(scale_bits);
+      auto* record = expected_page.data() + kind_offset +
+                     static_cast<std::size_t>(row) * record_bytes;
+      std::memcpy(record + head_dim, &scale_bits, sizeof(scale_bits));
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto index =
+            static_cast<std::size_t>(row) * head_dim + dimension;
+        const auto quantized = std::max(
+            -127, std::min(127, static_cast<int>(
+                std::nearbyint(source[index] / record_scale))));
+        const auto signed_value = static_cast<std::int8_t>(quantized);
+        std::memcpy(record + dimension, &signed_value, sizeof(signed_value));
+        decoded[index] = static_cast<float>(signed_value) * record_scale;
+      }
+    }
+  };
+  const auto records_per_kind =
+      static_cast<std::size_t>(page_tokens) * kv_heads;
+  encode_kind(key, decoded_key, 0U);
+  encode_kind(value, decoded_value, records_per_kind * record_bytes);
+
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<std::uint8_t> device_page(page_bytes);
+  DeviceBuffer<void*> device_page_table(1U);
+  DeviceBuffer<float> device_output(
+      static_cast<std::size_t>(query_heads) * head_dim);
+  DeviceBuffer<float> partial_maxima(query_heads);
+  DeviceBuffer<float> partial_sums(query_heads);
+  DeviceBuffer<float> partial_outputs(
+      static_cast<std::size_t>(query_heads) * head_dim);
+  device_key.upload(key);
+  device_value.upload(value);
+  device_query.upload(query);
+  cuda_check(cudaMemset(device_page.get(), 0, page_bytes),
+             "initialize Q8 numerical page");
+  device_page_table.upload(std::vector<void*>{device_page.get()});
+  status_check(expert::runtime::cuda::store_gqa_kv_paged_q8_batch(
+      device_key.get(), device_value.get(),
+      reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+      page_tokens, 0U, rows, kv_heads, head_dim, nullptr));
+  status_check(
+      expert::runtime::cuda::gated_gqa_attention_decode_paged_q8_tensor_core({
+          device_query.get(),
+          reinterpret_cast<const void* const*>(device_page_table.get()),
+          device_output.get(), partial_maxima.get(), partial_sums.get(),
+          partial_outputs.get(), rows, 0U, page_tokens, query_heads, kv_heads,
+          head_dim, rows, 1U, nullptr}));
+  cuda_check(cudaDeviceSynchronize(), "synchronize Q8 KV attention check");
+
+  Q8KvAttentionCheck result;
+  const auto actual_page = device_page.download();
+  for (std::size_t index = 0U; index < expected_page.size(); ++index)
+    result.layout_maximum_byte_difference = std::max(
+        result.layout_maximum_byte_difference,
+        static_cast<double>(std::abs(static_cast<int>(actual_page[index]) -
+                                     expected_page[index])));
+
+  std::vector<float> expected_output(
+      static_cast<std::size_t>(query_heads) * head_dim);
+  for (std::uint32_t head = 0U; head < query_heads; ++head) {
+    const auto* head_query = query.data() +
+        static_cast<std::size_t>(head) * 2U * head_dim;
+    std::array<float, rows> scores{};
+    float maximum = -std::numeric_limits<float>::infinity();
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+      float dot{};
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        dot += rounded_bf16(head_query[dimension]) *
+               rounded_bf16(decoded_key[
+                   static_cast<std::size_t>(row) * head_dim + dimension]);
+      scores[row] = dot / std::sqrt(static_cast<float>(head_dim));
+      maximum = std::max(maximum, scores[row]);
+    }
+    std::array<float, rows> probabilities{};
+    float denominator{};
+    for (std::uint32_t row = 0U; row < rows; ++row) {
+      probabilities[row] = rounded_bf16(std::exp(scores[row] - maximum));
+      denominator += probabilities[row];
+    }
+    for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+      float numerator{};
+      for (std::uint32_t row = 0U; row < rows; ++row)
+        numerator += probabilities[row] * rounded_bf16(decoded_value[
+            static_cast<std::size_t>(row) * head_dim + dimension]);
+      const auto gate = head_query[head_dim + dimension];
+      expected_output[static_cast<std::size_t>(head) * head_dim + dimension] =
+          (numerator / denominator) / (1.0F + std::exp(-gate));
+    }
+  }
+  const auto actual_output = device_output.download();
+  for (std::size_t index = 0U; index < actual_output.size(); ++index)
+    result.independent_oracle_maximum_absolute_difference = std::max(
+        result.independent_oracle_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_output[index]) -
+                 expected_output[index]));
+  result.five_query_maximum_absolute_difference =
+      q8_five_query_microbatch_check();
   return result;
 }
 
@@ -1292,10 +1615,9 @@ struct DecodeBatchBandwidth {
   double tensor_core_gb_per_second{};
 };
 
-DecodeBatchBandwidth decode_batch_bandwidth_check() {
+DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   constexpr std::uint32_t rows = 17408U;
   constexpr std::uint32_t columns = 5120U;
-  constexpr std::uint32_t batch = 2U;
   constexpr std::uint32_t iterations = 12U;
   const auto weight_bytes = static_cast<std::size_t>(rows) * columns / 2U;
   const auto scale_bytes = static_cast<std::size_t>(rows) * columns / 32U;
@@ -1320,9 +1642,9 @@ DecodeBatchBandwidth decode_batch_bandwidth_check() {
   const expert::runtime::cuda::Fp4Block32Matrix matrix{
       device_weights.get(), device_scales.get(), rows, columns, columns};
 
-  const auto measure = [&](bool tensor_core) {
+  const auto measure = [&](std::uint32_t implementation) {
     for (unsigned warmup = 0U; warmup < 3U; ++warmup) {
-      if (tensor_core)
+      if (implementation == 1U)
         status_check(expert::runtime::cuda::fp4_gemm_q8_block32(
             matrix, device_q8.get(), device_q8_scales.get(),
             device_output.get(), batch, nullptr));
@@ -1337,7 +1659,7 @@ DecodeBatchBandwidth decode_batch_bandwidth_check() {
     cuda_check(cudaEventCreate(&stop), "create decode batch stop event");
     cuda_check(cudaEventRecord(start), "record decode batch start");
     for (unsigned iteration = 0U; iteration < iterations; ++iteration) {
-      if (tensor_core)
+      if (implementation == 1U)
         status_check(expert::runtime::cuda::fp4_gemm_q8_block32(
             matrix, device_q8.get(), device_q8_scales.get(),
             device_output.get(), batch, nullptr));
@@ -1358,13 +1680,12 @@ DecodeBatchBandwidth decode_batch_bandwidth_check() {
                        iterations;
     return bytes / (static_cast<double>(milliseconds) * 1.0e6);
   };
-  return {measure(false), measure(true)};
+  return {measure(0U), measure(1U)};
 }
 
-double wide_decode_batch_bandwidth_check() {
+double wide_decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   constexpr std::uint32_t rows = 5120U;
   constexpr std::uint32_t columns = 17408U;
-  constexpr std::uint32_t batch = 2U;
   constexpr std::uint32_t iterations = 12U;
   const auto weight_bytes = static_cast<std::size_t>(rows) * columns / 2U;
   const auto scale_bytes = static_cast<std::size_t>(rows) * columns / 32U;
@@ -2847,14 +3168,31 @@ bool presence_penalty_check() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) ==
+                         "--decode-batch-5-profile") {
+      const auto maximum_absolute_error = numerical_check();
+      const auto narrow = decode_batch_bandwidth_check(5U);
+      const auto wide = wide_decode_batch_bandwidth_check(5U);
+      std::cout << "{\"batch\":5"
+                << ",\"maximum_absolute_error\":"
+                << maximum_absolute_error
+                << ",\"narrow_weight_reuse_gb_per_second\":"
+                << narrow.selected_gb_per_second
+                << ",\"narrow_tensor_core_gb_per_second\":"
+                << narrow.tensor_core_gb_per_second
+                << ",\"wide_weight_reuse_gb_per_second\":" << wide
+                << "}\n";
+      return maximum_absolute_error < 2.0e-4 ? 0 : 1;
+    }
     const auto error = numerical_check();
     const auto topk = topk_logits_check();
     const auto presence_penalty_pass = presence_penalty_check();
     const auto delta_error = delta_prefill_check();
     const auto attention_error = attention_prefill_check();
     const auto fp8_kv_attention = fp8_kv_attention_check();
+    const auto q8_kv_attention = q8_kv_attention_check();
     const auto fp4_key_outlier1 = fp4_key_outlier1_check();
     const auto standard_gqa_ratio16_error = standard_gqa_ratio16_check();
     const auto gated_gqa_ratio12_error = gated_gqa_ratio12_check();
@@ -2897,6 +3235,13 @@ int main() {
                       fp8_kv_attention.
                               implementation_maximum_absolute_difference <
                           2.0e-4 &&
+                      q8_kv_attention.layout_maximum_byte_difference == 0.0 &&
+                      q8_kv_attention.
+                              independent_oracle_maximum_absolute_difference <
+                          2.0e-3 &&
+                      q8_kv_attention.
+                              five_query_maximum_absolute_difference <
+                          2.0e-3 &&
                       fp4_key_outlier1.layout_maximum_byte_difference ==
                           0.0 &&
                       fp4_key_outlier1.
@@ -3016,6 +3361,14 @@ int main() {
               << fp8_kv_attention.output_mean_absolute_difference
               << ",\"fp8_kv_output_cosine_similarity\":"
               << fp8_kv_attention.output_cosine_similarity
+              << ",\"q8_kv_layout_maximum_byte_difference\":"
+              << q8_kv_attention.layout_maximum_byte_difference
+              << ",\"q8_kv_independent_oracle_maximum_absolute_difference\":"
+              << q8_kv_attention.
+                     independent_oracle_maximum_absolute_difference
+              << ",\"q8_kv_five_query_maximum_absolute_difference\":"
+              << q8_kv_attention.
+                     five_query_maximum_absolute_difference
               << ",\"fp4_key_outlier1_layout_maximum_byte_difference\":"
               << fp4_key_outlier1.layout_maximum_byte_difference
               << ",\"fp4_key_outlier1_implementation_maximum_absolute_difference\":"

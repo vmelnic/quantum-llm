@@ -1,6 +1,6 @@
 # Research decisions
 
-Status: canonical decision and rejection ledger, 2026-09-17.
+Status: canonical decision and rejection ledger, 2026-09-19.
 
 This file prevents failed mechanisms from returning under new names. Detailed
 measurements live in [Benchmarks](benchmarks.md). Reopen a rejection only when
@@ -268,6 +268,106 @@ while leaving the K1 fidelity exception and cold-prefill failure unchanged.
 | all-K-resident/selective-V | about 25,922 MiB before V staging | exceeds VRAM |
 | pageable-to-pinned expert bounce | extra 1.385 GB copy and worse upload wait | removed |
 | neural CPU replacement | failed structural/correctness boundary | removed |
+
+The `exact MTP tree` rejection above applies to the exact-F16/offloaded traffic
+inequality that produced it. It does not reject resident K1 target verification.
+On 2026-09-19, the installed one-draft K1 service completed a real
+262,016/128 gate at 26.00 useful tok/s after first token. It accepted 60 of 67
+drafts, advanced 127 positions in 67 target calls (`A=1.8955`) and spent
+72.91 ms per complete proposer/verifier cycle. At the measured conditional
+acceptance `p=60/67`, MTP-4 projects `A=4.0588`; 40 tok/s permits 101.47 ms per
+complete cycle, leaving 28.56 ms over the one-draft baseline. This is the new
+quantitative prerequisite that admits a resident-K1 MTP-4 experiment. The
+50 tok/s bound is 81.18 ms and is not admitted until the complete sampled
+multi-draft cycle passes it.
+
+The experiment must remain fail-closed on these boundaries:
+
+- the target K1 distribution is authoritative and remains explicitly lossy
+  relative to F16 KV;
+- sampled speculation uses exact `p/q` rejection/correction, not argmax
+  identity, and is independently checked against the scalar target sampler;
+- target verification processes five causal rows while loading each target
+  K/V tile once; a prefill fallback or five scalar attention launches is not
+  the requested result;
+- the draft vocabulary may be an artifact-declared 65,536-token prefix, but
+  the target head remains the complete 248,320-token head and residual
+  sampling retains target mass outside the draft prefix;
+- Q8 applies only to the proposer cache. Its 528,384-byte page increases the
+  1,024-page MTP allocation by 244 MiB. The measured 1,286 MiB post-gate free
+  VRAM leaves only 18 MiB over the 1 GiB reserve after that increase, so the
+  120 MiB sequence-prefill buffer must become releasable before Q8 promotion;
+- RAM and NVMe carry no active per-token payload. The target lower bound is
+  still 13,625,700,352 weight bytes plus 5,100,273,664 target-K1 bytes per
+  target call. At `A=4.0588` this is at least 4.614 GB of target HBM traffic
+  per useful token, before MTP weights/cache and workspaces.
+
+The completed ABI-2 experiment failed this prerequisite. With exact sampled
+`p/q` at `temperature=1.0`, `top_p=0.95`, `top_k=20`, MTP-4 reached only
+`A=2.4615` at 32K and `A=2.6458` at 128K. End-to-end post-first rates were
+15.67 and 8.59 useful tok/s respectively. Linear extrapolation of measured
+seconds/useful-token gives 5.36 tok/s at 262K; no 262K service run was made for
+this experiment. Because even 32K requires a 2.55x improvement to reach 40
+tok/s, local kernel tuning cannot satisfy the admitted inequality. The stable
+artifact was rolled back to exact-decode ABI 1. Do not promote the ABI-2
+recurrent rollout without new measured evidence that changes both the
+accepted-positions boundary (`A>=3.0`) and the complete-cycle bound; a
+microbenchmark-only improvement is insufficient.
+
+That rollback was not the final result. Executable profiling subsequently
+proved that every rejection reran the target prefix even though the first
+five-row verification pass had already produced the required recurrent states.
+The experiment was reopened on this new end-to-end prerequisite. The target
+pass now writes five FP32 recurrent checkpoints and restores the accepted row;
+it never rereads target weights or target K/V after rejection. The final
+context-boundary draft was also removed, and benchmark service starts disabled
+session parking/snapshots.
+
+Clean suffix-window gates improved to 26.19 useful tok/s at 32K and 23.89 at
+128K. They advanced 127 positions in 54 and 45 target calls respectively,
+giving `A=2.3519` and `A=2.8222`. Linear extrapolation of measured
+seconds/useful-token is 21.39 tok/s at 262K; no live 262K run was made. This is
+a real improvement and the MTP-4 implementation remains usable, but it still
+does not satisfy 40-50 tok/s.
+
+The updated blocker is cycle latency. At 128K, `A=2.8222` permits 70.56 ms for
+40 tok/s while the measured cycle is 118.12 ms. The 32K/128K cycle slope
+extrapolates to 155.90 ms at 262K, where even the perfect five positions per
+MTP-4 cycle cap at 32.07 tok/s. A short-context phase trace attributes 25.31
+ms/call to dense FFN and 15.38 ms/call to recurrent target matrices before
+long-context attention.
+
+Do not replace the selected small-batch DP4A path with BF16 Tensor Core weight
+decode. The real batch-five gate measured 453.70/365.78 GB/s for DP4A on the
+narrow/wide Qwen projections. The Tensor Core candidate reached only
+148.60/67.14 GB/s; its one permitted barrier-removal correction regressed to
+121.74/51.17 GB/s. Both were numerically valid, but the runtime candidate was
+removed. Reopen target dense kernels only with a mechanism whose two-shape
+micro-gate exceeds the selected DP4A bandwidth and whose projected complete
+cycle can close the 47.56 ms 128K gap.
+
+### Exact-F16 capacity and speed reopening gate, 2026-09-20
+
+Making the raw F16 cache resident is not by itself a 40-50 tok/s result. The
+current SM86 resident-F16 attention smoke reads one 262,144-token layer in
+5.73952 ms at its best split, or 91.832 ms across the 16 full-attention layers
+before target matrices, proposer, head or sampling. At the measured 128K
+MTP-4 acceptance (`A=2.8222`), the complete 40 tok/s budget is only 70.56 ms.
+
+The short-context trace leaves at least 47.35 ms/cycle for target FFN,
+recurrent blocks, proposer and head. Exact-F16 attention would therefore have
+to fit within 23.21 ms/cycle at the current acceptance: a 3.96x reduction from
+the measured raw-F16 attention time, in addition to fitting beside
+13,625,700,352 bytes of hot target weights, recurrent state, MTP state,
+workspaces and the 1 GiB reserve.
+
+The existing bit-exact measurements do not admit that path: the best tested
+reversible F16 transform needs 13.265926 bits/value and the best held-out
+Huffman result needs 13.719539 bits/value. New lossless work must first beat
+both the actual resident-capacity budget and the `<=23.21 ms` fused-attention
+gate on real Qwen K/V. A codec ratio measured only at rest is insufficient.
+Lossy transform coding may meet the capacity/traffic gate, but it is a new
+target-KV fidelity profile and requires an explicit quality gate against F16.
 
 ## Rejected DeepSeek work
 

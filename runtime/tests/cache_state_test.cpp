@@ -18,6 +18,7 @@
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
 #include "expert/runtime/sha256.hpp"
+#include "expert/runtime/speculative_sampling.hpp"
 #include "expert/runtime/worker_contract.hpp"
 
 #include <algorithm>
@@ -53,6 +54,66 @@ void require(bool condition, std::string_view message) {
   if (!condition) {
     throw std::runtime_error(std::string(message));
   }
+}
+
+void test_exact_rejection_sampling_matches_independent_target_oracle() {
+  const er::SamplingDistribution target{{
+      {3U, 0.50}, {7U, 0.30}, {11U, 0.20},
+  }};
+  const er::SamplingDistribution draft{{
+      {3U, 0.20}, {7U, 0.70}, {13U, 0.10},
+  }};
+
+  // Independent closed-form oracle: accepted mass is min(p, q), while all
+  // rejection mass is redistributed according to normalized max(p-q, 0).
+  const std::array tokens{3U, 7U, 11U, 13U};
+  std::array<double, tokens.size()> expected{};
+  double rejection_mass{};
+  double residual_mass{};
+  for (std::size_t index = 0U; index < tokens.size(); ++index) {
+    const auto p = target.probability(tokens[index]);
+    const auto q = draft.probability(tokens[index]);
+    expected[index] = std::min(p, q);
+    rejection_mass += q - std::min(p, q);
+    residual_mass += std::max(0.0, p - q);
+  }
+  require(std::abs(rejection_mass - residual_mass) < 1e-12,
+          "independent p/q mass identity failed");
+  for (std::size_t index = 0U; index < tokens.size(); ++index)
+    expected[index] += rejection_mass *
+        std::max(0.0, target.probability(tokens[index]) -
+                          draft.probability(tokens[index])) /
+        residual_mass;
+
+  constexpr std::uint32_t trials = 400'000U;
+  std::array<std::uint32_t, tokens.size()> observed{};
+  for (std::uint32_t trial = 0U; trial < trials; ++trial) {
+    const auto proposal = er::sample_distribution(
+        draft, er::counter_uniform(19U, trial, 1U));
+    const auto result = er::rejection_sample(
+        proposal, target, draft, er::counter_uniform(19U, trial, 2U),
+        er::counter_uniform(19U, trial, 3U));
+    const auto found = std::find(tokens.begin(), tokens.end(), result.token);
+    require(found != tokens.end(), "p/q sampler emitted an unknown token");
+    ++observed[static_cast<std::size_t>(found - tokens.begin())];
+  }
+  for (std::size_t index = 0U; index < tokens.size(); ++index) {
+    const auto frequency =
+        static_cast<double>(observed[index]) / static_cast<double>(trials);
+    require(std::abs(frequency - expected[index]) < 0.004,
+            "p/q sampler disagrees with independent target oracle");
+  }
+
+  const std::array logits{4.0F, 3.0F, 2.0F, 1.0F};
+  const std::array ids{9U, 5U, 2U, 1U};
+  const auto nucleus = er::make_sampling_distribution(
+      logits, ids, 1'000'000U, 800'000U, 0U);
+  require(nucleus.entries.size() == 2U &&
+              nucleus.entries[0].token == 9U &&
+              nucleus.entries[1].token == 5U &&
+              std::abs(nucleus.entries[0].probability -
+                       0.7310585786300049) < 1e-12,
+          "sampling distribution changed scalar temperature/top-p math");
 }
 
 void test_deepseek_compact_and_sm86_hot_abi() {
@@ -434,6 +495,7 @@ struct FixtureOperationProviderControl final {
   std::uint32_t exact_prepared{};
   std::uint32_t exact_synchronizations{};
   std::uint32_t exact_executions{};
+  std::vector<bool> exact_draft_requests;
 };
 
 class FixtureOperationRequestState final
@@ -568,12 +630,13 @@ class FixtureCallableOperationProvider final : public er::IOperationProvider {
   er::Status synchronize_exact_decode(
       const er::IPreparedOperation& operation,
       const std::shared_ptr<er::IOperationProviderRequestState>& request_state,
-      const er::ExactDecodeSynchronization&) override {
+      const er::ExactDecodeSynchronization& synchronization) override {
     if (dynamic_cast<const FixturePreparedExactDecode*>(&operation) == nullptr ||
         !request_state)
       return {er::ErrorCode::invalid_argument,
               "fixture exact decode synchronization is invalid"};
     ++control_->exact_synchronizations;
+    control_->exact_draft_requests.push_back(synchronization.produce_draft);
     return er::Status::success();
   }
 
@@ -848,16 +911,23 @@ void test_schema_v3_callable_program_is_exact_and_family_neutral() {
           "artifact-declared exact decode service is unavailable");
   const auto synchronized =
       begun.session.synchronize_exact_decode(110U, 1U, true);
+  const auto boundary_draft =
+      begun.session.synchronize_exact_decode(110U, 124U, true);
+  const auto boundary_no_draft =
+      begun.session.synchronize_exact_decode(110U, 126U, true);
   auto exact = begun.session.execute_exact_decode(110U, 2U, 128U);
   const auto exact_result = exact.handle.poll();
-  require(synchronized.ok() && exact.status.ok() && exact_result &&
+  require(synchronized.ok() && boundary_draft.ok() &&
+              boundary_no_draft.ok() && exact.status.ok() && exact_result &&
               exact_result->status.ok() &&
               exact_result->emitted_tokens ==
                   std::vector<std::uint32_t>({110U, 111U}) &&
               exact_result->next_token == 112U &&
               exact_result->positions_advanced == 2U &&
               first_control->exact_prepared == 1U &&
-              first_control->exact_synchronizations == 1U &&
+              first_control->exact_synchronizations == 3U &&
+              first_control->exact_draft_requests ==
+                  std::vector<bool>({true, true, false}) &&
               first_control->exact_executions == 1U,
           "exact decode binding lost synchronization or token semantics");
   begun.session.cancel();
@@ -3655,6 +3725,7 @@ void test_placement_profile_uses_measurements_and_exact_budgets() {
 
 int main() {
   try {
+    test_exact_rejection_sampling_matches_independent_target_oracle();
     test_deepseek_compact_and_sm86_hot_abi();
     test_deepseek_compact_admission_validation();
     test_headerless_fp4_admission_is_geometry_driven();

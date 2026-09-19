@@ -1487,11 +1487,24 @@ Status MoeProgramExecutor::Core::SessionState::synchronize_exact(
     active = true;
     provider_state = found->second;
   }
+  auto effective_produce_final_draft = produce_final_draft;
+  if (effective_produce_final_draft) {
+    const auto limit = request.parameters.find("reserved_context_tokens");
+    if (limit != request.parameters.end()) {
+      const auto synchronized_end =
+          static_cast<std::uint64_t>(first_target_position) +
+          next_tokens.size();
+      // A draft is useful only when the following exact invocation can
+      // verify both its guaranteed token and at least one proposal.
+      effective_produce_final_draft =
+          synchronized_end + 1U < limit->second;
+    }
+  }
   auto status = prepared.provider->synchronize_exact_decode_batch(
       *prepared.operation, provider_state,
       ExactDecodeSynchronizationBatch{request, next_tokens,
                                       first_target_position,
-                                      produce_final_draft});
+                                      effective_produce_final_draft});
   {
     std::lock_guard lock(mutex);
     active = false;

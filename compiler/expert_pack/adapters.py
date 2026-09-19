@@ -1601,7 +1601,7 @@ class HybridDeltaAdapter:
         mtp_capability = (
             "decode.mtp.moe-full-attention.fp4-block32.exact.v1"
             if is_moe
-            else "decode.mtp.dense-full-attention.fp4-block32.exact.v1"
+            else "decode.mtp.dense-full-attention.fp4-block32.exact.v2"
         )
         exact_decode = None
         if mtp_layers and not is_moe:
@@ -1661,9 +1661,12 @@ class HybridDeltaAdapter:
                     ))
             exact_decode = RuntimeExactDecodeTopology(
                 capability=mtp_capability,
-                abi=1,
-                maximum_emitted_tokens=mtp_layers + 1,
-                parameters=(("draft_layers", mtp_layers),
+                abi=2,
+                maximum_emitted_tokens=5,
+                parameters=(("source_mtp_layers", mtp_layers),
+                            ("draft_depth", 4),
+                            ("draft_vocabulary_size", min(vocab, 65_536)),
+                            ("mtp_kv_encoding", 1),
                             ("embedding_first", 1), ("post_norm", 1)),
                 tensor_bindings=tuple(mtp_bindings),
             )
@@ -1682,7 +1685,7 @@ class HybridDeltaAdapter:
         else:
             required_kernels.append(("ffn.swiglu.dense.fp4-block32.v1", 1))
         if exact_decode is not None:
-            required_kernels.append((mtp_capability, 1))
+            required_kernels.append((mtp_capability, 2))
         runtime_attributes = [
             ("attention_heads", heads),
             ("kv_heads", kv_heads),

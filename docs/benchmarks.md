@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-09-17.
+Status: canonical measurement ledger, 2026-09-20.
 
 ## Reporting rules
 
@@ -14,10 +14,13 @@ Status: canonical measurement ledger, 2026-09-17.
 
 ## Validation baseline
 
-The latest changed-code gate used the Windows Release/CUDA build (MSVC 19.44,
-CUDA 12.1), built `--clean-first --parallel 22`. Windows CTest passed 6/6;
-the canonical compiler/server suite passed 117/117; Python byte compilation,
-shell syntax and `git diff --check` passed. The Windows binary is authoritative.
+The latest native changed-code gate used the Windows Release/CUDA build
+(MSVC 19.44, CUDA 12.1), built `--clean-first --parallel 22`. Windows CTest
+passed 6/6 and the canonical compiler/server suite ran 118 tests successfully.
+The later Python-only artifact migration and populated-window driver changes
+passed the expanded local 122-test suite with nine optional NumPy skips.
+Python byte compilation, shell syntax and `git diff --check` passed. The
+Windows binary is authoritative.
 
 ## Service results
 
@@ -66,6 +69,31 @@ One RTX 3090, 12 GiB routed-VRAM ceiling, default `xhigh`, 2026-09-02.
 Pi may add system instructions even with project context/tools disabled. The
 abliterated row was run on 2026-09-15 and only client wall time was captured.
 This table qualifies API/template/generation wiring only.
+
+#### Clean-build isolated Pi regression, 2026-09-20
+
+Immediately after the canonical clean Windows Release/CUDA build passed CTest
+6/6 and the canonical Python suite 119/119, six published artifacts were
+started sequentially on the RTX 3090. Each start used its declared KV codec,
+disabled server-side session retention and reported `ready=true`. The Pi
+command added `--no-extensions --no-skills --no-prompt-templates` to the
+minimal gate above, so no project context, tool, extension, skill, prompt
+template or prior session was available. The values below are client wall
+time, not service throughput measurements.
+
+| Alias | Declared KV | Client wall | Result |
+|---|---|---:|---|
+| `qwen` | K1 | 2.75 s | pass, coherent text |
+| `qwen-abliterated` | K1 | 5.42 s | pass, coherent text |
+| `qwen-flash` | F16 | 62.11 s | pass, coherent text |
+| `mistral` | artifact-native | 78.44 s | pass, coherent text |
+| `muse` | F16 | 3.88 s | pass, coherent text |
+| `ornith` | F16 | 7.12 s | pass, coherent text |
+
+DeepSeek was intentionally not run in this regression at the user's request;
+its earlier result above remains historical evidence only. After the six
+gates, the common task was stopped and `/ready` was unreachable with no active
+model advertised.
 
 ### Coding harness
 
@@ -200,6 +228,166 @@ improvement over 14.39 tok/s. Short chat reached 44.86 tok/s post-first versus
 30.92 tok/s previously. This is an exact sampling-path improvement, not an
 attention, KV-quality or prefill result: K1 remains lossy and cold 262K TTFT
 remained 536.469 s.
+
+### K1 one-draft MTP baseline, 2026-09-19
+
+Build `871ff4d` was run through the real streaming completion service with an
+exact 262,016-token repository prompt, 128 generated tokens, `temperature=0`
+and the K1 alias. The prompt token-id SHA-256 was
+`5a6457d4279ecb5958d7765f6f7cc6feed532dc5dcbf089e13b6dd322599dfff`.
+
+| Gate | Result |
+|---|---:|
+| cold TTFT | 563.615 s |
+| total wall | 568.499 s |
+| post-first decode | 26.00 useful tok/s |
+| exact target calls / positions | 67 / 127 |
+| accepted one-token drafts | 60 / 67 = 89.55% |
+| useful positions per target call | 1.8955 |
+| complete measured cycle | 72.91 ms/call |
+| cleanup | 0 logical pages; 1,024 physical pool pages retained |
+
+The installed one-draft path therefore provides a real K1 prerequisite that
+the older exact-F16/offload MTP rejection did not: if the measured conditional
+acceptance remains `p=60/67`, a linear MTP-3 rollout has
+`A3=1+p+p^2+p^3=3.4157` useful positions/call and MTP-4 has
+`A4=1+p+p^2+p^3+p^4=4.0588`. The corresponding complete-cycle limits are:
+
+| Rollout | 40 tok/s | 50 tok/s |
+|---|---:|---:|
+| MTP-3 | <=85.39 ms | <=68.31 ms |
+| MTP-4 | <=101.47 ms | <=81.18 ms |
+
+Against the 72.91 ms one-draft cycle, MTP-4 has 28.56 ms of measured
+incremental budget for 40 tok/s but only 8.27 ms for 50 tok/s. This admits an
+MTP-4 implementation experiment for the 40 tok/s gate. It does not establish
+the sampled `p/q` acceptance rate, multi-row target cost, or 50 tok/s.
+
+The deployed page telemetry reported 4,980,736 target bytes and 278,528 MTP
+bytes per 256-token page. A symmetric Q8 MTP record with 256 signed bytes plus
+one FP16 scale per token/head/K-or-V requires 528,384 MTP bytes/page, or
+541,065,216 bytes at 1,024 pages. This is 255,852,544 bytes (244 MiB) more than
+the current MTP-K1 cache. After the completed gate `nvidia-smi` reported
+1,286 MiB free, so a direct replacement would leave about 1,042 MiB: only
+18 MiB above the required 1 GiB reserve before wider logits or other new
+state. The 6,144-row `sequence_hidden` prefill buffer is 125,829,120 bytes
+(120 MiB); releasing it after prefill and recreating it only when a later
+prefill has headroom is therefore a capacity prerequisite for Q8 MTP.
+
+### Sampled MTP-4 implementation result, 2026-09-19
+
+Exact-decode ABI 2 implemented a recurrent four-draft rollout, a 65,536-token
+draft head, unchanged 248,320-token target head, Q8 proposer K/V with
+checkpoint/rollback, and five-position target verification. The compact CUDA
+attention path processed all speculative queries per K/V tile; direct telemetry
+reported ABI 2, draft depth 4, Q8 page bytes 528,384 and multi-query fused
+launches. Independent gates passed for Q8 layout/attention (maximum absolute
+error `1.49e-08`), the real five-query Qwen geometry (`1.86265e-09`), and
+400,000-trial exact `p/q` rejection against an independent scalar oracle.
+
+The real service used terminal windows from the same 262,016-token coding
+prompt so the task remained present at the end of both shorter contexts. Both
+runs generated exactly 128 tokens with the artifact's thinking profile:
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed 1. K1 remains explicitly
+lossy relative to F16.
+
+| Populated prompt | TTFT | Post-first | Target calls / positions | Accepted drafts | Positions/call |
+|---:|---:|---:|---:|---:|---:|
+| 32,768 | 39.295 s | 15.67 tok/s | 52 / 128 | 76 | 2.4615 |
+| 131,072 | 203.145 s | 8.59 tok/s | 48 / 127 | 79 | 2.6458 |
+
+The first attempted 32K prefix window was excluded: removing the terminal task
+made it stop after eight output tokens. It was a prompt-construction failure,
+not a throughput sample.
+
+For the two valid runs, the measured post-first seconds per emitted token were
+`8.1032434/127 = 0.0638051` at 32K and
+`14.7817454/127 = 0.1163917` at 128K. A simple linear extrapolation of the
+complete observed decode time per useful token is:
+
+```text
+d(C) = 0.0638051 + (C - 32768) *
+       (0.1163917 - 0.0638051) / (131072 - 32768)
+d(262144) = 0.1865072 seconds/useful token
+rate(262144) = 5.36 useful tok/s
+```
+
+This is an extrapolation, not a 262K measurement. It is sufficient for the
+fail-fast decision because the implementation already misses 40 tok/s by
+2.55x at 32K; the two-point 262K estimate misses it by 7.46x. MTP-4 sampled
+acceptance also reached only 2.46-2.65 positions per target call, below the
+admitted `A>=3.0` boundary. The candidate artifact was therefore not retained
+as the default; promotion was transactionally rolled back to exact-decode ABI
+1, whose real `hi` smoke passed after rollback.
+
+### MTP-4 rejection-path elimination and clean 32K/128K gates, 2026-09-20
+
+The failed sampled result above was reopened only after profiling found a
+complete redundant target execution on every rejected speculative branch. The
+five-row target pass already computed the recurrent state after each causal
+row, but rejection discarded those states and reran the target prefix. The
+replacement emits FP32 convolution and matrix-state checkpoints for all five
+rows during the original target pass and restores the selected row after exact
+`p/q` acceptance. It does not rerun target weights or target K/V. A direct
+recurrent oracle passed with maximum absolute error `1.49e-07`.
+
+The generic program executor also stopped requesting a useless next draft when
+the accepted target position reaches the reserved context boundary. Benchmark
+service starts explicitly disabled session parking and disk snapshots; no
+post-output cache write is included in the decode numbers below.
+
+Both service gates used suffix windows from the same 262,016-token coding
+prompt, generated 128 tokens, and kept the real thinking sampler
+`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed 1. No 262K gate was run.
+
+| Populated prompt | TTFT | Post-first | Target calls / positions | Accepted drafts | Positions/call | Cycle |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32,768 | 39.617 s | 26.19 tok/s | 54 / 127 | 73 | 2.3519 | 89.786 ms |
+| 131,072 | 203.341 s | 23.89 tok/s | 45 / 127 | 82 | 2.8222 | 118.119 ms |
+
+The clean artifacts are
+`qwen-k1-mtp4-recurrent-checkpoint-32768-suffix.json` and
+`qwen-k1-mtp4-no-retention-131072-suffix.json`. At 128K the worker ended with
+zero allocated and zero reserved pages, proving that the reported wall time
+does not contain a session snapshot or parked GPU state.
+
+Observed useful-token time extrapolates as requested from 32K and 128K only:
+
+```text
+d32  = 4.8484416 / 127 = 0.0381767 s/useful token
+d128 = 5.3153668 / 127 = 0.0418533 s/useful token
+d262 = d32 + (7/3) * (d128 - d32) = 0.0467554 s/useful token
+rate262 = 21.39 useful tok/s
+```
+
+This is an extrapolation, not a 262K measurement. At the measured 128K
+acceptance, 40 tok/s requires a complete cycle no slower than
+`2.8222 / 40 = 70.56 ms`; the current cycle is 118.12 ms. Extrapolating the
+cycle itself gives 155.90 ms at 262K. Even the impossible perfect MTP-4 result
+of five useful positions every cycle would then cap at 32.07 tok/s, so the
+remaining gap is cycle cost, not another acceptance-only fix.
+
+A one-token context phase run isolated the short-cycle GPU cost across 67
+target calls:
+
+| GPU phase | Total | Per target call |
+|---|---:|---:|
+| dense FFN | 1.695497 s | 25.306 ms |
+| recurrent blocks | 1.030414 s | 15.379 ms |
+| full attention | 0.290482 s | 4.336 ms |
+| MTP proposer | 0.333457 s | 4.977 ms |
+| vocabulary head | 0.113024 s | 1.687 ms |
+
+The target dense matrices therefore contribute about 40.69 ms of the fixed
+cycle before long-context attention.
+
+An SM86 small-batch BF16 Tensor Core candidate was tested against the selected
+DP4A weight-reuse kernel for the real batch of five. It was numerically within
+`5.34058e-05`, but the first version reached only 148.60 GB/s on the
+17,408x5,120 projection and 67.14 GB/s on the 5,120x17,408 projection, versus
+453.70 and 365.78 GB/s for DP4A. Removing every block-wide K-loop barrier
+regressed it further to 121.74 and 51.17 GB/s. The candidate was removed; no
+context gate was run for a kernel that failed its bandwidth prerequisite.
 
 ## Sparse MoE evidence
 

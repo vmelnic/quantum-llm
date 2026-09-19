@@ -11,6 +11,7 @@ from .compile import (
     compile_checkpoint,
     refresh_sampling_profiles,
     refresh_runtime_model_program,
+    upgrade_dense_mtp_program,
 )
 from .constants import PACK_ALIGNMENT, QUANT_PROFILE, QUANT_PROFILES
 from .deepseek_v4 import (
@@ -110,6 +111,19 @@ def _parser() -> argparse.ArgumentParser:
     sampling_parser.add_argument("--container", type=Path, required=True)
     sampling_parser.add_argument("--output", type=Path, required=True)
     sampling_parser.add_argument("--profiles", type=Path, required=True)
+
+    mtp_upgrade_parser = commands.add_parser(
+        "upgrade-dense-mtp-program",
+        help="clone an authenticated dense-MTP ABI v1 artifact and migrate its VM program to ABI v2",
+    )
+    mtp_upgrade_parser.add_argument("--container", type=Path, required=True)
+    mtp_upgrade_parser.add_argument("--output", type=Path, required=True)
+    mtp_upgrade_parser.add_argument(
+        "--draft-depth", type=int, choices=(3, 4), default=4
+    )
+    mtp_upgrade_parser.add_argument(
+        "--draft-vocabulary-size", type=int, default=65_536
+    )
 
     inspect_parser = commands.add_parser(
         "inspect-source",
@@ -346,6 +360,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         elif args.command == "refresh-sampling-profiles":
             result = refresh_sampling_profiles(
                 args.container, args.output, args.profiles
+            )
+        elif args.command == "upgrade-dense-mtp-program":
+            result = upgrade_dense_mtp_program(
+                args.container,
+                args.output,
+                draft_depth=args.draft_depth,
+                draft_vocabulary_size=args.draft_vocabulary_size,
             )
         elif args.command == "inspect-source":
             checkpoint = SafeTensorCheckpoint(

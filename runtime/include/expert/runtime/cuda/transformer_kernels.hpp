@@ -329,6 +329,13 @@ struct PleDilatedConvLaunch final {
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
     std::uint32_t first_cache_position, std::uint32_t rows,
     std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+// Symmetric signed INT8 with one FP16 scale per complete K or V head record.
+// This encoding is used by artifact-declared proposer caches only.
+[[nodiscard]] Status store_gqa_kv_paged_q8_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
 [[nodiscard]] Status store_gqa_kv_fp16_batch(
     const float* key, const float* value, void* fp16_keys,
     void* fp16_values, std::uint32_t rows, std::uint32_t kv_heads,
@@ -652,6 +659,25 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
     float rope_theta, void* stream) noexcept;
 
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q8_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q8_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+
 struct PagedFp4GatedGqaAttentionLaunch final {
   const float* q_and_gate{};
   const void* const* page_table{};
@@ -688,9 +714,12 @@ gated_gqa_attention_decode_paged_fp4_key_outlier1_tensor_core(
     const PagedFp4KeyOutlier1GatedGqaAttentionLaunch& launch) noexcept;
 
 using PagedFp8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
+using PagedQ8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
 
 [[nodiscard]] Status gated_gqa_attention_decode_paged_fp8_tensor_core(
     const PagedFp8GatedGqaAttentionLaunch& launch) noexcept;
+[[nodiscard]] Status gated_gqa_attention_decode_paged_q8_tensor_core(
+    const PagedQ8GatedGqaAttentionLaunch& launch) noexcept;
 
 struct PagedFp4GatedGqaPrefillLaunch final {
   const float* q_and_gate{};  // [rows, 2 * query_heads * head_dim]
@@ -737,18 +766,24 @@ struct PagedFp4GatedGqaStagedPrefillWorkspace final {
 using PagedFp8GatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
 using PagedFp8GatedGqaStagedPrefillWorkspace =
     PagedFp4GatedGqaStagedPrefillWorkspace;
+using PagedQ8GatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
+using PagedQ8GatedGqaStagedPrefillWorkspace =
+    PagedFp4GatedGqaStagedPrefillWorkspace;
 using PagedFp4KeyOutlier1GatedGqaPrefillLaunch =
     PagedFp4GatedGqaPrefillLaunch;
 using PagedFp4KeyOutlier1GatedGqaStagedPrefillWorkspace =
     PagedFp4GatedGqaStagedPrefillWorkspace;
 
 // Exact causal microbatch attention. Positions times grouped query heads must
-// fit one 16-row WMMA tile so packed K/V is shared across both dimensions.
+// fit two 16-row WMMA tiles so packed K/V is shared across every speculative
+// query before the next K/V tile is read.
 [[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp4_tensor_core(
     const PagedFp4GatedGqaPrefillLaunch& launch) noexcept;
 
 [[nodiscard]] Status gated_gqa_attention_microbatch_paged_fp8_tensor_core(
     const PagedFp8GatedGqaPrefillLaunch& launch) noexcept;
+[[nodiscard]] Status gated_gqa_attention_microbatch_paged_q8_tensor_core(
+    const PagedQ8GatedGqaPrefillLaunch& launch) noexcept;
 
 [[nodiscard]] Status
 gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
@@ -769,6 +804,9 @@ gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
 [[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp8(
     const PagedFp8GatedGqaPrefillLaunch& launch,
     const PagedFp8GatedGqaStagedPrefillWorkspace& workspace) noexcept;
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_q8(
+    const PagedQ8GatedGqaPrefillLaunch& launch,
+    const PagedQ8GatedGqaStagedPrefillWorkspace& workspace) noexcept;
 
 [[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_fp4_key_outlier1(
     const PagedFp4KeyOutlier1GatedGqaPrefillLaunch& launch,
@@ -994,6 +1032,11 @@ struct SplitGatedDeltaPrefillLaunch final {
   // is present; otherwise execution falls back to the scalar reference path.
   float* recurrent_workspace{};
   std::size_t recurrent_workspace_bytes{};
+  // Optional exact speculative checkpoints. When both pointers are present,
+  // row r stores the causal state after consuming rows [0, r]. Layout is
+  // [rows, state_values] using the same layout as the live state.
+  float* conv_checkpoints{};
+  float* recurrent_checkpoints{};
   std::uint32_t rows{};
   std::uint32_t key_heads{};
   std::uint32_t value_heads{};
@@ -1011,6 +1054,12 @@ struct SplitGatedDeltaPrefillLaunch final {
 // recurrent implementation; unsupported geometries use the scalar reference.
 [[nodiscard]] Status split_gated_delta_prefill(
     const SplitGatedDeltaPrefillLaunch& launch) noexcept;
+
+// Restores one value-major recurrent checkpoint into the live key-major state.
+[[nodiscard]] Status restore_split_gated_delta_recurrent_checkpoint(
+    const float* checkpoint, float* recurrent_state,
+    std::uint32_t value_heads, std::uint32_t key_head_dim,
+    std::uint32_t value_head_dim, void* stream) noexcept;
 
 struct Mamba2BatchLaunch final {
   const float* projected{};       // [rows, intermediate + conv + heads]

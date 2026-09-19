@@ -102,6 +102,8 @@ struct SamplingSettings final {
   [[nodiscard]] bool enabled() const noexcept {
     return temperature_ppm != 0U;
   }
+
+  bool operator==(const SamplingSettings&) const = default;
 };
 
 struct ActiveRequest final {
@@ -326,7 +328,8 @@ er::ProgramRequestContext request_context(std::uint64_t request_id,
                                           std::uint32_t reserved_context,
                                           std::uint32_t retention_position,
                                           std::uint32_t first_output_position,
-                                          const SamplingSettings& sampling) {
+                                          const SamplingSettings& sampling,
+                                          bool exact_decode_enabled) {
   er::ProgramRequestContext result;
   result.request_id = request_id;
   result.deadline = std::chrono::steady_clock::time_point::max();
@@ -348,7 +351,7 @@ er::ProgramRequestContext request_context(std::uint64_t request_id,
                             first_output_position);
   result.parameters.emplace("sampling_seed", sampling.seed);
   result.parameters.emplace("exact_decode_enabled",
-                            sampling.enabled() ? 0U : 1U);
+                            exact_decode_enabled ? 1U : 0U);
   return result;
 }
 
@@ -687,6 +690,12 @@ int worker_loop(er::MoeProgramExecutor& executor,
   std::uint64_t exact_decode_accepted_tokens{};
   std::uint64_t cancelled_requests{};
   CommandInbox inbox;
+  const auto exact_eligible = [&](const SamplingSettings& sampling) {
+    if (!descriptor.exact_decode_program) return false;
+    if (!sampling.enabled()) return true;
+    return descriptor.exact_decode_program->abi_version >= 2U &&
+           sampling.top_k != 0U && sampling.top_k <= 64U;
+  };
   print_ready(descriptor, module.service, options.capacity,
               options.profile_gpu_phases);
 
@@ -742,7 +751,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
         require(predictions.size() == 1U,
                 "program-sequence returned an invalid prediction width");
         request.predicted = predictions.front();
-        if (!request.sampling.enabled() &&
+        if (exact_eligible(request.sampling) &&
             request.session.exact_decode_available()) {
           for (std::size_t offset = 0U;
                offset < segments[index].size();) {
@@ -852,7 +861,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
           std::chrono::duration_cast<std::chrono::nanoseconds>(
               std::chrono::steady_clock::now() - started)
               .count());
-      if (!request.sampling.enabled() &&
+      if (exact_eligible(request.sampling) &&
           request.session.exact_decode_available()) {
         std::vector<std::uint32_t> successors(count);
         for (std::size_t row = 0U; row < count; ++row) {
@@ -992,8 +1001,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
           require(found->second.next_position + prompt.size() <= context,
                   "resumed prompt exhausts request context");
           auto& retained_request = found->second;
-          require(retained_request.sampling.enabled() == sampling.enabled(),
-                  "retained session exact-decode policy changed");
+          require(retained_request.sampling == sampling,
+                  "retained session sampling policy changed");
           const auto original_position = retained_request.next_position;
           const auto original_retention = retained_request.retention_position;
           const auto original_predicted = retained_request.predicted;
@@ -1030,7 +1039,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
                                     static_cast<std::uint32_t>(
                                         prompt.empty() ? 0U
                                                        : prompt.size() - 1U),
-                                retained_request.sampling));
+                                retained_request.sampling,
+                                exact_eligible(retained_request.sampling)));
             require(rebound.ok(), rebound.message());
             if (!prompt.empty())
               feed(id, retained_request, prompt,
@@ -1091,7 +1101,8 @@ int worker_loop(er::MoeProgramExecutor& executor,
               request_context(id, static_cast<std::uint32_t>(context),
                               request.retention_position,
                               static_cast<std::uint32_t>(prompt.size() - 1U),
-                              request.sampling));
+                              request.sampling,
+                              exact_eligible(request.sampling)));
           require(begun.status.ok(), begun.status.message());
           request.session = std::move(begun.session);
           feed(id, request, prompt, 0U);
@@ -1141,7 +1152,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
           }
           require(request.next_position < request.context_limit,
                   "request context is exhausted");
-          if (mode == 0U && !request.sampling.enabled() &&
+          if (mode == 0U && exact_eligible(request.sampling) &&
               request.session.exact_decode_available() &&
               request.next_position + 1U < request.context_limit) {
             auto exact = request.session.execute_exact_decode(
@@ -1176,7 +1187,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
             auto& request = active.at(started[index].request_id);
             request.predicted = read_u32(output->second);
             ++request.next_position;
-            if (!request.sampling.enabled() &&
+            if (exact_eligible(request.sampling) &&
                 request.session.exact_decode_available()) {
               const auto synchronized =
                   request.session.synchronize_exact_decode(
@@ -1404,7 +1415,7 @@ int worker_loop(er::MoeProgramExecutor& executor,
             request_context(key, options.max_context,
                             static_cast<std::uint32_t>(next_position),
                             static_cast<std::uint32_t>(next_position),
-                            sampling),
+                            sampling, exact_eligible(sampling)),
             path, generation, static_cast<std::uint32_t>(next_position));
         require(loaded.status.ok(), loaded.status.message());
         ActiveRequest request;

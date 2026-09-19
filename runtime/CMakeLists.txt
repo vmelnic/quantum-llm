@@ -36,6 +36,7 @@ add_library(expert_runtime STATIC
   src/routed_expert_runtime.cpp
   src/scheduler.cpp
   src/sha256.cpp
+  src/speculative_sampling.cpp
   src/telemetry.cpp
   src/worker_contract.cpp
   src/worker_provider.cpp
