@@ -87,8 +87,23 @@ _SAMPLING_PROFILE_FIELDS = frozenset((
 
 def validate_sampling_profiles(value: object) -> dict[str, object]:
     """Validate artifact-declared, harness-overridable sampling defaults."""
-    if not isinstance(value, dict) or value.get("schema") != "sampling-profiles-v1":
-        raise ValueError("sampling profiles have an unsupported schema")
+    if not isinstance(value, dict):
+        raise ValueError("sampling policy must be an object")
+    if (not isinstance(value.get("schema"), str) or
+            not value["schema"].strip()):
+        raise ValueError("sampling policy schema is invalid")
+    allowed_fields = {
+        "schema", "profiles", "maximum_thinking_tokens",
+    }
+    if not {"schema", "profiles"} <= set(value) or set(value) - allowed_fields:
+        raise ValueError("sampling profiles have unknown or missing fields")
+    maximum = value.get("maximum_thinking_tokens")
+    if maximum is not None and (
+            isinstance(maximum, bool) or not isinstance(maximum, int) or
+            not 1 <= maximum <= 0xffff_ffff):
+        raise ValueError(
+            "sampling profiles maximum_thinking_tokens is invalid"
+        )
     profiles = value.get("profiles")
     if not isinstance(profiles, dict) or set(profiles) != _SAMPLING_PROFILE_NAMES:
         raise ValueError("sampling profiles must declare thinking and non_thinking")

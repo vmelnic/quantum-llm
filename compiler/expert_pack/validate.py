@@ -793,9 +793,26 @@ def validate_container(root: Path | str) -> dict[str, Any]:
     if sampling is not None:
         _require(
             isinstance(sampling, dict) and
-            sampling.get("schema") == "sampling-profiles-v1",
-            "sampling profiles have an unsupported schema",
+            isinstance(sampling.get("schema"), str) and
+            bool(sampling["schema"].strip()),
+            "sampling policy schema is invalid",
         )
+        allowed_sampling_fields = {
+            "schema", "profiles", "maximum_thinking_tokens",
+        }
+        _require(
+            {"schema", "profiles"} <= set(sampling) and
+            not set(sampling) - allowed_sampling_fields,
+            "sampling profiles have unknown or missing fields",
+        )
+        maximum_thinking_tokens = sampling.get("maximum_thinking_tokens")
+        if maximum_thinking_tokens is not None:
+            _require(
+                not isinstance(maximum_thinking_tokens, bool) and
+                isinstance(maximum_thinking_tokens, int) and
+                1 <= maximum_thinking_tokens <= 0xffff_ffff,
+                "sampling profiles maximum_thinking_tokens is invalid",
+            )
         profiles = sampling.get("profiles")
         _require(
             isinstance(profiles, dict) and

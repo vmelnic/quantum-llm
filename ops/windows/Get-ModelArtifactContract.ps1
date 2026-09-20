@@ -45,21 +45,89 @@ if ($model.Count -lt 6 -or $model[0] -ne "model" -or
     throw "Model artifact program descriptor is invalid"
 }
 
+[uint32]$maximumThinkingTokens = 0
+if ($null -ne $manifest.tokenizer -and
+    $null -ne $manifest.tokenizer.sampling) {
+    if ([string]::IsNullOrWhiteSpace(
+            [string]$manifest.tokenizer.sampling.schema)) {
+        throw "Model artifact sampling policy schema is invalid"
+    }
+    $maximumThinkingProperty = `
+        $manifest.tokenizer.sampling.PSObject.Properties[
+            "maximum_thinking_tokens"
+        ]
+    if ($null -ne $maximumThinkingProperty) {
+        if (-not [uint32]::TryParse(
+                [string]$maximumThinkingProperty.Value,
+                [ref]$maximumThinkingTokens) -or
+            $maximumThinkingTokens -eq 0 -or
+            $maximumThinkingTokens -ge $maximumContext) {
+            throw "Model artifact maximum-thinking-token policy is invalid"
+        }
+    }
+}
+
 [uint64]$minimumExactKvBytesPerToken = 0
 $seenMinimumExactKvBytesPerToken = $false
+[uint32]$mtpLayers = 0
+$seenMtpLayers = $false
+[uint32]$exactDecodeAbi = 0
+[uint32]$exactDecodeMaximumEmittedTokens = 0
+$exactDecodeCapability = ""
+$seenExactDecode = $false
+$exactDecodeParameters = @{}
 foreach ($line in $lines) {
     $fields = @([string]$line -split "`t")
-    if ($fields.Count -ne 3 -or $fields[0] -ne "attribute" -or
-        $fields[1] -ne "minimum_exact_kv_bytes_per_token") {
+    if ($fields.Count -eq 3 -and $fields[0] -eq "attribute" -and
+        $fields[1] -eq "minimum_exact_kv_bytes_per_token") {
+        if ($seenMinimumExactKvBytesPerToken -or
+            -not [uint64]::TryParse(
+                $fields[2], [ref]$minimumExactKvBytesPerToken) -or
+            $minimumExactKvBytesPerToken -eq 0) {
+            throw "Model artifact exact-KV resource attribute is invalid"
+        }
+        $seenMinimumExactKvBytesPerToken = $true
         continue
     }
-    if ($seenMinimumExactKvBytesPerToken -or
-        -not [uint64]::TryParse(
-            $fields[2], [ref]$minimumExactKvBytesPerToken) -or
-        $minimumExactKvBytesPerToken -eq 0) {
-        throw "Model artifact exact-KV resource attribute is invalid"
+    if ($fields.Count -eq 3 -and $fields[0] -eq "attribute" -and
+        $fields[1] -eq "mtp_layers") {
+        if ($seenMtpLayers -or
+            -not [uint32]::TryParse($fields[2], [ref]$mtpLayers)) {
+            throw "Model artifact MTP layer attribute is invalid"
+        }
+        $seenMtpLayers = $true
+        continue
     }
-    $seenMinimumExactKvBytesPerToken = $true
+    if ($fields.Count -eq 4 -and $fields[0] -eq "exact_decode") {
+        if ($seenExactDecode -or [string]::IsNullOrWhiteSpace($fields[1]) -or
+            -not [uint32]::TryParse($fields[2], [ref]$exactDecodeAbi) -or
+            -not [uint32]::TryParse(
+                $fields[3], [ref]$exactDecodeMaximumEmittedTokens)) {
+            throw "Model artifact exact-decode record is invalid"
+        }
+        $exactDecodeCapability = $fields[1]
+        $seenExactDecode = $true
+        continue
+    }
+    if ($fields.Count -eq 3 -and $fields[0] -eq "exact_decode_parameter") {
+        if ([string]::IsNullOrWhiteSpace($fields[1]) -or
+            $exactDecodeParameters.ContainsKey($fields[1])) {
+            throw "Model artifact exact-decode parameters are invalid"
+        }
+        [uint32]$parameterValue = 0
+        if (-not [uint32]::TryParse($fields[2], [ref]$parameterValue)) {
+            throw "Model artifact exact-decode parameter is not an unsigned integer"
+        }
+        $exactDecodeParameters[$fields[1]] = $parameterValue
+    }
+}
+
+function Get-ExactDecodeParameter {
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ($exactDecodeParameters.ContainsKey($Name)) {
+        return [uint32]$exactDecodeParameters[$Name]
+    }
+    return [uint32]0
 }
 
 [PSCustomObject]@{
@@ -67,6 +135,16 @@ foreach ($line in $lines) {
     program_schema = $schema
     architecture_id = $model[2]
     maximum_context = $maximumContext
+    maximum_thinking_tokens = $maximumThinkingTokens
     minimum_exact_kv_bytes_per_token = $minimumExactKvBytesPerToken
+    mtp_layers = $mtpLayers
+    exact_decode_capability = $exactDecodeCapability
+    exact_decode_abi = $exactDecodeAbi
+    exact_decode_maximum_emitted_tokens = $exactDecodeMaximumEmittedTokens
+    exact_decode_draft_depth = Get-ExactDecodeParameter -Name "draft_depth"
+    exact_decode_draft_vocabulary_size = Get-ExactDecodeParameter `
+        -Name "draft_vocabulary_size"
+    exact_decode_mtp_kv_encoding = Get-ExactDecodeParameter `
+        -Name "mtp_kv_encoding"
     program_sha256 = $actualHash
 } | ConvertTo-Json

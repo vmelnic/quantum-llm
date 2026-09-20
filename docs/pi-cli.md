@@ -71,17 +71,31 @@ The repository default is `xhigh`. Pi can append another supported
 `--thinking` level for an explicit run, including `off`. The request path maps
 thinking mode and reasoning effort into the artifact's official template.
 
-Qwen-family default sampling comes from artifact metadata, not Pi:
+Sampling defaults come from artifact metadata, not Pi. The
+upstream-compatible profile remains available as
+`qwen3.8-sampling-profiles-v1.json`. The operational Qwen and Qwen Abliterated
+artifacts select the approved long-agent profile:
 
 ```text
-thinking:     temperature=1.0, top_p=0.95, top_k=20
+thinking:     temperature=1.0, top_p=0.95, top_k=20,
+              presence_penalty=0.5
 non-thinking: temperature=0.7, top_p=0.8, top_k=20,
-              presence_penalty=1.5
+              presence_penalty=0.5
+thinking output ceiling: 32,768 tokens
 ```
 
-Supported explicit API/Pi parameters override individual defaults. Results
-must report hidden reasoning separately; changing thinking is a quality and
-latency experiment, not a runtime correctness setting.
+The operational Ornith Q4H artifact preserves its tokenizer defaults in both
+profiles (`temperature=1.0`, `top_p=0.95`, `top_k=20`) and declares the same
+`presence_penalty=0.5`; it does not inherit Qwen's thinking-output ceiling.
+
+The service enforces the artifact-declared ceiling only while thinking is
+enabled. Both global Pi model entries retain `contextWindow=262144` and
+`maxTokens=262143`; oversized thinking requests are clamped server-side to
+32,768, while non-thinking output is bounded by the remaining context.
+Supported explicit API/Pi sampling parameters override individual defaults but
+cannot raise the thinking ceiling. Results must report hidden reasoning
+separately; changing thinking is a quality and latency experiment, not a
+runtime correctness setting.
 
 ## Context and concurrency
 

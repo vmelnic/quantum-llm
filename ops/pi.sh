@@ -79,9 +79,26 @@ models_file, expected_model, expected_kv = sys.argv[1:]
 with open(models_file, encoding="utf-8") as handle:
     registry = json.load(handle)
 try:
-    base_url = registry["providers"]["quantum-llm"]["baseUrl"]
+    provider = registry["providers"]["quantum-llm"]
+    base_url = provider["baseUrl"]
 except (KeyError, TypeError) as error:
     raise SystemExit(f"Pi quantum-llm provider has no baseUrl: {error}")
+models = provider.get("models")
+if not isinstance(models, list):
+    raise SystemExit("Pi quantum-llm provider has no model registry")
+configured = next(
+    (model for model in models
+     if isinstance(model, dict) and model.get("id") == expected_model),
+    None,
+)
+if configured is None:
+    raise SystemExit(f"Pi has no Quantum LLM model {expected_model!r}")
+client_maximum = configured.get("maxTokens")
+if (isinstance(client_maximum, bool) or
+        not isinstance(client_maximum, int) or client_maximum <= 0):
+    raise SystemExit(
+        f"Pi model {expected_model!r} has invalid maxTokens"
+    )
 parsed = urllib.parse.urlsplit(str(base_url).rstrip("/"))
 path = parsed.path
 if path.endswith("/v1"):
@@ -103,11 +120,42 @@ if actual_model != expected_model:
     raise SystemExit(
         f"running model is {actual_model!r}, expected {expected_model!r}"
     )
+service_maximum = (info.get("runtime_config") or {}).get(
+    "maximum_new_tokens"
+)
+if (isinstance(service_maximum, bool) or
+        not isinstance(service_maximum, int) or
+        client_maximum > service_maximum):
+    raise SystemExit(
+        "Pi output limit exceeds the running service limit: "
+        f"Pi={client_maximum!r}, service={service_maximum!r}"
+    )
 actual_kv = (info.get("worker_kv") or {}).get("dtype")
 if expected_kv != "artifact" and actual_kv != expected_kv:
     raise SystemExit(
         f"running KV codec is {actual_kv!r}, expected {expected_kv!r}"
     )
+execution = info.get("worker_execution") or {}
+runtime = info.get("worker_runtime") or {}
+if expected_kv == "q4-f16-per-head" and execution.get("mtp_enabled") is True:
+    abi = runtime.get("provider_exact_decode_abi")
+    depth = runtime.get("provider_mtp_draft_depth")
+    draft_vocabulary = runtime.get("provider_mtp_draft_vocabulary_size")
+    mtp_q8 = runtime.get("provider_mtp_q8_kv")
+    valid = (
+        abi == 2 and depth in (3, 4) and
+        isinstance(draft_vocabulary, int) and
+        not isinstance(draft_vocabulary, bool) and
+        0 < draft_vocabulary <= 65_536 and mtp_q8 == 1 and
+        execution.get("mtp_resource_available") is True and
+        execution.get("mtp_runtime_ready") is True
+    )
+    if not valid:
+        raise SystemExit(
+            "running Q4H MTP contract is incomplete: "
+            f"ABI={abi!r}, depth={depth!r}, "
+            f"draft_vocabulary={draft_vocabulary!r}, Q8={mtp_q8!r}"
+        )
 PY
 then
   die "start the selected model/codec before launching Pi"

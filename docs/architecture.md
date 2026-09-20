@@ -135,6 +135,21 @@ This policy is more lossy than block-floating Q4. It is the default only for
 compatible 256-dimensional GQA artifacts: Qwen, Qwen Abliterated and Ornith.
 Passing throughput does not qualify fidelity or exact-F16 semantics.
 
+Sampling defaults and the thinking runaway ceiling are artifact policy,
+not model-name branches. The single generic sampling-policy contract carries
+the two explicit thinking/non-thinking profiles and an optional
+`maximum_thinking_tokens`; its schema label is metadata, not a runtime behavior
+switch. The server fails closed on invalid fields and clamps only thinking
+requests. The
+all three operational Q4H artifacts use `presence_penalty=0.5` in both
+sampling profiles. Qwen and Qwen Abliterated also declare a 32,768-token
+thinking-output ceiling after a real long-context Pi session entered unbounded
+lexical repetition. The initial 1.5 penalty on those two artifacts caused
+visible Romanian lexical and grammatical degradation and was rejected. Their
+service context remains 262,144 positions; non-thinking output remains bounded
+only by the populated prompt and that context. Other artifacts retain their
+own declared or tokenizer defaults.
+
 For compact non-F16 Qwen attention, prefill uses the vendored official
 FlashAttention implementation over artifact-sized paged segments. Gated
 DeltaNet recurrent prefill uses a numerically gated value-major warp update,

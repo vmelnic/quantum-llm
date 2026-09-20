@@ -257,19 +257,52 @@ start_model() {
   if is_true "${sync_on_start}"; then
     sync_remote
   fi
-  local contract_json artifact_max_context artifact_kv_bytes_per_token
+  local contract_json artifact_max_context artifact_max_thinking_output
+  local artifact_kv_bytes_per_token
+  local artifact_mtp_layers artifact_exact_decode_abi
+  local artifact_draft_depth artifact_draft_vocabulary_size
+  local artifact_mtp_kv_encoding artifact_maximum_emitted_tokens
   contract_json="$(run_remote Get-ModelArtifactContract.ps1 -Container "${container}")"
-  read -r artifact_max_context artifact_kv_bytes_per_token < <(python3 -c '
+  read -r artifact_max_context artifact_max_thinking_output artifact_kv_bytes_per_token \
+    artifact_mtp_layers artifact_exact_decode_abi artifact_draft_depth \
+    artifact_draft_vocabulary_size artifact_mtp_kv_encoding \
+    artifact_maximum_emitted_tokens < <(python3 -c '
 import json, sys
 contract = json.load(sys.stdin)
 maximum = contract.get("maximum_context")
+maximum_thinking_output = contract.get("maximum_thinking_tokens", 0)
 per_token = contract.get("minimum_exact_kv_bytes_per_token", 0)
 if not isinstance(maximum, int) or maximum <= 1:
     raise SystemExit("artifact contract has no valid maximum_context")
+if (isinstance(maximum_thinking_output, bool) or
+        not isinstance(maximum_thinking_output, int) or
+        maximum_thinking_output < 0 or maximum_thinking_output >= maximum):
+    raise SystemExit("artifact contract has invalid maximum_thinking_tokens")
 if not isinstance(per_token, int) or per_token < 0:
     raise SystemExit("artifact contract has invalid exact-KV geometry")
-print(maximum, per_token)
+names = (
+    "mtp_layers", "exact_decode_abi", "exact_decode_draft_depth",
+    "exact_decode_draft_vocabulary_size", "exact_decode_mtp_kv_encoding",
+    "exact_decode_maximum_emitted_tokens",
+)
+values = []
+for name in names:
+    value = contract.get(name, 0)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise SystemExit(f"artifact contract has invalid {name}")
+    values.append(value)
+print(maximum, maximum_thinking_output, per_token, *values)
 ' <<<"${contract_json}")
+  if [[ "${kv_cache_dtype}" == q4-f16-per-head ]] &&
+     (( artifact_mtp_layers > 0 )) &&
+     ! (( artifact_exact_decode_abi == 2 &&
+          artifact_draft_depth >= 3 && artifact_draft_depth <= 4 &&
+          artifact_draft_vocabulary_size > 0 &&
+          artifact_draft_vocabulary_size <= 65536 &&
+          artifact_mtp_kv_encoding == 1 &&
+          artifact_maximum_emitted_tokens == artifact_draft_depth + 1 )); then
+    die "Q4H artifact with MTP requires exact-decode ABI 2, MTP-3/4, a <=65,536 draft vocabulary, and Q8 MTP KV (got ABI=${artifact_exact_decode_abi} depth=${artifact_draft_depth} vocabulary=${artifact_draft_vocabulary_size} MTP-KV=${artifact_mtp_kv_encoding} emitted=${artifact_maximum_emitted_tokens})"
+  fi
   if (( max_context > artifact_max_context )); then
     printf 'Using artifact context limit %s instead of configured %s\n' \
       "${artifact_max_context}" "${max_context}"

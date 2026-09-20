@@ -1087,7 +1087,10 @@ class ExpertPackTests(unittest.TestCase):
             }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
             updated = json.loads(json.dumps(profiles))
-            updated["profiles"]["non_thinking"]["temperature"] = 0.6
+            updated["schema"] = "sampling-policy"
+            updated["maximum_thinking_tokens"] = 32768
+            updated["profiles"]["thinking"]["presence_penalty"] = 0.5
+            updated["profiles"]["non_thinking"]["presence_penalty"] = 0.5
             updated_path = root / "updated-sampling.json"
             updated_path.write_text(json.dumps(updated), encoding="utf-8")
             refreshed = root / "pack-refreshed"

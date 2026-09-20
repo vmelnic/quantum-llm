@@ -1764,9 +1764,10 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
 
         app = application_fixture()
         app.args = types.SimpleNamespace(
-            model="test-model", maximum_new_tokens=32, max_context=128,
+            model="test-model", maximum_new_tokens=127, max_context=128,
         )
         app.tokenizer = Tokenizer()
+        app.maximum_thinking_tokens = 4
         app.sampling_profiles = {
             "thinking": SamplingSettings(1.0, 0.95, 20, 0.0, 0, 0.0),
             "non_thinking": SamplingSettings(0.7, 0.8, 20, 0.0, 0, 1.5),
@@ -1795,6 +1796,21 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         self.assertEqual(overridden.sampling.temperature, 0.4)
         self.assertEqual(overridden.sampling.top_p, 0.8)
         self.assertEqual(overridden.sampling.presence_penalty, -0.25)
+
+        capped_thinking = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_completion_tokens": 262143,
+        }, "chat")
+        self.assertEqual(capped_thinking.maximum, 4)
+
+        full_non_thinking = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "chat_template_kwargs": {"enable_thinking": False},
+            "max_completion_tokens": 262143,
+        }, "chat")
+        self.assertEqual(full_non_thinking.maximum, 126)
 
     def test_responses_request_uses_artifact_sampling_contract(self) -> None:
         class Tokenizer:

@@ -879,6 +879,42 @@ not a fidelity claim. The discarded ad-hoc retrieval probe, RULER and
 LongBench were not admitted as quality gates; a relevant fixed-harness
 ContextBench run and the user-owned real-project Pi gate remain separate.
 
+### Long-agent repetition policy, 2026-09-20
+
+The first real Qwen Abliterated Pi fidelity run failed qualitatively at long
+context. Requests with 133,610 and 148,441 prompt tokens entered lexical
+reasoning loops and were manually cancelled after 12,952 and 79,608 generated
+tokens. A coherent 4,786-token request between the failures, plus full fresh
+prefill on each request, rules out a permanently corrupted retained session.
+No matched K1 or F16 replay was run, so this evidence does not isolate Q4H as
+the cause. It does reject the prior short-smoke inference that the promoted
+configuration was adequate for long-agent use.
+
+The initial mitigation used an artifact-declared `presence_penalty=1.5` for
+thinking and non-thinking on both operational Qwen artifacts. It produced
+visible Romanian lexical and grammatical degradation: common words were
+displaced by malformed or semantically wrong alternatives. That value is
+rejected for operational use. The corrected Qwen policy uses
+`presence_penalty=0.5` in both profiles, with a 32,768-token ceiling only for
+thinking output. Ornith declares the same 0.5 penalty while retaining its
+existing `temperature=1.0`, `top_p=0.95`, `top_k=20` defaults in both profiles
+and no Qwen-specific output ceiling.
+
+The 262,144-position context and non-thinking output capacity remain
+unchanged. The penalty is applied consistently to target and MTP proposal
+distributions and changes sampling semantics intentionally. The ceiling is the
+firm circuit breaker, not a quality fix: 16,384 was rejected because the same
+session contained a coherent 23,599-token tool-producing turn. Requalify
+Romanian quality and real long-agent behavior under 0.5; do not attribute a
+pass or failure specifically to Q4H without a matched codec control.
+
+Context capacity, normal output capacity and the thinking circuit breaker are
+independent universal limits. Pi therefore advertises 262,144 context positions
+and 262,143 maximum output tokens for both Qwen Q4H models; the server clamps
+only thinking requests to their artifact-declared 32,768 bound. Sampling-policy
+schema labels do not select runtime behavior, and no model-family branch
+implements this distinction.
+
 ## Rejected DeepSeek work
 
 - Whole-prompt layer-major routing required about 176 GiB of selection streams

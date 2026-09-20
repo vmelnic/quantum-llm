@@ -584,6 +584,55 @@ budget entirely as hidden reasoning, so this is a serving-performance gate,
 not a coherence, visible-answer or fidelity gate. One request is not a latency
 distribution.
 
+#### Real Pi long-context repetition failure and mitigation
+
+A Qwen Abliterated Q4H Pi session supplied the missing real-project quality
+evidence. Two fresh-prefill requests entered lexical reasoning loops; the user
+cancelled both. A normal request completed between them, so this is not evidence
+of a permanently corrupted retained session. No matched K1 or F16 replay was
+run, and the result therefore cannot isolate the KV codec.
+
+| Prompt | Generated before cancellation | TTFT | Wall | Result |
+|---:|---:|---:|---:|---|
+| 133,610 | 12,952 | 208.906 s | 449.750 s | repeated `(2026 real)` pattern |
+| 148,441 | 79,608 | 240.218 s | 1,533.172 s | repeated multi-clause pattern |
+
+Between those failures, a 133,617-token prompt generated 4,786 coherent tokens
+and reached a tool call. Another coherent tool-producing turn in the session
+used 23,599 output tokens, so a 16K ceiling would reject observed valid work.
+The initial replacement policy declared `presence_penalty=1.5` and a 32,768
+token thinking-output ceiling in each operational Qwen artifact. The
+262,144-position context and non-thinking output capacity remain unchanged.
+This is an intentional sampling change and a runaway bound; its real-project
+fidelity gate is pending. Post-promotion `/model-info` reported the manifest as
+the sampling source, the 32,768 thinking limit, Q4H, ABI 2, MTP-4, the
+65,536-token draft head and Q8 MTP state for both artifacts. Non-thinking `hi`
+smokes completed coherently at
+52.99 tok/s post-first for Abliterated and 62.23 tok/s for official Qwen. These
+short smokes qualify wiring only, not the pending long-context mitigation.
+
+The corrected universal limit contract was then promoted on both Qwen Q4H
+artifacts. The live Abliterated service reported `max_context=262144`, normal
+`maximum_new_tokens=262143` and `maximum_thinking_tokens=32768`. A direct xhigh
+request using Pi's actual `max_tokens=262143` shape completed with `OK`, 57
+prompt tokens, 17 reasoning tokens and 22 total completion tokens, with
+`finish_reason=stop`. The identical official-Qwen gate also returned `OK` and
+`stop`, with 42 reasoning tokens and 47 total completion tokens. This closes
+the prior HTTP 400 wiring regression; it does not replace the pending
+long-project repetition gate.
+
+The first user-observed Romanian answer under the 1.5 policy showed material
+quality degradation: malformed words, inappropriate lexical substitutions and
+broken agreement appeared throughout otherwise structured prose. Runtime
+inspection confirmed that the artifact policy, rather than the parser, applies
+the penalty once to every token already emitted by the response. The Qwen and
+Qwen Abliterated policies were therefore corrected to `presence_penalty=0.5`
+in both profiles while retaining the 32,768-token thinking ceiling. Ornith,
+the third operational Q4H artifact, received the same 0.5 penalty while
+retaining its existing sampling defaults and no Qwen-specific ceiling. Real
+Romanian replays and the long-project repetition gate remain pending;
+configuration validation alone is not a quality pass.
+
 ## Sparse MoE evidence
 
 ### Ornith startup fitting

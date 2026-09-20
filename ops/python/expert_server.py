@@ -1276,15 +1276,32 @@ class Application:
             "thinking": self.default_sampling,
             "non_thinking": self.default_sampling,
         }
+        self.maximum_thinking_tokens: int | None = None
         artifact_sampling = self.manifest.get("tokenizer", {}).get("sampling")
         if artifact_sampling is not None:
             if (not isinstance(artifact_sampling, dict) or
-                    artifact_sampling.get("schema") != "sampling-profiles-v1" or
+                    not isinstance(artifact_sampling.get("schema"), str) or
+                    not artifact_sampling["schema"].strip() or
+                    not {"schema", "profiles"} <= set(artifact_sampling) or
+                    set(artifact_sampling) - {
+                        "schema", "profiles", "maximum_thinking_tokens"
+                    } or
                     not isinstance(artifact_sampling.get("profiles"), dict) or
                     set(artifact_sampling["profiles"]) != {
                         "thinking", "non_thinking"
                     }):
                 raise RuntimeError("artifact sampling profiles are invalid")
+            maximum_thinking_tokens = artifact_sampling.get(
+                "maximum_thinking_tokens"
+            )
+            if maximum_thinking_tokens is not None:
+                if (isinstance(maximum_thinking_tokens, bool) or
+                        not isinstance(maximum_thinking_tokens, int) or
+                        not 1 <= maximum_thinking_tokens < args.max_context):
+                    raise RuntimeError(
+                        "artifact sampling maximum_thinking_tokens is invalid"
+                    )
+                self.maximum_thinking_tokens = maximum_thinking_tokens
             profiles: dict[str, SamplingSettings] = {}
             for name, profile in artifact_sampling["profiles"].items():
                 if not isinstance(profile, dict):
@@ -3084,9 +3101,14 @@ class Application:
             maximum_value = 16
         if isinstance(maximum_value, bool) or not isinstance(maximum_value, int):
             raise RequestError(f"{max_field} must be an integer", max_field)
-        maximum = maximum_value
-        if not 1 <= maximum <= self.args.maximum_new_tokens:
+        if maximum_value < 1:
             raise RequestError(f"{max_field} is outside service limits", max_field)
+        maximum = min(maximum_value, self.args.maximum_new_tokens)
+        maximum_thinking_tokens = getattr(
+            self, "maximum_thinking_tokens", None
+        )
+        if enable_thinking and maximum_thinking_tokens is not None:
+            maximum = min(maximum, maximum_thinking_tokens)
 
         instructions = payload.get("instructions")
         if instructions is not None and not isinstance(instructions, str):
@@ -3822,6 +3844,9 @@ class Application:
                 "port": self.args.port,
                 "max_context": self.args.max_context,
                 "maximum_new_tokens": self.args.maximum_new_tokens,
+                "maximum_thinking_tokens": getattr(
+                    self, "maximum_thinking_tokens", None
+                ),
                 "maximum_queue": self.args.maximum_queue,
                 "worker_capacity": self.args.worker_capacity,
                 "worker_ram_cache_gib": self.args.worker_ram_cache_gib,
