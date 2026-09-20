@@ -27,8 +27,9 @@ readiness. Sync never copies or deletes ignored model/build/cache state.
 `pi.sh` selects the same provider/model registry, verifies the running model
 and explicit KV codec through `/model-info`, and defaults to `xhigh` thinking;
 all additional Pi arguments pass through unchanged. `qwen`,
-`qwen-abliterated` and `ornith-k1` select K1 while `qwen-f16` and `ornith`
-preserve the exact-F16 reference paths.
+`qwen-abliterated` and `ornith` select `q4-f16-per-head`; `qwen-f16` preserves
+the exact-F16 Qwen reference. The wrapper resolves the repository and `.env`
+from its own path, so it can be invoked from any current directory.
 
 ## Windows workflows
 

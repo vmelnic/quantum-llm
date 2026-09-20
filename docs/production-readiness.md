@@ -1,7 +1,7 @@
 # Production readiness
 
 Status: functional research/pilot runtime; not production-ready for the full
-maximum-context coding objective, 2026-09-15.
+maximum-context coding objective, 2026-09-20.
 
 ## Verdict
 
@@ -13,11 +13,13 @@ telemetry, exact sparse routing and cleanup are functional.
 
 The complete product goal is not ready:
 
-- Qwen exact-F16 populated 262,016 tokens but took 2,278.082 s; K1 took
-  546.173 s but changes fidelity;
+- Qwen exact-F16 populated 262,016 tokens but took 2,278.082 s; the lossy
+  per-head-Q4 default passed 40 useful tok/s at 32K/128K but has no live 262K
+  or real-project fidelity result;
 - one hot provider slot serializes all agents;
 - Qwen Flash and Mistral are callable but fail coding latency/behavior gates;
-- Ornith K1+fit failed its coding fixture 2/3 after 1,832.80 s;
+- Ornith's historical K1+fit run failed its coding fixture 2/3 after
+  1,832.80 s; the new per-head-Q4 default has only a minimal Pi smoke;
 - DeepSeek novel routes remain near 1 tok/s, settled throughput is below target
   and some cancellations require restart;
 - durable supervision, long-prefix failure recovery and a hardened network
@@ -33,7 +35,7 @@ The complete product goal is not ready:
 | paging | exact top-k/stable merge with measured NVMe/RAM/VRAM traffic |
 | KV/session state | artifact-declared progressive allocation; Qwen provider supports transactional RAM parking and durable, lazy NVMe restart/resume with TTL/LRU and explicit per-artifact cleanup |
 | APIs | bounded OpenAI- and Anthropic-compatible streaming surfaces |
-| harness wiring | all seven advertised models pass minimal Pi `hi`; this is not coding or behavioral qualification |
+| harness wiring | current defaults for six advertised models pass isolated minimal Pi `hi`; DeepSeek retains older wiring evidence and was intentionally excluded from the latest regression |
 | introspection | bounded health/readiness/model/metrics and per-request telemetry |
 
 ## Release blockers
@@ -53,8 +55,9 @@ The complete product goal is not ready:
 - `MODEL_ROOT` is the only host-dependent model-storage root.
 - The common fixed routed-VRAM ceiling is 12 GiB; startup fitting is admitted
   only after accounting maximum future state and reserve.
-- Format and fidelity names remain exact; K1 is a lossy opt-in, while exact F16
-  remains the Qwen acceptance target.
+- Format and fidelity names remain exact; `q4-f16-per-head` is the explicit
+  lossy default for compatible artifacts, while exact F16 remains the Qwen
+  acceptance target and `qwen-f16` reference.
 - DeepSeek keeps exact router/top-k/stable aggregation and receives no
   unsupported session commands.
 - Native releases use a clean-first Windows CUDA build.

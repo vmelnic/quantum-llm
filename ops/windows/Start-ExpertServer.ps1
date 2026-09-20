@@ -22,7 +22,7 @@ param(
     [string]$PlacementProfile = "balanced",
     [int]$WorkerKvCacheMiB = 2048,
     [int]$WorkerKvPageTokens = 256,
-    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "fp16")]
+    [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "q4-bfp16-block32-key-outlier1", "q4-bfp16-block32", "q4-f16-per-head", "q5-q4-bfp16-block32", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
     [string]$SessionCacheRoot = "",
     [int]$SessionCacheGiB = 0,

@@ -1,6 +1,6 @@
 # Architecture
 
-Status: implemented architecture and boundaries, 2026-09-12.
+Status: implemented architecture and boundaries, 2026-09-20.
 
 ## Scope
 
@@ -83,11 +83,11 @@ converge at the executable-program, logical-page and provider boundaries.
 
 | Alias | Program and representation | Request state | Callable scope |
 |---|---|---|---|
-| `qwen` / `qwen-f16` / `qwen-abliterated` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated alias selects separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select experimental resident K1 KV; `qwen-f16` selects progressive exact F16 KV with a bounded disposable VRAM mirror | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only |
+| `qwen` / `qwen-f16` / `qwen-abliterated` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated alias selects separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select resident `q4-f16-per-head` target KV; `qwen-f16` selects progressive exact F16 KV with a bounded disposable VRAM mirror | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only; per-head Q4 quality remains a user-run real-project Pi gate |
 | `qwen-flash` | 48 layers; 36 Gated DeltaNet, 12 QSA, Hyper, PLE, 512 experts/layer, exact top-10 FP4 routing; scalar decode may execute the selected standard-FP4 experts on local P100s | recurrent state plus progressive exact F16 QSA K/V; compact index retained on device where declared | text/reasoning/tools; P100 execution is exact but slower than the primary path in the measured short chat; quality and long-context performance remain unqualified |
 | `mistral` | source-native block-16 E2M1/E4M3FN NVFP4 W4A4 MoE plus BF16 organs | artifact-declared BF16 MLA latent KV pages | text/reasoning/tools; auxiliary multimodal records are not callable support |
 | `muse` | 52-layer dense FP4 text model with global and exact 2,048-token sliding attention | exact F16 global pages plus cyclic exact F16 sliding windows; artifact maximum 131,072 | text only; preserved vision records are auxiliary |
-| `ornith` / `ornith-k1` | 40-layer hybrid model; 30 recurrent, 10 full attention, 256 experts/layer, exact top-8 standard FP4 routing | `ornith` selects progressive exact F16 KV and the fixed common expert cache; `ornith-k1` selects experimental resident K1 KV and startup-fitted routed VRAM; the complete 17,154,703,360-byte expert pool can live in the host bank | text/reasoning/tools |
+| `ornith` | 40-layer hybrid model; 30 recurrent, 10 full attention, 256 experts/layer, exact top-8 standard FP4 routing | resident `q4-f16-per-head` target KV and the fixed common expert cache; the complete 17,154,703,360-byte expert pool can live in the host bank | text/reasoning/tools; per-head Q4 service wiring is qualified separately from model quality |
 | `deepseek` | resident dense/shared organs; 43 routed layers x 256 experts; exact top-6 compact FP4 pages | provider-owned artifact KV and request state; no exact checkpoint/rewind/session-retention capability | text/reasoning/tools through exact demand paging |
 
 An artifact limit is an admission ceiling, not allocated context. Muse is
@@ -104,12 +104,36 @@ is released and the provider falls back atomically to bounded exact host-KV
 staging. This preserves values but cannot meet the saturated-context throughput
 target because all full-attention KV remains hot.
 
-K1 (`fp4-e2m1-ue8m0-block32-key-outlier1`) is a separate lossy KV policy:
+K1 (`fp4-e2m1-ue8m0-block32-key-outlier1`) remains a separate implemented
+lossy KV policy:
 values use block-32 FP4; keys add one FP16 largest-magnitude correction per
 block. At Qwen's 262,144-position ceiling it reduces target KV from 16 GiB to
-4.75 GiB, or 5.015625 GiB including MTP pages. The `qwen`,
-`qwen-abliterated` and `ornith-k1` aliases opt into K1; `qwen-f16` and
-`ornith` remain exact-F16 references. K1 is never reported as exact F16.
+4.75 GiB, or 5.015625 GiB including MTP pages. It is no longer selected by an
+active alias. K1 is never reported as exact F16.
+
+`q4-bfp16-block32-key-outlier1` is a second, explicitly lossy target-KV
+policy. Each 256-value record stores signed Q4 payload, one FP16 base, and
+four-bit block-32 exponents; K also stores one aligned FP16 outlier per block.
+The K+V record pair is 300 bytes, so Qwen target KV occupies 4.6875 GiB at
+262,144 populated positions and 5.191406 GiB with its Q8 MTP pages. The
+batch-five decode kernel reads the head-major packed planes once per K/V tile,
+expands only transient INT8 Tensor Core operands in shared memory, and evaluates
+all five causal queries there. It does not materialize a decoded F16 cache.
+Large cold-prefill batches retain bounded transient BF16 staging for the
+vendored FlashAttention path; that staging is not the decode path or retained
+KV representation. It remains an implemented research format but is not
+selected by an active alias.
+
+`q4-f16-per-head`, shortened to **Q4H**, is the lower-overhead packed policy selected for the
+40--50 useful-token/s experiment. K and V each store 128 signed-Q4 code bytes
+and one FP16 scale for the complete 256-value head, for a 260-byte K+V record
+pair. Qwen target KV therefore occupies 4.0625 GiB at 262,144 positions, or
+4.566406 GiB including the unchanged Q8 MTP pages. The same batch-five kernel
+loads each packed K/V tile once for all speculative queries and expands it only
+to transient signed-INT8 Tensor Core operands. It never builds an F16 cache.
+This policy is more lossy than block-floating Q4. It is the default only for
+compatible 256-dimensional GQA artifacts: Qwen, Qwen Abliterated and Ornith.
+Passing throughput does not qualify fidelity or exact-F16 semantics.
 
 For compact non-F16 Qwen attention, prefill uses the vendored official
 FlashAttention implementation over artifact-sized paged segments. Gated
@@ -206,8 +230,8 @@ GiB. It is a ceiling, not an upfront allocation. A 13 GiB primary DeepSeek
 profile fails preflight after immutable allocations, workspace and the 1 GiB
 emergency reserve, so it is not a supported common configuration. Fitting is
 therefore an explicit per-alias policy rather than a global budget increase.
-The first admitted alias is `ornith-k1`: it fitted 15.9375 GiB after accounting
-for its smaller maximum K1 state. The optional P100 arena is separate and
+The former `ornith-k1` profile fitted 15.9375 GiB after accounting for its
+smaller maximum K1 state. The optional P100 arena is separate and
 reserves its own fitted capacity at startup without loading expert payloads
 into those slots.
 

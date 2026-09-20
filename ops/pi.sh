@@ -46,6 +46,10 @@ while IFS=$'\t' read -r alias advertised_model artifact declared_kv declared_vra
      ( "${declared_kv}" == artifact ||
        "${declared_kv}" == fp8-e4m3-per-head ||
        "${declared_kv}" == fp4-e2m1-ue8m0-block32-key-outlier1 ||
+       "${declared_kv}" == q4-bfp16-block32-key-outlier1 ||
+       "${declared_kv}" == q4-bfp16-block32 ||
+       "${declared_kv}" == q4-f16-per-head ||
+       "${declared_kv}" == q5-q4-bfp16-block32 ||
        "${declared_kv}" == fp16 ) &&
      ( "${declared_vram}" == fixed || "${declared_vram}" == fit ) ]] ||
     die "invalid model alias registry row for '${alias}'"

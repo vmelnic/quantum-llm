@@ -764,6 +764,10 @@ class CudaWorker:
                     "fp16", "bf16", "bf16-latent", "fp32",
                     "fp4-e2m1-ue8m0-block32",
                     "fp4-e2m1-ue8m0-block32-key-outlier1",
+                    "q4-bfp16-block32-key-outlier1",
+                    "q4-bfp16-block32",
+                    "q4-f16-per-head",
+                    "q5-q4-bfp16-block32",
                     "fp8-e4m3-per-head",
                 } or
                 self.kv_allocation not in {"paged_on_demand", "preallocated"} or
@@ -4848,6 +4852,10 @@ def parse_args() -> argparse.Namespace:
             "artifact",
             "fp8-e4m3-per-head",
             "fp4-e2m1-ue8m0-block32-key-outlier1",
+            "q4-bfp16-block32-key-outlier1",
+            "q4-bfp16-block32",
+            "q4-f16-per-head",
+            "q5-q4-bfp16-block32",
             "fp16",
         ),
     )

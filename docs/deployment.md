@@ -1,6 +1,6 @@
 # Deployment
 
-Status: supported single-host lifecycle, 2026-09-12.
+Status: supported single-host lifecycle, 2026-09-20.
 
 ## Contract
 
@@ -20,18 +20,22 @@ artifact passes real gates and recovery is no longer needed.
 
 | Alias | Advertised model | Path below `MODEL_ROOT` | KV selection |
 |---|---|---|---|
-| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
-| `qwen-abliterated` | `qwen3.8-27b-abliterated-fp4` | `qwen3.8-27b-abliterated-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
+| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | lossy `q4-f16-per-head`; direct packed batch-five decode |
+| `qwen-abliterated` | `qwen3.8-27b-abliterated-fp4` | `qwen3.8-27b-abliterated-fp4` | lossy `q4-f16-per-head`; same compatible attention geometry |
 | `qwen-f16` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | exact `fp16` reference |
 | `qwen-flash` | `qwen3.8-flash-next-fp4` | `qwen3.8-flash-next-fp4` | `fp16` |
 | `mistral` | `mistral-small-4-119b-nvfp4` | `mistral-small-4-119b-nvfp4` | artifact-declared |
 | `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` | `fp16` |
-| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | `fp16` |
-| `ornith-k1` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | experimental `fp4-e2m1-ue8m0-block32-key-outlier1` |
+| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | lossy `q4-f16-per-head`; compatible 256-dimensional GQA |
 | `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` | artifact-declared |
 
-Aliases select an artifact, advertised ID and required KV policy. The task
+Long artifact-name aliases select the same policies. The compact-Q4/K1
+research implementations remain in source history but are not active service
+aliases. Aliases select an artifact, advertised ID and required KV policy. The task
 `QuantumLLM-ExpertVm`, HTTP service and native VM are common.
+
+Documentation shortens `q4-f16-per-head` to **Q4H**. The service, artifact and
+worker ABI always use the complete string and never accept the shorthand.
 
 ## Lifecycle
 

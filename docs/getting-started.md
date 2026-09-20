@@ -114,14 +114,15 @@ or a task at `.partial`, `.candidate` or a missing artifact.
 ./ops/model.sh stop all
 ```
 
-The lifecycle aliases are `qwen`, `qwen-f16`, `qwen-flash`, `mistral`, `muse`,
-`ornith`, `ornith-k1` and `deepseek`. `qwen` and `ornith-k1` select
-experimental K1 KV; `qwen-f16` and `ornith` preserve their exact-F16 reference
-paths. A real `hi` validates wiring only. For a minimal Pi check:
+The lifecycle aliases are `qwen`, `qwen-abliterated`, `qwen-f16`, `qwen-flash`,
+`mistral`, `muse`, `ornith` and `deepseek`. `qwen`, `qwen-abliterated` and
+`ornith` select `q4-f16-per-head`; `qwen-f16` preserves the exact-F16 Qwen
+reference path. A real `hi` validates wiring only. For a minimal Pi check:
 
 ```bash
 ./ops/model.sh start qwen
-./ops/pi.sh qwen --no-context-files --no-tools --no-session -p hi
+./ops/pi.sh qwen --no-context-files --no-tools --no-extensions \
+  --no-skills --no-prompt-templates --no-session -p hi
 ./ops/model.sh stop all
 ```
 

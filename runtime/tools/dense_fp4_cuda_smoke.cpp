@@ -236,6 +236,17 @@ double numerical_check() {
         std::abs(static_cast<double>(reused[index]) - expected[index]));
   status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
       {device_weights.get(), device_scales.get(), rows, columns, padded},
+      device_q8.get(), device_q8_scales.get(), device_output.get(), 5U,
+      nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize dense FP4 batch-5 tensor-core smoke");
+  const auto batch_five = device_output.download();
+  for (std::size_t index = 0; index < 5U * rows; ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(batch_five[index]) - expected[index]));
+  status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
+      {device_weights.get(), device_scales.get(), rows, columns, padded},
       device_q8.get(), device_q8_scales.get(), device_output.get(), 2U,
       nullptr));
   cuda_check(cudaDeviceSynchronize(),
@@ -1441,6 +1452,1050 @@ Fp4KeyOutlier1Check fp4_key_outlier1_check() {
     }
   }
   return result;
+}
+
+struct Q4BfpKeyOutlier1Check final {
+  double layout_maximum_byte_difference{};
+  double query_maximum_byte_difference{};
+  double query_scale_maximum_absolute_difference{};
+  double independent_oracle_maximum_absolute_difference{};
+};
+
+std::uint8_t host_q4_bfp_exponent(float desired_scale, float base) {
+  const auto ratio = desired_scale / base;
+  if (ratio <= 1.0F) return 0U;
+  return static_cast<std::uint8_t>(
+      std::max(0, std::min(4, static_cast<int>(std::ceil(std::log2(ratio))))));
+}
+
+std::uint8_t host_signed_q4(float value, float scale) {
+  const auto quantized = std::max(
+      -7, std::min(7, static_cast<int>(std::nearbyint(value / scale))));
+  return static_cast<std::uint8_t>(quantized & 0x0f);
+}
+
+std::int32_t host_signed_q4_value(std::uint8_t nibble) {
+  return nibble >= 8U ? static_cast<std::int32_t>(nibble) - 16
+                      : static_cast<std::int32_t>(nibble);
+}
+
+std::uint8_t host_q5_bfp_exponent(float desired_scale, float base) {
+  const auto ratio = desired_scale / base;
+  if (ratio <= 1.0F) return 0U;
+  return static_cast<std::uint8_t>(
+      std::max(0, std::min(3, static_cast<int>(std::ceil(std::log2(ratio))))));
+}
+
+std::uint8_t host_signed_q5(float value, float scale) {
+  const auto quantized = std::max(
+      -15, std::min(15, static_cast<int>(std::nearbyint(value / scale))));
+  return static_cast<std::uint8_t>(quantized & 0x1f);
+}
+
+std::int32_t host_signed_q5_value(std::uint8_t code) {
+  return code >= 16U ? static_cast<std::int32_t>(code) - 32
+                     : static_cast<std::int32_t>(code);
+}
+
+template <bool PreserveKeyOutlier, bool PerHead = false>
+Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
+  static_assert(!(PreserveKeyOutlier && PerHead));
+  constexpr std::uint32_t stored_tokens = 8U;
+  constexpr std::uint32_t rows = 5U;
+  constexpr std::uint32_t first_context_tokens = 4U;
+  constexpr std::uint32_t query_heads = 24U;
+  constexpr std::uint32_t kv_heads = 4U;
+  constexpr std::uint32_t grouped_heads = query_heads / kv_heads;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t page_tokens = 32U;
+  constexpr std::uint32_t blocks = head_dim / 32U;
+  constexpr std::uint32_t exponent_bytes =
+      PerHead ? 0U : head_dim / 64U;
+  constexpr std::uint32_t key_correction_bytes = PreserveKeyOutlier
+      ? blocks * sizeof(std::uint32_t)
+      : 0U;
+  constexpr std::uint32_t key_record_bytes =
+      head_dim / 2U + exponent_bytes + sizeof(std::uint16_t) +
+      key_correction_bytes;
+  constexpr std::uint32_t value_record_bytes =
+      head_dim / 2U + exponent_bytes + sizeof(std::uint16_t);
+  constexpr std::size_t records =
+      static_cast<std::size_t>(page_tokens) * kv_heads;
+  constexpr std::size_t page_bytes =
+      records * (key_record_bytes + value_record_bytes);
+  constexpr std::size_t key_code_bytes = records * (head_dim / 2U);
+  constexpr std::size_t key_exponent_bytes = records * exponent_bytes;
+  constexpr std::size_t key_base_bytes =
+      records * sizeof(std::uint16_t);
+  constexpr std::size_t correction_bytes =
+      records * key_correction_bytes;
+  constexpr std::size_t value_code_bytes = records * (head_dim / 2U);
+  constexpr std::size_t value_exponent_bytes = records * exponent_bytes;
+  constexpr std::size_t key_exponent_offset = key_code_bytes;
+  constexpr std::size_t key_base_offset =
+      key_exponent_offset + key_exponent_bytes;
+  constexpr std::size_t correction_offset =
+      key_base_offset + key_base_bytes;
+  constexpr std::size_t value_code_offset =
+      correction_offset + correction_bytes;
+  constexpr std::size_t value_exponent_offset =
+      value_code_offset + value_code_bytes;
+  constexpr std::size_t value_base_offset =
+      value_exponent_offset + value_exponent_bytes;
+
+  const auto kv_values = static_cast<std::size_t>(stored_tokens) *
+                         kv_heads * head_dim;
+  std::vector<float> key(kv_values);
+  std::vector<float> value(kv_values);
+  for (std::uint32_t token = 0U; token < stored_tokens; ++token) {
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto record = static_cast<std::size_t>(token) * kv_heads + head;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto index = record * head_dim + dimension;
+        key[index] =
+            std::sin(static_cast<float>(index + 11U) * 0.013F) *
+            (0.08F + 0.006F * static_cast<float>(dimension % 17U));
+        value[index] =
+            std::cos(static_cast<float>(index + 19U) * 0.009F) *
+            (0.07F + 0.005F * static_cast<float>(dimension % 23U));
+      }
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        const auto outlier =
+            (token * 5U + head * 7U + block * 11U + 3U) % 32U;
+        key[record * head_dim + block * 32U + outlier] =
+            ((token + head + block) & 1U ? -1.0F : 1.0F) *
+            (1.75F + 0.125F * static_cast<float>(block + head));
+      }
+    }
+  }
+
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            2U * head_dim;
+  std::vector<float> query(query_values);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto base =
+          (static_cast<std::size_t>(row) * query_heads + head) * 2U *
+          head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        query[base + dimension] =
+            std::sin(static_cast<float>(base + dimension + 1U) * 0.005F) *
+            (0.11F + 0.002F * static_cast<float>(dimension % 13U));
+        query[base + head_dim + dimension] =
+            std::cos(static_cast<float>(row + head + dimension + 1U) *
+                     0.017F) *
+            0.4F;
+      }
+    }
+  }
+
+  // This encoder is deliberately host-only and shares no decoder, scale
+  // helper, or layout helper with the CUDA implementation under test.
+  std::vector<std::uint8_t> expected_page(page_bytes, 0U);
+  for (std::uint32_t token = 0U; token < stored_tokens; ++token) {
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto source_record =
+          static_cast<std::size_t>(token) * kv_heads + head;
+      const auto plane_record =
+          static_cast<std::size_t>(head) * page_tokens + token;
+      std::array<float, blocks> key_desired{};
+      std::array<float, blocks> value_desired{};
+      std::array<std::uint32_t, blocks> outliers{};
+      float key_maximum_scale{};
+      float value_maximum_scale{};
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        float outlier_magnitude{};
+        float value_maximum{};
+        for (std::uint32_t offset = 0U; offset < 32U; ++offset) {
+          const auto index = source_record * head_dim + block * 32U + offset;
+          const auto magnitude = std::abs(key[index]);
+          if (magnitude > outlier_magnitude) {
+            outlier_magnitude = magnitude;
+            outliers[block] = offset;
+          }
+          value_maximum = std::max(value_maximum, std::abs(value[index]));
+        }
+        float retained_maximum{};
+        for (std::uint32_t offset = 0U; offset < 32U; ++offset) {
+          if (offset == outliers[block]) continue;
+          const auto index = source_record * head_dim + block * 32U + offset;
+          retained_maximum =
+              std::max(retained_maximum, std::abs(key[index]));
+        }
+        key_desired[block] =
+            (PreserveKeyOutlier ? retained_maximum : outlier_magnitude) /
+            7.0F;
+        value_desired[block] = value_maximum / 7.0F;
+        key_maximum_scale =
+            std::max(key_maximum_scale, key_desired[block]);
+        value_maximum_scale =
+            std::max(value_maximum_scale, value_desired[block]);
+      }
+      const auto key_base = binary16_value(binary16_bits(std::max(
+          PerHead ? key_maximum_scale : key_maximum_scale / 16.0F,
+          std::ldexp(1.0F, -24))));
+      const auto value_base = binary16_value(binary16_bits(std::max(
+          PerHead ? value_maximum_scale : value_maximum_scale / 16.0F,
+          std::ldexp(1.0F, -24))));
+      const auto key_base_bits = binary16_bits(key_base);
+      const auto value_base_bits = binary16_bits(value_base);
+      std::memcpy(expected_page.data() + key_base_offset +
+                      plane_record * sizeof(std::uint16_t),
+                  &key_base_bits, sizeof(key_base_bits));
+      std::memcpy(expected_page.data() + value_base_offset +
+                      plane_record * sizeof(std::uint16_t),
+                  &value_base_bits, sizeof(value_base_bits));
+
+      std::array<std::uint8_t, blocks> key_exponents{};
+      std::array<std::uint8_t, blocks> value_exponents{};
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        if constexpr (!PerHead) {
+          key_exponents[block] =
+              host_q4_bfp_exponent(key_desired[block], key_base);
+          value_exponents[block] =
+              host_q4_bfp_exponent(value_desired[block], value_base);
+        }
+        if constexpr (PreserveKeyOutlier) {
+          auto* correction = expected_page.data() + correction_offset +
+              plane_record * key_correction_bytes +
+              block * sizeof(std::uint32_t);
+          correction[0] = static_cast<std::uint8_t>(outliers[block]);
+          correction[1] = 0U;
+          const auto outlier_bits = binary16_bits(
+              key[source_record * head_dim + block * 32U + outliers[block]]);
+          std::memcpy(correction + 2U, &outlier_bits, sizeof(outlier_bits));
+        }
+      }
+      if constexpr (!PerHead) {
+        for (std::uint32_t block = 0U; block < blocks; block += 2U) {
+          expected_page[key_exponent_offset +
+                        plane_record * exponent_bytes + block / 2U] =
+              static_cast<std::uint8_t>(key_exponents[block] |
+                                        (key_exponents[block + 1U] << 4U));
+          expected_page[value_exponent_offset +
+                        plane_record * exponent_bytes + block / 2U] =
+              static_cast<std::uint8_t>(value_exponents[block] |
+                                        (value_exponents[block + 1U] << 4U));
+        }
+      }
+      for (std::uint32_t dimension = 0U; dimension < head_dim;
+           dimension += 2U) {
+        const auto block = dimension / 32U;
+        const auto key_scale =
+            std::ldexp(key_base, key_exponents[block]);
+        const auto value_scale =
+            std::ldexp(value_base, value_exponents[block]);
+        const auto first_index = source_record * head_dim + dimension;
+        const auto key_low =
+            PreserveKeyOutlier && dimension % 32U == outliers[block]
+                ? 0U
+                : host_signed_q4(key[first_index], key_scale);
+        const auto key_high =
+            PreserveKeyOutlier &&
+                    (dimension + 1U) % 32U == outliers[block]
+                ? 0U
+                : host_signed_q4(key[first_index + 1U], key_scale);
+        const auto value_low = host_signed_q4(value[first_index], value_scale);
+        const auto value_high =
+            host_signed_q4(value[first_index + 1U], value_scale);
+        expected_page[plane_record * (head_dim / 2U) + dimension / 2U] =
+            static_cast<std::uint8_t>(key_low | (key_high << 4U));
+        expected_page[value_code_offset +
+                      plane_record * (head_dim / 2U) + dimension / 2U] =
+            static_cast<std::uint8_t>(value_low | (value_high << 4U));
+      }
+    }
+  }
+
+  std::vector<std::int8_t> expected_q8(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  std::vector<float> expected_query_scales(
+      static_cast<std::size_t>(rows) * query_heads);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto source =
+          (static_cast<std::size_t>(row) * query_heads + head) * 2U *
+          head_dim;
+      const auto target =
+          (static_cast<std::size_t>(row) * query_heads + head) * head_dim;
+      float maximum{};
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        maximum = std::max(maximum,
+                           std::abs(query[source + dimension]));
+      const auto query_scale =
+          std::max(maximum / 127.0F, std::ldexp(1.0F, -24));
+      expected_query_scales[static_cast<std::size_t>(row) * query_heads +
+                            head] = query_scale;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto quantized = std::max(
+            -127, std::min(127, static_cast<int>(std::nearbyint(
+                               query[source + dimension] / query_scale))));
+        expected_q8[target + dimension] =
+            static_cast<std::int8_t>(quantized);
+      }
+    }
+  }
+
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<std::uint8_t> device_page(page_bytes);
+  DeviceBuffer<void*> device_page_table(1U);
+  DeviceBuffer<std::int8_t> device_q8(expected_q8.size());
+  DeviceBuffer<float> device_query_scales(expected_query_scales.size());
+  DeviceBuffer<float> device_output(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  DeviceBuffer<float> partial_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_sums(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_outputs(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  device_key.upload(key);
+  device_value.upload(value);
+  device_query.upload(query);
+  cuda_check(cudaMemset(device_page.get(), 0, page_bytes),
+             "initialize Q4 BFP numerical page");
+  device_page_table.upload(std::vector<void*>{device_page.get()});
+  if constexpr (PerHead)
+    status_check(expert::runtime::cuda::store_gqa_kv_paged_q4_per_head_batch(
+        device_key.get(), device_value.get(),
+        reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+        page_tokens, 0U, stored_tokens, kv_heads, head_dim, nullptr));
+  else if constexpr (PreserveKeyOutlier)
+    status_check(
+        expert::runtime::cuda::store_gqa_kv_paged_q4_bfp_key_outlier1_batch(
+            device_key.get(), device_value.get(),
+            reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+            page_tokens, 0U, stored_tokens, kv_heads, head_dim, nullptr));
+  else
+    status_check(expert::runtime::cuda::store_gqa_kv_paged_q4_bfp_batch(
+        device_key.get(), device_value.get(),
+        reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+        page_tokens, 0U, stored_tokens, kv_heads, head_dim, nullptr));
+  status_check(expert::runtime::cuda::quantize_gqa_queries_q8(
+      device_query.get(), device_q8.get(), device_query_scales.get(), rows,
+      query_heads, head_dim, nullptr));
+  const expert::runtime::cuda::PagedQ4BfpGatedGqaAttentionLaunch launch{
+      device_query.get(), device_q8.get(), device_query_scales.get(),
+      reinterpret_cast<const void* const*>(device_page_table.get()),
+      device_output.get(), partial_maxima.get(), partial_sums.get(),
+      partial_outputs.get(), first_context_tokens, rows, 0U, page_tokens,
+      query_heads, kv_heads, head_dim, page_tokens, 1U, nullptr};
+  if constexpr (PerHead)
+    status_check(expert::runtime::cuda::
+                     gated_gqa_attention_microbatch_paged_q4_per_head_tensor_core(
+                         launch));
+  else if constexpr (PreserveKeyOutlier)
+    status_check(expert::runtime::cuda::
+                     gated_gqa_attention_microbatch_paged_q4_bfp_key_outlier1_tensor_core(
+                         launch));
+  else
+    status_check(expert::runtime::cuda::
+                     gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
+                         launch));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize Q4 BFP five-query numerical check");
+
+  Q4BfpKeyOutlier1Check result;
+  const auto actual_page = device_page.download();
+  for (std::size_t index = 0U; index < expected_page.size(); ++index)
+    result.layout_maximum_byte_difference = std::max(
+        result.layout_maximum_byte_difference,
+        static_cast<double>(std::abs(static_cast<int>(actual_page[index]) -
+                                     expected_page[index])));
+  const auto actual_q8 = device_q8.download();
+  for (std::size_t index = 0U; index < expected_q8.size(); ++index)
+    result.query_maximum_byte_difference = std::max(
+        result.query_maximum_byte_difference,
+        static_cast<double>(std::abs(static_cast<int>(actual_q8[index]) -
+                                     expected_q8[index])));
+  const auto actual_query_scales = device_query_scales.download();
+  for (std::size_t index = 0U; index < expected_query_scales.size(); ++index)
+    result.query_scale_maximum_absolute_difference = std::max(
+        result.query_scale_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_query_scales[index]) -
+                 expected_query_scales[index]));
+
+  const auto packed_nibble = [](const std::uint8_t* codes,
+                                std::size_t record,
+                                std::uint32_t dimension) {
+    const auto packed =
+        codes[record * (head_dim / 2U) + dimension / 2U];
+    return static_cast<std::uint8_t>(
+        (dimension & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+  };
+  const auto exponent = [](const std::uint8_t* exponents,
+                           std::size_t record, std::uint32_t block) {
+    if constexpr (PerHead) return static_cast<std::uint8_t>(0U);
+    const auto packed =
+        exponents[record * exponent_bytes + block / 2U];
+    return static_cast<std::uint8_t>(
+        (block & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+  };
+  const auto* key_codes = expected_page.data();
+  const auto* key_exponents = expected_page.data() + key_exponent_offset;
+  const auto* key_bases = expected_page.data() + key_base_offset;
+  const auto* corrections = expected_page.data() + correction_offset;
+  const auto* value_codes = expected_page.data() + value_code_offset;
+  const auto* value_exponents =
+      expected_page.data() + value_exponent_offset;
+  const auto* value_bases = expected_page.data() + value_base_offset;
+  const auto half_at = [](const std::uint8_t* bytes, std::size_t offset) {
+    std::uint16_t bits{};
+    std::memcpy(&bits, bytes + offset, sizeof(bits));
+    return binary16_value(bits);
+  };
+  const auto actual_output = device_output.download();
+  const auto score_scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    const auto context_tokens = first_context_tokens + row;
+    for (std::uint32_t query_head = 0U; query_head < query_heads;
+         ++query_head) {
+      const auto kv_head = query_head / grouped_heads;
+      const auto query_record =
+          static_cast<std::size_t>(row) * query_heads + query_head;
+      std::vector<float> scores(context_tokens);
+      float maximum = -std::numeric_limits<float>::infinity();
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto key_base =
+            half_at(key_bases, record * sizeof(std::uint16_t));
+        std::int32_t dot{};
+        float correction_dot{};
+        for (std::uint32_t dimension = 0U; dimension < head_dim;
+             ++dimension) {
+          const auto block = dimension / 32U;
+          const auto expanded =
+              host_signed_q4_value(
+                  packed_nibble(key_codes, record, dimension)) *
+              (1 << exponent(key_exponents, record, block));
+          dot += static_cast<std::int32_t>(
+                     expected_q8[query_record * head_dim + dimension]) *
+                 expanded;
+        }
+        if constexpr (PreserveKeyOutlier) {
+          for (std::uint32_t block = 0U; block < blocks; ++block) {
+            const auto* correction = corrections +
+                record * key_correction_bytes +
+                block * sizeof(std::uint32_t);
+            const auto dimension = block * 32U + correction[0];
+            correction_dot +=
+                static_cast<float>(
+                    expected_q8[query_record * head_dim + dimension]) *
+                expected_query_scales[query_record] *
+                half_at(correction, 2U);
+          }
+        }
+        scores[token] =
+            (static_cast<float>(dot) * expected_query_scales[query_record] *
+                 key_base +
+             correction_dot) *
+            score_scale;
+        maximum = std::max(maximum, scores[token]);
+      }
+      std::vector<float> probabilities(context_tokens);
+      float denominator{};
+      float weighted_maximum{};
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        probabilities[token] = std::exp(scores[token] - maximum);
+        denominator += probabilities[token];
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto value_base =
+            half_at(value_bases, record * sizeof(std::uint16_t));
+        weighted_maximum = std::max(
+            weighted_maximum, probabilities[token] * value_base);
+      }
+      const auto probability_scale =
+          std::max(weighted_maximum / 127.0F, std::ldexp(1.0F, -24));
+      std::vector<std::int8_t> quantized_probabilities(context_tokens);
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto value_base =
+            half_at(value_bases, record * sizeof(std::uint16_t));
+        const auto quantized = std::max(
+            0, std::min(127, static_cast<int>(std::nearbyint(
+                                probabilities[token] * value_base /
+                                probability_scale))));
+        quantized_probabilities[token] =
+            static_cast<std::int8_t>(quantized);
+      }
+      const auto gate_base = query_record * 2U * head_dim + head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim;
+           ++dimension) {
+        std::int32_t product{};
+        for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+          const auto record =
+              static_cast<std::size_t>(kv_head) * page_tokens + token;
+          const auto block = dimension / 32U;
+          const auto expanded =
+              host_signed_q4_value(
+                  packed_nibble(value_codes, record, dimension)) *
+              (1 << exponent(value_exponents, record, block));
+          product += static_cast<std::int32_t>(
+                         quantized_probabilities[token]) *
+                     expanded;
+        }
+        const auto expected =
+            (static_cast<float>(product) * probability_scale / denominator) /
+            (1.0F + std::exp(-query[gate_base + dimension]));
+        const auto output_index = query_record * head_dim + dimension;
+        result.independent_oracle_maximum_absolute_difference = std::max(
+            result.independent_oracle_maximum_absolute_difference,
+            std::abs(static_cast<double>(actual_output[output_index]) -
+                     expected));
+      }
+    }
+  }
+  return result;
+}
+
+Q4BfpKeyOutlier1Check q4_bfp_key_outlier1_check() {
+  return q4_bfp_check_impl<true>();
+}
+
+Q4BfpKeyOutlier1Check q4_bfp_check() {
+  return q4_bfp_check_impl<false>();
+}
+
+Q4BfpKeyOutlier1Check q4_per_head_check() {
+  return q4_bfp_check_impl<false, true>();
+}
+
+struct Q5Q4BfpCheck final {
+  double layout_maximum_byte_difference{};
+  double query_maximum_byte_difference{};
+  double query_scale_maximum_absolute_difference{};
+  double independent_oracle_maximum_absolute_difference{};
+};
+
+Q5Q4BfpCheck q5_q4_bfp_check() {
+  constexpr std::uint32_t stored_tokens = 8U;
+  constexpr std::uint32_t rows = 5U;
+  constexpr std::uint32_t first_context_tokens = 4U;
+  constexpr std::uint32_t query_heads = 24U;
+  constexpr std::uint32_t kv_heads = 4U;
+  constexpr std::uint32_t grouped_heads = query_heads / kv_heads;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t page_tokens = 32U;
+  constexpr std::uint32_t blocks = head_dim / 32U;
+  constexpr std::uint32_t exponent_bytes = head_dim / 64U;
+  constexpr std::uint32_t key_code_bytes = head_dim * 5U / 8U;
+  constexpr std::uint32_t value_code_bytes = head_dim / 2U;
+  constexpr std::uint32_t key_record_bytes =
+      key_code_bytes + exponent_bytes + sizeof(std::uint16_t);
+  constexpr std::uint32_t value_record_bytes =
+      value_code_bytes + exponent_bytes + sizeof(std::uint16_t);
+  constexpr std::size_t records =
+      static_cast<std::size_t>(page_tokens) * kv_heads;
+  constexpr std::size_t page_bytes =
+      records * (key_record_bytes + value_record_bytes);
+  constexpr std::size_t key_exponent_offset = records * key_code_bytes;
+  constexpr std::size_t key_base_offset =
+      key_exponent_offset + records * exponent_bytes;
+  constexpr std::size_t value_code_offset =
+      key_base_offset + records * sizeof(std::uint16_t);
+  constexpr std::size_t value_exponent_offset =
+      value_code_offset + records * value_code_bytes;
+  constexpr std::size_t value_base_offset =
+      value_exponent_offset + records * exponent_bytes;
+
+  const auto kv_values = static_cast<std::size_t>(stored_tokens) *
+                         kv_heads * head_dim;
+  std::vector<float> key(kv_values);
+  std::vector<float> value(kv_values);
+  for (std::uint32_t token = 0U; token < stored_tokens; ++token) {
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto record = static_cast<std::size_t>(token) * kv_heads + head;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto index = record * head_dim + dimension;
+        key[index] =
+            std::sin(static_cast<float>(index + 11U) * 0.013F) *
+            (0.08F + 0.006F * static_cast<float>(dimension % 17U));
+        value[index] =
+            std::cos(static_cast<float>(index + 19U) * 0.009F) *
+            (0.07F + 0.005F * static_cast<float>(dimension % 23U));
+      }
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        const auto outlier =
+            (token * 5U + head * 7U + block * 11U + 3U) % 32U;
+        key[record * head_dim + block * 32U + outlier] =
+            ((token + head + block) & 1U ? -1.0F : 1.0F) *
+            (1.75F + 0.125F * static_cast<float>(block + head));
+      }
+    }
+  }
+
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            2U * head_dim;
+  std::vector<float> query(query_values);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto base =
+          (static_cast<std::size_t>(row) * query_heads + head) * 2U *
+          head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        query[base + dimension] =
+            std::sin(static_cast<float>(base + dimension + 1U) * 0.005F) *
+            (0.11F + 0.002F * static_cast<float>(dimension % 13U));
+        query[base + head_dim + dimension] =
+            std::cos(static_cast<float>(row + head + dimension + 1U) *
+                     0.017F) *
+            0.4F;
+      }
+    }
+  }
+
+  // This host encoder intentionally shares no codec or layout helper with
+  // the CUDA implementation under test.
+  std::vector<std::uint8_t> expected_page(page_bytes, 0U);
+  for (std::uint32_t token = 0U; token < stored_tokens; ++token) {
+    for (std::uint32_t head = 0U; head < kv_heads; ++head) {
+      const auto source_record =
+          static_cast<std::size_t>(token) * kv_heads + head;
+      const auto plane_record =
+          static_cast<std::size_t>(head) * page_tokens + token;
+      std::array<float, blocks> key_desired{};
+      std::array<float, blocks> value_desired{};
+      float key_maximum_scale{};
+      float value_maximum_scale{};
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        float key_maximum{};
+        float value_maximum{};
+        for (std::uint32_t offset = 0U; offset < 32U; ++offset) {
+          const auto index = source_record * head_dim + block * 32U + offset;
+          key_maximum = std::max(key_maximum, std::abs(key[index]));
+          value_maximum = std::max(value_maximum, std::abs(value[index]));
+        }
+        key_desired[block] = key_maximum / 15.0F;
+        value_desired[block] = value_maximum / 7.0F;
+        key_maximum_scale =
+            std::max(key_maximum_scale, key_desired[block]);
+        value_maximum_scale =
+            std::max(value_maximum_scale, value_desired[block]);
+      }
+      const auto key_base = binary16_value(binary16_bits(
+          std::max(key_maximum_scale / 8.0F, std::ldexp(1.0F, -24))));
+      const auto value_base = binary16_value(binary16_bits(
+          std::max(value_maximum_scale / 16.0F, std::ldexp(1.0F, -24))));
+      const auto key_base_bits = binary16_bits(key_base);
+      const auto value_base_bits = binary16_bits(value_base);
+      std::memcpy(expected_page.data() + key_base_offset +
+                      plane_record * sizeof(std::uint16_t),
+                  &key_base_bits, sizeof(key_base_bits));
+      std::memcpy(expected_page.data() + value_base_offset +
+                      plane_record * sizeof(std::uint16_t),
+                  &value_base_bits, sizeof(value_base_bits));
+
+      std::array<std::uint8_t, blocks> key_exponents{};
+      std::array<std::uint8_t, blocks> value_exponents{};
+      for (std::uint32_t block = 0U; block < blocks; ++block) {
+        key_exponents[block] =
+            host_q5_bfp_exponent(key_desired[block], key_base);
+        value_exponents[block] =
+            host_q4_bfp_exponent(value_desired[block], value_base);
+      }
+      for (std::uint32_t block = 0U; block < blocks; block += 2U) {
+        expected_page[key_exponent_offset +
+                      plane_record * exponent_bytes + block / 2U] =
+            static_cast<std::uint8_t>(key_exponents[block] |
+                                      (key_exponents[block + 1U] << 4U));
+        expected_page[value_exponent_offset +
+                      plane_record * exponent_bytes + block / 2U] =
+            static_cast<std::uint8_t>(value_exponents[block] |
+                                      (value_exponents[block + 1U] << 4U));
+      }
+      for (std::uint32_t group = 0U; group < head_dim / 8U; ++group) {
+        const auto first = group * 8U;
+        const auto block = first / 32U;
+        const auto key_scale = std::ldexp(key_base, key_exponents[block]);
+        const auto value_scale =
+            std::ldexp(value_base, value_exponents[block]);
+        std::uint32_t packed_key_magnitudes{};
+        std::uint8_t packed_key_signs{};
+        std::uint32_t packed_value{};
+        for (std::uint32_t index = 0U; index < 8U; ++index) {
+          const auto source = source_record * head_dim + first + index;
+          const auto key_code = host_signed_q5_value(
+              host_signed_q5(key[source], key_scale));
+          packed_key_magnitudes |=
+              static_cast<std::uint32_t>(std::abs(key_code)) <<
+              (4U * index);
+          if (key_code < 0)
+            packed_key_signs |= static_cast<std::uint8_t>(1U << index);
+          packed_value |= static_cast<std::uint32_t>(
+                              host_signed_q4(value[source], value_scale))
+                          << (4U * index);
+        }
+        std::memcpy(expected_page.data() +
+                        plane_record * (head_dim / 2U) +
+                        group * sizeof(std::uint32_t),
+                    &packed_key_magnitudes,
+                    sizeof(packed_key_magnitudes));
+        expected_page[records * (head_dim / 2U) +
+                      plane_record * (head_dim / 8U) + group] =
+            packed_key_signs;
+        std::memcpy(expected_page.data() + value_code_offset +
+                        plane_record * value_code_bytes +
+                        group * sizeof(std::uint32_t),
+                    &packed_value, sizeof(packed_value));
+      }
+    }
+  }
+
+  std::vector<std::int8_t> expected_q8(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  std::vector<float> expected_query_scales(
+      static_cast<std::size_t>(rows) * query_heads);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t head = 0U; head < query_heads; ++head) {
+      const auto source =
+          (static_cast<std::size_t>(row) * query_heads + head) * 2U *
+          head_dim;
+      const auto target =
+          (static_cast<std::size_t>(row) * query_heads + head) * head_dim;
+      float maximum{};
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+        maximum = std::max(maximum, std::abs(query[source + dimension]));
+      const auto scale =
+          std::max(maximum / 127.0F, std::ldexp(1.0F, -24));
+      expected_query_scales[static_cast<std::size_t>(row) * query_heads +
+                            head] = scale;
+      for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+        const auto quantized = std::max(
+            -127, std::min(127, static_cast<int>(std::nearbyint(
+                               query[source + dimension] / scale))));
+        expected_q8[target + dimension] =
+            static_cast<std::int8_t>(quantized);
+      }
+    }
+  }
+
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_value(value.size());
+  DeviceBuffer<float> device_query(query.size());
+  DeviceBuffer<std::uint8_t> device_page(page_bytes);
+  DeviceBuffer<void*> device_page_table(1U);
+  DeviceBuffer<std::int8_t> device_q8(expected_q8.size());
+  DeviceBuffer<float> device_query_scales(expected_query_scales.size());
+  DeviceBuffer<float> device_output(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  DeviceBuffer<float> partial_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_sums(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> partial_outputs(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  device_key.upload(key);
+  device_value.upload(value);
+  device_query.upload(query);
+  cuda_check(cudaMemset(device_page.get(), 0, page_bytes),
+             "initialize Q5-K/Q4-V BFP numerical page");
+  device_page_table.upload(std::vector<void*>{device_page.get()});
+  status_check(expert::runtime::cuda::store_gqa_kv_paged_q5_q4_bfp_batch(
+      device_key.get(), device_value.get(),
+      reinterpret_cast<const void* const*>(device_page_table.get()), 0U,
+      page_tokens, 0U, stored_tokens, kv_heads, head_dim, nullptr));
+  status_check(expert::runtime::cuda::quantize_gqa_queries_q8(
+      device_query.get(), device_q8.get(), device_query_scales.get(), rows,
+      query_heads, head_dim, nullptr));
+  status_check(expert::runtime::cuda::
+                   gated_gqa_attention_microbatch_paged_q5_q4_bfp_tensor_core(
+                       {device_query.get(), device_q8.get(),
+                        device_query_scales.get(),
+                        reinterpret_cast<const void* const*>(
+                            device_page_table.get()),
+                        device_output.get(), partial_maxima.get(),
+                        partial_sums.get(), partial_outputs.get(),
+                        first_context_tokens, rows, 0U, page_tokens,
+                        query_heads, kv_heads, head_dim, page_tokens, 1U,
+                        nullptr}));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize Q5-K/Q4-V BFP five-query numerical check");
+
+  Q5Q4BfpCheck result;
+  const auto actual_page = device_page.download();
+  for (std::size_t index = 0U; index < expected_page.size(); ++index)
+    result.layout_maximum_byte_difference = std::max(
+        result.layout_maximum_byte_difference,
+        static_cast<double>(std::abs(static_cast<int>(actual_page[index]) -
+                                     expected_page[index])));
+  const auto actual_q8 = device_q8.download();
+  for (std::size_t index = 0U; index < expected_q8.size(); ++index)
+    result.query_maximum_byte_difference = std::max(
+        result.query_maximum_byte_difference,
+        static_cast<double>(std::abs(static_cast<int>(actual_q8[index]) -
+                                     expected_q8[index])));
+  const auto actual_query_scales = device_query_scales.download();
+  for (std::size_t index = 0U; index < expected_query_scales.size(); ++index)
+    result.query_scale_maximum_absolute_difference = std::max(
+        result.query_scale_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_query_scales[index]) -
+                 expected_query_scales[index]));
+
+  const auto exponent = [](const std::uint8_t* exponents,
+                           std::size_t record, std::uint32_t block) {
+    const auto packed = exponents[record * exponent_bytes + block / 2U];
+    return static_cast<std::uint8_t>(
+        (block & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+  };
+  const auto q5_value = [](const std::uint8_t* codes, std::size_t record,
+                           std::uint32_t dimension) {
+    const auto group = dimension / 8U;
+    const auto index = dimension % 8U;
+    const auto packed = codes[record * (head_dim / 2U) + dimension / 2U];
+    const auto magnitude = static_cast<std::int32_t>(
+        (dimension & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+    const auto signs = codes[records * (head_dim / 2U) +
+                             record * (head_dim / 8U) + group];
+    return (signs & (1U << index)) != 0U ? -magnitude : magnitude;
+  };
+  const auto q4_code = [](const std::uint8_t* codes, std::size_t record,
+                          std::uint32_t dimension) {
+    const auto packed =
+        codes[record * value_code_bytes + dimension / 2U];
+    return static_cast<std::uint8_t>(
+        (dimension & 1U) == 0U ? packed & 0x0fU : packed >> 4U);
+  };
+  const auto half_at = [](const std::uint8_t* bytes, std::size_t offset) {
+    std::uint16_t bits{};
+    std::memcpy(&bits, bytes + offset, sizeof(bits));
+    return binary16_value(bits);
+  };
+  const auto* key_codes = expected_page.data();
+  const auto* key_exponents = expected_page.data() + key_exponent_offset;
+  const auto* key_bases = expected_page.data() + key_base_offset;
+  const auto* value_codes = expected_page.data() + value_code_offset;
+  const auto* value_exponents =
+      expected_page.data() + value_exponent_offset;
+  const auto* value_bases = expected_page.data() + value_base_offset;
+  const auto actual_output = device_output.download();
+  const auto score_scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    const auto context_tokens = first_context_tokens + row;
+    for (std::uint32_t query_head = 0U; query_head < query_heads;
+         ++query_head) {
+      const auto kv_head = query_head / grouped_heads;
+      const auto query_record =
+          static_cast<std::size_t>(row) * query_heads + query_head;
+      std::vector<float> scores(context_tokens);
+      float maximum = -std::numeric_limits<float>::infinity();
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto key_base =
+            half_at(key_bases, record * sizeof(std::uint16_t));
+        std::int32_t dot{};
+        for (std::uint32_t dimension = 0U; dimension < head_dim;
+             ++dimension) {
+          const auto block = dimension / 32U;
+          const auto expanded = q5_value(key_codes, record, dimension) *
+              (1 << exponent(key_exponents, record, block));
+          dot += static_cast<std::int32_t>(
+                     expected_q8[query_record * head_dim + dimension]) *
+                 expanded;
+        }
+        scores[token] =
+            static_cast<float>(dot) * expected_query_scales[query_record] *
+            key_base * score_scale;
+        maximum = std::max(maximum, scores[token]);
+      }
+      std::vector<float> probabilities(context_tokens);
+      float denominator{};
+      float weighted_maximum{};
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        probabilities[token] = std::exp(scores[token] - maximum);
+        denominator += probabilities[token];
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto value_base =
+            half_at(value_bases, record * sizeof(std::uint16_t));
+        weighted_maximum = std::max(
+            weighted_maximum, probabilities[token] * value_base);
+      }
+      const auto probability_scale =
+          std::max(weighted_maximum / 127.0F, std::ldexp(1.0F, -24));
+      std::vector<std::int8_t> quantized_probabilities(context_tokens);
+      for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+        const auto record =
+            static_cast<std::size_t>(kv_head) * page_tokens + token;
+        const auto value_base =
+            half_at(value_bases, record * sizeof(std::uint16_t));
+        quantized_probabilities[token] = static_cast<std::int8_t>(std::max(
+            0, std::min(127, static_cast<int>(std::nearbyint(
+                                probabilities[token] * value_base /
+                                probability_scale)))));
+      }
+      const auto gate_base = query_record * 2U * head_dim + head_dim;
+      for (std::uint32_t dimension = 0U; dimension < head_dim;
+           ++dimension) {
+        std::int32_t product{};
+        for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+          const auto record =
+              static_cast<std::size_t>(kv_head) * page_tokens + token;
+          const auto block = dimension / 32U;
+          const auto expanded = host_signed_q4_value(
+              q4_code(value_codes, record, dimension)) *
+              (1 << exponent(value_exponents, record, block));
+          product += static_cast<std::int32_t>(
+                         quantized_probabilities[token]) *
+                     expanded;
+        }
+        const auto expected =
+            (static_cast<float>(product) * probability_scale / denominator) /
+            (1.0F + std::exp(-query[gate_base + dimension]));
+        const auto output_index = query_record * head_dim + dimension;
+        result.independent_oracle_maximum_absolute_difference = std::max(
+            result.independent_oracle_maximum_absolute_difference,
+            std::abs(static_cast<double>(actual_output[output_index]) -
+                     expected));
+      }
+    }
+  }
+  return result;
+}
+
+struct Q4BfpAttentionProfile final {
+  std::uint32_t context_tokens{};
+  double milliseconds{};
+  double sixteen_layer_milliseconds{};
+  double kv_gb_per_second{};
+};
+
+enum class PackedBfpProfileEncoding : std::uint8_t {
+  q4_key_outlier1,
+  q4,
+  q4_per_head,
+  q5_q4,
+};
+
+Q4BfpAttentionProfile packed_bfp_attention_profile(
+    std::uint32_t context_tokens, PackedBfpProfileEncoding encoding) {
+  constexpr std::uint32_t rows = 5U;
+  constexpr std::uint32_t query_heads = 24U;
+  constexpr std::uint32_t kv_heads = 4U;
+  constexpr std::uint32_t head_dim = 256U;
+  constexpr std::uint32_t page_tokens = 256U;
+  if (context_tokens < rows || context_tokens % page_tokens)
+    throw std::runtime_error("invalid Q4 BFP profile context");
+  const auto split_tokens = context_tokens <= 65536U ? 512U : 1024U;
+  const auto maximum_splits =
+      (context_tokens + split_tokens - 1U) / split_tokens;
+  const auto pages = context_tokens / page_tokens;
+  const auto per_head =
+      encoding == PackedBfpProfileEncoding::q4_per_head;
+  const auto key_record_bytes =
+      per_head ? 130U
+               : encoding == PackedBfpProfileEncoding::q4 ? 134U : 166U;
+  const auto value_record_bytes = per_head ? 130U : 134U;
+  const auto page_bytes = static_cast<std::size_t>(page_tokens) * kv_heads *
+                          (key_record_bytes + value_record_bytes);
+  const auto payload_bytes = static_cast<std::size_t>(pages) * page_bytes;
+  const auto query_values = static_cast<std::size_t>(rows) * query_heads *
+                            2U * head_dim;
+  const auto output_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  const auto partials = static_cast<std::size_t>(rows) * maximum_splits *
+                        query_heads;
+
+  DeviceBuffer<float> query(query_values);
+  DeviceBuffer<std::int8_t> q8(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  DeviceBuffer<float> query_scales(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> output(output_values);
+  DeviceBuffer<float> partial_maxima(partials);
+  DeviceBuffer<float> partial_sums(partials);
+  DeviceBuffer<float> partial_outputs(partials * head_dim);
+  DeviceBuffer<std::uint8_t> page_storage(payload_bytes);
+  DeviceBuffer<void*> page_table(pages);
+  std::vector<float> host_query(query_values);
+  for (std::size_t index = 0U; index < host_query.size(); ++index)
+    host_query[index] =
+        std::sin(static_cast<float>(index + 1U) * 0.001F) * 0.1F;
+  query.upload(host_query);
+  cuda_check(cudaMemset(page_storage.get(), 0, payload_bytes),
+             "initialize Q4 BFP profile pages");
+  std::vector<void*> host_pages(pages);
+  for (std::uint32_t page = 0U; page < pages; ++page)
+    host_pages[page] = page_storage.get() +
+                       static_cast<std::size_t>(page) * page_bytes;
+  page_table.upload(host_pages);
+  status_check(expert::runtime::cuda::quantize_gqa_queries_q8(
+      query.get(), q8.get(), query_scales.get(), rows, query_heads,
+      head_dim, nullptr));
+  const expert::runtime::cuda::PagedQ4BfpGatedGqaAttentionLaunch launch{
+      query.get(), q8.get(), query_scales.get(),
+      reinterpret_cast<const void* const*>(page_table.get()), output.get(),
+      partial_maxima.get(), partial_sums.get(), partial_outputs.get(),
+      context_tokens - rows + 1U, rows, 0U, page_tokens, query_heads,
+      kv_heads, head_dim, split_tokens, maximum_splits, nullptr};
+  const auto run_attention = [&]() {
+    if (encoding == PackedBfpProfileEncoding::q5_q4)
+      status_check(expert::runtime::cuda::
+                       gated_gqa_attention_microbatch_paged_q5_q4_bfp_tensor_core(
+                           launch));
+    else if (encoding == PackedBfpProfileEncoding::q4_per_head)
+      status_check(expert::runtime::cuda::
+                       gated_gqa_attention_microbatch_paged_q4_per_head_tensor_core(
+                           launch));
+    else if (encoding == PackedBfpProfileEncoding::q4)
+      status_check(expert::runtime::cuda::
+                       gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
+                           launch));
+    else
+      status_check(expert::runtime::cuda::
+                       gated_gqa_attention_microbatch_paged_q4_bfp_key_outlier1_tensor_core(
+                           launch));
+  };
+  for (unsigned warmup = 0U; warmup < 2U; ++warmup) {
+    run_attention();
+  }
+  cudaEvent_t start{}, stop{};
+  cuda_check(cudaEventCreate(&start), "create Q4 BFP profile start event");
+  cuda_check(cudaEventCreate(&stop), "create Q4 BFP profile stop event");
+  cuda_check(cudaEventRecord(start), "record Q4 BFP profile start");
+  constexpr unsigned iterations = 8U;
+  for (unsigned iteration = 0U; iteration < iterations; ++iteration)
+    run_attention();
+  cuda_check(cudaEventRecord(stop), "record Q4 BFP profile stop");
+  cuda_check(cudaEventSynchronize(stop), "synchronize Q4 BFP profile stop");
+  float total_milliseconds{};
+  cuda_check(cudaEventElapsedTime(&total_milliseconds, start, stop),
+             "measure Q4 BFP profile elapsed time");
+  static_cast<void>(cudaEventDestroy(start));
+  static_cast<void>(cudaEventDestroy(stop));
+  const auto milliseconds =
+      static_cast<double>(total_milliseconds) / iterations;
+  return {context_tokens, milliseconds, 16.0 * milliseconds,
+          static_cast<double>(payload_bytes) / (milliseconds * 1.0e6)};
+}
+
+Q4BfpAttentionProfile q4_bfp_attention_profile(
+    std::uint32_t context_tokens) {
+  return packed_bfp_attention_profile(
+      context_tokens, PackedBfpProfileEncoding::q4_key_outlier1);
+}
+
+Q4BfpAttentionProfile q4_bfp_plain_attention_profile(
+    std::uint32_t context_tokens) {
+  return packed_bfp_attention_profile(
+      context_tokens, PackedBfpProfileEncoding::q4);
+}
+
+Q4BfpAttentionProfile q4_per_head_attention_profile(
+    std::uint32_t context_tokens) {
+  return packed_bfp_attention_profile(
+      context_tokens, PackedBfpProfileEncoding::q4_per_head);
+}
+
+Q4BfpAttentionProfile q5_q4_bfp_attention_profile(
+    std::uint32_t context_tokens) {
+  return packed_bfp_attention_profile(
+      context_tokens, PackedBfpProfileEncoding::q5_q4);
 }
 
 double bandwidth_check() {
@@ -3171,6 +4226,157 @@ bool presence_penalty_check() {
 int main(int argc, char** argv) {
   try {
     if (argc == 2 && std::string_view(argv[1]) ==
+                         "--q4-bfp-batch-5-profile") {
+      const auto numerical = q4_bfp_key_outlier1_check();
+      const std::array profiles{
+          q4_bfp_attention_profile(32768U),
+          q4_bfp_attention_profile(131072U)};
+      const auto pass =
+          numerical.layout_maximum_byte_difference == 0.0 &&
+          numerical.query_maximum_byte_difference == 0.0 &&
+          numerical.query_scale_maximum_absolute_difference < 1.0e-8 &&
+          numerical.independent_oracle_maximum_absolute_difference < 2.0e-4 &&
+          profiles[0].sixteen_layer_milliseconds <= 11.45 &&
+          profiles[1].sixteen_layer_milliseconds <= 23.21;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"layout_maximum_byte_difference\":"
+          << numerical.layout_maximum_byte_difference
+          << ",\"query_maximum_byte_difference\":"
+          << numerical.query_maximum_byte_difference
+          << ",\"query_scale_maximum_absolute_difference\":"
+          << numerical.query_scale_maximum_absolute_difference
+          << ",\"independent_oracle_maximum_absolute_difference\":"
+          << numerical.independent_oracle_maximum_absolute_difference
+          << ",\"profiles\":[";
+      for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        if (index != 0U) std::cout << ',';
+        const auto& profile = profiles[index];
+        std::cout << "{\"context_tokens\":" << profile.context_tokens
+                  << ",\"milliseconds\":" << profile.milliseconds
+                  << ",\"sixteen_layer_milliseconds\":"
+                  << profile.sixteen_layer_milliseconds
+                  << ",\"kv_gb_per_second\":"
+                  << profile.kv_gb_per_second << '}';
+      }
+      std::cout << "]}\n";
+      return pass ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) ==
+                         "--q5-q4-bfp-batch-5-profile") {
+      const auto numerical = q5_q4_bfp_check();
+      const std::array profiles{
+          q5_q4_bfp_attention_profile(32768U),
+          q5_q4_bfp_attention_profile(131072U)};
+      const auto pass =
+          numerical.layout_maximum_byte_difference == 0.0 &&
+          numerical.query_maximum_byte_difference == 0.0 &&
+          numerical.query_scale_maximum_absolute_difference < 1.0e-8 &&
+          numerical.independent_oracle_maximum_absolute_difference < 2.0e-4 &&
+          std::isfinite(profiles[0].sixteen_layer_milliseconds) &&
+          profiles[0].sixteen_layer_milliseconds > 0.0 &&
+          profiles[1].sixteen_layer_milliseconds <= 16.7527;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"layout_maximum_byte_difference\":"
+          << numerical.layout_maximum_byte_difference
+          << ",\"query_maximum_byte_difference\":"
+          << numerical.query_maximum_byte_difference
+          << ",\"query_scale_maximum_absolute_difference\":"
+          << numerical.query_scale_maximum_absolute_difference
+          << ",\"independent_oracle_maximum_absolute_difference\":"
+          << numerical.independent_oracle_maximum_absolute_difference
+          << ",\"profiles\":[";
+      for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        if (index != 0U) std::cout << ',';
+        const auto& profile = profiles[index];
+        std::cout << "{\"context_tokens\":" << profile.context_tokens
+                  << ",\"milliseconds\":" << profile.milliseconds
+                  << ",\"sixteen_layer_milliseconds\":"
+                  << profile.sixteen_layer_milliseconds
+                  << ",\"kv_gb_per_second\":"
+                  << profile.kv_gb_per_second << '}';
+      }
+      std::cout << "]}\n";
+      return pass ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) ==
+                         "--q4-bfp-plain-batch-5-profile") {
+      const auto numerical = q4_bfp_check();
+      const std::array profiles{
+          q4_bfp_plain_attention_profile(32768U),
+          q4_bfp_plain_attention_profile(131072U)};
+      const auto pass =
+          numerical.layout_maximum_byte_difference == 0.0 &&
+          numerical.query_maximum_byte_difference == 0.0 &&
+          numerical.query_scale_maximum_absolute_difference < 1.0e-8 &&
+          numerical.independent_oracle_maximum_absolute_difference < 2.0e-4 &&
+          std::isfinite(profiles[0].sixteen_layer_milliseconds) &&
+          profiles[0].sixteen_layer_milliseconds > 0.0 &&
+          profiles[1].sixteen_layer_milliseconds <= 16.7527;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"layout_maximum_byte_difference\":"
+          << numerical.layout_maximum_byte_difference
+          << ",\"query_maximum_byte_difference\":"
+          << numerical.query_maximum_byte_difference
+          << ",\"query_scale_maximum_absolute_difference\":"
+          << numerical.query_scale_maximum_absolute_difference
+          << ",\"independent_oracle_maximum_absolute_difference\":"
+          << numerical.independent_oracle_maximum_absolute_difference
+          << ",\"profiles\":[";
+      for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        if (index != 0U) std::cout << ',';
+        const auto& profile = profiles[index];
+        std::cout << "{\"context_tokens\":" << profile.context_tokens
+                  << ",\"milliseconds\":" << profile.milliseconds
+                  << ",\"sixteen_layer_milliseconds\":"
+                  << profile.sixteen_layer_milliseconds
+                  << ",\"kv_gb_per_second\":"
+                  << profile.kv_gb_per_second << '}';
+      }
+      std::cout << "]}\n";
+      return pass ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) ==
+                         "--q4-per-head-batch-5-profile") {
+      const auto numerical = q4_per_head_check();
+      const std::array profiles{
+          q4_per_head_attention_profile(32768U),
+          q4_per_head_attention_profile(131072U)};
+      const auto pass =
+          numerical.layout_maximum_byte_difference == 0.0 &&
+          numerical.query_maximum_byte_difference == 0.0 &&
+          numerical.query_scale_maximum_absolute_difference < 1.0e-8 &&
+          numerical.independent_oracle_maximum_absolute_difference < 2.0e-4 &&
+          std::isfinite(profiles[0].sixteen_layer_milliseconds) &&
+          profiles[0].sixteen_layer_milliseconds > 0.0 &&
+          profiles[1].sixteen_layer_milliseconds <= 16.7527;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"layout_maximum_byte_difference\":"
+          << numerical.layout_maximum_byte_difference
+          << ",\"query_maximum_byte_difference\":"
+          << numerical.query_maximum_byte_difference
+          << ",\"query_scale_maximum_absolute_difference\":"
+          << numerical.query_scale_maximum_absolute_difference
+          << ",\"independent_oracle_maximum_absolute_difference\":"
+          << numerical.independent_oracle_maximum_absolute_difference
+          << ",\"profiles\":[";
+      for (std::size_t index = 0U; index < profiles.size(); ++index) {
+        if (index != 0U) std::cout << ',';
+        const auto& profile = profiles[index];
+        std::cout << "{\"context_tokens\":" << profile.context_tokens
+                  << ",\"milliseconds\":" << profile.milliseconds
+                  << ",\"sixteen_layer_milliseconds\":"
+                  << profile.sixteen_layer_milliseconds
+                  << ",\"kv_gb_per_second\":"
+                  << profile.kv_gb_per_second << '}';
+      }
+      std::cout << "]}\n";
+      return pass ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) ==
                          "--decode-batch-5-profile") {
       const auto maximum_absolute_error = numerical_check();
       const auto narrow = decode_batch_bandwidth_check(5U);
@@ -3194,6 +4400,8 @@ int main(int argc, char** argv) {
     const auto fp8_kv_attention = fp8_kv_attention_check();
     const auto q8_kv_attention = q8_kv_attention_check();
     const auto fp4_key_outlier1 = fp4_key_outlier1_check();
+    const auto q4_bfp_key_outlier1 = q4_bfp_key_outlier1_check();
+    const auto q5_q4_bfp = q5_q4_bfp_check();
     const auto standard_gqa_ratio16_error = standard_gqa_ratio16_check();
     const auto gated_gqa_ratio12_error = gated_gqa_ratio12_check();
     const auto standard_gqa_no_position_error =
@@ -3254,6 +4462,24 @@ int main(int argc, char** argv) {
                               candidate_fp16_maximum_absolute_difference <
                           fp4_key_outlier1.
                               ordinary_fp4_fp16_maximum_absolute_difference &&
+                      q4_bfp_key_outlier1.
+                              layout_maximum_byte_difference == 0.0 &&
+                      q4_bfp_key_outlier1.
+                              query_maximum_byte_difference == 0.0 &&
+                      q4_bfp_key_outlier1.
+                              query_scale_maximum_absolute_difference <
+                          1.0e-8 &&
+                      q4_bfp_key_outlier1.
+                              independent_oracle_maximum_absolute_difference <
+                          2.0e-4 &&
+                      q5_q4_bfp.layout_maximum_byte_difference == 0.0 &&
+                      q5_q4_bfp.query_maximum_byte_difference == 0.0 &&
+                      q5_q4_bfp.
+                              query_scale_maximum_absolute_difference <
+                          1.0e-8 &&
+                      q5_q4_bfp.
+                              independent_oracle_maximum_absolute_difference <
+                          2.0e-4 &&
                       std::isfinite(fp8_kv_attention.
                                         output_maximum_absolute_difference) &&
                       std::isfinite(fp8_kv_attention.
@@ -3383,6 +4609,24 @@ int main(int argc, char** argv) {
               << ",\"ordinary_fp4_fp16_maximum_absolute_difference\":"
               << fp4_key_outlier1.
                      ordinary_fp4_fp16_maximum_absolute_difference
+              << ",\"q4_bfp_key_outlier1_layout_maximum_byte_difference\":"
+              << q4_bfp_key_outlier1.layout_maximum_byte_difference
+              << ",\"q4_bfp_key_outlier1_query_maximum_byte_difference\":"
+              << q4_bfp_key_outlier1.query_maximum_byte_difference
+              << ",\"q4_bfp_key_outlier1_query_scale_maximum_absolute_difference\":"
+              << q4_bfp_key_outlier1.
+                     query_scale_maximum_absolute_difference
+              << ",\"q4_bfp_key_outlier1_independent_oracle_maximum_absolute_difference\":"
+              << q4_bfp_key_outlier1.
+                     independent_oracle_maximum_absolute_difference
+              << ",\"q5_q4_bfp_layout_maximum_byte_difference\":"
+              << q5_q4_bfp.layout_maximum_byte_difference
+              << ",\"q5_q4_bfp_query_maximum_byte_difference\":"
+              << q5_q4_bfp.query_maximum_byte_difference
+              << ",\"q5_q4_bfp_query_scale_maximum_absolute_difference\":"
+              << q5_q4_bfp.query_scale_maximum_absolute_difference
+              << ",\"q5_q4_bfp_independent_oracle_maximum_absolute_difference\":"
+              << q5_q4_bfp.independent_oracle_maximum_absolute_difference
               << ",\"standard_gqa_ratio16_maximum_absolute_error\":"
               << standard_gqa_ratio16_error
               << ",\"gated_gqa_ratio12_maximum_absolute_error\":"

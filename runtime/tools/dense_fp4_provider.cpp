@@ -82,10 +82,21 @@ constexpr std::uint32_t kMaximumExactDecodeRows = 5U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
 constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 
+constexpr std::uint32_t packed_attention_split_tokens(
+    std::uint32_t context_tokens) noexcept {
+  return context_tokens <= 65536U ? 512U
+       : context_tokens <= 131077U ? 1024U
+                                   : 2048U;
+}
+
 enum class TargetKvEncoding : std::uint8_t {
   artifact_native,
   fp8_e4m3_per_head,
   fp4_key_outlier1,
+  q4_bfp_key_outlier1,
+  q4_bfp,
+  q4_per_head,
+  q5_q4_bfp,
   fp16
 };
 
@@ -101,6 +112,14 @@ TargetKvEncoding target_kv_encoding(std::string_view value) {
     return TargetKvEncoding::fp8_e4m3_per_head;
   if (value == "fp4-e2m1-ue8m0-block32-key-outlier1")
     return TargetKvEncoding::fp4_key_outlier1;
+  if (value == "q4-bfp16-block32-key-outlier1")
+    return TargetKvEncoding::q4_bfp_key_outlier1;
+  if (value == "q4-bfp16-block32")
+    return TargetKvEncoding::q4_bfp;
+  if (value == "q4-f16-per-head")
+    return TargetKvEncoding::q4_per_head;
+  if (value == "q5-q4-bfp16-block32")
+    return TargetKvEncoding::q5_q4_bfp;
   if (value == "fp16") return TargetKvEncoding::fp16;
   throw std::runtime_error("unsupported target KV cache dtype");
 }
@@ -2569,6 +2588,46 @@ class DenseFp4Provider final : public er::IOperationProvider {
       mtp_kv_page_bytes_ =
           static_cast<std::uint64_t>(mtp_layers_) * mtp_layer_page_bytes;
       kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
+    } else if (target_kv_encoding_ ==
+                   TargetKvEncoding::q4_bfp_key_outlier1 ||
+               target_kv_encoding_ == TargetKvEncoding::q4_bfp ||
+               target_kv_encoding_ == TargetKvEncoding::q4_per_head ||
+               target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp) {
+      if (head_dim_ != 256U || kv_page_tokens_ % 32U)
+        throw std::runtime_error(
+            "packed BFP target KV requires head dimension 256 and page alignment 32");
+      const auto exponent_bytes =
+          static_cast<std::uint64_t>(head_dim_ / 64U);
+      const auto key_record_bytes =
+          target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp
+              ? static_cast<std::uint64_t>(head_dim_) * 5U / 8U +
+                    exponent_bytes + sizeof(std::uint16_t)
+          : target_kv_encoding_ == TargetKvEncoding::q4_bfp
+              ? static_cast<std::uint64_t>(head_dim_ / 2U) +
+                    exponent_bytes + sizeof(std::uint16_t)
+          : target_kv_encoding_ == TargetKvEncoding::q4_per_head
+              ? static_cast<std::uint64_t>(head_dim_ / 2U) +
+                    sizeof(std::uint16_t)
+              : static_cast<std::uint64_t>(head_dim_ / 2U) +
+                    exponent_bytes + sizeof(std::uint16_t) +
+                    static_cast<std::uint64_t>(head_dim_ / 32U) *
+                        sizeof(std::uint32_t);
+      const auto value_record_bytes =
+          static_cast<std::uint64_t>(head_dim_ / 2U) +
+          (target_kv_encoding_ == TargetKvEncoding::q4_per_head
+               ? 0U
+               : exponent_bytes) +
+          sizeof(std::uint16_t);
+      const auto layer_page_bytes =
+          static_cast<std::uint64_t>(kv_page_tokens_) * kv_heads_ *
+          (key_record_bytes + value_record_bytes);
+      target_kv_page_bytes_ =
+          static_cast<std::uint64_t>(target_full_layers_) *
+          layer_page_bytes;
+      mtp_kv_page_offset_ = target_kv_page_bytes_;
+      mtp_kv_page_bytes_ =
+          static_cast<std::uint64_t>(mtp_layers_) * mtp_layer_page_bytes;
+      kv_page_bytes_ = target_kv_page_bytes_ + mtp_kv_page_bytes_;
     } else if (device_resident_fp16_kv()) {
       qsa_index_page_offset_ = static_cast<std::uint32_t>(
           host_fp16_target_page_bytes_);
@@ -2901,6 +2960,14 @@ class DenseFp4Provider final : public er::IOperationProvider {
       return "fp8-e4m3-per-head";
     if (target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1)
       return "fp4-e2m1-ue8m0-block32-key-outlier1";
+    if (target_kv_encoding_ == TargetKvEncoding::q4_bfp_key_outlier1)
+      return "q4-bfp16-block32-key-outlier1";
+    if (target_kv_encoding_ == TargetKvEncoding::q4_bfp)
+      return "q4-bfp16-block32";
+    if (target_kv_encoding_ == TargetKvEncoding::q4_per_head)
+      return "q4-f16-per-head";
+    if (target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp)
+      return "q5-q4-bfp16-block32";
     return "fp4-e2m1-ue8m0-block32";
   }
   [[nodiscard]] std::map<std::string, std::uint64_t, std::less<>> telemetry()
@@ -3931,6 +3998,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float* qsa_scores_{};
   std::uint32_t* qsa_selected_{};
   float* query_gate_{};
+  std::int8_t* attention_q8_queries_{};
+  float* attention_query_scales_{};
   float* mla_query_rank_{};
   float* mla_latent_{};
   float* mla_latent_query_{};
@@ -4744,6 +4813,17 @@ void DenseFp4Provider::allocate_workspace() {
   }
   query_gate_ =
       device_allocate<float>(allocations_, workspace_rows_ * query_width);
+  if (target_kv_encoding_ == TargetKvEncoding::q4_bfp_key_outlier1 ||
+      target_kv_encoding_ == TargetKvEncoding::q4_bfp ||
+      target_kv_encoding_ == TargetKvEncoding::q4_per_head ||
+      target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp) {
+    attention_q8_queries_ = device_allocate<std::int8_t>(
+        allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
+                          query_heads_ * head_dim_);
+    attention_query_scales_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
+                          query_heads_);
+  }
   if (mla_enabled_) {
     mla_query_rank_ = device_allocate<float>(
         allocations_, static_cast<std::size_t>(workspace_rows_) *
@@ -5015,7 +5095,11 @@ void DenseFp4Provider::allocate_state() {
                             maximum_pages_per_slot_ * sizeof(void*)),
              "zero FP4 KV page table");
   if ((target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head ||
-       target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1) &&
+       target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1 ||
+       target_kv_encoding_ == TargetKvEncoding::q4_bfp_key_outlier1 ||
+       target_kv_encoding_ == TargetKvEncoding::q4_bfp ||
+       target_kv_encoding_ == TargetKvEncoding::q4_per_head ||
+       target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp) &&
       mtp_layers_ != 0U) {
     device_mtp_page_table_ = device_allocate<void*>(
         allocations_, static_cast<std::size_t>(capacity_) *
@@ -7138,9 +7222,19 @@ void DenseFp4Provider::run_full_attention(
       target_kv_encoding_ == TargetKvEncoding::fp8_e4m3_per_head;
   const auto target_fp4_key_outlier1 =
       target_kv_encoding_ == TargetKvEncoding::fp4_key_outlier1;
+  const auto target_q4_bfp_outlier1 =
+      target_kv_encoding_ == TargetKvEncoding::q4_bfp_key_outlier1;
+  const auto target_q4_bfp =
+      target_kv_encoding_ == TargetKvEncoding::q4_bfp;
+  const auto target_q4_per_head =
+      target_kv_encoding_ == TargetKvEncoding::q4_per_head;
+  const auto target_q5_q4_bfp =
+      target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp;
   const auto mtp_q8 = mtp_q8_kv_ && mtp_attention_.get() == &operation;
   const auto mixed_mtp =
-      (target_fp8 || target_fp4_key_outlier1 || mtp_q8) &&
+      (target_fp8 || target_fp4_key_outlier1 || target_q4_bfp_outlier1 ||
+       target_q4_bfp || target_q4_per_head ||
+       target_q5_q4_bfp || mtp_q8) &&
       full_attention_slot >= target_full_layers_;
   const auto physical_layer =
       mixed_mtp ? full_attention_slot - target_full_layers_
@@ -7164,6 +7258,22 @@ void DenseFp4Provider::run_full_attention(
           cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
     else if (target_fp4_key_outlier1 && !mixed_mtp)
       status_check(ec::store_gqa_kv_paged_fp4_key_outlier1_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_q4_bfp_outlier1 && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_q4_bfp_key_outlier1_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_q4_bfp && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_q4_bfp_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_q4_per_head && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_q4_per_head_batch(
+          key_, value_, page_table, physical_layer, kv_page_tokens_,
+          cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
+    else if (target_q5_q4_bfp && !mixed_mtp)
+      status_check(ec::store_gqa_kv_paged_q5_q4_bfp_batch(
           key_, value_, page_table, physical_layer, kv_page_tokens_,
           cache_positions.front(), rows, kv_heads_, head_dim_, nullptr));
     else
@@ -7223,6 +7333,89 @@ void DenseFp4Provider::run_full_attention(
                             kv_page_tokens_, query_heads_, kv_heads_,
                             head_dim_, kAttentionSplitTokens,
                             attention_maximum_splits_, nullptr}));
+    } else if (target_q4_bfp_outlier1 && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(
+            ec::gated_gqa_qkv_rope_cache_paged_q4_bfp_key_outlier1_at(
+                query_gate_, key_, value_,
+                binding(operation, "query_norm").f32,
+                binding(operation, "key_norm").f32, page, physical_layer,
+                kv_page_tokens_, cache_positions.front(),
+                rotary_positions.front(), query_heads_, kv_heads_, head_dim_,
+                rotary_dimension_, epsilon_, rope_theta_, nullptr));
+      status_check(ec::quantize_gqa_queries_q8(
+          query_gate_, attention_q8_queries_, attention_query_scales_, 1U,
+          query_heads_, head_dim_, nullptr));
+      const auto context_tokens = cache_positions.front() + 1U;
+      status_check(ec::
+          gated_gqa_attention_microbatch_paged_q4_bfp_key_outlier1_tensor_core(
+              {query_gate_, attention_q8_queries_, attention_query_scales_,
+               page_table, attention_, partial_maxima_, partial_sums_,
+               partial_outputs_, context_tokens, 1U, physical_layer,
+               kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+               packed_attention_split_tokens(context_tokens),
+               attention_maximum_splits_, nullptr}));
+    } else if (target_q4_bfp && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_bfp_at(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
+            rope_theta_, nullptr));
+      status_check(ec::quantize_gqa_queries_q8(
+          query_gate_, attention_q8_queries_, attention_query_scales_, 1U,
+          query_heads_, head_dim_, nullptr));
+      const auto context_tokens = cache_positions.front() + 1U;
+      status_check(ec::gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
+          {query_gate_, attention_q8_queries_, attention_query_scales_,
+           page_table, attention_, partial_maxima_, partial_sums_,
+           partial_outputs_, context_tokens, 1U, physical_layer,
+           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+           packed_attention_split_tokens(context_tokens),
+           attention_maximum_splits_, nullptr}));
+    } else if (target_q4_per_head && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_per_head_at(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
+            rope_theta_, nullptr));
+      status_check(ec::quantize_gqa_queries_q8(
+          query_gate_, attention_q8_queries_, attention_query_scales_, 1U,
+          query_heads_, head_dim_, nullptr));
+      const auto context_tokens = cache_positions.front() + 1U;
+      status_check(
+          ec::gated_gqa_attention_microbatch_paged_q4_per_head_tensor_core(
+              {query_gate_, attention_q8_queries_, attention_query_scales_,
+               page_table, attention_, partial_maxima_, partial_sums_,
+               partial_outputs_, context_tokens, 1U, physical_layer,
+               kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+               packed_attention_split_tokens(context_tokens),
+               attention_maximum_splits_, nullptr}));
+    } else if (target_q5_q4_bfp && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_at(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
+            rope_theta_, nullptr));
+      status_check(ec::quantize_gqa_queries_q8(
+          query_gate_, attention_q8_queries_, attention_query_scales_, 1U,
+          query_heads_, head_dim_, nullptr));
+      const auto context_tokens = cache_positions.front() + 1U;
+      status_check(ec::gated_gqa_attention_microbatch_paged_q5_q4_bfp_tensor_core(
+          {query_gate_, attention_q8_queries_, attention_query_scales_,
+           page_table, attention_, partial_maxima_, partial_sums_,
+           partial_outputs_, context_tokens, 1U, physical_layer,
+           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+           packed_attention_split_tokens(context_tokens),
+           attention_maximum_splits_, nullptr}));
     } else {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_at(
@@ -7267,6 +7460,44 @@ void DenseFp4Provider::run_full_attention(
                 rotary_positions.front(), rows, query_heads_, kv_heads_,
                 head_dim_, rotary_dimension_, epsilon_, rope_theta_,
                 nullptr));
+    } else if (target_q4_bfp_outlier1 && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(
+            ec::gated_gqa_qkv_rope_cache_paged_q4_bfp_key_outlier1_batch(
+                query_gate_, key_, value_,
+                binding(operation, "query_norm").f32,
+                binding(operation, "key_norm").f32, page_table,
+                physical_layer, kv_page_tokens_, cache_positions.front(),
+                rotary_positions.front(), rows, query_heads_, kv_heads_,
+                head_dim_, rotary_dimension_, epsilon_, rope_theta_,
+                nullptr));
+    } else if (target_q4_bfp && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_bfp_batch(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page_table, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
+            epsilon_, rope_theta_, nullptr));
+    } else if (target_q4_per_head && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_per_head_batch(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page_table, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
+            epsilon_, rope_theta_, nullptr));
+    } else if (target_q5_q4_bfp && !mixed_mtp) {
+      if (mrope_positions.empty())
+        status_check(ec::gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_batch(
+            query_gate_, key_, value_,
+            binding(operation, "query_norm").f32,
+            binding(operation, "key_norm").f32, page_table, physical_layer,
+            kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
+            rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
+            epsilon_, rope_theta_, nullptr));
     } else {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_batch(
@@ -7293,6 +7524,61 @@ void DenseFp4Provider::run_full_attention(
         status_check(ec::
                          gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
                              launch));
+      else if (target_q4_bfp_outlier1 && !mixed_mtp) {
+        status_check(ec::quantize_gqa_queries_q8(
+            query_gate_, attention_q8_queries_, attention_query_scales_,
+            rows, query_heads_, head_dim_, nullptr));
+        const auto context_tokens = cache_positions.front() + 1U;
+        status_check(ec::
+            gated_gqa_attention_microbatch_paged_q4_bfp_key_outlier1_tensor_core(
+                {query_gate_, attention_q8_queries_,
+                 attention_query_scales_, page_table, attention_,
+                 partial_maxima_, partial_sums_, partial_outputs_,
+                 context_tokens, rows, physical_layer, kv_page_tokens_,
+                 query_heads_, kv_heads_, head_dim_,
+                 packed_attention_split_tokens(context_tokens),
+                 attention_maximum_splits_, nullptr}));
+      }
+      else if (target_q4_bfp && !mixed_mtp) {
+        status_check(ec::quantize_gqa_queries_q8(
+            query_gate_, attention_q8_queries_, attention_query_scales_,
+            rows, query_heads_, head_dim_, nullptr));
+        const auto context_tokens = cache_positions.front() + 1U;
+        status_check(ec::gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
+            {query_gate_, attention_q8_queries_, attention_query_scales_,
+             page_table, attention_, partial_maxima_, partial_sums_,
+             partial_outputs_, context_tokens, rows, physical_layer,
+             kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+             packed_attention_split_tokens(context_tokens),
+             attention_maximum_splits_, nullptr}));
+      }
+      else if (target_q4_per_head && !mixed_mtp) {
+        status_check(ec::quantize_gqa_queries_q8(
+            query_gate_, attention_q8_queries_, attention_query_scales_,
+            rows, query_heads_, head_dim_, nullptr));
+        const auto context_tokens = cache_positions.front() + 1U;
+        status_check(
+            ec::gated_gqa_attention_microbatch_paged_q4_per_head_tensor_core(
+                {query_gate_, attention_q8_queries_, attention_query_scales_,
+                 page_table, attention_, partial_maxima_, partial_sums_,
+                 partial_outputs_, context_tokens, rows, physical_layer,
+                 kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+                 packed_attention_split_tokens(context_tokens),
+                 attention_maximum_splits_, nullptr}));
+      }
+      else if (target_q5_q4_bfp && !mixed_mtp) {
+        status_check(ec::quantize_gqa_queries_q8(
+            query_gate_, attention_q8_queries_, attention_query_scales_,
+            rows, query_heads_, head_dim_, nullptr));
+        const auto context_tokens = cache_positions.front() + 1U;
+        status_check(ec::gated_gqa_attention_microbatch_paged_q5_q4_bfp_tensor_core(
+            {query_gate_, attention_q8_queries_, attention_query_scales_,
+             page_table, attention_, partial_maxima_, partial_sums_,
+             partial_outputs_, context_tokens, rows, physical_layer,
+             kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
+             packed_attention_split_tokens(context_tokens),
+             attention_maximum_splits_, nullptr}));
+      }
       else
         status_check(
             ec::gated_gqa_attention_microbatch_paged_fp4_tensor_core(launch));
@@ -7332,6 +7618,20 @@ void DenseFp4Provider::run_full_attention(
         status_check(
             ec::gated_gqa_attention_staged_prefill_paged_fp4_key_outlier1(
                 launch, workspace));
+      else if (target_q4_bfp_outlier1 && !mixed_mtp)
+        status_check(
+            ec::gated_gqa_attention_staged_prefill_paged_q4_bfp_key_outlier1(
+                launch, workspace));
+      else if (target_q4_bfp && !mixed_mtp)
+        status_check(ec::gated_gqa_attention_staged_prefill_paged_q4_bfp(
+            launch, workspace));
+      else if (target_q4_per_head && !mixed_mtp)
+        status_check(
+            ec::gated_gqa_attention_staged_prefill_paged_q4_per_head(
+                launch, workspace));
+      else if (target_q5_q4_bfp && !mixed_mtp)
+        status_check(ec::gated_gqa_attention_staged_prefill_paged_q5_q4_bfp(
+            launch, workspace));
       else
         status_check(ec::gated_gqa_attention_staged_prefill_paged_fp4(
             launch, workspace));

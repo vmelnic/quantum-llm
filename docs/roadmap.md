@@ -1,6 +1,6 @@
 # Roadmap
 
-Status: active dependency order, 2026-09-17. Measurements belong in
+Status: active dependency order, 2026-09-20. Measurements belong in
 [Benchmarks](benchmarks.md); failed ideas belong in
 [Research decisions](research-decisions.md).
 
@@ -44,11 +44,12 @@ RTX 3090 physical           = 25,769,803,776 bytes
 host-KV scan floor          = 1.284 s/scalar call
 ```
 
-K1 fits and measured 14.39 tok/s after first token, but it is lossy. The
-matched 262,016-token case took 546.173 s under K1 and 2,278.082 s under F16.
-Do not add another codec until K1 receives a broader retrieval/reasoning/coding
-quality decision. If K1 is accepted, optimize only the measured full-shape
-dominants: 250.365 s attention, 178.069 s dense FFN and 116.299 s recurrent.
+The explicitly lossy `q4-f16-per-head` policy is now the operational default
+for compatible Qwen, Abliterated and Ornith artifacts. Qwen measured 54.54 and
+47.16 useful tok/s at 32K/128K; the two-point 262K extrapolation is 39.94 tok/s,
+not a live maximum-context result. ContextBench and the user-owned real-project
+Pi fidelity gate remain pending. The exact-F16 release target above is
+unchanged.
 
 Persistent, codec-preserving Qwen session snapshots are implemented behind the
 provider capability: immutable content-addressed NVMe chunks plus a
@@ -90,7 +91,7 @@ kernel again without a complete design that first proves <=100 ms/token.
 | Qwen Flash | official operation parity, then representative coding; P100 route is not an accelerator |
 | Mistral | identify and reduce measured TTFT before another coding run |
 | Muse | populated 131K text and representative tools; vision remains auxiliary |
-| Ornith | long-context K1/F16 quality and correct coding completion without routed churn |
+| Ornith | long-context per-head-Q4 quality and correct coding completion without routed churn |
 
 Minimal `hi` and valid tool transport do not satisfy these gates.
 

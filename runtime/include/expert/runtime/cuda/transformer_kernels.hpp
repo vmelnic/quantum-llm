@@ -324,6 +324,35 @@ struct PleDilatedConvLaunch final {
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
     std::uint32_t first_cache_position, std::uint32_t rows,
     std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+// Signed Q4 block-floating K/V. Every head record has one FP16 base and one
+// four-bit power-of-two exponent per block-32. K additionally preserves one
+// FP16 outlier per block. Payload planes are head-major so decode attention
+// reads aligned records without materializing an FP16 cache.
+[[nodiscard]] Status store_gqa_kv_paged_q4_bfp_key_outlier1_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+// Signed Q4 block-floating K/V without an outlier side channel. Both planes
+// use one FP16 base per head record and one four-bit exponent per block-32.
+[[nodiscard]] Status store_gqa_kv_paged_q4_bfp_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+[[nodiscard]] Status store_gqa_kv_paged_q4_per_head_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
+// Signed Q5 block-floating K and signed Q4 block-floating V. Both use one
+// FP16 base per head record and one four-bit power-of-two exponent per
+// block-32. The unequal planes total 300 bytes per K/V record pair.
+[[nodiscard]] Status store_gqa_kv_paged_q5_q4_bfp_batch(
+    const float* key, const float* value, const void* const* page_table,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t first_cache_position, std::uint32_t rows,
+    std::uint32_t kv_heads, std::uint32_t head_dim, void* stream) noexcept;
 [[nodiscard]] Status store_gqa_kv_paged_fp8_batch(
     const float* key, const float* value, const void* const* page_table,
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
@@ -636,6 +665,74 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
     float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_bfp_key_outlier1_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_bfp_key_outlier1_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_bfp_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_bfp_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_per_head_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_per_head_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_at(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight, void* page,
+    std::uint32_t full_attention_layer, std::uint32_t page_tokens,
+    std::uint32_t cache_position, std::uint32_t rotary_position,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
+[[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_batch(
+    float* q_and_gate, float* key, const float* value,
+    const float* q_norm_weight, const float* k_norm_weight,
+    const void* const* page_table, std::uint32_t full_attention_layer,
+    std::uint32_t page_tokens, std::uint32_t first_cache_position,
+    std::uint32_t first_rotary_position, std::uint32_t rows,
+    std::uint32_t query_heads, std::uint32_t kv_heads,
+    std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
+    float rope_theta, void* stream) noexcept;
 
 // Output-gated GQA with E4M3 K/V values and one FP16 dynamic scale per
 // [token, kv-head, K-or-V] record. The cache remains paged and token-major;
@@ -713,6 +810,47 @@ using PagedFp4KeyOutlier1GatedGqaAttentionLaunch =
 gated_gqa_attention_decode_paged_fp4_key_outlier1_tensor_core(
     const PagedFp4KeyOutlier1GatedGqaAttentionLaunch& launch) noexcept;
 
+struct PagedQ4BfpGatedGqaAttentionLaunch final {
+  const float* q_and_gate{};          // FP32 gate and numerical reference.
+  const std::int8_t* q8_queries{};    // [rows, query_heads, head_dim]
+  const float* query_scales{};        // [rows, query_heads]
+  const void* const* page_table{};
+  float* output{};
+  float* partial_maxima{};
+  float* partial_sums{};
+  float* partial_outputs{};
+  std::uint32_t first_context_tokens{};
+  std::uint32_t rows{};
+  std::uint32_t full_attention_layer{};
+  std::uint32_t page_tokens{};
+  std::uint32_t query_heads{};
+  std::uint32_t kv_heads{};
+  std::uint32_t head_dim{};
+  std::uint32_t split_tokens{};
+  std::uint32_t maximum_splits{};
+  void* stream{};
+};
+
+using PagedQ5Q4BfpGatedGqaAttentionLaunch =
+    PagedQ4BfpGatedGqaAttentionLaunch;
+
+[[nodiscard]] Status quantize_gqa_queries_q8(
+    const float* q_and_gate, std::int8_t* q8_queries, float* query_scales,
+    std::uint32_t rows, std::uint32_t query_heads,
+    std::uint32_t head_dim, void* stream) noexcept;
+[[nodiscard]] Status
+gated_gqa_attention_microbatch_paged_q4_bfp_key_outlier1_tensor_core(
+    const PagedQ4BfpGatedGqaAttentionLaunch& launch) noexcept;
+[[nodiscard]] Status
+gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
+    const PagedQ4BfpGatedGqaAttentionLaunch& launch) noexcept;
+[[nodiscard]] Status
+gated_gqa_attention_microbatch_paged_q4_per_head_tensor_core(
+    const PagedQ4BfpGatedGqaAttentionLaunch& launch) noexcept;
+[[nodiscard]] Status
+gated_gqa_attention_microbatch_paged_q5_q4_bfp_tensor_core(
+    const PagedQ5Q4BfpGatedGqaAttentionLaunch& launch) noexcept;
+
 using PagedFp8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
 using PagedQ8GatedGqaAttentionLaunch = PagedFp4GatedGqaAttentionLaunch;
 
@@ -773,6 +911,12 @@ using PagedFp4KeyOutlier1GatedGqaPrefillLaunch =
     PagedFp4GatedGqaPrefillLaunch;
 using PagedFp4KeyOutlier1GatedGqaStagedPrefillWorkspace =
     PagedFp4GatedGqaStagedPrefillWorkspace;
+using PagedQ4BfpGatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
+using PagedQ4BfpGatedGqaStagedPrefillWorkspace =
+    PagedFp4GatedGqaStagedPrefillWorkspace;
+using PagedQ5Q4BfpGatedGqaPrefillLaunch = PagedFp4GatedGqaPrefillLaunch;
+using PagedQ5Q4BfpGatedGqaStagedPrefillWorkspace =
+    PagedFp4GatedGqaStagedPrefillWorkspace;
 
 // Exact causal microbatch attention. Positions times grouped query heads must
 // fit two 16-row WMMA tiles so packed K/V is shared across every speculative
@@ -812,6 +956,19 @@ gated_gqa_attention_microbatch_paged_fp4_key_outlier1_tensor_core(
     const PagedFp4KeyOutlier1GatedGqaPrefillLaunch& launch,
     const PagedFp4KeyOutlier1GatedGqaStagedPrefillWorkspace& workspace)
     noexcept;
+[[nodiscard]] Status
+gated_gqa_attention_staged_prefill_paged_q4_bfp_key_outlier1(
+    const PagedQ4BfpGatedGqaPrefillLaunch& launch,
+    const PagedQ4BfpGatedGqaStagedPrefillWorkspace& workspace) noexcept;
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_q4_bfp(
+    const PagedQ4BfpGatedGqaPrefillLaunch& launch,
+    const PagedQ4BfpGatedGqaStagedPrefillWorkspace& workspace) noexcept;
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_q4_per_head(
+    const PagedQ4BfpGatedGqaPrefillLaunch& launch,
+    const PagedQ4BfpGatedGqaStagedPrefillWorkspace& workspace) noexcept;
+[[nodiscard]] Status gated_gqa_attention_staged_prefill_paged_q5_q4_bfp(
+    const PagedQ5Q4BfpGatedGqaPrefillLaunch& launch,
+    const PagedQ5Q4BfpGatedGqaStagedPrefillWorkspace& workspace) noexcept;
 
 // Output-gated GQA backed by an authoritative FP16 host cache. K/V remains
 // token-major in pinned host memory; the staged provider copies one bounded

@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|clear-cache|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|ornith-k1|mistral|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|clear-cache|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|mistral|deepseek|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -71,6 +71,10 @@ else
        ( "${declared_kv}" == artifact ||
          "${declared_kv}" == fp8-e4m3-per-head ||
          "${declared_kv}" == fp4-e2m1-ue8m0-block32-key-outlier1 ||
+         "${declared_kv}" == q4-bfp16-block32-key-outlier1 ||
+         "${declared_kv}" == q4-bfp16-block32 ||
+         "${declared_kv}" == q4-f16-per-head ||
+         "${declared_kv}" == q5-q4-bfp16-block32 ||
          "${declared_kv}" == fp16 ) &&
        ( "${declared_vram}" == fixed || "${declared_vram}" == fit ) ]] ||
       die "invalid model alias registry row for '${alias}'"
@@ -179,8 +183,12 @@ esac
 [[ "${kv_cache_dtype}" == artifact ||
    "${kv_cache_dtype}" == fp8-e4m3-per-head ||
    "${kv_cache_dtype}" == fp4-e2m1-ue8m0-block32-key-outlier1 ||
+   "${kv_cache_dtype}" == q4-bfp16-block32-key-outlier1 ||
+   "${kv_cache_dtype}" == q4-bfp16-block32 ||
+   "${kv_cache_dtype}" == q4-f16-per-head ||
+   "${kv_cache_dtype}" == q5-q4-bfp16-block32 ||
    "${kv_cache_dtype}" == fp16 ]] ||
-  die "MODEL_KV_CACHE_DTYPE must be artifact, fp8-e4m3-per-head, fp4-e2m1-ue8m0-block32-key-outlier1, or fp16"
+  die "MODEL_KV_CACHE_DTYPE must be artifact, fp8-e4m3-per-head, fp4-e2m1-ue8m0-block32-key-outlier1, q4-bfp16-block32-key-outlier1, q4-bfp16-block32, q4-f16-per-head, q5-q4-bfp16-block32, or fp16"
 (( max_output < max_context )) || die "MODEL_MAX_OUTPUT_TOKENS must be smaller than MODEL_MAX_CONTEXT"
 
 export QUANTUM_LLM_REMOTE="${remote_host}"

@@ -1,6 +1,6 @@
 # Pi CLI
 
-Status: maintained coding-harness integration, 2026-09-15.
+Status: maintained coding-harness integration, 2026-09-20.
 
 Pi is the preferred local harness because it can call the repository's
 OpenAI-compatible endpoint without Claude Code's fixed Claude-oriented prompt.
@@ -35,27 +35,35 @@ should contain only these project models:
 ```
 
 Replace the alias with `qwen-abliterated`, `qwen-f16`, `qwen-flash`, `mistral`,
-`muse`, `ornith`, `ornith-k1` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
+`muse`, `ornith` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
 URL, then checks the running model ID and explicit KV codec through
 `/model-info` before launching Pi. It defaults to `--thinking xhigh` and
 forwards remaining arguments. The operational `qwen`, `qwen-abliterated` and
-experimental `ornith-k1` aliases require K1; `qwen-f16` and `ornith` are the
-explicit exact-F16 reference aliases for the official artifacts.
+`ornith` aliases require `q4-f16-per-head`; `qwen-f16` is the explicit
+exact-F16 Qwen reference.
+
+The wrapper resolves its repository and `.env` from its own absolute path, not
+from the current directory. Pi's provider/model registry is user-global, so
+the wrapper and direct `pi --provider quantum-llm --model <advertised-id>` calls
+work from any project directory. The current directory remains intentional Pi
+project context unless `--no-context-files` is supplied.
 
 Minimal wiring gate:
 
 ```bash
 ./ops/pi.sh qwen \
-  --no-context-files --no-tools --no-session -p hi
+  --no-context-files --no-tools --no-extensions --no-skills \
+  --no-prompt-templates --no-session --thinking off -p hi
 ```
 
 ## Current evidence
 
-All seven advertised model IDs and `ornith-k1` pass the
-no-context/no-tools/no-session `hi` wiring gate. Qwen, Qwen Abliterated and
-Muse are responsive in that gate; Flash, Mistral and especially DeepSeek are
-slow. Exact timings live only in [Benchmarks](benchmarks.md). Wiring does not
-qualify tools, coding quality, long context or concurrency.
+All seven advertised model IDs have historical minimal-Pi wiring evidence. The
+current post-promotion regression passed Qwen, Qwen Abliterated and Ornith on
+`q4-f16-per-head`, plus Muse, Flash and Mistral on their unchanged formats.
+DeepSeek was intentionally excluded from that regression; Flash and Mistral
+remain slow. Exact timings live only in [Benchmarks](benchmarks.md). Wiring
+does not qualify tools, coding quality, long context or concurrency.
 
 ## Thinking and sampling
 

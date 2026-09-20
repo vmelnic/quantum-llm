@@ -70,30 +70,31 @@ Pi may add system instructions even with project context/tools disabled. The
 abliterated row was run on 2026-09-15 and only client wall time was captured.
 This table qualifies API/template/generation wiring only.
 
-#### Clean-build isolated Pi regression, 2026-09-20
+#### Default-policy isolated Pi regression, 2026-09-20
 
-Immediately after the canonical clean Windows Release/CUDA build passed CTest
-6/6 and the canonical Python suite 119/119, six published artifacts were
-started sequentially on the RTX 3090. Each start used its declared KV codec,
-disabled server-side session retention and reported `ready=true`. The Pi
-command added `--no-extensions --no-skills --no-prompt-templates` to the
-minimal gate above, so no project context, tool, extension, skill, prompt
-template or prior session was available. The values below are client wall
-time, not service throughput measurements.
+After promoting `q4-f16-per-head` for every compatible artifact, six published
+artifacts were started sequentially on the RTX 3090. Each start disabled
+server-side session retention and reported `ready=true` with the required KV
+codec. Pi ran from a temporary directory outside the repository with
+`--no-context-files --no-tools --no-extensions --no-skills
+--no-prompt-templates --no-session --thinking off -p hi`. No project context,
+tool, extension, skill, prompt template or prior session was available. The
+values below are client wall time, not service throughput measurements.
 
-| Alias | Declared KV | Client wall | Result |
+| Alias | Required and reported KV | Client wall | Result |
 |---|---|---:|---|
-| `qwen` | K1 | 2.75 s | pass, coherent text |
-| `qwen-abliterated` | K1 | 5.42 s | pass, coherent text |
-| `qwen-flash` | F16 | 62.11 s | pass, coherent text |
-| `mistral` | artifact-native | 78.44 s | pass, coherent text |
-| `muse` | F16 | 3.88 s | pass, coherent text |
-| `ornith` | F16 | 7.12 s | pass, coherent text |
+| `qwen` | `q4-f16-per-head` | 1.87 s | pass, coherent text |
+| `qwen-abliterated` | `q4-f16-per-head` | 1.42 s | pass, coherent text |
+| `ornith` | `q4-f16-per-head` | 8.92 s | pass, coherent text |
+| `muse` | F16 | 3.58 s | pass, coherent text |
+| `qwen-flash` | F16 | 48.38 s | pass, coherent text; slow |
+| `mistral` | artifact-native | 59.48 s | pass, coherent text; slow |
 
-DeepSeek was intentionally not run in this regression at the user's request;
-its earlier result above remains historical evidence only. After the six
-gates, the common task was stopped and `/ready` was unreachable with no active
-model advertised.
+DeepSeek was intentionally not run at the user's request; its earlier result
+above remains historical evidence only. After the six gates, the common task
+was stopped, `/ready` was unreachable with no model advertised, and the RTX
+3090 reported 25,161,629,696 of 25,769,803,776 bytes free. This is a wiring and
+cleanup gate, not a quality, coding or long-context result.
 
 ### Coding harness
 
@@ -388,6 +389,200 @@ DP4A weight-reuse kernel for the real batch of five. It was numerically within
 453.70 and 365.78 GB/s for DP4A. Removing every block-wide K-loop barrier
 regressed it further to 121.74 and 51.17 GB/s. The candidate was removed; no
 context gate was run for a kernel that failed its bandwidth prerequisite.
+
+### Direct packed-Q4 batch-five attention, 2026-09-20
+
+The experimental `qwen-q4-bfp` alias uses 166-byte K records and 134-byte V
+records. The batch-five kernel reads this payload directly, expands only to
+transient INT8 Tensor Core operands and never materializes an F16 KV cache.
+Its independent attention oracle remained within `3.72529e-09` maximum
+absolute error. The clean native gate measured:
+
+| Populated context | 16-layer attention | Per layer | Packed bandwidth |
+|---:|---:|---:|---:|
+| 32,768 | 6.10714 ms | 0.381696 ms | 103.018 GB/s |
+| 131,072 | 22.8332 ms | 1.42707 ms | 110.216 GB/s |
+
+The exact same terminal coding-prompt windows and real sampled profile used by
+the K1 baseline (`temperature=1.0`, `top_p=0.95`, `top_k=20`, seed 1) then
+produced 128 tokens through the service path. Session retention and durable
+snapshots were disabled; cleanup reported zero allocated and reserved pages.
+
+| Populated prompt | TTFT | Post-first | Target calls / positions | Accepted drafts | Positions/call | Cycle |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32,768 | 39.390 s | 46.88 tok/s | 48 / 127 | 79 | 2.6458 | 56.437 ms |
+| 131,072 | 203.496 s | 33.56 tok/s | 50 / 127 | 77 | 2.5400 | 75.685 ms |
+
+The gate artifacts are
+`qwen-q4-bfp-batch5-direct-32768-suffix.json` and
+`qwen-q4-bfp-batch5-direct-131072-suffix.json`. Relative to K1 MTP-4, useful
+decode improved by 79.0% at 32K and 40.5% at 128K. The candidate passes the
+40-50 tok/s target at 32K but not at 128K. Linear extrapolation from only the
+two requested contexts is:
+
+```text
+d32  = 2.7089760 / 127 = 0.0213305 s/useful token
+d128 = 3.7842662 / 127 = 0.0297974 s/useful token
+d262 = d32 + (7/3) * (d128 - d32) = 0.0410870 s/useful token
+rate262 = 24.34 useful tok/s
+```
+
+This is an extrapolation, not a 262K measurement. At the measured 128K
+acceptance, 40 tok/s requires `63.50 ms/cycle`; the observed `75.685 ms` cycle
+misses by `12.185 ms`. The measured attention call is `22.833 ms`, leaving an
+observed `52.852 ms` of proposer, target dense/recurrent/head, sampling and
+runtime work per cycle.
+
+The admitted split-K INT8 Tensor Core dense kernel subsequently kept the same
+FP4 artifact, Q8 activations and FP32 block-scale accumulation. Eight warps
+cover disjoint K blocks for one 16x8 output tile and reduce once in 4 KiB of
+shared memory. The independent scalar oracle stayed at `5.34058e-05`; clean
+batch-five bandwidth improved from 453.70 to 597.287 GB/s on
+17,408x5,120 and from 365.78 to 525.455 GB/s on 5,120x17,408.
+
+The final real service gates used the same prompt windows and sampling profile
+as the table above. Both output hashes were byte-identical to the pre-split-K
+Q4 runs, and session cleanup again returned allocated/reserved pages to zero.
+
+| Populated prompt | TTFT | Post-first | Target calls / positions | Accepted drafts | Positions/call | Cycle |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32,768 | 39.559 s | 52.82 tok/s | 48 / 127 | 79 | 2.6458 | 50.089 ms |
+| 131,072 | 203.296 s | 36.57 tok/s | 50 / 127 | 77 | 2.5400 | 69.449 ms |
+
+The artifacts are `qwen-q4-bfp-splitk-dense-32768-suffix.json` and
+`qwen-q4-bfp-splitk-dense-131072-suffix.json`. Relative to the preceding
+direct-Q4 result, useful throughput improved another 12.7% at 32K and 9.0% at
+128K. The requested two-point extrapolation is:
+
+```text
+d32  = 2.4042503 / 127 = 0.0189311 s/useful token
+d128 = 3.4724691 / 127 = 0.0273423 s/useful token
+d262 = d32 + (7/3) * (d128 - d32) = 0.0385572 s/useful token
+rate262 = 25.94 useful tok/s
+```
+
+This is an extrapolation, not a 262K measurement. The 32K target passes. At
+128K, 40 tok/s requires 63.50 ms/cycle and the measured cycle is 69.449 ms,
+so 5.949 ms/cycle remains.
+
+### Direct per-head-Q4 (Q4H) batch-five attention, 2026-09-20
+
+The separately named `qwen-q4-per-head` profile stores one FP16 scale for
+each complete 256-value K or V head and 128 signed-Q4 code bytes. The target
+K+V record pair is 260 bytes. The target cache is 4.0625 GiB at the configured
+262,144-position ceiling; the unchanged Q8 MTP cache raises the combined
+capacity to 4.566406 GiB. This is explicitly lossy and is not an exact-F16
+result.
+
+The direct kernel consumes packed codes and scales without materializing F16.
+Its independent host encoder/layout check was byte exact, the independent
+attention oracle had maximum absolute error `3.72529e-09`, and the final clean
+Windows Release/CUDA gate measured:
+
+| Populated context | 16-layer attention | Per layer | Packed bandwidth |
+|---:|---:|---:|---:|
+| 32,768 | 4.54246 ms | 0.283904 ms | 120.036 GB/s |
+| 131,072 | 16.5949 ms | 1.03718 ms | 131.428 GB/s |
+
+The initial 128K result was `16.9247 ms`, 0.1720 ms above the admitted
+`16.7527 ms` bound. One local correction decoded all eight Q4 values from one
+32-bit word, sharing the nibble mask and shift between both four-value PRMT
+expansions. It retained the oracle and reduced 128K attention to `16.5949 ms`.
+
+Real service gates then used suffix windows from the same 262,016-token coding
+prompt and generated 128 tokens with `temperature=1.0`, `top_p=0.95`,
+`top_k=20`, seed 1. Session retention was disabled. The worker reported
+`q4-f16-per-head`, MTP-4 ready, GPU sampling only, and zero allocated/reserved
+pages after each request.
+
+| Populated prompt | TTFT | Post-first | Target calls / positions | Accepted drafts | Positions/call | Cycle |
+|---:|---:|---:|---:|---:|---:|---:|
+| 32,768 | 39.627 s | 54.54 tok/s | 48 / 128 | 80 | 2.6667 | 48.512 ms |
+| 131,072 | 203.250 s | 47.16 tok/s | 42 / 128 | 86 | 3.0476 | 64.124 ms |
+
+The gate artifacts are `qwen-q4-per-head-32768-suffix.json` and
+`qwen-q4-per-head-131072-suffix.json`. Relative to the selected block-floating
+Q4 baseline, measured useful throughput improved by 3.25% at 32K and 28.93%
+at 128K. Both requested live contexts pass 40 useful tok/s. The user-owned
+real-project Pi fidelity gate remains pending.
+
+Only the requested points are extrapolated; no 262K service gate was run:
+
+```text
+d32  = 2.3285583 / 127 = 0.0183351 s/useful token
+d128 = 2.6932210 / 127 = 0.0212065 s/useful token
+d262 = d32 + (7/3) * (d128 - d32) = 0.0250349 s/useful token
+rate262 = 39.94 useful tok/s
+```
+
+#### External `llama-benchy` endpoint gate
+
+`llama-benchy` 0.4.0 was run against the real OpenAI-compatible chat endpoint,
+not against the provider directly. The service was freshly started with the
+`qwen-q4-per-head` alias, session retention and durable session caching were
+disabled, and the request used `temperature=1.0`, `top_p=0.95`, `top_k=20`,
+concurrency one and cache avoidance. The standard shape was `pp=2048`,
+`depth=32768`, `tg=32`; the server reported 34,817 actual prompt tokens after
+chat templating.
+
+| External metric | Result |
+|---|---:|
+| end-to-end time to first content token | 42.131 s |
+| post-first decode | 56.99 tok/s |
+| peak one-second decode | 58.82 tok/s |
+| target calls / verified positions | 12 / 32 |
+| accepted drafts | 20 |
+| verified positions/call | 2.6667 |
+
+The worker confirmed `q4-f16-per-head`, MTP-4, a 65,536-token draft
+vocabulary, Q8 MTP K/V, GPU-only sampling and direct fused multi-query
+attention. Cleanup left zero allocated/reserved pages and zero retained
+sessions. The raw result is
+`out/benchmarks/llama-benchy-qwen-q4-per-head-32k-noretention.json`.
+
+The tool also printed 193,112 prompt tok/s from `TTFR - latency`. That value is
+invalid for this endpoint because an early SSE role/metadata chunk arrived at
+0.210 s while the first content token arrived at 42.131 s. It is deliberately
+not promoted as a prefill measurement. This was one 32-token run, so the decode
+number is an external service-path confirmation with MTP acceptance variance,
+not a multi-run statistical estimate or a fidelity gate.
+
+#### External GuideLLM single-stream endpoint gate
+
+GuideLLM 0.7.4 used its synchronous profile with one worker, maximum
+concurrency one and exactly one synthetic request. The requested shape was
+32,768 prompt tokens and 128 generated tokens; chat templating raised the
+actual input to 32,820 tokens. The freshly started `qwen-q4-per-head` service
+had session retention and durable caching disabled. Sampling came from the
+artifact's thinking profile (`temperature=1.0`, `top_p=0.95`, `top_k=20`).
+
+| GuideLLM metric | Result |
+|---|---:|
+| actual input | 32,820 tokens |
+| reasoning / visible output | 128 / 0 tokens |
+| first generated reasoning token | 39.861 s |
+| request wall | 41.957 s |
+| post-first generation window | 2.0963 s |
+| post-first generation rate | 60.58 tok/s |
+| mean inter-token latency | 16.506 ms |
+| end-to-end output rate including prefill | 3.05 tok/s |
+| target calls / verified positions | 43 / 128 |
+| accepted drafts | 85 |
+| verified positions/call | 2.9767 |
+
+The worker again confirmed MTP-4, the 65,536-token draft vocabulary, Q8 MTP
+K/V, GPU-only sampling and direct fused multi-query attention. Cleanup left
+zero allocated/reserved pages and zero retained sessions. Raw results are
+`out/benchmarks/guidellm-qwen-q4-per-head-32k-c1.json` and its CSV companion.
+
+GuideLLM's `time_per_output_token_ms=327.8` is request wall divided by all 128
+output tokens, so it includes the entire prefill and is not decode TPOT. The
+post-first value above is independently derived from the recorded first/last
+token timestamps: `127 / 2.0962884 = 60.58 tok/s`, matching the reported
+16.506 ms inter-token latency. The random synthetic prompt consumed the output
+budget entirely as hidden reasoning, so this is a serving-performance gate,
+not a coherence, visible-answer or fidelity gate. One request is not a latency
+distribution.
 
 ## Sparse MoE evidence
 

@@ -828,23 +828,34 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "placement_prefetch_state": "disabled",
             "placement_minimum_observations": 2,
         }
-        process = unittest.mock.MagicMock()
-        process.stdin = io.StringIO()
-        process.stdout = io.StringIO(json.dumps(ready) + "\n")
-        process.stderr = io.StringIO()
-        with unittest.mock.patch.object(
-                expert_server.subprocess, "Popen", return_value=process
-        ) as popen:
-            worker = CudaWorker(
-                expert_server.Path("provider.exe"),
-                expert_server.Path("pack"), 262144, 1, 1, 48, 12,
-                5136, 256, "balanced", False,
-                kv_cache_dtype="fp4-e2m1-ue8m0-block32-key-outlier1",
-                routed_vram_policy="fit",
-            )
-        self.assertEqual(worker.vram_cache_bytes, 16 << 30)
-        self.assertEqual(worker.routed_vram_policy, "fit")
-        self.assertIn("--routed-vram-policy=fit", popen.call_args.args[0])
+        for kv_dtype in (
+            "fp4-e2m1-ue8m0-block32-key-outlier1",
+            "q4-bfp16-block32-key-outlier1",
+            "q4-bfp16-block32",
+            "q4-f16-per-head",
+            "q5-q4-bfp16-block32",
+        ):
+            with self.subTest(kv_dtype=kv_dtype):
+                ready["kv_dtype"] = kv_dtype
+                process = unittest.mock.MagicMock()
+                process.stdin = io.StringIO()
+                process.stdout = io.StringIO(json.dumps(ready) + "\n")
+                process.stderr = io.StringIO()
+                with unittest.mock.patch.object(
+                        expert_server.subprocess, "Popen",
+                        return_value=process) as popen:
+                    worker = CudaWorker(
+                        expert_server.Path("provider.exe"),
+                        expert_server.Path("pack"), 262144, 1, 1, 48, 12,
+                        5136, 256, "balanced", False,
+                        kv_cache_dtype=kv_dtype,
+                        routed_vram_policy="fit",
+                    )
+                self.assertEqual(worker.kv_dtype, kv_dtype)
+                self.assertEqual(worker.vram_cache_bytes, 16 << 30)
+                self.assertEqual(worker.routed_vram_policy, "fit")
+                self.assertIn("--routed-vram-policy=fit",
+                              popen.call_args.args[0])
 
     def test_protocol7_rejects_partial_routed_geometry(self) -> None:
         ready = {
