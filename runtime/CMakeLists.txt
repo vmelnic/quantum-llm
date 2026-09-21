@@ -185,6 +185,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   add_executable(expert-cuda-moe-smoke tools/cuda_moe_smoke.cpp)
   target_compile_features(expert-cuda-moe-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-cuda-moe-smoke PRIVATE expert_runtime CUDA::cudart)
+  add_executable(expert-grouped-fp4-moe-cuda-smoke
+    tools/grouped_fp4_moe_cuda_smoke.cpp)
+  target_compile_features(expert-grouped-fp4-moe-cuda-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-grouped-fp4-moe-cuda-smoke PRIVATE
+    expert_runtime CUDA::cudart)
   add_executable(expert-path-probe tools/expert_path_probe.cpp)
   target_compile_features(expert-path-probe PRIVATE cxx_std_20)
   target_link_libraries(expert-path-probe PRIVATE expert_runtime CUDA::cudart)
@@ -327,6 +332,10 @@ if(EXPERT_RUNTIME_BUILD_TESTS)
   if(TARGET expert-qwen3-next-cuda-smoke)
     add_test(NAME expert-qwen3-next-cuda-smoke
       COMMAND expert-qwen3-next-cuda-smoke)
+  endif()
+  if(TARGET expert-grouped-fp4-moe-cuda-smoke)
+    add_test(NAME expert-grouped-fp4-moe-cuda-smoke
+      COMMAND expert-grouped-fp4-moe-cuda-smoke)
   endif()
   if(TARGET expert-dense-fp4-cuda-smoke)
     add_test(NAME expert-dense-fp4-cuda-smoke

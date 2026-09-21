@@ -153,9 +153,19 @@ own declared or tokenizer defaults.
 For compact non-F16 Qwen attention, prefill uses the vendored official
 FlashAttention implementation over artifact-sized paged segments. Gated
 DeltaNet recurrent prefill uses a numerically gated value-major warp update,
-and the complete compact path uses 1,024 workspace rows. F16 host-authoritative
-prefill retains the 512-row bounded staging path. These choices are capability-
-and geometry-driven; common service code does not branch on the Qwen family.
+and the complete compact path uses 1,024 workspace rows. The default F16
+host-authoritative path retains 512 rows. An exact-F16 artifact that also
+declares Hyper, QSA, PLE and routed components may select 1,024 rows only after
+pre- and post-allocation CUDA checks preserve the 1 GiB device reserve. These
+choices are capability- and geometry-driven; common service code does not
+branch on the Qwen family.
+
+The generic program-sequence path accepts artifact-declared Hyper initialize,
+read, inject and reduce operations, PLE state, exact QSA/recurrent operations
+and their no-residual variants. It retains an interior stable-prefix checkpoint
+without splitting the prompt into another layer sweep. Hidden, Hyper and
+injection streams stay device-side for the admitted tile; prompts larger than
+the admitted tile remain tiled and do not imply whole-context residency.
 
 Muse and Mistral derive KV bytes and dtype from their artifact programs rather
 than a Qwen-shaped estimate. Muse's global and sliding windows remain distinct;
@@ -203,6 +213,11 @@ Demand outranks bounded warm/prefetch work. Leases prevent eviction while CPU
 or CUDA work consumes a page. RAM uses probationary/protected retention; VRAM
 uses transient/protected classes. Missing selected experts are never treated as
 zero, and aggregation preserves router order and weights.
+
+For batched standard-FP4 routed work, primary selections are grouped by expert
+ID in bounded groups of four. Gate/up and down kernels reuse the expert weight
+group across those rows; the exact router results and stable aggregation remain
+unchanged. Native NVFP4 and scalar decode retain their existing dispatches.
 
 The routed-VRAM policy is alias-declared and provider-neutral. `fixed` keeps the
 configured common ceiling. `fit` is a startup-only policy: after immutable

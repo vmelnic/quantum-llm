@@ -728,63 +728,47 @@ int worker_loop(er::MoeProgramExecutor& executor,
       const auto started = std::chrono::steady_clock::now();
       const auto final_position =
           first_position + static_cast<std::uint32_t>(tokens.size());
-      std::array<std::span<const std::uint32_t>, 2U> segments{tokens, {}};
-      std::size_t segment_count = 1U;
-      if (request.multimodal.empty() &&
+      const auto interior_retention =
           request.retention_position > first_position &&
-          request.retention_position < final_position) {
-        const auto checkpoint_rows = static_cast<std::size_t>(
-            request.retention_position - first_position);
-        segments[0] = tokens.first(checkpoint_rows);
-        segments[1] = tokens.subspan(checkpoint_rows);
-        segment_count = 2U;
+          request.retention_position < final_position;
+      auto step = start_prefill_sequence(
+          request, ports, tokens, first_position, request.multimodal);
+      require(step.status.ok(), step.status.message());
+      auto predictions = complete_prefill(step.handle);
+      require(predictions.size() == (interior_retention ? 2U : 1U),
+              "program-sequence returned an invalid prediction width");
+      if (interior_retention) {
+        request.retention_predicted = predictions.front();
+        request.retention_prediction_valid = true;
       }
-      auto segment_position = first_position;
-      std::size_t segment_offset{};
-      bool retention_checkpointed{};
-      for (std::size_t index = 0U; index < segment_count; ++index) {
-        auto step = start_prefill_sequence(
-            request, ports, segments[index], segment_position,
-            request.multimodal);
-        require(step.status.ok(), step.status.message());
-        auto predictions = complete_prefill(step.handle);
-        require(predictions.size() == 1U,
-                "program-sequence returned an invalid prediction width");
-        request.predicted = predictions.front();
-        if (exact_eligible(request.sampling) &&
-            request.session.exact_decode_available()) {
-          for (std::size_t offset = 0U;
-               offset < segments[index].size();) {
-            const auto count = std::min<std::size_t>(
-                chunk_tokens, segments[index].size() - offset);
-            std::vector<std::uint32_t> successors(count);
-            for (std::size_t row = 0U; row < count; ++row) {
-              const auto global = segment_offset + offset + row;
-              successors[row] = global + 1U == tokens.size()
-                                    ? request.predicted
-                                    : tokens[global + 1U];
-            }
-            const auto synchronized =
-                request.session.synchronize_exact_decode_batch(
-                    successors,
-                    first_position + static_cast<std::uint32_t>(
-                                         segment_offset + offset),
-                    segment_offset + offset + count == tokens.size());
-            require(synchronized.ok(), synchronized.message());
-            offset += count;
+      request.predicted = predictions.back();
+      if (exact_eligible(request.sampling) &&
+          request.session.exact_decode_available()) {
+        for (std::size_t offset = 0U; offset < tokens.size();) {
+          const auto count = std::min<std::size_t>(
+              chunk_tokens, tokens.size() - offset);
+          std::vector<std::uint32_t> successors(count);
+          for (std::size_t row = 0U; row < count; ++row) {
+            const auto global = offset + row;
+            successors[row] = global + 1U == tokens.size()
+                                  ? request.predicted
+                                  : tokens[global + 1U];
           }
+          const auto synchronized =
+              request.session.synchronize_exact_decode_batch(
+                  successors,
+                  first_position + static_cast<std::uint32_t>(offset),
+                  offset + count == tokens.size());
+          require(synchronized.ok(), synchronized.message());
+          offset += count;
         }
-        segment_position +=
-            static_cast<std::uint32_t>(segments[index].size());
-        segment_offset += segments[index].size();
-        if (segment_position == request.retention_position) {
-          request.retention_predicted = request.predicted;
-          request.retention_prediction_valid = true;
-          const auto checkpoint =
-              request.session.checkpoint_retention(segment_position);
-          require(checkpoint.ok(), checkpoint.message());
-          retention_checkpointed = true;
-        }
+      }
+      bool retention_checkpointed{};
+      if (interior_retention) {
+        const auto checkpoint = request.session.checkpoint_retention(
+            request.retention_position);
+        require(checkpoint.ok(), checkpoint.message());
+        retention_checkpointed = true;
       }
       program_steps += tokens.size();
       program_step_ns += static_cast<std::uint64_t>(

@@ -3351,7 +3351,16 @@ class Application:
     })
     _TELEMETRY_CONFIGURATION_KEYS = frozenset({
         "provider_workspace_rows", "provider_compact_flash_prefill",
+        "provider_program_sequence_tile_rows",
+        "provider_large_exact_prefill_workspace",
+        "provider_workspace_preflight_free_bytes",
+        "provider_workspace_postallocation_free_bytes",
     })
+
+    _PREFILL_TELEMETRY_KEYS = (
+        "cache_read_bytes", "cache_uploaded_bytes",
+        "cache_storage_wait_ns", "cache_upload_wait_ns",
+    )
 
     @classmethod
     def _request_telemetry_fields(
@@ -3502,6 +3511,9 @@ class Application:
             else:
                 retain = False
         stats_before = self.worker_stats()
+        stats_after_prefill: dict[str, int] | None = None
+        prefill_wall_seconds: float | None = None
+        prefill_stats_seconds: float | None = None
         prefill_tokens = len(prompt_ids)
         resumed = False
         finished = False
@@ -3577,6 +3589,10 @@ class Application:
                     session = None
                     continue
                 raise
+        prefill_wall_seconds = time.monotonic() - started
+        prefill_stats_started = time.monotonic()
+        stats_after_prefill = self.worker_stats()
+        prefill_stats_seconds = time.monotonic() - prefill_stats_started
         try:
             for index in range(maximum):
                 if progress_callback is not None:
@@ -3667,11 +3683,21 @@ class Application:
                 self._drop_worker_session(session.key)
             stats_after = self.worker_stats()
             deltas = self._request_telemetry_fields(stats_before, stats_after)
+            prefill_deltas = self._request_telemetry_fields(
+                stats_before, stats_after_prefill or stats_before
+            )
+            prefill_fields = {
+                f"prefill_{key}": prefill_deltas[key]
+                for key in self._PREFILL_TELEMETRY_KEYS
+                if key in prefill_deltas
+            }
             log("request_telemetry", request_id=request_id, resumed=resumed,
                 prefill_tokens=prefill_tokens,
                 generated_tokens=len(generated), finished=finished,
                 wall_seconds=time.monotonic() - started,
-                ttft_seconds=first_token_seconds, **deltas)
+                prefill_wall_seconds=prefill_wall_seconds,
+                prefill_stats_seconds=prefill_stats_seconds,
+                ttft_seconds=first_token_seconds, **prefill_fields, **deltas)
 
     def info(self) -> dict[str, Any]:
         with self.active_lock:

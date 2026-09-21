@@ -1454,6 +1454,10 @@ class Fp4RoutedExperts final {
     cuda_check(cudaMalloc(reinterpret_cast<void**>(&device_execution_indices_),
                           maximum_selections * sizeof(std::uint32_t)),
                "allocate FP4 execution route");
+    cuda_check(cudaMalloc(reinterpret_cast<void**>(&device_grouped_work_),
+                          maximum_selections *
+                              sizeof(ec::MoeGroupedSelectionWork)),
+               "allocate grouped FP4 execution work");
     cuda_check(cudaStreamCreateWithFlags(&host_transfer_stream_,
                                          cudaStreamNonBlocking),
                "create FP4 host transfer stream");
@@ -1513,6 +1517,8 @@ class Fp4RoutedExperts final {
       static_cast<void>(cudaStreamDestroy(host_transfer_stream_));
     if (device_execution_indices_)
       static_cast<void>(cudaFree(device_execution_indices_));
+    if (device_grouped_work_)
+      static_cast<void>(cudaFree(device_grouped_work_));
     if (device_alternate_slots_)
       static_cast<void>(cudaFree(device_alternate_slots_));
     if (device_primary_mask_)
@@ -1565,6 +1571,18 @@ class Fp4RoutedExperts final {
 
   [[nodiscard]] std::uint64_t host_warm_failed() const noexcept {
     return host_warm_failed_.load(std::memory_order_relaxed);
+  }
+
+  [[nodiscard]] std::uint64_t grouped_prefill_calls() const noexcept {
+    return grouped_prefill_calls_;
+  }
+
+  [[nodiscard]] std::uint64_t grouped_prefill_work_items() const noexcept {
+    return grouped_prefill_work_items_;
+  }
+
+  [[nodiscard]] std::uint64_t grouped_prefill_selections() const noexcept {
+    return grouped_prefill_selections_;
   }
 
   void execute(std::uint32_t layer, const float* input,
@@ -1740,6 +1758,40 @@ class Fp4RoutedExperts final {
         found->output_slots.push_back(alternate_slots[selection]);
       }
 
+      const auto grouped_prefill = rows > 8U && !native_nvfp4_;
+      std::vector<ec::MoeGroupedSelectionWork> grouped_work;
+      std::size_t grouped_work_count{};
+      std::uint64_t grouped_selection_count{};
+      if (grouped_prefill) {
+        grouped_work.resize(selection_count);
+        std::map<std::uint32_t, std::vector<std::uint32_t>> by_expert;
+        for (std::uint32_t selection = 0U; selection < selection_count;
+             ++selection) {
+          if (!primary_mask[selection]) continue;
+          by_expert[execution_indices[selection]].push_back(selection);
+          ++grouped_selection_count;
+        }
+        for (const auto& [expert, selections] : by_expert) {
+          for (std::size_t first = 0U; first < selections.size();
+               first += ec::kMoeGroupedSelectionWidth) {
+            auto& item = grouped_work.at(grouped_work_count++);
+            item.expert = expert;
+            item.count = static_cast<std::uint32_t>(std::min<std::size_t>(
+                ec::kMoeGroupedSelectionWidth, selections.size() - first));
+            std::copy_n(selections.data() + first, item.count,
+                        item.selections);
+          }
+        }
+        cuda_check(cudaMemcpyAsync(
+                       device_grouped_work_, grouped_work.data(),
+                       grouped_work_count * sizeof(grouped_work[0]),
+                       cudaMemcpyHostToDevice, execution_stream_),
+                   "stage grouped FP4 execution work");
+        ++grouped_prefill_calls_;
+        grouped_prefill_work_items_ += grouped_work_count;
+        grouped_prefill_selections_ += grouped_selection_count;
+      }
+
       const auto index_bytes = static_cast<std::size_t>(selection_count) *
                                sizeof(std::uint32_t);
       cuda_check(cudaMemcpyAsync(device_execution_indices_,
@@ -1788,7 +1840,8 @@ class Fp4RoutedExperts final {
                              quantized_input_scales, quantized_intermediate,
                              quantized_intermediate_scales,
                              nvfp4_gate_input, nvfp4_up_input,
-                             nvfp4_down_input, rows);
+                             nvfp4_down_input, rows,
+                             static_cast<std::uint32_t>(grouped_work_count));
       if (measure_gpu) {
         cuda_check(cudaEventRecord(gpu_finished_event_, execution_stream_),
                    "record FP4 GPU execution finish");
@@ -1984,7 +2037,20 @@ class Fp4RoutedExperts final {
       std::int8_t* quantized_intermediate,
       float* quantized_intermediate_scales, float* nvfp4_gate_input,
       float* nvfp4_up_input, float* nvfp4_down_input,
-      std::uint32_t rows) {
+      std::uint32_t rows, std::uint32_t grouped_work_items) {
+    if (grouped_work_items != 0U) {
+      status_check(ec::launch_moe_selection_batch({
+          input, routing_weights, device_execution_indices_,
+          device_primary_mask_, intermediate, selection_output,
+          quantized_input, quantized_input_scales, quantized_intermediate,
+          quantized_intermediate_scales, rows, component_.hidden_size,
+          component_.intermediate_size, component_.route_width,
+          component_.experts_per_layer, execution_stream_,
+          directory_->device_entries(), layer, 0.0F, false,
+          true, false, nvfp4_gate_input, nvfp4_up_input, nvfp4_down_input,
+          device_grouped_work_, grouped_work_items, true}));
+      return;
+    }
     const auto key = (static_cast<std::uint64_t>(layer) << 32U) | rows;
     auto found = selection_graphs_.find(key);
     if (found == selection_graphs_.end()) {
@@ -2154,6 +2220,10 @@ class Fp4RoutedExperts final {
   std::uint8_t* device_primary_mask_{};
   std::uint32_t* device_alternate_slots_{};
   std::uint32_t* device_execution_indices_{};
+  ec::MoeGroupedSelectionWork* device_grouped_work_{};
+  std::uint64_t grouped_prefill_calls_{};
+  std::uint64_t grouped_prefill_work_items_{};
+  std::uint64_t grouped_prefill_selections_{};
   std::uint64_t observed_upload_bytes_{};
   std::uint64_t observed_upload_wait_ns_{};
   std::uint32_t gpu_observation_selections_{};
@@ -2539,8 +2609,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
         !exact_fp16_kv() && !qsa_enabled_ && !mla_enabled_ &&
         head_dim_ == 256U && query_heads_ != 0U && kv_heads_ != 0U &&
         query_heads_ % kv_heads_ == 0U;
-    workspace_rows_ = compact_flash_prefill_ ? kMaximumWorkspaceRows
-                                              : kDefaultWorkspaceRows;
+    large_exact_prefill_workspace_ =
+        exact_fp16_kv() && qsa_enabled_ && hyper_enabled_ && ple_enabled_ &&
+        !descriptor_.routed_components.empty();
+    workspace_rows_ =
+        (compact_flash_prefill_ || large_exact_prefill_workspace_)
+            ? kMaximumWorkspaceRows
+            : kDefaultWorkspaceRows;
     if (qsa_enabled_ && !device_resident_fp16_kv_ && !qsa_tiered_)
       throw std::runtime_error(
           "latency-profile QSA requires exact FP16 KV and index to fit in VRAM");
@@ -3011,6 +3086,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
              program_sequence_host_bytes_},
             {"provider_program_sequence_tile_rows", sequence_tile_rows_},
             {"provider_workspace_rows", workspace_rows_},
+            {"provider_large_exact_prefill_workspace",
+             large_exact_prefill_workspace_ ? 1U : 0U},
+            {"provider_workspace_preflight_free_bytes",
+             workspace_preflight_free_bytes_},
+            {"provider_workspace_postallocation_free_bytes",
+             workspace_postallocation_free_bytes_},
             {"provider_compact_flash_prefill",
              compact_flash_prefill_ ? 1U : 0U},
             {"provider_sampling_gpu_calls", sampling_gpu_calls_},
@@ -3129,6 +3210,12 @@ class DenseFp4Provider final : public er::IOperationProvider {
                      routed_experts_->host_warm_completed());
       result.emplace("routed_host_warm_failed",
                      routed_experts_->host_warm_failed());
+      result.emplace("routed_grouped_prefill_calls",
+                     routed_experts_->grouped_prefill_calls());
+      result.emplace("routed_grouped_prefill_work_items",
+                     routed_experts_->grouped_prefill_work_items());
+      result.emplace("routed_grouped_prefill_selections",
+                     routed_experts_->grouped_prefill_selections());
       result.emplace("routed_cpu_decisions", hybrid.cpu_only +
                                              hybrid.cpu_cost_wins +
                                              hybrid.cpu_calibrations);
@@ -3774,11 +3861,14 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t kv_cache_bytes_{};
   std::uint32_t kv_page_tokens_{};
   std::uint32_t workspace_rows_{kDefaultWorkspaceRows};
+  std::uint64_t workspace_preflight_free_bytes_{};
+  std::uint64_t workspace_postallocation_free_bytes_{};
   TargetKvEncoding target_kv_encoding_{TargetKvEncoding::artifact_native};
   bool capacity_placement_{};
   bool fit_routed_vram_{};
   bool device_resident_fp16_kv_{};
   bool compact_flash_prefill_{};
+  bool large_exact_prefill_workspace_{};
   std::uint32_t hidden_size_{};
   std::uint32_t vocabulary_size_{};
   std::uint32_t query_heads_{};
@@ -3978,6 +4068,10 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float* hidden_{};
   float* sequence_hidden_{};
   std::size_t sequence_hidden_values_{};
+  float* sequence_hyper_{};
+  std::size_t sequence_hyper_values_{};
+  float* sequence_injection_{};
+  std::size_t sequence_injection_values_{};
   std::uint32_t sequence_tile_rows_{};
   float* normalized_{};
   float* residual_{};
@@ -4627,6 +4721,18 @@ void DenseFp4Provider::initialize_execution() {
     staged_int8_weight_capacity_values_ = std::max(
         staged_int8_weight_capacity_values_, int8_matrix_bytes / sizeof(float));
   }
+  if (large_exact_prefill_workspace_) {
+    std::size_t free_bytes{};
+    std::size_t total_bytes{};
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes),
+               "inspect large exact-prefill workspace headroom");
+    workspace_preflight_free_bytes_ = free_bytes;
+    const auto reserve = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(total_bytes) / 8U, 1ULL << 30U);
+    if (static_cast<std::uint64_t>(free_bytes) <= reserve)
+      throw std::runtime_error(
+          "large exact-prefill workspace cannot preserve the device reserve");
+  }
   const auto maximum_columns = align32(std::max(
       {2U * hidden_size_, hidden_size_, intermediate_size_,
        shared_intermediate_size_, expert_width_,
@@ -4641,6 +4747,18 @@ void DenseFp4Provider::initialize_execution() {
       sizeof(std::uint16_t);
   allocate_workspace();
   allocate_state();
+  if (large_exact_prefill_workspace_) {
+    std::size_t free_bytes{};
+    std::size_t total_bytes{};
+    cuda_check(cudaMemGetInfo(&free_bytes, &total_bytes),
+               "verify large exact-prefill workspace reserve");
+    workspace_postallocation_free_bytes_ = free_bytes;
+    const auto reserve = std::min<std::uint64_t>(
+        static_cast<std::uint64_t>(total_bytes) / 8U, 1ULL << 30U);
+    if (static_cast<std::uint64_t>(free_bytes) < reserve)
+      throw std::runtime_error(
+          "large exact-prefill workspace consumed the device reserve");
+  }
   if (fit_routed_vram_ && routed_experts_) {
     if (!all_kv_pages_.empty() || !all_target_mirror_pages_.empty())
       throw std::runtime_error(
@@ -4736,6 +4854,16 @@ void DenseFp4Provider::allocate_workspace() {
                             sequence_tile_rows_ * hidden_size_;
   sequence_hidden_ = device_allocate<float>(
       allocations_, sequence_hidden_values_);
+  if (hyper_enabled_) {
+    sequence_hyper_values_ = static_cast<std::size_t>(capacity_) *
+                             sequence_tile_rows_ * hyper_width_;
+    sequence_injection_values_ = static_cast<std::size_t>(capacity_) *
+                                 sequence_tile_rows_ * hyper_count_;
+    sequence_hyper_ = device_allocate<float>(
+        allocations_, sequence_hyper_values_);
+    sequence_injection_ = device_allocate<float>(
+        allocations_, sequence_injection_values_);
+  }
   normalized_ =
       device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   residual_ = device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
@@ -5864,22 +5992,39 @@ void DenseFp4Provider::ensure_logits_capacity(std::uint32_t rows) {
 }
 
 void DenseFp4Provider::ensure_sequence_workspace() {
-  if (sequence_hidden_) return;
+  if (sequence_hidden_ && (!hyper_enabled_ ||
+                           (sequence_hyper_ && sequence_injection_)))
+    return;
   if (!sequence_hidden_values_)
     throw std::runtime_error("sequence workspace geometry is empty");
-  sequence_hidden_ =
-      device_allocate<float>(allocations_, sequence_hidden_values_);
+  if (!sequence_hidden_)
+    sequence_hidden_ =
+        device_allocate<float>(allocations_, sequence_hidden_values_);
+  if (hyper_enabled_) {
+    if (!sequence_hyper_values_ || !sequence_injection_values_)
+      throw std::runtime_error("Hyper sequence workspace geometry is empty");
+    if (!sequence_hyper_)
+      sequence_hyper_ =
+          device_allocate<float>(allocations_, sequence_hyper_values_);
+    if (!sequence_injection_)
+      sequence_injection_ =
+          device_allocate<float>(allocations_, sequence_injection_values_);
+  }
 }
 
 void DenseFp4Provider::release_sequence_workspace() noexcept {
-  if (!sequence_hidden_) return;
-  const auto allocation = sequence_hidden_;
-  const auto released = cudaFree(allocation);
-  if (released != cudaSuccess) return;
-  const auto found = std::find(allocations_.begin(), allocations_.end(),
-                               static_cast<void*>(allocation));
-  if (found != allocations_.end()) *found = nullptr;
-  sequence_hidden_ = nullptr;
+  const auto release = [this](float*& allocation) {
+    if (!allocation) return;
+    const auto pointer = allocation;
+    if (cudaFree(pointer) != cudaSuccess) return;
+    const auto found = std::find(allocations_.begin(), allocations_.end(),
+                                 static_cast<void*>(pointer));
+    if (found != allocations_.end()) *found = nullptr;
+    allocation = nullptr;
+  };
+  release(sequence_injection_);
+  release(sequence_hyper_);
+  release(sequence_hidden_);
 }
 
 void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
@@ -8438,8 +8583,7 @@ void DenseFp4Provider::extend_mtp_rollout(
 bool DenseFp4Provider::supports_program_sequence(
     const er::CompiledModelProgram& program) const noexcept {
   try {
-    if (hyper_enabled_ || qsa_enabled_ || ple_enabled_ ||
-        program.operations.size() != prepared_target_.size() ||
+    if (program.operations.size() != prepared_target_.size() ||
         program.operations.empty() ||
         program.inputs.size() != (vision_enabled_ ? 3U : 2U) ||
         program.outputs.size() != 1U ||
@@ -8483,6 +8627,9 @@ bool DenseFp4Provider::supports_program_sequence(
     };
 
     std::optional<std::uint32_t> hidden;
+    std::optional<std::uint32_t> hyper;
+    std::optional<std::uint32_t> retained;
+    std::optional<std::uint32_t> injection;
     std::optional<std::uint32_t> expert_input;
     std::optional<std::uint32_t> route_indices;
     std::optional<std::uint32_t> route_weights;
@@ -8493,12 +8640,6 @@ bool DenseFp4Provider::supports_program_sequence(
       const auto& prepared = *prepared_target_[index];
       if (prepared.logical_operation != index) return false;
       switch (prepared.kernel) {
-        case Kernel::hyper_initialize:
-        case Kernel::ple:
-        case Kernel::hyper_read:
-        case Kernel::hyper_inject:
-        case Kernel::hyper_reduce:
-          return false;
         case Kernel::embedding:
           if (index != 0U || compiled.input_values.size() != 1U ||
               compiled.output_values.size() != 1U ||
@@ -8506,6 +8647,62 @@ bool DenseFp4Provider::supports_program_sequence(
             return false;
           hidden = value_for_port(compiled, "hidden", true);
           if (!hidden) return false;
+          break;
+        case Kernel::hyper_initialize:
+          if (!hidden || hyper || retained || injection ||
+              compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hidden", false) != hidden)
+            return false;
+          hyper = value_for_port(compiled, "hyper", true);
+          if (!hyper) return false;
+          hidden.reset();
+          break;
+        case Kernel::ple:
+          if (!hyper || hidden || retained || injection ||
+              compiled.input_values.size() != 2U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hyper", false) != hyper ||
+              value_for_port(compiled, "token_ids", false) != token_input)
+            return false;
+          hyper = value_for_port(compiled, "hyper", true);
+          if (!hyper) return false;
+          break;
+        case Kernel::hyper_read:
+          if (!hyper || hidden || retained || injection ||
+              compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 3U ||
+              value_for_port(compiled, "hyper", false) != hyper)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          retained = value_for_port(compiled, "retained", true);
+          injection = value_for_port(compiled, "injection", true);
+          if (!hidden || !retained || !injection) return false;
+          hyper.reset();
+          break;
+        case Kernel::hyper_inject:
+          if (!hidden || hyper || !retained || !injection ||
+              compiled.input_values.size() != 3U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "retained", false) != retained ||
+              value_for_port(compiled, "hidden", false) != hidden ||
+              value_for_port(compiled, "injection", false) != injection)
+            return false;
+          hyper = value_for_port(compiled, "hyper", true);
+          if (!hyper) return false;
+          hidden.reset();
+          retained.reset();
+          injection.reset();
+          break;
+        case Kernel::hyper_reduce:
+          if (!hyper || hidden || retained || injection ||
+              compiled.input_values.size() != 1U ||
+              compiled.output_values.size() != 1U ||
+              value_for_port(compiled, "hyper", false) != hyper)
+            return false;
+          hidden = value_for_port(compiled, "hidden", true);
+          if (!hidden) return false;
+          hyper.reset();
           break;
         case Kernel::vision:
           if (!vision_enabled_ || !hidden || !media_input ||
@@ -8528,27 +8725,35 @@ bool DenseFp4Provider::supports_program_sequence(
           hidden = value_for_port(compiled, "hidden", true);
           if (!hidden) return false;
           break;
-        case Kernel::router:
+        case Kernel::router: {
+          const auto no_residual =
+              prepared.capability ==
+              "router.linear-topk.shared-swiglu.no-residual.v1";
           if (!hidden || expert_input || route_indices || route_weights ||
               residual || shared_output ||
               compiled.input_values.size() != 1U ||
-              compiled.output_values.size() != 5U ||
+              compiled.output_values.size() != (no_residual ? 4U : 5U) ||
               value_for_port(compiled, "hidden", false) != hidden)
             return false;
           expert_input = value_for_port(compiled, "expert_input", true);
           route_indices = value_for_port(compiled, "route_indices", true);
           route_weights = value_for_port(compiled, "route_weights", true);
-          residual = value_for_port(compiled, "residual", true);
+          if (!no_residual)
+            residual = value_for_port(compiled, "residual", true);
           shared_output = value_for_port(compiled, "shared_output", true);
-          if (!expert_input || !route_indices || !route_weights || !residual ||
-              !shared_output)
+          if (!expert_input || !route_indices || !route_weights ||
+              (!no_residual && !residual) || !shared_output)
             return false;
           hidden.reset();
           break;
-        case Kernel::routed_moe:
+        }
+        case Kernel::routed_moe: {
+          const auto no_residual =
+              prepared.capability ==
+              "moe.swiglu.routed.merge-shared.no-residual.v1";
           if (hidden || !expert_input || !route_indices || !route_weights ||
-              !residual || !shared_output ||
-              compiled.input_values.size() != 5U ||
+              (!no_residual && !residual) || !shared_output ||
+              compiled.input_values.size() != (no_residual ? 4U : 5U) ||
               compiled.output_values.size() != 1U ||
               value_for_port(compiled, "expert_input", false) !=
                   expert_input ||
@@ -8556,7 +8761,8 @@ bool DenseFp4Provider::supports_program_sequence(
                   route_indices ||
               value_for_port(compiled, "route_weights", false) !=
                   route_weights ||
-              value_for_port(compiled, "residual", false) != residual ||
+              (!no_residual &&
+               value_for_port(compiled, "residual", false) != residual) ||
               value_for_port(compiled, "shared_output", false) !=
                   shared_output)
             return false;
@@ -8568,6 +8774,7 @@ bool DenseFp4Provider::supports_program_sequence(
           residual.reset();
           shared_output.reset();
           break;
+        }
         case Kernel::ffn:
           if (!hidden || compiled.input_values.size() != 1U ||
               compiled.output_values.size() != 1U ||
@@ -8592,8 +8799,8 @@ bool DenseFp4Provider::supports_program_sequence(
           return false;
       }
     }
-    return !hidden && !expert_input && !route_indices && !route_weights &&
-           !residual && !shared_output;
+    return !hidden && !hyper && !retained && !injection && !expert_input &&
+           !route_indices && !route_weights && !residual && !shared_output;
   } catch (...) {
     return false;
   }
@@ -9721,6 +9928,16 @@ DenseFp4Provider::poll_program_sequence(
         sequence_hidden_ +
         static_cast<std::size_t>(sequence->request->slot()) *
             sequence_tile_rows_ * hidden_size_;
+    auto* tile_hyper = hyper_enabled_
+        ? sequence_hyper_ +
+              static_cast<std::size_t>(sequence->request->slot()) *
+                  sequence_tile_rows_ * hyper_width_
+        : nullptr;
+    auto* tile_injection = hyper_enabled_
+        ? sequence_injection_ +
+              static_cast<std::size_t>(sequence->request->slot()) *
+                  sequence_tile_rows_ * hyper_count_
+        : nullptr;
 
     if (operation.kernel == Kernel::head) {
       if (sequence->next_row != 0U || total_rows == 0U ||
@@ -9765,15 +9982,38 @@ DenseFp4Provider::poll_program_sequence(
         sequence->next_row = 0U;
         return std::nullopt;
       }
+      const auto phase_event = begin_gpu_phase(GpuPhase::head);
+      std::vector<std::uint32_t> predictions;
+      if (sequence->retention_position != 0U &&
+          sequence->retention_position <= sequence->positions.back()) {
+        cuda_check(cudaMemcpy(
+                       hidden_,
+                       slot_retention_last_hidden_ +
+                           static_cast<std::size_t>(
+                               sequence->request->slot()) * hidden_size_,
+                       hidden_size_ * sizeof(float),
+                       cudaMemcpyDeviceToDevice),
+                   "load retained program-sequence hidden state");
+        auto retained = run_head(
+            operation, 1U, &sequence->generation, sequence->request.get(),
+            sequence->retention_position - 1U, true);
+        if (retained.size() != 1U)
+          throw std::runtime_error(
+              "program-sequence retained head returned invalid width");
+        predictions.push_back(retained.front());
+      }
       cuda_check(cudaMemcpy(
                      hidden_,
                      tile_hidden + (sequence->tile_rows - 1U) * hidden_size_,
                      hidden_size_ * sizeof(float), cudaMemcpyDeviceToDevice),
                  "load final program-sequence hidden state");
-      const auto phase_event = begin_gpu_phase(GpuPhase::head);
-      auto predictions = run_head(
+      auto terminal = run_head(
           operation, 1U, &sequence->generation, sequence->request.get(),
           sequence->positions.back(), true);
+      if (terminal.size() != 1U)
+        throw std::runtime_error(
+            "program-sequence terminal head returned invalid width");
+      predictions.push_back(terminal.front());
       auto* retained_hidden = slot_target_hidden_batch_ +
                               static_cast<std::size_t>(
                                   sequence->request->slot()) *
@@ -9867,6 +10107,20 @@ DenseFp4Provider::poll_program_sequence(
     auto phase_event = begin_gpu_phase(gpu_phase(operation.kernel));
     bool phase_ended = false;
     std::uint32_t operation_advance = 1U;
+    const auto stage_candidate =
+        rows > 8U && staged_dense_weight_capacity_bytes_ != 0U &&
+        operation.kernel != Kernel::embedding &&
+        operation.kernel != Kernel::routed_moe;
+    if (stage_candidate && sequence->next_row == 0U)
+      static_cast<void>(sequence_staging_has_headroom(*sequence, operation));
+    auto staged = false;
+    if (stage_candidate && !sequence->staging_disabled) {
+      staged = activate_staged_weights(operation);
+      if (!staged) {
+        sequence->staging_disabled = true;
+        ++staged_dense_weight_low_memory_fallbacks_;
+      }
+    }
     if (operation.kernel == Kernel::embedding) {
       run_embedding(operation, sequence->tokens.data() + offset, rows);
       cuda_check(cudaMemcpy(
@@ -9874,25 +10128,117 @@ DenseFp4Provider::poll_program_sequence(
                      hidden_bytes, cudaMemcpyDeviceToDevice),
                  "store program-sequence embedding tile");
       program_sequence_device_bytes_ += hidden_bytes;
+    } else if (operation.kernel == Kernel::hyper_initialize) {
+      if (!tile_hyper)
+        throw std::runtime_error("program-sequence Hyper tile is absent");
+      cuda_check(cudaMemcpy(hidden_,
+                            tile_hidden + tile_offset * hidden_size_,
+                            hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence Hyper initialization tile");
+      status_check(ec::hyper_repeat_batch(
+          hidden_, hyper_, rows, hidden_size_, hyper_count_, nullptr));
+      const auto hyper_bytes = static_cast<std::size_t>(rows) * hyper_width_ *
+                               sizeof(float);
+      cuda_check(cudaMemcpy(tile_hyper + tile_offset * hyper_width_, hyper_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "store program-sequence initialized Hyper tile");
+      program_sequence_device_bytes_ += hidden_bytes + hyper_bytes;
+    } else if (operation.kernel == Kernel::ple) {
+      if (!tile_hyper)
+        throw std::runtime_error("program-sequence PLE Hyper tile is absent");
+      const auto hyper_bytes = static_cast<std::size_t>(rows) * hyper_width_ *
+                               sizeof(float);
+      cuda_check(cudaMemcpy(hyper_, tile_hyper + tile_offset * hyper_width_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence PLE Hyper tile");
+      run_ple(operation, *sequence->request,
+              std::span(sequence->tokens).subspan(offset, rows), rows);
+      cuda_check(cudaMemcpy(tile_hyper + tile_offset * hyper_width_, hyper_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "store program-sequence PLE Hyper tile");
+      program_sequence_device_bytes_ += 2U * hyper_bytes;
+      if (sequence->retention_position != 0U &&
+          offset + rows == static_cast<std::size_t>(
+                               sequence->retention_position -
+                               sequence->positions.front())) {
+        cuda_check(cudaMemcpy(
+                       ple_conv_retention_checkpoint_[operation.ple_slot] +
+                           static_cast<std::size_t>(
+                               sequence->request->slot()) *
+                               ple_conv_state_values_,
+                       ple_conv_state_[operation.ple_slot] +
+                           static_cast<std::size_t>(
+                               sequence->request->slot()) *
+                               ple_conv_state_values_,
+                       ple_conv_state_values_ * sizeof(float),
+                       cudaMemcpyDeviceToDevice),
+                   "checkpoint layer-major PLE convolution state");
+        const auto history_values = ple_ngram_size_ - 1U;
+        const auto history_offset = static_cast<std::size_t>(
+            operation.ple_slot) * history_values;
+        std::copy_n(sequence->request->ple_history.data() + history_offset,
+                    history_values,
+                    sequence->request->ple_retention_history.data() +
+                        history_offset);
+      }
+    } else if (operation.kernel == Kernel::hyper_read ||
+               operation.kernel == Kernel::hyper_reduce) {
+      if (!tile_hyper ||
+          (operation.kernel == Kernel::hyper_read && !tile_injection))
+        throw std::runtime_error("program-sequence Hyper read tile is absent");
+      const auto hyper_bytes = static_cast<std::size_t>(rows) * hyper_width_ *
+                               sizeof(float);
+      cuda_check(cudaMemcpy(hyper_, tile_hyper + tile_offset * hyper_width_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence Hyper read tile");
+      const auto reduce = operation.kernel == Kernel::hyper_reduce;
+      run_hyper_read(operation, rows, reduce);
+      cuda_check(cudaMemcpy(tile_hidden + tile_offset * hidden_size_, hidden_,
+                            hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "store program-sequence Hyper read hidden tile");
+      program_sequence_device_bytes_ += hyper_bytes + hidden_bytes;
+      if (!reduce) {
+        const auto injection_bytes = static_cast<std::size_t>(rows) *
+                                     hyper_count_ * sizeof(float);
+        cuda_check(cudaMemcpy(
+                       tile_injection + tile_offset * hyper_count_,
+                       hyper_injection_, injection_bytes,
+                       cudaMemcpyDeviceToDevice),
+                   "store program-sequence Hyper injection tile");
+        program_sequence_device_bytes_ += injection_bytes;
+      }
+    } else if (operation.kernel == Kernel::hyper_inject) {
+      if (!tile_hyper || !tile_injection)
+        throw std::runtime_error("program-sequence Hyper injection tile is absent");
+      const auto hyper_bytes = static_cast<std::size_t>(rows) * hyper_width_ *
+                               sizeof(float);
+      const auto injection_bytes = static_cast<std::size_t>(rows) *
+                                   hyper_count_ * sizeof(float);
+      cuda_check(cudaMemcpy(hyper_, tile_hyper + tile_offset * hyper_width_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "load retained program-sequence Hyper tile");
+      cuda_check(cudaMemcpy(hidden_,
+                            tile_hidden + tile_offset * hidden_size_,
+                            hidden_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence Hyper block output");
+      cuda_check(cudaMemcpy(
+                     hyper_injection_,
+                     tile_injection + tile_offset * hyper_count_,
+                     injection_bytes, cudaMemcpyDeviceToDevice),
+                 "load program-sequence Hyper injection coefficients");
+      status_check(ec::hyper_inject_batch(
+          hyper_, hidden_, hyper_injection_, hyper_, rows, hidden_size_,
+          hyper_count_, nullptr));
+      cuda_check(cudaMemcpy(tile_hyper + tile_offset * hyper_width_, hyper_,
+                            hyper_bytes, cudaMemcpyDeviceToDevice),
+                 "store injected program-sequence Hyper tile");
+      program_sequence_device_bytes_ +=
+          2U * hyper_bytes + hidden_bytes + injection_bytes;
     } else {
       cuda_check(cudaMemcpy(hidden_,
                             tile_hidden + tile_offset * hidden_size_,
                             hidden_bytes, cudaMemcpyDeviceToDevice),
                  "load program-sequence hidden tile");
-      const auto stage_candidate =
-          rows > 8U && staged_dense_weight_capacity_bytes_ != 0U &&
-          operation.kernel != Kernel::routed_moe;
-      if (stage_candidate && sequence->next_row == 0U)
-        static_cast<void>(
-            sequence_staging_has_headroom(*sequence, operation));
-      auto staged = false;
-      if (stage_candidate && !sequence->staging_disabled) {
-        staged = activate_staged_weights(operation);
-        if (!staged) {
-          sequence->staging_disabled = true;
-          ++staged_dense_weight_low_memory_fallbacks_;
-        }
-      }
       switch (operation.kernel) {
         case Kernel::hyper_initialize:
         case Kernel::ple:
@@ -9900,19 +10246,26 @@ DenseFp4Provider::poll_program_sequence(
         case Kernel::hyper_inject:
         case Kernel::hyper_reduce:
           throw std::runtime_error(
-              "Hyper/PLE operation entered unsupported sequence path");
+              "Hyper/PLE operation entered the hidden-only sequence path");
         case Kernel::full_attention:
         case Kernel::recurrent_attention: {
-          cuda_check(cudaMemcpy(residual_, hidden_,
-                                static_cast<std::size_t>(rows) * hidden_size_ *
-                                    sizeof(float),
-                                cudaMemcpyDeviceToDevice),
-                     "retain program-sequence attention residual");
-          if (operation.kernel == Kernel::full_attention)
-            normalize_operation_input(operation, hidden_, normalized_, rows);
-          else
-            normalize_rows(hidden_, binding(operation, "input_norm").f32,
-                           normalized_, rows);
+          const auto no_residual =
+              operation.capability ==
+                  "block.sparse-attention.qsa.output-gated.v1" ||
+              operation.capability ==
+                  "block.recurrent-linear-attention.split-gated-delta.no-residual.v1";
+          if (!no_residual) {
+            cuda_check(cudaMemcpy(residual_, hidden_,
+                                  static_cast<std::size_t>(rows) * hidden_size_ *
+                                      sizeof(float),
+                                  cudaMemcpyDeviceToDevice),
+                       "retain program-sequence attention residual");
+            if (operation.kernel == Kernel::full_attention)
+              normalize_operation_input(operation, hidden_, normalized_, rows);
+            else
+              normalize_rows(hidden_, binding(operation, "input_norm").f32,
+                             normalized_, rows);
+          }
           const auto positions = std::span(sequence->positions)
                                      .subspan(offset, rows);
           if (operation.kernel == Kernel::full_attention) {
@@ -9978,7 +10331,11 @@ DenseFp4Provider::poll_program_sequence(
                            cudaMemcpyDeviceToDevice),
                        "checkpoint layer-major recurrent matrix state");
           }
-          if (operation.kernel == Kernel::full_attention)
+          if (no_residual)
+            cuda_check(cudaMemcpy(hidden_, residual_, hidden_bytes,
+                                  cudaMemcpyDeviceToDevice),
+                       "commit program-sequence no-residual attention output");
+          else if (operation.kernel == Kernel::full_attention)
             finish_attention_block(operation, rows);
           else
             status_check(ec::add_in_place(hidden_, residual_,
@@ -10018,13 +10375,13 @@ DenseFp4Provider::poll_program_sequence(
           throw std::runtime_error(
               "invalid operation in program-sequence hidden phase");
       }
-      if (staged) deactivate_staged_weights();
       cuda_check(cudaMemcpy(
                      tile_hidden + tile_offset * hidden_size_, hidden_,
                      hidden_bytes, cudaMemcpyDeviceToDevice),
                  "store program-sequence hidden tile");
       program_sequence_device_bytes_ += 2U * hidden_bytes;
     }
+    if (staged) deactivate_staged_weights();
     if (!phase_ended) end_gpu_phase(phase_event);
     collect_gpu_phases();
     sequence->next_row += rows;

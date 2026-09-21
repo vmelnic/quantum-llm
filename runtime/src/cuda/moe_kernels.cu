@@ -509,6 +509,84 @@ __global__ void gate_up_silu_selection_batch(
   }
 }
 
+__global__ void gate_up_silu_grouped_fp4_batch(
+    const DeviceExpertEntry* directory, std::uint32_t directory_offset,
+    const MoeGroupedSelectionWork* work, float* intermediate,
+    std::uint32_t hidden, std::uint32_t width, std::uint32_t top_k,
+    const std::int8_t* quantized_input,
+    const float* quantized_input_scales) {
+  const auto& item = work[blockIdx.y];
+  if (item.count == 0U) return;
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto output_row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (output_row >= width) return;
+  const auto& entry = directory[directory_offset + item.expert];
+  const bool relu2 = entry.format == static_cast<std::uint32_t>(
+      DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32);
+  if (!relu2 &&
+      entry.format != static_cast<std::uint32_t>(
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32))
+    return;
+  const auto blocks = hidden / 32U;
+  const auto groups = hidden / 4U;
+  const auto* gate_weights =
+      entry.w1_fp4 + static_cast<std::size_t>(output_row) * (hidden / 2U);
+  const auto* gate_scales =
+      entry.w1_ue8m0 + static_cast<std::size_t>(output_row) * blocks;
+  const auto* up_weights = relu2
+      ? gate_weights
+      : entry.w3_fp4 +
+            static_cast<std::size_t>(output_row) * (hidden / 2U);
+  const auto* up_scales = relu2
+      ? gate_scales
+      : entry.w3_ue8m0 + static_cast<std::size_t>(output_row) * blocks;
+  float gate_total[kMoeGroupedSelectionWidth]{};
+  float up_total[kMoeGroupedSelectionWidth]{};
+  for (std::uint32_t group = lane; group < groups; group += kWarpSize) {
+    const auto byte_offset = group * 2U;
+    const auto packed_gate = packed_fp4x4(
+        gate_weights[byte_offset], gate_weights[byte_offset + 1U]);
+    const auto packed_up = relu2
+        ? packed_gate
+        : packed_fp4x4(up_weights[byte_offset],
+                       up_weights[byte_offset + 1U]);
+    const auto gate_scale = decode_ue8m0(gate_scales[group / 8U]);
+    const auto up_scale = relu2
+        ? gate_scale
+        : decode_ue8m0(up_scales[group / 8U]);
+    for (std::uint32_t local = 0U; local < item.count; ++local) {
+      const auto selection = item.selections[local];
+      const auto row = selection / top_k;
+      const auto* activation = quantized_input +
+          static_cast<std::size_t>(row) * hidden + group * 4U;
+      const auto q = *reinterpret_cast<const int*>(activation);
+      gate_total[local] +=
+          static_cast<float>(__dp4a(packed_gate, q, 0)) * gate_scale;
+      if (!relu2)
+        up_total[local] +=
+            static_cast<float>(__dp4a(packed_up, q, 0)) * up_scale;
+    }
+  }
+  for (std::uint32_t local = 0U; local < item.count; ++local) {
+    auto gate_sum = warp_sum(gate_total[local]) *
+                    quantized_input_scales[item.selections[local] / top_k] *
+                    0.5F;
+    auto up_sum = relu2
+        ? gate_sum
+        : warp_sum(up_total[local]) *
+              quantized_input_scales[item.selections[local] / top_k] * 0.5F;
+    if (lane == 0U) {
+      const auto value = relu2
+          ? fmaxf(up_sum, 0.0F) * fmaxf(up_sum, 0.0F)
+          : (gate_sum / (1.0F + expf(-gate_sum))) * up_sum;
+      intermediate[static_cast<std::size_t>(item.selections[local]) * width +
+                   output_row] = value;
+    }
+  }
+}
+
 __global__ void down_selection_batch(
     const DeviceExpertEntry* directory, std::uint32_t directory_offset,
     const std::uint32_t* indices, const std::uint8_t* mask,
@@ -561,6 +639,54 @@ __global__ void down_selection_batch(
       partial = __bfloat162float(__float2bfloat16_rn(partial));
     selection_outputs[static_cast<std::size_t>(selection) * hidden +
                       output_row] = partial;
+  }
+}
+
+__global__ void down_grouped_fp4_batch(
+    const DeviceExpertEntry* directory, std::uint32_t directory_offset,
+    const MoeGroupedSelectionWork* work, const std::int8_t* intermediate,
+    const float* intermediate_scales, float* selection_outputs,
+    std::uint32_t hidden, std::uint32_t width) {
+  const auto& item = work[blockIdx.y];
+  if (item.count == 0U) return;
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto output_row =
+      static_cast<std::uint32_t>(blockIdx.x) * kWarpsPerBlock + warp;
+  if (output_row >= hidden) return;
+  const auto& entry = directory[directory_offset + item.expert];
+  if (entry.format != static_cast<std::uint32_t>(
+                          DeviceExpertFormat::fp4_e2m1_ue8m0_block32) &&
+      entry.format != static_cast<std::uint32_t>(
+                          DeviceExpertFormat::fp4_relu2_e2m1_ue8m0_block32))
+    return;
+  const auto blocks = width / 32U;
+  const auto groups = width / 4U;
+  const auto* weights =
+      entry.w2_fp4 + static_cast<std::size_t>(output_row) * (width / 2U);
+  const auto* scales =
+      entry.w2_ue8m0 + static_cast<std::size_t>(output_row) * blocks;
+  float totals[kMoeGroupedSelectionWidth]{};
+  for (std::uint32_t group = lane; group < groups; group += kWarpSize) {
+    const auto byte_offset = group * 2U;
+    const auto packed = packed_fp4x4(weights[byte_offset],
+                                     weights[byte_offset + 1U]);
+    const auto scale = decode_ue8m0(scales[group / 8U]);
+    for (std::uint32_t local = 0U; local < item.count; ++local) {
+      const auto selection = item.selections[local];
+      const auto* activation = intermediate +
+          static_cast<std::size_t>(selection) * width + group * 4U;
+      const auto q = *reinterpret_cast<const int*>(activation);
+      totals[local] += static_cast<float>(__dp4a(packed, q, 0)) * scale;
+    }
+  }
+  for (std::uint32_t local = 0U; local < item.count; ++local) {
+    const auto selection = item.selections[local];
+    const auto total = warp_sum(totals[local]) *
+                       intermediate_scales[selection] * 0.5F;
+    if (lane == 0U)
+      selection_outputs[static_cast<std::size_t>(selection) * hidden +
+                        output_row] = total;
   }
 }
 
@@ -692,6 +818,9 @@ Status launch_moe_selection_batch(
       (launch.enable_native_nvfp4 &&
        (!launch.nvfp4_gate_input || !launch.nvfp4_up_input ||
         !launch.nvfp4_down_input)) ||
+      (launch.enable_grouped_fp4 &&
+       (!launch.enable_packed_fp4 || !launch.grouped_work ||
+        launch.grouped_work_items == 0U)) ||
       (launch.enable_packed_fp4 && launch.enable_native_nvfp4) ||
       launch.rows == 0 ||
       launch.hidden_size == 0 || launch.intermediate_size == 0 ||
@@ -725,17 +854,28 @@ Status launch_moe_selection_batch(
   }
   const dim3 gate_grid(
       (launch.intermediate_size + kWarpsPerBlock - 1U) / kWarpsPerBlock,
-      selections);
-  gate_up_silu_selection_batch<<<gate_grid, kThreads, 0, stream>>>(
-      launch.input, launch.directory_entries,
-      launch.directory_layer * launch.expert_table_size,
-      launch.intermediate, launch.hidden_size, launch.intermediate_size,
-      launch.top_k, launch.expert_indices, launch.selection_mask,
-      launch.swiglu_limit, launch.bf16_intermediate, launch.quantized_input,
-      launch.quantized_input_scales, launch.nvfp4_gate_input,
-      launch.nvfp4_up_input);
-  status =
-      cuda_status(cudaPeekAtLastError(), "gate_up_silu_selection launch");
+      launch.enable_grouped_fp4 ? launch.grouped_work_items : selections);
+  if (launch.enable_grouped_fp4) {
+    gate_up_silu_grouped_fp4_batch<<<gate_grid, kThreads, 0, stream>>>(
+        launch.directory_entries,
+        launch.directory_layer * launch.expert_table_size,
+        launch.grouped_work, launch.intermediate, launch.hidden_size,
+        launch.intermediate_size, launch.top_k, launch.quantized_input,
+        launch.quantized_input_scales);
+    status = cuda_status(cudaPeekAtLastError(),
+                         "grouped FP4 gate/up launch");
+  } else {
+    gate_up_silu_selection_batch<<<gate_grid, kThreads, 0, stream>>>(
+        launch.input, launch.directory_entries,
+        launch.directory_layer * launch.expert_table_size,
+        launch.intermediate, launch.hidden_size, launch.intermediate_size,
+        launch.top_k, launch.expert_indices, launch.selection_mask,
+        launch.swiglu_limit, launch.bf16_intermediate, launch.quantized_input,
+        launch.quantized_input_scales, launch.nvfp4_gate_input,
+        launch.nvfp4_up_input);
+    status =
+        cuda_status(cudaPeekAtLastError(), "gate_up_silu_selection launch");
+  }
   if (!status.ok()) return status;
   if (launch.enable_packed_fp4) {
     quantize_q8_vectors<<<selections, kThreads, 0, stream>>>(
@@ -759,7 +899,16 @@ Status launch_moe_selection_batch(
   }
   const dim3 down_grid(
       (launch.hidden_size + kWarpsPerBlock - 1U) / kWarpsPerBlock,
-      selections);
+      launch.enable_grouped_fp4 ? launch.grouped_work_items : selections);
+  if (launch.enable_grouped_fp4) {
+    down_grouped_fp4_batch<<<down_grid, kThreads, 0, stream>>>(
+        launch.directory_entries,
+        launch.directory_layer * launch.expert_table_size,
+        launch.grouped_work, launch.quantized_intermediate,
+        launch.quantized_intermediate_scales, launch.selection_outputs,
+        launch.hidden_size, launch.intermediate_size);
+    return cuda_status(cudaPeekAtLastError(), "grouped FP4 down launch");
+  }
   down_selection_batch<<<down_grid, kThreads, 0, stream>>>(
       launch.directory_entries,
       launch.directory_layer * launch.expert_table_size,

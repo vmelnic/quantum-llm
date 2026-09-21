@@ -46,16 +46,19 @@ if ($model.Count -lt 6 -or $model[0] -ne "model" -or
 }
 
 [uint32]$maximumThinkingTokens = 0
-if ($null -ne $manifest.tokenizer -and
-    $null -ne $manifest.tokenizer.sampling) {
+$tokenizerProperty = $manifest.PSObject.Properties["tokenizer"]
+$samplingProperty = $null
+if ($null -ne $tokenizerProperty -and $null -ne $tokenizerProperty.Value) {
+    $samplingProperty = $tokenizerProperty.Value.PSObject.Properties["sampling"]
+}
+if ($null -ne $samplingProperty -and $null -ne $samplingProperty.Value) {
+    $sampling = $samplingProperty.Value
     if ([string]::IsNullOrWhiteSpace(
-            [string]$manifest.tokenizer.sampling.schema)) {
+            [string]$sampling.schema)) {
         throw "Model artifact sampling policy schema is invalid"
     }
     $maximumThinkingProperty = `
-        $manifest.tokenizer.sampling.PSObject.Properties[
-            "maximum_thinking_tokens"
-        ]
+        $sampling.PSObject.Properties["maximum_thinking_tokens"]
     if ($null -ne $maximumThinkingProperty) {
         if (-not [uint32]::TryParse(
                 [string]$maximumThinkingProperty.Value,

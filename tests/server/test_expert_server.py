@@ -125,12 +125,20 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "provider_gpu_ffn_ns": 100,
             "provider_workspace_rows": 1024,
             "provider_compact_flash_prefill": 1,
+            "provider_program_sequence_tile_rows": 4190,
+            "provider_large_exact_prefill_workspace": 1,
+            "provider_workspace_preflight_free_bytes": 3_146_776_576,
+            "provider_workspace_postallocation_free_bytes": 2_182_299_648,
             "allocated_pages": 12,
         }
         after = {
             "provider_gpu_ffn_ns": 140,
             "provider_workspace_rows": 1024,
             "provider_compact_flash_prefill": 1,
+            "provider_program_sequence_tile_rows": 4190,
+            "provider_large_exact_prefill_workspace": 1,
+            "provider_workspace_preflight_free_bytes": 3_146_776_576,
+            "provider_workspace_postallocation_free_bytes": 2_182_299_648,
             "allocated_pages": 20,
         }
         self.assertEqual(
@@ -139,6 +147,10 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
                 "provider_gpu_ffn_ns": 40,
                 "provider_workspace_rows": 1024,
                 "provider_compact_flash_prefill": 1,
+                "provider_program_sequence_tile_rows": 4190,
+                "provider_large_exact_prefill_workspace": 1,
+                "provider_workspace_preflight_free_bytes": 3_146_776_576,
+                "provider_workspace_postallocation_free_bytes": 2_182_299_648,
             },
         )
 

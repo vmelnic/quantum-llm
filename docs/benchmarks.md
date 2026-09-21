@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: canonical measurement ledger, 2026-09-20.
+Status: canonical measurement ledger, 2026-09-21.
 
 ## Reporting rules
 
@@ -16,11 +16,11 @@ Status: canonical measurement ledger, 2026-09-20.
 
 The latest native changed-code gate used the Windows Release/CUDA build
 (MSVC 19.44, CUDA 12.1), built `--clean-first --parallel 22`. Windows CTest
-passed 6/6 and the canonical compiler/server suite ran 118 tests successfully.
-The later Python-only artifact migration and populated-window driver changes
-passed the expanded local 122-test suite with nine optional NumPy skips.
-Python byte compilation, shell syntax and `git diff --check` passed. The
-Windows binary is authoritative.
+passed 7/7, including the independent grouped standard-FP4 CUDA smoke, and the
+canonical compiler/server suite ran 119 tests successfully. The telemetry-only
+server follow-up then passed the full 119-test canonical suite locally, with
+nine optional NumPy skips. Python byte compilation and `git diff --check`
+passed. The Windows binary is authoritative.
 
 ## Service results
 
@@ -681,6 +681,54 @@ zero failures. It needed 157.743 s for 31 generated tokens (0.20 tok/s
 end-to-end), versus 108.456 s for 40 tokens (0.37 tok/s) on the earlier primary
 path. Output lengths differ, but the P100 path plainly failed its acceleration
 gate.
+
+#### RTX 3090 cold Pi layer-major gate, 2026-09-21
+
+This gate used `./ops/pi.sh qwen-flash --no-session -p hi`, the real project
+context, default xhigh reasoning, exact F16 KV, the 12 GiB common routed-VRAM
+ceiling and one RTX 3090. Before the measured request the service loaded zero
+persistent sessions and reported zero session-cache bytes. Model startup is not
+included. The server snapshots worker counters immediately after `BEGIN`, so
+prefill traffic below excludes all decode tokens.
+
+| Metric | Historical baseline | Final gate |
+|---|---:|---:|
+| populated prompt | 4,190 | 4,190 |
+| provider prefill batches | 10 | 1 |
+| program-sequence tiles | not recorded | 1 |
+| workspace rows | 512 | 1,024 |
+| SSD -> RAM | 158.8 GB | 62,030,667,776 B (62.03 GB) |
+| storage wait | 99.7 s | 34.730 s |
+| RAM -> GPU | 236.8 GB | 61,982,054,400 B (61.98 GB) |
+| upload wait | 92.3 s | 24.617 s |
+| prefill wall | not separated | 163.125 s |
+| TTFT | 325.3 s | 163.640 s |
+
+TTFT improved by about 49.7%, and both prefill traffic counters passed the
+80 GB gate. The runtime selected a 12,288-row sequence tile, so the complete
+4,190-row hidden/Hyper stream stayed in one tile. CUDA free memory was
+18,724,421,632 bytes before fixed workspace allocation and 14,012,121,088
+bytes afterwards, above the mandatory 1 GiB reserve.
+
+The grouped standard-FP4 path processed 1,999,010 primary selections in
+533,944 bounded work items across 240 routed-prefill calls. Its independent
+native oracle reported maximum absolute error 0 and cosine 1.0. This combined
+end-to-end gate does not isolate how much TTFT reduction came from grouping.
+It does prove the exact standard-FP4 service path; native NVFP4 was neither
+selected nor credited.
+
+The same request generated 331 tokens and finished in 264.406 s. Its complete
+request counters reached 77,046,390,784 read bytes and 113,401,804,800 uploaded
+bytes. Those totals include decode and are intentionally not compared with the
+prefill-only 80 GB gate.
+
+Common-path regressions on the same clean binary passed through
+`./ops/model.sh chat`: Qwen returned coherent text at 13 prompt / 11 output
+tokens, 1.700 s first-visible and 1.895 s wall; DeepSeek returned coherent text
+at 5 prompt / 10 output tokens, 3.350 s first-visible and 9.688 s wall. The
+DeepSeek start also exposed and fixed a strict-PowerShell validation bug for an
+absent optional artifact sampling policy; Qwen, Qwen Flash and DeepSeek
+contract extraction then passed.
 
 ## P100 admission gates
 

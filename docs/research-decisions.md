@@ -1,6 +1,6 @@
 # Research decisions
 
-Status: canonical decision and rejection ledger, 2026-09-20.
+Status: canonical decision and rejection ledger, 2026-09-21.
 
 This file prevents failed mechanisms from returning under new names. Detailed
 measurements live in [Benchmarks](benchmarks.md). Reopen a rejection only when
@@ -50,6 +50,8 @@ complete proposer/verifier cost.
 | startup routed-cache fitting | artifact-neutral, before first expert admission, after future-state reservation | measured with the former `ornith-k1` profile; not a global cache increase |
 | lazy dense/logits workspaces | allocate only the rows/operation requested | saved about 994 MiB; arithmetic unchanged |
 | exact hierarchical top-k | dense-provider sampling with artifact-declared `top_k <= 64` | preserves logits, candidate ids, tie order and NaN exclusion; does not change KV fidelity or prefill |
+| capability-gated layer-major short prefill | exact-F16 Hyper/QSA/PLE programs whose complete activation stream fits while preserving the 1 GiB device reserve | Qwen Flash 4,190-token cold prefill read 62.03 GB and uploaded 61.98 GB; this does not reopen rejected DeepSeek maximum-context layer-major work |
+| grouped standard-FP4 routed prefill | rows are grouped by exact expert ID in bounded groups of four; router top-k and stable aggregation are unchanged | independent host decode/oracle was exact; the combined service result has no isolated grouped-kernel speed attribution |
 
 ## Experimental K1 exception
 
@@ -157,6 +159,49 @@ These failures do not prove the measured phases are optimal. They prove that
 the stated mechanisms and latency gates do not follow from the current code or
 hardware. Reopening cold prefill requires a new design whose exact operation
 count, state representation, capacity and traffic pass before implementation.
+
+### Qwen Flash bounded layer-major prefill, 2026-09-21
+
+Qwen3.8-Flash-Next is a different bounded case from the rejected dense-Qwen and
+DeepSeek maximum-context proposals: 48 MoE layers, 512 experts/layer, exact
+top-10 routing, standard FP4 E2M1/UE8M0 block-32 experts, Hyper width 10,240,
+QSA, PLE and exact F16 target KV. For the real Pi prompt of 4,190 tokens:
+
+```text
+hidden stream       4,190 * 2,560 * 4 =  42,905,600 bytes
+Hyper stream       4,190 * 10,240 * 4 = 171,622,400 bytes
+minimum streams total                 = 214,528,000 bytes
+expert pool                            about 64.22 GB
+prefill read/upload admission          <= 80 GB each
+device reserve                          1,073,741,824 bytes
+original 1,024-row allocation+reserve   2,174,494,720 bytes
+original measured free                  3,146,776,576 bytes
+```
+
+The provider now selects the 1,024-row workspace from declared exact-F16,
+Hyper, QSA, PLE and routed-component capabilities. It checks CUDA free memory
+both before and after fixed allocation and fails closed if the 1 GiB reserve is
+not preserved. Program-sequence execution carries exact Hyper, PLE convolution,
+QSA/recurrent and no-residual state layer-major. An interior stable-prefix
+checkpoint is captured inside that one sequence instead of splitting the
+prompt into a second program sweep.
+
+The standard-FP4 routed kernel groups primary selections by exact expert ID in
+groups of at most four, reusing each decoded weight group across those rows.
+The router, top-10 indices, weights and aggregation order remain unchanged.
+The independent smoke used a separate host FP4/UE8M0 decoder and produced zero
+maximum absolute error and cosine 1.0 for 16 selections in five work items.
+Native NVFP4 dispatch is unchanged. A prior speed claim attributed to NVFP4
+was invalid: the artifact executes standard FP4, and the observed difference
+was cold paging/cache variation. No current conclusion relies on it.
+
+The final cold Pi gate used one program batch/tile and measured 62,030,667,776
+storage-read bytes, 61,982,054,400 H2D bytes, 34.730 s storage wait, 24.617 s
+upload wait, 163.125 s prefill and 163.640 s TTFT. The earlier 325.3-second
+baseline used ten prefill batches and reported 158.8 GB storage reads and
+236.8 GB uploads. Request-total counters after 331 decode tokens were 77.05 GB
+read and 113.40 GB uploaded; they are not prefill counters and must not be used
+against the 80 GB admission gate.
 
 ### Persistent continuation snapshots: implemented restart/resume path
 

@@ -8,6 +8,14 @@
 
 namespace expert::runtime::cuda {
 
+constexpr std::uint32_t kMoeGroupedSelectionWidth = 4U;
+
+struct MoeGroupedSelectionWork final {
+  std::uint32_t expert{};
+  std::uint32_t count{};
+  std::uint32_t selections[kMoeGroupedSelectionWidth]{};
+};
+
 struct MoeLaunch final {
   const float* input{};
   const std::int8_t* const* gate_up_weights{};
@@ -77,6 +85,9 @@ struct MoeSelectionBatchLaunch final {
   float* nvfp4_gate_input{};                // [rows, top_k, hidden]
   float* nvfp4_up_input{};                  // [rows, top_k, hidden]
   float* nvfp4_down_input{};                // [rows, top_k, intermediate]
+  const MoeGroupedSelectionWork* grouped_work{};
+  std::uint32_t grouped_work_items{};
+  bool enable_grouped_fp4{};
 };
 
 struct MoeAggregateLaunch final {
