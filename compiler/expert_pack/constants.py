@@ -29,6 +29,13 @@ QUANT_GROUP_SIZE = 0  # 0 means one scale per complete output row.
 # inconsistently between the toolchain decoder and the CUDA kernel, so the
 # compiler never emits it.
 FP4_QUANT_PROFILE = "fp4-e2m1-ue8m0-block32-v1"
+FP4_MSE_QUANT_PROFILE = "fp4-e2m1-ue8m0-block32-mse-v2"
+FP4_ACTIVATION_QUANT_PROFILE = (
+    "fp4-e2m1-ue8m0-block32-activation-aware-v3"
+)
+FP4_ACTIVATION_CODE_QUANT_PROFILE = (
+    "fp4-e2m1-ue8m0-block32-activation-codes-v4"
+)
 FP4_QUANT_ABI_ID = 3
 # Routed ReLU2 experts use the same FP4 payload encoding as ABI 3, but their
 # executable record contains only up/down matrices.  Keeping a distinct ABI
@@ -38,6 +45,14 @@ FP4_QUANT_GROUP_SIZE = 32
 FP4_UE8M0_MIN_CODE = 1
 FP4_UE8M0_MAX_CODE = 254
 
+# OCP MXFP6 E3M2 payload with one UE8M0 scale per 32-value block. Four
+# six-bit elements are packed little-endian into three bytes. This dense-only
+# ABI is used for precision-sensitive semantic roles; routed experts retain
+# their declared expert ABI.
+MXFP6_QUANT_PROFILE = "mxfp6-e3m2-ue8m0-block32-v1"
+MXFP6_QUANT_ABI_ID = 6
+MXFP6_QUANT_GROUP_SIZE = 32
+
 # Native NVIDIA FP4 checkpoint encoding. Packed E2M1 values use one E4M3FN
 # scale per 16 input values plus checkpoint-stored FP32 global divisors for
 # weights and activations. Unlike the block-32 profile above, this ABI copies
@@ -46,7 +61,13 @@ NVFP4_QUANT_PROFILE = "nvfp4-e2m1-e4m3fn-block16-w4a4-v1"
 NVFP4_QUANT_ABI_ID = 5
 NVFP4_QUANT_GROUP_SIZE = 16
 
-QUANT_PROFILES = (QUANT_PROFILE, FP4_QUANT_PROFILE, NVFP4_QUANT_PROFILE)
+FP4_QUANT_PROFILES = (
+    FP4_QUANT_PROFILE,
+    FP4_MSE_QUANT_PROFILE,
+    FP4_ACTIVATION_QUANT_PROFILE,
+    FP4_ACTIVATION_CODE_QUANT_PROFILE,
+)
+QUANT_PROFILES = (QUANT_PROFILE, *FP4_QUANT_PROFILES, NVFP4_QUANT_PROFILE)
 
 DENSE_MAGIC = b"EPDENS01"
 EXPERT_MAGIC = b"EPEXPR01"

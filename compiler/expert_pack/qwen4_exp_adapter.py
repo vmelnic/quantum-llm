@@ -24,7 +24,7 @@ from .adapters import (
     _integer,
     _number,
 )
-from .constants import DTYPE_BYTES, FP4_QUANT_PROFILE
+from .constants import DTYPE_BYTES, FP4_QUANT_PROFILES
 from .errors import AdapterError
 from .safetensors import SafeTensorCheckpoint
 
@@ -742,5 +742,5 @@ class Qwen4ExpAdapter:
             dense_int64=frozenset(int64),
             host_mapped_dense=frozenset(host_mapped),
             auxiliary_dense=frozenset(auxiliary),
-            supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
+            supported_expert_quant_profiles=frozenset(FP4_QUANT_PROFILES),
         )

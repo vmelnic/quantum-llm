@@ -14,7 +14,7 @@ from .adapters import (
     _integer,
     _number,
 )
-from .constants import FP4_QUANT_PROFILE
+from .constants import FP4_QUANT_PROFILES
 from .errors import AdapterError
 from .safetensors import SafeTensorCheckpoint
 
@@ -387,5 +387,5 @@ class MuseGlimmerAdapter:
             dense_float32=frozenset(float32),
             dense_fp4=frozenset(fp4),
             auxiliary_dense=frozenset(auxiliary),
-            supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
+            supported_expert_quant_profiles=frozenset(FP4_QUANT_PROFILES),
         )

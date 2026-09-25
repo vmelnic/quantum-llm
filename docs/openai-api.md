@@ -47,6 +47,12 @@ penalties, stop rules, `reasoning_effort` and `enable_thinking`. Artifact
 sampling/template/EOS metadata supplies defaults; explicit supported request
 fields override them per key.
 
+`speculative_decoding` is an optional boolean extension. It defaults to
+`true`. Setting it to `false` keeps the target model and sampling distribution
+unchanged while forcing ordinary one-position target decoding for that
+request. This is primarily a fidelity and runtime-diagnostic control; it does
+not remove artifact-declared draft resources from the running service.
+
 For chat requests, `reasoning_effort` accepts `low`, `medium` or `xhigh`.
 Thinking-off is not the string `reasoning_effort: "off"`; use:
 

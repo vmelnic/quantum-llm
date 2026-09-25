@@ -28,6 +28,8 @@ from .constants import (
     FP4_QUANT_ABI_ID,
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
+    MXFP6_QUANT_ABI_ID,
+    MXFP6_QUANT_GROUP_SIZE,
     NVFP4_QUANT_ABI_ID,
     NVFP4_QUANT_GROUP_SIZE,
     HEADER_BYTES,
@@ -35,7 +37,12 @@ from .constants import (
     QUANT_ABI_ID,
     SECTION_ALIGNMENT,
 )
-from .quant import write_float32, write_fp4_block32_rows, write_int8_rows
+from .quant import (
+    write_float32,
+    write_fp4_block32_rows,
+    write_int8_rows,
+    write_mxfp6_e3m2_block32_rows,
+)
 from .safetensors import SafeTensorCheckpoint, TensorInfo
 from .util import align_up, fsync_file, sha256_bytes, write_all, write_zeros
 
@@ -110,7 +117,7 @@ def dense_record_size(
         and
         not preserve_float32
         and (
-            quant_abi == FP4_QUANT_ABI_ID
+            quant_abi in (FP4_QUANT_ABI_ID, MXFP6_QUANT_ABI_ID)
             or dense_is_quantized(info, preserve_float32)
         )
     )
@@ -120,6 +127,12 @@ def dense_record_size(
         padded_columns = align_up(columns, FP4_QUANT_GROUP_SIZE)
         data_bytes = rows * padded_columns // 2
         scale_bytes = rows * padded_columns // FP4_QUANT_GROUP_SIZE
+    elif quantized and quant_abi == MXFP6_QUANT_ABI_ID:
+        rows = math.prod(info.shape[:-1]) if len(info.shape) > 1 else 1
+        columns = info.shape[-1]
+        padded_columns = align_up(columns, MXFP6_QUANT_GROUP_SIZE)
+        data_bytes = rows * padded_columns * 3 // 4
+        scale_bytes = rows * padded_columns // MXFP6_QUANT_GROUP_SIZE
     elif quantized and quant_abi == QUANT_ABI_ID:
         data_bytes = elements
         scale_bytes = info.shape[0] * 4
@@ -201,6 +214,8 @@ def write_dense_record(
     preserve_int64: bool = False,
     preserve_bfloat16: bool = False,
     native_nvfp4=None,
+    optimize_fp4_mse: bool = False,
+    activation_calibration=None,
 ) -> RecordResult:
     start = handle.tell()
     if start % alignment:
@@ -221,7 +236,7 @@ def write_dense_record(
         and
         not preserve_float32
         and (
-            quant_abi == FP4_QUANT_ABI_ID
+            quant_abi in (FP4_QUANT_ABI_ID, MXFP6_QUANT_ABI_ID)
             or dense_is_quantized(info, preserve_float32)
         )
     )
@@ -267,7 +282,19 @@ def write_dense_record(
             if quantized:
                 if quant_abi == FP4_QUANT_ABI_ID:
                     before = handle.tell()
-                    scales = write_fp4_block32_rows(view, handle, digest)
+                    scales = write_fp4_block32_rows(
+                        view,
+                        handle,
+                        digest,
+                        optimize_fp4_mse,
+                        activation_calibration,
+                    )
+                    data_bytes = handle.tell() - before
+                elif quant_abi == MXFP6_QUANT_ABI_ID:
+                    before = handle.tell()
+                    scales = write_mxfp6_e3m2_block32_rows(
+                        view, handle, digest
+                    )
                     data_bytes = handle.tell() - before
                 elif quant_abi == QUANT_ABI_ID:
                     scales = write_int8_rows(view, handle, digest)
@@ -319,6 +346,9 @@ def write_dense_record(
         if quant_abi == FP4_QUANT_ABI_ID:
             stored_dtype = "FP4_E2M1"
             layout = "row-major-fp4-e2m1-ue8m0-block32-padded"
+        elif quant_abi == MXFP6_QUANT_ABI_ID:
+            stored_dtype = "MXFP6_E3M2"
+            layout = "row-major-mxfp6-e3m2-ue8m0-block32-padded"
         else:
             stored_dtype = "I8"
             layout = "output-major-row-contiguous-int8"
@@ -369,6 +399,18 @@ def write_dense_record(
     }
     if source_tensors is not None:
         entry["source_tensors"] = source_tensors
+    if (
+        quant_abi == FP4_QUANT_ABI_ID
+        and activation_calibration is not None
+        and activation_calibration.contains(info.name)
+    ):
+        entry["fp4_scale_policy"] = (
+            "activation-aware-complete-output-residual-v1"
+        )
+        if activation_calibration.selects_payload_codes(info.name):
+            entry["fp4_payload_policy"] = (
+                "activation-aware-adjacent-code-top64-complete-output-residual-v1"
+            )
     return RecordResult(entry=entry, end_offset=start + record_bytes)
 
 
@@ -381,6 +423,7 @@ def write_expert_record(
     intermediate: int,
     alignment: int = PACK_ALIGNMENT,
     quant_abi: int = QUANT_ABI_ID,
+    optimize_fp4_mse: bool = False,
 ) -> RecordResult:
     native_nvfp4 = quant_abi == NVFP4_QUANT_ABI_ID
     fp4 = quant_abi in (
@@ -403,7 +446,9 @@ def write_expert_record(
         if native_nvfp4:
             raise ValueError("native NVFP4 must be copied with its sidecars")
         if fp4:
-            return write_fp4_block32_rows(view, destination, record_digest)
+            return write_fp4_block32_rows(
+                view, destination, record_digest, optimize_fp4_mse
+            )
         return write_int8_rows(view, destination, record_digest)
 
     def copy_native(matrix) -> bytes:

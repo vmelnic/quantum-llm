@@ -27,6 +27,7 @@ from compiler.expert_pack.constants import (
     FP4_QUANT_ABI_ID,
     FP4_QUANT_PROFILE,
     HEADER_BYTES,
+    MXFP6_QUANT_ABI_ID,
     PACK_ALIGNMENT,
     QUANT_ABI_ID,
 )
@@ -293,6 +294,7 @@ def _make_hybrid_delta_fixture(root: Path, *, moe: bool = False) -> None:
     """Build a small, topology-complete hybrid-delta checkpoint."""
     text = {
         "model_type": "qwen3_5_moe_text" if moe else "qwen3_5_text",
+        "dtype": "bfloat16",
         "hidden_act": "silu",
         "hidden_size": 32,
         "max_position_embeddings": 64,
@@ -1451,11 +1453,11 @@ class ExpertPackTests(unittest.TestCase):
             self.assertIn(
                 "model.visual.patch_embed.proj.weight", adapted.dense_fp4
             )
+            self.assertEqual(adapted.dense_mxfp6, frozenset())
             self.assertIn(
                 "model.language_model.layers.0.linear_attn.A_log",
                 adapted.dense_float32,
             )
-
             rejected = root / "rejected-pack"
             with self.assertRaisesRegex(ValueError, "does not support"):
                 compile_checkpoint(CompileOptions(
@@ -1465,14 +1467,71 @@ class ExpertPackTests(unittest.TestCase):
                 ))
             self.assertFalse(rejected.exists())
 
+            mxfp6_names = frozenset({
+                "model.language_model.embed_tokens.weight",
+                "lm_head.weight",
+            })
+            mxfp6_operations = tuple(
+                replace(
+                    operation,
+                    capability=(
+                        "embedding.lookup.mxfp6-e3m2-block32.v1"
+                        if operation.capability ==
+                           "embedding.lookup.fp4-block32.v1"
+                        else "head.rmsnorm.token-select."
+                             "mxfp6-e3m2-block32.v1"
+                        if operation.capability ==
+                           "head.rmsnorm.token-select.fp4-block32.v1"
+                        else operation.capability
+                    ),
+                )
+                for operation in adapted.runtime_topology.operations
+            )
+            mxfp6_required = tuple(
+                (
+                    "embedding.lookup.mxfp6-e3m2-block32.v1"
+                    if capability == "embedding.lookup.fp4-block32.v1"
+                    else "head.rmsnorm.token-select."
+                         "mxfp6-e3m2-block32.v1"
+                    if capability ==
+                       "head.rmsnorm.token-select.fp4-block32.v1"
+                    else "decode.mtp.dense-full-attention."
+                         "fp4-mxfp6-io.exact.v3"
+                    if capability ==
+                       "decode.mtp.dense-full-attention."
+                       "fp4-block32.exact.v2"
+                    else capability,
+                    abi,
+                )
+                for capability, abi in adapted.runtime_topology.required_kernels
+            )
+            mxfp6_adapted = replace(
+                adapted,
+                dense_mxfp6=mxfp6_names,
+                runtime_topology=replace(
+                    adapted.runtime_topology,
+                    operations=mxfp6_operations,
+                    required_kernels=mxfp6_required,
+                    exact_decode=replace(
+                        adapted.runtime_topology.exact_decode,
+                        capability="decode.mtp.dense-full-attention."
+                                   "fp4-mxfp6-io.exact.v3",
+                    ),
+                ),
+            )
             output = root / "pack"
-            result = compile_checkpoint(CompileOptions(
-                source=source,
-                output=output,
-                adapter="hybrid_delta",
-                quant_profile=FP4_QUANT_PROFILE,
-                max_expert_pack_bytes=PACK_ALIGNMENT,
-            ))
+            with mock.patch(
+                "compiler.expert_pack.compile.adapt_checkpoint",
+                return_value=mxfp6_adapted,
+            ):
+                result = compile_checkpoint(CompileOptions(
+                    source=source,
+                    output=output,
+                    adapter="hybrid_delta",
+                    quant_profile=FP4_QUANT_PROFILE,
+                    max_expert_pack_bytes=PACK_ALIGNMENT,
+                    source_revision=source.name,
+                ))
             self.assertTrue(result["validation"]["valid"])
             self.assertEqual(result["validation"]["experts"], 0)
             manifest = load_json(output / "manifest.json")
@@ -1480,21 +1539,41 @@ class ExpertPackTests(unittest.TestCase):
             self.assertEqual(manifest["quantization"]["expert_weights"], "none")
             self.assertEqual(
                 manifest["quantization"]["dense_matrix_weights"],
-                "fp4-e2m1-ue8m0-block32-padded",
+                "mixed-mxfp6-fp4-and-other-quantized-tensors",
             )
             self.assertEqual(
                 manifest["quantization"]["dense_tensor_quant_abis"],
-                [0, FP4_QUANT_ABI_ID],
+                [0, FP4_QUANT_ABI_ID, MXFP6_QUANT_ABI_ID],
             )
             dense_by_name = {entry["name"]: entry for entry in manifest["tensors"]}
-            for name in adapted.dense_fp4:
+            for name in adapted.dense_fp4 - mxfp6_names:
                 self.assertEqual(dense_by_name[name]["stored_dtype"], "FP4_E2M1")
                 self.assertEqual(
                     dense_by_name[name]["quant_abi"], FP4_QUANT_ABI_ID
                 )
+            for name in mxfp6_names:
+                self.assertEqual(
+                    dense_by_name[name]["stored_dtype"], "MXFP6_E3M2"
+                )
+                self.assertEqual(
+                    dense_by_name[name]["quant_abi"], MXFP6_QUANT_ABI_ID
+                )
             for name in adapted.dense_float32:
                 self.assertEqual(dense_by_name[name]["stored_dtype"], "F32")
                 self.assertEqual(dense_by_name[name]["quant_abi"], 0)
+            quality = qualify_container_against_source(
+                source, output, samples_per_tensor=3,
+                maximum_relative_l2=0.30, minimum_cosine=0.90,
+            )
+            self.assertTrue(quality["valid"])
+            self.assertEqual(quality["records"]["tensor_mxfp6"], 2)
+            self.assertEqual(
+                quality["sampled"]["mxfp6_payload_mismatches"], 0
+            )
+            self.assertEqual(
+                quality["sampled"]["mxfp6_scale_mismatches"], 0
+            )
+            self.assertEqual(quality["sampled"]["f32_value_mismatches"], 0)
             patch = dense_by_name["model.visual.patch_embed.proj.weight"]
             self.assertEqual(patch["source_shape"], [32, 3, 1, 2, 2])
             self.assertEqual(patch["sections"]["data"]["bytes"], 3072)
@@ -1526,7 +1605,8 @@ class ExpertPackTests(unittest.TestCase):
             )
             self.assertIn(
                 "exact_decode\t"
-                "decode.mtp.dense-full-attention.fp4-block32.exact.v2\t2\t5",
+                "decode.mtp.dense-full-attention."
+                "fp4-mxfp6-io.exact.v3\t2\t5",
                 program,
             )
             self.assertIn(
@@ -1898,6 +1978,7 @@ class ExpertPackTests(unittest.TestCase):
             self.assertNotIn("exact_decode\t", program)
             quality = qualify_container_against_source(source, output)
             self.assertTrue(quality["valid"])
+            self.assertEqual(quality["sampled"]["f32_value_mismatches"], 0)
 
     def test_lfm2_moe_adapter_compiles_dense_prefix_and_local_expert_layers(
         self,
@@ -2030,6 +2111,7 @@ class ExpertPackTests(unittest.TestCase):
                 output, refreshed, source, "lfm2_moe",
                 config_file="params.json",
                 index_file="consolidated.safetensors.index.json",
+                dense_activation_input="bf16",
             )
             self.assertTrue(refresh_result["validation"]["valid"])
             refreshed_manifest = load_json(refreshed / "manifest.json")
@@ -2040,9 +2122,20 @@ class ExpertPackTests(unittest.TestCase):
                 [item["sha256"] for item in refreshed_manifest["packs"]],
                 [item["sha256"] for item in manifest["packs"]],
             )
+            refreshed_program = (refreshed / "runtime-model.tsv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "attribute\tdense_activation_input_bf16\t1\n",
+                refreshed_program,
+            )
+            self.assertIn(
+                "kernel\tdense.activation-input.bfloat16.v1\t1\n",
+                refreshed_program,
+            )
             self.assertEqual(
-                (refreshed / "runtime-model.tsv").read_text(encoding="utf-8"),
-                program,
+                refreshed_manifest["quantization"]["dense_activation_input"],
+                "bf16",
             )
 
     def test_lfm2_moe_adapter_rejects_unidentified_tensor(self) -> None:

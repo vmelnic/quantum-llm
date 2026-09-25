@@ -960,6 +960,779 @@ only thinking requests to their artifact-declared 32,768 bound. Sampling-policy
 schema labels do not select runtime behavior, and no model-family branch
 implements this distinction.
 
+### Romanian fidelity isolation, 2026-09-22
+
+The pending Romanian replay failed under a controlled 196-token prompt and a
+12,000-token `xhigh` output ceiling. The test matrix crossed Abliterated and
+official FP4 weights, Q4H and F16 target KV, MTP-4 and scalar target decode,
+presence penalties 0.5 and 0.0, and temperatures 1.0 and 0.6. Every scalar
+request reported zero exact-decode calls. Material malformed Romanian remained
+in every row; F16, scalar decode, the official checkpoint and lower sampling
+entropy did not restore fidelity. Exact counts and examples are recorded in
+`docs/benchmarks.md`.
+
+This closes several false shortcuts:
+
+- disabling MTP can change one sampled trajectory and completion length, but
+  it does not remove the lexical defect;
+- replacing Q4H with F16 target KV does not remove the defect;
+- returning thinking `presence_penalty` to the official 0.0 does not remove
+  the defect;
+- lowering temperature to 0.6 shortens this sample but does not make its
+  Romanian correct;
+- the failure is not unique to the Abliterated artifact.
+
+Do not continue sampling-policy tuning as a runtime-fidelity diagnosis. This
+isolation initially identified an independent full-target oracle as the
+cleanest diagnostic boundary, but that direction was not admitted as the
+active remedy: it adds validation work without itself producing a same-ABI fix
+or preserving the throughput contract. The active prerequisite is the
+activation-weighted, same-payload scale-selection gate recorded below. Until
+that gate supplies causal evidence, do not attribute the remaining defect
+specifically to weight quantization, the source checkpoint or a runtime
+kernel.
+
+### Same-ABI FP4 scale-selection gate, 2026-09-22
+
+The active experiment keeps the Abliterated Qwen source revision, Q4H target
+KV, MTP-4, `xhigh` harness and one RTX 3090 fixed. It changes only the offline
+choice of each existing UE8M0 block scale. The candidate compares the current
+non-clipping scale with the immediately lower power-of-two scale and selects
+the latter only when literal E2M1 reconstruction has lower squared error. The
+payload remains 32 FP4 values plus one UE8M0 byte, so runtime ABI 3 and every
+CUDA kernel remain unchanged.
+
+```text
+FP4 QPack stored bytes                         14,775,390,208 -> unchanged
+hot target-weight bytes touched/call           13,625,700,352 -> unchanged
+Q4H target KV at 262,144 positions                  4.062500 GiB -> unchanged
+Q8 MTP pages at 262,144 positions                   0.503906 GiB -> unchanged
+target KV + draft pages                             4.566406 GiB -> unchanged
+recurrent state, workspaces and 1 GiB reserve              delta = 0
+RAM, PCIe and NVMe weight/KV traffic per call/token         delta = 0
+GPU instructions and payload bytes per target call/token    delta = 0
+```
+
+Speculative acceptance can still move when better weights change logits, so
+equal static work is not by itself a throughput pass. Admission requires the
+same real prompt, sampling seed and MTP policy to retain at least the matched
+generated tok/s baseline.
+
+The fail-fast source prerequisite sampled 64 deterministic blocks from each
+of all 666 FP4 matrices in the pinned Abliterated checkpoint. Across 42,624
+blocks, 10,856 (25.47%) selected exactly one lower exponent. Relative L2 fell
+from 0.120971 to 0.114928 and total squared error fell 9.74%; every recorded
+matrix-role group improved. The prerequisite was at least 5% aggregate squared
+error reduction with no role-group regression, so implementation is admitted.
+This numerical result is not yet a Romanian quality or service-throughput
+pass.
+
+### Selective MXFP6 I/O trial, 2026-09-22
+
+The hypothesis that Romanian corruption was dominated by the token embedding
+and vocabulary head was tested without changing target KV, MTP semantics or
+the remaining FP4 matrices. `model.language_model.embed_tokens.weight` and
+`lm_head.weight` each contain 1,271,398,400 values. Their per-tensor storage
+changed from 675,434,496 bytes in FP4 to 993,284,096 bytes in OCP MXFP6 E3M2
+block-32, so the exact resident-artifact delta was:
+
+```text
+2 * (993,284,096 - 675,434,496) = 635,699,200 bytes
+candidate QPack                         = 15,411,089,408 bytes
+operational Q4H QPack                  = 14,775,390,208 bytes
+```
+
+The format was implemented as generic dense-record ABI 6 with explicit
+embedding/head/exact-decode capabilities, an independent literal E3M2 oracle
+and an emulated SM86 CUDA kernel. The source-quality gate found zero payload or
+scale mismatches. Across the two MXFP6 tensors it measured relative L2
+0.0563446, cosine 0.998523 and maximum absolute error 0.00366211. Startup left
+5,877 MiB free on the RTX 3090, but no full-populated-context memory gate was
+credited because the fidelity gate failed first.
+
+The fixed Romanian MTP/xhigh request still exhausted all 12,000 completion
+tokens in hidden reasoning, returned no visible content and retained malformed
+forms such as `senzoriilor`, `devieri timpuri`, `linii lunar` and `întoarcii`.
+Its wall time increased from 244.578 seconds on the matched Q4H baseline to
+306.641 seconds: 49.06 to 39.13 generated tokens/s, a 20.24% throughput loss.
+The operational artifact was therefore rolled back to Q4H; the failed MXFP6
+candidate remains recoverable only as an experiment.
+
+Selective embedding/head MXFP6 is rejected as a Romanian-fidelity remedy and
+as an operational speed trade. Do not expand FP6 to arbitrary internal layers:
+full-model FP6 exceeds the single-RTX-3090 capacity budget, while another
+selective set needs an independent layer-sensitivity prerequisite that proves
+quality gain within a stated byte budget before another service artifact is
+built. The full-target oracle and source-precision comparison above remain the
+next admitted diagnosis.
+
+### Source-BF16 activation-semantics trial, 2026-09-23
+
+The source checkpoint declares BF16 activations, while the original artifact
+program left the provider's activation-rounding mode disabled. A universal
+artifact attribute enabled BF16 rounding at projection outputs, residual and
+gating boundaries, recurrent decode/prefill and text mRoPE. It did not change
+the QPack, target-KV codec, MTP policy, workspace capacity or data movement:
+
+```text
+FP4 QPack stored bytes                         14,775,390,208 -> unchanged
+hot target-weight bytes touched/call           13,625,700,352 -> unchanged
+Q4H target KV at 262,144 positions                  4.062500 GiB -> unchanged
+Q8 MTP pages at 262,144 positions                   0.503906 GiB -> unchanged
+target KV + draft pages                             4.566406 GiB -> unchanged
+activation workspace, RAM, PCIe and NVMe traffic           delta = 0
+```
+
+A clean Windows Release/CUDA build passed the focused Qwen numeric gates. The
+first live start ended in a transient `nvcuda64.dll` failure; the exact
+317-token prefill, stable-prefix checkpoint and first speculative step then
+passed both Compute Sanitizer and normal asynchronous execution. One permitted
+real-service retest completed without another crash, so no runtime patch was
+made for the non-reproducing driver event.
+
+The fixed Q4H/MTP-4/`xhigh`/presence-0.5 Romanian request produced 12,000
+completion tokens, including 8,619 reasoning tokens, in 262.208 seconds. Raw
+provider telemetry confirmed `provider_activation_bf16=1`; request telemetry
+initially displayed zero because configuration gauges were incorrectly
+subtracted like counters. The answer still contained malformed language such
+as `familile`, `progreului`, `moduile`, `meslerii`, `nevoiea`, `alerte mai
+early` and `bilanț hídric`. Generated throughput was 45.78 tok/s, below the
+49.06 tok/s floor.
+
+Source-BF16 activation rounding is therefore rejected as the Romanian-fidelity
+remedy and as an operational speed trade. The candidate artifact is not an
+active alias. Do not refresh operational Qwen artifacts into this mode without
+new evidence that passes both the same Romanian gate and the throughput floor.
+
+### Hybrid block-32 Q8 activation trial, 2026-09-23
+
+An experimental activation path retained the existing row-global FP32 Q8
+scale as a per-block fallback and selected a UE8M0 block scale only when its
+literal Q8 reconstruction had lower squared error. On layer-0 normalized
+embeddings from the fixed 317-token Romanian request, the hybrid policy reduced
+activation SSE by 19.258x, improved or tied all 317 rows, selected local scales
+for 64.6155% of blocks and introduced no clipping. A clean native CUDA check
+covered scalar GEMV, weight-reuse GEMV, prefill GEMM and staged BF16 GEMM.
+
+That local result did not transfer to service quality. The exact Q4H,
+MTP-4, `xhigh`, temperature 1.0, top-p 0.95, top-k 20, seed 314159 and
+presence-penalty 0.5 request produced 12,000 completion tokens, including
+11,554 reasoning tokens, in 285.906 seconds (41.97 generated tok/s). Visible
+output stopped after the first requested idea and still contained malformed
+Romanian such as `diailizelor`, `clinicii pierd`, `introdu greutatea` and
+`Medicianul`. It failed both fidelity and the 49.06 tok/s floor.
+
+The hybrid Q8 activation path is rejected. Its runtime code, artifact
+attribute, alias and dedicated test were removed so the inactive experiment
+cannot leave branches in the hot path. The failed candidate artifact remains
+recoverable but is not operational.
+
+### Exhaustive same-ABI FP4 scale audit, 2026-09-23
+
+The MSE-v2 encoder compares the non-clipping UE8M0 exponent with exactly one
+lower exponent. A separate literal E2M1 analysis exhaustively searched every
+legal exponent at or below the covering exponent for the same 64 deterministic
+blocks from all 666 FP4 matrices (42,624 blocks total). The prerequisite was at
+least 5% additional aggregate SSE reduction over MSE-v2, with every block and
+every role group non-regressed.
+
+The exhaustive search selected the existing MSE-v2 code for all 42,624
+blocks. Relative L2 remained 0.1149280417, aggregate SSE remained
+4.1241743611 and additional reduction was exactly 0%. No encoder, artifact or
+runtime build is justified by this direction. Do not widen the unweighted
+scale search again without evidence that changes the objective; MSE-v2 is
+already the sampled global optimum for the present E2M1/UE8M0 block-32 ABI.
+
+Activation-weighted offline selection is the remaining same-payload direction:
+the final artifact size, hot bytes, kernels and runtime instructions can stay
+unchanged, but it first requires reproducible calibration activations and a
+fail-fast output-error improvement over MSE-v2. It is not a fidelity result
+until the fixed Romanian service gate also passes at no less than 49.06
+generated tok/s.
+
+The admitted prerequisite is specifically for the 64-layer hybrid Qwen3.8-27B
+Abliterated target (48 recurrent and 16 full-attention layers), not the
+Hyper/QSA/PLE Flash artifact. It keeps source BF16 weights, E2M1/UE8M0
+block-32 payloads, Q4H target KV, MTP-4 and the one-RTX-3090 execution path:
+
+```text
+resident hot target weights                    13,625,700,352 bytes
+Q4H target KV + Q8 draft state @262,144         4,903,141,376 bytes
+recurrent plus retained hidden state              158,920,704 bytes
+mandatory device reserve                         1,073,741,824 bytes
+subtotal before existing transient workspaces       about 18.404 GiB
+
+artifact payload bytes                                  delta = 0
+GPU/RAM/PCIe/NVMe bytes per target call/token            delta = 0
+runtime instructions and workspace bytes                 delta = 0
+13,625,700,352 B / 936 GB/s weight-read floor        14.56 ms/call
+```
+
+Only the offline UE8M0 code choice may change. MTP proposal count, verifier
+rows and bytes per accepted token are structurally unchanged, but acceptance
+can move with the logits and must therefore pass the final live throughput
+gate. Before compiler integration, exact runtime-consumed Q8 activations from
+two disjoint Romanian prompts must cover at least 90% of eligible FP4 matrices.
+The sampled complete-output-row objective, including cross-block error terms,
+must reduce calibration SSE by at least 10% and holdout SSE by at least 5%,
+with no holdout role-group regression. A block-local SSE sum is insufficient
+because it omits cross-block cancellation. Failure stops without building an
+artifact.
+
+### Activation-aware complete-output trial, 2026-09-23
+
+The compiler captured exact runtime-consumed Q8 inputs for 505/505 eligible
+dense projections from two disjoint Romanian prompts. The complete-output-row
+objective reduced calibration residual SSE by 33.70% and holdout residual SSE
+by 24.12%, with all 14 holdout role groups improved. Quantization used only the
+calibration capture; the holdout remained excluded from scale selection.
+
+The published candidate retained QPack ABI 3, the 14,775,390,208-byte payload,
+the CUDA kernels, Q4H target KV and MTP-4. It reselected the covering scale for
+105,250,169 of 813,957,120 blocks (12.93%) across all 505 calibrated matrices.
+The independent source qualifier found zero payload or scale mismatches over
+269,056 sampled values, with aggregate FP4 relative L2 0.1170506 and cosine
+0.9931263. The clean Windows Release/CUDA build and dense-FP4 CUDA smoke passed.
+
+The corrected live gate used the fixed 317-token Romanian prompt, seed 314159,
+temperature 1.0, top-p 0.95, top-k 20, `presence_penalty=0.5`, Q4H, MTP-4 and
+`xhigh`, with the artifact's 32,768-token thinking circuit breaker. It stopped
+normally after 25,673 completion tokens, including 17,850 reasoning tokens, in
+500.235 seconds. Generated throughput was 51.32 tok/s, above the 49.06 tok/s
+floor. MTP accepted 15,151 draft tokens across 10,523 exact calls.
+
+Romanian fidelity still failed materially. Representative malformed phrases
+included `muncă de liniă`, `modele de anomaliă`, `școlile private vau
+diferențiere`, `decizie de rețu` and `o reducere de 3% a pierdutului`. The
+candidate was not promoted over the operational artifact; its temporary alias
+was removed and cleanup released the worker and GPU allocation.
+
+This rejects activation-aware selection between the MSE-optimal and covering
+UE8M0 scales as a Romanian-fidelity remedy, despite passing its offline
+residual and live throughput gates. Do not repeat same-payload scale-objective
+tuning without a new mechanism that changes the representable reconstruction,
+not merely the choice between these two legal block scales.
+
+### Activation-aware adjacent-code trial, 2026-09-23
+
+The next same-ABI mechanism kept every activation-v3 UE8M0 scale fixed and
+allowed each target weight to move by at most one adjacent E2M1 magnitude.
+Candidate moves were ranked by isolated calibration gain and the best prefix
+of at most 64 moves per output row was selected against the complete output
+residual. An independent pre-implementation analyzer covered 497/497 regular
+target projections and 27,172,864 sampled weight values. Relative to the
+activation-v3 payload, it reduced calibration residual SSE by 55.24% and
+disjoint holdout SSE by 41.93%, with zero regression across all 13 holdout
+role groups. The top-64 bound produced exactly the same 23,590 sampled changes
+and aggregate errors as the unbounded ordering.
+
+Eligibility came only from artifact VM operations. Embedding and vision
+capabilities were excluded, as were eight matrices referenced exclusively by
+exact decode. This kept the MTP-only payload byte-identical to activation-v3;
+there is no model-family or tensor-path branch in the common compiler. The
+published candidate retained QPack ABI 3, the 14,775,390,208-byte pack,
+unchanged CUDA kernels, Q4H target KV and MTP-4. It applied 27,945,498 adjacent
+payload reselections while preserving the 105,250,169 activation-aware scale
+reselections. The independent source qualifier checked 269,056 values and
+reported zero payload or scale mismatches, FP4 relative L2 0.1181699 and
+cosine 0.9929944.
+
+The fixed Romanian request used 317 prompt tokens, seed 314159, temperature
+1.0, top-p 0.95, top-k 20, `presence_penalty=0.5`, Q4H, MTP-4, `xhigh` and the
+32,768-token circuit breaker. It stopped normally after 19,541 completion
+tokens, including 13,612 reasoning tokens. Provider wall was 387.125 seconds,
+or 50.48 generated tok/s, above the 49.06 tok/s floor. Prefill took 1.125
+seconds, TTFT was 1.157 seconds, and MTP accepted 11,335 drafts over 8,207
+exact calls.
+
+Romanian fidelity still failed. Representative output included `angajatori
+care recrutați`, `pașii greșiit`, `violurile de siguranță`, `model de limba
+artificială`, `producători de vinificați`, `stabilizaască`, `de la o anuire`
+and a Cyrillic-contaminated `partenери`. The candidate was stopped and not
+promoted; its temporary alias was removed and process/GPU cleanup passed.
+Adjacent-code activation tuning is therefore rejected as the Romanian-fidelity
+fix despite passing its offline, structural and live-throughput gates. Reopen
+only with a new mechanism and prerequisite that addresses the remaining
+language failure without changing the throughput floor.
+
+### Raw source-BF16 Romanian separation, 2026-09-23
+
+The exact abliterated source snapshot at revision
+`739e3c5b89849f6c238ce1e5b70008612ae42cdd` was loaded directly through the
+Transformers implementation in `torch.bfloat16`, using the source tokenizer
+and template. The fixed request retained its 317-token prompt, `xhigh`
+thinking, seed 314159, temperature 1.0, top-p 0.95, top-k 20 and
+`presence_penalty=0.5`. A checkpoint after 528 freely generated reasoning
+tokens was initially described as natural Romanian. Reinspection found
+`experiența utilizator` and `irigare/boale` in that raw BF16 reasoning text.
+It was not visible answer text and is not a full-response fidelity verdict,
+but the earlier claim of no malformed word was false.
+
+The initial discriminator reconstructed the activation-v4 output text through
+its first visible grammatical defect. On the resulting 14,087-token prefix,
+the raw BF16 source assigned the correct continuation ` durata` a total log
+probability 3.533903 greater than the emitted malformed continuation
+` durată`, a 34.2574x probability ratio. The reference was then stopped rather
+than repeating two later contrasts; cleanup returned the RTX 3090 to desktop
+residency.
+
+The probability ratio was not a causal separator: a matched no-cache BF16
+forward over the reconstructed prefix placed the malformed first token 14th
+after the actual 0.5 presence penalty, inside the configured top-20 sampler.
+The correct token was 6th; its adjusted first-token logit lead was 1.375.
+Sampling could therefore emit the malformed continuation even with unquantized
+weights. The service's original token IDs were not retained, so reconstruction
+from text adds another limitation. Neither weight quantization nor provider
+semantics is ruled in or out by this one continuation. A subsequent diagnostic
+searched other malformed continuations for a BF16 top-20 exclusion. Do not
+change the operational ABI, Q4H/MTP policy or 49.06 generated-tok/s floor on
+this evidence. The BF16
+source run is not a throughput result or authorization for a slower mode.
+
+### BF16 versus independently dequantized FP4 Romanian tokens, 2026-09-24
+
+Seven malformed expressions in the saved activation-v4 response were reencoded
+with the source tokenizer. This reconstructed a 16,820-token causal prefix from
+the same 317-token prompt and selected 19 token positions. Original service
+token IDs were not retained. Upstream Transformers scored the same reconstructed
+prefix twice with a causal KV cache: first with raw BF16 source weights, then
+after all 546 text-path FP4 QPack tensors were literally dequantized into that
+implementation's BF16 parameter storage. The latter does not execute the
+quantum-llm CUDA provider. All logits were finite and each cache length was
+checked. Both rankings applied the request's 0.5 presence penalty to prior
+completion tokens and used the configured `top_k=20` boundary.
+
+BF16 placed 18 of 19 emitted token pieces inside top-20. The sole exclusion
+was the final `it` in `greșiit`: BF16 rank 23, 0.3125 logit below the top-20
+cutoff. Independently dequantized FP4 moved it to rank 13, 0.625 above the
+cutoff. All 19 pieces were inside FP4 top-20. Thus stored FP4 weights alone
+can change this token's top-k eligibility; a native runtime defect is not
+necessary for that boundary crossing. The other pieces were already top-k
+eligible with source BF16, and the short free BF16 reasoning checkpoint also
+contained Romanian defects. These observations do not establish that FP4
+alone caused the full response's grammatical degradation or that the native
+provider is numerically correct.
+
+This was a reconstructed, self-conditioned prefix, not captured service token
+IDs or a freely generated full BF16 answer. The separate `top_p=0.95` filter
+was not evaluated, so top-k inclusion is not proof of final sampling
+eligibility. No artifact, service, quantization ABI, or policy changed; GPU
+cleanup returned to 207 MiB desktop residency. Before choosing mixed-precision
+weights or editing runtime semantics, capture exact service IDs and compare
+full sampling eligibility and independent logits on a source-excluded token.
+
+### Full-sampler replay rejects the reconstructed-token ablation, 2026-09-24
+
+The next causal-weight prerequisite reused the same saved activation-v4 text
+and source snapshot. It dequantized all 546 text-path FP4 tensors into upstream
+Transformers, replayed the reencoded prefix through the token preceding the
+final `it` in `greșiit`, and applied temperature 1.0, presence penalty 0.5,
+top-k 20 and top-p 0.95 in the same order as the native sampler. On this
+15,590-token reconstructed prefix, `it` ranked 12th and cleared top-k, but
+the top-p nucleus contained only the first two candidates. The independent
+FP4 path could not have sampled `it` from this reconstructed state. The
+planned BF16-head and layer interventions were therefore not executed.
+
+A read-only tokenizer audit found 19,529--19,531 tokens for seven plausible
+thinking/content separator reconstructions, versus 19,541 actual generated
+tokens reported by the saved service response. The previously used separator
+produced 19,531, a 10-token deficit. The response's `reasoning_tokens=13,612`
+does not prove original token parity because the server computes that field by
+reencoding the parsed reasoning text. The missing generated IDs may reflect
+parser-removed markers or non-invertible reencoding; their location is unknown.
+Thus neither a native sampler/provider error nor a weight-only explanation can
+be selected from this saved response. The earlier top-k crossing remains a
+property of the reconstructed reference, not a causal explanation of the
+observed service token. Stop weight-group selection on this prefix. The
+prerequisite is one exact native generated-token stream and its effective
+sampling distribution at the suspect step; only then repeat a bounded
+counterfactual. No service/artifact changed, and GPU cleanup reached 214 MiB.
+
+### Incremental text-decoding check, 2026-09-24
+
+The saved activation-v4 response was reencoded with its artifact tokenizer,
+then fed token by token through the service's `IncrementalTokenDecoder`.
+Reasoning used 13,612 reencoded tokens and visible content used 5,916.
+For both regions, concatenated incremental output equaled full tokenizer
+decoding byte-for-byte, and full decoding equaled the saved text. This does
+not prove parity with the original 19,541 service IDs: parser delimiters and
+any non-invertible segment are still missing. It rejects only a simple
+incremental-decoder corruption of the reconstructed response. Do not patch
+transport as a Romanian-fidelity remedy without a mismatch on exact service
+IDs.
+
+### Exact Qwen Romanian token and sampler separation, 2026-09-24
+
+The fixed 317-token Romanian request was repeated on the unchanged
+`qwen3.8-27b-abliterated-fp4-activation-v4` artifact with Q4H, MTP-4,
+`xhigh`, seed 314159, temperature 1.0, top-p 0.95, top-k 20 and presence
+penalty 0.5. The response again had exactly 19,541 completion tokens; its
+reasoning and visible content were byte-identical to the earlier saved run.
+The service captured all original prompt and completion IDs. The native
+sampling trace matched the first 19,531 completion IDs and positions exactly;
+the final ten decisions were not flushed before diagnostic service shutdown,
+but all inspected malformed expressions precede them. Incremental decoding of
+the original IDs contained the displayed content exactly. This rules out a
+simple display/retokenization explanation for these examples.
+
+The captured native target distributions and an independent upstream BF16
+forward on the **same exact FP4-generated prefix** gave:
+
+| Emitted piece | Native target probability | Source-BF16 probability |
+|---|---:|---:|
+| `ată` in `durată șederii` | 0.138190 | 0.125107 |
+| `ți` in `angajatori care recrutați` | 0.980674 | 0.972415 |
+| `it` in `pașii greșiit` | 0.078535 | 0, excluded by top-p |
+
+All three inspected pieces were emitted by the target residual path, not an
+unchecked MTP proposal. The first two distributions are close at the selected
+step, so neither transport nor MTP alone explains those malformed words.
+This does **not** prove that freely generated BF16 would make the same
+mistakes: the prefix was generated by FP4, and an earlier divergence could
+have changed the state. The third piece is a genuine source-versus-native
+separator, but without a memory-safe independent QPack-logit result it cannot
+yet be assigned to stored FP4 weights versus provider arithmetic.
+
+An attempted source-then-literal-QPack comparison in one process was stopped
+before its FP4 forward completed: committed private memory reached about
+112 GB on the 64 GB host, physical free RAM fell to about 1.8 GiB, and paging
+pressure made the comparison unsuitable. The subsequent source-only exact
+forward completed with KV length checks; its process exited and GPU memory
+returned to about 215 MiB. No artifact was promoted, no production sampling
+policy was changed, and the diagnostic service was stopped. Do not repeat the
+same in-process full-weight replacement; a memory-bounded independent FP4
+reference is the remaining prerequisite before any quantization/runtime fix
+claim for `greșiit`.
+
+### Recurrent A-projection selective-MXFP6 gate, 2026-09-23
+
+The next fail-fast analysis kept Q4H, MTP-4, `xhigh`, the sampler and all
+runtime mathematics fixed. At the activation-v4 operating point:
+
+```text
+hot target weights                          13,625,700,352 B/call
+exact calls / generated token                    8,207 / 19,541
+effective hot-weight traffic                 5.722640744 GB/token
+measured throughput                                  50.48 tok/s
+required floor                                       49.06 tok/s
+maximum additional traffic                         2.8944%
+byte-equivalent ceiling                       about 394,384,315 B/call
+```
+
+Converting all 96 recurrent `a_projection` and `b_projection` matrices from
+FP4 to MXFP6 added only 5,898,240 raw payload bytes, but failed the declared
+50% disjoint-holdout residual gate: aggregate improvement was 47.8270%.
+Selection was therefore reassessed from calibration only. Recurrent A improved
+calibration residual by about 52.04%, while recurrent B improved it by only
+about 1.87%; B was excluded before opening another holdout.
+
+The resulting A-only policy was evaluated on a third, previously unseen
+267-token Romanian BF16 prompt about school energy renovation. All 48
+recurrent layers improved, aggregate Q8-input output-residual SSE fell from
+11,061.264079 to 4,110.853400 (62.8356%), and there were no layer regressions.
+The added hot payload is 2,949,120 B per target call, 0.748% of the conservative
+byte ceiling. This admits one real artifact candidate; it is not yet a Romanian
+fidelity or throughput pass.
+
+The compiler now accepts a strict artifact encoding policy expressed as an
+operation capability plus tensor role. It resolves and records exact tensor
+names, rejects unmatched or non-FP4 matrix roles, and emits MXFP6 ABI 6 records
+without a model-family branch. Activation-calibration provenance explicitly
+records captures excluded because another ABI owns those tensors. Promotion
+required independent source qualification, the fixed real Romanian service
+gate and at least 49.06 generated tok/s.
+
+The candidate QPack was exactly 2,949,120 bytes larger than activation-v4 and
+contained 48 MXFP6 records. Independent source qualification found zero FP4 or
+MXFP6 payload/scale mismatches; MXFP6 cosine was 0.9985397 with relative L2
+0.0541595. The fixed 317-token Romanian request stopped normally after 22,308
+completion tokens, including 15,825 reasoning and 6,483 visible tokens. Wall
+time was 450.961 seconds, or 49.4677 generated tok/s, so the candidate passed
+the 49.06 tok/s floor by 0.83%.
+
+Romanian fidelity still failed materially. The visible answer contained forms
+including `gerosiatrii`, `oprrire`, `coleriele`, `meseriași calificăți`, `pot
+demostra`, `agronomii consilienți`, `o istoric`, `date incompletes` and
+`reducererea`. The stable artifact was not replaced. Recurrent A-only MXFP6 is
+therefore rejected as the Romanian-fidelity remedy despite passing its
+numerical and throughput gates. Another mixed-precision candidate requires a
+logit-directed sensitivity prerequisite; local projection residual alone has
+now failed to predict language fidelity twice.
+
+### BF16 dense-activation-input gate, 2026-09-23
+
+The source/runtime boundary was narrowed without changing weights, Q4H, MTP-4,
+sampling or the fixed 317-token Romanian request. A generic artifact capability
+replaced row-global Q8 dense operands with BF16 operands while retaining the
+same FP4 weight payload. Its incremental activation traffic was estimated at
+about 16.98 MB per target call, below the 394,384,315-byte ceiling derived from
+the 49.06 tok/s floor.
+
+The first CUDA gate was invalid because it covered only the narrow
+`[17408,5120]` geometry. In service, the generic 128-row prefill tile was also
+selected for decode batches of at most five and wasted most warps; after more
+than 1,375 seconds the request still had not completed. One corrective patch
+added a 16-row/32-output, two-warp BF16 decode kernel and extended the gate to
+include the wide `[5120,17408]` down projection. A canonical clean build passed
+CTest 8/8 and the 120-test Python contract. The corrected native gate measured:
+
+```text
+maximum absolute error                         0.0000534058
+combined Q8 rate                              76.3036 GB/s
+combined BF16-input rate                     108.2550 GB/s
+required BF16-input rate                      74.1572 GB/s
+```
+
+The corrected live request still did not complete before the 675.008-second
+client deadline. Even the impossible best case of all 32,768 allowed tokens
+already generated gives only `32768 / 675.008 = 48.5446 tok/s`, below the
+49.06 floor; actual throughput is lower. The service was stopped, the temporary
+alias was removed, and the stable artifact was not changed. Because the request
+was cancelled, it supplies no Romanian-fidelity verdict.
+
+Full BF16 dense operands are rejected for this goal on end-to-end throughput,
+despite passing the corrected local kernel prerequisite. Do not tune this path
+again without a new whole-service traffic/cost inequality. The next candidate
+must preserve the existing FP4 payload size and fast Q8 runtime path: either an
+offline quantization improvement or a demonstrated semantic/layout correction.
+
+### Exact recurrent-convolution trial, 2026-09-24
+
+The 48 recurrent `linear_attn.conv1d.weight` tensors contain only 1,966,080
+values. Their existing FP4 block-32 representation wastes 28 padded values for
+every four-value convolution row and has aggregate source relative L2
+0.1119022. Replacing those records with exact source F32 therefore required no
+new kernel arithmetic or per-call device traffic: the existing recurrent
+kernel already consumes a dequantized F32 convolution buffer.
+
+```text
+current convolution bytes read per target call       7,864,320 B
+exact-F32 convolution bytes read per target call      7,864,320 B
+raw stored payload delta                               -491,520 B
+aligned candidate QPack delta                          -393,216 B
+hot target-weight traffic delta per call/token                 0
+GPU instructions, Q4H, MTP state and workspaces delta          0
+```
+
+A generic recurrent capability ABI accepted an F32 convolution record without
+model-name or layer-count dispatch. The independent source qualifier found zero
+F32 value mismatches across all 48 tensors and zero FP4 payload or scale
+mismatches elsewhere. A clean Windows Release/CUDA build passed CTest 8/8 and
+the Python contract.
+
+The fixed 317-token Romanian request retained Q4H, MTP-4, `xhigh`, seed 314159,
+temperature 1.0, top-p 0.95, top-k 20 and `presence_penalty=0.5`. It stopped
+normally after 19,471 completion tokens, including 11,153 reasoning and 8,318
+visible tokens, in 391.799 seconds. Generated throughput was 49.6964 tok/s,
+above the 49.06 tok/s floor by 1.30%.
+
+Romanian fidelity still failed materially. The visible answer included
+`afecțiuni cardiice`, `utilizatori directs`, `datele greu de replicabile`,
+`o操are de utilaj`, `Fermere`, `regulilor statiche` and `experiența
+utilizatorul`. The stable artifact was not changed, the candidate service was
+stopped, the temporary alias was removed, and the experimental compiler/runtime
+branch was rolled back. Exact recurrent convolutions are rejected as the
+Romanian-fidelity remedy: removing 100% of their quantization error did not
+remove the defect.
+
+The next same-speed mechanism must change the representable FP4 solution and
+pass a logit-directed prerequisite at the known malformed continuation. Local
+tensor or projection residual alone is insufficient because it has now failed
+to predict language fidelity across scale selection, adjacent-code tuning,
+selective MXFP6 and exact convolution controls.
+
+### Exact RMSNorm diagonal-equalization prerequisite, 2026-09-24
+
+An AWQ-style offline trial tested the exact algebraic transform
+`gamma' = gamma / s`, `W'[:,i] = W[:,i] * s[i]` for every artifact operation
+that binds one input RMSNorm to FP4 projections. It covered all 128 text-layer
+norm groups, 368 projections and 2,944 deterministic sampled output rows. The
+candidate retained row-global Q8 activations, E2M1/UE8M0 block-32 weights, all
+runtime geometry and the exact byte/instruction stream. The unquantized
+invariance check had maximum absolute error below `1.8e-15`.
+
+The first analyzer omitted the identity policy and could only report
+regressing transforms. The single corrective patch added the byte-identical
+activation-v4 baseline as an explicit candidate for every group, then reran
+the complete gate. All 128 groups selected that identity candidate:
+
+```text
+calibration SSE       1,118.3724605 -> 1,118.3724605   (0.00%)
+disjoint holdout SSE  1,604.7805987 -> 1,604.7805987   (0.00%)
+holdout relative L2       0.0544408 -> 0.0544408
+runtime bytes/instructions delta                         0
+```
+
+The declared thresholds were 60% calibration improvement, 50% holdout
+improvement and no holdout role regression. The prerequisite failed before a
+compiler change, artifact build or service request. Do not build this diagonal
+equalization family from the tested activation/weight-statistic alpha search;
+it does not beat the existing activation-v4 representation even locally.
+
+### Full-code FP4 residual-correction prerequisite, 2026-09-24
+
+A second same-payload trial retained every activation-v4 UE8M0 scale but let
+sampled weights select any of the 15 distinct signed E2M1 values instead of
+only one adjacent magnitude. It covered 497/497 target projections and 3,976
+sampled output rows. Four unrestricted passes reduced calibration SSE by
+79.09%, but external holdout SSE regressed by 25.08% and 12/13 role groups
+regressed. This was direct overfitting, not an admissible quantizer.
+
+The single corrective strategy split calibration rows into selection and
+internal-validation halves, required every accepted prefix to improve both,
+and reduced the search to 64 candidates over two passes. `lm_head.weight` had
+only one captured row, so the end-to-end reassessment retained it byte-identical
+and covered the other 496/497 matrices (99.798%). The corrected result was:
+
+```text
+calibration SSE       1,167.6500239 -> 1,036.9593290   (+11.1926%)
+external holdout SSE  1,710.0331263 -> 1,709.8159836   (+0.0127%)
+holdout relative L2       0.0555464 -> 0.0555429
+changed sampled values                      1,683 / 27,131,904
+holdout role regressions                                  9 / 12
+```
+
+The declared gate required at least 70% calibration improvement, 55% holdout
+improvement and no role regression. It failed before compiler/runtime work or
+an artifact build. Full-code coordinate residual correction is rejected for
+the present captures; do not tune its pass/count bounds again without a new
+generalization mechanism.
+
+### Sparse FP16 row-residual prerequisite, 2026-09-24
+
+A SpQR/SqueezeLLM-inspired prerequisite kept the activation-v4 FP4 payload and
+tested a fused sparse sidecar. Each correction contains one U16 input-column
+index and one F16 source-minus-FP4 residual. Selection used alternating halves
+of calibration and admitted a correction only when it improved both; external
+holdout remained excluded. `lm_head.weight` retained its baseline payload, so
+496/497 target matrices (99.798%) were evaluated without inventing samples.
+
+For all 3,904,000 eligible output rows, K=4 required 62,464,000 sidecar bytes
+and at most 124,928,000 conservative sidecar-plus-activation bytes per target
+call. It improved calibration SSE by 30.5652% and holdout by 18.1209%, with no
+role regression, but missed the predeclared 25% holdout gate. The one allowed
+capacity correction increased to K=8 while remaining inside the throughput
+inequality:
+
+```text
+sidecar payload / conservative bytes per call   124,928,000 / 249,856,000 B
+allowed incremental bytes per target call                    394,384,315 B
+calibration SSE improvement                                      39.5242%
+holdout SSE improvement                                          21.4018%
+holdout role regressions                                             0 / 12
+projected bandwidth-only throughput                      about 49.57 tok/s
+```
+
+K=8 still missed the unchanged 25% holdout threshold, so no ABI, CUDA kernel
+or artifact was built. Do not increase K or relax the quality gate under this
+mechanism; the next representation must obtain more correction per hot byte.
+
+### Matrix-specific signed-Q4 codebook prerequisite, 2026-09-24
+
+A dense alternative retained every activation-v4 nibble and UE8M0 scale while
+replacing fixed E2M1 magnitudes with an eight-entry matrix codebook in 0.25
+units. The proposed runtime representation would carry the codebook in one
+64-bit kernel argument, leaving packed-weight bytes, scale bytes, loads and
+Tensor Core operations unchanged. It is a custom Q4 representation, not FP4.
+
+The first fit reassigned codes to learned centers; no one of 496 evaluable
+matrices beat activation-v4 on both internal splits. The single correction
+kept all published nibbles fixed and solved only their seven nonzero decode
+values. It selected custom tables for 98 matrices, adding only 784 codebook
+bytes, but produced:
+
+```text
+calibration SSE improvement       0.4742%
+external holdout improvement      0.6114%
+holdout role regressions          recurrent in_proj_b (1 / 12)
+```
+
+This is far below the unchanged 20%/20% gate and fails the no-regression rule.
+No custom-Q4 ABI or CUDA path is justified. Matrix-specific decode codebooks
+are rejected; diagnosis returns to a possible source/runtime semantic mismatch
+rather than more local weight-error tuning.
+
+### Block-Hessian FP4 GPTQ prerequisite, 2026-09-24
+
+The official Qwen3.5 GPTQ-Int4 recipe uses one-shot second-order error
+compensation with `true_sequential=true`, `damp_percent=0.01` and
+`desc_act=false`. A fail-fast adaptation retained the runtime's E2M1 payload,
+UE8M0 block-32 scales and every serving byte/instruction contract, but applied
+damped block-128 inverse-Hessian feedback while quantizing each block-32 group.
+Selection used the existing Romanian calibration capture; the disjoint holdout
+was excluded until the final decision. `lm_head.weight` had only one captured
+row and remained byte-identical, giving 496/497 matrix coverage.
+
+The first analyzer launched the independent block factorizations serially and
+retained their factors, so it was stopped without a result. The one corrective
+implementation batched all block factorizations for one matrix and released
+them before advancing. It preserved the exact algorithm and thresholds. The
+completed result strongly overfit:
+
+```text
+sampled output rows / values            3,968 / 27,131,904
+calibration SSE improvement                         56.3665%
+holdout SSE improvement                             -130.5282%
+holdout relative L2                    0.0555464 -> 0.0843370
+holdout role regressions                              12 / 12
+runtime bytes/instructions delta                            0
+```
+
+The declared gate required at least 50% calibration improvement, 35% holdout
+improvement and no role regression. No compiler profile, artifact or runtime
+change was built. Do not tune damping or Hessian block size on the present
+64-row captures; the failure is broad rather than a near-threshold miss. A
+future true-sequential GPTQ attempt requires a materially larger and more
+diverse calibration corpus plus a full-network/logit gate.
+
+### One-byte U6M2 FP4 scale prerequisite, 2026-09-24
+
+A new representation kept each block's 32 signed E2M1 values and one-byte
+scale, but decoded the scale as unsigned U6M2:
+`(1 + mantissa / 4) * 2 ** (exponent - 32)`. This preserves payload bytes and
+weight traffic while adding two mantissa bits to the former power-of-two
+scale. An exact bounded search covered all 256 codes for 849,152 sampled
+blocks from all 497 target projections. The source-only form reduced sampled
+BF16 weight SSE by 34.5332%, but increased complete-output SSE by 96.2298% on
+calibration and 33.1450% on disjoint holdout, with nine role regressions.
+
+The single corrective trial retained activation-v4 blocks unless the
+source-optimal U6M2 replacement improved the complete calibration-row
+residual. Holdout remained excluded from selection. It reduced calibration
+SSE by 74.2967% and holdout SSE by 29.9718%, with zero role regressions, but
+only reduced source-weight SSE by 8.4380% versus the predeclared 30% minimum:
+
+```text
+selected source-optimal blocks            167,421 / 849,152
+sampled values                                 27,172,864
+source relative L2                    0.1185884 -> 0.1134749
+holdout relative L2                   0.0555443 -> 0.0464810
+runtime payload/traffic delta                              0
+```
+
+The corrected candidate is still predominantly an activation-tuned Q4
+artifact rather than a materially closer reconstruction of the BF16 source.
+No U6M2 ABI, encoder, CUDA path or artifact was built. Do not relax the source
+gate or tune this scale format further on the same captures. A later rank audit
+found one BF16-excluded token in `greșiit` that becomes top-k eligible with
+independently dequantized FP4, but a full-sampler replay excluded it after
+top-p on the reconstructed prefix. Exact service token IDs, the effective
+sampling distribution and an end-to-end numerical gate remain prerequisites
+for mixed-precision selection.
+The previously selected ` durată` continuation was eligible in BF16 top-20.
+
+### Invalid first-token sensitivity audit, 2026-09-24
+
+An attempted BF16-gradient/QPack projection ranking at the reconstructed
+14,087-token prefix reported NaNs and output squared errors up to about `1e77`,
+yet incorrectly serialized `pass: true`. Its matrix ranking and predicted
+recovery are invalid and must not select mixed precision. A separate read-only
+audit of 504 rank-two QPack records found no invalid UE8M0 codes, no scale code
+above 125, and no code above 160. The stored scales cannot explain the
+astronomical analyzer values; the captured activation/gradient computation or
+its comparison path remains unvalidated. No artifact, runtime, or service was
+changed by that ranking attempt.
+
 ## Rejected DeepSeek work
 
 - Whole-prompt layer-major routing required about 176 GiB of selection streams

@@ -2,8 +2,8 @@
 """Run a bounded, local-only Hugging Face reference corpus.
 
 The reference backend is selected from checkpoint capabilities.  It uses the
-immutable source snapshot, its tokenizer and chat template, and deterministic
-generation.  It never downloads model files.
+immutable source snapshot, its tokenizer and chat template, and corpus-declared
+generation settings.  It never downloads model files.
 """
 
 from __future__ import annotations
@@ -18,6 +18,75 @@ from pathlib import Path
 from typing import Any
 
 
+_MAXIMUM_NEW_TOKENS = 32_768
+
+
+class _PresencePenalty:
+    """OpenAI presence semantics over generated tokens only."""
+
+    def __init__(self, prompt_tokens: int, penalty: float) -> None:
+        self.prompt_tokens = prompt_tokens
+        self.penalty = penalty
+
+    def __call__(self, input_ids: Any, scores: Any) -> Any:
+        emitted = input_ids[:, self.prompt_tokens:]
+        for row in range(emitted.shape[0]):
+            if emitted.shape[1]:
+                scores[row, emitted[row].unique()] -= self.penalty
+        return scores
+
+
+class _ProgressStreamer:
+    """Persist bounded generated-token checkpoints during a long reference run."""
+
+    def __init__(self, tokenizer: Any, prompt_ids: list[int], output: Path,
+                 case_id: str, interval: int) -> None:
+        self.tokenizer = tokenizer
+        self.prompt_ids = prompt_ids
+        self.output = output
+        self.case_id = case_id
+        self.interval = interval
+        self.output_ids: list[int] = []
+        self.received_prompt = False
+
+    def _publish(self) -> None:
+        document = {
+            "schema_version": 1,
+            "case_id": self.case_id,
+            "output_tokens": len(self.output_ids),
+            "output_token_ids": self.output_ids,
+            "raw_text": self.tokenizer.decode(
+                self.output_ids, skip_special_tokens=False,
+            ),
+        }
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        partial = self.output.with_name(self.output.name + ".partial")
+        partial.write_text(
+            json.dumps(document, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        partial.replace(self.output)
+        print(
+            f"reference_progress case={self.case_id} "
+            f"output_tokens={len(self.output_ids)}",
+            flush=True,
+        )
+
+    def put(self, value: Any) -> None:
+        tokens = [int(token) for token in value.detach().cpu().reshape(-1)]
+        if not self.received_prompt:
+            if tokens != self.prompt_ids:
+                raise RuntimeError("reference streamer prompt token mismatch")
+            self.received_prompt = True
+            return
+        self.output_ids.extend(tokens)
+        if len(self.output_ids) % self.interval == 0:
+            self._publish()
+
+    def end(self) -> None:
+        self._publish()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--snapshot", type=Path, required=True)
@@ -26,6 +95,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-gpu-memory", default="20GiB")
     parser.add_argument("--max-cpu-memory", default="42GiB")
     parser.add_argument("--offload-directory", type=Path, required=True)
+    parser.add_argument("--progress-every-tokens", type=int, default=128)
     return parser.parse_args()
 
 
@@ -73,6 +143,8 @@ def main() -> int:
     cases = corpus.get("cases")
     if not isinstance(cases, list) or not cases:
         raise ValueError("behavior corpus has no cases")
+    if args.progress_every_tokens <= 0:
+        raise ValueError("progress token interval must be positive")
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -123,8 +195,18 @@ def main() -> int:
             raise ValueError(f"case {case['id']} has no messages")
         tools = case.get("tools") or None
         maximum = int(case.get("maximum_new_tokens", 128))
-        if maximum <= 0 or maximum > 512:
+        if maximum <= 0 or maximum > _MAXIMUM_NEW_TOKENS:
             raise ValueError(f"case {case['id']} has unsafe output limit")
+        do_sample = bool(case.get("do_sample", False))
+        temperature = float(case.get("temperature", 1.0))
+        top_p = float(case.get("top_p", 1.0))
+        top_k = int(case.get("top_k", 0))
+        presence_penalty = float(case.get("presence_penalty", 0.0))
+        seed = int(case.get("seed", 0))
+        if not 0.0 < temperature or not 0.0 < top_p <= 1.0:
+            raise ValueError(f"case {case['id']} has invalid sampling bounds")
+        if top_k < 0 or not -2.0 <= presence_penalty <= 2.0 or seed < 0:
+            raise ValueError(f"case {case['id']} has invalid sampling settings")
         template_kwargs = {
             "reasoning_effort": case.get("reasoning_effort", "xhigh"),
             "enable_thinking": bool(case.get("enable_thinking", True)),
@@ -143,18 +225,43 @@ def main() -> int:
         model_inputs = {
             name: value.to(input_device) for name, value in encoded.items()
         }
+        progress = args.output.resolve().with_name(
+            args.output.name + f".{case['id']}.progress.json"
+        )
+        streamer = _ProgressStreamer(
+            tokenizer, input_ids, progress, case["id"],
+            args.progress_every_tokens,
+        )
+        logits_processors = []
+        if presence_penalty != 0.0:
+            logits_processors.append(_PresencePenalty(
+                len(input_ids), presence_penalty,
+            ))
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        generation_options: dict[str, Any] = {
+            "do_sample": do_sample,
+            "max_new_tokens": maximum,
+            "use_cache": True,
+            "streamer": streamer,
+            "logits_processor": logits_processors,
+            "pad_token_id": (
+                tokenizer.pad_token_id
+                if tokenizer.pad_token_id is not None
+                else tokenizer.eos_token_id
+            ),
+        }
+        if do_sample:
+            generation_options.update({
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+            })
         generation_started = time.perf_counter()
         with torch.inference_mode():
             generated = model.generate(
                 **model_inputs,
-                do_sample=False,
-                max_new_tokens=maximum,
-                use_cache=True,
-                pad_token_id=(
-                    tokenizer.pad_token_id
-                    if tokenizer.pad_token_id is not None
-                    else tokenizer.eos_token_id
-                ),
+                **generation_options,
             )
         torch.cuda.synchronize()
         generation_seconds = time.perf_counter() - generation_started
@@ -171,6 +278,15 @@ def main() -> int:
             "reasoning_content": reasoning,
             "content": content,
             "generation_seconds": generation_seconds,
+            "sampling": {
+                "do_sample": do_sample,
+                "temperature": temperature,
+                "top_p": top_p,
+                "top_k": top_k,
+                "presence_penalty": presence_penalty,
+                "seed": seed,
+                "rng_backend": "torch.manual_seed",
+            },
         })
 
     document = {

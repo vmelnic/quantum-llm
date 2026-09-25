@@ -53,9 +53,8 @@ requires explicit user approval.
 - The serving target is self-contained on one RTX 3090 host (`3090box`).
 - No external owner, remote expert executor, distributed fallback, or outside
   coordinator may be introduced as a dependency or future escape hatch.
-- Current validated common routed-VRAM budget: 12 GiB. The 13 GiB DeepSeek
-  profile fails preflight after fixed allocations and the 1 GiB reserve. Do not
-  raise the budget without real Qwen + DeepSeek chat gates and cleanup.
+- Current validated routed-VRAM budget is 12 GiB. Do not raise it without real
+  in-scope model chat gates and cleanup.
 
 ### Qwen3.8-27B
 
@@ -73,16 +72,17 @@ throughput          approximately 15 generated tokens/s, measured as useful outp
 Cold prefill, reused-prefix prefill, decode, and tool-loop wall time are
 independent gates. Passing one never implies another.
 
-### DeepSeek
+### DeepSeek scope exclusion
 
-- Preserve exact router, top-k, and stable aggregation.
-- The model may exceed RAM+VRAM and use NVMe+RAM+VRAM demand paging.
-- Novel-route performance around 1 tok/s is acceptable; settled useful target
-  is 10-15 tok/s.
-- The callable provider does not implement exact session checkpoint/rewind.
-  Never send it `CHECKPOINT`, `RESUME`, `RETAIN`, or `DROP`.
-- Cancelling a long DeepSeek prefill can leave the worker unhealthy. Check
-  `/ready`; restart before further gates. Do not claim automatic recovery.
+- DeepSeek is out of scope. Agents MUST NOT research, modify, build, deploy,
+  start, stop, restart, benchmark, smoke-test, or otherwise operate any
+  DeepSeek model, artifact, provider, paging path, or task.
+- DeepSeek MUST NOT be used as a universal-path, regression, release, cleanup,
+  or acceptance gate. Existing DeepSeek code, artifacts, documentation, and
+  historical evidence are read-only and may be consulted ONLY when required to
+  avoid collateral damage to in-scope work.
+- ONLY a later explicit user request that names DeepSeek and places it back in
+  scope may revoke this exclusion.
 
 ## 3. Feasibility gate before inference work
 
@@ -145,7 +145,7 @@ transfer bytes/accepted token, or real harness throughput. Stop when it fails.
   final structured tool extraction. Pi receives standard API events; do not add
   a second final reparse/reconcile path or family-specific output parser.
 - A universal-path claim requires the same real `hi` smoke through
-  `./ops/model.sh chat` for Qwen, DeepSeek, and every newly claimed model.
+  `./ops/model.sh chat` for Qwen and every newly claimed in-scope model.
 
 ## 6. Artifact and model operations
 
@@ -184,16 +184,14 @@ Canonical Python contract:
 
 ```bash
 python3 -m unittest -v \
-  tests.compiler.test_deepseek_quant \
   tests.compiler.test_expert_pack \
-  tests.server.test_expert_server \
-  tests.server.test_deepseek_route_oracle
+  tests.server.test_expert_server
 ```
 
 Use the Windows Release/CUDA build and CTest path when native runtime code
 changes. For universal service changes, run real `model.sh chat` gates in this
-order: new/affected model, Qwen, DeepSeek. Test Pi only when harness behavior is
-part of the goal. Do not claim unrun gates.
+order: new/affected model, then Qwen. DeepSeek is excluded by section 2. Test Pi
+only when harness behavior is part of the goal. Do not claim unrun gates.
 
 - `cmake --fresh` resets CMake configuration; it does NOT remove stale object
   files or libraries. The canonical Windows Release/CUDA build MUST use

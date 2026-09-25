@@ -6,17 +6,16 @@ endif()
 option(EXPERT_RUNTIME_BUILD_TESTS "Build deterministic runtime tests" ON)
 option(EXPERT_RUNTIME_ENABLE_CUDA_PINNED "Use cudaHostAlloc for the fixed host pool" OFF)
 option(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE "Build SM86 Expert Pack kernels" OFF)
+option(EXPERT_RUNTIME_ENABLE_COMPRESSED_SPARSE_PROVIDER
+  "Build the optional compressed-sparse provider and its source adapters" ON)
 
 add_library(expert_runtime STATIC
   src/active_expert_executor.cpp
   src/adaptive_placement.cpp
   src/buffer_pool.cpp
   src/cache_state.cpp
-  src/cpu/deepseek_packed_executor.cpp
   src/cpu/expert_executor.cpp
-  src/deepseek_catalog.cpp
-  src/deepseek_artifacts.cpp
-  src/deepseek_expert.cpp
+  src/cpu/fp4_host_executor.cpp
   src/expert_cache.cpp
   src/expert_catalog.cpp
   src/execution_provider.cpp
@@ -41,6 +40,16 @@ add_library(expert_runtime STATIC
   src/worker_contract.cpp
   src/worker_provider.cpp
 )
+
+if(EXPERT_RUNTIME_ENABLE_COMPRESSED_SPARSE_PROVIDER)
+  target_sources(expert_runtime PRIVATE
+    src/deepseek_catalog.cpp
+    src/deepseek_artifacts.cpp
+    src/deepseek_expert.cpp)
+else()
+  target_compile_definitions(expert_runtime PRIVATE
+    EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER=1)
+endif()
 
 target_compile_features(expert_runtime PUBLIC cxx_std_20)
 target_include_directories(expert_runtime PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -78,13 +87,13 @@ endif()
 
 if(MSVC)
   set_source_files_properties(
-    src/cpu/deepseek_packed_executor.cpp
     src/cpu/expert_executor.cpp
+    src/cpu/fp4_host_executor.cpp
     PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|amd64")
   set_source_files_properties(
-    src/cpu/deepseek_packed_executor.cpp
     src/cpu/expert_executor.cpp
+    src/cpu/fp4_host_executor.cpp
     PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
 endif()
 
@@ -103,28 +112,31 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   enable_language(CUDA)
   find_package(CUDAToolkit 12.1 REQUIRED)
   target_sources(expert_runtime PRIVATE
-    src/cuda/deepseek_admission.cu
-    src/cuda/deepseek_attention.cu
-    src/cuda/deepseek_csa.cu
-    src/cuda/deepseek_dense.cu
-    src/cuda/deepseek_dense_set.cpp
-    src/cuda/deepseek_decode.cpp
-    src/cuda/deepseek_scheduler.cpp
-    src/cuda/deepseek_ffn.cu
-    src/cuda/deepseek_hca.cu
-    src/cuda/deepseek_io.cu
-    src/cuda/deepseek_model.cpp
-    src/cuda/deepseek_mtp.cu
-    src/cuda/deepseek_mtp_request.cpp
-    src/cuda/deepseek_request.cpp
-    src/cuda/deepseek_verify.cpp
-    src/cuda/deepseek_typed.cu
-    src/cuda/deepseek_typed_set.cpp
     src/cuda/expert_directory.cu
     src/cuda/expert_uploader.cu
     src/cuda/flash_attention.cu
     src/cuda/moe_kernels.cu
     src/cuda/transformer_kernels.cu)
+  if(EXPERT_RUNTIME_ENABLE_COMPRESSED_SPARSE_PROVIDER)
+    target_sources(expert_runtime PRIVATE
+      src/cuda/deepseek_admission.cu
+      src/cuda/deepseek_attention.cu
+      src/cuda/deepseek_csa.cu
+      src/cuda/deepseek_dense.cu
+      src/cuda/deepseek_dense_set.cpp
+      src/cuda/deepseek_decode.cpp
+      src/cuda/deepseek_scheduler.cpp
+      src/cuda/deepseek_ffn.cu
+      src/cuda/deepseek_hca.cu
+      src/cuda/deepseek_io.cu
+      src/cuda/deepseek_model.cpp
+      src/cuda/deepseek_mtp.cu
+      src/cuda/deepseek_mtp_request.cpp
+      src/cuda/deepseek_request.cpp
+      src/cuda/deepseek_verify.cpp
+      src/cuda/deepseek_typed.cu
+      src/cuda/deepseek_typed_set.cpp)
+  endif()
   target_compile_definitions(expert_runtime PUBLIC EXPERT_RUNTIME_HAS_CUDA_COMPUTE=1)
   target_compile_definitions(expert_runtime PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH>)
@@ -206,11 +218,17 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_compile_features(expert-dense-fp4-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-dense-fp4-cuda-smoke PRIVATE
     expert_runtime CUDA::cudart)
+  add_executable(expert-mxfp6-cuda-smoke
+    tools/mxfp6_cuda_smoke.cpp)
+  target_compile_features(expert-mxfp6-cuda-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-mxfp6-cuda-smoke PRIVATE
+    expert_runtime CUDA::cudart)
   add_executable(expert-native-nvfp4-cuda-smoke
     tools/native_nvfp4_cuda_smoke.cpp)
   target_compile_features(expert-native-nvfp4-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-native-nvfp4-cuda-smoke PRIVATE
     expert_runtime CUDA::cudart)
+  if(EXPERT_RUNTIME_ENABLE_COMPRESSED_SPARSE_PROVIDER)
   add_executable(expert-deepseek-admission-smoke
     tools/deepseek_admission_smoke.cpp)
   target_compile_features(expert-deepseek-admission-smoke PRIVATE cxx_std_20)
@@ -279,6 +297,7 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
     target_link_libraries(expert-deepseek-catalog-smoke PRIVATE
       expert_runtime CUDA::cudart)
   endif()
+  endif()
   add_library(expert-sm86-dense-moe-provider OBJECT tools/olmoe_runner.cpp)
   target_compile_features(expert-sm86-dense-moe-provider PRIVATE cxx_std_20)
   target_compile_definitions(expert-sm86-dense-moe-provider PRIVATE
@@ -340,6 +359,10 @@ if(EXPERT_RUNTIME_BUILD_TESTS)
   if(TARGET expert-dense-fp4-cuda-smoke)
     add_test(NAME expert-dense-fp4-cuda-smoke
       COMMAND expert-dense-fp4-cuda-smoke)
+  endif()
+  if(TARGET expert-mxfp6-cuda-smoke)
+    add_test(NAME expert-mxfp6-cuda-smoke
+      COMMAND expert-mxfp6-cuda-smoke)
   endif()
   if(TARGET expert-native-nvfp4-cuda-smoke)
     add_test(NAME expert-native-nvfp4-cuda-smoke

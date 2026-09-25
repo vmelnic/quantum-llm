@@ -61,9 +61,14 @@ handled only by strict source adapters; genuinely new mathematics or encoding
 requires a provider capability and numerical gate.
 
 The physical containers are not falsely unified. Expert Pack v1 stores QPack
-records used by the FP4/NVFP4 provider. DeepSeek uses a separately authenticated
-compact layout suited to its source representation and paging geometry. Both
-converge at the executable-program, logical-page and provider boundaries.
+records used by the FP4/NVFP4 provider. It also defines dense-record ABI 6 for
+row-major OCP MXFP6 E3M2 weights: four 6-bit values occupy three bytes and one
+UE8M0 scale covers each block of 32 values. Artifacts select that encoding only
+through explicit embedding, head and exact-decode capabilities; SM86 executes
+it through an emulated CUDA path because the RTX 3090 has no native FP6
+instruction. DeepSeek uses a separately authenticated compact layout suited to
+its source representation and paging geometry. Both converge at the
+executable-program, logical-page and provider boundaries.
 
 ## Model organs and placement
 
@@ -83,7 +88,7 @@ converge at the executable-program, logical-page and provider boundaries.
 
 | Alias | Program and representation | Request state | Callable scope |
 |---|---|---|---|
-| `qwen` / `qwen-f16` / `qwen-abliterated` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated alias selects separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select resident `q4-f16-per-head` target KV; `qwen-f16` selects progressive exact F16 KV with a bounded disposable VRAM mirror | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only; per-head Q4 quality remains a user-run real-project Pi gate |
+| `qwen` / `qwen-f16` / `qwen-abliterated` / `qwen-abliterated-k1` / `qwen-abliterated-f16` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated aliases select separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select resident `q4-f16-per-head` target KV; `qwen-abliterated-k1` is the matched diagnostic K1 policy; `qwen-f16` and `qwen-abliterated-f16` select progressive exact F16 KV with a bounded disposable VRAM mirror on their respective weight artifacts | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only; compact-KV quality remains an explicit real-project gate |
 | `qwen-flash` | 48 layers; 36 Gated DeltaNet, 12 QSA, Hyper, PLE, 512 experts/layer, exact top-10 FP4 routing; scalar decode may execute the selected standard-FP4 experts on local P100s | recurrent state plus progressive exact F16 QSA K/V; compact index retained on device where declared | text/reasoning/tools; P100 execution is exact but slower than the primary path in the measured short chat; quality and long-context performance remain unqualified |
 | `mistral` | source-native block-16 E2M1/E4M3FN NVFP4 W4A4 MoE plus BF16 organs | artifact-declared BF16 MLA latent KV pages | text/reasoning/tools; auxiliary multimodal records are not callable support |
 | `muse` | 52-layer dense FP4 text model with global and exact 2,048-token sliding attention | exact F16 global pages plus cyclic exact F16 sliding windows; artifact maximum 131,072 | text only; preserved vision records are auxiliary |
@@ -180,6 +185,23 @@ staging is allocated only for eligible batched single-tile operations, reused
 within that sequence, and released on success, cancellation or failure. A
 multi-tile maximum-context prefill never allocates that staging arena. Runtime
 telemetry reports capacity and currently resident bytes separately.
+
+MXFP6 embedding and vocabulary-head execution uses artifact-declared ABI 6,
+not a model-family branch. The batched head kernel reuses each packed weight
+across up to eight rows and the exact-decode object retains the capability and
+ABI metadata used to validate its I/O tensors. The implementation is available
+for experiments, but no active artifact selects it: the first selective
+embedding/head fidelity trial was rolled back after its Romanian quality and
+decode-speed gates failed.
+
+Dense encoding experiments may select ABI 6 through a compiler policy keyed by
+an operation capability and tensor role. The compiler resolves the concrete
+tensor set from the adapter-provided VM topology, requires every result to be a
+rank-two semantic FP4 matrix, records the resolved set and policy digest in the
+artifact, and fails closed on unmatched roles. Activation captures superseded
+by the alternate ABI are explicitly indexed as exclusions. This is a generic
+artifact mechanism; it does not inspect model names, layer counts or tensor
+path fragments.
 
 Exact-decode ABI 2 is an artifact-declared experimental capability, not an
 exact-F16 qualification. It rolls one source MTP layer recurrently for a declared

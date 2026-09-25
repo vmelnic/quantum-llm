@@ -12,6 +12,9 @@ ornith-1.5	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	q4-f16-per-head	fixed
 ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	ornith-1.5-35b-a3b-fp4	q4-f16-per-head	fixed
 qwen	qwen3.8-27b-fp4	qwen3.8-27b-fp4	q4-f16-per-head	fixed
 qwen-abliterated	qwen3.8-27b-abliterated-fp4	qwen3.8-27b-abliterated-fp4	q4-f16-per-head	fixed
+qwen-abliterated-mse	qwen3.8-27b-abliterated-fp4-mse-v2	qwen3.8-27b-abliterated-fp4-mse-v2	q4-f16-per-head	fixed
+qwen-abliterated-k1	qwen3.8-27b-abliterated-fp4	qwen3.8-27b-abliterated-fp4	fp4-e2m1-ue8m0-block32-key-outlier1	fixed
+qwen-abliterated-f16	qwen3.8-27b-abliterated-fp4	qwen3.8-27b-abliterated-fp4	fp16	fixed
 qwen3.8	qwen3.8-27b-fp4	qwen3.8-27b-fp4	q4-f16-per-head	fixed
 qwen3.8-27b-abliterated-fp4	qwen3.8-27b-abliterated-fp4	qwen3.8-27b-abliterated-fp4	q4-f16-per-head	fixed
 qwen3.8-27b-fp4	qwen3.8-27b-fp4	qwen3.8-27b-fp4	q4-f16-per-head	fixed

@@ -16,8 +16,9 @@ a request timeout matching long local prefills. Compaction keeps 32,768 recent
 tokens and reserves 8,192 tokens for the next answer/summary.
 
 The base URL and secret live in Pi's user-local registry
-`~/.pi/agent/models.json`; Git contains no credential. The local registry
-should contain only these project models:
+`~/.pi/agent/models.json`; Git contains no credential. The user-local
+`~/.pi/agent/settings.json` selects `quantum-llm/qwen3.8-27b-fp4` with
+`xhigh` by default. The local registry should contain only these project models:
 
 - `qwen3.8-27b-fp4`;
 - `qwen3.8-27b-abliterated-fp4`;
@@ -38,9 +39,11 @@ Replace the alias with `qwen-abliterated`, `qwen-f16`, `qwen-flash`, `mistral`,
 `muse`, `ornith` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
 URL, then checks the running model ID and explicit KV codec through
 `/model-info` before launching Pi. It defaults to `--thinking xhigh` and
-forwards remaining arguments. The operational `qwen`, `qwen-abliterated` and
-`ornith` aliases require `q4-f16-per-head`; `qwen-f16` is the explicit
-exact-F16 Qwen reference.
+forwards remaining arguments. The operational `qwen` and `qwen-abliterated`
+aliases select standard FP4 weights and require `q4-f16-per-head` plus
+artifact-declared MTP-4; `ornith` requires Q4H but does not declare MTP.
+The Pi wrapper rejects a Q4H service with an incomplete declared MTP-4
+contract. `qwen-f16` remains the explicit exact-F16 Qwen reference.
 
 The wrapper resolves its repository and `.env` from its own absolute path, not
 from the current directory. Pi's provider/model registry is user-global, so
@@ -64,6 +67,12 @@ current post-promotion regression passed Qwen, Qwen Abliterated and Ornith on
 DeepSeek was intentionally excluded from that regression; Flash and Mistral
 remain slow. Exact timings live only in [Benchmarks](benchmarks.md). Wiring
 does not qualify tools, coding quality, long context or concurrency.
+
+The 2026-09-24 isolated `xhigh` regression returned `hi` responses for all six
+in-scope published models. Direct Pi using the user-local default and direct
+chat on both standard-FP4 Qwen artifacts also returned text. One native worker
+crash during sequential restart passed on an unchanged controlled retry, but
+restart reliability remains unqualified; see [Benchmarks](benchmarks.md).
 
 ## Thinking and sampling
 

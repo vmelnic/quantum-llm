@@ -137,25 +137,32 @@ if expected_kv != "artifact" and actual_kv != expected_kv:
     )
 execution = info.get("worker_execution") or {}
 runtime = info.get("worker_runtime") or {}
-if expected_kv == "q4-f16-per-head" and execution.get("mtp_enabled") is True:
-    abi = runtime.get("provider_exact_decode_abi")
-    depth = runtime.get("provider_mtp_draft_depth")
-    draft_vocabulary = runtime.get("provider_mtp_draft_vocabulary_size")
-    mtp_q8 = runtime.get("provider_mtp_q8_kv")
-    valid = (
-        abi == 2 and depth in (3, 4) and
-        isinstance(draft_vocabulary, int) and
-        not isinstance(draft_vocabulary, bool) and
-        0 < draft_vocabulary <= 65_536 and mtp_q8 == 1 and
-        execution.get("mtp_resource_available") is True and
-        execution.get("mtp_runtime_ready") is True
-    )
-    if not valid:
-        raise SystemExit(
-            "running Q4H MTP contract is incomplete: "
-            f"ABI={abi!r}, depth={depth!r}, "
-            f"draft_vocabulary={draft_vocabulary!r}, Q8={mtp_q8!r}"
+if expected_kv == "q4-f16-per-head":
+    descriptor = info.get("worker_model_descriptor") or {}
+    capabilities = descriptor.get("operation_capabilities")
+    if (not isinstance(capabilities, list) or
+            any(not isinstance(value, str) for value in capabilities)):
+        raise SystemExit("running Q4H artifact has no valid capability list")
+    if any(value.startswith("decode.mtp.") for value in capabilities):
+        abi = runtime.get("provider_exact_decode_abi")
+        depth = runtime.get("provider_mtp_draft_depth")
+        draft_vocabulary = runtime.get("provider_mtp_draft_vocabulary_size")
+        mtp_q8 = runtime.get("provider_mtp_q8_kv")
+        valid = (
+            abi == 2 and depth == 4 and
+            isinstance(draft_vocabulary, int) and
+            not isinstance(draft_vocabulary, bool) and
+            0 < draft_vocabulary <= 65_536 and mtp_q8 == 1 and
+            execution.get("mtp_resource_available") is True and
+            execution.get("mtp_runtime_ready") is True and
+            execution.get("mtp_enabled") is True
         )
+        if not valid:
+            raise SystemExit(
+                "running Q4H MTP-4 contract is incomplete: "
+                f"ABI={abi!r}, depth={depth!r}, "
+                f"draft_vocabulary={draft_vocabulary!r}, Q8={mtp_q8!r}"
+            )
 PY
 then
   die "start the selected model/codec before launching Pi"

@@ -127,6 +127,7 @@ class GenerationRequest:
     reasoning_effort: str = "xhigh"
     enable_thinking: bool = True
     preserve_thinking: bool = True
+    speculative_decoding: bool = True
     sampling: SamplingSettings = SamplingSettings(0.0, 1.0, 0, 0.0, 0)
     tools: tuple[dict[str, Any], ...] = ()
     tool_choice: str | dict[str, Any] = "auto"
@@ -3093,6 +3094,13 @@ class Application:
                 "reasoning_effort", "unsupported_value",
             )
 
+        speculative_decoding = payload.get("speculative_decoding", True)
+        if not isinstance(speculative_decoding, bool):
+            raise RequestError(
+                "speculative_decoding must be boolean",
+                "speculative_decoding",
+            )
+
         max_field = "max_output_tokens" if endpoint == "responses" else "max_tokens"
         maximum_value = payload.get("max_output_tokens") if endpoint == "responses" else payload.get(
             "max_completion_tokens", payload.get("max_tokens", 16)
@@ -3214,6 +3222,7 @@ class Application:
             metadata=metadata, user=user, reasoning_effort=reasoning_effort,
             enable_thinking=enable_thinking,
             preserve_thinking=preserve_thinking, sampling=sampling,
+            speculative_decoding=speculative_decoding,
             tools=tools, tool_choice=tool_choice,
             media_packet=media_packet, media_signature=media_signature,
             image_count=image_count, image_tokens=image_tokens,
@@ -3355,6 +3364,8 @@ class Application:
         "provider_large_exact_prefill_workspace",
         "provider_workspace_preflight_free_bytes",
         "provider_workspace_postallocation_free_bytes",
+        "provider_activation_bf16",
+        "provider_dense_activation_input_bf16",
     })
 
     _PREFILL_TELEMETRY_KEYS = (
@@ -3485,6 +3496,7 @@ class Application:
                  media_packet: bytes | None = None,
                  media_signature: bytes | None = None,
                  preserve_special_tokens: bool = False,
+                 speculative_decoding: bool = True,
                  ) -> Iterator[tuple[int, str]]:
         request_id = self.request_id()
         generated: list[int] = []
@@ -3609,7 +3621,8 @@ class Application:
                 last = index + 1 == maximum
                 token = self.decode_batcher.step(
                     request_id, last and not retain,
-                    hold=last and retain and self.worker.mtp_enabled,
+                    hold=(not speculative_decoding and not (last and not retain))
+                    or (last and retain and self.worker.mtp_enabled),
                 )
                 if progress_callback is not None:
                     progress_callback()
@@ -3691,6 +3704,19 @@ class Application:
                 for key in self._PREFILL_TELEMETRY_KEYS
                 if key in prefill_deltas
             }
+            if os.environ.get("QUANTUM_LLM_TRACE_TOKEN_IDS") == "1":
+                log("request_token_ids", request_id=request_id,
+                    prompt_token_ids=prompt_ids,
+                    generated_token_ids=generated,
+                    finished=finished,
+                    sampling={
+                        "temperature": effective_sampling.temperature,
+                        "top_p": effective_sampling.top_p,
+                        "top_k": effective_sampling.top_k,
+                        "min_p": effective_sampling.min_p,
+                        "presence_penalty": effective_sampling.presence_penalty,
+                        "seed": effective_sampling.seed,
+                    })
             log("request_telemetry", request_id=request_id, resumed=resumed,
                 prefill_tokens=prefill_tokens,
                 generated_tokens=len(generated), finished=finished,
@@ -4111,11 +4137,13 @@ class Handler(BaseHTTPRequestHandler):
                     request.endpoint != "completion"
                     and self.app.response_protocol is not None
                 ),
+                speculative_decoding=request.speculative_decoding,
             )
         except TypeError as error:
             if not any(name in str(error) for name in (
                     "cancel_check", "cache_prefix_tokens", "sampling",
-                    "progress_callback", "preserve_special_tokens")):
+                    "progress_callback", "preserve_special_tokens",
+                    "speculative_decoding")):
                 raise
             generation = self.app.generate(
                 request.prompt_ids, request.maximum, context

@@ -1659,8 +1659,13 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
       return std::nullopt;
     }
     auto& entry = *iterator->second;
-    if ((record.source_abi != kExpertSourceAbiExpertPackV1 &&
-         record.source_abi != kExpertSourceAbiDeepSeekCompactV1) ||
+    const auto supported_source =
+        record.source_abi == kExpertSourceAbiExpertPackV1
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
+        || record.source_abi == kExpertSourceAbiDeepSeekCompactV1
+#endif
+        ;
+    if (!supported_source ||
         !same_record(entry.record, record) || !entry.host_copy ||
         !entry.validated_sections ||
         (entry.state != CacheState::ram_ready &&

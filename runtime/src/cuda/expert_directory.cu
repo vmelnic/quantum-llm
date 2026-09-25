@@ -643,9 +643,13 @@ Status CudaExpertDirectory::publish(
   }
   const auto* cuda_allocation =
       dynamic_cast<const CudaExpertAllocation*>(allocation.get());
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
   const auto* compact_allocation =
       dynamic_cast<const CudaCompactExpertAllocation*>(allocation.get());
   if (!cuda_allocation && !compact_allocation) {
+#else
+  if (!cuda_allocation) {
+#endif
     return Status(ErrorCode::invalid_argument,
                   "CUDA directory received a non-CUDA allocation");
   }
@@ -697,7 +701,9 @@ Status CudaExpertDirectory::publish(
       entry.format = static_cast<std::uint32_t>(
           DeviceExpertFormat::int8_per_row);
     }
-  } else {
+  }
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
+  else {
     const auto* base = compact_allocation->base();
     const auto& sections = compact_allocation->sections();
     entry.w1_fp4 = base + sections.w1_weight_offset;
@@ -709,6 +715,7 @@ Status CudaExpertDirectory::publish(
     entry.format = static_cast<std::uint32_t>(
         DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
   }
+#endif
   entry.generation = ++impl_->generations[index];
   entry.state = static_cast<std::uint32_t>(DeviceExpertState::ready);
   return checked(cudaMemcpy(impl_->entries + index, &entry, sizeof(entry),

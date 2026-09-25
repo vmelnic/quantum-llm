@@ -96,6 +96,44 @@ was stopped, `/ready` was unreachable with no model advertised, and the RTX
 3090 reported 25,161,629,696 of 25,769,803,776 bytes free. This is a wiring and
 cleanup gate, not a quality, coding or long-context result.
 
+#### Canonical standard-FP4/Q4H/MTP-4 serving and isolated Pi regression, 2026-09-24
+
+The two standard-FP4 Qwen artifacts declared exact-decode ABI 2, MTP depth 4,
+65,536 draft-vocabulary entries, and Q8 draft KV. Their operational aliases
+selected `q4-f16-per-head`; explicit exact-F16 and diagnostic aliases remained
+distinct. The user-local Pi default selected standard Qwen at `xhigh`, and the
+generic service fallback selected the artifact-declared KV format. This is an
+operational lossy-Q4H selection, not qualification of the exact-F16 product goal.
+
+Each Pi `hi` ran at default `xhigh` from a fresh temporary directory with
+`--no-context-files --no-tools --no-extensions --no-skills
+--no-prompt-templates --no-session`. No project context or prior Pi session was
+available; Pi's built-in instructions still contribute prompt tokens. These
+are wiring checks, not language-quality, long-context or throughput gates.
+
+| Alias | Selected target KV | Isolated Pi `hi` |
+|---|---|---|
+| `qwen` | `q4-f16-per-head` | pass |
+| `qwen-abliterated` | `q4-f16-per-head` | pass |
+| `ornith` | `q4-f16-per-head`, no declared MTP | pass |
+| `muse` | F16 | pass |
+| `qwen-flash` | F16 | pass |
+| `mistral` | artifact-native | pass |
+
+A direct Pi `hi` with no provider/model flags also passed using the user-local
+default. Direct chat `hi` passed for both standard-FP4 Qwen aliases. The
+launcher had incorrectly applied `minimum_exact_kv_bytes_per_token` to lossy
+Q4H, expanding the Abliterated KV pool from the configured 5,136 MiB to
+16,384 MiB. The format-conditioned fix restored 5,136 MiB while preserving
+the exact-format minima observed for Flash (6,912 MiB) and Mistral (5,760 MiB).
+
+One Qwen direct-chat request after sequential model switching failed when the
+native worker faulted inside `nvcuda64.dll` (Windows exception `0xc0000409`).
+The service was stopped and an unchanged controlled retry passed both Pi and
+direct chat. The root cause and rapid-restart reliability remain unqualified;
+the single successful retry is not proof of a fix. After the final stop, port
+8080 was closed, no runner process remained, and GPU usage was 292 MiB.
+
 ### Coding harness
 
 | Model/mode | Measured result |
@@ -630,8 +668,493 @@ Qwen Abliterated policies were therefore corrected to `presence_penalty=0.5`
 in both profiles while retaining the 32,768-token thinking ceiling. Ornith,
 the third operational Q4H artifact, received the same 0.5 penalty while
 retaining its existing sampling defaults and no Qwen-specific ceiling. Real
-Romanian replays and the long-project repetition gate remain pending;
-configuration validation alone is not a quality pass.
+Romanian replays were still required; configuration validation alone was not
+a quality pass.
+
+#### Controlled Romanian long-generation fidelity matrix, 2026-09-22
+
+A fixed 196-token Romanian prompt requested ten detailed AI-startup ideas.
+Every controlled request used `reasoning_effort=xhigh`, `top_p=0.95`,
+`top_k=20`, seed `314159`, a 12,000-token ceiling and the same native service
+path. A new provider-neutral `speculative_decoding=false` request control used
+the worker's existing scalar target step. Worker telemetry proved zero
+`exact_decode_calls` for every non-speculative row.
+
+| Weights | Target KV | Decode | Temp / presence | Wall | Completion / reasoning | Finish | Result |
+|---|---|---|---|---:|---:|---|---|
+| Abliterated FP4 | Q4H | MTP-4 | 1.0 / 0.5 | 240.967 s | 12,000 / 9,830 | length | stopped during idea 4; malformed Romanian |
+| Abliterated FP4 | Q4H | scalar target | 1.0 / 0.5 | 391.897 s | 10,903 / 7,029 | stop | all ten ideas; malformed Romanian |
+| Abliterated FP4 | F16 | scalar target | 1.0 / 0.5 | 459.430 s | 12,000 / 10,296 | length | stopped during idea 5; malformed Romanian |
+| Official FP4 | F16 | scalar target | 1.0 / 0.5 | 319.344 s | 8,521 / 4,505 | stop | all ten ideas; severe malformed Romanian |
+| Official FP4 | F16 | scalar target | 1.0 / 0.0 | 327.364 s | 8,730 / 4,127 | stop | all ten ideas; severe malformed Romanian |
+| Official FP4 | F16 | scalar target | 0.6 / 0.0 | 225.539 s | 6,097 / 2,751 | stop | all ten ideas; shorter but still malformed Romanian |
+
+Representative failures included `persoanelor vârstnici`, `sistemul triage`,
+`Prevvedere`, `date longitudinale de vocă`, `frontierile`, `camiona`,
+`script care iubește 1000 de dosare`, `gâdiluri uriașe`, `Rani un model`,
+`părărire` and `școlile ... nu știe`. The issue therefore persists without
+MTP, with exact F16 target KV, on official weights, with the official thinking
+presence penalty of zero, and at a lower temperature. Q4H, MTP and sampling
+change the sampled trajectory and task completion, but none is an isolated
+root cause or a fidelity fix.
+
+One matched-seed MTP/scalar pair is not a distribution-level MTP quality
+measurement: exact speculative sampling may consume random values differently
+while preserving the target distribution. It is valid evidence that disabling
+MTP does not remove the lexical defect. No further sampling adjustment is an
+admitted cause-isolation step. The next gate is an independent full-target
+numerical oracle for the stored FP4 artifact, followed by a source-precision
+behavior comparison if the artifact execution passes.
+
+#### Selective MXFP6 embedding/head gate, 2026-09-22
+
+The same Abliterated source revision was recompiled with only the token
+embedding and vocabulary head in OCP MXFP6 E3M2 block-32. All other tensors,
+Q4H target KV, MTP-4, sampling values and the fixed Romanian prompt remained
+unchanged. This was a selective weight-fidelity experiment, not a claim that
+the RTX 3090 executes native FP6.
+
+| Gate | Result |
+|---|---|
+| compiler/container validation | 1,199 tensors; valid; source checkpoint SHA unchanged |
+| MXFP6 records | exactly 2; 993,284,096 B each; ABI 6 |
+| artifact delta | +635,699,200 B; 15,411,089,408 B candidate QPack |
+| independent source oracle | relative L2 0.0563446; cosine 0.998523; max abs 0.00366211; 0 payload/scale mismatches |
+| native CUDA oracle | embedding max abs 0; GEMV max abs 0 |
+| Windows clean build | CTest 8/8; canonical Python suite 120/120 |
+| live startup | passed on one RTX 3090; 5,877 MiB free after load |
+| short `hi` smoke | coherent; 27 completion tokens; 1.211 s; 22.30 generated tok/s |
+| Romanian long gate | 180 prompt + 12,000 completion tokens; 11,996 reasoning; `content=null`; `finish_reason=length`; 306.641 s |
+| generated throughput | 39.13 tok/s versus 49.06 tok/s on the matched 244.578 s Q4H baseline; -20.24% |
+| disposition | failed fidelity and speed; operational Q4H artifact restored and smoke-tested |
+
+The hidden reasoning remained grammatically degraded (`senzoriilor`, `devieri
+timpuri`, `linii lunar`, `întoarcii`) despite the better local reconstruction
+of both I/O matrices. The result rejects those two tensors as the dominant
+cause of the Romanian defect. It does not distinguish internal FP4 weight error
+from a source-model behavior problem; that boundary still requires the
+independent full-target and source-precision gates.
+
+#### Source-BF16 activation-semantics gate, 2026-09-23
+
+The candidate reused the validated 14,775,390,208-byte MSE-v2 QPack and changed
+only artifact-declared activation semantics. Its CUDA path rounded the same
+FP32 workspaces to BF16 at source-equivalent operation boundaries; Q4H, MTP-4,
+sampling and the fixed Romanian request remained unchanged.
+
+| Gate | Result |
+|---|---|
+| Windows clean Release/CUDA build | focused Qwen numeric gates passed |
+| exact diagnostic request | 317-token prefill + stable-prefix checkpoint + first MTP step; Compute Sanitizer reported zero errors |
+| asynchronous direct replay | passed with the same first two generated token IDs |
+| real service telemetry | raw `provider_activation_bf16=1` |
+| Romanian long gate | 317 prompt + 12,000 completion tokens; 8,619 reasoning; `finish_reason=length` |
+| wall / generated throughput | 262.208 s / 45.78 tok/s |
+| speed floor | 49.06 tok/s; failed by 6.69% |
+| fidelity | malformed `familile`, `progreului`, `moduile`, `meslerii`, `nevoiea`, `alerte mai early`, `bilanț hídric` |
+| disposition | failed fidelity and speed; no operational alias |
+
+The first service start ended in `nvcuda64.dll` with status `0xc0000409`, but
+the failure did not recur under the exact sanitizer, asynchronous direct or
+real-service replays. It is not credited as a deterministic inference defect.
+The request-level value `provider_activation_bf16=0` was also misleading: the
+server subtracted a configuration gauge before/after the request, while raw
+provider stats correctly reported one.
+
+#### Hybrid block-32 Q8 activation gate, 2026-09-23
+
+| Gate | Result |
+|---|---|
+| offline activation sample | fixed 317-token Romanian request, layer-0 normalized embeddings |
+| hybrid Q8 reconstruction | 19.258x lower SSE; 317/317 rows non-regressed; 64.6155% local blocks; zero clipping |
+| native CUDA gate | exact Q8 bytes/codes; GEMV, weight-reuse, GEMM and staged-GEMM checks passed after a clean build |
+| live request | 317 prompt + 12,000 completion tokens; 11,554 reasoning; stopped after visible idea 1 |
+| wall / generated throughput | 285.906 s / 41.97 tok/s |
+| speed floor | 49.06 tok/s; failed by 14.45% |
+| fidelity | malformed `diailizelor`, `clinicii pierd`, `introdu greutatea`, `Medicianul` |
+| disposition | rejected; runtime implementation and service alias removed |
+
+More accepted MTP drafts did not compensate for the per-block activation-scale
+work. This is direct evidence that the much better local activation
+reconstruction neither fixes the Romanian defect nor preserves the throughput
+contract.
+
+#### Exhaustive MSE-v2 scale audit, 2026-09-23
+
+| Metric | MSE-v2 | Exhaustive legal UE8M0 search |
+|---|---:|---:|
+| FP4 matrices | 666 | 666 |
+| deterministic sampled blocks | 42,624 | 42,624 |
+| relative L2 | 0.1149280417 | 0.1149280417 |
+| aggregate SSE | 4.1241743611 | 4.1241743611 |
+| blocks selecting a different exponent | - | 0 |
+| additional SSE reduction | - | 0.00% |
+
+The predeclared admission threshold was at least 5% additional SSE reduction
+with no block or role-group regression. It failed before any encoder change,
+artifact build or live request.
+
+#### Activation-aware complete-output scale gate, 2026-09-23
+
+| Gate | Result |
+|---|---|
+| calibration coverage | 505/505 eligible dense projections |
+| calibration residual SSE | -33.70% versus MSE-v2 |
+| disjoint holdout residual SSE | -24.12%; 14/14 role groups improved |
+| selected block scales | 105,250,169 / 813,957,120 covering reselections (12.93%) |
+| QPack/runtime | ABI 3; 14,775,390,208 B; unchanged CUDA kernels |
+| independent source qualification | valid; 269,056 sampled values; zero payload/scale mismatches; relative L2 0.1170506; cosine 0.9931263 |
+| clean native gate | Windows Release/CUDA `--clean-first`; dense-FP4 CUDA smoke passed |
+| live request | 317 prompt + 25,673 completion tokens; 17,850 reasoning; `finish_reason=stop` |
+| prefill / TTFT | 1.000 s / 1.032 s; one prefill batch |
+| wall / generated throughput | 500.235 s / 51.32 tok/s |
+| MTP | depth 4; 15,151 accepted drafts; 10,523 exact calls |
+| speed floor | 49.06 tok/s; passed by 4.61% |
+| fidelity | failed: `muncă de liniă`, `modele de anomaliă`, `vau diferențiere`, `decizie de rețu`, `a pierdutului` |
+| disposition | rejected as a Romanian-fidelity remedy; no operational promotion |
+
+The artifact passed the no-runtime-cost premise and was faster than the fixed
+floor on this completed trajectory, but the large offline residual improvement
+did not restore natural Romanian. The candidate remains a recoverable research
+artifact; the operational alias was never changed.
+
+#### Activation-v3 Russian long-generation contrast, 2026-09-24
+
+The physical `qwen3.8-27b-abliterated-fp4-activation-v3` artifact used above
+was reopened directly on the RTX 3090. Its `COMPLETED` marker matched the
+manifest file hash, and the QPack was 14,775,390,208 bytes. The service was
+started cold with Q4H target KV, MTP-4, no retained session, and the same
+`xhigh`, seed 314159, temperature 1.0, top-p 0.95, top-k 20, presence penalty
+0.5, and 32,768-token completion ceiling. Only the 10-AI-startup-ideas prompt
+was translated faithfully into Russian; the artifact was not promoted and
+the operational alias was unchanged.
+
+| Gate | Russian contrast |
+|---|---:|
+| prompt / completion / reasoning / visible tokens | 307 / 20,666 / 14,896 / 5,770 |
+| finish reason / HTTP status | `stop` / 200 |
+| provider / HTTP wall | 486.578 / 486.642 s |
+| cold prefill / TTFT / prefill batches | 0.984 / 1.031 s / 1 |
+| generated throughput | 42.47 tok/s; below the 49.06 tok/s floor on this trajectory |
+| MTP accepted drafts / exact calls | 10,348 / 10,319 |
+| visible quality | all 10 ideas completed; mostly fluent Russian, but `Последняя миля часто suffers от опозданий`, malformed technical word `металомах`, and `precast-заводы` |
+| cleanup | service and runner exited; port 8080 closed; GPU returned to 218 MiB desktop residency |
+
+The Russian result does not reproduce the Romanian error density, but it does
+not establish clean multilingual fidelity either. This is one cold prompt and
+one seed, not a source-BF16 contrast. The translated prompt changed token count
+and generated trajectory; lower draft acceptance (10,348/10,319 versus
+15,151/10,523 in the Romanian gate) accompanies the lower observed throughput
+but does not prove a language-specific runtime regression. The raw request,
+response, HTTP timing and service telemetry are retained under
+`out/gates/qwen-abliterated-activation-v3-russian-*` and
+`out/gates/qwen-activation-v3-russian-server.jsonl`.
+
+#### Qwen3.8-27B configuration inventory, 2026-09-24
+
+These are the distinct Qwen 27B mappings currently declared in
+`ops/model-aliases.tsv`; alias synonyms share one row. This is a configuration
+inventory, not a claim that every artifact is present on the host or that every
+cross-product of settings has passed a live quality gate.
+
+| Alias(es) | Weight artifact | Target KV at launch |
+|---|---|---|
+| `qwen`, `qwen3.8`, `qwen3.8-27b-fp4` | official FP4 | Q4H (`q4-f16-per-head`) |
+| `qwen-f16` | official FP4 | exact F16 (`fp16`) |
+| `qwen-abliterated`, `qwen3.8-27b-abliterated-fp4` | Abliterated FP4 | Q4H |
+| `qwen-abliterated-k1` | Abliterated FP4 | lossy K1 (`fp4-e2m1-ue8m0-block32-key-outlier1`) |
+| `qwen-abliterated-f16` | Abliterated FP4 | exact F16 |
+| `qwen-abliterated-mse` | Abliterated MSE-v2 FP4 | Q4H |
+
+The activation-v3 and activation-v4 FP4 artifacts are research candidates,
+not operational aliases. The Russian contrast above verified activation-v3
+physically and launched it directly; its JSON `model` field named the ordinary
+Abliterated alias but did **not** change that alias. Activation-v4 passed a
+separate Romanian speed gate at 50.48 generated tok/s and failed fidelity.
+
+The last Russian request used the direct activation-v3 artifact, one RTX 3090,
+cold startup, no retained session, Q4H, MTP depth 4, 307 prompt tokens,
+`reasoning_effort=xhigh`, `enable_thinking=true`, `temperature=1.0`,
+`top_p=0.95`, `top_k=20`, `min_p=0.0`, `presence_penalty=0.5`, seed `314159`,
+`stream=false`, and `max_completion_tokens=32768`. The latter is a ceiling,
+not a generation target. The effective policy also has frequency penalty 0
+and repetition penalty 1. The exact payload is retained in
+`out/gates/qwen-abliterated-activation-v3-russian-request.json`.
+
+Request controls are separate from launch-time artifact/KV selection:
+`speculative_decoding=true` uses available MTP by default, while `false`
+forces scalar target decoding without changing weights or target KV;
+`reasoning_effort` accepts `low`, `medium`, or `xhigh`; thinking-off uses
+`chat_template_kwargs.enable_thinking=false`. The server accepts temperature
+0--2, top-p (0,1], top-k 0--1,000,000, min-p 0--1, presence penalty -2--2,
+and a non-negative signed-63-bit seed. Nonzero frequency penalty and
+nonunit repetition penalty are not implemented. The current long-agent
+policy defaults to temperature/top-p/top-k/min-p/presence of
+`1.0/0.95/20/0/0.5` in thinking and `0.7/0.8/20/0/0.5` otherwise.
+
+**Causal limit:** FP4 weights are not established as the cause of malformed
+Romanian. Raw source-BF16 free generation was stopped after 528 reasoning
+tokens and already contained malformed Romanian; it was not a full visible
+answer. On an exact FP4-generated prefix, two malformed pieces had similar
+native and source-BF16 probabilities; a third was excluded by BF16 top-p but
+admitted by the native target. That separator has not been assigned to stored
+FP4 weights versus provider arithmetic. A separately dequantized FP4 replay
+used a reconstructed prefix that failed exact token parity, so it cannot close
+this causal question. The earlier source-BF16 and exact-token gates above are
+the evidence; no full source-BF16 visible-response fidelity pass exists.
+
+#### English xhigh 12-profile speed matrix, 2026-09-24 (complete)
+
+This new measurement does not rank candidates using any historical speed
+number. It compares four physical Abliterated Qwen FP4 artifacts (standard,
+MSE-v2, activation-v3, activation-v4) crossed with Q4H, K1 and F16 target KV.
+All 12 profiles keep Q8 dense activations, MTP-4, one RTX 3090, a fresh service,
+no retained session, `xhigh`, temperature 1.0, top-p 0.95, top-k 20, min-p 0,
+presence penalty 0.5 and seed 314159. Each profile runs exactly one
+English request using the same fixed ten-startup-ideas prompt in
+`ops/benchmarks/qwen27b_english_startups_prompt.json`. The 32,768-token output
+ceiling is a runaway guard; any length-terminated or empty-visible round is
+excluded from ranking.
+
+Each profile has an immutable run script under
+`ops/windows/benchmarks/qwen27b/<profile>/Run.ps1`. The host-local launcher
+continues without an SSH session. Each round saves the exact request, raw
+response, and a summary matched to provider request telemetry; it also saves
+`round.md`, and the orchestrator updates
+`ledger.md` and `RESULTS.json` on the host. The result bundle is transferred
+only after `COMPLETE.json` exists. Prefill is provider prefill wall time;
+decode rate is `(completion_tokens - 1) / (provider_wall - TTFT)`; HTTP
+end-to-end rate is `completion_tokens / HTTP_wall`. The primary winner is the
+highest HTTP end-to-end rate among the twelve normally stopped requests;
+the decode-rate winner is reported separately. Startup time is recorded
+separately and is not included in request throughput.
+
+An earlier launcher erroneously repeated the same request ten times per
+profile. It was stopped during `fp4_q4h` after four completed requests; its
+partial files are archived on the 3090 under
+`out/benchmarks/qwen27b-english-speed-invalid-repeats-20260924`. Those files
+are excluded from this matrix and from ranking. The corrected matrix uses one
+request per profile and starts in a fresh result directory.
+
+The first corrected `fp4_q4h` request completed and its service cleaned up,
+but the orchestrator initially stopped before recording the round as complete:
+Windows PowerShell rejected `File.Replace` with a null backup path while
+updating existing `RESULTS.json`. An explicit backup path passed a two-update
+Windows gate. The orchestrator then resumed from the validated first-round
+summary and cleanup record; it did not regenerate that response. This was an
+orchestration failure, not an inference failure.
+
+The final `COMPLETE.json` reports 12 completed and zero failed rounds. Its
+scheduled task exited with result 0; port 18080 was free, and GPU memory use
+after cleanup was 309 MiB. The full 114-file result bundle was copied from the
+3090 to `out/benchmarks/qwen27b-english-speed`. Each request JSON has the same
+canonical SHA-256 (`471619a2f6bcf33e45462a2b3cf50e3ac45daf1daebc28eacaeec74f23c4a281`),
+all responses have `finish_reason=stop`, and each contains ten numbered startup
+ideas. The prompt had 228 populated tokens in every round.
+
+| Rank | Profile | Generated / reasoning tokens | Prefill s / tok/s | TTFT s | Decode tok/s | HTTP end-to-end tok/s | HTTP wall s |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 | `fp4_q4h` | 20603 / 15160 | 0.531 / 429.38 | 0.578 | 59.55 | 59.44 | 346.61 |
+| 2 | `msev2_q4h` | 18851 / 10657 | 0.578 / 394.46 | 0.609 | 57.48 | 57.37 | 328.57 |
+| 3 | `v4_q4h` | 17007 / 11721 | 0.563 / 404.97 | 0.609 | 56.54 | 56.41 | 301.47 |
+| 4 | `v3_q4h` | 18026 / 9887 | 0.547 / 416.82 | 0.594 | 56.18 | 56.07 | 321.51 |
+| 5 | `msev2_k1` | 16743 / 9953 | 0.563 / 404.97 | 0.609 | 51.56 | 51.46 | 325.39 |
+| 6 | `fp4_k1` | 18399 / 13143 | 0.531 / 429.38 | 0.578 | 50.81 | 50.72 | 362.73 |
+| 7 | `v3_k1` | 21950 / 13818 | 0.547 / 416.82 | 0.594 | 49.88 | 49.80 | 440.75 |
+| 8 | `v4_k1` | 20697 / 12285 | 0.562 / 405.69 | 0.609 | 49.06 | 48.98 | 422.59 |
+| 9 | `v4_f16` | 23477 / 14893 | 0.594 / 383.84 | 0.656 | 46.58 | 46.51 | 504.76 |
+| 10 | `msev2_f16` | 20786 / 14176 | 0.594 / 383.84 | 0.640 | 46.24 | 46.17 | 450.22 |
+| 11 | `v3_f16` | 15419 / 10015 | 0.593 / 384.49 | 0.640 | 44.83 | 44.74 | 344.62 |
+| 12 | `fp4_f16` | 19305 / 13013 | 0.625 / 364.80 | 0.687 | 44.15 | 44.07 | 438.04 |
+
+The speed-only winner on this **single 228-token prompt** is the standard FP4
+artifact with Q4H target KV: 59.55 generated decode tokens/s and 59.44
+generated HTTP end-to-end tokens/s. These rates include reasoning tokens; its
+visible output was 5,443 tokens, or 15.70 visible tokens/HTTP second. The
+responses have different generated and reasoning lengths, so this one-shot
+ordering is not a statistical claim about all prompts, long-context prefill,
+fidelity, or real coding-harness throughput. The highest visible-output rate
+on this request was `v3_q4h` at 25.31 visible tokens/HTTP second, reflecting
+different reasoning/output allocation rather than higher generated-token
+decode speed. No service alias or model default was changed by this benchmark.
+
+#### Activation-aware adjacent-code gate, 2026-09-23
+
+| Gate | Result |
+|---|---|
+| target coverage | 497/497 regular VM projections; eight exact-decode-only matrices excluded |
+| sampled calibration residual SSE | -55.24% versus activation-v3 |
+| disjoint holdout residual SSE | -41.93%; 13/13 role groups non-regressed |
+| bounded ordering | top-64 exactly matched unbounded sampled result; 23,590 / 27,172,864 changes |
+| complete artifact payload changes | 27,945,498 adjacent nibble reselections; scales fixed to activation-v3 result |
+| QPack/runtime | ABI 3; 14,775,390,208 B; unchanged CUDA kernels and MTP-only payload |
+| independent source qualification | valid; 269,056 sampled values; zero payload/scale mismatches; FP4 relative L2 0.1181699; cosine 0.9929944 |
+| live request | 317 prompt + 19,541 completion tokens; 13,612 reasoning; `finish_reason=stop` |
+| prefill / TTFT | 1.125 s / 1.157 s; one prefill batch |
+| wall / generated throughput | 387.125 s / 50.48 tok/s |
+| MTP | depth 4; 11,335 accepted drafts; 8,207 exact calls |
+| speed floor | 49.06 tok/s; passed by 2.89% |
+| fidelity | failed: `angajatori care recrutați`, `pașii greșiit`, `model de limba artificială`, `stabilizaască`, `de la o anuire`, `partenери` |
+| disposition | rejected as a Romanian-fidelity remedy; no operational promotion |
+
+The candidate proved that representable adjacent-code changes can substantially
+reduce the captured complete-output residual while preserving live throughput.
+That improvement still did not restore natural Romanian, so it is not an
+accepted quality fix and remains outside the operational alias.
+
+#### Raw source-BF16 Romanian separation gate, 2026-09-23
+
+The immutable `huihui-ai/Huihui-Qwen3.8-27B-abliterated` snapshot at revision
+`739e3c5b89849f6c238ce1e5b70008612ae42cdd` was loaded directly with
+Transformers in `torch.bfloat16`; no QPack or quantum-llm projection kernel was
+used. The request retained the fixed 317-token Romanian prompt, `xhigh`
+thinking, seed 314159, temperature 1.0, top-p 0.95, top-k 20 and
+`presence_penalty=0.5`.
+
+| Gate | Result |
+|---|---|
+| free source generation | 528 reasoning tokens checkpointed; reinspection found `experiența utilizator` and `irigare/boale` in raw BF16 thinking |
+| source contrast | 14,087-token text prefix reconstructed through the first activation-v4 visible defect; original service token IDs were not retained |
+| malformed candidate | ` durată` in `prețurile de spitalizare și durată șederii` |
+| corrected candidate | ` durata` |
+| BF16 log-probability delta | corrected minus malformed = `+3.533903` |
+| BF16 probability ratio | corrected / malformed = `34.2574x` |
+| matched BF16 first-token top-20, presence 0.5 | corrected token rank 6, malformed first token rank 14; adjusted logit lead `+1.375` for corrected |
+| cleanup | reference process stopped; GPU returned to 323 MiB desktop use |
+
+The short free generation is not a visible-response fidelity pass, and the
+earlier "no malformed word" description was incorrect. Although BF16 preferred
+the corrected continuation, the malformed first token remained eligible under
+the fixed top-20 sampler. This contrast alone cannot attribute the emitted
+mistake to the FP4 representation or native runtime. The CPU-offloaded reference
+run is not a service-throughput measurement.
+
+#### Independent FP4 weight versus BF16 Romanian-token gate, 2026-09-24
+
+The saved activation-v4 response was reencoded with the source tokenizer to
+select 19 token pieces across seven malformed expressions. Source BF16 and the
+same upstream Transformers implementation with all 546 text-path FP4 QPack
+tensors dequantized into BF16 storage scored the same 16,820-token reconstructed
+prefix. The native quantum-llm provider was not used in either pass. Cached
+causal scoring verified every cache length; logits were finite. Rankings below
+include the request's 0.5 presence penalty, before the separate top-p filter.
+
+| Gate | BF16 source | Independent dequantized FP4 |
+|---|---:|---:|
+| token pieces inside `top_k=20` | 18 / 19 | 19 / 19 |
+| final `it` in `greșiit` | rank 23; -0.3125 logit to cutoff | rank 13; +0.625 logit to cutoff |
+| reference cleanup | not applicable | 207 MiB GPU desktop residency |
+
+This demonstrates that stored FP4 weights can cross a malformed token's top-k
+boundary without the native provider. It does not establish top-p eligibility,
+the probability of the full malformed phrase, or numerical parity with the
+service: original service token IDs were not captured and the prefix was
+reconstructed from text. The other 18 pieces were already inside BF16 top-20.
+No operational artifact or setting changed, and no throughput gate was run.
+
+#### Full-sampler reconstructed-prefix prerequisite, 2026-09-24
+
+The independent FP4 replay targeted the final `it` in `greșiit` with all 546
+text-path FP4 tensors dequantized in upstream Transformers. It kept the 0.5
+presence penalty, temperature 1.0, top-k 20 and top-p 0.95. No native service
+or candidate artifact was changed.
+
+| Gate | Result |
+|---|---:|
+| reconstructed prefix before target | 15,590 tokens |
+| malformed `it` after presence penalty | rank 12; 0.875 logit above top-20 cutoff |
+| top-p nucleus | 2 tokens; malformed `it` excluded |
+| plausible reencoded full completions | 19,529--19,531 tokens |
+| service-reported actual completion | 19,541 tokens |
+| planned BF16-head/layer substitutions | stopped before execution |
+| cleanup | 214 MiB GPU desktop residency |
+
+The earlier rank-13 result used different causal chunks; both runs agree on
+top-k inclusion, but top-p exclusion is the decisive new gate. The 10-token
+deficit for the previously used separator proves the saved parsed text is not
+an exact token-stream replay. Neither the responsible tensor group nor the
+native sampler/provider can be identified from this prefix. This is not a
+fidelity fix or a throughput measurement.
+
+#### Recurrent A-projection selective-MXFP6 prerequisite, 2026-09-23
+
+The first candidate covered both recurrent scalar-control projections across
+48 layers each. It added 5,898,240 bytes but missed the fixed disjoint-holdout
+improvement gate (47.8270% versus the required 50%), so it was not built.
+Calibration-only selection retained A and rejected B before a third holdout.
+
+| Gate | A-only result |
+|---|---:|
+| selected matrices | 48 |
+| third holdout prompt | 267 tokens; distinct school-energy domain |
+| FP4 residual SSE | 11,061.264079 |
+| MXFP6 residual SSE | 4,110.853400 |
+| improvement | 62.8356% |
+| layer regressions | 0/48 |
+| added raw bytes / target call | 2,949,120 B |
+| declared maximum | 5 MiB and about 394.38 MB throughput-equivalent |
+| candidate QPack delta / MXFP6 records | +2,949,120 B / 48 |
+| independent source qualification | valid; zero FP4/MXFP6 payload or scale mismatches; MXFP6 cosine 0.9985397, relative L2 0.0541595 |
+| live request | 317 prompt + 22,308 completion tokens; 15,825 reasoning; 6,483 visible; `finish_reason=stop` |
+| wall / generated throughput | 450.961 s / 49.4677 tok/s |
+| speed floor | 49.06 tok/s; passed by 0.83% |
+| fidelity | failed: `gerosiatrii`, `oprrire`, `coleriele`, `calificăți`, `demostra`, `consilienți`, `o istoric`, `incompletes`, `reducererea` |
+| disposition | rejected as a Romanian-fidelity remedy; no stable-artifact promotion |
+
+The comparison used actual activation-v4 FP4 QPack rows, an independent MXFP6
+decoder and source-BF16 weights. Runtime Q8 activation rounding was emulated
+exactly. The prerequisite admitted a candidate, but the completed live gate
+showed that its large local residual improvement did not restore Romanian.
+
+#### BF16 dense-activation-input gate, 2026-09-23
+
+This artifact-declared experiment retained the activation-v4 FP4 weights and
+replaced only the dense projection operand quantization from row-global Q8 to
+BF16. The first narrow-only microbenchmark was invalidated by the real service
+path. A small-batch BF16 kernel and a wide down-projection measurement were then
+added before the single allowed retest.
+
+| Gate | Corrected result |
+|---|---:|
+| canonical clean build | CTest 8/8; Python contract 120/120 |
+| CUDA maximum absolute error | 0.0000534058 |
+| batch-five combined Q8 / BF16-input | 76.3036 / 108.2550 GB/s |
+| BF16-input minimum | 74.1572 GB/s |
+| live request deadline | 675.008 s; no completed response |
+| absolute throughput upper bound | 48.5446 tok/s (`32768 / 675.008`) |
+| required throughput | at least 49.06 tok/s |
+| fidelity | not scored because the request was cancelled |
+| disposition | rejected for speed; stable artifact untouched |
+
+The native result proves the corrected kernel in isolation, but not an
+end-to-end speed pass. The real request falsified the prerequisite once service
+overheads and all dense operations were included.
+
+#### Exact recurrent-convolution gate, 2026-09-24
+
+This candidate replaced all 48 four-tap recurrent convolution tensors with
+exact source F32 records. The recurrent CUDA kernel already read an F32 buffer,
+so arithmetic and per-call device bytes were unchanged; only offline storage
+and startup dequantization changed.
+
+| Gate | Result |
+|---|---:|
+| source FP4 convolution relative L2 | 0.1119022 aggregate; 0.1058189--0.1148664 by layer |
+| candidate source qualification | 48 exact F32 convolutions; zero F32 mismatches; zero remaining FP4 payload/scale mismatches |
+| candidate QPack | 14,774,996,992 B; 393,216 B smaller than activation-v4 |
+| canonical clean build | CTest 8/8; Python contract 120/120 |
+| direct service smoke | coherent `Hi! How can I help you today?`; normal stop |
+| live request | 317 prompt + 19,471 completion tokens; 11,153 reasoning; 8,318 visible; `finish_reason=stop` |
+| wall / generated throughput | 391.799 s / 49.6964 tok/s |
+| speed floor | 49.06 tok/s; passed by 1.30% |
+| fidelity | failed: `cardiice`, `utilizatori directs`, `datele greu de replicabile`, `o操are de utilaj`, `Fermere`, `statiche`, `experiența utilizatorul` |
+| cleanup | candidate stopped; temporary alias removed; stable artifact untouched |
+| disposition | rejected; experimental ABI and default adapter change rolled back |
+
+This is a stronger negative control than another local error reduction: it
+removed the entire source error of the selected component and still left the
+same defect class. Recurrent convolution quantization is not the dominant cause
+of the Romanian corruption.
 
 ## Sparse MoE evidence
 

@@ -40,6 +40,13 @@ constexpr unsigned kAttentionKvTile = 16;
 constexpr unsigned kMaximumAttentionHeadDim = 256;
 constexpr float kNegativeInfinity = -3.402823466e+38F;
 
+__device__ __forceinline__ float activation_value(float value,
+                                                   bool bf16) {
+  return bf16
+      ? __bfloat162float(__float2bfloat16_rn(value))
+      : value;
+}
+
 enum class PagedKvEncoding : std::uint8_t {
   fp4,
   fp8,
@@ -813,9 +820,99 @@ __global__ void fp4_embedding_batch_kernel(
   }
 }
 
+__device__ __forceinline__ std::uint8_t mxfp6_code(
+    const std::uint8_t* packed, std::uint32_t column) {
+  const auto group = column / 4U;
+  const auto item = column & 3U;
+  const auto* bytes = packed + 3U * group;
+  const auto word = static_cast<std::uint32_t>(bytes[0]) |
+                    (static_cast<std::uint32_t>(bytes[1]) << 8U) |
+                    (static_cast<std::uint32_t>(bytes[2]) << 16U);
+  return static_cast<std::uint8_t>((word >> (6U * item)) & 0x3fU);
+}
+
+// Exact E3M2 value multiplied by 16. This integer representation keeps the
+// inner product exact until the block's UE8M0 and activation scales apply.
+__device__ __forceinline__ int decode_mxfp6_e3m2_times16(
+    std::uint8_t code) {
+  const auto magnitude_code = code & 0x1fU;
+  const auto exponent = magnitude_code >> 2U;
+  const auto mantissa = magnitude_code & 0x03U;
+  const auto magnitude = exponent == 0U
+      ? static_cast<int>(mantissa)
+      : static_cast<int>((4U + mantissa) << (exponent - 1U));
+  return (code & 0x20U) != 0U ? -magnitude : magnitude;
+}
+
+__global__ void mxfp6_embedding_batch_kernel(
+    const std::uint8_t* weights, const std::uint8_t* scales,
+    const std::uint32_t* tokens, std::uint32_t vocabulary,
+    std::uint32_t columns, std::uint32_t padded_columns, float* output) {
+  const auto request = static_cast<std::uint32_t>(blockIdx.x);
+  const auto token = tokens[request];
+  if (token >= vocabulary) return;
+  const auto* row = weights +
+      static_cast<std::size_t>(token) * (padded_columns * 3U / 4U);
+  const auto* row_scales = scales +
+      static_cast<std::size_t>(token) * (padded_columns / 32U);
+  auto* target = output + static_cast<std::size_t>(request) * columns;
+  for (std::uint32_t column = threadIdx.x; column < columns;
+       column += blockDim.x) {
+    const auto integer = decode_mxfp6_e3m2_times16(
+        mxfp6_code(row, column));
+    target[column] = static_cast<float>(integer) * (1.0F / 16.0F) *
+                     decode_ue8m0(row_scales[column / 32U]);
+  }
+}
+
+template <std::uint32_t Batch>
+__global__ void mxfp6_gemv_q8_batch_weight_reuse_kernel(
+    const std::uint8_t* weights, const std::uint8_t* weight_scales,
+    const std::int8_t* input, const float* input_scales, float* output,
+    std::uint32_t rows, std::uint32_t padded_columns) {
+  static_assert(Batch > 0U && Batch <= kMaximumWeightReuseBatch);
+  const auto warp = threadIdx.x / kWarpSize;
+  const auto lane = threadIdx.x % kWarpSize;
+  const auto row = static_cast<std::uint32_t>(
+      blockIdx.x * kWarpsPerBlock + warp);
+  if (row >= rows) return;
+  const auto blocks = padded_columns / 32U;
+  const auto* row_weights = weights +
+      static_cast<std::size_t>(row) * (padded_columns * 3U / 4U);
+  const auto* row_scales = weight_scales +
+      static_cast<std::size_t>(row) * blocks;
+  float totals[Batch]{};
+  for (std::uint32_t block = lane; block < blocks; block += kWarpSize) {
+    int block_totals[Batch]{};
+    const auto* packed = row_weights + block * 24U;
+#pragma unroll
+    for (std::uint32_t column = 0U; column < 32U; ++column) {
+      const auto weight = decode_mxfp6_e3m2_times16(
+          mxfp6_code(packed, column));
+#pragma unroll
+      for (std::uint32_t request = 0U; request < Batch; ++request)
+        block_totals[request] += weight * static_cast<int>(
+            input[static_cast<std::size_t>(request) * padded_columns +
+                  block * 32U + column]);
+    }
+    const auto scale = decode_ue8m0(row_scales[block]);
+#pragma unroll
+    for (std::uint32_t request = 0U; request < Batch; ++request)
+      totals[request] += static_cast<float>(block_totals[request]) * scale;
+  }
+#pragma unroll
+  for (std::uint32_t request = 0U; request < Batch; ++request) {
+    const auto value = warp_sum(totals[request]) *
+        input_scales[request] * (1.0F / 16.0F);
+    if (lane == 0U)
+      output[static_cast<std::size_t>(request) * rows + row] = value;
+  }
+}
+
 __global__ void quantize_q8_batch_kernel(
     const float* input, std::int8_t* output, float* scales,
-    std::uint32_t columns, std::uint32_t padded_columns) {
+    std::uint32_t columns, std::uint32_t padded_columns,
+    bool bf16_input) {
   const auto row = static_cast<std::uint32_t>(blockIdx.x);
   const auto* source = input + static_cast<std::size_t>(row) * columns;
   auto* target = output + static_cast<std::size_t>(row) * padded_columns;
@@ -823,7 +920,8 @@ __global__ void quantize_q8_batch_kernel(
   float maximum = 0.0F;
   for (std::uint32_t column = threadIdx.x; column < columns;
        column += blockDim.x)
-    maximum = fmaxf(maximum, fabsf(source[column]));
+    maximum = fmaxf(
+        maximum, fabsf(activation_value(source[column], bf16_input)));
   maxima[threadIdx.x] = maximum;
   __syncthreads();
   for (unsigned stride = kThreads / 2U; stride != 0U; stride >>= 1U) {
@@ -838,11 +936,26 @@ __global__ void quantize_q8_batch_kernel(
   for (std::uint32_t column = threadIdx.x; column < padded_columns;
        column += blockDim.x) {
     auto quantized = column < columns
-                         ? __float2int_rn(source[column] / scale)
+                         ? __float2int_rn(
+                               activation_value(source[column], bf16_input) /
+                               scale)
                          : 0;
     quantized = max(-127, min(127, quantized));
     target[column] = static_cast<std::int8_t>(quantized);
   }
+}
+
+__global__ void convert_f32_to_bf16_batch_kernel(
+    const float* input, __nv_bfloat16* output, std::uint32_t columns,
+    std::uint32_t padded_columns) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.x);
+  const auto* source = input + static_cast<std::size_t>(row) * columns;
+  auto* target = output + static_cast<std::size_t>(row) * padded_columns;
+  for (std::uint32_t column = threadIdx.x; column < padded_columns;
+       column += blockDim.x)
+    target[column] = column < columns
+        ? __float2bfloat16_rn(source[column])
+        : __float2bfloat16_rn(0.0F);
 }
 
 __device__ float fp4_q8_dot(
@@ -891,7 +1004,7 @@ __global__ void fp4_gemv_q8_batch_kernel(
     const std::uint8_t* weights, const std::uint8_t* weight_scales,
     const std::int8_t* input, const float* input_scales, float* output,
     std::uint32_t rows, std::uint32_t padded_columns,
-    std::uint32_t batch) {
+    std::uint32_t batch, bool bf16_output) {
   const auto warp = threadIdx.x / kWarpSize;
   const auto item = static_cast<std::uint64_t>(blockIdx.x) * kWarpsPerBlock +
                     warp;
@@ -902,10 +1015,11 @@ __global__ void fp4_gemv_q8_batch_kernel(
   const auto* activation = input +
       static_cast<std::size_t>(request) * padded_columns;
   const auto value = fp4_q8_dot(
-      weights, weight_scales, activation, input_scales[request], row,
-      padded_columns);
+      weights, weight_scales, activation, input_scales[request],
+      row, padded_columns);
   if (threadIdx.x % kWarpSize == 0U)
-    output[static_cast<std::size_t>(request) * rows + row] = value;
+    output[static_cast<std::size_t>(request) * rows + row] =
+        activation_value(value, bf16_output);
 }
 
 template <std::uint32_t Batch, bool CacheAllActivations = false,
@@ -913,7 +1027,7 @@ template <std::uint32_t Batch, bool CacheAllActivations = false,
 __global__ void fp4_gemv_q8_batch_weight_reuse_kernel(
     const std::uint8_t* weights, const std::uint8_t* weight_scales,
     const std::int8_t* input, const float* input_scales, float* output,
-    std::uint32_t rows, std::uint32_t padded_columns) {
+    std::uint32_t rows, std::uint32_t padded_columns, bool bf16_output) {
   static_assert(Batch > 0U && Batch <= kMaximumWeightReuseBatch);
   const auto warp = threadIdx.x / kWarpSize;
   const auto lane = threadIdx.x % kWarpSize;
@@ -1036,7 +1150,8 @@ __global__ void fp4_gemv_q8_batch_weight_reuse_kernel(
     const auto value = warp_sum(totals[request]) *
                        input_scales[request] * 0.5F;
     if (lane == 0U)
-      output[static_cast<std::size_t>(request) * rows + row] = value;
+      output[static_cast<std::size_t>(request) * rows + row] =
+          activation_value(value, bf16_output);
   }
 }
 
@@ -1048,7 +1163,7 @@ __global__ __launch_bounds__(256, 2) void
 fp4_gemv_q8_batch5_tensor_core_kernel(
     const std::uint8_t* weights, const std::uint8_t* weight_scales,
     const std::int8_t* input, const float* input_scales, float* output,
-    std::uint32_t rows, std::uint32_t padded_columns) {
+    std::uint32_t rows, std::uint32_t padded_columns, bool bf16_output) {
   constexpr std::uint32_t kBatch = 5U;
   constexpr std::uint32_t kWarps = 8U;
   constexpr std::uint32_t kRowsPerWarp = 16U;
@@ -1143,30 +1258,36 @@ fp4_gemv_q8_batch5_tensor_core_kernel(
 
   if (row0_active && output_column0 < kBatch)
     output[static_cast<std::size_t>(output_column0) * rows + row0] =
-        totals[0] * input_scales[output_column0] * 0.5F;
+        activation_value(totals[0] * input_scales[output_column0] * 0.5F,
+                         bf16_output);
   if (row0_active && output_column1 < kBatch)
     output[static_cast<std::size_t>(output_column1) * rows + row0] =
-        totals[1] * input_scales[output_column1] * 0.5F;
+        activation_value(totals[1] * input_scales[output_column1] * 0.5F,
+                         bf16_output);
   if (row1_active && output_column0 < kBatch)
     output[static_cast<std::size_t>(output_column0) * rows + row1] =
-        totals[2] * input_scales[output_column0] * 0.5F;
+        activation_value(totals[2] * input_scales[output_column0] * 0.5F,
+                         bf16_output);
   if (row1_active && output_column1 < kBatch)
     output[static_cast<std::size_t>(output_column1) * rows + row1] =
-        totals[3] * input_scales[output_column1] * 0.5F;
+        activation_value(totals[3] * input_scales[output_column1] * 0.5F,
+                         bf16_output);
 }
 
 // A CTA owns [up to 128 activation rows, 32 output rows]. Q8 integers and
 // FP4-twice values multiplied by their power-of-two block scales are exactly
 // representable in BF16. Baking the weight scale into the BF16 operand lets
-// each of sixteen warps keep one FP32 accumulator fragment across the
+// each of eight warps keep one FP32 accumulator fragment across the
 // complete K axis;
 // the old integer path had to store, rescale, and reload a 64x32 product after
 // every K=32 block.
-__global__ void fp4_gemm_q8_block32_kernel(
+template <bool Bf16Input>
+__global__ void fp4_gemm_block32_kernel(
     const std::uint8_t* weights, const std::uint8_t* weight_scales,
-    const std::int8_t* input, const float* input_scales, float* output,
+    const std::int8_t* q8_input, const __nv_bfloat16* bf16_input,
+    const float* input_scales, float* output,
     std::uint32_t output_rows, std::uint32_t padded_columns,
-    std::uint32_t batch) {
+    std::uint32_t batch, bool bf16_output) {
   using namespace nvcuda;
   constexpr std::uint32_t kOperandStride = kFp4GemmBlockColumns + 8U;
   constexpr std::uint32_t kProductStride = kFp4GemmOutputTile + 4U;
@@ -1203,20 +1324,39 @@ __global__ void fp4_gemm_q8_block32_kernel(
       const auto row = item / (kFp4GemmBlockColumns / 4U);
       const auto group = item % (kFp4GemmBlockColumns / 4U);
       const auto source_row = first_batch + row;
-      char4 values{};
-      if (source_row < batch)
-        values = *reinterpret_cast<const char4*>(
-            input + static_cast<std::size_t>(source_row) * padded_columns +
-            block * kFp4GemmBlockColumns + 4U * group);
       const auto column = 4U * group;
-      activation_tile[row][column] =
-          __float2bfloat16(static_cast<float>(values.x));
-      activation_tile[row][column + 1U] =
-          __float2bfloat16(static_cast<float>(values.y));
-      activation_tile[row][column + 2U] =
-          __float2bfloat16(static_cast<float>(values.z));
-      activation_tile[row][column + 3U] =
-          __float2bfloat16(static_cast<float>(values.w));
+      if constexpr (Bf16Input) {
+        const auto* source = bf16_input +
+            static_cast<std::size_t>(source_row < batch ? source_row : 0U) *
+                padded_columns +
+            block * kFp4GemmBlockColumns + column;
+        const auto values = source_row < batch
+            ? *reinterpret_cast<const ushort4*>(source)
+            : ushort4{};
+        activation_tile[row][column] =
+            __ushort_as_bfloat16(values.x);
+        activation_tile[row][column + 1U] =
+            __ushort_as_bfloat16(values.y);
+        activation_tile[row][column + 2U] =
+            __ushort_as_bfloat16(values.z);
+        activation_tile[row][column + 3U] =
+            __ushort_as_bfloat16(values.w);
+      } else {
+        char4 values{};
+        if (source_row < batch)
+          values = *reinterpret_cast<const char4*>(
+              q8_input +
+              static_cast<std::size_t>(source_row) * padded_columns +
+              block * kFp4GemmBlockColumns + column);
+        activation_tile[row][column] =
+            __float2bfloat16(static_cast<float>(values.x));
+        activation_tile[row][column + 1U] =
+            __float2bfloat16(static_cast<float>(values.y));
+        activation_tile[row][column + 2U] =
+            __float2bfloat16(static_cast<float>(values.z));
+        activation_tile[row][column + 3U] =
+            __float2bfloat16(static_cast<float>(values.w));
+      }
     }
     for (std::uint32_t item = local_thread;
          item < kFp4GemmOutputTile * (kFp4GemmBlockColumns / 8U);
@@ -1280,9 +1420,123 @@ __global__ void fp4_gemm_q8_block32_kernel(
     const auto output_row = first_output + item % kFp4GemmOutputTile;
     if (batch_row < batch && output_row < output_rows)
       output[static_cast<std::size_t>(batch_row) * output_rows + output_row] =
-          product_tile[item / kFp4GemmOutputTile]
-                      [item % kFp4GemmOutputTile] *
-          input_scales[batch_row] * 0.5F;
+          activation_value(
+              product_tile[item / kFp4GemmOutputTile]
+                          [item % kFp4GemmOutputTile] *
+                  (Bf16Input ? 0.5F
+                             : input_scales[batch_row] * 0.5F),
+              bf16_output);
+  }
+}
+
+// Decode batches never exceed the exact-decoder width. Avoid launching the
+// 128-row prefill tile for one to sixteen rows: two warps cover the same 32
+// output rows while reading each FP4 weight once and issuing only the useful
+// BF16 Tensor Core fragments.
+__global__ __launch_bounds__(64) void fp4_gemv_bf16_batch_tensor_core_kernel(
+    const std::uint8_t* weights, const std::uint8_t* weight_scales,
+    const __nv_bfloat16* input, float* output, std::uint32_t output_rows,
+    std::uint32_t padded_columns, std::uint32_t batch, bool bf16_output) {
+  using namespace nvcuda;
+  constexpr std::uint32_t kBatchTile = 16U;
+  constexpr std::uint32_t kOutputTile = 32U;
+  constexpr std::uint32_t kOperandStride = kFp4GemmBlockColumns + 8U;
+  constexpr std::uint32_t kProductStride = kOutputTile + 4U;
+  __shared__ __align__(32) __nv_bfloat16
+      activation_tile[kBatchTile][kOperandStride];
+  __shared__ __align__(32) __nv_bfloat16
+      weight_tile[kOutputTile][kOperandStride];
+  __shared__ __align__(32) float product_tile[kBatchTile][kProductStride];
+
+  const auto local_thread = static_cast<std::uint32_t>(threadIdx.x);
+  const auto warp = local_thread / kWarpSize;
+  const auto first_output =
+      static_cast<std::uint32_t>(blockIdx.x) * kOutputTile;
+  wmma::fragment<wmma::matrix_a, 16, 16, 16,
+                 __nv_bfloat16, wmma::row_major>
+      activation_fragment;
+  wmma::fragment<wmma::matrix_b, 16, 16, 16,
+                 __nv_bfloat16, wmma::col_major>
+      weight_fragment;
+  wmma::fragment<wmma::accumulator, 16, 16, 16, float>
+      product_fragment;
+  wmma::fill_fragment(product_fragment, 0.0F);
+
+  const auto blocks = padded_columns / kFp4GemmBlockColumns;
+  for (std::uint32_t block = 0U; block < blocks; ++block) {
+    for (std::uint32_t item = local_thread;
+         item < kBatchTile * (kFp4GemmBlockColumns / 4U); item += 64U) {
+      const auto row = item / (kFp4GemmBlockColumns / 4U);
+      const auto group = item % (kFp4GemmBlockColumns / 4U);
+      const auto column = 4U * group;
+      const auto* source = input +
+          static_cast<std::size_t>(row < batch ? row : 0U) *
+              padded_columns +
+          block * kFp4GemmBlockColumns + column;
+      const auto values = row < batch
+          ? *reinterpret_cast<const ushort4*>(source)
+          : ushort4{};
+      activation_tile[row][column] = __ushort_as_bfloat16(values.x);
+      activation_tile[row][column + 1U] = __ushort_as_bfloat16(values.y);
+      activation_tile[row][column + 2U] = __ushort_as_bfloat16(values.z);
+      activation_tile[row][column + 3U] = __ushort_as_bfloat16(values.w);
+    }
+    for (std::uint32_t item = local_thread;
+         item < kOutputTile * (kFp4GemmBlockColumns / 8U); item += 64U) {
+      const auto row = item / (kFp4GemmBlockColumns / 8U);
+      const auto group = item % (kFp4GemmBlockColumns / 8U);
+      const auto source_row = first_output + row;
+      std::uint32_t packed{};
+      float scale{};
+      if (source_row < output_rows) {
+        packed = *reinterpret_cast<const std::uint32_t*>(
+            weights + static_cast<std::size_t>(source_row) *
+                          (padded_columns / 2U) +
+            block * (kFp4GemmBlockColumns / 2U) + 4U * group);
+        scale = decode_ue8m0(
+            weight_scales[static_cast<std::size_t>(source_row) * blocks +
+                          block]);
+      }
+#pragma unroll
+      for (std::uint32_t byte = 0U; byte < 4U; ++byte) {
+        const auto codes = static_cast<std::uint8_t>(packed >> (8U * byte));
+        const auto column = 8U * group + 2U * byte;
+        weight_tile[row][column] = __float2bfloat16(
+            static_cast<float>(decode_fp4_twice(codes & 0x0fU)) * scale);
+        weight_tile[row][column + 1U] = __float2bfloat16(
+            static_cast<float>(decode_fp4_twice(codes >> 4U)) * scale);
+      }
+    }
+    __syncthreads();
+
+    wmma::load_matrix_sync(
+        activation_fragment, &activation_tile[0][0], kOperandStride);
+    wmma::load_matrix_sync(
+        weight_fragment, &weight_tile[warp * 16U][0], kOperandStride);
+    wmma::mma_sync(product_fragment, activation_fragment, weight_fragment,
+                   product_fragment);
+    wmma::load_matrix_sync(
+        activation_fragment, &activation_tile[0][16], kOperandStride);
+    wmma::load_matrix_sync(
+        weight_fragment, &weight_tile[warp * 16U][16], kOperandStride);
+    wmma::mma_sync(product_fragment, activation_fragment, weight_fragment,
+                   product_fragment);
+    __syncthreads();
+  }
+
+  wmma::store_matrix_sync(
+      &product_tile[0][warp * 16U], product_fragment, kProductStride,
+      wmma::mem_row_major);
+  __syncthreads();
+  for (std::uint32_t item = local_thread;
+       item < kBatchTile * kOutputTile; item += 64U) {
+    const auto batch_row = item / kOutputTile;
+    const auto output_row = first_output + item % kOutputTile;
+    if (batch_row < batch && output_row < output_rows)
+      output[static_cast<std::size_t>(batch_row) * output_rows + output_row] =
+          activation_value(
+              product_tile[batch_row][item % kOutputTile] * 0.5F,
+              bf16_output);
   }
 }
 
@@ -1315,18 +1569,21 @@ __global__ void q8_to_bf16_kernel(
   for (std::size_t item =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        item < values;
-       item += static_cast<std::size_t>(blockDim.x) * gridDim.x)
+       item += static_cast<std::size_t>(blockDim.x) * gridDim.x) {
     decoded[item] = __float2bfloat16(static_cast<float>(input[item]));
+  }
 }
 
 __global__ void scale_bf16_q8_gemm_kernel(
     float* output, const float* input_scales, std::uint32_t output_rows,
-    std::size_t values) {
+    std::size_t values, bool bf16_output) {
   for (std::size_t item =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        item < values;
        item += static_cast<std::size_t>(blockDim.x) * gridDim.x)
-    output[item] *= input_scales[item / output_rows] * 0.5F;
+    output[item] = activation_value(
+        output[item] * input_scales[item / output_rows] * 0.5F,
+        bf16_output);
 }
 
 __global__ void embedding_kernel(const std::int8_t* weights,
@@ -2106,9 +2363,11 @@ __global__ void weightless_rms_batch_kernel(
 }
 
 __global__ void add_kernel(float* destination, const float* source,
-                           std::uint32_t count) {
+                           std::uint32_t count, bool bf16_output) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (i < count) destination[i] += source[i];
+  if (i < count)
+    destination[i] = activation_value(destination[i] + source[i],
+                                      bf16_output);
 }
 
 __global__ void add_bias_kernel(float* destination, const float* bias,
@@ -2268,6 +2527,7 @@ __device__ std::uint32_t mrope_axis(std::uint32_t pair,
   return 0U;
 }
 
+template <bool Bf16Activations = false>
 __global__ void gated_gqa_qk_norm_mrope_kernel(
     float* q_and_gate, float* key, const float* q_weight,
     const float* k_weight, const std::uint32_t* positions_thw,
@@ -2289,9 +2549,11 @@ __global__ void gated_gqa_qk_norm_mrope_kernel(
                        : 0.0F;
     square = reduce_sum(square);
     if (dimension < head_dim)
-      normalized[dimension] = vector[dimension] *
-          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
-          (1.0F + weight[dimension]);
+      normalized[dimension] = activation_value(
+          vector[dimension] *
+              rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+              (1.0F + weight[dimension]),
+          Bf16Activations);
     __syncthreads();
     if (dimension < head_dim) {
       auto result = normalized[dimension];
@@ -2306,9 +2568,11 @@ __global__ void gated_gqa_qk_norm_mrope_kernel(
         const auto other = dimension < half
                                ? -normalized[dimension + half]
                                : normalized[dimension - half];
-        result = normalized[dimension] * cosf(angle) + other * sinf(angle);
+        result = normalized[dimension] *
+                     activation_value(cosf(angle), Bf16Activations) +
+                 other * activation_value(sinf(angle), Bf16Activations);
       }
-      vector[dimension] = result;
+      vector[dimension] = activation_value(result, Bf16Activations);
     }
     __syncthreads();
   };
@@ -2351,9 +2615,14 @@ __global__ void store_gqa_kv_fp16_batch_kernel(
 }
 
 __global__ void silu_product_kernel(const float* gate, const float* up,
-                                    float* output, std::uint32_t count) {
+                                    float* output, std::uint32_t count,
+                                    bool bf16_activations) {
   const auto i = static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (i < count) output[i] = (gate[i] / (1.0F + expf(-gate[i]))) * up[i];
+  if (i < count) {
+    const auto activated = activation_value(
+        gate[i] / (1.0F + expf(-gate[i])), bf16_activations);
+    output[i] = activation_value(activated * up[i], bf16_activations);
+  }
 }
 
 __global__ void relu2_in_place_kernel(float* values, std::uint32_t count) {
@@ -2364,6 +2633,7 @@ __global__ void relu2_in_place_kernel(float* values, std::uint32_t count) {
   values[index] = value * value;
 }
 
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 __global__ void deepseek_swiglu_product_kernel(
     const float* gate, const float* up, float* output, std::uint32_t count,
     float limit, bool bf16_output) {
@@ -2380,6 +2650,7 @@ __global__ void deepseek_swiglu_product_kernel(
   if (bf16_output) value = __bfloat162float(__float2bfloat16_rn(value));
   output[i] = value;
 }
+#endif
 
 __global__ void sigmoid_scale_kernel(float* values, const float* gate,
                                      std::uint32_t count) {
@@ -2388,11 +2659,16 @@ __global__ void sigmoid_scale_kernel(float* values, const float* gate,
 }
 
 __global__ void sigmoid_product_kernel(float* values, const float* gate,
-                                       std::uint32_t count) {
+                                       std::uint32_t count,
+                                       bool bf16_activations) {
   const auto index =
       static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
-  if (index < count)
-    values[index] *= 1.0F / (1.0F + expf(-gate[index]));
+  if (index < count) {
+    const auto value = activation_value(values[index], bf16_activations);
+    const auto sigmoid = activation_value(
+        1.0F / (1.0F + expf(-gate[index])), bf16_activations);
+    values[index] = activation_value(value * sigmoid, bf16_activations);
+  }
 }
 
 __global__ void scaled_tanh_kernel(float* values, std::uint32_t count,
@@ -2663,6 +2939,7 @@ __global__ void sigmoid_bias_router_select_batch_kernel(
   }
 }
 
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 __device__ float deepseek_route_score(float logit) {
   const float softplus = logit > 20.0F ? logit : log1pf(expf(logit));
   return sqrtf(softplus);
@@ -2827,6 +3104,7 @@ __global__ void deepseek_learned_router_batch_kernel(
   }
 }
 
+#endif
 __global__ void qwen_qkv_rope_kernel(
     float* q_and_gate, float* key, const float* value,
     const float* q_weight, const float* k_weight, float* key_cache,
@@ -3215,7 +3493,7 @@ __global__ void qwen_attention_paged_fp16_kernel(
   }
 }
 
-template <PagedKvEncoding Encoding>
+template <PagedKvEncoding Encoding, bool Bf16Activations = false>
 __global__ void gated_gqa_qkv_rope_paged_kernel(
     float* q_and_gate, float* key, const float* value,
     const float* q_weight, const float* k_weight, std::uint8_t* page,
@@ -3234,9 +3512,11 @@ __global__ void gated_gqa_qkv_rope_paged_kernel(
                        : 0.0F;
     square = reduce_sum(square);
     if (dimension < head_dim)
-      normalized[dimension] = query[dimension] *
-          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
-          (1.0F + q_weight[dimension]);
+      normalized[dimension] = activation_value(
+          query[dimension] *
+              rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+              (1.0F + q_weight[dimension]),
+          Bf16Activations);
     __syncthreads();
     if (dimension < head_dim) {
       float final_query = normalized[dimension];
@@ -3248,9 +3528,11 @@ __global__ void gated_gqa_qkv_rope_paged_kernel(
                              static_cast<float>(rotary_dim));
         const float other = dimension < half ? -normalized[dimension + half]
                                              : normalized[dimension - half];
-        final_query = normalized[dimension] * cosf(angle) + other * sinf(angle);
+        final_query = normalized[dimension] *
+                          activation_value(cosf(angle), Bf16Activations) +
+                      other * activation_value(sinf(angle), Bf16Activations);
       }
-      query[dimension] = final_query;
+      query[dimension] = activation_value(final_query, Bf16Activations);
     }
   }
   __syncthreads();
@@ -3262,9 +3544,11 @@ __global__ void gated_gqa_qkv_rope_paged_kernel(
                      : 0.0F;
   square = reduce_sum(square);
   if (dimension < head_dim)
-    normalized[dimension] = key_head[dimension] *
-        rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
-        (1.0F + k_weight[dimension]);
+    normalized[dimension] = activation_value(
+        key_head[dimension] *
+            rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+            (1.0F + k_weight[dimension]),
+        Bf16Activations);
   __syncthreads();
   if (dimension < head_dim) {
     float final_key = normalized[dimension];
@@ -3276,9 +3560,11 @@ __global__ void gated_gqa_qkv_rope_paged_kernel(
                            static_cast<float>(rotary_dim));
       const float other = dimension < half ? -normalized[dimension + half]
                                            : normalized[dimension - half];
-      final_key = normalized[dimension] * cosf(angle) + other * sinf(angle);
+      final_key = normalized[dimension] *
+                      activation_value(cosf(angle), Bf16Activations) +
+                  other * activation_value(sinf(angle), Bf16Activations);
     }
-    key_head[dimension] = final_key;
+    key_head[dimension] = activation_value(final_key, Bf16Activations);
   }
   __syncthreads();
 
@@ -3288,7 +3574,7 @@ __global__ void gated_gqa_qkv_rope_paged_kernel(
       value + static_cast<std::size_t>(head) * head_dim);
 }
 
-template <PagedKvEncoding Encoding>
+template <PagedKvEncoding Encoding, bool Bf16Activations = false>
 __global__ void gated_gqa_qkv_rope_paged_batch_kernel(
     float* q_and_gate, float* key, const float* value,
     const float* q_weight, const float* k_weight,
@@ -3316,10 +3602,11 @@ __global__ void gated_gqa_qkv_rope_paged_batch_kernel(
                        : 0.0F;
     square = reduce_sum(square);
     if (dimension < head_dim)
-      normalized[dimension] =
+      normalized[dimension] = activation_value(
           query[dimension] *
-          rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
-          (1.0F + q_weight[dimension]);
+              rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+              (1.0F + q_weight[dimension]),
+          Bf16Activations);
     __syncthreads();
     if (dimension < head_dim) {
       float final_query = normalized[dimension];
@@ -3333,9 +3620,11 @@ __global__ void gated_gqa_qkv_rope_paged_batch_kernel(
         const float other = dimension < half
                                 ? -normalized[dimension + half]
                                 : normalized[dimension - half];
-        final_query = normalized[dimension] * cosf(angle) + other * sinf(angle);
+        final_query = normalized[dimension] *
+                          activation_value(cosf(angle), Bf16Activations) +
+                      other * activation_value(sinf(angle), Bf16Activations);
       }
-      query[dimension] = final_query;
+      query[dimension] = activation_value(final_query, Bf16Activations);
     }
   }
   __syncthreads();
@@ -3347,10 +3636,11 @@ __global__ void gated_gqa_qkv_rope_paged_batch_kernel(
                      : 0.0F;
   square = reduce_sum(square);
   if (dimension < head_dim)
-    normalized[dimension] =
+    normalized[dimension] = activation_value(
         key_head[dimension] *
-        rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
-        (1.0F + k_weight[dimension]);
+            rsqrtf(square / static_cast<float>(head_dim) + epsilon) *
+            (1.0F + k_weight[dimension]),
+        Bf16Activations);
   __syncthreads();
   if (dimension < head_dim) {
     float final_key = normalized[dimension];
@@ -3363,9 +3653,11 @@ __global__ void gated_gqa_qkv_rope_paged_batch_kernel(
                           static_cast<float>(rotary_dim));
       const float other = dimension < half ? -normalized[dimension + half]
                                            : normalized[dimension - half];
-      final_key = normalized[dimension] * cosf(angle) + other * sinf(angle);
+      final_key = normalized[dimension] *
+                      activation_value(cosf(angle), Bf16Activations) +
+                  other * activation_value(sinf(angle), Bf16Activations);
     }
-    key_head[dimension] = final_key;
+    key_head[dimension] = activation_value(final_key, Bf16Activations);
   }
   __syncthreads();
 
@@ -5620,7 +5912,7 @@ __global__ void gated_gqa_attention_paged_fp4_combine_kernel(
     const float* q_and_gate, float* partial_maxima,
     const float* partial_sums, const float* partial_outputs, float* output,
     std::uint32_t splits, std::uint32_t query_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t head_dim, bool bf16_activations) {
   __shared__ float global_sum;
   const auto query_head = static_cast<std::uint32_t>(blockIdx.x);
   const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
@@ -5656,8 +5948,12 @@ __global__ void gated_gqa_attention_paged_fp4_combine_kernel(
   const auto* query = q_and_gate +
       static_cast<std::size_t>(query_head) * 2U * head_dim;
   const float gate = query[head_dim + dimension];
+  const auto attention = activation_value(result / global_sum,
+                                           bf16_activations);
+  const auto sigmoid = activation_value(
+      1.0F / (1.0F + expf(-gate)), bf16_activations);
   output[static_cast<std::size_t>(query_head) * head_dim + dimension] =
-      (result / global_sum) / (1.0F + expf(-gate));
+      activation_value(attention * sigmoid, bf16_activations);
 }
 
 __global__ __launch_bounds__(kFp4GemmThreads, 2) void
@@ -5964,7 +6260,7 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_combine_kernel(
     const float* partial_sums, const float* partial_outputs, float* output,
     std::uint32_t first_context_tokens, std::uint32_t maximum_splits,
     std::uint32_t split_tokens, std::uint32_t query_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t head_dim, bool bf16_activations) {
   __shared__ float global_maximum;
   __shared__ float global_sum;
   const auto query_head = static_cast<std::uint32_t>(blockIdx.x);
@@ -6008,10 +6304,14 @@ __global__ void gated_gqa_attention_paged_fp4_prefill_combine_kernel(
       (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
           head_dim;
   const auto gate = query[head_dim + dimension];
+  const auto attention = activation_value(result / global_sum,
+                                           bf16_activations);
+  const auto sigmoid = activation_value(
+      1.0F / (1.0F + expf(-gate)), bf16_activations);
   output[(static_cast<std::size_t>(row) * query_heads + query_head) *
              head_dim +
          dimension] =
-      (result / global_sum) / (1.0F + expf(-gate));
+      activation_value(attention * sigmoid, bf16_activations);
 }
 
 __global__ void qwen_delta_conv_kernel(
@@ -6132,7 +6432,8 @@ __global__ void qwen_delta_recurrent_kernel(
 
 __global__ void split_delta_conv_kernel(
     const float* projected_qkv, const float* weights, float* state,
-    float* output, std::uint32_t conv_dim, std::uint32_t kernel) {
+    float* output, std::uint32_t conv_dim, std::uint32_t kernel,
+    bool bf16_activations) {
   const auto channel =
       static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (channel >= conv_dim) return;
@@ -6145,7 +6446,8 @@ __global__ void split_delta_conv_kernel(
   float sum = 0.0F;
   for (std::uint32_t index = 0U; index < kernel; ++index)
     sum += channel_state[index] * channel_weights[index];
-  output[channel] = sum / (1.0F + expf(-sum));
+  output[channel] = activation_value(
+      sum / (1.0F + expf(-sum)), bf16_activations);
 }
 
 __global__ void split_delta_recurrent_kernel(
@@ -6154,7 +6456,8 @@ __global__ void split_delta_recurrent_kernel(
     const float* a_log, const float* norm_weight, float* recurrent,
     float* output, std::uint32_t key_heads, std::uint32_t value_heads,
     std::uint32_t key_head_dim, std::uint32_t value_head_dim,
-    float epsilon, std::uint32_t output_gate_activation) {
+    float epsilon, std::uint32_t output_gate_activation,
+    bool bf16_activations) {
   __shared__ float query[256];
   __shared__ float key[256];
   __shared__ float per_dimension[256];
@@ -6179,12 +6482,16 @@ __global__ void split_delta_recurrent_kernel(
   q_square = reduce_sum(q_square);
   k_square = reduce_sum(k_square);
   if (dimension < key_head_dim) {
-    query[dimension] *= rsqrtf(q_square + 1.0e-6F) *
-                        rsqrtf(static_cast<float>(key_head_dim));
-    key[dimension] *= rsqrtf(k_square + 1.0e-6F);
+    query[dimension] = activation_value(
+        query[dimension] * rsqrtf(q_square + 1.0e-6F) *
+            rsqrtf(static_cast<float>(key_head_dim)),
+        bf16_activations);
+    key[dimension] = activation_value(
+        key[dimension] * rsqrtf(k_square + 1.0e-6F), bf16_activations);
   }
   __syncthreads();
-  const float beta = 1.0F / (1.0F + expf(-projected_b[value_head]));
+  const float beta = activation_value(
+      1.0F / (1.0F + expf(-projected_b[value_head])), bf16_activations);
   const float a = projected_a[value_head] + dt_bias[value_head];
   const float softplus = log1pf(expf(-fabsf(a))) + fmaxf(a, 0.0F);
   const float decay = expf(-expf(a_log[value_head]) * softplus);
@@ -6210,6 +6517,7 @@ __global__ void split_delta_recurrent_kernel(
       state += key[index] * delta;
       core += state * query[index];
     }
+    core = activation_value(core, bf16_activations);
     per_dimension[dimension] = core * core;
   } else {
     per_dimension[dimension] = 0.0F;
@@ -6222,9 +6530,13 @@ __global__ void split_delta_recurrent_kernel(
                     dimension];
     const float sigmoid = 1.0F / (1.0F + expf(-z));
     const float gate = output_gate_activation == 2U ? sigmoid : z * sigmoid;
+    const auto normalized = activation_value(
+        core * rsqrtf(square / static_cast<float>(value_head_dim) + epsilon),
+        bf16_activations);
+    const auto weighted = activation_value(
+        normalized * norm_weight[dimension], bf16_activations);
     output[static_cast<std::size_t>(value_head) * value_head_dim + dimension] =
-        core * rsqrtf(square / static_cast<float>(value_head_dim) + epsilon) *
-        norm_weight[dimension] * gate;
+        activation_value(weighted * gate, bf16_activations);
   }
 }
 
@@ -6309,7 +6621,7 @@ __global__ void mamba2_gated_group_norm_kernel(
 __global__ void split_delta_conv_prefill_kernel(
     const float* projected_qkv, const float* weights, float* state,
     float* output, float* checkpoints, std::uint32_t rows,
-    std::uint32_t conv_dim, std::uint32_t kernel) {
+    std::uint32_t conv_dim, std::uint32_t kernel, bool bf16_activations) {
   const auto channel =
       static_cast<std::uint32_t>(blockIdx.x * blockDim.x + threadIdx.x);
   if (channel >= conv_dim) return;
@@ -6329,7 +6641,7 @@ __global__ void split_delta_conv_prefill_kernel(
     for (std::uint32_t index = 0U; index < kernel; ++index)
       sum += local_state[index] * channel_weights[index];
     output[static_cast<std::size_t>(row) * conv_dim + channel] =
-        sum / (1.0F + expf(-sum));
+        activation_value(sum / (1.0F + expf(-sum)), bf16_activations);
     if (checkpoints) {
       auto* row_checkpoint = checkpoints +
           static_cast<std::size_t>(row) * conv_dim * kernel +
@@ -6346,7 +6658,7 @@ __global__ void split_delta_conv_prefill_kernel(
 __global__ void split_delta_qk_normalize_prefill_kernel(
     float* conv, std::uint32_t rows, std::uint32_t key_heads,
     std::uint32_t value_heads, std::uint32_t key_head_dim,
-    std::uint32_t value_head_dim) {
+    std::uint32_t value_head_dim, bool bf16_activations) {
   const auto row_head = static_cast<std::uint32_t>(blockIdx.x);
   const auto row = row_head / key_heads;
   const auto key_head = row_head % key_heads;
@@ -6366,9 +6678,12 @@ __global__ void split_delta_qk_normalize_prefill_kernel(
   q_square = reduce_sum(q_square);
   k_square = reduce_sum(k_square);
   if (dimension < key_head_dim) {
-    query[dimension] *= rsqrtf(q_square + 1.0e-6F) *
-                        rsqrtf(static_cast<float>(key_head_dim));
-    key[dimension] *= rsqrtf(k_square + 1.0e-6F);
+    query[dimension] = activation_value(
+        query[dimension] * rsqrtf(q_square + 1.0e-6F) *
+            rsqrtf(static_cast<float>(key_head_dim)),
+        bf16_activations);
+    key[dimension] = activation_value(
+        key[dimension] * rsqrtf(k_square + 1.0e-6F), bf16_activations);
   }
 }
 
@@ -6435,13 +6750,15 @@ __global__ void split_delta_recurrent_core_prefill_kernel(
 __global__ void split_delta_recurrent_gate_prefill_kernel(
     const float* projected_b, const float* projected_a,
     const float* dt_bias, const float* a_log, float* beta, float* decay,
-    std::uint32_t rows, std::uint32_t value_heads) {
+    std::uint32_t rows, std::uint32_t value_heads,
+    bool bf16_activations) {
   const auto item = static_cast<std::uint32_t>(
       blockIdx.x * blockDim.x + threadIdx.x);
   const auto count = static_cast<std::size_t>(rows) * value_heads;
   if (item >= count) return;
   const auto value_head = item % value_heads;
-  beta[item] = 1.0F / (1.0F + expf(-projected_b[item]));
+  beta[item] = activation_value(
+      1.0F / (1.0F + expf(-projected_b[item])), bf16_activations);
   const float a = projected_a[item] + dt_bias[value_head];
   const float softplus = log1pf(expf(-fabsf(a))) + fmaxf(a, 0.0F);
   decay[item] = expf(-expf(a_log[value_head]) * softplus);
@@ -6568,7 +6885,7 @@ __global__ void split_delta_output_prefill_kernel(
     const float* projected_z, const float* norm_weight, float* output,
     std::uint32_t rows, std::uint32_t value_heads,
     std::uint32_t value_head_dim, float epsilon,
-    std::uint32_t output_gate_activation) {
+    std::uint32_t output_gate_activation, bool bf16_activations) {
   const auto row_head = static_cast<std::uint32_t>(blockIdx.x);
   const auto row = row_head / value_heads;
   const auto value_head = row_head % value_heads;
@@ -6577,16 +6894,21 @@ __global__ void split_delta_output_prefill_kernel(
   const auto value_index =
       static_cast<std::size_t>(row) * value_dim +
       static_cast<std::size_t>(value_head) * value_head_dim + dimension;
-  const float core =
-      dimension < value_head_dim ? output[value_index] : 0.0F;
+  const float core = dimension < value_head_dim
+      ? activation_value(output[value_index], bf16_activations)
+      : 0.0F;
   const float square = reduce_sum(core * core);
   if (dimension < value_head_dim) {
     const float z = projected_z[value_index];
     const float sigmoid = 1.0F / (1.0F + expf(-z));
     const float gate = output_gate_activation == 2U ? sigmoid : z * sigmoid;
+    const auto normalized = activation_value(
+        core * rsqrtf(square / static_cast<float>(value_head_dim) + epsilon),
+        bf16_activations);
+    const auto weighted = activation_value(
+        normalized * norm_weight[dimension], bf16_activations);
     output[value_index] =
-        core * rsqrtf(square / static_cast<float>(value_head_dim) + epsilon) *
-        norm_weight[dimension] * gate;
+        activation_value(weighted * gate, bf16_activations);
   }
 }
 
@@ -6691,7 +7013,7 @@ __global__ void flash_prefill_merge_kernel(
 __global__ void flash_prefill_finalize_kernel(
     const float* q_and_gate, const float* accumulator, float* output,
     std::uint32_t rows, std::uint32_t query_heads,
-    std::uint32_t head_dim) {
+    std::uint32_t head_dim, bool bf16_activations) {
   const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
   for (std::size_t item =
            static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -6701,7 +7023,11 @@ __global__ void flash_prefill_finalize_kernel(
     const auto row_head = item / head_dim;
     const auto gate =
         q_and_gate[row_head * 2U * head_dim + head_dim + dimension];
-    output[item] = accumulator[item] / (1.0F + expf(-gate));
+    const auto attention = activation_value(accumulator[item],
+                                             bf16_activations);
+    const auto sigmoid = activation_value(
+        1.0F / (1.0F + expf(-gate)), bf16_activations);
+    output[item] = activation_value(attention * sigmoid, bf16_activations);
   }
 }
 
@@ -7214,7 +7540,8 @@ __global__ void staged_prefill_softmax_kernel(
 __global__ void staged_prefill_finalize_kernel(
     const float* q_and_gate, const float* accumulator, const float* sums,
     float* output, std::uint32_t rows, std::uint32_t query_heads,
-    std::uint32_t kv_heads, std::uint32_t head_dim, bool output_gated) {
+    std::uint32_t kv_heads, std::uint32_t head_dim, bool output_gated,
+    bool bf16_activations) {
   const auto grouped_heads = query_heads / kv_heads;
   const auto matrix_rows = rows * grouped_heads;
   const auto values = static_cast<std::size_t>(rows) * query_heads * head_dim;
@@ -7231,13 +7558,16 @@ __global__ void staged_prefill_finalize_kernel(
     const auto matrix_row = row * grouped_heads + local_head;
     const auto packed_row =
         static_cast<std::size_t>(kv_head) * matrix_rows + matrix_row;
-    auto result = accumulator[packed_row * head_dim + dimension] /
-                  sums[packed_row];
+    auto result = activation_value(
+        accumulator[packed_row * head_dim + dimension] / sums[packed_row],
+        bf16_activations);
     if (output_gated) {
       const auto gate = q_and_gate[
           (static_cast<std::size_t>(row) * query_heads + query_head) * 2U *
               head_dim + head_dim + dimension];
-      result /= 1.0F + expf(-gate);
+      const auto sigmoid = activation_value(
+          1.0F / (1.0F + expf(-gate)), bf16_activations);
+      result = activation_value(result * sigmoid, bf16_activations);
     }
     output[item] = result;
   }
@@ -7502,6 +7832,21 @@ Status fp4_embedding_batch(const Fp4Block32Matrix& m,
   return checked(cudaPeekAtLastError(), "FP4 embedding batch");
 }
 
+Status mxfp6_embedding_batch(const Mxfp6E3m2Block32Matrix& m,
+                             const std::uint32_t* tokens, float* output,
+                             std::uint32_t batch, void* raw) noexcept {
+  if (!m.weights || !m.scales || !tokens || !output || !batch || !m.rows ||
+      !m.columns || m.padded_columns < m.columns ||
+      m.padded_columns % 32U)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid MXFP6 embedding batch");
+  mxfp6_embedding_batch_kernel<<<batch, kThreads, 0,
+                                 static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, tokens, m.rows, m.columns, m.padded_columns,
+      output);
+  return checked(cudaPeekAtLastError(), "MXFP6 embedding batch");
+}
+
 Status quantize_q8_batch(const float* input, std::int8_t* output,
                          float* scales, std::uint32_t rows,
                          std::uint32_t columns,
@@ -7512,14 +7857,48 @@ Status quantize_q8_batch(const float* input, std::int8_t* output,
                   "invalid Q8 activation quantization");
   quantize_q8_batch_kernel<<<rows, kThreads, 0,
                              static_cast<cudaStream_t>(raw)>>>(
-      input, output, scales, columns, padded_columns);
+      input, output, scales, columns, padded_columns, false);
   return checked(cudaPeekAtLastError(), "Q8 activation quantization");
+}
+
+Status quantize_q8_batch_bf16(
+    const float* input, std::int8_t* output, float* scales,
+    std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t padded_columns, void* raw) noexcept {
+  if (!input || !output || !scales || !rows || !columns ||
+      padded_columns < columns || padded_columns % 32U)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid BF16-semantics Q8 activation quantization");
+  quantize_q8_batch_kernel<<<rows, kThreads, 0,
+                             static_cast<cudaStream_t>(raw)>>>(
+      input, output, scales, columns, padded_columns, true);
+  return checked(cudaPeekAtLastError(),
+                 "BF16-semantics Q8 activation quantization");
+}
+
+Status convert_f32_to_bf16_batch(
+    const float* input, void* output, std::size_t output_bytes,
+    std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t padded_columns, void* raw) noexcept {
+  const auto values = static_cast<std::size_t>(rows) * padded_columns;
+  if (!input || !output || !rows || !columns ||
+      padded_columns < columns || padded_columns % 32U ||
+      values > std::numeric_limits<std::size_t>::max() /
+                   sizeof(__nv_bfloat16) ||
+      output_bytes < values * sizeof(__nv_bfloat16))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid BF16 activation conversion");
+  convert_f32_to_bf16_batch_kernel<<<rows, kThreads, 0,
+                                      static_cast<cudaStream_t>(raw)>>>(
+      input, static_cast<__nv_bfloat16*>(output), columns, padded_columns);
+  return checked(cudaPeekAtLastError(), "BF16 activation conversion");
 }
 
 Status fp4_gemv_q8_batch(const Fp4Block32Matrix& m,
                          const std::int8_t* input,
                          const float* input_scales, float* output,
-                         std::uint32_t batch, void* raw) noexcept {
+                         std::uint32_t batch, void* raw,
+                         bool bf16_output) noexcept {
   if (!m.weights || !m.scales || !input || !input_scales || !output ||
       !m.rows || !m.columns || !batch || m.padded_columns < m.columns ||
       m.padded_columns % 32U)
@@ -7531,13 +7910,13 @@ Status fp4_gemv_q8_batch(const Fp4Block32Matrix& m,
   fp4_gemv_q8_batch_kernel<<<static_cast<unsigned>(blocks), kThreads, 0,
                               static_cast<cudaStream_t>(raw)>>>(
       m.weights, m.scales, input, input_scales, output, m.rows,
-      m.padded_columns, batch);
+      m.padded_columns, batch, bf16_output);
   return checked(cudaPeekAtLastError(), "FP4 Q8 GEMV");
 }
 Status fp4_gemv_q8_batch_weight_reuse(
     const Fp4Block32Matrix& m, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
-    void* raw) noexcept {
+    void* raw, bool bf16_output) noexcept {
   if (!m.weights || !m.scales || !input || !input_scales || !output ||
       !m.rows || !m.columns || m.padded_columns < m.columns ||
       m.padded_columns % 32U || !batch ||
@@ -7555,7 +7934,7 @@ Status fp4_gemv_q8_batch_weight_reuse(
 #define LAUNCH_WEIGHT_REUSE(Batch)                                           \
   fp4_gemv_q8_batch_weight_reuse_kernel<Batch><<<grid, kThreads, 0, stream>>>(\
       m.weights, m.scales, input, input_scales, output, m.rows,              \
-      m.padded_columns)
+      m.padded_columns, bf16_output)
   switch (batch) {
     case 1U: LAUNCH_WEIGHT_REUSE(1U); break;
     case 2U: {
@@ -7588,14 +7967,14 @@ Status fp4_gemv_q8_batch_weight_reuse(
         fp4_gemv_q8_batch_weight_reuse_kernel<2U, true><<<
             grid, kThreads, shared_bytes, stream>>>(
             m.weights, m.scales, input, input_scales, output, m.rows,
-            m.padded_columns);
+            m.padded_columns, bf16_output);
       } else {
         constexpr std::size_t tile_shared_bytes =
             2U * 8U * (kWarpSize + 4U) * sizeof(int);
         fp4_gemv_q8_batch_weight_reuse_kernel<2U, false, true><<<
             grid, kThreads, tile_shared_bytes, stream>>>(
             m.weights, m.scales, input, input_scales, output, m.rows,
-            m.padded_columns);
+            m.padded_columns, bf16_output);
       }
       break;
     }
@@ -7605,7 +7984,7 @@ Status fp4_gemv_q8_batch_weight_reuse(
       static_cast<std::size_t>(Batch) * 8U * (kWarpSize + 4U) *            \
           sizeof(int),                                                      \
       stream>>>(m.weights, m.scales, input, input_scales, output, m.rows,   \
-                m.padded_columns)
+                m.padded_columns, bf16_output)
     case 3U: LAUNCH_TILED_WEIGHT_REUSE(3U); break;
     case 4U: LAUNCH_TILED_WEIGHT_REUSE(4U); break;
     case 5U:
@@ -7614,7 +7993,7 @@ Status fp4_gemv_q8_batch_weight_reuse(
                                 16U),
           256U, 0, stream>>>(
           m.weights, m.scales, input, input_scales, output, m.rows,
-          m.padded_columns);
+          m.padded_columns, bf16_output);
       break;
     case 6U: LAUNCH_TILED_WEIGHT_REUSE(6U); break;
     case 7U: LAUNCH_TILED_WEIGHT_REUSE(7U); break;
@@ -7625,10 +8004,57 @@ Status fp4_gemv_q8_batch_weight_reuse(
 #undef LAUNCH_WEIGHT_REUSE
   return checked(cudaPeekAtLastError(), "FP4 Q8 weight-reuse GEMV");
 }
+
+Status mxfp6_gemv_q8_batch_weight_reuse(
+    const Mxfp6E3m2Block32Matrix& m, const std::int8_t* input,
+    const float* input_scales, float* output, std::uint32_t batch,
+    void* raw) noexcept {
+  if (!m.weights || !m.scales || !input || !input_scales || !output ||
+      !m.rows || !m.columns || m.padded_columns < m.columns ||
+      m.padded_columns % 32U || !batch)
+    return Status(ErrorCode::invalid_argument,
+                  "invalid MXFP6 Q8 weight-reuse GEMV");
+  const auto blocks =
+      (static_cast<std::uint64_t>(m.rows) + kWarpsPerBlock - 1U) /
+      kWarpsPerBlock;
+  if (blocks > 0xffffffffULL)
+    return Status(ErrorCode::invalid_argument,
+                  "MXFP6 Q8 weight-reuse GEMV grid too large");
+  const auto grid = static_cast<unsigned>(blocks);
+  const auto stream = static_cast<cudaStream_t>(raw);
+  for (std::uint32_t first = 0U; first < batch;
+       first += kMaximumWeightReuseBatch) {
+    const auto count = std::min<std::uint32_t>(
+        kMaximumWeightReuseBatch, batch - first);
+    const auto* tile_input = input +
+        static_cast<std::size_t>(first) * m.padded_columns;
+    const auto* tile_scales = input_scales + first;
+    auto* tile_output = output + static_cast<std::size_t>(first) * m.rows;
+#define LAUNCH_MXFP6_WEIGHT_REUSE(Batch)                                   \
+    mxfp6_gemv_q8_batch_weight_reuse_kernel<Batch><<<                      \
+        grid, kThreads, 0, stream>>>(                                      \
+        m.weights, m.scales, tile_input, tile_scales, tile_output, m.rows, \
+        m.padded_columns)
+    switch (count) {
+      case 1U: LAUNCH_MXFP6_WEIGHT_REUSE(1U); break;
+      case 2U: LAUNCH_MXFP6_WEIGHT_REUSE(2U); break;
+      case 3U: LAUNCH_MXFP6_WEIGHT_REUSE(3U); break;
+      case 4U: LAUNCH_MXFP6_WEIGHT_REUSE(4U); break;
+      case 5U: LAUNCH_MXFP6_WEIGHT_REUSE(5U); break;
+      case 6U: LAUNCH_MXFP6_WEIGHT_REUSE(6U); break;
+      case 7U: LAUNCH_MXFP6_WEIGHT_REUSE(7U); break;
+      case 8U: LAUNCH_MXFP6_WEIGHT_REUSE(8U); break;
+      default: break;
+    }
+#undef LAUNCH_MXFP6_WEIGHT_REUSE
+  }
+  return checked(cudaPeekAtLastError(), "MXFP6 Q8 weight-reuse GEMV");
+}
 Status fp4_gemm_q8_block32(const Fp4Block32Matrix& m,
                            const std::int8_t* input,
                            const float* input_scales, float* output,
-                           std::uint32_t batch, void* raw) noexcept {
+                           std::uint32_t batch, void* raw,
+                           bool bf16_output) noexcept {
   if (!m.weights || !m.scales || !input || !input_scales || !output ||
       !m.rows || !m.columns || m.padded_columns < m.columns ||
       m.padded_columns % kFp4GemmBlockColumns || !batch)
@@ -7639,11 +8065,47 @@ Status fp4_gemm_q8_block32(const Fp4Block32Matrix& m,
                       kFp4GemmOutputTile,
                   (batch + kFp4GemmBatchTile - 1U) /
                       kFp4GemmBatchTile);
-  fp4_gemm_q8_block32_kernel<<<grid, kFp4PrefillGemmThreads, 0,
-                              static_cast<cudaStream_t>(raw)>>>(
-      m.weights, m.scales, input, input_scales, output, m.rows,
-      m.padded_columns, batch);
+  fp4_gemm_block32_kernel<false><<<grid, kFp4PrefillGemmThreads, 0,
+                                  static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, input, nullptr, input_scales, output, m.rows,
+      m.padded_columns, batch, bf16_output);
   return checked(cudaPeekAtLastError(), "FP4 Q8 block-32 GEMM");
+}
+
+Status fp4_gemm_bf16_block32(
+    const Fp4Block32Matrix& m, const void* input,
+    std::size_t input_bytes, float* output, std::uint32_t batch,
+    void* raw, bool bf16_output) noexcept {
+  const auto input_values = static_cast<std::size_t>(batch) *
+                            m.padded_columns;
+  if (!m.weights || !m.scales || !input || !output || !m.rows ||
+      !m.columns || m.padded_columns < m.columns ||
+      m.padded_columns % kFp4GemmBlockColumns || !batch ||
+      input_values > std::numeric_limits<std::size_t>::max() /
+                         sizeof(__nv_bfloat16) ||
+      input_bytes < input_values * sizeof(__nv_bfloat16))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid FP4 BF16 block-32 GEMM");
+  if (batch <= 16U) {
+    const auto grid = (m.rows + 31U) / 32U;
+    fp4_gemv_bf16_batch_tensor_core_kernel<<<
+        grid, 64U, 0, static_cast<cudaStream_t>(raw)>>>(
+        m.weights, m.scales, static_cast<const __nv_bfloat16*>(input), output,
+        m.rows, m.padded_columns, batch, bf16_output);
+    return checked(cudaPeekAtLastError(),
+                   "FP4 BF16 decode Tensor Core GEMM");
+  }
+  static_assert(kFp4GemmWarps == 8U);
+  const dim3 grid((m.rows + kFp4GemmOutputTile - 1U) /
+                      kFp4GemmOutputTile,
+                  (batch + kFp4GemmBatchTile - 1U) /
+                      kFp4GemmBatchTile);
+  fp4_gemm_block32_kernel<true><<<grid, kFp4PrefillGemmThreads, 0,
+                                 static_cast<cudaStream_t>(raw)>>>(
+      m.weights, m.scales, nullptr,
+      static_cast<const __nv_bfloat16*>(input), nullptr, output, m.rows,
+      m.padded_columns, batch, bf16_output);
+  return checked(cudaPeekAtLastError(), "FP4 BF16 block-32 GEMM");
 }
 
 Status fp4_decode_matrix_bf16(const Fp4Block32Matrix& m,
@@ -7676,7 +8138,7 @@ Status bf16_gemm_q8_block32(
     std::size_t decoded_weight_bytes, const std::int8_t* input,
     const float* input_scales, void* decoded_input,
     std::size_t decoded_input_bytes, float* output, std::uint32_t batch,
-    void* raw) noexcept {
+    void* raw, bool bf16_output) noexcept {
   if (!m.weights || !m.scales || !decoded_weights || !input ||
       !input_scales || !decoded_input || !output || !m.rows || !m.columns ||
       m.padded_columns < m.columns ||
@@ -7726,8 +8188,62 @@ Status bf16_gemm_q8_block32(
   const auto output_blocks = static_cast<unsigned>(std::min<std::size_t>(
       (output_values + kThreads - 1U) / kThreads, 65535U));
   scale_bf16_q8_gemm_kernel<<<output_blocks, kThreads, 0, stream>>>(
-      output, input_scales, m.rows, output_values);
+      output, input_scales, m.rows, output_values, bf16_output);
   return checked(cudaPeekAtLastError(), "scale staged BF16 Q8 GEMM");
+}
+
+Status bf16_gemm_bf16_block32(
+    const Fp4Block32Matrix& m, const void* decoded_weights,
+    std::size_t decoded_weight_bytes, const void* input,
+    std::size_t input_bytes, float* output, std::uint32_t batch,
+    void* raw, bool bf16_output) noexcept {
+  if (!m.weights || !m.scales || !decoded_weights || !input || !output ||
+      !m.rows || !m.columns || m.padded_columns < m.columns ||
+      m.padded_columns % kFp4GemmBlockColumns || !batch ||
+      m.rows > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      m.padded_columns >
+          static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+      batch > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
+    return Status(ErrorCode::invalid_argument,
+                  "invalid staged BF16 activation GEMM");
+  const auto weight_values =
+      static_cast<std::size_t>(m.rows) * m.padded_columns;
+  const auto input_values =
+      static_cast<std::size_t>(batch) * m.padded_columns;
+  const auto output_values = static_cast<std::size_t>(batch) * m.rows;
+  if (weight_values > std::numeric_limits<std::size_t>::max() /
+                          sizeof(__nv_bfloat16) ||
+      input_values > std::numeric_limits<std::size_t>::max() /
+                         sizeof(__nv_bfloat16) ||
+      decoded_weight_bytes < weight_values * sizeof(__nv_bfloat16) ||
+      input_bytes < input_values * sizeof(__nv_bfloat16))
+    return Status(ErrorCode::invalid_argument,
+                  "staged BF16 activation GEMM workspace is too small");
+  const auto stream = static_cast<cudaStream_t>(raw);
+  cublasHandle_t blas{};
+  auto blas_status = current_cublas_handle(stream, blas);
+  if (blas_status != CUBLAS_STATUS_SUCCESS)
+    return checked(blas_status, "initialize staged BF16 activation cuBLAS");
+  // Staged FP4 weights retain the exact twice-E2M1 integer so decoding is
+  // lossless in BF16; apply the common 1/2 factor in GEMM alpha.
+  const float alpha = 0.5F;
+  const float zero = 0.0F;
+  blas_status = cublasGemmEx(
+      blas, CUBLAS_OP_T, CUBLAS_OP_N, static_cast<int>(m.rows),
+      static_cast<int>(batch), static_cast<int>(m.padded_columns), &alpha,
+      decoded_weights, CUDA_R_16BF, static_cast<int>(m.padded_columns),
+      input, CUDA_R_16BF, static_cast<int>(m.padded_columns), &zero,
+      output, CUDA_R_32F, static_cast<int>(m.rows), CUBLAS_COMPUTE_32F,
+      CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  if (blas_status != CUBLAS_STATUS_SUCCESS)
+    return checked(blas_status, "staged BF16 activation GEMM");
+  if (bf16_output) {
+    const auto blocks = static_cast<unsigned>(std::min<std::size_t>(
+        (output_values + kThreads - 1U) / kThreads, 65535U));
+    round_bf16_kernel<<<blocks, kThreads, 0, stream>>>(
+        output, output_values);
+  }
+  return checked(cudaPeekAtLastError(), "staged BF16 activation GEMM");
 }
 
 Status embedding(const Int8Matrix& m, std::uint32_t token, float* output, void* raw) noexcept {
@@ -8244,9 +8760,13 @@ Status weightless_rms_norm_batch(
       input, output, elements, epsilon);
   return checked(cudaPeekAtLastError(), "weightless RMS norm batch");
 }
-Status add_in_place(float* destination, const float* source, std::uint32_t elements, void* raw) noexcept {
+Status add_in_place(float* destination, const float* source,
+                    std::uint32_t elements, void* raw,
+                    bool bf16_output) noexcept {
   if (!destination || !source || !elements) return Status(ErrorCode::invalid_argument, "invalid add");
-  add_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(destination, source, elements);
+  add_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0,
+               static_cast<cudaStream_t>(raw)>>>(destination, source,
+                                                  elements, bf16_output);
   return checked(cudaPeekAtLastError(), "add");
 }
 Status add_bias_in_place(float* destination, const float* bias,
@@ -8347,7 +8867,8 @@ Status gated_gqa_qk_norm_mrope_batch(
     std::uint32_t kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, std::uint32_t section_zero,
     std::uint32_t section_one, std::uint32_t section_two,
-    float epsilon, float rope_theta, void* raw) noexcept {
+    float epsilon, float rope_theta, void* raw,
+    bool bf16_activations) noexcept {
   if (!q_and_gate || !key || !q_norm_weight || !k_norm_weight ||
       !positions_thw || !rows || !query_heads || !kv_heads ||
       query_heads % kv_heads || !head_dim || head_dim > kThreads ||
@@ -8357,12 +8878,20 @@ Status gated_gqa_qk_norm_mrope_batch(
       !(epsilon > 0.0F) || !(rope_theta > 0.0F))
     return Status(ErrorCode::invalid_argument,
                   "invalid three-axis GQA QKV mRoPE batch");
-  gated_gqa_qk_norm_mrope_kernel<<<
-      dim3(query_heads, rows), kThreads, 0,
-      static_cast<cudaStream_t>(raw)>>>(
-      q_and_gate, key, q_norm_weight, k_norm_weight, positions_thw,
-      query_heads, kv_heads, head_dim, rotary_dim, section_one, section_two,
-      epsilon, rope_theta);
+  if (bf16_activations)
+    gated_gqa_qk_norm_mrope_kernel<true><<<
+        dim3(query_heads, rows), kThreads, 0,
+        static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, q_norm_weight, k_norm_weight, positions_thw,
+        query_heads, kv_heads, head_dim, rotary_dim, section_one, section_two,
+        epsilon, rope_theta);
+  else
+    gated_gqa_qk_norm_mrope_kernel<false><<<
+        dim3(query_heads, rows), kThreads, 0,
+        static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, q_norm_weight, k_norm_weight, positions_thw,
+        query_heads, kv_heads, head_dim, rotary_dim, section_one, section_two,
+        epsilon, rope_theta);
   return checked(cudaPeekAtLastError(), "three-axis GQA QKV mRoPE batch");
 }
 template <PagedKvEncoding Encoding>
@@ -8496,12 +9025,14 @@ Status store_gqa_kv_fp16_batch(
   return checked(cudaPeekAtLastError(), "FP16 GQA KV store batch");
 }
 Status silu_product(const float* gate, const float* up, float* output,
-                    std::uint32_t elements, void* raw) noexcept {
+                    std::uint32_t elements, void* raw,
+                    bool bf16_activations) noexcept {
   if (!gate || !up || !output || !elements)
     return Status(ErrorCode::invalid_argument, "invalid silu product");
   silu_product_kernel<<<(elements + kThreads - 1) / kThreads, kThreads, 0,
                         static_cast<cudaStream_t>(raw)>>>(gate, up, output,
-                                                          elements);
+                                                          elements,
+                                                          bf16_activations);
   return checked(cudaPeekAtLastError(), "silu product");
 }
 Status relu2_in_place(float* values, std::uint32_t elements,
@@ -8512,6 +9043,7 @@ Status relu2_in_place(float* values, std::uint32_t elements,
                            static_cast<cudaStream_t>(raw)>>>(values, elements);
   return checked(cudaPeekAtLastError(), "ReLU squared");
 }
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 Status deepseek_swiglu_product(
     const float* gate, const float* up, float* output,
     std::uint32_t elements, float limit, bool bf16_output,
@@ -8525,6 +9057,7 @@ Status deepseek_swiglu_product(
                                        bf16_output);
   return checked(cudaPeekAtLastError(), "DeepSeek SwiGLU product");
 }
+#endif
 Status sigmoid_scale_in_place(float* values, const float* gate,
                               std::uint32_t elements, void* raw) noexcept {
   if (!values || !gate || !elements)
@@ -8536,12 +9069,12 @@ Status sigmoid_scale_in_place(float* values, const float* gate,
 }
 Status sigmoid_product_in_place(float* values, const float* gate,
                                 std::uint32_t elements,
-                                void* raw) noexcept {
+                                void* raw, bool bf16_activations) noexcept {
   if (!values || !gate || !elements)
     return Status(ErrorCode::invalid_argument, "invalid sigmoid product");
   sigmoid_product_kernel<<<(elements + kThreads - 1U) / kThreads, kThreads,
                             0, static_cast<cudaStream_t>(raw)>>>(
-      values, gate, elements);
+      values, gate, elements, bf16_activations);
   return checked(cudaPeekAtLastError(), "sigmoid product");
 }
 Status scaled_tanh_in_place(float* values, std::uint32_t elements,
@@ -8658,6 +9191,7 @@ Status sigmoid_bias_router_topk_batch(
   return checked(cudaPeekAtLastError(),
                  "sigmoid-bias batched router select");
 }
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 Status deepseek_router_hash(
     const float* input, const std::uint16_t* weights,
     const std::int64_t* token_experts, std::uint32_t token_id,
@@ -8773,6 +9307,7 @@ Status deepseek_router_learned_rows(
   return checked(cudaPeekAtLastError(),
                  "DeepSeek learned router rows select");
 }
+#endif
 Status qwen3_next_qkv_rope_cache(
     float* q_and_gate, float* key, const float* value,
     const float* q_norm_weight, const float* k_norm_weight, float* key_cache,
@@ -9199,7 +9734,7 @@ Status gated_gqa_qkv_rope_cache_paged_q4_per_head_at(
     std::uint32_t cache_position, std::uint32_t rotary_position,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* raw) noexcept {
+    float rope_theta, void* raw, bool bf16_activations) noexcept {
   if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
       !page || !page_tokens || !query_heads || !kv_heads ||
       query_heads % kv_heads || query_heads / kv_heads > 8U ||
@@ -9207,12 +9742,20 @@ Status gated_gqa_qkv_rope_cache_paged_q4_per_head_at(
       rotary_dim % 2U || !(epsilon > 0.0F) || !(rope_theta > 0.0F))
     return Status(ErrorCode::invalid_argument,
                   "invalid paged Q4 per-head gated GQA QKV rope");
-  gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q4_per_head><<<
-      query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      q_and_gate, key, value, q_norm_weight, k_norm_weight,
-      static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
-      cache_position, rotary_position, query_heads, kv_heads, head_dim,
-      rotary_dim, epsilon, rope_theta);
+  if (bf16_activations)
+    gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q4_per_head, true><<<
+        query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight,
+        static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
+        cache_position, rotary_position, query_heads, kv_heads, head_dim,
+        rotary_dim, epsilon, rope_theta);
+  else
+    gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q4_per_head><<<
+        query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight,
+        static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
+        cache_position, rotary_position, query_heads, kv_heads, head_dim,
+        rotary_dim, epsilon, rope_theta);
   return checked(cudaPeekAtLastError(),
                  "paged Q4 per-head gated GQA QKV rope");
 }
@@ -9224,7 +9767,7 @@ Status gated_gqa_qkv_rope_cache_paged_q4_per_head_batch(
     std::uint32_t first_rotary_position, std::uint32_t rows,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* raw) noexcept {
+    float rope_theta, void* raw, bool bf16_activations) noexcept {
   if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
       !page_table || !page_tokens || !rows || !query_heads || !kv_heads ||
       query_heads % kv_heads || query_heads / kv_heads > 8U ||
@@ -9234,13 +9777,22 @@ Status gated_gqa_qkv_rope_cache_paged_q4_per_head_batch(
       first_rotary_position > 0xffffffffU - (rows - 1U))
     return Status(ErrorCode::invalid_argument,
                   "invalid paged Q4 per-head gated GQA QKV rope batch");
-  gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q4_per_head><<<
-      dim3(query_heads, rows), kThreads, 0,
-      static_cast<cudaStream_t>(raw)>>>(
-      q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
-      full_attention_layer, page_tokens, first_cache_position,
-      first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
-      epsilon, rope_theta);
+  if (bf16_activations)
+    gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q4_per_head, true><<<
+        dim3(query_heads, rows), kThreads, 0,
+        static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
+        full_attention_layer, page_tokens, first_cache_position,
+        first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
+        epsilon, rope_theta);
+  else
+    gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q4_per_head><<<
+        dim3(query_heads, rows), kThreads, 0,
+        static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
+        full_attention_layer, page_tokens, first_cache_position,
+        first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
+        epsilon, rope_theta);
   return checked(cudaPeekAtLastError(),
                  "paged Q4 per-head gated GQA QKV rope batch");
 }
@@ -9359,7 +9911,7 @@ Status gated_gqa_qkv_rope_cache_paged_q8_at(
     std::uint32_t cache_position, std::uint32_t rotary_position,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* raw) noexcept {
+    float rope_theta, void* raw, bool bf16_activations) noexcept {
   if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
       !page || !page_tokens || !query_heads || !kv_heads ||
       query_heads % kv_heads || query_heads / kv_heads > 8U || !head_dim ||
@@ -9368,12 +9920,20 @@ Status gated_gqa_qkv_rope_cache_paged_q8_at(
       !(rope_theta > 0.0F))
     return Status(ErrorCode::invalid_argument,
                   "invalid paged Q8 gated GQA QKV rope");
-  gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q8><<<
-      query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      q_and_gate, key, value, q_norm_weight, k_norm_weight,
-      static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
-      cache_position, rotary_position, query_heads, kv_heads, head_dim,
-      rotary_dim, epsilon, rope_theta);
+  if (bf16_activations)
+    gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q8, true><<<
+        query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight,
+        static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
+        cache_position, rotary_position, query_heads, kv_heads, head_dim,
+        rotary_dim, epsilon, rope_theta);
+  else
+    gated_gqa_qkv_rope_paged_kernel<PagedKvEncoding::q8><<<
+        query_heads, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight,
+        static_cast<std::uint8_t*>(page), full_attention_layer, page_tokens,
+        cache_position, rotary_position, query_heads, kv_heads, head_dim,
+        rotary_dim, epsilon, rope_theta);
   return checked(cudaPeekAtLastError(),
                  "paged Q8 gated GQA QKV rope");
 }
@@ -9385,7 +9945,7 @@ Status gated_gqa_qkv_rope_cache_paged_q8_batch(
     std::uint32_t first_rotary_position, std::uint32_t rows,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* raw) noexcept {
+    float rope_theta, void* raw, bool bf16_activations) noexcept {
   if (!q_and_gate || !key || !value || !q_norm_weight || !k_norm_weight ||
       !page_table || !page_tokens || !rows || !query_heads || !kv_heads ||
       query_heads % kv_heads || query_heads / kv_heads > 8U || !head_dim ||
@@ -9397,12 +9957,20 @@ Status gated_gqa_qkv_rope_cache_paged_q8_batch(
     return Status(ErrorCode::invalid_argument,
                   "invalid paged Q8 gated GQA QKV rope batch");
   const dim3 grid(query_heads, rows);
-  gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q8><<<
-      grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
-      q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
-      full_attention_layer, page_tokens, first_cache_position,
-      first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
-      epsilon, rope_theta);
+  if (bf16_activations)
+    gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q8, true><<<
+        grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
+        full_attention_layer, page_tokens, first_cache_position,
+        first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
+        epsilon, rope_theta);
+  else
+    gated_gqa_qkv_rope_paged_batch_kernel<PagedKvEncoding::q8><<<
+        grid, kThreads, 0, static_cast<cudaStream_t>(raw)>>>(
+        q_and_gate, key, value, q_norm_weight, k_norm_weight, page_table,
+        full_attention_layer, page_tokens, first_cache_position,
+        first_rotary_position, query_heads, kv_heads, head_dim, rotary_dim,
+        epsilon, rope_theta);
   return checked(cudaPeekAtLastError(),
                  "paged Q8 gated GQA QKV rope batch");
 }
@@ -9577,7 +10145,7 @@ Status gated_gqa_attention_decode_paged_fp4(
       launch.query_heads, kThreads, 0, stream>>>(
       launch.q_and_gate, launch.partial_maxima, launch.partial_sums,
       launch.partial_outputs, launch.output, active_splits,
-      launch.query_heads, launch.head_dim);
+      launch.query_heads, launch.head_dim, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "paged FP4 gated GQA attention combine");
 }
@@ -9678,7 +10246,7 @@ Status gated_gqa_attention_microbatch_paged_bfp_tensor_core_impl(
       launch.q_and_gate, launch.partial_maxima, launch.partial_sums,
       launch.partial_outputs, launch.output, launch.first_context_tokens,
       launch.maximum_splits, split_tokens, launch.query_heads,
-      launch.head_dim);
+      launch.head_dim, launch.bf16_activations);
   return checked(
       cudaPeekAtLastError(),
       "paged Q4 BFP Tensor Core GQA microbatch attention combine");
@@ -9755,7 +10323,7 @@ Status gated_gqa_attention_decode_paged_tensor_core_impl(
       launch.query_heads, kThreads, 0, stream>>>(
       launch.q_and_gate, launch.partial_maxima, launch.partial_sums,
       launch.partial_outputs, launch.output, active_splits,
-      launch.query_heads, launch.head_dim);
+      launch.query_heads, launch.head_dim, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "paged FP4 Tensor Core GQA attention combine");
 }
@@ -9883,7 +10451,7 @@ Status gated_gqa_attention_microbatch_paged_tensor_core_impl(
       launch.q_and_gate, launch.partial_maxima, launch.partial_sums,
       launch.partial_outputs, launch.output, launch.first_context_tokens,
       launch.maximum_splits, launch.split_tokens, launch.query_heads,
-      launch.head_dim);
+      launch.head_dim, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "paged FP4 Tensor Core GQA microbatch combine");
 }
@@ -9947,7 +10515,7 @@ Status gated_gqa_attention_prefill_paged_fp4(
       launch.q_and_gate, launch.partial_maxima, launch.partial_sums,
       launch.partial_outputs, launch.output, launch.first_context_tokens,
       launch.maximum_splits, launch.split_tokens, launch.query_heads,
-      launch.head_dim);
+      launch.head_dim, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "paged FP4 gated GQA prefill combine");
 }
@@ -10042,7 +10610,7 @@ Status gated_gqa_attention_flash_prefill_paged_impl(
 
   flash_prefill_finalize_kernel<<<value_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, launch.output, launch.rows,
-      launch.query_heads, launch.head_dim);
+      launch.query_heads, launch.head_dim, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "finalize paged FlashAttention prefill");
 }
@@ -10194,7 +10762,7 @@ Status gated_gqa_attention_staged_prefill_paged_impl(
   staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, workspace.sums,
       launch.output, launch.rows, launch.query_heads, launch.kv_heads,
-      launch.head_dim, true);
+      launch.head_dim, true, launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "finalize staged paged FP4 prefill");
 }
@@ -10518,7 +11086,7 @@ Status gated_gqa_attention_staged_fp16_impl(
   staged_prefill_finalize_kernel<<<prepare_blocks, kThreads, 0, stream>>>(
       launch.q_and_gate, workspace.accumulator, workspace.sums, launch.output,
       launch.rows, launch.query_heads, launch.kv_heads, launch.head_dim,
-      launch.output_gated);
+      launch.output_gated, false);
   return checked(cudaPeekAtLastError(),
                  "finalize staged FP16 attention");
 }
@@ -10588,7 +11156,8 @@ Status split_gated_delta_decode(const SplitGatedDeltaLaunch& launch) noexcept {
   split_delta_conv_kernel<<<(conv_dim + kThreads - 1U) / kThreads, kThreads,
                               0, stream>>>(
       launch.projected_qkv, launch.conv_weights, launch.conv_state,
-      launch.conv_output, conv_dim, launch.conv_kernel);
+      launch.conv_output, conv_dim, launch.conv_kernel,
+      launch.bf16_activations);
   if (auto status = checked(cudaPeekAtLastError(), "split delta conv");
       !status.ok())
     return status;
@@ -10597,7 +11166,7 @@ Status split_gated_delta_decode(const SplitGatedDeltaLaunch& launch) noexcept {
       launch.conv_output, launch.dt_bias, launch.a_log, launch.norm_weight,
       launch.recurrent_state, launch.output, launch.key_heads,
       launch.value_heads, launch.key_head_dim, launch.value_head_dim,
-      launch.epsilon, activation);
+      launch.epsilon, activation, launch.bf16_activations);
   return checked(cudaPeekAtLastError(), "split delta recurrent");
 }
 Status split_gated_delta_prefill(
@@ -10626,14 +11195,14 @@ Status split_gated_delta_prefill(
       (conv_dim + kThreads - 1U) / kThreads, kThreads, 0, stream>>>(
       launch.projected_qkv, launch.conv_weights, launch.conv_state,
       launch.conv_output, launch.conv_checkpoints, launch.rows, conv_dim,
-      launch.conv_kernel);
+      launch.conv_kernel, launch.bf16_activations);
   auto status = checked(cudaPeekAtLastError(),
                         "split gated-delta prefill conv");
   if (!status.ok()) return status;
   split_delta_qk_normalize_prefill_kernel<<<
       launch.rows * launch.key_heads, kThreads, 0, stream>>>(
       launch.conv_output, launch.rows, launch.key_heads, launch.value_heads,
-      launch.key_head_dim, launch.value_head_dim);
+      launch.key_head_dim, launch.value_head_dim, launch.bf16_activations);
   status = checked(cudaPeekAtLastError(),
                    "split gated-delta prefill Q/K normalization");
   if (!status.ok()) return status;
@@ -10669,7 +11238,8 @@ Status split_gated_delta_prefill(
     split_delta_recurrent_gate_prefill_kernel<<<
         scalar_blocks, kThreads, 0, stream>>>(
         launch.projected_b, launch.projected_a, launch.dt_bias,
-        launch.a_log, beta, decay, launch.rows, launch.value_heads);
+        launch.a_log, beta, decay, launch.rows, launch.value_heads,
+        launch.bf16_activations);
     split_delta_state_to_value_major_kernel<<<
         state_blocks, kThreads, 0, stream>>>(
         launch.recurrent_state, value_major_state, launch.value_heads,
@@ -10701,7 +11271,8 @@ Status split_gated_delta_prefill(
   split_delta_output_prefill_kernel<<<
       launch.rows * launch.value_heads, kThreads, 0, stream>>>(
       launch.projected_z, launch.norm_weight, launch.output, launch.rows,
-      launch.value_heads, launch.value_head_dim, launch.epsilon, activation);
+      launch.value_heads, launch.value_head_dim, launch.epsilon, activation,
+      launch.bf16_activations);
   return checked(cudaPeekAtLastError(),
                  "split gated-delta prefill output normalization");
 }

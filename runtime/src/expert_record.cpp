@@ -317,6 +317,11 @@ ExpertAdmissionValidation validate_expert_admission(
     }
     return {validated.status, validated.record.sections, split};
   }
+#ifdef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
+  static_cast<void>(verify_payload_sha256);
+  return admission_failure(ErrorCode::invalid_argument,
+                           "unsupported source/target expert ABI pair");
+#else
   if (key.encoding_abi != kExpertEncodingAbiFp4Block32 ||
       (expected.source_abi != kExpertSourceAbiDeepSeekCompactV1 &&
        expected.source_abi != kExpertSourceAbiDeepSeekFp8Block128V1)) {
@@ -418,6 +423,7 @@ ExpertAdmissionValidation validate_expert_admission(
   target.down_scale_offset = down_scale_offset;
   target.down_scale_bytes = down_scale_bytes;
   return {Status::success(), target, compact};
+#endif
 }
 
 }  // namespace expert::runtime

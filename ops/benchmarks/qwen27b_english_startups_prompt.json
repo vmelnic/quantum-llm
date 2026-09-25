@@ -1,0 +1,4 @@
+{
+  "schema": "qwen27b-english-startups-speed-v1",
+  "question": "Generate 10 original AI startup ideas, entirely in English. For each idea, provide a memorable name, the concrete problem solved, the target customer, the product and user experience, the AI technology required, the competitive advantage and hard-to-replicate data, the revenue model, the initial distribution strategy, an MVP achievable in 90 days, the principal risks, and a way to validate the idea. Avoid generic chatbot-for-everything ideas and do not repeat a market. Cover different sectors, including health, manufacturing, education, agriculture, energy, logistics, and professional services. Be concrete: explain who pays, why they would pay now, and what measurable outcome they receive. Use natural English and correct terminology. Think rigorously before answering, then present all 10 ideas in a clear structure with enough detail for a founder to decide what to validate."
+}

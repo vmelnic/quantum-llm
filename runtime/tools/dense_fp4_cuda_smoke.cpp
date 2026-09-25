@@ -162,6 +162,8 @@ double numerical_check() {
     input[index] = std::sin(static_cast<float>(index) * 0.071F) * 0.7F;
 
   std::vector<float> expected(static_cast<std::size_t>(batch) * rows);
+  std::vector<float> expected_bf16(
+      static_cast<std::size_t>(batch) * rows);
   for (std::uint32_t request = 0; request < batch; ++request) {
     float maximum = 0.0F;
     for (std::uint32_t column = 0; column < columns; ++column)
@@ -192,6 +194,24 @@ double numerical_check() {
                scale(scale_code) * input_scale;
       }
       expected[static_cast<std::size_t>(request) * rows + row] = sum;
+      float bf16_sum = 0.0F;
+      for (std::uint32_t column = 0; column < padded; ++column) {
+        const auto byte = packed[static_cast<std::size_t>(row) *
+                                     (padded / 2U) +
+                                 column / 2U];
+        const auto code = static_cast<std::uint8_t>(
+            (column & 1U) == 0U ? byte & 0x0fU : byte >> 4U);
+        const auto scale_code = scales[static_cast<std::size_t>(row) *
+                                                (padded / 32U) +
+                                            column / 32U];
+        const auto activation = column < columns
+            ? rounded_bf16(input[static_cast<std::size_t>(request) *
+                                      columns + column])
+            : 0.0F;
+        bf16_sum += activation * decode_fp4(code) * scale(scale_code);
+      }
+      expected_bf16[static_cast<std::size_t>(request) * rows + row] =
+          bf16_sum;
     }
   }
 
@@ -286,6 +306,36 @@ double numerical_check() {
     maximum_error = std::max(
         maximum_error,
         std::abs(static_cast<double>(staged[index]) - expected[index]));
+  status_check(expert::runtime::cuda::convert_f32_to_bf16_batch(
+      device_input.get(), decoded_input.get(),
+      static_cast<std::size_t>(batch) * padded * sizeof(std::uint16_t),
+      batch, columns, padded, nullptr));
+  status_check(expert::runtime::cuda::fp4_gemm_bf16_block32(
+      matrix, decoded_input.get(),
+      static_cast<std::size_t>(batch) * padded * sizeof(std::uint16_t),
+      device_output.get(), batch, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize packed FP4 BF16-input smoke");
+  const auto bf16_input = device_output.download();
+  for (std::size_t index = 0; index < bf16_input.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(bf16_input[index]) -
+                 expected_bf16[index]));
+  status_check(expert::runtime::cuda::bf16_gemm_bf16_block32(
+      matrix, decoded_weights.get(),
+      static_cast<std::size_t>(rows) * padded * sizeof(std::uint16_t),
+      decoded_input.get(),
+      static_cast<std::size_t>(batch) * padded * sizeof(std::uint16_t),
+      device_output.get(), batch, nullptr));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize staged FP4 BF16-input smoke");
+  const auto staged_bf16_input = device_output.download();
+  for (std::size_t index = 0; index < staged_bf16_input.size(); ++index)
+    maximum_error = std::max(
+        maximum_error,
+        std::abs(static_cast<double>(staged_bf16_input[index]) -
+                 expected_bf16[index]));
 
   DeviceBuffer<float> embedding(columns);
   status_check(expert::runtime::cuda::fp4_embedding(
@@ -307,7 +357,7 @@ double numerical_check() {
   return maximum_error;
 }
 
-double delta_prefill_check() {
+double delta_prefill_check(bool bf16_activations = false) {
   constexpr std::uint32_t rows = 7U;
   constexpr std::uint32_t key_heads = 2U;
   constexpr std::uint32_t value_heads = 4U;
@@ -391,7 +441,7 @@ double delta_prefill_check() {
         key_heads, value_heads, key_head_dim, value_head_dim, conv_kernel,
         epsilon,
         expert::runtime::cuda::GatedDeltaOutputActivation::sigmoid,
-        nullptr}));
+        bf16_activations, nullptr}));
     const auto conv_snapshot = scalar_conv_state.download();
     const auto recurrent_snapshot = scalar_recurrent.download();
     std::copy(conv_snapshot.begin(), conv_snapshot.end(),
@@ -427,7 +477,7 @@ double delta_prefill_check() {
       rows, key_heads, value_heads, key_head_dim, value_head_dim, conv_kernel,
       epsilon,
       expert::runtime::cuda::GatedDeltaOutputActivation::sigmoid,
-      nullptr}));
+      bf16_activations, nullptr}));
   cuda_check(cudaDeviceSynchronize(), "synchronize gated-delta prefill smoke");
 
   double maximum_error = 0.0;
@@ -1459,6 +1509,7 @@ struct Q4BfpKeyOutlier1Check final {
   double query_maximum_byte_difference{};
   double query_scale_maximum_absolute_difference{};
   double independent_oracle_maximum_absolute_difference{};
+  double staged_prefill_maximum_absolute_difference{};
 };
 
 std::uint8_t host_q4_bfp_exponent(float desired_scale, float base) {
@@ -1751,6 +1802,23 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
       static_cast<std::size_t>(rows) * query_heads);
   DeviceBuffer<float> partial_outputs(
       static_cast<std::size_t>(rows) * query_heads * head_dim);
+  DeviceBuffer<float> staged_output(
+      static_cast<std::size_t>(rows) * query_heads * head_dim);
+  constexpr std::uint32_t staged_split_tokens = page_tokens;
+  const auto staged_query_values =
+      static_cast<std::size_t>(rows) * query_heads * head_dim;
+  const auto staged_kv_values = static_cast<std::size_t>(kv_heads) *
+                                staged_split_tokens * head_dim;
+  DeviceBuffer<std::uint16_t> staged_queries(staged_query_values);
+  DeviceBuffer<std::uint16_t> staged_keys(staged_kv_values);
+  DeviceBuffer<std::uint16_t> staged_values(staged_kv_values);
+  DeviceBuffer<float> staged_scores(staged_query_values);
+  DeviceBuffer<std::uint16_t> staged_probabilities(staged_query_values);
+  DeviceBuffer<float> staged_accumulator(staged_query_values);
+  DeviceBuffer<float> staged_maxima(
+      static_cast<std::size_t>(rows) * query_heads);
+  DeviceBuffer<float> staged_sums(
+      static_cast<std::size_t>(rows) * query_heads);
   device_key.upload(key);
   device_value.upload(value);
   device_query.upload(query);
@@ -1794,6 +1862,35 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
     status_check(expert::runtime::cuda::
                      gated_gqa_attention_microbatch_paged_q4_bfp_tensor_core(
                          launch));
+  if constexpr (PerHead) {
+    const expert::runtime::cuda::PagedQ4BfpGatedGqaPrefillLaunch
+        staged_launch{
+            device_query.get(),
+            reinterpret_cast<const void* const*>(device_page_table.get()),
+            staged_output.get(), nullptr, nullptr, nullptr,
+            first_context_tokens, rows, 0U, page_tokens, query_heads,
+            kv_heads, head_dim, page_tokens, 1U, nullptr};
+    status_check(
+        expert::runtime::cuda::gated_gqa_attention_staged_prefill_paged_q4_per_head(
+            staged_launch,
+            {staged_queries.get(),
+             staged_query_values * sizeof(std::uint16_t),
+             staged_keys.get(),
+             staged_kv_values * sizeof(std::uint16_t),
+             staged_values.get(),
+             staged_kv_values * sizeof(std::uint16_t),
+             staged_scores.get(),
+             staged_query_values * sizeof(float),
+             staged_probabilities.get(),
+             staged_query_values * sizeof(std::uint16_t),
+             staged_accumulator.get(),
+             staged_query_values * sizeof(float),
+             staged_maxima.get(),
+             static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+             staged_sums.get(),
+             static_cast<std::size_t>(rows) * query_heads * sizeof(float),
+             staged_split_tokens}));
+  }
   cuda_check(cudaDeviceSynchronize(),
              "synchronize Q4 BFP five-query numerical check");
 
@@ -1847,6 +1944,8 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
     return binary16_value(bits);
   };
   const auto actual_output = device_output.download();
+  const auto actual_staged_output =
+      PerHead ? staged_output.download() : std::vector<float>{};
   const auto score_scale = 1.0F / std::sqrt(static_cast<float>(head_dim));
   for (std::uint32_t row = 0U; row < rows; ++row) {
     const auto context_tokens = first_context_tokens + row;
@@ -1856,13 +1955,17 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
       const auto query_record =
           static_cast<std::size_t>(row) * query_heads + query_head;
       std::vector<float> scores(context_tokens);
+      std::vector<float> staged_reference_scores(context_tokens);
       float maximum = -std::numeric_limits<float>::infinity();
+      float staged_reference_maximum =
+          -std::numeric_limits<float>::infinity();
       for (std::uint32_t token = 0U; token < context_tokens; ++token) {
         const auto record =
             static_cast<std::size_t>(kv_head) * page_tokens + token;
         const auto key_base =
             half_at(key_bases, record * sizeof(std::uint16_t));
         std::int32_t dot{};
+        float staged_reference_dot{};
         float correction_dot{};
         for (std::uint32_t dimension = 0U; dimension < head_dim;
              ++dimension) {
@@ -1874,6 +1977,12 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
           dot += static_cast<std::int32_t>(
                      expected_q8[query_record * head_dim + dimension]) *
                  expanded;
+          if constexpr (PerHead) {
+            staged_reference_dot +=
+                rounded_bf16(query[query_record * 2U * head_dim +
+                                    dimension]) *
+                rounded_bf16(static_cast<float>(expanded) * key_base);
+          }
         }
         if constexpr (PreserveKeyOutlier) {
           for (std::uint32_t block = 0U; block < blocks; ++block) {
@@ -1894,6 +2003,11 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
              correction_dot) *
             score_scale;
         maximum = std::max(maximum, scores[token]);
+        if constexpr (PerHead) {
+          staged_reference_scores[token] = staged_reference_dot * score_scale;
+          staged_reference_maximum = std::max(
+              staged_reference_maximum, staged_reference_scores[token]);
+        }
       }
       std::vector<float> probabilities(context_tokens);
       float denominator{};
@@ -1947,6 +2061,32 @@ Q4BfpKeyOutlier1Check q4_bfp_check_impl() {
             result.independent_oracle_maximum_absolute_difference,
             std::abs(static_cast<double>(actual_output[output_index]) -
                      expected));
+        if constexpr (PerHead) {
+          float staged_numerator{};
+          float staged_denominator{};
+          for (std::uint32_t token = 0U; token < context_tokens; ++token) {
+            const auto probability = std::exp(
+                staged_reference_scores[token] - staged_reference_maximum);
+            const auto record =
+                static_cast<std::size_t>(kv_head) * page_tokens + token;
+            const auto value_base =
+                half_at(value_bases, record * sizeof(std::uint16_t));
+            const auto expanded = host_signed_q4_value(
+                packed_nibble(value_codes, record, dimension));
+            staged_numerator +=
+                probability * rounded_bf16(static_cast<float>(expanded) *
+                                             value_base);
+            staged_denominator += probability;
+          }
+          const auto staged_expected =
+              (staged_numerator / staged_denominator) /
+              (1.0F + std::exp(-query[gate_base + dimension]));
+          result.staged_prefill_maximum_absolute_difference = std::max(
+              result.staged_prefill_maximum_absolute_difference,
+              std::abs(static_cast<double>(
+                           actual_staged_output[output_index]) -
+                       staged_expected));
+        }
       }
     }
   }
@@ -2668,6 +2808,7 @@ PrefillGemmProfile batch_bandwidth_check() {
 struct DecodeBatchBandwidth {
   double selected_gb_per_second{};
   double tensor_core_gb_per_second{};
+  double bf16_activation_gb_per_second{};
 };
 
 DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
@@ -2687,6 +2828,8 @@ DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   DeviceBuffer<std::int8_t> device_q8(
       static_cast<std::size_t>(batch) * columns);
   DeviceBuffer<float> device_q8_scales(batch);
+  DeviceBuffer<std::uint16_t> device_bf16_input(
+      static_cast<std::size_t>(batch) * columns);
   DeviceBuffer<float> device_output(static_cast<std::size_t>(batch) * rows);
   device_weights.upload(weights);
   device_scales.upload(scales);
@@ -2694,12 +2837,22 @@ DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   status_check(expert::runtime::cuda::quantize_q8_batch(
       device_input.get(), device_q8.get(), device_q8_scales.get(), batch,
       columns, columns, nullptr));
+  status_check(expert::runtime::cuda::convert_f32_to_bf16_batch(
+      device_input.get(), device_bf16_input.get(),
+      static_cast<std::size_t>(batch) * columns * sizeof(std::uint16_t),
+      batch, columns, columns, nullptr));
   const expert::runtime::cuda::Fp4Block32Matrix matrix{
       device_weights.get(), device_scales.get(), rows, columns, columns};
 
   const auto measure = [&](std::uint32_t implementation) {
     for (unsigned warmup = 0U; warmup < 3U; ++warmup) {
-      if (implementation == 1U)
+      if (implementation == 2U)
+        status_check(expert::runtime::cuda::fp4_gemm_bf16_block32(
+            matrix, device_bf16_input.get(),
+            static_cast<std::size_t>(batch) * columns *
+                sizeof(std::uint16_t),
+            device_output.get(), batch, nullptr));
+      else if (implementation == 1U)
         status_check(expert::runtime::cuda::fp4_gemm_q8_block32(
             matrix, device_q8.get(), device_q8_scales.get(),
             device_output.get(), batch, nullptr));
@@ -2714,7 +2867,13 @@ DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
     cuda_check(cudaEventCreate(&stop), "create decode batch stop event");
     cuda_check(cudaEventRecord(start), "record decode batch start");
     for (unsigned iteration = 0U; iteration < iterations; ++iteration) {
-      if (implementation == 1U)
+      if (implementation == 2U)
+        status_check(expert::runtime::cuda::fp4_gemm_bf16_block32(
+            matrix, device_bf16_input.get(),
+            static_cast<std::size_t>(batch) * columns *
+                sizeof(std::uint16_t),
+            device_output.get(), batch, nullptr));
+      else if (implementation == 1U)
         status_check(expert::runtime::cuda::fp4_gemm_q8_block32(
             matrix, device_q8.get(), device_q8_scales.get(),
             device_output.get(), batch, nullptr));
@@ -2735,10 +2894,16 @@ DecodeBatchBandwidth decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
                        iterations;
     return bytes / (static_cast<double>(milliseconds) * 1.0e6);
   };
-  return {measure(0U), measure(1U)};
+  return {measure(0U), measure(1U), measure(2U)};
 }
 
-double wide_decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
+struct WideDecodeBatchBandwidth {
+  double q8_gb_per_second{};
+  double bf16_activation_gb_per_second{};
+};
+
+WideDecodeBatchBandwidth wide_decode_batch_bandwidth_check(
+    std::uint32_t batch = 2U) {
   constexpr std::uint32_t rows = 5120U;
   constexpr std::uint32_t columns = 17408U;
   constexpr std::uint32_t iterations = 12U;
@@ -2755,6 +2920,8 @@ double wide_decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   DeviceBuffer<std::int8_t> device_q8(
       static_cast<std::size_t>(batch) * columns);
   DeviceBuffer<float> device_q8_scales(batch);
+  DeviceBuffer<std::uint16_t> device_bf16_input(
+      static_cast<std::size_t>(batch) * columns);
   DeviceBuffer<float> device_output(static_cast<std::size_t>(batch) * rows);
   device_weights.upload(weights);
   device_scales.upload(scales);
@@ -2762,33 +2929,56 @@ double wide_decode_batch_bandwidth_check(std::uint32_t batch = 2U) {
   status_check(expert::runtime::cuda::quantize_q8_batch(
       device_input.get(), device_q8.get(), device_q8_scales.get(), batch,
       columns, columns, nullptr));
+  status_check(expert::runtime::cuda::convert_f32_to_bf16_batch(
+      device_input.get(), device_bf16_input.get(),
+      static_cast<std::size_t>(batch) * columns * sizeof(std::uint16_t),
+      batch, columns, columns, nullptr));
   const expert::runtime::cuda::Fp4Block32Matrix matrix{
       device_weights.get(), device_scales.get(), rows, columns, columns};
-  for (unsigned warmup = 0U; warmup < 3U; ++warmup)
-    status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
-        matrix, device_q8.get(), device_q8_scales.get(), device_output.get(),
-        batch, nullptr));
-  cudaEvent_t start{}, stop{};
-  cuda_check(cudaEventCreate(&start),
-             "create wide decode batch start event");
-  cuda_check(cudaEventCreate(&stop),
-             "create wide decode batch stop event");
-  cuda_check(cudaEventRecord(start), "record wide decode batch start");
-  for (unsigned iteration = 0U; iteration < iterations; ++iteration)
-    status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
-        matrix, device_q8.get(), device_q8_scales.get(), device_output.get(),
-        batch, nullptr));
-  cuda_check(cudaEventRecord(stop), "record wide decode batch stop");
-  cuda_check(cudaEventSynchronize(stop),
-             "synchronize wide decode batch stop");
-  float milliseconds{};
-  cuda_check(cudaEventElapsedTime(&milliseconds, start, stop),
-             "measure wide decode batch elapsed time");
-  static_cast<void>(cudaEventDestroy(start));
-  static_cast<void>(cudaEventDestroy(stop));
-  const auto bytes = static_cast<double>(weight_bytes + scale_bytes) *
-                     iterations;
-  return bytes / (static_cast<double>(milliseconds) * 1.0e6);
+  const auto measure = [&](bool bf16) {
+    for (unsigned warmup = 0U; warmup < 3U; ++warmup) {
+      if (bf16)
+        status_check(expert::runtime::cuda::fp4_gemm_bf16_block32(
+            matrix, device_bf16_input.get(),
+            static_cast<std::size_t>(batch) * columns *
+                sizeof(std::uint16_t),
+            device_output.get(), batch, nullptr));
+      else
+        status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
+            matrix, device_q8.get(), device_q8_scales.get(),
+            device_output.get(), batch, nullptr));
+    }
+    cudaEvent_t start{}, stop{};
+    cuda_check(cudaEventCreate(&start),
+               "create wide decode batch start event");
+    cuda_check(cudaEventCreate(&stop),
+               "create wide decode batch stop event");
+    cuda_check(cudaEventRecord(start), "record wide decode batch start");
+    for (unsigned iteration = 0U; iteration < iterations; ++iteration) {
+      if (bf16)
+        status_check(expert::runtime::cuda::fp4_gemm_bf16_block32(
+            matrix, device_bf16_input.get(),
+            static_cast<std::size_t>(batch) * columns *
+                sizeof(std::uint16_t),
+            device_output.get(), batch, nullptr));
+      else
+        status_check(expert::runtime::cuda::fp4_gemv_q8_batch_weight_reuse(
+            matrix, device_q8.get(), device_q8_scales.get(),
+            device_output.get(), batch, nullptr));
+    }
+    cuda_check(cudaEventRecord(stop), "record wide decode batch stop");
+    cuda_check(cudaEventSynchronize(stop),
+               "synchronize wide decode batch stop");
+    float milliseconds{};
+    cuda_check(cudaEventElapsedTime(&milliseconds, start, stop),
+               "measure wide decode batch elapsed time");
+    static_cast<void>(cudaEventDestroy(start));
+    static_cast<void>(cudaEventDestroy(stop));
+    const auto bytes = static_cast<double>(weight_bytes + scale_bytes) *
+                       iterations;
+    return bytes / (static_cast<double>(milliseconds) * 1.0e6);
+  };
+  return {measure(false), measure(true)};
 }
 
 double attention_prefill_4096_milliseconds() {
@@ -4221,10 +4411,257 @@ bool presence_penalty_check() {
          std::vector<float>({3.0F, 0.5F, -0.5F, -1.0F});
 }
 
+struct Bf16ActivationCheck final {
+  bool q8_exact{};
+  double q8_scale_maximum_absolute_difference{};
+  double add_maximum_absolute_difference{};
+  double silu_maximum_absolute_difference{};
+  double sigmoid_maximum_absolute_difference{};
+  double mrope_maximum_absolute_difference{};
+  double recurrent_prefill_maximum_absolute_difference{};
+};
+
+Bf16ActivationCheck bf16_activation_check() {
+  constexpr std::uint32_t rows = 2U;
+  constexpr std::uint32_t columns = 35U;
+  constexpr std::uint32_t padded_columns = 64U;
+  const auto values = static_cast<std::size_t>(rows) * columns;
+  std::vector<float> input(values);
+  std::vector<float> source(values);
+  std::vector<float> gate(values);
+  std::vector<float> up(values);
+  for (std::size_t index = 0U; index < values; ++index) {
+    input[index] = std::sin(static_cast<float>(index + 1U) * 0.173F) *
+                   (0.7F + static_cast<float>(index % 5U) * 0.031F);
+    source[index] = rounded_bf16(
+        std::cos(static_cast<float>(index + 3U) * 0.097F) * 0.3F);
+    gate[index] = rounded_bf16(
+        std::sin(static_cast<float>(index + 5U) * 0.061F) * 1.7F);
+    up[index] = rounded_bf16(
+        std::cos(static_cast<float>(index + 7U) * 0.043F) * 0.9F);
+  }
+
+  std::vector<std::int8_t> expected_q8(
+      static_cast<std::size_t>(rows) * padded_columns, 0);
+  std::vector<float> expected_scales(rows);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    float maximum = 0.0F;
+    for (std::uint32_t column = 0U; column < columns; ++column)
+      maximum = std::max(
+          maximum,
+          std::abs(rounded_bf16(
+              input[static_cast<std::size_t>(row) * columns + column])));
+    const auto scale_value = maximum > 0.0F ? maximum / 127.0F : 1.0F;
+    expected_scales[row] = scale_value;
+    for (std::uint32_t column = 0U; column < columns; ++column) {
+      auto quantized = static_cast<int>(std::nearbyint(
+          rounded_bf16(
+              input[static_cast<std::size_t>(row) * columns + column]) /
+          scale_value));
+      quantized = std::max(-127, std::min(127, quantized));
+      expected_q8[static_cast<std::size_t>(row) * padded_columns + column] =
+          static_cast<std::int8_t>(quantized);
+    }
+  }
+
+  DeviceBuffer<float> device_input(input.size());
+  DeviceBuffer<float> device_source(source.size());
+  DeviceBuffer<float> device_gate(gate.size());
+  DeviceBuffer<float> device_up(up.size());
+  DeviceBuffer<float> device_output(values);
+  DeviceBuffer<std::int8_t> device_q8(expected_q8.size());
+  DeviceBuffer<float> device_scales(rows);
+  device_input.upload(input);
+  device_source.upload(source);
+  device_gate.upload(gate);
+  device_up.upload(up);
+  status_check(expert::runtime::cuda::quantize_q8_batch_bf16(
+      device_input.get(), device_q8.get(), device_scales.get(), rows,
+      columns, padded_columns, nullptr));
+
+  Bf16ActivationCheck result;
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize BF16 Q8 activation smoke");
+  result.q8_exact = device_q8.download() == expected_q8;
+  const auto actual_scales = device_scales.download();
+  for (std::uint32_t row = 0U; row < rows; ++row)
+    result.q8_scale_maximum_absolute_difference = std::max(
+        result.q8_scale_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_scales[row]) -
+                 expected_scales[row]));
+
+  device_output.upload(input);
+  status_check(expert::runtime::cuda::add_in_place(
+      device_output.get(), device_source.get(),
+      static_cast<std::uint32_t>(values), nullptr, true));
+  cuda_check(cudaDeviceSynchronize(), "synchronize BF16 residual-add smoke");
+  const auto actual_add = device_output.download();
+  for (std::size_t index = 0U; index < values; ++index) {
+    const auto expected = rounded_bf16(input[index] + source[index]);
+    result.add_maximum_absolute_difference = std::max(
+        result.add_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_add[index]) - expected));
+  }
+
+  status_check(expert::runtime::cuda::silu_product(
+      device_gate.get(), device_up.get(), device_output.get(),
+      static_cast<std::uint32_t>(values), nullptr, true));
+  cuda_check(cudaDeviceSynchronize(), "synchronize BF16 SwiGLU smoke");
+  const auto actual_silu = device_output.download();
+  for (std::size_t index = 0U; index < values; ++index) {
+    const auto activated = rounded_bf16(
+        gate[index] / (1.0F + std::exp(-gate[index])));
+    const auto expected = rounded_bf16(activated * up[index]);
+    result.silu_maximum_absolute_difference = std::max(
+        result.silu_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_silu[index]) - expected));
+  }
+
+  device_output.upload(up);
+  status_check(expert::runtime::cuda::sigmoid_product_in_place(
+      device_output.get(), device_gate.get(),
+      static_cast<std::uint32_t>(values), nullptr, true));
+  cuda_check(cudaDeviceSynchronize(),
+             "synchronize BF16 sigmoid-gate smoke");
+  const auto actual_sigmoid = device_output.download();
+  for (std::size_t index = 0U; index < values; ++index) {
+    const auto sigmoid = rounded_bf16(
+        1.0F / (1.0F + std::exp(-gate[index])));
+    const auto expected = rounded_bf16(up[index] * sigmoid);
+    result.sigmoid_maximum_absolute_difference = std::max(
+        result.sigmoid_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_sigmoid[index]) - expected));
+  }
+
+  constexpr std::uint32_t query_heads = 2U;
+  constexpr std::uint32_t kv_heads = 1U;
+  constexpr std::uint32_t head_dim = 32U;
+  constexpr std::uint32_t rotary_dim = 32U;
+  constexpr float epsilon = 1.0e-6F;
+  constexpr float rope_theta = 10000000.0F;
+  std::vector<float> query_gate(
+      static_cast<std::size_t>(query_heads) * 2U * head_dim);
+  std::vector<float> key(static_cast<std::size_t>(kv_heads) * head_dim);
+  std::vector<float> query_weight(head_dim);
+  std::vector<float> key_weight(head_dim);
+  for (std::size_t index = 0U; index < query_gate.size(); ++index)
+    query_gate[index] = rounded_bf16(
+        std::sin(static_cast<float>(index + 11U) * 0.037F) * 0.8F);
+  for (std::size_t index = 0U; index < key.size(); ++index)
+    key[index] = rounded_bf16(
+        std::cos(static_cast<float>(index + 13U) * 0.041F) * 0.7F);
+  for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+    query_weight[dimension] =
+        std::sin(static_cast<float>(dimension + 1U) * 0.017F) * 0.1F;
+    key_weight[dimension] =
+        std::cos(static_cast<float>(dimension + 1U) * 0.019F) * 0.1F;
+  }
+  const std::vector<std::uint32_t> positions{13U, 7U, 3U};
+  auto expected_query_gate = query_gate;
+  auto expected_key = key;
+  const auto apply_mrope = [&](float* vector, const float* weight) {
+    float square = 0.0F;
+    for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+      square += vector[dimension] * vector[dimension];
+    std::array<float, head_dim> normalized{};
+    for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension)
+      normalized[dimension] = rounded_bf16(
+          vector[dimension] *
+          (1.0F / std::sqrt(square / static_cast<float>(head_dim) +
+                            epsilon)) *
+          (1.0F + weight[dimension]));
+    const auto half = rotary_dim / 2U;
+    for (std::uint32_t dimension = 0U; dimension < head_dim; ++dimension) {
+      const auto pair = dimension % half;
+      const auto axis = pair % 3U == 1U && pair < 15U
+                            ? 1U
+                            : pair % 3U == 2U && pair < 15U ? 2U : 0U;
+      const auto angle = static_cast<float>(positions[axis]) *
+          std::pow(rope_theta,
+                   -2.0F * static_cast<float>(pair) /
+                       static_cast<float>(rotary_dim));
+      const auto cosine = rounded_bf16(std::cos(angle));
+      const auto sine = rounded_bf16(std::sin(angle));
+      const auto other = dimension < half
+                             ? -normalized[dimension + half]
+                             : normalized[dimension - half];
+      vector[dimension] = rounded_bf16(
+          normalized[dimension] * cosine + other * sine);
+    }
+  };
+  for (std::uint32_t head = 0U; head < query_heads; ++head)
+    apply_mrope(expected_query_gate.data() +
+                    static_cast<std::size_t>(head) * 2U * head_dim,
+                query_weight.data());
+  apply_mrope(expected_key.data(), key_weight.data());
+  DeviceBuffer<float> device_query_gate(query_gate.size());
+  DeviceBuffer<float> device_key(key.size());
+  DeviceBuffer<float> device_query_weight(query_weight.size());
+  DeviceBuffer<float> device_key_weight(key_weight.size());
+  DeviceBuffer<std::uint32_t> device_positions(positions.size());
+  device_query_gate.upload(query_gate);
+  device_key.upload(key);
+  device_query_weight.upload(query_weight);
+  device_key_weight.upload(key_weight);
+  device_positions.upload(positions);
+  status_check(expert::runtime::cuda::gated_gqa_qk_norm_mrope_batch(
+      device_query_gate.get(), device_key.get(), device_query_weight.get(),
+      device_key_weight.get(), device_positions.get(), 1U, query_heads,
+      kv_heads, head_dim, rotary_dim, 6U, 5U, 5U, epsilon, rope_theta,
+      nullptr, true));
+  cuda_check(cudaDeviceSynchronize(), "synchronize BF16 mRoPE smoke");
+  const auto actual_query_gate = device_query_gate.download();
+  const auto actual_key = device_key.download();
+  for (std::size_t index = 0U; index < query_gate.size(); ++index)
+    result.mrope_maximum_absolute_difference = std::max(
+        result.mrope_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_query_gate[index]) -
+                 expected_query_gate[index]));
+  for (std::size_t index = 0U; index < key.size(); ++index)
+    result.mrope_maximum_absolute_difference = std::max(
+        result.mrope_maximum_absolute_difference,
+        std::abs(static_cast<double>(actual_key[index]) -
+                 expected_key[index]));
+
+  result.recurrent_prefill_maximum_absolute_difference =
+      delta_prefill_check(true);
+  return result;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc == 2 && std::string_view(argv[1]) ==
+                         "--bf16-activation-check") {
+      const auto numerical = bf16_activation_check();
+      const auto pass =
+          numerical.q8_exact &&
+          numerical.q8_scale_maximum_absolute_difference == 0.0 &&
+          numerical.add_maximum_absolute_difference == 0.0 &&
+          numerical.silu_maximum_absolute_difference == 0.0 &&
+          numerical.sigmoid_maximum_absolute_difference == 0.0 &&
+          numerical.mrope_maximum_absolute_difference < 8.0e-3 &&
+          numerical.recurrent_prefill_maximum_absolute_difference < 2.0e-4;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"q8_exact\":"
+          << (numerical.q8_exact ? "true" : "false")
+          << ",\"q8_scale_maximum_absolute_difference\":"
+          << numerical.q8_scale_maximum_absolute_difference
+          << ",\"add_maximum_absolute_difference\":"
+          << numerical.add_maximum_absolute_difference
+          << ",\"silu_maximum_absolute_difference\":"
+          << numerical.silu_maximum_absolute_difference
+          << ",\"sigmoid_maximum_absolute_difference\":"
+          << numerical.sigmoid_maximum_absolute_difference
+          << ",\"mrope_maximum_absolute_difference\":"
+          << numerical.mrope_maximum_absolute_difference
+          << ",\"recurrent_prefill_maximum_absolute_difference\":"
+          << numerical.recurrent_prefill_maximum_absolute_difference
+          << "}\n";
+      return pass ? 0 : 1;
+    }
     if (argc == 2 && std::string_view(argv[1]) ==
                          "--q4-bfp-batch-5-profile") {
       const auto numerical = q4_bfp_key_outlier1_check();
@@ -4339,6 +4776,20 @@ int main(int argc, char** argv) {
       return pass ? 0 : 1;
     }
     if (argc == 2 && std::string_view(argv[1]) ==
+                         "--q4-per-head-flash-prefill-check") {
+      const auto numerical = q4_per_head_check();
+      const auto pass =
+          numerical.layout_maximum_byte_difference == 0.0 &&
+          numerical.staged_prefill_maximum_absolute_difference < 2.0e-3;
+      std::cout
+          << "{\"pass\":" << (pass ? "true" : "false")
+          << ",\"layout_maximum_byte_difference\":"
+          << numerical.layout_maximum_byte_difference
+          << ",\"staged_prefill_maximum_absolute_difference\":"
+          << numerical.staged_prefill_maximum_absolute_difference << "}\n";
+      return pass ? 0 : 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) ==
                          "--q4-per-head-batch-5-profile") {
       const auto numerical = q4_per_head_check();
       const std::array profiles{
@@ -4349,6 +4800,7 @@ int main(int argc, char** argv) {
           numerical.query_maximum_byte_difference == 0.0 &&
           numerical.query_scale_maximum_absolute_difference < 1.0e-8 &&
           numerical.independent_oracle_maximum_absolute_difference < 2.0e-4 &&
+          numerical.staged_prefill_maximum_absolute_difference < 2.0e-3 &&
           std::isfinite(profiles[0].sixteen_layer_milliseconds) &&
           profiles[0].sixteen_layer_milliseconds > 0.0 &&
           profiles[1].sixteen_layer_milliseconds <= 16.7527;
@@ -4362,6 +4814,8 @@ int main(int argc, char** argv) {
           << numerical.query_scale_maximum_absolute_difference
           << ",\"independent_oracle_maximum_absolute_difference\":"
           << numerical.independent_oracle_maximum_absolute_difference
+          << ",\"staged_prefill_maximum_absolute_difference\":"
+          << numerical.staged_prefill_maximum_absolute_difference
           << ",\"profiles\":[";
       for (std::size_t index = 0U; index < profiles.size(); ++index) {
         if (index != 0U) std::cout << ',';
@@ -4381,16 +4835,36 @@ int main(int argc, char** argv) {
       const auto maximum_absolute_error = numerical_check();
       const auto narrow = decode_batch_bandwidth_check(5U);
       const auto wide = wide_decode_batch_bandwidth_check(5U);
-      std::cout << "{\"batch\":5"
+      const auto q8_combined = 3.0 /
+          (2.0 / narrow.tensor_core_gb_per_second +
+           1.0 / wide.q8_gb_per_second);
+      const auto bf16_combined = 3.0 /
+          (2.0 / narrow.bf16_activation_gb_per_second +
+           1.0 / wide.bf16_activation_gb_per_second);
+      const auto bf16_floor = q8_combined * (49.06 / 50.48);
+      const auto pass = maximum_absolute_error < 2.0e-4 &&
+                        bf16_combined >= bf16_floor;
+      std::cout << "{\"pass\":" << (pass ? "true" : "false")
+                << ",\"batch\":5"
                 << ",\"maximum_absolute_error\":"
                 << maximum_absolute_error
                 << ",\"narrow_weight_reuse_gb_per_second\":"
                 << narrow.selected_gb_per_second
                 << ",\"narrow_tensor_core_gb_per_second\":"
                 << narrow.tensor_core_gb_per_second
-                << ",\"wide_weight_reuse_gb_per_second\":" << wide
+                << ",\"narrow_bf16_activation_gb_per_second\":"
+                << narrow.bf16_activation_gb_per_second
+                << ",\"combined_q8_gb_per_second\":" << q8_combined
+                << ",\"combined_bf16_activation_gb_per_second\":"
+                << bf16_combined
+                << ",\"combined_bf16_required_gb_per_second\":"
+                << bf16_floor
+                << ",\"wide_weight_reuse_gb_per_second\":"
+                << wide.q8_gb_per_second
+                << ",\"wide_bf16_activation_gb_per_second\":"
+                << wide.bf16_activation_gb_per_second
                 << "}\n";
-      return maximum_absolute_error < 2.0e-4 ? 0 : 1;
+      return pass ? 0 : 1;
     }
     const auto error = numerical_check();
     const auto topk = topk_logits_check();
@@ -4518,8 +4992,13 @@ int main(int argc, char** argv) {
                           decode_batch_bandwidth.tensor_core_gb_per_second) &&
                       decode_batch_bandwidth.tensor_core_gb_per_second >
                           0.0 &&
-                      std::isfinite(wide_decode_batch_bandwidth) &&
-                      wide_decode_batch_bandwidth > 0.0 &&
+                      std::isfinite(
+                          wide_decode_batch_bandwidth.q8_gb_per_second) &&
+                      wide_decode_batch_bandwidth.q8_gb_per_second > 0.0 &&
+                      std::isfinite(wide_decode_batch_bandwidth.
+                                        bf16_activation_gb_per_second) &&
+                      wide_decode_batch_bandwidth.
+                              bf16_activation_gb_per_second > 0.0 &&
                       std::isfinite(attention_milliseconds) &&
                       attention_milliseconds > 0.0 &&
                       std::isfinite(
@@ -4662,8 +5141,13 @@ int main(int argc, char** argv) {
               << decode_batch_bandwidth.selected_gb_per_second
               << ",\"decode_batch_tensor_core_gb_per_second\":"
               << decode_batch_bandwidth.tensor_core_gb_per_second
+              << ",\"decode_batch_bf16_activation_gb_per_second\":"
+              << decode_batch_bandwidth.bf16_activation_gb_per_second
               << ",\"wide_decode_batch_selected_gb_per_second\":"
-              << wide_decode_batch_bandwidth
+              << wide_decode_batch_bandwidth.q8_gb_per_second
+              << ",\"wide_decode_batch_bf16_activation_gb_per_second\":"
+              << wide_decode_batch_bandwidth.
+                     bf16_activation_gb_per_second
               << ",\"attention_prefill_4096_milliseconds\":"
               << attention_milliseconds
               << ",\"attention_prefill_262144_milliseconds\":"

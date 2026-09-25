@@ -71,6 +71,7 @@ std::uint64_t fp4_device_bytes(std::uint32_t hidden,
   return matrices * (elements / 2U + elements / kExpertFp4BlockSize);
 }
 
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 std::uint64_t runtime_u64(std::string_view text, std::string_view key) {
   const auto prefix = std::string(key) + "\t";
   std::optional<std::uint64_t> result;
@@ -99,6 +100,7 @@ std::uint64_t runtime_u64(std::string_view text, std::string_view key) {
   if (!result) throw std::invalid_argument("artifact runtime field is absent");
   return *result;
 }
+#endif
 
 }  // namespace
 
@@ -120,8 +122,10 @@ Status ModelArtifact::load(const std::filesystem::path& root,
         Required(format, "version", "format").AsU64("format.version");
     if (name == "expert-pack" && version == 1U)
       return load_expert_pack_v1(root, destination);
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
     if (name == "deepseek-worker-bundle" && version == 3U)
       return load_deepseek_worker_bundle_v3(root, destination);
+#endif
     return {ErrorCode::invalid_argument,
             "no artifact storage adapter implements manifest format"};
   } catch (const std::exception& error) {
@@ -130,6 +134,7 @@ Status ModelArtifact::load(const std::filesystem::path& root,
   }
 }
 
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 Status ModelArtifact::load_deepseek_worker_bundle_v3(
     const std::filesystem::path& root, ModelArtifact& destination) noexcept {
   try {
@@ -175,6 +180,7 @@ Status ModelArtifact::load_deepseek_worker_bundle_v3(
             std::string("invalid worker bundle artifact: ") + error.what()};
   }
 }
+#endif
 
 const ArtifactPack* ModelArtifact::find_pack(std::string_view name) const
     noexcept {
@@ -307,7 +313,8 @@ Status ModelArtifact::load_expert_pack_v1(
           tensor.stored_bytes > pack->second - tensor.record_offset ||
           (tensor.encoding != "I8" && tensor.encoding != "F32" &&
            tensor.encoding != "I64" && tensor.encoding != "BF16" &&
-           tensor.encoding != "FP4_E2M1"))
+           tensor.encoding != "FP4_E2M1" &&
+           tensor.encoding != "MXFP6_E3M2"))
         throw std::invalid_argument("dense tensor index is invalid");
       candidate.dense_tensors_.push_back(std::move(tensor));
     }

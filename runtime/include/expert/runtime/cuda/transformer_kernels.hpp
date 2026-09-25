@@ -31,6 +31,16 @@ struct Fp4Block32Matrix final {
   std::uint32_t padded_columns{};
 };
 
+// OCP MXFP6 E3M2 dense ABI 6. Four six-bit values occupy three bytes and one
+// UE8M0 scale byte belongs to each padded block of 32 columns.
+struct Mxfp6E3m2Block32Matrix final {
+  const std::uint8_t* weights{};
+  const std::uint8_t* scales{};
+  std::uint32_t rows{};
+  std::uint32_t columns{};
+  std::uint32_t padded_columns{};
+};
+
 // Native Blackwell NVFP4 checkpoint matrix. Packed E2M1 weights retain one
 // E4M3FN scale per 16 columns. The two global values are the reciprocals of
 // the divisors stored by compressed-tensors after fail-closed host decoding.
@@ -58,20 +68,35 @@ struct Nvfp4Block16Matrix final {
 [[nodiscard]] Status fp4_embedding_batch(
     const Fp4Block32Matrix& matrix, const std::uint32_t* tokens,
     float* output, std::uint32_t batch, void* stream) noexcept;
+[[nodiscard]] Status mxfp6_embedding_batch(
+    const Mxfp6E3m2Block32Matrix& matrix, const std::uint32_t* tokens,
+    float* output, std::uint32_t batch, void* stream) noexcept;
 // Quantizes row-major FP32 activations once so several projections sharing an
 // input can execute direct packed-FP4 dp4a GEMVs without redundant work.
 [[nodiscard]] Status quantize_q8_batch(
     const float* input, std::int8_t* output, float* scales,
     std::uint32_t rows, std::uint32_t columns,
     std::uint32_t padded_columns, void* stream) noexcept;
+[[nodiscard]] Status quantize_q8_batch_bf16(
+    const float* input, std::int8_t* output, float* scales,
+    std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t padded_columns, void* stream) noexcept;
+[[nodiscard]] Status convert_f32_to_bf16_batch(
+    const float* input, void* output, std::size_t output_bytes,
+    std::uint32_t rows, std::uint32_t columns,
+    std::uint32_t padded_columns, void* stream) noexcept;
 [[nodiscard]] Status fp4_gemv_q8_batch(
     const Fp4Block32Matrix& matrix, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
-    void* stream) noexcept;
+    void* stream, bool bf16_output = false) noexcept;
 // One warp owns one output row and accumulates up to eight activation rows
 // while reading every packed FP4 weight exactly once.
 [[nodiscard]] Status fp4_gemv_q8_batch_weight_reuse(
     const Fp4Block32Matrix& matrix, const std::int8_t* input,
+    const float* input_scales, float* output, std::uint32_t batch,
+    void* stream, bool bf16_output = false) noexcept;
+[[nodiscard]] Status mxfp6_gemv_q8_batch_weight_reuse(
+    const Mxfp6E3m2Block32Matrix& matrix, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
     void* stream) noexcept;
 // SM80 Tensor Core path for causal prefill. A CTA retains four 128x32 output
@@ -80,7 +105,11 @@ struct Nvfp4Block16Matrix final {
 [[nodiscard]] Status fp4_gemm_q8_block32(
     const Fp4Block32Matrix& matrix, const std::int8_t* input,
     const float* input_scales, float* output, std::uint32_t batch,
-    void* stream) noexcept;
+    void* stream, bool bf16_output = false) noexcept;
+[[nodiscard]] Status fp4_gemm_bf16_block32(
+    const Fp4Block32Matrix& matrix, const void* input,
+    std::size_t input_bytes, float* output, std::uint32_t batch,
+    void* stream, bool bf16_output = false) noexcept;
 
 // Layer-major prefill may decode an FP4 matrix once and reuse the exact BF16
 // operand across every prompt chunk for that artifact operation. Workspace
@@ -93,7 +122,12 @@ struct Nvfp4Block16Matrix final {
     std::size_t decoded_weight_bytes, const std::int8_t* input,
     const float* input_scales, void* decoded_input,
     std::size_t decoded_input_bytes, float* output, std::uint32_t batch,
-    void* stream) noexcept;
+    void* stream, bool bf16_output = false) noexcept;
+[[nodiscard]] Status bf16_gemm_bf16_block32(
+    const Fp4Block32Matrix& matrix, const void* decoded_weights,
+    std::size_t decoded_weight_bytes, const void* input,
+    std::size_t input_bytes, float* output, std::uint32_t batch,
+    void* stream, bool bf16_output = false) noexcept;
 
 [[nodiscard]] Status embedding(const Int8Matrix& matrix, std::uint32_t token,
                                float* output, void* stream) noexcept;
@@ -268,7 +302,8 @@ struct PleDilatedConvLaunch final {
     const float* input, float* output, std::uint32_t rows,
     std::uint32_t elements, float epsilon, void* stream) noexcept;
 [[nodiscard]] Status add_in_place(float* destination, const float* source,
-                                  std::uint32_t elements, void* stream) noexcept;
+                                  std::uint32_t elements, void* stream,
+                                  bool bf16_output = false) noexcept;
 [[nodiscard]] Status add_bias_in_place(float* destination, const float* bias,
                                        std::uint32_t rows,
                                        std::uint32_t columns,
@@ -310,7 +345,8 @@ struct PleDilatedConvLaunch final {
     std::uint32_t kv_heads, std::uint32_t head_dim,
     std::uint32_t rotary_dim, std::uint32_t mrope_section_0,
     std::uint32_t mrope_section_1, std::uint32_t mrope_section_2,
-    float epsilon, float rope_theta, void* stream) noexcept;
+    float epsilon, float rope_theta, void* stream,
+    bool bf16_activations = false) noexcept;
 [[nodiscard]] Status store_gqa_kv_paged_fp4_batch(
     const float* key, const float* value, const void* const* page_table,
     std::uint32_t full_attention_layer, std::uint32_t page_tokens,
@@ -372,7 +408,8 @@ struct PleDilatedConvLaunch final {
 
 [[nodiscard]] Status silu_product(const float* gate, const float* up,
                                   float* output, std::uint32_t elements,
-                                  void* stream) noexcept;
+                                  void* stream,
+                                  bool bf16_activations = false) noexcept;
 [[nodiscard]] Status relu2_in_place(float* values, std::uint32_t elements,
                                     void* stream) noexcept;
 [[nodiscard]] Status deepseek_swiglu_product(
@@ -386,7 +423,8 @@ struct PleDilatedConvLaunch final {
 [[nodiscard]] Status sigmoid_product_in_place(float* values,
                                               const float* gate,
                                               std::uint32_t elements,
-                                              void* stream) noexcept;
+                                              void* stream,
+                                              bool bf16_activations = false) noexcept;
 [[nodiscard]] Status scaled_tanh_in_place(float* values,
                                           std::uint32_t elements,
                                           float multiplier, float softcap,
@@ -706,7 +744,8 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t cache_position, std::uint32_t rotary_position,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* stream) noexcept;
+    float rope_theta, void* stream,
+    bool bf16_activations = false) noexcept;
 [[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q4_per_head_batch(
     float* q_and_gate, float* key, const float* value,
     const float* q_norm_weight, const float* k_norm_weight,
@@ -715,7 +754,8 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t first_rotary_position, std::uint32_t rows,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* stream) noexcept;
+    float rope_theta, void* stream,
+    bool bf16_activations = false) noexcept;
 [[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_at(
     float* q_and_gate, float* key, const float* value,
     const float* q_norm_weight, const float* k_norm_weight, void* page,
@@ -763,7 +803,8 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t cache_position, std::uint32_t rotary_position,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* stream) noexcept;
+    float rope_theta, void* stream,
+    bool bf16_activations = false) noexcept;
 
 [[nodiscard]] Status gated_gqa_qkv_rope_cache_paged_q8_batch(
     float* q_and_gate, float* key, const float* value,
@@ -773,7 +814,8 @@ struct QsaSelectedContiguousAttentionLaunch final {
     std::uint32_t first_rotary_position, std::uint32_t rows,
     std::uint32_t query_heads, std::uint32_t kv_heads,
     std::uint32_t head_dim, std::uint32_t rotary_dim, float epsilon,
-    float rope_theta, void* stream) noexcept;
+    float rope_theta, void* stream,
+    bool bf16_activations = false) noexcept;
 
 struct PagedFp4GatedGqaAttentionLaunch final {
   const float* q_and_gate{};
@@ -791,6 +833,7 @@ struct PagedFp4GatedGqaAttentionLaunch final {
   std::uint32_t split_tokens{};
   std::uint32_t maximum_splits{};
   void* stream{};
+  bool bf16_activations{};
 };
 
 // Split-K Flash-Decoding: one producer block owns a KV-head/context slice and
@@ -829,6 +872,7 @@ struct PagedQ4BfpGatedGqaAttentionLaunch final {
   std::uint32_t split_tokens{};
   std::uint32_t maximum_splits{};
   void* stream{};
+  bool bf16_activations{};
 };
 
 using PagedQ5Q4BfpGatedGqaAttentionLaunch =
@@ -876,6 +920,7 @@ struct PagedFp4GatedGqaPrefillLaunch final {
   std::uint32_t split_tokens{};
   std::uint32_t maximum_splits{};
   void* stream{};
+  bool bf16_activations{};
 };
 
 // Scratch for exact staged prefill attention. Q/K/V and probabilities are
@@ -1162,6 +1207,7 @@ struct SplitGatedDeltaLaunch final {
   float epsilon{};
   GatedDeltaOutputActivation output_gate_activation{
       GatedDeltaOutputActivation::silu};
+  bool bf16_activations{};
   void* stream{};
 };
 
@@ -1203,6 +1249,7 @@ struct SplitGatedDeltaPrefillLaunch final {
   float epsilon{};
   GatedDeltaOutputActivation output_gate_activation{
       GatedDeltaOutputActivation::silu};
+  bool bf16_activations{};
   void* stream{};
 };
 

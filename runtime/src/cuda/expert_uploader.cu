@@ -1,5 +1,7 @@
 #include "expert/runtime/cuda/expert_uploader.hpp"
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 #include "expert/runtime/cuda/deepseek_admission.hpp"
+#endif
 #include "expert/runtime/expert_record.hpp"
 
 #include <cuda_runtime_api.h>
@@ -232,6 +234,7 @@ bool CudaExpertAllocation::native_nvfp4() const noexcept {
   return native_nvfp4_;
 }
 
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
 CudaCompactExpertAllocation::CudaCompactExpertAllocation(
     std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
     DeepSeekCompactSections sections) noexcept
@@ -254,6 +257,7 @@ const DeepSeekCompactSections& CudaCompactExpertAllocation::sections()
     const noexcept {
   return sections_;
 }
+#endif
 
 CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
     : pool_(std::make_shared<CudaExpertPool>()) {
@@ -338,6 +342,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
     allocation.reset();
     completion({admission, {}, 0});
   };
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
   if (request.key.encoding_abi == kExpertEncodingAbiFp4Block32 &&
       request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
       pool_->direct_compact_execution) {
@@ -362,6 +367,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
                  compact_bytes, Status::success());
     return operation;
   }
+#endif
   void* raw = nullptr;
   auto error = pool_->acquire_locked(total, &raw);
   if (error != cudaSuccess) {
@@ -378,6 +384,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   cursor += sections.down_q_bytes;
   auto* down_scales = reinterpret_cast<float*>(cursor);
   const auto source = request.complete_record.data();
+#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
   if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1 ||
       request.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1) {
     void* compact_raw = nullptr;
@@ -493,6 +500,7 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
                  total, std::move(admission));
     return operation;
   }
+#endif
   const auto copy = [&](void* destination, std::uint64_t offset,
                         std::uint64_t bytes) {
     return cudaMemcpyAsync(destination, source + offset,

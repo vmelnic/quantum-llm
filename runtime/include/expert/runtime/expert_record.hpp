@@ -20,6 +20,7 @@ inline constexpr std::uint32_t kExpertRecordAbiInt8PerRow = 1;
 inline constexpr std::uint32_t kExpertRecordAbiFp4Block32 = 3;
 inline constexpr std::uint32_t kExpertRecordAbiFp4Relu2Block32 = 4;
 inline constexpr std::uint32_t kExpertRecordAbiNvfp4Block16W4A4 = 5;
+inline constexpr std::uint32_t kDenseRecordAbiMxfp6E3m2Block32 = 6;
 // Compatibility names for existing artifact adapters. New common code uses
 // encoding ABI, source ABI, and record ABI as separate fields.
 inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow =
@@ -33,6 +34,7 @@ inline constexpr std::uint32_t kExpertQuantAbiFp4Block32 =
     kExpertRecordAbiFp4Block32;
 inline constexpr std::uint32_t kExpertFp4BlockSize = 32;
 inline constexpr std::uint32_t kExpertNvfp4BlockSize = 16;
+inline constexpr std::uint32_t kDenseMxfp6BlockSize = 32;
 inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
 inline constexpr std::uint32_t kExpertSourceAbiSplitFp4Block32V1 = 2;
 inline constexpr std::uint32_t kExpertSourceAbiSplitFp8Block128V1 = 3;

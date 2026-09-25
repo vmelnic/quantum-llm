@@ -5,22 +5,29 @@ from __future__ import annotations
 import os
 import shutil
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
 from .adapters import AdaptedModel, adapt_checkpoint
+from .activation_calibration import DenseActivationCalibrationSet
 from .constants import (
     FORMAT_NAME,
     FORMAT_VERSION,
+    FP4_ACTIVATION_CODE_QUANT_PROFILE,
     FP4_QUANT_ABI_ID,
+    FP4_ACTIVATION_QUANT_PROFILE,
+    FP4_MSE_QUANT_PROFILE,
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     FP4_QUANT_PROFILE,
+    FP4_QUANT_PROFILES,
     NVFP4_QUANT_ABI_ID,
     NVFP4_QUANT_GROUP_SIZE,
     NVFP4_QUANT_PROFILE,
+    MXFP6_QUANT_ABI_ID,
+    MXFP6_QUANT_PROFILE,
     HASH_ALGORITHM,
     MANIFEST_SCHEMA,
     MIN_RUNTIME_VERSION,
@@ -64,6 +71,9 @@ class CompileOptions:
     source_id: str | None = None
     source_revision: str | None = None
     sampling_profiles: Path | None = None
+    activation_calibration: Path | None = None
+    dense_encoding_policy: Path | None = None
+    dense_activation_input: str = "q8"
     config_file: str = "config.json"
     index_file: str = "model.safetensors.index.json"
     resume: bool = False
@@ -139,10 +149,140 @@ def _load_sampling_profiles(path: Path | None) -> dict[str, object] | None:
     return validate_sampling_profiles(load_json(path))
 
 
+_DENSE_ENCODING_POLICY_SCHEMA = "expert-pack-dense-encoding-policy-v1"
+_DENSE_ACTIVATION_INPUTS = frozenset(("q8", "bf16"))
+_BF16_ACTIVATION_KERNEL = ("dense.activation-input.bfloat16.v1", 1)
+
+
+def _load_dense_encoding_policy(path: Path | None) -> dict[str, object] | None:
+    if path is None:
+        return None
+    path = Path(path).resolve()
+    if not path.is_file():
+        raise ValueError(f"dense encoding policy file is missing: {path}")
+    value = load_json(path)
+    if not isinstance(value, dict) or set(value) != {"schema", "rules"}:
+        raise ValueError("dense encoding policy has unknown or missing fields")
+    if value.get("schema") != _DENSE_ENCODING_POLICY_SCHEMA:
+        raise ValueError("dense encoding policy schema is unsupported")
+    rules = value.get("rules")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("dense encoding policy rules must be a non-empty list")
+    normalized: list[dict[str, str]] = []
+    identities: set[tuple[str, str, str]] = set()
+    for rule in rules:
+        if (
+            not isinstance(rule, dict)
+            or set(rule) != {"encoding", "capability", "tensor_role"}
+        ):
+            raise ValueError("dense encoding rule has unknown or missing fields")
+        if rule.get("encoding") != MXFP6_QUANT_PROFILE:
+            raise ValueError(
+                f"unsupported dense encoding {rule.get('encoding')!r}"
+            )
+        if any(
+            not isinstance(rule.get(field), str) or not rule[field].strip()
+            for field in ("capability", "tensor_role")
+        ):
+            raise ValueError("dense encoding capability and role must be non-empty")
+        normalized_rule = {
+            "encoding": str(rule["encoding"]),
+            "capability": str(rule["capability"]),
+            "tensor_role": str(rule["tensor_role"]),
+        }
+        identity = tuple(normalized_rule[field] for field in (
+            "encoding", "capability", "tensor_role"
+        ))
+        if identity in identities:
+            raise ValueError("dense encoding policy contains a duplicate rule")
+        identities.add(identity)
+        normalized.append(normalized_rule)
+    return {"schema": _DENSE_ENCODING_POLICY_SCHEMA, "rules": normalized}
+
+
+def _resolve_dense_encoding_policy(
+    adapted: AdaptedModel,
+    policy: dict[str, object] | None,
+) -> tuple[AdaptedModel, dict[str, object] | None]:
+    if policy is None:
+        return adapted, None
+    selected: set[str] = set()
+    resolved_rules: list[dict[str, object]] = []
+    for rule in policy["rules"]:
+        matches = {
+            tensor
+            for operation in adapted.runtime_topology.operations
+            if operation.capability == rule["capability"]
+            for role, tensor in operation.tensor_bindings
+            if role == rule["tensor_role"]
+        }
+        if not matches:
+            raise ValueError(
+                "dense encoding rule matched no operation tensor: "
+                f"{rule['capability']} / {rule['tensor_role']}"
+            )
+        selected.update(matches)
+        resolved_rules.append({**rule, "matched_tensors": len(matches)})
+    dense_by_name = {info.name: info for info in adapted.dense}
+    ineligible = sorted(selected - adapted.dense_fp4)
+    if ineligible:
+        raise ValueError(
+            "dense encoding policy selected tensors that are not semantic "
+            "FP4 matrices: " + ", ".join(ineligible[:8])
+        )
+    invalid_shape = sorted(
+        name for name in selected
+        if name not in dense_by_name or len(dense_by_name[name].shape) != 2
+    )
+    if invalid_shape:
+        raise ValueError(
+            "dense encoding policy requires rank-2 dense tensors: "
+            + ", ".join(invalid_shape[:8])
+        )
+    selected_names = sorted(selected)
+    resolved = {
+        "schema": policy["schema"],
+        "content_sha256": sha256_bytes(canonical_json_bytes(policy)),
+        "rules": resolved_rules,
+        "resolved_tensor_count": len(selected_names),
+        "resolved_tensors": selected_names,
+    }
+    return replace(
+        adapted,
+        dense_mxfp6=frozenset(set(adapted.dense_mxfp6) | selected),
+    ), resolved
+
+
+def _configure_dense_activation_input(
+    adapted: AdaptedModel, encoding: str,
+) -> AdaptedModel:
+    if encoding not in _DENSE_ACTIVATION_INPUTS:
+        raise ValueError(f"unsupported dense activation input {encoding!r}")
+    if encoding == "q8":
+        return adapted
+    if adapted.dense_mxfp6:
+        raise ValueError(
+            "BF16 dense activation input currently requires FP4 dense matrices"
+        )
+    topology = adapted.runtime_topology
+    attributes = dict(topology.attributes)
+    attributes["dense_activation_input_bf16"] = 1
+    required = set(topology.required_kernels)
+    required.add(_BF16_ACTIVATION_KERNEL)
+    return replace(
+        adapted,
+        runtime_topology=replace(
+            topology,
+            attributes=tuple(sorted(attributes.items())),
+            required_kernels=tuple(sorted(required)),
+        ),
+    )
+
+
 def _expert_quant_abi(quant_profile: str) -> int:
     if quant_profile == QUANT_PROFILE:
         return QUANT_ABI_ID
-    if quant_profile == FP4_QUANT_PROFILE:
+    if quant_profile in FP4_QUANT_PROFILES:
         return FP4_QUANT_ABI_ID
     if quant_profile == NVFP4_QUANT_PROFILE:
         return NVFP4_QUANT_ABI_ID
@@ -514,7 +654,12 @@ def _source_inventory(checkpoint: SafeTensorCheckpoint) -> list[dict[str, object
     return inventory
 
 
-def _option_contract(options: CompileOptions, source_files: list[dict[str, object]]) -> dict[str, object]:
+def _option_contract(
+    options: CompileOptions,
+    source_files: list[dict[str, object]],
+    activation_calibration: DenseActivationCalibrationSet | None,
+    dense_encoding_policy: dict[str, object] | None,
+) -> dict[str, object]:
     sampling_profiles = _load_sampling_profiles(options.sampling_profiles)
     return {
         "adapter": options.adapter,
@@ -524,6 +669,12 @@ def _option_contract(options: CompileOptions, source_files: list[dict[str, objec
         "source_id": options.source_id,
         "source_revision": options.source_revision,
         "sampling_profiles": sampling_profiles,
+        "activation_calibration": (
+            activation_calibration.source_summary()
+            if activation_calibration is not None else None
+        ),
+        "dense_encoding_policy": dense_encoding_policy,
+        "dense_activation_input": options.dense_activation_input,
         "config_file": options.config_file,
         "index_file": options.index_file,
         "reclaim_source_shards": options.reclaim_source_shards,
@@ -679,6 +830,7 @@ def _write_dense_pack(
     adapted: AdaptedModel,
     alignment: int,
     quant_profile: str,
+    activation_calibration: DenseActivationCalibrationSet | None,
 ) -> list[dict[str, object]]:
     temporary = partial / "dense.qpack.tmp"
     entries: list[dict[str, object]] = []
@@ -691,8 +843,12 @@ def _write_dense_pack(
                 NVFP4_QUANT_ABI_ID
                 if info.name in native_nvfp4
                 else
+                MXFP6_QUANT_ABI_ID
+                if quant_profile in FP4_QUANT_PROFILES
+                and info.name in adapted.dense_mxfp6
+                else
                 FP4_QUANT_ABI_ID
-                if quant_profile == FP4_QUANT_PROFILE
+                if quant_profile in FP4_QUANT_PROFILES
                 and info.name in adapted.dense_fp4
                 else QUANT_ABI_ID
             )
@@ -707,6 +863,12 @@ def _write_dense_pack(
                 info.name in adapted.dense_int64,
                 info.name in adapted.dense_bfloat16,
                 native_nvfp4.get(info.name),
+                quant_profile in (
+                    FP4_MSE_QUANT_PROFILE,
+                    FP4_ACTIVATION_QUANT_PROFILE,
+                    FP4_ACTIVATION_CODE_QUANT_PROFILE,
+                ),
+                activation_calibration,
             )
             entries.append(result.entry)
         fsync_file(handle)
@@ -772,6 +934,8 @@ def _build_manifest(
     metadata_files: list[dict[str, object]],
     model_program: dict[str, object],
     partial: Path,
+    activation_calibration: dict[str, object] | None,
+    dense_encoding_policy: dict[str, object] | None,
 ) -> dict[str, object]:
     pack_names = ["dense.qpack"] + sorted({entry["pack"] for entry in experts})
     packs: list[dict[str, object]] = []
@@ -832,9 +996,14 @@ def _build_manifest(
     relu2_experts = expert_abi == FP4_RELU2_EXPERT_ABI_ID
     dense_abis = sorted({int(entry["quant_abi"]) for entry in dense})
     dense_fp4 = FP4_QUANT_ABI_ID in dense_abis
+    dense_mxfp6 = MXFP6_QUANT_ABI_ID in dense_abis
     dense_nvfp4 = NVFP4_QUANT_ABI_ID in dense_abis
     dense_int8 = QUANT_ABI_ID in dense_abis
-    if dense_nvfp4 and (dense_fp4 or dense_int8):
+    if dense_mxfp6 and (dense_fp4 or dense_int8 or dense_nvfp4):
+        dense_weights = "mixed-mxfp6-fp4-and-other-quantized-tensors"
+    elif dense_mxfp6:
+        dense_weights = "mxfp6-e3m2-ue8m0-block32-padded"
+    elif dense_nvfp4 and (dense_fp4 or dense_int8):
         dense_weights = "mixed-native-nvfp4-and-other-quantized-tensors"
     elif dense_nvfp4:
         dense_weights = "native-nvfp4-e2m1-e4m3fn-block16-w4a4"
@@ -908,6 +1077,11 @@ def _build_manifest(
             ),
             "rounding": "nearest-ties-to-even",
             "zero_points": False,
+            "dense_activation_input": options.dense_activation_input,
+            **({"activation_calibration": activation_calibration}
+               if activation_calibration is not None else {}),
+            **({"dense_encoding_policy": dense_encoding_policy}
+               if dense_encoding_policy is not None else {}),
         },
         "kernel_abi": {
             "id": (
@@ -916,7 +1090,9 @@ def _build_manifest(
                  "expert-pack-sm86-fp4-block32-v1" if fp4
                  else "expert-pack-sm86-int8-row-v1")
                 if has_routed else
-                ("expert-pack-sm86-dense-nvfp4-block16-w4a4-v1"
+                ("expert-pack-sm86-dense-mixed-mxfp6-fp4-v1"
+                 if dense_mxfp6 else
+                 "expert-pack-sm86-dense-nvfp4-block16-w4a4-v1"
                  if dense_nvfp4 else
                  "expert-pack-sm86-dense-fp4-block32-v1" if dense_fp4
                  else "expert-pack-sm86-dense-int8-row-v1")
@@ -992,8 +1168,33 @@ def compile_checkpoint(
     source = Path(options.source).resolve()
     output = Path(options.output).resolve()
     quant_abi = _expert_quant_abi(options.quant_profile)
+    dense_encoding_policy = _load_dense_encoding_policy(
+        options.dense_encoding_policy
+    )
     if options.quant_profile not in QUANT_PROFILES:
         raise ValueError(f"unsupported quant profile {options.quant_profile!r}")
+    if (
+        dense_encoding_policy is not None
+        and options.quant_profile not in FP4_QUANT_PROFILES
+    ):
+        raise ValueError("dense encoding policy requires an FP4 quant profile")
+    if options.quant_profile in (
+        FP4_ACTIVATION_QUANT_PROFILE,
+        FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    ):
+        if options.activation_calibration is None:
+            raise ValueError(
+                "activation-aware FP4 profile requires activation calibration"
+            )
+        activation_calibration = DenseActivationCalibrationSet(
+            options.activation_calibration
+        )
+    else:
+        if options.activation_calibration is not None:
+            raise ValueError(
+                "activation calibration requires the activation-aware FP4 profile"
+            )
+        activation_calibration = None
     if options.alignment < PACK_ALIGNMENT or options.alignment & (options.alignment - 1):
         raise ValueError(f"alignment must be a power of two >= {PACK_ALIGNMENT}")
     if options.max_expert_pack_bytes < options.alignment:
@@ -1013,6 +1214,12 @@ def compile_checkpoint(
         source, config_file=options.config_file, index_file=options.index_file
     )
     adapted = adapt_checkpoint(checkpoint, options.adapter)
+    adapted, resolved_dense_encoding_policy = _resolve_dense_encoding_policy(
+        adapted, dense_encoding_policy
+    )
+    adapted = _configure_dense_activation_input(
+        adapted, options.dense_activation_input
+    )
     expert_abi = _expert_record_abi(adapted, quant_abi)
     if options.quant_profile not in adapted.supported_expert_quant_profiles:
         raise ValueError(
@@ -1020,8 +1227,34 @@ def compile_checkpoint(
             f"{options.quant_profile!r}; supported: "
             f"{sorted(adapted.supported_expert_quant_profiles)}"
         )
+    if activation_calibration is not None:
+        activation_calibration.configure_exclusions({
+            name for name in adapted.dense_mxfp6
+            if activation_calibration.contains(name)
+        })
+    if options.quant_profile == FP4_ACTIVATION_CODE_QUANT_PROFILE:
+        regular_target_tensors = {
+            tensor
+            for operation in adapted.runtime_topology.operations
+            if not operation.capability.startswith("embedding.lookup.")
+            and not operation.capability.startswith("vision.")
+            for _, tensor in operation.tensor_bindings
+        }
+        payload_targets = {
+            info.name
+            for info in adapted.dense
+            if len(info.shape) == 2
+            and info.name in adapted.dense_fp4
+            and info.name not in adapted.dense_mxfp6
+            and info.name in regular_target_tensors
+            and activation_calibration.contains(info.name)
+        }
+        activation_calibration.configure_payload_targets(payload_targets)
     source_files = _source_inventory(checkpoint)
-    contract = _option_contract(options, source_files)
+    contract = _option_contract(
+        options, source_files, activation_calibration,
+        resolved_dense_encoding_policy,
+    )
     contract_hash = sha256_bytes(canonical_json_bytes(contract))
     state_path = partial / "compile-state.json"
 
@@ -1061,12 +1294,20 @@ def compile_checkpoint(
     if not dense_entries:
         dense_entries = _write_dense_pack(
             partial, checkpoint, adapted, options.alignment,
-            options.quant_profile,
+            options.quant_profile, activation_calibration,
         )
         state["dense"] = dense_entries
+        if activation_calibration is not None:
+            state["activation_calibration"] = (
+                activation_calibration.snapshot()
+            )
         atomic_json(state_path, state)
         if _record_hook:
             _record_hook("dense-pack", len(dense_entries))
+    elif activation_calibration is not None:
+        activation_calibration.restore(
+            state.get("activation_calibration")
+        )
 
     expert_entries = state["experts"]
     next_expert = len(expert_entries)
@@ -1112,6 +1353,11 @@ def compile_checkpoint(
                     routed_component.intermediate_size,
                     options.alignment,
                     expert_abi,
+                    options.quant_profile in (
+                        FP4_MSE_QUANT_PROFILE,
+                        FP4_ACTIVATION_QUANT_PROFILE,
+                        FP4_ACTIVATION_CODE_QUANT_PROFILE,
+                    ),
                 )
                 pack_entries.append(result.entry)
                 next_expert += 1
@@ -1133,6 +1379,10 @@ def compile_checkpoint(
     model_program = _write_runtime_model_descriptor(
         partial, adapted, expert_abi
     )
+    activation_calibration_report = (
+        activation_calibration.finalize()
+        if activation_calibration is not None else None
+    )
     manifest = _build_manifest(
         options,
         checkpoint,
@@ -1143,6 +1393,8 @@ def compile_checkpoint(
         metadata_files,
         model_program,
         partial,
+        activation_calibration_report,
+        resolved_dense_encoding_policy,
     )
     atomic_json(partial / "manifest.json", manifest)
     report = {
@@ -1154,6 +1406,7 @@ def compile_checkpoint(
         "output": str(output),
         "adapter": options.adapter,
         "quant_profile": options.quant_profile,
+        "dense_activation_input": options.dense_activation_input,
         "alignment": options.alignment,
         "max_expert_pack_bytes": options.max_expert_pack_bytes,
         "resumed": options.resume,
@@ -1166,6 +1419,10 @@ def compile_checkpoint(
         "expert_count": len(expert_entries),
         "packs": manifest["packs"],
         "masses": manifest["masses"],
+        **({"activation_calibration": activation_calibration_report}
+           if activation_calibration_report is not None else {}),
+        **({"dense_encoding_policy": resolved_dense_encoding_policy}
+           if resolved_dense_encoding_policy is not None else {}),
     }
     atomic_json(partial / "conversion-report.json", report)
     marker = {
@@ -1195,6 +1452,7 @@ def refresh_runtime_model_program(
     adapter: str,
     config_file: str = "config.json",
     index_file: str = "model.safetensors.index.json",
+    dense_activation_input: str | None = None,
 ) -> dict[str, object]:
     """Publish a cloned container with freshly compiled VM metadata only.
 
@@ -1305,6 +1563,26 @@ def refresh_runtime_model_program(
         quantization.get("abi_id"), int
     ):
         raise ValueError("container quantization ABI is invalid")
+    selected_activation_input = (
+        quantization.get("dense_activation_input", "q8")
+        if dense_activation_input is None else dense_activation_input
+    )
+    if selected_activation_input not in _DENSE_ACTIVATION_INPUTS:
+        raise ValueError(
+            "unsupported dense activation input "
+            f"{selected_activation_input!r}"
+        )
+    if selected_activation_input == "bf16" and any(
+        isinstance(item, dict) and
+        item.get("quant_abi") == MXFP6_QUANT_ABI_ID
+        for item in dense
+    ):
+        raise ValueError(
+            "BF16 dense activation input currently requires FP4 dense matrices"
+        )
+    adapted = _configure_dense_activation_input(
+        adapted, selected_activation_input
+    )
 
     shutil.copytree(container, partial, copy_function=_link_or_copy)
     shutil.rmtree(partial / "tokenizer")
@@ -1314,6 +1592,9 @@ def refresh_runtime_model_program(
     )
     refreshed_manifest = load_json(partial / "manifest.json")
     refreshed_manifest["model_program"] = model_program
+    refreshed_manifest["quantization"]["dense_activation_input"] = (
+        selected_activation_input
+    )
     tokenizer_metadata = load_json(source / "tokenizer_config.json")
     previous_tokenizer = refreshed_manifest.get("tokenizer")
     previous_sampling = (
@@ -1344,6 +1625,7 @@ def refresh_runtime_model_program(
         raise ValueError("container conversion report is invalid")
     report["output"] = str(output)
     report["adapter"] = adapter
+    report["dense_activation_input"] = selected_activation_input
     report["manifest_content_sha256"] = refreshed_manifest["integrity"][
         "content_sha256"
     ]

@@ -19,12 +19,18 @@ from .constants import (
     FLAG_SYMMETRIC,
     FORMAT_NAME,
     FORMAT_VERSION,
+    FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    FP4_ACTIVATION_QUANT_PROFILE,
     FP4_QUANT_ABI_ID,
+    FP4_MSE_QUANT_PROFILE,
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
     FP4_QUANT_PROFILE,
     FP4_UE8M0_MAX_CODE,
     FP4_UE8M0_MIN_CODE,
+    MXFP6_QUANT_ABI_ID,
+    MXFP6_QUANT_GROUP_SIZE,
+    MXFP6_QUANT_PROFILE,
     NVFP4_QUANT_ABI_ID,
     NVFP4_QUANT_GROUP_SIZE,
     NVFP4_QUANT_PROFILE,
@@ -124,6 +130,21 @@ def _validate_positive_scalar(
 
 def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> None:
     offset = entry.get("offset")
+    scale_policy = entry.get("fp4_scale_policy")
+    payload_policy = entry.get("fp4_payload_policy")
+    _require(
+        scale_policy in (
+            None, "activation-aware-complete-output-residual-v1"
+        ),
+        "unknown dense FP4 scale policy",
+    )
+    _require(
+        payload_policy in (
+            None,
+            "activation-aware-adjacent-code-top64-complete-output-residual-v1",
+        ),
+        "unknown dense FP4 payload policy",
+    )
     stored_bytes = entry.get("stored_bytes")
     _require(isinstance(offset, int) and offset >= 0, "invalid dense record offset")
     _require(isinstance(stored_bytes, int) and stored_bytes >= HEADER_BYTES, "invalid dense size")
@@ -153,6 +174,19 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
         name_hash,
         payload_hash,
     ) = DENSE_HEADER_STRUCT.unpack(raw[: DENSE_HEADER_STRUCT.size])
+    _require(
+        scale_policy is None or quant_abi == FP4_QUANT_ABI_ID,
+        "activation-aware scale policy requires dense FP4",
+    )
+    _require(
+        payload_policy is None
+        or (
+            quant_abi == FP4_QUANT_ABI_ID
+            and scale_policy
+                == "activation-aware-complete-output-residual-v1"
+        ),
+        "activation-aware payload policy requires calibrated dense FP4",
+    )
     _require(magic == DENSE_MAGIC and version == FORMAT_VERSION, "unknown dense record ABI")
     _require(header_bytes == HEADER_BYTES, "invalid dense header fields")
     _require(record_bytes == stored_bytes, "dense record/manifest size mismatch")
@@ -208,6 +242,30 @@ def validate_dense_record(path: Path, entry: dict[str, Any], alignment: int) -> 
         )
         _validate_ue8m0_scales(
             path, offset + scale_offset, scale_bytes, "dense"
+        )
+    elif quant_abi == MXFP6_QUANT_ABI_ID:
+        required = FLAG_SYMMETRIC | FLAG_PER_ROW_SCALES
+        _require(flags & required == required,
+                 "MXFP6 dense flags are incomplete")
+        rows = math.prod(dimensions[:-1]) if rank > 1 else 1
+        columns = dimensions[-1]
+        padded_columns = (
+            (columns + MXFP6_QUANT_GROUP_SIZE - 1)
+            // MXFP6_QUANT_GROUP_SIZE
+            * MXFP6_QUANT_GROUP_SIZE
+        )
+        _require(scale_offset % SECTION_ALIGNMENT == 0,
+                 "unaligned MXFP6 dense scales")
+        _require(
+            data_bytes == rows * padded_columns * 3 // 4,
+            "MXFP6 dense data byte count mismatch",
+        )
+        _require(
+            scale_bytes == rows * padded_columns // MXFP6_QUANT_GROUP_SIZE,
+            "MXFP6 dense scale count mismatch",
+        )
+        _validate_ue8m0_scales(
+            path, offset + scale_offset, scale_bytes, "MXFP6 dense"
         )
     elif quant_abi == NVFP4_QUANT_ABI_ID:
         _require(flags & FLAG_SYMMETRIC, "NVFP4 dense flags are incomplete")
@@ -505,12 +563,184 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         FP4_QUANT_PROFILE: {
             FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
         },
+        FP4_MSE_QUANT_PROFILE: {
+            FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
+        },
+        FP4_ACTIVATION_QUANT_PROFILE: {
+            FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
+        },
+        FP4_ACTIVATION_CODE_QUANT_PROFILE: {
+            FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID
+        },
         NVFP4_QUANT_PROFILE: {NVFP4_QUANT_ABI_ID},
     }
     _require(
         profile in expected_abis and quant.get("abi_id") in expected_abis[profile],
         "unsupported quant ABI",
     )
+    calibration = quant.get("activation_calibration")
+    dense_encoding_policy = quant.get("dense_encoding_policy")
+    dense_activation_input = quant.get("dense_activation_input", "q8")
+    _require(
+        dense_activation_input in ("q8", "bf16"),
+        "dense activation input encoding is invalid",
+    )
+    if dense_encoding_policy is not None:
+        rules = dense_encoding_policy.get("rules") if isinstance(
+            dense_encoding_policy, dict
+        ) else None
+        resolved_names = dense_encoding_policy.get(
+            "resolved_tensors"
+        ) if isinstance(dense_encoding_policy, dict) else None
+        _require(
+            isinstance(dense_encoding_policy, dict)
+            and dense_encoding_policy.get("schema")
+                == "expert-pack-dense-encoding-policy-v1"
+            and isinstance(rules, list)
+            and bool(rules)
+            and all(
+                isinstance(rule, dict)
+                and set(rule) == {
+                    "encoding", "capability", "tensor_role",
+                    "matched_tensors",
+                }
+                and rule.get("encoding") == MXFP6_QUANT_PROFILE
+                and isinstance(rule.get("capability"), str)
+                and bool(rule["capability"])
+                and isinstance(rule.get("tensor_role"), str)
+                and bool(rule["tensor_role"])
+                and isinstance(rule.get("matched_tensors"), int)
+                and rule["matched_tensors"] > 0
+                for rule in rules
+            )
+            and isinstance(resolved_names, list)
+            and bool(resolved_names)
+            and resolved_names == sorted(set(resolved_names))
+            and all(isinstance(name, str) and name for name in resolved_names)
+            and dense_encoding_policy.get("resolved_tensor_count")
+                == len(resolved_names)
+            and isinstance(dense_encoding_policy.get("content_sha256"), str)
+            and dense_encoding_policy["content_sha256"] == sha256_bytes(
+                canonical_json_bytes({
+                    "schema": dense_encoding_policy["schema"],
+                    "rules": [{
+                        "encoding": rule["encoding"],
+                        "capability": rule["capability"],
+                        "tensor_role": rule["tensor_role"],
+                    } for rule in rules],
+                })
+            ),
+            "dense encoding policy metadata is invalid",
+        )
+    if profile in (
+        FP4_ACTIVATION_QUANT_PROFILE,
+        FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    ):
+        _require(
+            isinstance(calibration, dict)
+            and calibration.get("format") == "q8-runtime-input-v1"
+            and isinstance(calibration.get("dense_files"), int)
+            and calibration["dense_files"] > 0
+            and isinstance(calibration.get("inventory_sha256"), str)
+            and len(calibration["inventory_sha256"]) == 64
+            and isinstance(calibration.get("dense_matrices"), int)
+            and calibration["dense_matrices"] > 0
+            and isinstance(calibration.get("matrix_names"), list)
+            and len(calibration["matrix_names"])
+                == calibration["dense_matrices"]
+            and len(set(calibration["matrix_names"]))
+                == calibration["dense_matrices"]
+            and all(isinstance(name, str) and name
+                    for name in calibration["matrix_names"])
+            and isinstance(calibration.get("output_rows"), int)
+            and calibration["output_rows"] > 0
+            and isinstance(calibration.get("blocks"), int)
+            and calibration["blocks"] > 0
+            and isinstance(calibration.get("covering_reselections"), int)
+            and 0 <= calibration["covering_reselections"]
+                <= calibration["blocks"],
+            "activation calibration metadata is invalid",
+        )
+        excluded_names = calibration.get("excluded_matrix_names", [])
+        _require(
+            isinstance(excluded_names, list)
+            and len(set(excluded_names)) == len(excluded_names)
+            and all(isinstance(name, str) and name for name in excluded_names)
+            and not set(excluded_names) & set(calibration["matrix_names"])
+            and len(excluded_names) + calibration["dense_matrices"]
+                == calibration["dense_files"],
+            "activation calibration exclusions are invalid",
+        )
+        if excluded_names:
+            _require(
+                calibration.get("excluded_dense_matrices")
+                    == len(excluded_names)
+                and isinstance(
+                    calibration.get("excluded_matrix_sha256"), str
+                )
+                and calibration["excluded_matrix_sha256"] == sha256_bytes(
+                    canonical_json_bytes(sorted(excluded_names))
+                ),
+                "activation calibration exclusion checksum mismatch",
+            )
+        else:
+            _require(
+                calibration.get("excluded_dense_matrices") is None
+                and calibration.get("excluded_matrix_sha256") is None,
+                "activation calibration declares empty exclusions",
+            )
+        calibrated_entries = {
+            entry.get("name") for entry in manifest.get("tensors", [])
+            if isinstance(entry, dict)
+            and entry.get("fp4_scale_policy")
+                == "activation-aware-complete-output-residual-v1"
+        }
+        _require(
+            calibrated_entries == set(calibration["matrix_names"]),
+            "activation calibration tensor index disagrees with records",
+        )
+        payload_entries = {
+            entry.get("name") for entry in manifest.get("tensors", [])
+            if isinstance(entry, dict)
+            and entry.get("fp4_payload_policy")
+                == "activation-aware-adjacent-code-top64-complete-output-residual-v1"
+        }
+        if profile == FP4_ACTIVATION_CODE_QUANT_PROFILE:
+            payload_names = calibration.get("payload_matrix_names")
+            _require(
+                isinstance(calibration.get("payload_target_matrices"), int)
+                and calibration["payload_target_matrices"] > 0
+                and isinstance(calibration.get("payload_target_sha256"), str)
+                and len(calibration["payload_target_sha256"]) == 64
+                and isinstance(calibration.get("payload_dense_matrices"), int)
+                and calibration["payload_dense_matrices"]
+                    == calibration["payload_target_matrices"]
+                and isinstance(payload_names, list)
+                and len(payload_names) == calibration["payload_dense_matrices"]
+                and len(set(payload_names)) == len(payload_names)
+                and all(isinstance(name, str) and name for name in payload_names)
+                and isinstance(calibration.get("payload_reselections"), int)
+                and calibration["payload_reselections"] >= 0,
+                "activation payload metadata is invalid",
+            )
+            _require(
+                sha256_bytes(canonical_json_bytes(sorted(payload_names)))
+                    == calibration["payload_target_sha256"],
+                "activation payload target checksum mismatch",
+            )
+            _require(
+                payload_entries == set(payload_names),
+                "activation payload tensor index disagrees with records",
+            )
+        else:
+            _require(
+                not payload_entries
+                and calibration.get("payload_matrix_names") is None,
+                "scale-only activation profile declares payload selection",
+            )
+    else:
+        _require(calibration is None,
+                 "non-activation profile declares activation calibration")
     alignment = manifest.get("alignment")
     _require(isinstance(alignment, dict), "manifest alignment block missing")
     pack_alignment = alignment.get("pack_bytes")
@@ -542,6 +772,25 @@ def validate_container(root: Path | str) -> dict[str, Any]:
         model_program_path.stat().st_size == model_program.get("bytes")
         and sha256_file(model_program_path) == model_program.get("sha256"),
         "runtime model program checksum mismatch",
+    )
+    model_program_text = model_program_path.read_text(encoding="utf-8")
+    bf16_activation_attribute = (
+        "attribute\tdense_activation_input_bf16\t1\n"
+        in model_program_text
+    )
+    bf16_activation_kernel = (
+        "kernel\tdense.activation-input.bfloat16.v1\t1\n"
+        in model_program_text
+    )
+    _require(
+        (dense_activation_input == "bf16")
+        == (bf16_activation_attribute and bf16_activation_kernel),
+        "dense activation input disagrees with runtime model program",
+    )
+    _require(
+        dense_activation_input == "bf16"
+        or (not bf16_activation_attribute and not bf16_activation_kernel),
+        "Q8 activation artifact declares BF16 runtime requirements",
     )
     with model_program_path.open("rb") as handle:
         _require(
@@ -591,6 +840,36 @@ def validate_container(root: Path | str) -> dict[str, Any]:
             )
             dense_source_names.update(source_tensors.values())
         records_by_pack[pack_name].append(("dense", entry))
+
+    dense_by_name = {entry["name"]: entry for entry in dense}
+    if dense_activation_input == "bf16":
+        _require(
+            all(
+                entry.get("quant_abi") != MXFP6_QUANT_ABI_ID
+                for entry in dense
+            ),
+            "BF16 dense activation input does not support MXFP6 records",
+        )
+    if dense_encoding_policy is not None:
+        _require(
+            all(
+                name in dense_by_name
+                and dense_by_name[name].get("quant_abi")
+                    == MXFP6_QUANT_ABI_ID
+                for name in dense_encoding_policy["resolved_tensors"]
+            ),
+            "dense encoding policy disagrees with tensor records",
+        )
+    if calibration is not None:
+        _require(
+            all(
+                name in dense_by_name
+                and dense_by_name[name].get("quant_abi")
+                    == MXFP6_QUANT_ABI_ID
+                for name in calibration.get("excluded_matrix_names", [])
+            ),
+            "activation calibration exclusions are not alternate encodings",
+        )
 
     auxiliary = manifest.get("auxiliary_tensors", [])
     _require(

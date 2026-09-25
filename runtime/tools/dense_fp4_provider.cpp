@@ -27,10 +27,12 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <future>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -858,6 +860,8 @@ er::Status validate_dense_fp4_descriptor(const er::ModelDescriptor& model) {
       });
   if ((split_recurrent && mamba2) || !query_heads || !kv_heads ||
       query_heads % kv_heads ||
+      parameter("activation_bf16") > 1U ||
+      parameter("dense_activation_input_bf16") > 1U ||
       (!mla && query_heads / kv_heads >
           ((standard_gqa || normalized_gated_gqa || qsa)
                ? ec::kMaximumExactFp16GroupedQueryHeads
@@ -996,8 +1000,10 @@ std::vector<er::KernelCapability> provider_capabilities() {
   };
   return {
       {"embedding.lookup.fp4-block32.v1", 1U, 2U, validator},
+      {"embedding.lookup.mxfp6-e3m2-block32.v1", 1U, 1U, validator},
       {"embedding.lookup.v1", 1U, 2U, validator},
       {"embedding.lookup.bfloat16.v1", 1U, 1U, validator},
+      {"dense.activation-input.bfloat16.v1", 1U, 1U, validator},
       {"state.hyper-connection.initialize.v1", 1U, 1U, validator},
       {"embedding.ngram-ple.fp4-block32.v1", 1U, 1U, validator},
       {"embedding.ngram-ple.v1", 1U, 1U, validator},
@@ -1032,6 +1038,8 @@ std::vector<er::KernelCapability> provider_capabilities() {
       {"ffn.swiglu.dense.fp4-block32.v1", 1U, 2U, validator},
       {"head.rmsnorm.argmax.fp4-block32.v1", 1U, 1U, validator},
       {"head.rmsnorm.token-select.fp4-block32.v1", 1U, 2U, validator},
+      {"head.rmsnorm.token-select.mxfp6-e3m2-block32.v1", 1U, 1U,
+       validator},
       {"head.token-select.fp4-block32.no-norm.v1", 1U, 1U, validator},
       {"head.token-select.no-norm.v1", 1U, 1U, validator},
       {"head.rmsnorm.token-select.bfloat16.v1", 1U, 1U, validator},
@@ -1039,11 +1047,14 @@ std::vector<er::KernelCapability> provider_capabilities() {
        validator},
       {"decode.mtp.dense-full-attention.fp4-block32.exact.v2", 2U, 2U,
        validator},
+      {"decode.mtp.dense-full-attention.fp4-mxfp6-io.exact.v3", 2U, 2U,
+       validator},
   };
 }
 
 Kernel kernel_from_capability(std::string_view capability) {
   if (capability == "embedding.lookup.fp4-block32.v1" ||
+      capability == "embedding.lookup.mxfp6-e3m2-block32.v1" ||
       capability == "embedding.lookup.v1" ||
       capability == "embedding.lookup.bfloat16.v1")
     return Kernel::embedding;
@@ -1092,6 +1103,7 @@ Kernel kernel_from_capability(std::string_view capability) {
     return Kernel::ffn;
   if (capability == "head.rmsnorm.argmax.fp4-block32.v1" ||
       capability == "head.rmsnorm.token-select.fp4-block32.v1" ||
+      capability == "head.rmsnorm.token-select.mxfp6-e3m2-block32.v1" ||
       capability == "head.token-select.fp4-block32.no-norm.v1" ||
       capability == "head.token-select.no-norm.v1" ||
       capability == "head.rmsnorm.token-select.bfloat16.v1")
@@ -1100,6 +1112,9 @@ Kernel kernel_from_capability(std::string_view capability) {
           "decode.mtp.dense-full-attention.fp4-block32.exact.v1" ||
       capability ==
           "decode.mtp.dense-full-attention.fp4-block32.exact.v2")
+    return Kernel::exact_decode;
+  if (capability ==
+      "decode.mtp.dense-full-attention.fp4-mxfp6-io.exact.v3")
     return Kernel::exact_decode;
   throw std::runtime_error("unsupported dense FP4 capability");
 }
@@ -1113,6 +1128,8 @@ struct DeviceTensor final {
   std::uint64_t allocation_bytes{};
   const std::uint8_t* fp4_data{};
   const std::uint8_t* fp4_scales{};
+  const std::uint8_t* mxfp6_data{};
+  const std::uint8_t* mxfp6_scales{};
   const std::int8_t* int8_data{};
   const float* int8_scales{};
   const std::uint16_t* bf16{};
@@ -1141,6 +1158,15 @@ struct DeviceTensor final {
             nvfp4_input_global_scale, shape[0], shape[1]};
   }
 
+  [[nodiscard]] ec::Mxfp6E3m2Block32Matrix mxfp6_matrix() const {
+    if (encoding != "MXFP6_E3M2" ||
+        quant_abi != er::kDenseRecordAbiMxfp6E3m2Block32 ||
+        shape.size() != 2U || !mxfp6_data || !mxfp6_scales)
+      throw std::runtime_error(name + " is not a rank-2 MXFP6 matrix");
+    return {mxfp6_data, mxfp6_scales, shape[0], shape[1],
+            align32(shape[1])};
+  }
+
   [[nodiscard]] ec::Fp4Block32Matrix flattened_matrix() const {
     if (encoding != "FP4_E2M1" ||
         quant_abi != er::kExpertQuantAbiFp4Block32 ||
@@ -1164,7 +1190,8 @@ struct DeviceTensor final {
 
   [[nodiscard]] std::uint32_t matrix_rows() const {
     if (shape.size() != 2U ||
-        (encoding != "FP4_E2M1" && encoding != "I8" &&
+        (encoding != "FP4_E2M1" && encoding != "MXFP6_E3M2" &&
+         encoding != "I8" &&
          encoding != "BF16"))
       throw std::runtime_error(name + " is not a quantized matrix");
     return shape[0];
@@ -1172,7 +1199,8 @@ struct DeviceTensor final {
 
   [[nodiscard]] std::uint32_t matrix_columns() const {
     if (shape.size() != 2U ||
-        (encoding != "FP4_E2M1" && encoding != "I8" &&
+        (encoding != "FP4_E2M1" && encoding != "MXFP6_E3M2" &&
+         encoding != "I8" &&
          encoding != "BF16"))
       throw std::runtime_error(name + " is not a quantized matrix");
     return shape[1];
@@ -1848,7 +1876,6 @@ class Fp4RoutedExperts final {
         gpu_observation_pending_ = true;
         gpu_observation_selections_ = selection_count - alternate_count;
       }
-
       if (!host.empty()) {
         cuda_check(cudaEventSynchronize(host_input_ready_event_),
                    "wait for FP4 host-lane input");
@@ -2300,6 +2327,14 @@ class DenseFp4Provider final : public er::IOperationProvider {
       throw std::runtime_error("invalid dense FP4 provider launch contract");
     hidden_size_ = descriptor_.hidden_size;
     vocabulary_size_ = descriptor_.vocab_size;
+    if (const auto* trace_path =
+            std::getenv("QUANTUM_LLM_SAMPLING_TRACE_FILE");
+        trace_path != nullptr && *trace_path != '\0') {
+      sampling_trace_stream_.open(trace_path, std::ios::out | std::ios::app);
+      if (!sampling_trace_stream_)
+        throw std::runtime_error("cannot open diagnostic sampling trace");
+      sampling_trace_stream_ << std::setprecision(17);
+    }
     const auto has_capability = [&](std::string_view capability) {
       return std::any_of(
           descriptor_.operation_program.begin(),
@@ -2333,6 +2368,16 @@ class DenseFp4Provider final : public er::IOperationProvider {
         descriptor_.attributes.find("zero_centered_norm");
     zero_centered_norm_ = zero_centered != descriptor_.attributes.end() &&
                           zero_centered->second == 1U;
+    const auto activation_bf16 =
+        descriptor_.attributes.find("activation_bf16");
+    activation_bf16_ =
+        activation_bf16 != descriptor_.attributes.end() &&
+        activation_bf16->second == 1U;
+    const auto dense_activation_input_bf16 =
+        descriptor_.attributes.find("dense_activation_input_bf16");
+    dense_activation_input_bf16_ =
+        dense_activation_input_bf16 != descriptor_.attributes.end() &&
+        dense_activation_input_bf16->second == 1U;
     query_heads_ = attribute_u32("attention_heads");
     kv_heads_ = attribute_u32("kv_heads");
     head_dim_ = attribute_u32("head_dim");
@@ -2886,9 +2931,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
           context.program.abi_version == 1U &&
           context.compiled.maximum_emitted_tokens == 2U &&
           parameter_u32(context.compiled.parameters, "draft_layers") == 1U;
-      const auto multi =
+      const auto multi_capability =
           context.program.capability ==
-              "decode.mtp.dense-full-attention.fp4-block32.exact.v2" &&
+              "decode.mtp.dense-full-attention.fp4-block32.exact.v2" ||
+          context.program.capability ==
+              "decode.mtp.dense-full-attention.fp4-mxfp6-io.exact.v3";
+      const auto multi =
+          multi_capability &&
           context.program.abi_version == 2U &&
           context.compiled.maximum_emitted_tokens == draft_depth_ + 1U &&
           parameter_u32(context.compiled.parameters, "source_mtp_layers") ==
@@ -2908,6 +2957,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
         throw std::runtime_error("unsupported exact-decode artifact contract");
       auto prepared = std::make_shared<PreparedOperation>();
       prepared->kernel = Kernel::exact_decode;
+      prepared->capability = context.program.capability;
+      prepared->abi_version = context.program.abi_version;
+      prepared->parameters = context.compiled.parameters;
       for (const auto& binding : context.tensors) {
         if (!binding.tensor)
           throw std::runtime_error("exact-decode tensor binding is null");
@@ -3053,6 +3105,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
           slot.begin(), slot.end(), [](const void* page) { return page; }));
     auto result = std::map<std::string, std::uint64_t, std::less<>>{
             {"resident_tensor_bytes", uploaded_tensor_bytes_},
+            {"provider_activation_bf16", activation_bf16_ ? 1U : 0U},
+            {"provider_dense_activation_input_bf16",
+             dense_activation_input_bf16_ ? 1U : 0U},
             {"provider_program_steps", program_steps_},
             {"provider_prefill_batches", prefill_batches_},
             {"provider_prefill_tokens", prefill_tokens_},
@@ -3550,6 +3605,24 @@ class DenseFp4Provider final : public er::IOperationProvider {
                    "upload dequantized convolution tensor");
       }
       }
+    } else if (source.encoding == "MXFP6_E3M2") {
+      if (source.quant_abi != er::kDenseRecordAbiMxfp6E3m2Block32 ||
+          source.shape.size() != 2U)
+        throw std::runtime_error("MXFP6 tensor has the wrong ABI");
+      const auto rows = source.shape[0];
+      const auto padded = align32(source.shape[1]);
+      const auto expected_data =
+          static_cast<std::uint64_t>(rows) * padded * 3U / 4U;
+      const auto expected_scales =
+          static_cast<std::uint64_t>(rows) * padded / 32U;
+      if (source.data_bytes != expected_data ||
+          source.scale_bytes != expected_scales)
+        throw std::runtime_error(
+            "MXFP6 tensor storage geometry is inconsistent");
+      tensor->mxfp6_data =
+          reinterpret_cast<const std::uint8_t*>(tensor->allocation);
+      tensor->mxfp6_scales = reinterpret_cast<const std::uint8_t*>(
+          tensor->allocation + scale_allocation_offset);
     } else if (source.encoding == "I8") {
       if (source.quant_abi != er::kExpertQuantAbiInt8PerRow ||
           source.shape.size() != 2U ||
@@ -3684,7 +3757,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
 
   static bool is_quantized_matrix(const DeviceTensor& tensor) noexcept {
     return tensor.shape.size() == 2U &&
-           (tensor.encoding == "FP4_E2M1" || tensor.encoding == "I8" ||
+           (tensor.encoding == "FP4_E2M1" ||
+            tensor.encoding == "MXFP6_E3M2" || tensor.encoding == "I8" ||
             tensor.encoding == "BF16");
   }
 
@@ -3768,6 +3842,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
                std::span<const std::uint32_t> tokens, std::uint32_t rows);
   void quantize_rows(const float* input, std::uint32_t rows,
                      std::uint32_t columns);
+  void prepare_dense_activation(const float* input, std::uint32_t rows,
+                                std::uint32_t columns);
   void project_quantized(const DeviceTensor& weight, const float* input,
                          float* output, std::uint32_t rows);
   void project(const DeviceTensor& weight, const float* input, float* output,
@@ -3839,8 +3915,13 @@ class DenseFp4Provider final : public er::IOperationProvider {
   er::SamplingDistribution distribution_from_logits(
       float* row_logits, std::uint32_t vocabulary,
       const er::ProgramRequestContext& request, const std::uint8_t* presence);
-  void project_fp4_prefix(const DeviceTensor& weight, const float* input,
-                          float* output, std::uint32_t matrix_rows);
+  void trace_sampling(const er::ProgramRequestContext& request,
+                      std::uint32_t position, std::uint32_t token,
+                      std::string_view mode,
+                      const er::SamplingDistribution* target,
+                      const er::SamplingDistribution* draft = nullptr);
+  void project_prefix(const DeviceTensor& weight, const float* input,
+                      float* output, std::uint32_t matrix_rows);
   void restore_recurrent_checkpoint(std::uint32_t slot);
   void restore_speculative_recurrent_checkpoint(std::uint32_t slot,
                                                 std::uint32_t row);
@@ -3894,6 +3975,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   bool mla_enabled_{};
   bool relu2_router_enabled_{};
   bool zero_centered_norm_{};
+  bool activation_bf16_{};
+  bool dense_activation_input_bf16_{};
   bool hyper_enabled_{};
   bool qsa_enabled_{};
   bool qsa_tiered_{};
@@ -4023,6 +4106,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t sampling_gpu_calls_{};
   std::uint64_t sampling_host_calls_{};
   std::uint64_t sampling_logit_transfer_bytes_{};
+  std::ofstream sampling_trace_stream_;
+  std::uint64_t sampling_trace_records_{};
   std::uint64_t vision_batches_{};
   std::uint64_t vision_images_{};
   std::uint64_t vision_patches_{};
@@ -4212,6 +4297,11 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
       if (operation.capability == "embedding.lookup.bfloat16.v1" &&
           binding(operation, "weight").encoding != "BF16")
         throw std::runtime_error("BF16 embedding has the wrong encoding");
+      if (operation.capability ==
+              "embedding.lookup.mxfp6-e3m2-block32.v1" &&
+          binding(operation, "weight").quant_abi !=
+              er::kDenseRecordAbiMxfp6E3m2Block32)
+        throw std::runtime_error("MXFP6 embedding has the wrong ABI");
       if (operation.abi_version >= 2U) {
         if (parameter_u32(operation.parameters, "output_norm_mode") != 1U)
           throw std::runtime_error("unsupported embedding ABI 2 norm mode");
@@ -4489,7 +4579,8 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
       expect_shape(convolution, {conv_dimension, 1U, conv_kernel_},
                    "FP4_E2M1");
       if (!convolution.dequantized)
-        throw std::runtime_error("recurrent convolution was not dequantized");
+        throw std::runtime_error(
+            "recurrent convolution was not dequantized");
       expect_shape(binding(operation, "time_bias"), {value_heads_}, "F32");
       expect_shape(binding(operation, "decay_log"), {value_heads_}, "F32");
       expect_shape(binding(operation, "output_norm"), {value_head_dim_},
@@ -4607,6 +4698,11 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
         expect_shape(binding(operation, "norm"), {hidden_size_}, "F32");
       expect_quantized_shape(binding(operation, "weight"),
                              {vocabulary_size_, hidden_size_});
+      if (operation.capability ==
+              "head.rmsnorm.token-select.mxfp6-e3m2-block32.v1" &&
+          binding(operation, "weight").quant_abi !=
+              er::kDenseRecordAbiMxfp6E3m2Block32)
+        throw std::runtime_error("MXFP6 output head has the wrong ABI");
       if (operation.abi_version >= 2U) {
         static_cast<void>(parameter_f32(
             operation.parameters, "logit_multiplier_f32_bits"));
@@ -4622,10 +4718,18 @@ void DenseFp4Provider::validate_operation(PreparedOperation& operation) {
 void DenseFp4Provider::validate_exact(PreparedOperation& operation) {
   if (mtp_layers_ != 1U)
     throw std::runtime_error("this exact provider implements one MTP layer");
-  expect_shape(binding(operation, "token_embedding"),
-               {vocabulary_size_, hidden_size_}, "FP4_E2M1");
-  expect_shape(binding(operation, "output_head"),
-               {vocabulary_size_, hidden_size_}, "FP4_E2M1");
+  expect_quantized_shape(binding(operation, "token_embedding"),
+                         {vocabulary_size_, hidden_size_});
+  expect_quantized_shape(binding(operation, "output_head"),
+                         {vocabulary_size_, hidden_size_});
+  const auto mixed_mxfp6 = operation.capability ==
+      "decode.mtp.dense-full-attention.fp4-mxfp6-io.exact.v3";
+  const auto expected_io_abi = mixed_mxfp6
+      ? er::kDenseRecordAbiMxfp6E3m2Block32
+      : er::kExpertQuantAbiFp4Block32;
+  if (binding(operation, "token_embedding").quant_abi != expected_io_abi ||
+      binding(operation, "output_head").quant_abi != expected_io_abi)
+    throw std::runtime_error("exact decode I/O quantization ABI mismatch");
   expect_shape(binding(operation, "fusion_projection"),
                {hidden_size_, 2U * hidden_size_}, "FP4_E2M1");
   for (const auto role : {"embedding_norm", "hidden_norm", "draft_norm"})
@@ -5644,7 +5748,8 @@ void DenseFp4Provider::finish_attention_block(
     const PreparedOperation& operation, std::uint32_t rows) {
   const auto values = rows * hidden_size_;
   if (operation.abi_version < 2U) {
-    status_check(ec::add_in_place(hidden_, residual_, values, nullptr));
+    status_check(ec::add_in_place(hidden_, residual_, values, nullptr,
+                                  activation_bf16_));
     if (operation.capability ==
         "block.mla.causal.latent-kv.bfloat16.v1")
       status_check(ec::round_bf16_in_place(hidden_, values, nullptr));
@@ -5663,7 +5768,8 @@ void DenseFp4Provider::finish_attention_block(
         hidden_size_, epsilon, nullptr));
   else
     throw std::runtime_error("unsupported attention post norm mode");
-  status_check(ec::add_in_place(hidden_, normalized_, values, nullptr));
+  status_check(ec::add_in_place(hidden_, normalized_, values, nullptr,
+                                activation_bf16_));
 }
 
 void DenseFp4Provider::run_embedding(
@@ -5679,6 +5785,9 @@ void DenseFp4Provider::run_embedding(
   if (weight.encoding == "FP4_E2M1") {
     status_check(ec::fp4_embedding_batch(
         weight.matrix(), output_tokens_, hidden_, rows, nullptr));
+  } else if (weight.encoding == "MXFP6_E3M2") {
+    status_check(ec::mxfp6_embedding_batch(
+        weight.mxfp6_matrix(), output_tokens_, hidden_, rows, nullptr));
   } else if (weight.encoding == "I8") {
     const auto matrix = weight.int8_matrix();
     for (std::uint32_t row = 0U; row < rows; ++row)
@@ -5832,15 +5941,32 @@ void DenseFp4Provider::run_ple(
        conv_state, ple_conv_output_, rows, hyper_width_,
        ple_convolution_kernel_, ple_ngram_size_, nullptr}));
   status_check(ec::add_in_place(ple_gated_, ple_conv_output_,
-                                rows * hyper_width_, nullptr));
+                                rows * hyper_width_, nullptr,
+                                activation_bf16_));
   status_check(ec::add_in_place(hyper_, ple_gated_, rows * hyper_width_,
-                                nullptr));
+                                nullptr, activation_bf16_));
 }
 
 void DenseFp4Provider::quantize_rows(const float* input, std::uint32_t rows,
                                      std::uint32_t columns) {
-  status_check(ec::quantize_q8_batch(input, q8_, q8_scales_, rows, columns,
-                                     align32(columns), nullptr));
+  const auto padded = align32(columns);
+  if (activation_bf16_)
+    status_check(ec::quantize_q8_batch_bf16(
+        input, q8_, q8_scales_, rows, columns, padded, nullptr));
+  else
+    status_check(ec::quantize_q8_batch(
+      input, q8_, q8_scales_, rows, columns, padded, nullptr));
+}
+
+void DenseFp4Provider::prepare_dense_activation(
+    const float* input, std::uint32_t rows, std::uint32_t columns) {
+  if (dense_activation_input_bf16_) {
+    status_check(ec::convert_f32_to_bf16_batch(
+        input, staged_dense_input_, staged_dense_input_capacity_bytes_, rows,
+        columns, align32(columns), nullptr));
+    return;
+  }
+  quantize_rows(input, rows, columns);
 }
 
 bool DenseFp4Provider::stage_operation_weights(
@@ -6059,6 +6185,14 @@ void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
           nullptr));
     return;
   }
+  if (weight.encoding == "MXFP6_E3M2") {
+    if (dense_activation_input_bf16_)
+      throw std::runtime_error(
+          "BF16 dense activation input does not support MXFP6 matrices");
+    status_check(ec::mxfp6_gemv_q8_batch_weight_reuse(
+        weight.mxfp6_matrix(), q8_, q8_scales_, output, rows, nullptr));
+    return;
+  }
   if (weight.encoding == "FP4_E2M1" &&
       weight.quant_abi == er::kExpertRecordAbiNvfp4Block16W4A4) {
     status_check(ec::nvfp4_gemv_f32_batch(
@@ -6067,41 +6201,77 @@ void DenseFp4Provider::project_quantized(const DeviceTensor& weight,
   }
   const auto matrix = weight.matrix();
   const auto staged = active_staged_weights_.find(&weight);
+  if (dense_activation_input_bf16_) {
+    if (rows > 8U && staged != active_staged_weights_.end()) {
+      ++staged_dense_weight_gemm_calls_;
+      status_check(ec::bf16_gemm_bf16_block32(
+          matrix, staged->second.data, staged->second.bytes,
+          staged_dense_input_, staged_dense_input_capacity_bytes_, output,
+          rows, nullptr, activation_bf16_));
+    } else {
+      status_check(ec::fp4_gemm_bf16_block32(
+          matrix, staged_dense_input_, staged_dense_input_capacity_bytes_,
+          output, rows, nullptr, activation_bf16_));
+    }
+    return;
+  }
   if (rows > 8U && staged != active_staged_weights_.end()) {
     ++staged_dense_weight_gemm_calls_;
     status_check(ec::bf16_gemm_q8_block32(
         matrix, staged->second.data, staged->second.bytes, q8_, q8_scales_,
         staged_dense_input_, staged_dense_input_capacity_bytes_, output, rows,
-        nullptr));
+        nullptr, activation_bf16_));
   } else if (rows > 8U)
     status_check(ec::fp4_gemm_q8_block32(
-        matrix, q8_, q8_scales_, output, rows, nullptr));
+        matrix, q8_, q8_scales_, output, rows, nullptr,
+        activation_bf16_));
   else if (rows > 1U)
     status_check(ec::fp4_gemv_q8_batch_weight_reuse(
-        matrix, q8_, q8_scales_, output, rows, nullptr));
+        matrix, q8_, q8_scales_, output, rows, nullptr,
+        activation_bf16_));
   else
     status_check(ec::fp4_gemv_q8_batch(matrix, q8_, q8_scales_, output, rows,
-                                       nullptr));
+                                       nullptr, activation_bf16_));
 }
 
 void DenseFp4Provider::project(const DeviceTensor& weight, const float* input,
                                float* output, std::uint32_t rows) {
   if (weight.encoding == "FP4_E2M1" &&
       weight.quant_abi == er::kExpertQuantAbiFp4Block32)
-    quantize_rows(input, rows, weight.matrix_columns());
+    prepare_dense_activation(input, rows, weight.matrix_columns());
+  else if (weight.encoding == "MXFP6_E3M2")
+    prepare_dense_activation(input, rows, weight.matrix_columns());
   project_quantized(weight, input, output, rows);
 }
 
-void DenseFp4Provider::project_fp4_prefix(const DeviceTensor& weight,
-                                          const float* input, float* output,
-                                          std::uint32_t matrix_rows) {
+void DenseFp4Provider::project_prefix(const DeviceTensor& weight,
+                                      const float* input, float* output,
+                                      std::uint32_t matrix_rows) {
+  if (weight.encoding == "MXFP6_E3M2") {
+    if (dense_activation_input_bf16_)
+      throw std::runtime_error(
+          "BF16 dense activation input does not support MXFP6 matrices");
+    auto matrix = weight.mxfp6_matrix();
+    if (!matrix_rows || matrix_rows > matrix.rows)
+      throw std::runtime_error("MXFP6 projection prefix is invalid");
+    matrix.rows = matrix_rows;
+    prepare_dense_activation(input, 1U, matrix.columns);
+    status_check(ec::mxfp6_gemv_q8_batch_weight_reuse(
+        matrix, q8_, q8_scales_, output, 1U, nullptr));
+    return;
+  }
   auto matrix = weight.matrix();
   if (!matrix_rows || matrix_rows > matrix.rows)
     throw std::runtime_error("FP4 projection prefix is invalid");
   matrix.rows = matrix_rows;
-  quantize_rows(input, 1U, matrix.columns);
-  status_check(ec::fp4_gemv_q8_batch(
-      matrix, q8_, q8_scales_, output, 1U, nullptr));
+  prepare_dense_activation(input, 1U, matrix.columns);
+  if (dense_activation_input_bf16_)
+    status_check(ec::fp4_gemm_bf16_block32(
+        matrix, staged_dense_input_, staged_dense_input_capacity_bytes_,
+        output, 1U, nullptr, activation_bf16_));
+  else
+    status_check(ec::fp4_gemv_q8_batch(
+        matrix, q8_, q8_scales_, output, 1U, nullptr, activation_bf16_));
 }
 
 void DenseFp4Provider::project_vision(const DeviceTensor& weight,
@@ -6269,7 +6439,8 @@ void DenseFp4Provider::run_vision(const PreparedOperation& operation,
         media.patch_count, vision_hidden_size_, nullptr));
     status_check(ec::add_in_place(
         vision_hidden_, vision_normalized_,
-        media.patch_count * vision_hidden_size_, nullptr));
+        media.patch_count * vision_hidden_size_, nullptr,
+        activation_bf16_));
 
     status_check(ec::layer_norm_batch(
         vision_hidden_, binding(operation, role(layer, "norm2_weight")).f32,
@@ -6295,7 +6466,8 @@ void DenseFp4Provider::run_vision(const PreparedOperation& operation,
         media.patch_count, vision_hidden_size_, nullptr));
     status_check(ec::add_in_place(
         vision_hidden_, vision_normalized_,
-        media.patch_count * vision_hidden_size_, nullptr));
+        media.patch_count * vision_hidden_size_, nullptr,
+        activation_bf16_));
   }
 
   status_check(ec::layer_norm_batch(
@@ -6797,7 +6969,7 @@ void DenseFp4Provider::run_full_attention(
   const auto qsa = operation.capability ==
       "block.sparse-attention.qsa.output-gated.v1";
   const auto* projection_input = qsa ? hidden_ : normalized_;
-  quantize_rows(projection_input, rows, hidden_size_);
+  prepare_dense_activation(projection_input, rows, hidden_size_);
   project_quantized(binding(operation, "query_projection"), projection_input,
                     query_gate_, rows);
   project_quantized(binding(operation, "key_projection"), projection_input,
@@ -7066,7 +7238,8 @@ void DenseFp4Provider::run_full_attention(
       execute_rows(0U, rows);
     }
     status_check(ec::sigmoid_product_in_place(
-        attention_, gate_, rows * query_heads_ * head_dim_, nullptr));
+        attention_, gate_, rows * query_heads_ * head_dim_, nullptr,
+        activation_bf16_));
     project(binding(operation, "output_projection"), attention_, residual_,
             rows);
     return;
@@ -7150,7 +7323,7 @@ void DenseFp4Provider::run_full_attention(
         binding(operation, "key_norm").f32, vision_positions_, rows,
         query_heads_, kv_heads_, head_dim_, rotary_dimension_,
         mrope_sections_[0], mrope_sections_[1], mrope_sections_[2], epsilon_,
-        rope_theta_, nullptr));
+        rope_theta_, nullptr, activation_bf16_));
   }
   const auto authoritative = host_authoritative_fp16_kv() &&
                              mtp_attention_.get() != &operation;
@@ -7440,12 +7613,13 @@ void DenseFp4Provider::run_full_attention(
             binding(operation, "key_norm").f32, page, physical_layer,
             kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
             query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
-            rope_theta_, nullptr));
+            rope_theta_, nullptr, activation_bf16_));
       status_check(ec::gated_gqa_attention_decode_paged_q8_tensor_core({
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, physical_layer,
           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
-          kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
+          kAttentionSplitTokens, attention_maximum_splits_, nullptr,
+          activation_bf16_}));
     } else if (target_fp8 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_at(
@@ -7459,7 +7633,8 @@ void DenseFp4Provider::run_full_attention(
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, physical_layer,
           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
-          kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
+          kAttentionSplitTokens, attention_maximum_splits_, nullptr,
+          activation_bf16_}));
     } else if (target_fp4_key_outlier1 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(
@@ -7477,7 +7652,8 @@ void DenseFp4Provider::run_full_attention(
                             cache_positions.front() + 1U, physical_layer,
                             kv_page_tokens_, query_heads_, kv_heads_,
                             head_dim_, kAttentionSplitTokens,
-                            attention_maximum_splits_, nullptr}));
+                            attention_maximum_splits_, nullptr,
+                            activation_bf16_}));
     } else if (target_q4_bfp_outlier1 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(
@@ -7499,7 +7675,7 @@ void DenseFp4Provider::run_full_attention(
                partial_outputs_, context_tokens, 1U, physical_layer,
                kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
                packed_attention_split_tokens(context_tokens),
-               attention_maximum_splits_, nullptr}));
+               attention_maximum_splits_, nullptr, activation_bf16_}));
     } else if (target_q4_bfp && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_bfp_at(
@@ -7519,7 +7695,7 @@ void DenseFp4Provider::run_full_attention(
            partial_outputs_, context_tokens, 1U, physical_layer,
            kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
            packed_attention_split_tokens(context_tokens),
-           attention_maximum_splits_, nullptr}));
+           attention_maximum_splits_, nullptr, activation_bf16_}));
     } else if (target_q4_per_head && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_q4_per_head_at(
@@ -7528,7 +7704,7 @@ void DenseFp4Provider::run_full_attention(
             binding(operation, "key_norm").f32, page, physical_layer,
             kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
             query_heads_, kv_heads_, head_dim_, rotary_dimension_, epsilon_,
-            rope_theta_, nullptr));
+            rope_theta_, nullptr, activation_bf16_));
       status_check(ec::quantize_gqa_queries_q8(
           query_gate_, attention_q8_queries_, attention_query_scales_, 1U,
           query_heads_, head_dim_, nullptr));
@@ -7540,7 +7716,7 @@ void DenseFp4Provider::run_full_attention(
                partial_outputs_, context_tokens, 1U, physical_layer,
                kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
                packed_attention_split_tokens(context_tokens),
-               attention_maximum_splits_, nullptr}));
+               attention_maximum_splits_, nullptr, activation_bf16_}));
     } else if (target_q5_q4_bfp && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_at(
@@ -7560,7 +7736,7 @@ void DenseFp4Provider::run_full_attention(
            partial_outputs_, context_tokens, 1U, physical_layer,
            kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
            packed_attention_split_tokens(context_tokens),
-           attention_maximum_splits_, nullptr}));
+           attention_maximum_splits_, nullptr, activation_bf16_}));
     } else {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp4_at(
@@ -7574,7 +7750,8 @@ void DenseFp4Provider::run_full_attention(
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, physical_layer,
           kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
-          kAttentionSplitTokens, attention_maximum_splits_, nullptr}));
+          kAttentionSplitTokens, attention_maximum_splits_, nullptr,
+          activation_bf16_}));
     }
   } else {
     if (mtp_q8) {
@@ -7585,7 +7762,7 @@ void DenseFp4Provider::run_full_attention(
             binding(operation, "key_norm").f32, page_table, physical_layer,
             kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
             rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
-            epsilon_, rope_theta_, nullptr));
+            epsilon_, rope_theta_, nullptr, activation_bf16_));
     } else if (target_fp8 && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_fp8_batch(
@@ -7633,7 +7810,7 @@ void DenseFp4Provider::run_full_attention(
             binding(operation, "key_norm").f32, page_table, physical_layer,
             kv_page_tokens_, cache_positions.front(), rotary_positions.front(),
             rows, query_heads_, kv_heads_, head_dim_, rotary_dimension_,
-            epsilon_, rope_theta_, nullptr));
+            epsilon_, rope_theta_, nullptr, activation_bf16_));
     } else if (target_q5_q4_bfp && !mixed_mtp) {
       if (mrope_positions.empty())
         status_check(ec::gated_gqa_qkv_rope_cache_paged_q5_q4_bfp_batch(
@@ -7658,7 +7835,8 @@ void DenseFp4Provider::run_full_attention(
           query_gate_, page_table, attention_, partial_maxima_, partial_sums_,
           partial_outputs_, cache_positions.front() + 1U, rows,
           physical_layer, kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
-          kAttentionSplitTokens, attention_maximum_splits_, nullptr};
+          kAttentionSplitTokens, attention_maximum_splits_, nullptr,
+          activation_bf16_};
       if (mtp_q8)
         status_check(
             ec::gated_gqa_attention_microbatch_paged_q8_tensor_core(launch));
@@ -7682,7 +7860,7 @@ void DenseFp4Provider::run_full_attention(
                  context_tokens, rows, physical_layer, kv_page_tokens_,
                  query_heads_, kv_heads_, head_dim_,
                  packed_attention_split_tokens(context_tokens),
-                 attention_maximum_splits_, nullptr}));
+                 attention_maximum_splits_, nullptr, activation_bf16_}));
       }
       else if (target_q4_bfp && !mixed_mtp) {
         status_check(ec::quantize_gqa_queries_q8(
@@ -7695,7 +7873,7 @@ void DenseFp4Provider::run_full_attention(
              partial_outputs_, context_tokens, rows, physical_layer,
              kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
              packed_attention_split_tokens(context_tokens),
-             attention_maximum_splits_, nullptr}));
+             attention_maximum_splits_, nullptr, activation_bf16_}));
       }
       else if (target_q4_per_head && !mixed_mtp) {
         status_check(ec::quantize_gqa_queries_q8(
@@ -7709,7 +7887,7 @@ void DenseFp4Provider::run_full_attention(
                  partial_outputs_, context_tokens, rows, physical_layer,
                  kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
                  packed_attention_split_tokens(context_tokens),
-                 attention_maximum_splits_, nullptr}));
+                 attention_maximum_splits_, nullptr, activation_bf16_}));
       }
       else if (target_q5_q4_bfp && !mixed_mtp) {
         status_check(ec::quantize_gqa_queries_q8(
@@ -7722,7 +7900,7 @@ void DenseFp4Provider::run_full_attention(
              partial_outputs_, context_tokens, rows, physical_layer,
              kv_page_tokens_, query_heads_, kv_heads_, head_dim_,
              packed_attention_split_tokens(context_tokens),
-             attention_maximum_splits_, nullptr}));
+             attention_maximum_splits_, nullptr, activation_bf16_}));
       }
       else
         status_check(
@@ -7733,7 +7911,7 @@ void DenseFp4Provider::run_full_attention(
           partial_outputs_, cache_positions.front() + 1U, rows,
           physical_layer, kv_page_tokens_, query_heads_, kv_heads_,
           head_dim_, kAttentionSplitTokens,
-          attention_maximum_splits_, nullptr};
+          attention_maximum_splits_, nullptr, activation_bf16_};
       const auto query_values =
           static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
       const auto kv_values = static_cast<std::size_t>(kv_heads_) *
@@ -7793,7 +7971,7 @@ void DenseFp4Provider::run_recurrent_attention(
     if (checkpoint_mode != RecurrentCheckpointMode::none)
       throw std::runtime_error(
           "Mamba2 does not advertise transactional draft checkpoints");
-    quantize_rows(normalized_, rows, hidden_size_);
+    prepare_dense_activation(normalized_, rows, hidden_size_);
     project_quantized(binding(operation, "input_projection"), normalized_,
                       projected_qkv_, rows);
     status_check(ec::mamba2_forward({
@@ -7819,7 +7997,7 @@ void DenseFp4Provider::run_recurrent_attention(
   const auto split_no_residual = operation.capability ==
       "block.recurrent-linear-attention.split-gated-delta.no-residual.v1";
   const auto* projection_input = split_no_residual ? hidden_ : normalized_;
-  quantize_rows(projection_input, rows, hidden_size_);
+  prepare_dense_activation(projection_input, rows, hidden_size_);
   project_quantized(binding(operation, "qkv_projection"), projection_input,
                     projected_qkv_, rows);
   project_quantized(binding(operation, "z_projection"), projection_input,
@@ -7868,7 +8046,8 @@ void DenseFp4Provider::run_recurrent_attention(
             sizeof(float),
         conv_checkpoints, matrix_checkpoints,
         rows, key_heads_, value_heads_, key_head_dim_, value_head_dim_,
-        conv_kernel_, epsilon_, output_gate_activation, nullptr}));
+        conv_kernel_, epsilon_, output_gate_activation, activation_bf16_,
+        nullptr}));
     project(binding(operation, "output_projection"), delta_output_, residual_,
             rows);
     return;
@@ -7888,7 +8067,7 @@ void DenseFp4Provider::run_recurrent_attention(
         conv_output_ + static_cast<std::size_t>(row) * conv_dimension,
         delta_output_ + static_cast<std::size_t>(row) * value_dimension,
         key_heads_, value_heads_, key_head_dim_, value_head_dim_, conv_kernel_,
-        epsilon_, output_gate_activation, nullptr}));
+        epsilon_, output_gate_activation, activation_bf16_, nullptr}));
     if (checkpoint_mode == RecurrentCheckpointMode::after_first &&
         row == 0U) {
       auto* conv_checkpoint =
@@ -7932,7 +8111,7 @@ void DenseFp4Provider::run_router(const PreparedOperation& operation,
             rows);
     status_check(ec::silu_product(
         gate_, up_, intermediate_, rows * shared_intermediate_size_,
-        nullptr));
+        nullptr, activation_bf16_));
     status_check(ec::round_bf16_in_place(
         intermediate_, static_cast<std::uint64_t>(rows) *
                            shared_intermediate_size_, nullptr));
@@ -7962,7 +8141,7 @@ void DenseFp4Provider::run_router(const PreparedOperation& operation,
   else
     normalize_rows(hidden_, binding(operation, "input_norm").f32,
                    normalized_, rows);
-  quantize_rows(normalized_, rows, hidden_size_);
+  prepare_dense_activation(normalized_, rows, hidden_size_);
   if (operation.capability ==
       "router.sigmoid-bias.topk.shared-relu2.v1") {
     project_quantized(binding(operation, "shared_up_projection"), normalized_,
@@ -7984,7 +8163,8 @@ void DenseFp4Provider::run_router(const PreparedOperation& operation,
   project_quantized(binding(operation, "shared_up_projection"), normalized_,
                     up_, rows);
   status_check(ec::silu_product(
-      gate_, up_, intermediate_, rows * shared_intermediate_size_, nullptr));
+      gate_, up_, intermediate_, rows * shared_intermediate_size_, nullptr,
+      activation_bf16_));
   project(binding(operation, "shared_down_projection"), intermediate_,
           shared_output_, rows);
   status_check(ec::gemv_f32_batch(
@@ -8011,7 +8191,8 @@ void DenseFp4Provider::run_routed_moe(const PreparedOperation& operation,
       moe_nvfp4_gate_input_, moe_nvfp4_up_input_, moe_nvfp4_down_input_,
       moe_output_);
   status_check(ec::add_in_place(moe_output_, shared_output_,
-                                rows * hidden_size_, nullptr));
+                                rows * hidden_size_, nullptr,
+                                activation_bf16_));
   const auto native_nvfp4 = operation.capability ==
       "moe.swiglu.routed.nvfp4-block16.merge-shared.v1";
   if (native_nvfp4)
@@ -8027,7 +8208,7 @@ void DenseFp4Provider::run_routed_moe(const PreparedOperation& operation,
                "commit no-residual routed output");
   else
     status_check(ec::add_in_place(hidden_, moe_output_, rows * hidden_size_,
-                                  nullptr));
+                                  nullptr, activation_bf16_));
   if (native_nvfp4)
     status_check(ec::round_bf16_in_place(
         hidden_, static_cast<std::uint64_t>(rows) * hidden_size_, nullptr));
@@ -8041,17 +8222,18 @@ void DenseFp4Provider::run_ffn(const PreparedOperation& operation,
                         cudaMemcpyDeviceToDevice),
              "retain FFN residual");
   normalize_operation_input(operation, hidden_, normalized_, rows);
-  quantize_rows(normalized_, rows, hidden_size_);
+  prepare_dense_activation(normalized_, rows, hidden_size_);
   project_quantized(binding(operation, "gate_projection"), normalized_, gate_,
                     rows);
   project_quantized(binding(operation, "up_projection"), normalized_, up_,
                     rows);
   status_check(ec::silu_product(gate_, up_, intermediate_,
-                                rows * intermediate_size_, nullptr));
+                                rows * intermediate_size_, nullptr,
+                                activation_bf16_));
   project(binding(operation, "down_projection"), intermediate_, hidden_, rows);
   if (operation.abi_version < 2U) {
     status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
-                                  nullptr));
+                                  nullptr, activation_bf16_));
   } else {
     const auto mode = parameter_u32(operation.parameters, "post_norm_mode");
     const auto epsilon = parameter_f32(
@@ -8067,13 +8249,50 @@ void DenseFp4Provider::run_ffn(const PreparedOperation& operation,
     else
       throw std::runtime_error("unsupported FFN post norm mode");
     status_check(ec::add_in_place(normalized_, residual_,
-                                  rows * hidden_size_, nullptr));
+                                  rows * hidden_size_, nullptr,
+                                  activation_bf16_));
     cuda_check(cudaMemcpy(hidden_, normalized_,
                           static_cast<std::size_t>(rows) * hidden_size_ *
                               sizeof(float),
                           cudaMemcpyDeviceToDevice),
                "commit post-normalized FFN update");
   }
+}
+
+void DenseFp4Provider::trace_sampling(
+    const er::ProgramRequestContext& request, std::uint32_t position,
+    std::uint32_t token, std::string_view mode,
+    const er::SamplingDistribution* target,
+    const er::SamplingDistribution* draft) {
+  if (!sampling_trace_stream_.is_open()) return;
+  if (target != nullptr && !(target->probability(token) > 0.0))
+    throw std::runtime_error(
+        "diagnostic token is outside its target sampling support");
+  auto& output = sampling_trace_stream_;
+  output << "{\"schema\":\"sampling-decision-v1\",\"request_id\":"
+         << request.request_id << ",\"position\":" << position
+         << ",\"token\":" << token << ",\"mode\":\"" << mode << '"';
+  const auto write_distribution = [&](std::string_view name,
+                                      const er::SamplingDistribution* value) {
+    output << ",\"" << name << "\":";
+    if (value == nullptr) {
+      output << "null";
+      return;
+    }
+    output << '[';
+    for (std::size_t index = 0U; index < value->entries.size(); ++index) {
+      if (index != 0U) output << ',';
+      const auto& entry = value->entries[index];
+      output << '[' << entry.token << ',' << entry.probability << ']';
+    }
+    output << ']';
+  };
+  write_distribution("target", target);
+  write_distribution("draft", draft);
+  output << "}\n";
+  if (!output)
+    throw std::runtime_error("cannot write diagnostic sampling trace");
+  if ((++sampling_trace_records_ & 63U) == 0U) output.flush();
 }
 
 er::SamplingDistribution DenseFp4Provider::distribution_from_logits(
@@ -8203,12 +8422,15 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
         *request, "sampling_temperature_ppm");
     const auto top_k = request_parameter(*request, "sampling_top_k");
     std::uint32_t selected{};
+    std::optional<er::SamplingDistribution> trace_distribution;
     if (temperature == 0U) {
       status_check(ec::argmax(logits_, vocabulary_size_, output_tokens_,
                               nullptr));
       cuda_check(cudaMemcpy(&selected, output_tokens_, sizeof(selected),
                             cudaMemcpyDeviceToHost),
                  "copy dense FP4 greedy token");
+      if (sampling_trace_stream_.is_open())
+        trace_distribution = er::SamplingDistribution{{{selected, 1.0}}};
     } else if (top_k != 0U && top_k <= kMaximumGpuSamplingTopK) {
       status_check(ec::topk_logits(
           logits_, vocabulary_size_, static_cast<std::uint32_t>(top_k),
@@ -8233,6 +8455,13 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
       sampling_logit_transfer_bytes_ +=
           host_logits.size() * sizeof(host_logits[0]) +
           host_tokens.size() * sizeof(host_tokens[0]);
+      if (sampling_trace_stream_.is_open())
+        trace_distribution = er::make_sampling_distribution(
+            host_logits, host_tokens, static_cast<std::uint32_t>(temperature),
+            static_cast<std::uint32_t>(request_parameter(*request,
+                                                         "sampling_top_p_ppm")),
+            static_cast<std::uint32_t>(request_parameter(*request,
+                                                         "sampling_min_p_ppm")));
       selected = sample_sorted_candidates(host_logits, host_tokens, *request,
                                            sample_position);
     } else {
@@ -8246,6 +8475,9 @@ std::vector<std::uint32_t> DenseFp4Provider::run_head(
           host_logits.size() * sizeof(host_logits[0]);
       selected = sample_token(host_logits, *request, sample_position);
     }
+    if (output_sampling)
+      trace_sampling(*request, sample_position, selected, "head",
+                     trace_distribution ? &*trace_distribution : nullptr);
     if (output_sampling)
       cuda_check(cudaMemset(emitted + selected, 1, 1),
                  "mark emitted sampling token");
@@ -8337,7 +8569,7 @@ std::vector<std::uint32_t> DenseFp4Provider::run_target(
                        normalized_, rows);
         run_recurrent_attention(operation, slot, rows, checkpoint_mode);
         status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
-                                      nullptr));
+                                      nullptr, activation_bf16_));
         break;
       case Kernel::router:
         run_router(operation, rows);
@@ -8433,9 +8665,15 @@ std::optional<MtpPrediction> DenseFp4Provider::run_mtp(
   cuda_check(cudaMemcpy(output_tokens_, tokens.data(),
                         rows * sizeof(tokens[0]), cudaMemcpyHostToDevice),
              "upload MTP token batch");
-  status_check(ec::fp4_embedding_batch(
-      binding(*exact_, "token_embedding").matrix(), output_tokens_,
-      mtp_embedding_, rows, nullptr));
+  const auto& mtp_token_embedding = binding(*exact_, "token_embedding");
+  if (mtp_token_embedding.encoding == "MXFP6_E3M2")
+    status_check(ec::mxfp6_embedding_batch(
+        mtp_token_embedding.mxfp6_matrix(), output_tokens_, mtp_embedding_,
+        rows, nullptr));
+  else
+    status_check(ec::fp4_embedding_batch(
+        mtp_token_embedding.matrix(), output_tokens_, mtp_embedding_, rows,
+        nullptr));
   normalize_rows(mtp_embedding_, binding(*exact_, "embedding_norm").f32,
                  mtp_embedding_norm_, rows);
   normalize_rows(previous_hidden, binding(*exact_, "hidden_norm").f32,
@@ -8488,7 +8726,7 @@ std::optional<MtpPrediction> DenseFp4Provider::run_mtp(
                          ? std::span<const std::uint32_t>{}
                          : std::span(mrope_positions).first(3U * rows));
   status_check(ec::add_in_place(hidden_, residual_, rows * hidden_size_,
-                                nullptr));
+                                nullptr, activation_bf16_));
   run_ffn(*mtp_ffn_, rows);
   state.mtp_length += rows;
   if (!produce_logits) {
@@ -8511,8 +8749,8 @@ std::optional<MtpPrediction> DenseFp4Provider::run_mtp(
   if (draft_vocabulary == vocabulary_size_)
     project(binding(*exact_, "output_head"), normalized_, logits_, 1U);
   else
-    project_fp4_prefix(binding(*exact_, "output_head"), normalized_, logits_,
-                       draft_vocabulary);
+    project_prefix(binding(*exact_, "output_head"), normalized_, logits_,
+                   draft_vocabulary);
   MtpPrediction result;
   if (request) {
     result.distribution = distribution_from_logits(
@@ -10339,7 +10577,8 @@ DenseFp4Provider::poll_program_sequence(
             finish_attention_block(operation, rows);
           else
             status_check(ec::add_in_place(hidden_, residual_,
-                                          rows * hidden_size_, nullptr));
+                                          rows * hidden_size_, nullptr,
+                                          activation_bf16_));
           break;
         }
         case Kernel::ffn:
@@ -10584,7 +10823,8 @@ er::OperationExecutionHandle DenseFp4Provider::execute(
           finish_attention_block(*operation, rows);
         else
           status_check(ec::add_in_place(
-              hidden_, residual_, rows * hidden_size_, nullptr));
+              hidden_, residual_, rows * hidden_size_, nullptr,
+              activation_bf16_));
         outputs.emplace("hidden", device_hidden_value(rows));
         break;
       }
@@ -10959,6 +11199,21 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
                 seed,
                 invocation.position + static_cast<std::uint32_t>(accepted),
                 300U));
+
+      for (std::size_t index = 0U; index < accepted; ++index)
+        trace_sampling(
+            invocation.request,
+            invocation.position + static_cast<std::uint32_t>(index),
+            state->draft_predictions[index].token, "mtp_accepted",
+            &target_distributions[index],
+            &state->draft_predictions[index].distribution);
+      trace_sampling(
+          invocation.request,
+          invocation.position + static_cast<std::uint32_t>(accepted),
+          next_token, rejected ? "mtp_residual" : "mtp_bonus",
+          &target_distributions[accepted],
+          rejected ? &state->draft_predictions[accepted].distribution
+                   : nullptr);
 
       if (rejected) {
         restore_speculative_recurrent_checkpoint(

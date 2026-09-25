@@ -5,8 +5,12 @@ param(
     [Parameter(Mandatory = $true)][string]$Adapter,
     [string]$ConfigFile = "config.json",
     [string]$IndexFile = "model.safetensors.index.json",
-    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
+    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "fp4-e2m1-ue8m0-block32-mse-v2", "fp4-e2m1-ue8m0-block32-activation-aware-v3", "fp4-e2m1-ue8m0-block32-activation-codes-v4", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
     [string]$QuantProfile = "fp4-e2m1-ue8m0-block32-v1",
+    [string]$ActivationCalibration = "",
+    [string]$DenseEncodingPolicy = "",
+    [ValidateSet("q8", "bf16")]
+    [string]$DenseActivationInput = "q8",
     [string]$SamplingProfiles = "",
     [int64]$MaxExpertPackBytes = 4GB,
     [int]$QualitySamplesPerTensor = 8,
@@ -65,6 +69,7 @@ if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
         ConfigFile = $ConfigFile
         IndexFile = $IndexFile
         QuantProfile = $QuantProfile
+        DenseActivationInput = $DenseActivationInput
         MaxExpertPackBytes = $MaxExpertPackBytes
         Resume = $true
     }
@@ -72,12 +77,23 @@ if (-not (Test-Path -LiteralPath $candidate -PathType Container)) {
     if (-not [string]::IsNullOrWhiteSpace($SamplingProfiles)) {
         $arguments.SamplingProfiles = $SamplingProfiles
     }
+    if (-not [string]::IsNullOrWhiteSpace($ActivationCalibration)) {
+        $arguments.ActivationCalibration = $ActivationCalibration
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DenseEncodingPolicy)) {
+        $arguments.DenseEncodingPolicy = $DenseEncodingPolicy
+    }
     & (Join-Path $PSScriptRoot "Invoke-ExpertPack.ps1") @arguments
 }
 
 & (Join-Path $PSScriptRoot "Invoke-ExpertPack.ps1") `
     -Action Validate -Path $candidate
-if ($QuantProfile -eq "fp4-e2m1-ue8m0-block32-v1") {
+if ($QuantProfile -in @(
+        "fp4-e2m1-ue8m0-block32-v1",
+        "fp4-e2m1-ue8m0-block32-mse-v2",
+        "fp4-e2m1-ue8m0-block32-activation-aware-v3",
+        "fp4-e2m1-ue8m0-block32-activation-codes-v4"
+    )) {
     & (Join-Path $PSScriptRoot "Invoke-Fp4SourceQualityGate.ps1") `
         -ModelId $ModelId -Revision $Revision `
         -ArtifactName ([System.IO.Path]::GetFileName($candidate)) `

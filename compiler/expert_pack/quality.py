@@ -19,18 +19,20 @@ from typing import Any, BinaryIO
 
 from .constants import (
     DTYPE_BYTES,
+    FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    FP4_ACTIVATION_QUANT_PROFILE,
     FP4_QUANT_ABI_ID,
     FP4_RELU2_EXPERT_ABI_ID,
     FP4_QUANT_GROUP_SIZE,
+    FP4_MSE_QUANT_PROFILE,
+    FP4_QUANT_PROFILE,
+    MXFP6_QUANT_ABI_ID,
+    MXFP6_QUANT_GROUP_SIZE,
     QUANT_ABI_ID,
 )
-from .deepseek_quant import decode_scaled_fp4_e2m1_row
 from .errors import ValidationError
 from .quant import (
     _decode_float_row,
-    _fp4_block_code,
-    _fp4_nearest_index,
-    _fp4_pack_nibbles,
     quantize_int8_row,
 )
 from .safetensors import SafeTensorCheckpoint, TensorInfo, TensorView
@@ -208,19 +210,118 @@ def _source_values(view: TensorView, start: int, count: int) -> list[float]:
     return values
 
 
-def _expected_fp4(values: list[float]) -> tuple[bytes, int]:
+_ORACLE_FP4_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def _oracle_fp4_index(magnitude: float) -> int:
+    boundaries = (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0)
+    for index, boundary in enumerate(boundaries):
+        if magnitude < boundary or (
+                magnitude == boundary and index % 2 == 0):
+            return index
+    return 7
+
+
+def _oracle_fp4_error(values: list[float], code: int) -> float:
+    scale = math.ldexp(1.0, code - 127)
+    return sum(
+        (
+            _ORACLE_FP4_LEVELS[_oracle_fp4_index(abs(value / scale))]
+            * scale - abs(value)
+        ) ** 2
+        for value in values
+    )
+
+
+def _expected_fp4(
+        values: list[float], optimize_mse: bool = False,
+        ) -> tuple[bytes, int]:
     padded = values + [0.0] * (FP4_QUANT_GROUP_SIZE - len(values))
-    code = _fp4_block_code(max(abs(value) for value in padded))
+    maximum = max(abs(value) for value in padded)
+    if maximum == 0.0:
+        code = 127
+    else:
+        exponent = math.ceil(math.log2(maximum / 6.0))
+        code = max(1, min(254, exponent + 127))
+    candidate = max(1, code - 1)
+    if (optimize_mse and candidate != code
+            and _oracle_fp4_error(padded, candidate)
+                < _oracle_fp4_error(padded, code)):
+        code = candidate
     scale = math.ldexp(1.0, code - 127)
     quotients = [value / scale for value in padded]
-    indices = [_fp4_nearest_index(abs(value)) for value in quotients]
-    signs = [1 if value < 0.0 else 0 for value in quotients]
-    return _fp4_pack_nibbles(indices, signs), code
+    nibbles = [
+        _oracle_fp4_index(abs(value)) | (8 if value < 0.0 else 0)
+        for value in quotients
+    ]
+    payload = bytes(
+        nibbles[index] | (nibbles[index + 1] << 4)
+        for index in range(0, len(nibbles), 2)
+    )
+    return payload, code
+
+
+def _expected_fp4_at_code(values: list[float], code: int) -> bytes:
+    """Independently encode one block with a separately supplied legal code."""
+    padded = values + [0.0] * (FP4_QUANT_GROUP_SIZE - len(values))
+    scale = math.ldexp(1.0, code - 127)
+    nibbles = [
+        _oracle_fp4_index(abs(value / scale))
+        | (8 if value / scale < 0.0 else 0)
+        for value in padded
+    ]
+    return bytes(
+        nibbles[index] | (nibbles[index + 1] << 4)
+        for index in range(0, len(nibbles), 2)
+    )
+
+
+def _oracle_decode_fp4(payload: bytes, scale_code: int) -> list[float]:
+    scale = math.ldexp(1.0, scale_code - 127)
+    decoded: list[float] = []
+    for packed in payload:
+        for code in (packed & 0x0f, packed >> 4):
+            value = _ORACLE_FP4_LEVELS[code & 0x07] * scale
+            decoded.append(-value if code & 0x08 else value)
+    return decoded
+
+
+def _valid_adjacent_fp4_payload(
+    payload: bytes, nearest: bytes, logical_count: int
+) -> bool:
+    """Independently enforce the v4 nearest-or-adjacent nibble contract."""
+    actual_codes = [
+        code
+        for packed in payload
+        for code in (packed & 0x0f, packed >> 4)
+    ]
+    nearest_codes = [
+        code
+        for packed in nearest
+        for code in (packed & 0x0f, packed >> 4)
+    ]
+    if len(actual_codes) != FP4_QUANT_GROUP_SIZE:
+        return False
+    for index, (actual, expected) in enumerate(
+        zip(actual_codes, nearest_codes)
+    ):
+        if index >= logical_count:
+            if actual != expected:
+                return False
+            continue
+        if (actual & 0x08) != (expected & 0x08):
+            return False
+        if abs((actual & 0x07) - (expected & 0x07)) > 1:
+            return False
+    return True
 
 
 def _qualify_fp4(
         pack: BinaryIO, view: TensorView, entry: dict[str, Any],
         samples_per_tensor: int,
+        optimize_mse: bool = False,
+        activation_aware: bool = False,
+        activation_payload_aware: bool = False,
         ) -> tuple[_Moments, int, int]:
     shape = tuple(entry["source_shape"])
     columns = shape[-1]
@@ -259,10 +360,116 @@ def _qualify_fp4(
         scale = pack.read(1)
         _require(len(payload) == 16 and len(scale) == 1,
                  f"short FP4 sample read for {entry['name']}")
-        expected_payload, expected_scale = _expected_fp4(source)
+        expected_payload, expected_scale = _expected_fp4(
+            source, optimize_mse
+        )
+        if activation_aware:
+            _covering_payload, covering_scale = _expected_fp4(source, False)
+            if scale[0] in {expected_scale, covering_scale}:
+                expected_payload = _expected_fp4_at_code(source, scale[0])
+                expected_scale = scale[0]
+            else:
+                expected_scale = -1
+        if activation_payload_aware:
+            payload_mismatches += int(not _valid_adjacent_fp4_payload(
+                payload, expected_payload, logical_count
+            ))
+        else:
+            payload_mismatches += int(payload != expected_payload)
+        scale_mismatches += int(scale[0] != expected_scale)
+        decoded = _oracle_decode_fp4(payload, scale[0])
+        moments.add(source, decoded[:logical_count])
+    return moments, payload_mismatches, scale_mismatches
+
+
+_ORACLE_E3M2_LEVELS = (
+    0.0, 0.0625, 0.125, 0.1875,
+    0.25, 0.3125, 0.375, 0.4375,
+    0.5, 0.625, 0.75, 0.875,
+    1.0, 1.25, 1.5, 1.75,
+    2.0, 2.5, 3.0, 3.5,
+    4.0, 5.0, 6.0, 7.0,
+    8.0, 10.0, 12.0, 14.0,
+    16.0, 20.0, 24.0, 28.0,
+)
+
+
+def _oracle_mxfp6_block(values: list[float]) -> tuple[bytes, int, list[float]]:
+    """Independent literal MXFP6 oracle; it shares no encoder helpers."""
+
+    padded = values + [0.0] * (MXFP6_QUANT_GROUP_SIZE - len(values))
+    maximum = max(abs(value) for value in padded)
+    scale_code = 127 if maximum == 0.0 else max(
+        1, min(254, math.floor(math.log2(maximum)) - 4 + 127)
+    )
+    scale = math.ldexp(1.0, scale_code - 127)
+    codes: list[int] = []
+    decoded: list[float] = []
+    for value in padded:
+        magnitude = abs(value / scale)
+        best = min(
+            range(32),
+            key=lambda code: (
+                abs(_ORACLE_E3M2_LEVELS[code] - magnitude), code & 1
+            ),
+        )
+        code = best | (0x20 if value < 0.0 else 0)
+        codes.append(code)
+        decoded.append(
+            (-1.0 if code & 0x20 else 1.0)
+            * _ORACLE_E3M2_LEVELS[code & 0x1f]
+            * scale
+        )
+    payload = bytearray(24)
+    for group in range(8):
+        word = sum(codes[4 * group + item] << (6 * item)
+                   for item in range(4))
+        payload[3 * group:3 * group + 3] = word.to_bytes(3, "little")
+    return bytes(payload), scale_code, decoded
+
+
+def _qualify_mxfp6(
+        pack: BinaryIO, view: TensorView, entry: dict[str, Any],
+        samples_per_tensor: int,
+        ) -> tuple[_Moments, int, int]:
+    shape = tuple(entry["source_shape"])
+    columns = shape[-1]
+    rows = math.prod(shape[:-1]) if len(shape) > 1 else 1
+    padded_columns = (
+        (columns + MXFP6_QUANT_GROUP_SIZE - 1)
+        // MXFP6_QUANT_GROUP_SIZE * MXFP6_QUANT_GROUP_SIZE
+    )
+    blocks_per_row = padded_columns // MXFP6_QUANT_GROUP_SIZE
+    moments = _Moments()
+    payload_mismatches = scale_mismatches = 0
+    sections = entry["sections"]
+    for flat_block in _sample_indices(
+            entry["name"], rows * blocks_per_row, samples_per_tensor):
+        row, block = divmod(flat_block, blocks_per_row)
+        logical_start = block * MXFP6_QUANT_GROUP_SIZE
+        logical_count = max(
+            0, min(MXFP6_QUANT_GROUP_SIZE, columns - logical_start)
+        )
+        source = _source_values(
+            view, row * columns + logical_start, logical_count
+        ) if logical_count else []
+        data_offset = (
+            entry["offset"] + sections["data"]["offset"]
+            + row * (padded_columns * 3 // 4) + block * 24
+        )
+        scale_offset = (
+            entry["offset"] + sections["scales"]["offset"]
+            + row * blocks_per_row + block
+        )
+        pack.seek(data_offset)
+        payload = pack.read(24)
+        pack.seek(scale_offset)
+        scale = pack.read(1)
+        _require(len(payload) == 24 and len(scale) == 1,
+                 f"short MXFP6 sample read for {entry['name']}")
+        expected_payload, expected_scale, decoded = _oracle_mxfp6_block(source)
         payload_mismatches += int(payload != expected_payload)
         scale_mismatches += int(scale[0] != expected_scale)
-        decoded = list(decode_scaled_fp4_e2m1_row(payload, scale))
         moments.add(source, decoded[:logical_count])
     return moments, payload_mismatches, scale_mismatches
 
@@ -346,6 +553,7 @@ def _qualify_int8(
 def _qualify_expert(
         pack: BinaryIO, checkpoint: SafeTensorCheckpoint,
         entry: dict[str, Any], samples_per_tensor: int,
+        optimize_mse: bool = False,
         ) -> tuple[_Moments, int, int, list[dict[str, Any]]]:
     _require(entry.get("quant_abi") in (
                  FP4_QUANT_ABI_ID, FP4_RELU2_EXPERT_ABI_ID),
@@ -394,7 +602,7 @@ def _qualify_expert(
         }
         with checkpoint.open_tensor(source_info) as view:
             moments, payload_bad, scale_bad = _qualify_fp4(
-                pack, view, pseudo_entry, samples_per_tensor
+                pack, view, pseudo_entry, samples_per_tensor, optimize_mse
             )
         aggregate.merge(moments)
         payload_mismatches += payload_bad
@@ -426,6 +634,22 @@ def qualify_container_against_source(
     container_root = Path(container).resolve()
     manifest = load_json(container_root / "manifest.json")
     _require(isinstance(manifest, dict), "container manifest is not an object")
+    quantization = manifest.get("quantization")
+    _require(isinstance(quantization, dict),
+             "manifest quantization policy is absent")
+    fp4_profile = quantization.get("profile")
+    _require(fp4_profile in (
+        FP4_QUANT_PROFILE,
+        FP4_MSE_QUANT_PROFILE,
+        FP4_ACTIVATION_QUANT_PROFILE,
+        FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    ),
+             "quality gate does not recognize the FP4 scale policy")
+    optimize_fp4_mse = fp4_profile in (
+        FP4_MSE_QUANT_PROFILE,
+        FP4_ACTIVATION_QUANT_PROFILE,
+        FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    )
     checkpoint = SafeTensorCheckpoint(source_root)
     entries = manifest.get("tensors")
     _require(isinstance(entries, list) and bool(entries), "manifest has no tensors")
@@ -528,10 +752,13 @@ def qualify_container_against_source(
 
     aggregate = _Moments()
     fp4_aggregate = _Moments()
+    mxfp6_aggregate = _Moments()
     int8_aggregate = _Moments()
     f32_aggregate = _Moments()
-    fp4_records = int8_records = f32_records = fp4_expert_records = 0
+    fp4_records = mxfp6_records = int8_records = f32_records = 0
+    fp4_expert_records = 0
     payload_mismatches = scale_mismatches = 0
+    mxfp6_payload_mismatches = mxfp6_scale_mismatches = 0
     int8_payload_mismatches = int8_scale_mismatches = f32_mismatches = 0
     per_tensor: list[dict[str, Any]] = []
     with ExitStack() as stack:
@@ -545,12 +772,26 @@ def qualify_container_against_source(
             with checkpoint.open_tensor(name) as view:
                 if entry.get("quant_abi") == FP4_QUANT_ABI_ID:
                     moments, payload_bad, scale_bad = _qualify_fp4(
-                        pack, view, entry, samples_per_tensor
+                        pack, view, entry, samples_per_tensor,
+                        optimize_fp4_mse,
+                        entry.get("fp4_scale_policy")
+                            == "activation-aware-complete-output-residual-v1",
+                        entry.get("fp4_payload_policy")
+                            == "activation-aware-adjacent-code-top64-complete-output-residual-v1",
                     )
                     fp4_records += 1
                     fp4_aggregate.merge(moments)
                     payload_mismatches += payload_bad
                     scale_mismatches += scale_bad
+                elif entry.get("quant_abi") == MXFP6_QUANT_ABI_ID:
+                    moments, payload_bad, scale_bad = _qualify_mxfp6(
+                        pack, view, entry, samples_per_tensor
+                    )
+                    mxfp6_records += 1
+                    mxfp6_aggregate.merge(moments)
+                    fp4_aggregate.merge(moments)
+                    mxfp6_payload_mismatches += payload_bad
+                    mxfp6_scale_mismatches += scale_bad
                 elif entry.get("quant_abi") == QUANT_ABI_ID:
                     moments, payload_bad, scale_bad = _qualify_int8(
                         pack, view, entry, samples_per_tensor
@@ -586,7 +827,8 @@ def qualify_container_against_source(
         for entry in experts:
             pack = pack_handles[entry["pack"]]
             moments, payload_bad, scale_bad, reports = _qualify_expert(
-                pack, checkpoint, entry, samples_per_tensor
+                pack, checkpoint, entry, samples_per_tensor,
+                optimize_fp4_mse,
             )
             aggregate.merge(moments)
             fp4_aggregate.merge(moments)
@@ -609,6 +851,8 @@ def qualify_container_against_source(
         bool(revision_match) and sizes_match and metadata_match
         and not unreferenced and not unknown_bindings
         and payload_mismatches == 0 and scale_mismatches == 0
+        and mxfp6_payload_mismatches == 0
+        and mxfp6_scale_mismatches == 0
         and int8_payload_mismatches == 0 and int8_scale_mismatches == 0
         and f32_mismatches == 0 and thresholds_pass
     )
@@ -626,6 +870,7 @@ def qualify_container_against_source(
         "records": {
             "total": len(entries) + len(experts),
             "tensor_fp4": fp4_records,
+            "tensor_mxfp6": mxfp6_records,
             "tensor_int8": int8_records,
             "tensor_f32": f32_records,
             "expert_fp4": fp4_expert_records,
@@ -637,6 +882,8 @@ def qualify_container_against_source(
             "values": aggregate.values,
             "fp4_payload_mismatches": payload_mismatches,
             "fp4_scale_mismatches": scale_mismatches,
+            "mxfp6_payload_mismatches": mxfp6_payload_mismatches,
+            "mxfp6_scale_mismatches": mxfp6_scale_mismatches,
             "int8_payload_mismatches": int8_payload_mismatches,
             "int8_scale_mismatches": int8_scale_mismatches,
             "f32_value_mismatches": f32_mismatches,
@@ -649,6 +896,7 @@ def qualify_container_against_source(
         "aggregate": {
             "all": aggregate_report,
             "fp4": fp4_report,
+            "mxfp6": mxfp6_aggregate.report(),
             "int8": int8_aggregate.report(),
             "f32": f32_aggregate.report(),
         },

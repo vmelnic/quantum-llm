@@ -9,18 +9,30 @@ import unittest
 from pathlib import Path
 
 from compiler.expert_pack import quant as quant_module
+from compiler.expert_pack.activation_calibration import (
+    DenseActivationCalibrationSet,
+)
 from compiler.expert_pack.compile import CompileOptions, compile_checkpoint
 from compiler.expert_pack.constants import (
     EXPERT_HEADER_STRUCT,
+    FP4_ACTIVATION_CODE_QUANT_PROFILE,
+    FP4_ACTIVATION_QUANT_PROFILE,
     FP4_QUANT_ABI_ID,
+    FP4_MSE_QUANT_PROFILE,
     FP4_QUANT_PROFILE,
     HEADER_BYTES,
+    MXFP6_QUANT_ABI_ID,
+    MXFP6_QUANT_PROFILE,
     PACK_ALIGNMENT,
     QUANT_PROFILE,
 )
 from compiler.expert_pack.deepseek_quant import decode_scaled_fp4_e2m1_row
 from compiler.expert_pack.errors import SourceFormatError
-from compiler.expert_pack.quant import write_fp4_block32_rows, write_int8_rows
+from compiler.expert_pack.quant import (
+    write_fp4_block32_rows,
+    write_int8_rows,
+    write_mxfp6_e3m2_block32_rows,
+)
 from compiler.expert_pack.quality import (
     _qualify_int8,
     qualify_container_against_source,
@@ -31,11 +43,41 @@ from compiler.expert_pack.validate import validate_container
 from compiler.expert_pack.writer import expert_record_size
 
 from tests.compiler.test_expert_pack import (
+    _make_hybrid_delta_fixture,
     _make_fixture,
     _tensor,
     _values,
     _write_safetensors,
 )
+
+
+def _write_dense_calibration(
+    root: Path,
+    name: str,
+    values: list[list[int]],
+    *,
+    columns: int,
+    scales: list[float] | None = None,
+) -> Path:
+    dense = root / "dense"
+    dense.mkdir(parents=True, exist_ok=True)
+    padded = (columns + 31) // 32 * 32
+    rows = len(values)
+    if rows <= 0 or any(len(row) != padded for row in values):
+        raise ValueError("invalid test calibration rows")
+    scales = scales or [1.0] * rows
+    encoded = name.encode("utf-8")
+    payload = bytearray(struct.pack(
+        "<8sIIIIII", b"QLCALD01", 1, len(encoded), rows, rows,
+        columns, padded,
+    ))
+    payload.extend(encoded)
+    payload.extend(struct.pack(f"<{rows}I", *range(rows)))
+    payload.extend(struct.pack(f"<{rows}f", *scales))
+    payload.extend(bytes(value & 0xff for row in values for value in row))
+    path = dense / (hashlib.sha256(encoded).hexdigest() + ".q8cal")
+    path.write_bytes(payload)
+    return path
 
 
 def _float32_tensor(name: str, shape: tuple[int, ...], values: list[float]):
@@ -51,14 +93,16 @@ def _open_single_tensor(root: Path, name: str, shape: tuple[int, ...], values: l
     return checkpoint.open_tensor(name)
 
 
-def _encode(view, use_numpy):
+def _encode(view, use_numpy, optimize_mse=False):
     previous = quant_module._np
     if not use_numpy:
         quant_module._np = None
     try:
         destination = io.BytesIO()
         digest = hashlib.sha256()
-        scales = write_fp4_block32_rows(view, destination, digest)
+        scales = write_fp4_block32_rows(
+            view, destination, digest, optimize_mse
+        )
         return destination.getvalue(), scales, digest.digest()
     finally:
         quant_module._np = previous
@@ -75,6 +119,40 @@ def _encode_int8(view, use_numpy):
         return destination.getvalue(), scales, digest.digest()
     finally:
         quant_module._np = previous
+
+
+def _encode_mxfp6(view, use_numpy):
+    previous = quant_module._np
+    if not use_numpy:
+        quant_module._np = None
+    try:
+        destination = io.BytesIO()
+        digest = hashlib.sha256()
+        scales = write_mxfp6_e3m2_block32_rows(view, destination, digest)
+        return destination.getvalue(), scales, digest.digest()
+    finally:
+        quant_module._np = previous
+
+
+def _decode_mxfp6(payload: bytes, scales: bytes) -> tuple[float, ...]:
+    levels = (
+        0.0, 0.0625, 0.125, 0.1875, 0.25, 0.3125, 0.375, 0.4375,
+        0.5, 0.625, 0.75, 0.875, 1.0, 1.25, 1.5, 1.75,
+        2.0, 2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 7.0,
+        8.0, 10.0, 12.0, 14.0, 16.0, 20.0, 24.0, 28.0,
+    )
+    decoded = []
+    for block, scale_code in enumerate(scales):
+        block_payload = payload[block * 24:(block + 1) * 24]
+        scale = 2.0 ** (scale_code - 127)
+        for group in range(8):
+            word = int.from_bytes(block_payload[group * 3:group * 3 + 3],
+                                  "little")
+            for item in range(4):
+                code = (word >> (6 * item)) & 0x3f
+                value = levels[code & 0x1f] * scale
+                decoded.append(-value if code & 0x20 else value)
+    return tuple(decoded)
 
 
 def _make_wide_fixture(root: Path) -> dict[str, list[float]]:
@@ -154,6 +232,94 @@ def _make_wide_fixture(root: Path) -> dict[str, list[float]]:
 
 
 class Fp4Block32EncoderTests(unittest.TestCase):
+    def test_activation_aware_selection_uses_complete_output_residual(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [4.2] + [0.26] * 31
+            calibration_root = root / "calibration"
+            _write_dense_calibration(
+                calibration_root,
+                "w",
+                [[1] + [0] * 31],
+                columns=32,
+            )
+            calibration = DenseActivationCalibrationSet(calibration_root)
+            baseline_source = root / "source"
+            baseline_source.mkdir()
+            candidate_source = root / "candidate"
+            candidate_source.mkdir()
+            with _open_single_tensor(
+                baseline_source, "w", (1, 32), values
+            ) as view:
+                baseline_payload, baseline_scales, _ = _encode(
+                    view, use_numpy=True, optimize_mse=True
+                )
+            with _open_single_tensor(
+                candidate_source, "w", (1, 32), values
+            ) as view:
+                destination = io.BytesIO()
+                digest = hashlib.sha256()
+                candidate_scales = write_fp4_block32_rows(
+                    view,
+                    destination,
+                    digest,
+                    optimize_mse=True,
+                    activation_calibration=calibration,
+                )
+                candidate_payload = destination.getvalue()
+            report = calibration.finalize()
+            self.assertEqual(baseline_scales, bytes((126,)))
+            self.assertEqual(candidate_scales, bytes((127,)))
+            self.assertNotEqual(candidate_payload, baseline_payload)
+            self.assertEqual(report["covering_reselections"], 1)
+
+    def test_activation_code_selection_uses_complete_output_residual(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [0.9, 0.9] + [0.0] * 30
+            calibration_root = root / "calibration"
+            _write_dense_calibration(
+                calibration_root,
+                "w",
+                [[1, 1] + [0] * 30],
+                columns=32,
+            )
+            calibration = DenseActivationCalibrationSet(calibration_root)
+            calibration.configure_payload_targets({"w"})
+            baseline_root = root / "baseline"
+            baseline_root.mkdir()
+            candidate_root = root / "candidate"
+            candidate_root.mkdir()
+            with _open_single_tensor(
+                baseline_root, "w", (1, 32), values
+            ) as view:
+                baseline_payload, baseline_scales, _ = _encode(
+                    view, use_numpy=True, optimize_mse=True
+                )
+            with _open_single_tensor(
+                candidate_root, "w", (1, 32), values
+            ) as view:
+                destination = io.BytesIO()
+                digest = hashlib.sha256()
+                candidate_scales = write_fp4_block32_rows(
+                    view,
+                    destination,
+                    digest,
+                    optimize_mse=True,
+                    activation_calibration=calibration,
+                )
+                candidate_payload = destination.getvalue()
+            report = calibration.finalize()
+            self.assertEqual(candidate_scales, baseline_scales)
+            self.assertNotEqual(candidate_payload, baseline_payload)
+            self.assertEqual(report["covering_reselections"], 0)
+            self.assertEqual(report["payload_reselections"], 1)
+            self.assertEqual(report["payload_matrix_names"], ["w"])
+
     def test_exact_levels_round_trip_bit_exact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -205,6 +371,51 @@ class Fp4Block32EncoderTests(unittest.TestCase):
                 slow_payload, slow_scales, _ = _encode(view, use_numpy=False)
             self.assertEqual(fast_payload, slow_payload)
             self.assertEqual(fast_scales, slow_scales)
+            with _open_single_tensor(root, "w", (3, 64), values) as view:
+                optimized_fast = _encode(
+                    view, use_numpy=True, optimize_mse=True
+                )
+            with _open_single_tensor(root, "w", (3, 64), values) as view:
+                optimized_slow = _encode(
+                    view, use_numpy=False, optimize_mse=True
+                )
+            self.assertEqual(optimized_fast, optimized_slow)
+
+    def test_mse_scale_clips_one_outlier_and_reduces_block_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [6.1] + [0.5] * 31
+            with _open_single_tensor(root, "w", (1, 32), values) as view:
+                covering_payload, covering_scales, _ = _encode(
+                    view, use_numpy=True
+                )
+            with _open_single_tensor(root, "w", (1, 32), values) as view:
+                optimized_fast = _encode(
+                    view, use_numpy=True, optimize_mse=True
+                )
+            with _open_single_tensor(root, "w", (1, 32), values) as view:
+                optimized_slow = _encode(
+                    view, use_numpy=False, optimize_mse=True
+                )
+            self.assertEqual(optimized_fast, optimized_slow)
+            optimized_payload, optimized_scales, _ = optimized_fast
+            self.assertEqual(covering_scales, bytes((128,)))
+            self.assertEqual(optimized_scales, bytes((127,)))
+            covering = decode_scaled_fp4_e2m1_row(
+                covering_payload, covering_scales
+            )
+            optimized = decode_scaled_fp4_e2m1_row(
+                optimized_payload, optimized_scales
+            )
+            covering_error = sum(
+                (actual - expected) ** 2
+                for actual, expected in zip(covering, values)
+            )
+            optimized_error = sum(
+                (actual - expected) ** 2
+                for actual, expected in zip(optimized, values)
+            )
+            self.assertLess(optimized_error, covering_error)
 
     def test_relative_error_is_e2m1_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -270,6 +481,55 @@ class Fp4Block32EncoderTests(unittest.TestCase):
                     _encode(view, use_numpy=True)
 
 
+class Mxfp6E3m2EncoderTests(unittest.TestCase):
+    def test_exact_levels_pack_and_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            positive = [
+                0.0, 0.0625, 0.125, 0.1875,
+                0.25, 0.3125, 0.375, 0.4375,
+                0.5, 0.625, 0.75, 0.875,
+                1.0, 1.25, 1.5, 1.75,
+                2.0, 2.5, 3.0, 3.5,
+                4.0, 5.0, 6.0, 7.0,
+                8.0, 10.0, 12.0, 14.0,
+                16.0, 20.0, 24.0, 28.0,
+            ]
+            with _open_single_tensor(root, "w", (1, 32), positive) as view:
+                payload, scales, _ = _encode_mxfp6(view, use_numpy=True)
+            self.assertEqual(scales, bytes((127,)))
+            self.assertEqual(len(payload), 24)
+            self.assertEqual(_decode_mxfp6(payload, scales), tuple(positive))
+            self.assertEqual(payload[:3], bytes((0x40, 0x20, 0x0c)))
+
+    def test_numpy_and_stdlib_paths_are_byte_identical(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [((index * 37) % 211 - 105) / 17.0
+                      for index in range(3 * 64)]
+            with _open_single_tensor(root, "w", (3, 64), values) as view:
+                fast = _encode_mxfp6(view, use_numpy=True)
+            with _open_single_tensor(root, "w", (3, 64), values) as view:
+                slow = _encode_mxfp6(view, use_numpy=False)
+            self.assertEqual(fast, slow)
+
+    def test_ties_round_to_even_and_columns_are_padded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            values = [0.09375, 28.0] + [0.0] * 31
+            with _open_single_tensor(root, "w", (1, 33), values) as view:
+                payload, scales, _ = _encode_mxfp6(view, use_numpy=True)
+            self.assertEqual(len(payload), 64 * 3 // 4)
+            self.assertEqual(len(scales), 2)
+            decoded = _decode_mxfp6(payload, scales)
+            # 0.09375 is halfway between E3M2 codes 1 and 2; code 2 is even.
+            self.assertEqual(decoded[0], 0.125)
+            self.assertEqual(decoded[1], 28.0)
+            self.assertEqual(decoded[33:], (0.0,) * 31)
+
+
 class Int8RowEncoderTests(unittest.TestCase):
     def test_binary32_half_boundary_is_byte_identical_without_numpy(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -308,6 +568,315 @@ class Int8RowEncoderTests(unittest.TestCase):
 
 
 class Fp4ExpertPackCompileTests(unittest.TestCase):
+    def test_activation_aware_profile_preserves_fp4_abi_and_provenance(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            name = "model.language_model.layers.0.mlp.gate_proj.weight"
+            calibration_root = root / "calibration"
+            _write_dense_calibration(
+                calibration_root,
+                name,
+                [[1] + [0] * 31],
+                columns=32,
+            )
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="hybrid_delta",
+                quant_profile=FP4_ACTIVATION_QUANT_PROFILE,
+                activation_calibration=calibration_root,
+                source_revision=source.name,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            self.assertEqual(
+                manifest["quantization"]["profile"],
+                FP4_ACTIVATION_QUANT_PROFILE,
+            )
+            calibration = manifest["quantization"]["activation_calibration"]
+            self.assertEqual(calibration["dense_files"], 1)
+            self.assertEqual(calibration["matrix_names"], [name])
+            entry = next(
+                item for item in manifest["tensors"] if item["name"] == name
+            )
+            self.assertEqual(entry["quant_abi"], FP4_QUANT_ABI_ID)
+            self.assertEqual(
+                entry["fp4_scale_policy"],
+                "activation-aware-complete-output-residual-v1",
+            )
+            quality = qualify_container_against_source(
+                source,
+                output,
+                samples_per_tensor=3,
+                maximum_relative_l2=0.40,
+                minimum_cosine=0.80,
+            )
+            self.assertTrue(quality["valid"])
+            self.assertEqual(
+                quality["sampled"]["fp4_payload_mismatches"], 0
+            )
+            self.assertEqual(
+                quality["sampled"]["fp4_scale_mismatches"], 0
+            )
+
+    def test_activation_code_profile_is_artifact_driven_and_qualified(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            name = "model.language_model.layers.0.mlp.gate_proj.weight"
+            calibration_root = root / "calibration"
+            _write_dense_calibration(
+                calibration_root,
+                name,
+                [[1, 1] + [0] * 30],
+                columns=32,
+            )
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="hybrid_delta",
+                quant_profile=FP4_ACTIVATION_CODE_QUANT_PROFILE,
+                activation_calibration=calibration_root,
+                source_revision=source.name,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            calibration = manifest["quantization"]["activation_calibration"]
+            self.assertEqual(calibration["payload_dense_matrices"], 1)
+            self.assertEqual(calibration["payload_matrix_names"], [name])
+            entry = next(
+                item for item in manifest["tensors"] if item["name"] == name
+            )
+            self.assertEqual(entry["quant_abi"], FP4_QUANT_ABI_ID)
+            self.assertEqual(
+                entry["fp4_payload_policy"],
+                "activation-aware-adjacent-code-top64-complete-output-residual-v1",
+            )
+            quality = qualify_container_against_source(
+                source,
+                output,
+                samples_per_tensor=3,
+                maximum_relative_l2=0.40,
+                minimum_cosine=0.80,
+            )
+            self.assertTrue(quality["valid"])
+            self.assertEqual(
+                quality["sampled"]["fp4_payload_mismatches"], 0
+            )
+            self.assertEqual(
+                quality["sampled"]["fp4_scale_mismatches"], 0
+            )
+
+    def test_dense_encoding_policy_resolves_capability_role_and_excludes_calibration(self) -> None:
+        if quant_module._np is None:
+            self.skipTest("NumPy is required")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            a_projections = [
+                f"model.language_model.layers.{layer}.linear_attn."
+                "in_proj_a.weight"
+                for layer in range(3)
+            ]
+            a_projection = a_projections[0]
+            fp4_projection = (
+                "model.language_model.layers.0.mlp.gate_proj.weight"
+            )
+            calibration_root = root / "calibration"
+            for name in (a_projection, fp4_projection):
+                _write_dense_calibration(
+                    calibration_root,
+                    name,
+                    [[1] + [0] * 31],
+                    columns=32,
+                )
+            policy_path = root / "dense-encoding-policy.json"
+            policy_path.write_text(json.dumps({
+                "schema": "expert-pack-dense-encoding-policy-v1",
+                "rules": [{
+                    "encoding": MXFP6_QUANT_PROFILE,
+                    "capability": (
+                        "block.recurrent-linear-attention."
+                        "split-gated-delta.v1"
+                    ),
+                    "tensor_role": "a_projection",
+                }],
+            }), encoding="utf-8")
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="hybrid_delta",
+                quant_profile=FP4_ACTIVATION_CODE_QUANT_PROFILE,
+                activation_calibration=calibration_root,
+                dense_encoding_policy=policy_path,
+                source_revision=source.name,
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            policy = manifest["quantization"]["dense_encoding_policy"]
+            self.assertEqual(policy["resolved_tensor_count"], 3)
+            self.assertEqual(policy["resolved_tensors"], a_projections)
+            entries = {
+                entry["name"]: entry for entry in manifest["tensors"]
+            }
+            self.assertTrue(all(
+                entries[name]["quant_abi"] == MXFP6_QUANT_ABI_ID
+                for name in a_projections
+            ))
+            self.assertEqual(
+                entries[fp4_projection]["quant_abi"], FP4_QUANT_ABI_ID
+            )
+            calibration = manifest["quantization"]["activation_calibration"]
+            self.assertEqual(
+                calibration["excluded_matrix_names"], [a_projection]
+            )
+            self.assertEqual(calibration["matrix_names"], [fp4_projection])
+            self.assertEqual(
+                calibration["payload_matrix_names"], [fp4_projection]
+            )
+
+    def test_dense_encoding_policy_fails_closed_on_unknown_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            policy_path = root / "dense-encoding-policy.json"
+            policy_path.write_text(json.dumps({
+                "schema": "expert-pack-dense-encoding-policy-v1",
+                "rules": [{
+                    "encoding": MXFP6_QUANT_PROFILE,
+                    "capability": (
+                        "block.recurrent-linear-attention."
+                        "split-gated-delta.v1"
+                    ),
+                    "tensor_role": "not_a_real_role",
+                }],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "matched no operation"):
+                compile_checkpoint(CompileOptions(
+                    source=source,
+                    output=root / "pack",
+                    adapter="hybrid_delta",
+                    quant_profile=FP4_QUANT_PROFILE,
+                    dense_encoding_policy=policy_path,
+                ))
+
+    def test_bf16_dense_activation_input_is_artifact_declared(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            output = root / "pack"
+            result = compile_checkpoint(CompileOptions(
+                source=source,
+                output=output,
+                adapter="hybrid_delta",
+                quant_profile=FP4_QUANT_PROFILE,
+                dense_activation_input="bf16",
+            ))
+            self.assertTrue(result["validation"]["valid"])
+            manifest = load_json(output / "manifest.json")
+            self.assertEqual(
+                manifest["quantization"]["dense_activation_input"],
+                "bf16",
+            )
+            program = (output / "runtime-model.tsv").read_text(
+                encoding="utf-8"
+            )
+            self.assertIn(
+                "attribute\tdense_activation_input_bf16\t1\n", program
+            )
+            self.assertIn(
+                "kernel\tdense.activation-input.bfloat16.v1\t1\n", program
+            )
+
+    def test_bf16_dense_activation_input_rejects_mxfp6_mix(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_hybrid_delta_fixture(source)
+            policy_path = root / "dense-encoding-policy.json"
+            policy_path.write_text(json.dumps({
+                "schema": "expert-pack-dense-encoding-policy-v1",
+                "rules": [{
+                    "encoding": MXFP6_QUANT_PROFILE,
+                    "capability": (
+                        "block.recurrent-linear-attention."
+                        "split-gated-delta.v1"
+                    ),
+                    "tensor_role": "a_projection",
+                }],
+            }), encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError, "requires FP4 dense matrices"
+            ):
+                compile_checkpoint(CompileOptions(
+                    source=source,
+                    output=root / "pack",
+                    adapter="hybrid_delta",
+                    quant_profile=FP4_QUANT_PROFILE,
+                    dense_encoding_policy=policy_path,
+                    dense_activation_input="bf16",
+                ))
+
+    def test_mse_profile_preserves_abi_and_passes_source_quality(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            source.mkdir()
+            _make_wide_fixture(source)
+            output = root / "pack"
+            compile_checkpoint(
+                CompileOptions(
+                    source=source,
+                    output=output,
+                    quant_profile=FP4_MSE_QUANT_PROFILE,
+                    max_expert_pack_bytes=PACK_ALIGNMENT,
+                    source_id="synthetic/mse-quality",
+                    source_revision=source.name,
+                )
+            )
+            manifest = load_json(output / "manifest.json")
+            self.assertEqual(
+                manifest["quantization"]["profile"],
+                FP4_MSE_QUANT_PROFILE,
+            )
+            self.assertEqual(
+                manifest["quantization"]["abi_id"], FP4_QUANT_ABI_ID
+            )
+            self.assertEqual(
+                {entry["quant_abi"] for entry in manifest["experts"]},
+                {FP4_QUANT_ABI_ID},
+            )
+            quality = qualify_container_against_source(
+                source, output, samples_per_tensor=3,
+                maximum_relative_l2=0.30, minimum_cosine=0.90,
+            )
+            self.assertTrue(quality["valid"])
+            self.assertEqual(
+                quality["sampled"]["fp4_payload_mismatches"], 0
+            )
+            self.assertEqual(
+                quality["sampled"]["fp4_scale_mismatches"], 0
+            )
+
     def test_fp4_source_quality_gate_is_artifact_driven_and_detects_corruption(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

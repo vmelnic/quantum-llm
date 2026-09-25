@@ -70,6 +70,18 @@ def _parser() -> argparse.ArgumentParser:
         "--sampling-profiles", type=Path,
         help="artifact-declared thinking/non-thinking sampling defaults",
     )
+    compile_parser.add_argument(
+        "--activation-calibration", type=Path,
+        help="validated runtime Q8 captures for activation-aware FP4",
+    )
+    compile_parser.add_argument(
+        "--dense-encoding-policy", type=Path,
+        help="capability/role rules selecting alternate dense weight ABIs",
+    )
+    compile_parser.add_argument(
+        "--dense-activation-input", choices=("q8", "bf16"), default="q8",
+        help="artifact-declared activation operand encoding for dense FP4 projections",
+    )
     compile_parser.add_argument("--resume", action="store_true")
     compile_parser.add_argument(
         "--reclaim-source-shards", action="store_true",
@@ -102,6 +114,10 @@ def _parser() -> argparse.ArgumentParser:
     refresh_parser.add_argument("--config-file", default="config.json")
     refresh_parser.add_argument(
         "--index-file", default="model.safetensors.index.json"
+    )
+    refresh_parser.add_argument(
+        "--dense-activation-input", choices=("q8", "bf16"),
+        help="replace the artifact-declared dense activation operand encoding",
     )
 
     sampling_parser = commands.add_parser(
@@ -336,6 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     source_id=args.source_id,
                     source_revision=args.source_revision,
                     sampling_profiles=args.sampling_profiles,
+                    activation_calibration=args.activation_calibration,
+                    dense_encoding_policy=args.dense_encoding_policy,
+                    dense_activation_input=args.dense_activation_input,
                     config_file=args.config_file,
                     index_file=args.index_file,
                     resume=args.resume,
@@ -356,6 +375,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             result = refresh_runtime_model_program(
                 args.container, args.output, args.source, args.adapter,
                 config_file=args.config_file, index_file=args.index_file,
+                dense_activation_input=args.dense_activation_input,
             )
         elif args.command == "refresh-sampling-profiles":
             result = refresh_sampling_profiles(

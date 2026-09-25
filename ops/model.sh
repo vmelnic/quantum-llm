@@ -308,7 +308,8 @@ print(maximum, maximum_thinking_output, per_token, *values)
       "${artifact_max_context}" "${max_context}"
     max_context="${artifact_max_context}"
   fi
-  if (( artifact_kv_bytes_per_token > 0 )); then
+  if (( artifact_kv_bytes_per_token > 0 )) &&
+     [[ "${kv_cache_dtype}" == fp16 || "${kv_cache_dtype}" == artifact ]]; then
     local artifact_kv_mib
     artifact_kv_mib=$((
       (((max_context + kv_page_tokens - 1) / kv_page_tokens) *

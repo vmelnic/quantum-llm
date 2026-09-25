@@ -1824,6 +1824,19 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         }, "chat")
         self.assertEqual(full_non_thinking.maximum, 126)
 
+        plain_decode = app.parse_request({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "speculative_decoding": False,
+        }, "chat")
+        self.assertFalse(plain_decode.speculative_decoding)
+        with self.assertRaises(expert_server.RequestError):
+            app.parse_request({
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "speculative_decoding": "false",
+            }, "chat")
+
     def test_responses_request_uses_artifact_sampling_contract(self) -> None:
         class Tokenizer:
             def apply_chat_template(self, messages: object, **_kwargs: object) -> list[int]:
@@ -2334,6 +2347,63 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
         result = list(app.generate([3], 5))
         self.assertEqual(result, [(7, "")])
         self.assertEqual(app.worker.active_ids, set())
+
+    def test_non_speculative_generation_uses_plain_worker_steps(self) -> None:
+        class Worker:
+            mtp_enabled = True
+
+            def __init__(self) -> None:
+                self.active_ids: set[int] = set()
+
+            def begin(self, request_id: int, _prompt: list[int],
+                      _context_limit: int,
+                      _sampling: SamplingSettings) -> None:
+                self.active_ids.add(request_id)
+
+            def cancel(self, request_id: int) -> None:
+                self.active_ids.discard(request_id)
+
+        class Batcher:
+            def __init__(self, worker: Worker) -> None:
+                self.worker = worker
+                self.steps: list[tuple[bool, bool]] = []
+                self.tokens = iter((20, 21, 22))
+
+            def step(self, request_id: int, final: bool,
+                     hold: bool = False) -> int:
+                self.steps.append((final, hold))
+                if final:
+                    self.worker.active_ids.discard(request_id)
+                return next(self.tokens)
+
+            def take_buffered(self, _request_id: int) -> list[int]:
+                return []
+
+        class Tokenizer:
+            def decode(self, tokens: list[int], **_kwargs: object) -> str:
+                return ",".join(str(token) for token in tokens)
+
+        worker = Worker()
+        app = application_fixture()
+        app.args = types.SimpleNamespace(generation_timeout=10.0)
+        app.request_id = lambda: 1
+        app.worker = worker
+        app.decode_batcher = Batcher(worker)
+        app.tokenizer = Tokenizer()
+        app.eos_token_ids = set()
+        app.increment = lambda *_args, **_kwargs: None
+        app.observe_latency = lambda *_args, **_kwargs: None
+
+        result = list(app.generate(
+            [3], 3, speculative_decoding=False,
+        ))
+
+        self.assertEqual([token for token, _delta in result], [20, 21, 22])
+        self.assertEqual(
+            app.decode_batcher.steps,
+            [(False, True), (False, True), (True, False)],
+        )
+        self.assertEqual(worker.active_ids, set())
 
     def test_non_retained_generation_omits_checkpoint(self) -> None:
         class Worker:

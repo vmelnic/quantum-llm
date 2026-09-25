@@ -907,7 +907,7 @@ double check_split_delta() {
         d_recurrent.get(), d_conv.get(), d_output.get(), key_heads,
         value_heads, key_dim, value_dim, kernel, 1.0e-6F,
         expert::runtime::cuda::GatedDeltaOutputActivation::silu,
-        nullptr}));
+        false, nullptr}));
   };
   run(first_qkv, first_z, first_b, first_a);
   run(second_qkv, second_z, second_b, second_a);

@@ -10,9 +10,13 @@ param(
     [string]$SourceRevision = "local",
     [string]$Adapter = "olmoe",
     [string]$SamplingProfiles = "",
+    [string]$ActivationCalibration = "",
+    [string]$DenseEncodingPolicy = "",
+    [ValidateSet("q8", "bf16")]
+    [string]$DenseActivationInput = "q8",
     [string]$ConfigFile = "config.json",
     [string]$IndexFile = "model.safetensors.index.json",
-    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
+    [ValidateSet("int8-symmetric-per-row-v1", "fp4-e2m1-ue8m0-block32-v1", "fp4-e2m1-ue8m0-block32-mse-v2", "fp4-e2m1-ue8m0-block32-activation-aware-v3", "fp4-e2m1-ue8m0-block32-activation-codes-v4", "nvfp4-e2m1-e4m3fn-block16-w4a4-v1")]
     [string]$QuantProfile = "int8-symmetric-per-row-v1",
     [int64]$MaxExpertPackBytes = 4GB,
     [switch]$Resume,
@@ -46,6 +50,7 @@ try {
             "--config-file", $ConfigFile,
             "--index-file", $IndexFile,
             "--quant-profile", $QuantProfile,
+            "--dense-activation-input", $DenseActivationInput,
             "--max-expert-pack-bytes", [string]$MaxExpertPackBytes
         )
         if ($Resume) { $arguments += "--resume" }
@@ -54,6 +59,18 @@ try {
             $arguments += @(
                 "--sampling-profiles",
                 [System.IO.Path]::GetFullPath($SamplingProfiles)
+            )
+        }
+        if (-not [string]::IsNullOrWhiteSpace($ActivationCalibration)) {
+            $arguments += @(
+                "--activation-calibration",
+                [System.IO.Path]::GetFullPath($ActivationCalibration)
+            )
+        }
+        if (-not [string]::IsNullOrWhiteSpace($DenseEncodingPolicy)) {
+            $arguments += @(
+                "--dense-encoding-policy",
+                [System.IO.Path]::GetFullPath($DenseEncodingPolicy)
             )
         }
     }
@@ -71,7 +88,8 @@ try {
             "--source", $resolvedSource,
             "--adapter", $Adapter,
             "--config-file", $ConfigFile,
-            "--index-file", $IndexFile
+            "--index-file", $IndexFile,
+            "--dense-activation-input", $DenseActivationInput
         )
     }
     elseif ($Action -eq "RefreshSamplingProfiles") {

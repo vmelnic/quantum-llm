@@ -24,6 +24,9 @@ The complete product goal is not ready:
   and some cancellations require restart;
 - durable supervision, long-prefix failure recovery and a hardened network
   edge remain incomplete.
+- a Qwen native worker faulted inside the NVIDIA CUDA driver during sequential
+  model switching on 2026-09-24; an unchanged retry passed, but restart
+  reliability remains unqualified.
 
 ## Ready components
 

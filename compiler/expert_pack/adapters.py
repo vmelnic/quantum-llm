@@ -7,7 +7,7 @@ import math
 import struct
 from dataclasses import dataclass
 
-from .constants import DTYPE_BYTES, FP4_QUANT_PROFILE, QUANT_PROFILES
+from .constants import DTYPE_BYTES, FP4_QUANT_PROFILES, QUANT_PROFILES
 from .errors import AdapterError
 from .safetensors import SafeTensorCheckpoint, TensorInfo
 
@@ -131,6 +131,11 @@ class AdaptedModel:
     # only when the selected container profile is FP4; existing adapters keep
     # their current INT8/FP32 dense representation by leaving this set empty.
     dense_fp4: frozenset[str] = frozenset()
+    # Dense MXFP6 placement is semantic. An adapter may declare it directly,
+    # or the common compiler may resolve an artifact encoding policy against
+    # operation capabilities and tensor roles. The writer and runtime dispatch
+    # exclusively on the resulting record ABI.
+    dense_mxfp6: frozenset[str] = frozenset()
     # Source-native NVFP4 records retain their packed values, local E4M3FN
     # scales and both checkpoint global divisors. They are not requantized by
     # the container writer.
@@ -938,7 +943,7 @@ class Qwen3NextAdapter:
                 f"model.layers.{layer}.mlp.gate.weight"
                 for layer in range(layers)
             ),
-            supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
+            supported_expert_quant_profiles=frozenset(FP4_QUANT_PROFILES),
         )
 
 
@@ -1020,6 +1025,10 @@ class HybridDeltaAdapter:
         full_interval = _integer(text, "full_attention_interval")
         mtp_layers = _integer(text, "mtp_num_hidden_layers")
         epsilon = _number(text, "rms_norm_eps")
+        if text.get("dtype") != "bfloat16":
+            raise AdapterError(
+                "hybrid_delta requires bfloat16 activation semantics"
+            )
         # This ABI declares head_dim explicitly. Its output-gated attention
         # may project to a query width larger than hidden_size, so residual
         # width divisibility by the query-head count is not an invariant.
@@ -1764,7 +1773,7 @@ class HybridDeltaAdapter:
                 name for name in expected
                 if is_moe and name.startswith("mtp.")
             ),
-            supported_expert_quant_profiles=frozenset((FP4_QUANT_PROFILE,)),
+            supported_expert_quant_profiles=frozenset(FP4_QUANT_PROFILES),
         )
 
 
