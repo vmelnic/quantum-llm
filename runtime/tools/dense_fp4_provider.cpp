@@ -11378,7 +11378,7 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     std::uint64_t active_expert_host_cache_bytes) {
   try {
     if (discover_active_expert_devices)
-      active_expert_devices = ec::discover_pascal_active_expert_devices();
+      active_expert_devices = ec::discover_active_expert_devices();
     if (active_expert_devices.empty()) {
       active_expert_device_cache_bytes = 0U;
       active_expert_host_cache_bytes = 0U;

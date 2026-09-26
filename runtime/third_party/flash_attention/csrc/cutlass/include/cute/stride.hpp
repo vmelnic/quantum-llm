@@ -282,7 +282,7 @@ using GenRowMajor = LayoutRight; // Alias
 
 namespace detail {
 
-// For GCC8.5 -- Use of lambdas in unevaluated contexts. Instead use function objects.
+// Keep the fold operation in a functor while selecting the sequence directly.
 template <class Major>
 struct CompactLambda;
 
@@ -295,9 +295,15 @@ compact(Shape   const& shape,
         Current const& current)
 {
   if constexpr (is_tuple<Shape>::value) { // Shape::tuple Current::int
-    using Lambda = CompactLambda<Major>;                  // Append or Prepend
-    using Seq    = typename Lambda::template seq<Shape>;  // Seq or RSeq
-    return cute::detail::fold(shape, cute::make_tuple(cute::make_tuple(), current), Lambda{}, Seq{});
+    using Lambda = CompactLambda<Major>;
+    if constexpr (is_same_v<Major, LayoutLeft>) {
+      return cute::detail::fold(shape, cute::make_tuple(cute::make_tuple(), current),
+                                Lambda{}, tuple_seq<Shape>{});
+    } else {
+      static_assert(is_same_v<Major, LayoutRight>);
+      return cute::detail::fold(shape, cute::make_tuple(cute::make_tuple(), current),
+                                Lambda{}, tuple_rseq<Shape>{});
+    }
   } else {                                // Shape::int Current::int
     if constexpr (is_constant<1, Shape>::value) {
       return cute::make_tuple(Int<0>{}, current); // If current is dynamic, this could save a reg
@@ -320,8 +326,6 @@ struct CompactLambda<LayoutLeft>
     return cute::make_tuple(append(get<0>(init), get<0>(result)), get<1>(result));  // Append
   }
 
-  template <class Shape>
-  using seq = tuple_seq<Shape>;                                                     // Seq
 };
 
 // For GCC8.5 -- Specialization LayoutRight
@@ -335,8 +339,6 @@ struct CompactLambda<LayoutRight>
     return cute::make_tuple(prepend(get<0>(init), get<0>(result)), get<1>(result));  // Prepend
   }
 
-  template <class Shape>
-  using seq = tuple_rseq<Shape>;                                                     // RSeq
 };
 
 } // end namespace detail

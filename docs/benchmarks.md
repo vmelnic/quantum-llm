@@ -14,7 +14,45 @@ Status: canonical measurement ledger, 2026-09-21.
 
 ## Validation baseline
 
-The latest native changed-code gate used the Windows Release/CUDA build
+### 2026-09-25 CUDA 13.4 clean build and isolated Pi `xhigh` smoke
+
+The Windows MSVC 19.44 / CUDA 13.4 Release build used a verified clean build
+directory and `--clean-first`. CTest passed 8/8 and the canonical remote Python
+suite passed 99 tests. The build still emitted 14,992 warnings, all from the
+vendored CUTLASS/FlashAttention headers; first-party CUDA/C++ and generated
+stub warnings were eliminated. This is **not** a zero-warning release gate.
+
+After this build, each of the six models in the remaining `quantum-llm` Pi
+catalog was started sequentially on the RTX 3090 and answered `hi` through Pi
+at `xhigh`. Pi ran from an empty temporary directory with `--no-session`,
+`--no-context-files`, `--no-extensions`, `--no-skills`, and
+`--no-prompt-templates`. No additional output-token ceiling was applied;
+Pi's built-in system instructions still contributed prompt tokens.
+
+| Pi model | Isolated `xhigh` `hi` |
+|---|---|
+| `qwen3.8-27b-fp4` | visible coherent answer |
+| `qwen3.8-27b-abliterated-fp4` | visible coherent answer |
+| `qwen3.8-flash-next-fp4` | visible coherent answer; 1,655 prompt and 144 generated tokens, 113.672 s server wall |
+| `ornith-1.5-35b-a3b-fp4` | visible coherent answer |
+| `muse-glimmer-30b-fp4` | visible coherent answer |
+| `mistral-small-4-119b-nvfp4` | visible coherent answer |
+
+An earlier direct Ornith `xhigh` `hi` generated 19 reasoning tokens, stopped
+normally, and produced no visible text. A later default-temperature series
+reproduced this at attempt 8: the model emitted a coherent final reply inside
+`reasoning_content` and stopped without `</think>`. The response parser did not
+lose a final-channel token. With only temperature changed from the artifact's
+`1.0` to the author's [general-use recommendation of `0.6`](https://huggingface.co/ornith-ai/Ornith-1.5-35B-A3B),
+30/30 independent uncapped `xhigh` `hi` requests produced visible text. This
+supports an artifact sampling-policy candidate, not a guarantee against future
+empty replies. The policy has not yet been published: the existing artifact
+lacks current placement metadata, so a fresh source compile is required.
+The separate `pascal-llm` provider's first Pi
+request timed out, and TCP to its shared `10.10.88.7:8080` endpoint timed out;
+its seven configured models were not qualified by this run.
+
+The prior native changed-code gate used the Windows Release/CUDA build
 (MSVC 19.44, CUDA 12.1), built `--clean-first --parallel 22`. Windows CTest
 passed 7/7, including the independent grouped standard-FP4 CUDA smoke, and the
 canonical compiler/server suite ran 119 tests successfully. The telemetry-only
@@ -133,6 +171,297 @@ The service was stopped and an unchanged controlled retry passed both Pi and
 direct chat. The root cause and rapid-restart reliability remain unqualified;
 the single successful retry is not proof of a fix. After the final stop, port
 8080 was closed, no runner process remained, and GPU usage was 292 MiB.
+
+#### Qwen English numeric-output single request, 2026-09-25
+
+One direct API request used `qwen3.8-27b-fp4` on one RTX 3090, the standard
+FP4 artifact, Q4H target KV, enabled MTP-4, `xhigh`, no prior conversation,
+and `max_completion_tokens=32768`. The 614-token prompt requested exactly 40
+fictional archive entries. Each entry required a calculated year, two ISO 8601
+timestamps, a retention date, a cyclic ISO country/currency-code pair, an
+identifier, and source/verified values; the same numbers and codes had to recur
+in 70--100 words of English prose. The exact request and raw JSON response are
+saved under `out/gates/qwen27b-numeric-english-20260925-{request,response}.json`.
+
+| Gate | Observed result |
+|---|---|
+| HTTP / client wall | 200 / 459.528 s |
+| completion / reasoning tokens | 32,768 / 24,108 |
+| finish reason | `length` |
+| complete machine-readable lines | 39/39 correct for records 1--39 (years 1985--2023) |
+| complete prose paragraphs | 38/38 repeated the required ID, year, source, verified, retention date and ISO codes correctly; no unexpected numeric runs |
+| truncation | record 39 prose ends mid-sentence; record 40 and the requested checksum are absent |
+| text encoding | no non-ASCII decimal digits or replacement characters in visible content |
+
+The observed output provides no evidence of numeric corruption in the
+completed portion, including late records. It does **not** pass the requested
+40-record completion gate: `xhigh` reasoning consumed most of the output
+allowance, leaving 8,660 completion tokens outside the reported reasoning
+count. One synthetic request cannot establish general numeric fidelity or
+separate model-weight error from runtime error.
+
+#### Planned Pi 256,000-token comparative dialogue, 2026-09-25
+
+Status at 2026-09-25: **the latest Qwen run was stopped after a model-call
+stall; no 256K result exists**. Its complete remote result directory was
+copied to
+`out/benchmarks/pi256k/quantum-interrupted-stall-20260925` locally; all
+49 copied files matched the remote originals by SHA-256, and the originals
+remain on `3090box`. The local archive has a per-call table and file guide in
+its `README.md`. This was Qwen3.8-27B standard FP4 weights, Q4H target KV,
+MTP-4, Pi `xhigh`, one RTX 3090, and a configured 256,000-position context.
+Three user turns completed (`hi`, live research, conference-app coding), with
+25 completed model calls and a maximum measured populated prompt of 58,664
+tokens. The unfinished fourth turn asked for iCalendar import and live RFC
+5545 guidance; it began at 14:25:06 UTC, emitted 690 thinking deltas (2,442
+characters) through 14:26:37 UTC, then produced no more events, tool call,
+visible text, or provider completion telemetry for over two hours. The GPU
+was idle at 0% while the process and HTTP connection remained alive. This is
+an observed stall, not evidence of a text loop or a known root cause. The
+user-requested stop removed the benchmark process tree; port 18080 was free,
+GPU memory returned to 292 MiB used, and the task was unregistered. No
+`COMPLETE.json` was produced.
+
+Across only the 25 completed calls, 50,323 generated tokens comprised 29,613
+reasoning and 20,710 visible tokens. Provider prefill consumed 1,327.951 s
+and decode 719.779 s; weighted generated-token decode was 69.915 tok/s.
+The 2,081.438 s elapsed through the last completed call gives 9.950 visible
+tok/s end-to-end, excluding the unfinished call and the subsequent stall.
+All 25 calls had `resumed=false` and full-prompt prefill; all 25 provider logs
+said `session_retain_skipped` with `reason=speculative_bonus`. This means no
+retained Pi prefix, **not** necessarily cold NVMe reads. Paging measurements
+were unavailable (`null`) in these call records. A single 27,230-token
+completion (24,434 reasoning) at prompt 4,814 jumped the next prompt to
+35,291. Correctness is still `pending_review`; this incomplete run does not
+pass the long-context or quality gate.
+
+Earlier Qwen launches were also stopped and archived. The third partial run is preserved on the 3090
+host under `out/benchmarks/pi256k/quantum-aborted-checkpoint-redesign-20260925`.
+Its first two turns passed: `hi` (2,239 populated
+prompt tokens) and the research request (3,362 populated prompt tokens,
+42.234 s end-to-end, 2,143 completion tokens, 1,403 reasoning tokens). The
+research turn used Pi's built-in PowerShell tool and returned live GitHub
+repository URLs and a fetched W3C URL. Pi `xhigh`, compaction-off and the
+request-level canonical sampling parameters were confirmed in its state.
+The third turn entered a long tool/model loop. The former controller wrote
+checkpoints only after a full user turn, so its first reported 32K crossing
+was 47,116 tokens after 27,705, not a 32K measurement. Raw Pi and provider
+logs can support per-call reconstruction, but cannot retroactively create an
+unobserved 32K prompt. The benchmark-owned controller, Pi and server process
+tree was stopped; port 18080 was free and the RTX 3090 returned to its idle
+allocation. The task was unregistered without deleting the archived evidence.
+The first revised run proved per-call persistence but correctly failed its 4K
+gate: consecutive prompt sizes were 3,636 and 5,656 around a live research
+tool call. The 5,656-token call was recorded as `missed_overshoot`; it is not
+a 4K speed result. The first call generated 1,831 tokens (1,267 reasoning)
+before invoking tools, explaining most of the jump. The run cleaned its
+port/GPU and is preserved as
+`out/benchmarks/pi256k/quantum-failed-4k-checkpoint-20260925`. A revised
+dialogue inserted brief ordinary follow-ups before live research and coding;
+the strict 4K gate was still in force for that run.
+The next run measured 4K at 4,466 populated prompt tokens, 6K at 6,191,
+and 8K at 8,189. Its first coding call then produced 9,206 completion
+tokens, including 9,158 reasoning tokens, before a tool call. The following
+actual prompt was 17,422 tokens: 10K was missed by 7,422 and the run stopped
+cleanly. The 17,422-token call is a near-16K observation, but it does not
+replace the missed 10K gate or establish a complete benchmark. The second
+partial result is preserved locally and on the host under
+`out/benchmarks/pi256k/quantum-failed-10k-checkpoint-20260925`; port/GPU cleanup
+passed. This shows that a fixed, natural `xhigh` Pi dialogue can skip a
+requested context size by many thousands of tokens in one model call.
+
+The first Qwen service loaded with the requested FP4/Q4H/MTP-4 formats and
+256,000-token context, but Pi 0.87.1 clamped the unlisted `xhigh` level to
+`high`. The task failed its state gate before sending `hi`, stopped its own
+service, and released its GPU allocation. The partial run is preserved on the
+3090 host under `out/benchmarks/pi256k/quantum-failed-xhigh-clamp-20260925`.
+The benchmark-local provider definition now declares `thinkingLevelMap.xhigh`
+and request-level sampling, including `presence_penalty=0.5`. A second launch
+confirmed Pi `xhigh`, disabled compaction and those model sampling parameters.
+The `hi` turn completed with 1,756 populated prompt tokens, 27 completion
+tokens (15 reasoning, 12 visible), 2.125 s cold prefill, 2.172 s provider TTFT,
+72 generated tok/s for that one tiny turn, and 2.625 s total turn wall time.
+These numbers are **not** a 32K/64K/128K/256K result. The next turn's custom
+`web_search` extension hung after launching a live request despite its declared
+20-second timeout; the model had finished its preceding tool call and was idle.
+The run was terminated, its exact process tree and GPU allocation cleaned up,
+and the partial data preserved under
+`out/benchmarks/pi256k/quantum-aborted-web-search-20260925`. No format or model
+throughput conclusion follows from this tool failure. The custom extension has
+been removed from the active candidate in favor of Pi's built-in PowerShell tool,
+whose public-API request succeeded in the host preflight. This is a separate comparative benchmark, not
+the project's exact-F16/262,144-token acceptance gate. The benchmark uses one
+RTX 3090 and runs backends sequentially. It starts with official
+`qwen3.8-27b-fp4:xhigh` (standard FP4 weights, Q4H target KV, MTP-4), then
+tests the official [ggml-org GGUF](https://huggingface.co/ggml-org/Qwen3.8-27B-GGUF/tree/main)
+Q4_K_M artifact with pinned [llama.cpp v0.5.0](https://github.com/ggml-org/llama.cpp/releases/tag/v0.5.0).
+GGUF Q4_K_M weights, llama.cpp `q4_0` KV and draft MTP-4 are **not**
+numerically equivalent to QPack FP4, Q4H and its MTP-4 implementation. Report
+the formats and actual CPU/GPU placement alongside every speed comparison.
+
+The English Pi dialogue begins with exactly `hi`, then grows through a
+disposable offline-first conference-schedule app: live research on iCalendar,
+time zones and accessibility, implementation, real file/tool operations,
+tests, changed requirements and long-range recall. Pi uses its own built-in
+PowerShell tool to fetch live public API/source pages over the network; it has
+no preloaded answers or custom web-search extension. Research turn 2 must
+complete a successful live request whose output includes a source URL. Pi's
+built-in PowerShell tool receives a per-call timeout in the opening request;
+the controller also fails and cleans up if any tool remains open beyond a
+90-second wall guard. Each subsequent user message is short and
+gradual; no synthetic 200K-token input block is inserted. Pi runs in an
+isolated workspace and config, with `xhigh`, automatic compaction and retries
+off. The active model context is **256,000 positions**, not 262K or 265K.
+
+The current measurement policy records **every completed Pi model call at its
+actual populated prompt size**. There are no intermediate target sizes,
+crossing tolerances, or overshoot aborts. Analysis after the run may derive
+context bands or compare nearby observations, but it must report the actual
+size of every source call and never relabel a 17,422-token observation as 10K.
+The first `hi` request in the coding harness already used 2,239 prompt
+tokens, so 1K/2K cannot be directly observed with this harness. The only
+terminal context gate is a real prompt of at least 255,000 and strictly fewer
+than 256,000 tokens, leaving room for output. Configuring a 256K window is
+not evidence that it was populated; if the next prompt exceeds capacity
+before the terminal gate, the run ends as incomplete with all prior calls
+preserved. Every completed call writes an atomic JSON file immediately after
+Pi `message_end`: actual prompt and output/reasoning/visible tokens, client
+and provider TTFT, cold/reused prefill seconds and tokens, prefill/decode
+tok/s, client wall time and effective output rates, tools completed since
+the previous call, provider telemetry and paging evidence where available.
+Each turn writes its prompt, visible response, raw Pi events, provider
+telemetry, actual input/output/reasoning token counts where reported, cold or
+retained-prefix prefill where independently logged, TTFT, decode speed, live
+tool count/time, total wall time, and `pending_review` correctness. Correctness
+is not inferred from a successful HTTP response; test-command outcomes are
+recorded as provisional evidence and source claims still need review. Missing
+provider telemetry is saved as `null`, never silently treated
+as zero. For GGUF, reported full input less log-reported prompt-eval tokens
+is saved as an **estimated** reused-prefix count, not provider-proof of exact
+retention; Qwen's own `resumed` telemetry supplies the exact classification.
+
+The GGUF download is pinned to HF revision
+`efbb3b1f70a21d97fd4495240648405f7228554f`: main Q4_K_M file
+18,973,870,528 B, SHA256
+`c600de0300ae8a0eb3a6c0b8b5561b8b96f16bd2c863c2a66c42de29d391a747`;
+MTP Q4_0 file 1,680,271,776 B, SHA256
+`c5be331f82fb61f5304adfa00ccd60c6743c8ce52255d66fa863446231d49ba4`.
+Only the maintained Xet Start/Get scripts transfer and verify these files.
+Their HF cache is explicitly relocated beneath `MODEL_ROOT` on the NVMe;
+publication makes validated hard links under
+`${MODEL_ROOT}/qwen3.8-27b-gguf-q4-k-m`. llama.cpp is pinned to the peeled
+v0.5.0 commit `7fe450e19305b828c199d602c23a8337aaa1f03b` and built for
+CUDA compute capability 8.6.
+
+The full-GPU capacity lower bound at 256,000 positions is:
+
+```text
+GGUF main weights                  18,973,870,528 B
+Q4_0 target KV estimate             4,718,592,000 B
+mandatory VRAM reserve              1,073,741,824 B
+without MTP                        24,766,204,352 B = 23.065 GiB
+MTP Q4_0 weights                    1,680,271,776 B
+with MTP                           26,446,476,128 B = 24.630 GiB
+```
+
+The estimate excludes runtime workspaces and allocator fragmentation. With
+MTP-4 it exceeds physical 3090 VRAM by at least 0.630 GiB, so the GGUF
+benchmark explicitly **allows RAM/CPU layer placement**. llama.cpp auto-fit
+may adjust the number of GPU layers, but the 256,000-token context, Q4_0 K/V,
+MTP-4, one visible 3090, 1-GiB fit margin and Pi `xhigh` remain fixed.
+`/props` must confirm the effective context is still 256,000; a silently
+reduced window fails the gate. The host had 61,014,260 KiB of free RAM at
+preparation. RAM capacity is checked again at launch. CPU-executed dense
+weights are hot per token, so offload can materially lower decode speed; this
+is a measured comparison, not a claimed throughput optimization. The
+previously measured pinned PCIe bound is 12.46 GiB/s, or at least 0.080 s
+per GiB of weights transferred per token if a configuration streams them.
+
+`placement.json` records each llama.cpp CPU-mapped, CPU-allocated and CUDA
+model **and KV** buffer (MiB) and reported GPU/total layer counts, including
+both target and MTP draft allocations. CPU model/KV **placement is selected**
+at load, before the first populated prompt token (selection threshold 0),
+not at a later 32K/64K/128K milestone. This does not claim that every mapped
+weight page or reserved KV position was already resident or touched. Per-turn
+JSON repeats that fixed
+placement beside actual populated context, and records GPU free MiB, host
+available RAM, process working set, private bytes, page faults and process
+read/write transfer counters before and after the turn, with explicit deltas.
+Mapped buffer size is **not** treated as physically resident RAM; working set
+is reported separately. RAM growth alone is **not** called new offload, and
+process read-transfer bytes are **not** automatically called NVMe traffic. The
+Qwen turns also report the provider's exact demand-paging read/upload bytes,
+RAM-hit and storage-miss counters, plus the first populated-prompt size where
+paging was actually observed; this is distinct from GGUF's fixed CPU layer/KV
+placement at startup. The raw startup/server logs are retained for auditing.
+Provider-reported TTFT and
+Pi-observed time to first stream delta/first visible text are separate fields;
+the latter includes client/transport overhead. The same per-call
+prefill/TTFT/decode definitions and
+tool-loop wall measurements apply to both backends; missing fields remain
+explicitly unavailable. The Qwen artifact's thinking sampling defaults are
+temperature 1.0, top-p 0.95, top-k 20, min-p 0 and presence penalty 0.5;
+the GGUF server is started with those same values, repeat penalty 1.0 and
+prompt caching enabled. Both Pi model entries cap an individual completion
+at 32,768 tokens as a runaway guard, not a target response length.
+
+The on-host Windows task writes durable results under
+`out/benchmarks/pi256k/{quantum,llama}` and survives SSH/PowerShell client
+disconnect while the Windows user remains logged in. The scheduled task uses
+that user's interactive token because [S4U explicitly lacks network access](https://learn.microsoft.com/en-us/windows/win32/taskschd/principal-logontype),
+which would invalidate the live-search dialogue. It never restarts an existing
+partial run or stops an occupied
+port. `ops/windows/Invoke-Pi256kBenchmark.ps1` exposes `prepare-pi`,
+`start-download`, `download-status`, `publish`, `build-llama`, `preflight`,
+`launch`, and `status`; `ops/benchmarks/pi256k/fetch.sh` copies a completed result bundle
+back to the local repository. Download/build/deploy remain prepared; the
+archived Qwen attempts above do not establish a full-context result. The
+current dialogue starts with `hi`, then live research and coding without
+artificial early questions to steer context sizes; both backends must use
+the same script.
+
+The 2026-09-26 GGUF run was stopped at the user's request because the early
+decode rate was too low to justify continuing the long-context dialogue. It
+used the pinned Q4_K_M model, Q4_0 target K/V, MTP-4, Pi `xhigh`, and one
+RTX 3090 with a configured 256,000-position window. Three completed Pi model
+calls are preserved under the host's `out/benchmarks/pi256k/llama/calls/`
+and copied locally to `out/benchmarks/pi256k/llama-aborted-20260926/`,
+along with `PROGRESS.json`, Pi events/session, placement, and server logs.
+The first `hi` call populated 2,239 prompt tokens, took 6.061 s of provider
+prefill and 6.281 s to the first client delta, and decoded at 6.740 tok/s.
+At the second user question (live iCalendar/accessibility research), the
+last completed call populated 3,632 prompt tokens and decoded at 6.672
+tok/s. The question had not completed when stopped. llama.cpp reported
+48/65 target layers and 66/66 draft layers on GPU, 5,727 MiB of CPU-mapped
+model buffers, and 1,125 MiB of CPU KV allocation. This is observed
+placement, not proof that all mapped pages were RAM-resident or that CPU
+placement alone caused the low rate. The scheduled task and its exact process
+tree were stopped; port 18081 was free, GPU memory returned to approximately
+its pre-run level, and the task registration was removed. There is no
+`COMPLETE.json` or 256K-context result from this aborted run. Do not use the
+early decode observations as a full-context or head-to-head throughput claim.
+
+The operational sequence uses the existing remote wrapper; `launch` returns
+after creating a Windows scheduled task, so the benchmark is not tied to the
+SSH session. Run the second backend only after the first has finished and its
+GPU/port cleanup gate passes:
+
+```bash
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action prepare-pi
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action preflight -Backend quantum
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action launch -Backend quantum
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action status -Backend quantum
+./ops/benchmarks/pi256k/fetch.sh quantum
+
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action start-download
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action download-status
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action publish
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action build-llama
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action preflight -Backend llama
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action launch -Backend llama
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 -Action status -Backend llama
+./ops/benchmarks/pi256k/fetch.sh llama
+```
 
 ### Coding harness
 

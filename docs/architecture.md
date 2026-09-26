@@ -28,7 +28,7 @@ official checkpoint
 candidate below ${MODEL_ROOT}
   manifest + hashes + COMPLETED
   tokenizer/generation/processor assets
-  QPack or compact payloads
+  QPack payloads
   runtime-model.tsv
        |
        | validate and promote
@@ -40,23 +40,18 @@ common Python HTTP service
 common native VM runner
   program validation and capability binding
        |
-       +------------------------------+
-       |                              |
-       v                              v
-SM86 FP4/NVFP4 provider       compressed sparse provider
-Qwen/Flash/Mistral/Muse/      DeepSeek dense/shared state
-Ornith operations             plus exact expert paging
-       |                              |
-       +--------------+---------------+
-                      v
-          optional in-process SM60/61
-          routed-expert executor
+       v
+SM86 FP4/NVFP4 providers
+Qwen/Flash/Mistral/Muse/Ornith operations
+       |
+       v
+optional in-process secondary routed-expert executor
 ```
 
 `runtime-model.tsv` declares ordered operations, tensor roles, geometry,
 encodings and required capabilities. Providers advertise the declarations they
 can execute. Common service/runtime code does not select Qwen, Mistral, Muse,
-Ornith, DeepSeek, fixed layer counts or family tensor paths. Upstream names are
+Ornith, fixed layer counts or family tensor paths. Upstream names are
 handled only by strict source adapters; genuinely new mathematics or encoding
 requires a provider capability and numerical gate.
 
@@ -66,9 +61,8 @@ row-major OCP MXFP6 E3M2 weights: four 6-bit values occupy three bytes and one
 UE8M0 scale covers each block of 32 values. Artifacts select that encoding only
 through explicit embedding, head and exact-decode capabilities; SM86 executes
 it through an emulated CUDA path because the RTX 3090 has no native FP6
-instruction. DeepSeek uses a separately authenticated compact layout suited to
-its source representation and paging geometry. Both converge at the
-executable-program, logical-page and provider boundaries.
+instruction. The supported artifacts converge at the executable-program,
+logical-page and provider boundaries.
 
 ## Model organs and placement
 
@@ -93,7 +87,6 @@ executable-program, logical-page and provider boundaries.
 | `mistral` | source-native block-16 E2M1/E4M3FN NVFP4 W4A4 MoE plus BF16 organs | artifact-declared BF16 MLA latent KV pages | text/reasoning/tools; auxiliary multimodal records are not callable support |
 | `muse` | 52-layer dense FP4 text model with global and exact 2,048-token sliding attention | exact F16 global pages plus cyclic exact F16 sliding windows; artifact maximum 131,072 | text only; preserved vision records are auxiliary |
 | `ornith` | 40-layer hybrid model; 30 recurrent, 10 full attention, 256 experts/layer, exact top-8 standard FP4 routing | resident `q4-f16-per-head` target KV and the fixed common expert cache; the complete 17,154,703,360-byte expert pool can live in the host bank | text/reasoning/tools; per-head Q4 service wiring is qualified separately from model quality |
-| `deepseek` | resident dense/shared organs; 43 routed layers x 256 experts; exact top-6 compact FP4 pages | provider-owned artifact KV and request state; no exact checkpoint/rewind/session-retention capability | text/reasoning/tools through exact demand paging |
 
 An artifact limit is an admission ceiling, not allocated context. Muse is
 clamped to 131,072; the other active artifacts currently advertise 262,144.
@@ -262,11 +255,7 @@ reported in `/model-info`, so a configured context limit is never mistaken for
 free cache capacity.
 
 Ornith's routed pool fits the configured 48 GiB host budget, so a warmed request
-can execute without NVMe reads. DeepSeek's 147,169,738,752-byte routed pool does
-not fit RAM, so cold routes still require storage. RAM-ready DeepSeek misses may
-be split between exact CPU execution and GPU fills using measured costs; CPU
-and GPU partial outputs are merged exactly. This makes the model executable
-beyond RAM+VRAM but does not remove novel-route bandwidth cost.
+can execute without NVMe reads.
 
 An explicitly configured compatible routed component can execute selected
 experts on the two P100s. Routing, stable aggregation, attention, recurrent
@@ -278,9 +267,7 @@ optional expert placement, not a dense-weight sharder or general multi-GPU
 allocator.
 
 The validated common `fixed` primary-RTX routed-VRAM budget is currently 12
-GiB. It is a ceiling, not an upfront allocation. A 13 GiB primary DeepSeek
-profile fails preflight after immutable allocations, workspace and the 1 GiB
-emergency reserve, so it is not a supported common configuration. Fitting is
+GiB. It is a ceiling, not an upfront allocation. Fitting is
 therefore an explicit per-alias policy rather than a global budget increase.
 The former `ornith-k1` profile fitted 15.9375 GiB after accounting for its
 smaller maximum K1 state. The optional P100 arena is separate and
@@ -310,11 +297,6 @@ This is continuity, not parallel decode. The Python command channel and hot
 provider slot are serialized. Multiple Pi processes may queue and retain short
 histories, but several actually populated 262K F16 contexts compete for real
 RAM/KV bytes. `MODEL_WORKER_CAPACITY` does not create concurrent GPU execution.
-
-DeepSeek does not advertise exact checkpoint/rewind/retain/drop. The service
-must not send those commands. Cancelling a long DeepSeek prefill may leave the
-worker unhealthy; readiness must be checked and the service restarted before
-another gate.
 
 ## Response and API boundary
 

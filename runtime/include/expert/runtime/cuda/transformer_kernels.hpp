@@ -412,10 +412,6 @@ struct PleDilatedConvLaunch final {
                                   bool bf16_activations = false) noexcept;
 [[nodiscard]] Status relu2_in_place(float* values, std::uint32_t elements,
                                     void* stream) noexcept;
-[[nodiscard]] Status deepseek_swiglu_product(
-    const float* gate, const float* up, float* output,
-    std::uint32_t elements, float limit, bool bf16_output,
-    void* stream) noexcept;
 [[nodiscard]] Status sigmoid_scale_in_place(float* values,
                                             const float* gate,
                                             std::uint32_t elements,
@@ -472,38 +468,6 @@ struct PleDilatedConvLaunch final {
     std::uint32_t experts, std::uint32_t top_k, float normalization_epsilon,
     float routed_scaling_factor, float* logits, float* topk_scores,
     std::uint32_t* topk_indices, void* stream) noexcept;
-
-// DeepSeek-V4 sqrt(softplus) routing. Hash layers select through the immutable
-// token table; learned layers select by score+bias while weighting by the
-// unbiased score. Both normalize the selected weights before route scaling.
-[[nodiscard]] Status deepseek_router_hash(
-    const float* input, const std::uint16_t* router_weights,
-    const std::int64_t* token_experts, std::uint32_t token_id,
-    float* logits, float* topk_scores, std::uint32_t* topk_indices,
-    float route_scale, void* stream) noexcept;
-[[nodiscard]] Status deepseek_router_learned(
-    const float* input, const std::uint16_t* router_weights,
-    const float* selection_bias, float* logits, float* topk_scores,
-    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
-[[nodiscard]] Status deepseek_router_hash_batch(
-    const float* input, const std::uint16_t* router_weights,
-    const std::int64_t* token_experts, std::uint32_t token_zero,
-    std::uint32_t token_one, float* logits, float* topk_scores,
-    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
-[[nodiscard]] Status deepseek_router_learned_batch(
-    const float* input, const std::uint16_t* router_weights,
-    const float* selection_bias, float* logits, float* topk_scores,
-    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
-[[nodiscard]] Status deepseek_router_hash_rows(
-    const float* input, const std::uint16_t* router_weights,
-    const std::int64_t* token_experts, const std::uint32_t* token_ids,
-    std::uint32_t rows, float* logits, float* topk_scores,
-    std::uint32_t* topk_indices, float route_scale, void* stream) noexcept;
-[[nodiscard]] Status deepseek_router_learned_rows(
-    const float* input, const std::uint16_t* router_weights,
-    const float* selection_bias, std::uint32_t rows, float* logits,
-    float* topk_scores, std::uint32_t* topk_indices, float route_scale,
-    void* stream) noexcept;
 
 // Qwen3-Next full attention. q_and_gate is laid out per query head as
 // [query(head_dim), output_gate(head_dim)]. K/V caches retain only KV heads.

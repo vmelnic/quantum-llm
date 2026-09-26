@@ -41,8 +41,6 @@ from its own path, so it can be invoked from any current directory.
 - QPack publication: `Invoke-SourceInventory.ps1`, `Invoke-ExpertPack.ps1`,
   source-quality gates, `Publish-HuggingFaceExpertPack.ps1` and
   `Promote-ModelArtifact.ps1`;
-- DeepSeek publication: source inspection/descriptors/oracles,
-  `Invoke-DeepSeekCompactPack.ps1` and `Publish-DeepSeekWorkerBundle.ps1`;
 - service: `Get-ModelArtifactContract.ps1`, `Start-ExpertServer.ps1`,
   `Install-ExpertServerTask.ps1`, `Get-ExpertServerStatus.ps1` and
   `Stop-ExpertServer.ps1`;

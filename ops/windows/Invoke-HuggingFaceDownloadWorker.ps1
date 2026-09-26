@@ -3,6 +3,7 @@ param(
     [Parameter(Mandatory = $true)][string]$ModelId,
     [Parameter(Mandatory = $true)][string]$Revision,
     [string]$Files = "",
+    [Parameter(Mandatory = $true)][string]$HfHome,
     [string]$ConfigFile = "config.json",
     [string]$IndexFile = "model.safetensors.index.json",
     [Parameter(Mandatory = $true)][int]$MaxWorkers,
@@ -19,6 +20,12 @@ $exitCode = 1
 $failure = $null
 $integrityChecked = $false
 try {
+    if (-not (Test-Path -LiteralPath $HfHome -PathType Container)) {
+        throw 'HfHome does not exist'
+    }
+    $env:HF_HOME = [System.IO.Path]::GetFullPath($HfHome)
+    $env:HF_HUB_CACHE = Join-Path $env:HF_HOME 'hub'
+    $env:HF_XET_CACHE = Join-Path $env:HF_HOME 'xet'
     # huggingface_hub uses hf_xet automatically when the package is installed.
     # Xet remains enabled in both modes. This flag controls whether Xet may
     # maximize internal CPU, network, buffer, and range-request concurrency.
@@ -84,9 +91,7 @@ try {
         } else {
             $integrityChecked = $true
             $cacheName = "models--" + ($ModelId -replace "/", "--")
-            $cacheRoot = Join-Path `
-                (Join-Path $env:USERPROFILE ".cache\huggingface\hub") `
-                $cacheName
+            $cacheRoot = Join-Path (Join-Path $env:HF_HOME 'hub') $cacheName
             Get-ChildItem (Join-Path $cacheRoot "blobs") `
                     -Filter "*.incomplete" -File -ErrorAction SilentlyContinue |
                 Where-Object { $_.Length -eq 0 } |
@@ -104,6 +109,7 @@ finally {
         model_id = $ModelId
         revision = $Revision
         files = $selectedFiles
+        hf_home = $env:HF_HOME
         config_file = $ConfigFile
         index_file = $IndexFile
         xet_high_performance = [bool]$XetHighPerformance

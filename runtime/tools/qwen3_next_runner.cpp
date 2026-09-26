@@ -3591,7 +3591,7 @@ make_sm86_hybrid_delta_moe_callable_provider(
   try {
     if (discover_active_expert_devices)
       active_expert_devices =
-          expert::runtime::cuda::discover_pascal_active_expert_devices();
+          expert::runtime::cuda::discover_active_expert_devices();
     if (active_expert_devices.empty()) {
       active_expert_device_cache_bytes = 0U;
       active_expert_host_cache_bytes = 0U;

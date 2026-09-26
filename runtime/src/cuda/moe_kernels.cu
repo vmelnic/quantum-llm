@@ -10,7 +10,7 @@
 #include <string>
 
 namespace expert::runtime::cuda {
-namespace {
+namespace moe_kernel_detail {
 
 constexpr unsigned kThreads = 256;
 constexpr unsigned kWarpSize = 32;
@@ -730,7 +730,8 @@ Status cuda_status(cudaError_t error, const char* operation) {
                 std::string(operation) + ": " + cudaGetErrorString(error));
 }
 
-}  // namespace
+}  // namespace moe_kernel_detail
+using namespace moe_kernel_detail;
 
 Status launch_moe_single_token(const MoeLaunch& launch) noexcept {
   const bool pointer_table = launch.gate_up_weights != nullptr &&

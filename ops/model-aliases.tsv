@@ -1,6 +1,4 @@
 model-aliases-v3
-deepseek	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact	fixed
-deepseek-v4-flash	deepseek-v4-flash	deepseek-v4-flash/worker-bundle-v3	artifact	fixed
 mistral	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed
 mistral-small-4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed
 mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	mistral-small-4-119b-nvfp4	artifact	fixed

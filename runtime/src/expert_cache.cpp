@@ -107,7 +107,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::shared_ptr<ImmutableHostBuffer> host_copy;
     std::shared_ptr<IDeviceAllocation> device;
     std::optional<ExpertSections> validated_sections;
-    DeepSeekCompactSections validated_compact;
+    SplitExpertSections validated_compact;
     std::uint64_t ram_reserved{};
     std::uint64_t vram_reserved{};
     std::uint64_t references{};
@@ -1660,11 +1660,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
     auto& entry = *iterator->second;
     const auto supported_source =
-        record.source_abi == kExpertSourceAbiExpertPackV1
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-        || record.source_abi == kExpertSourceAbiDeepSeekCompactV1
-#endif
-        ;
+        record.source_abi == kExpertSourceAbiExpertPackV1;
     if (!supported_source ||
         !same_record(entry.record, record) || !entry.host_copy ||
         !entry.validated_sections ||
@@ -2058,7 +2054,7 @@ void ExpertLease::reset() noexcept {
 HostExpertLease::HostExpertLease(
     std::shared_ptr<const void> ownership, const std::byte* bytes,
     std::size_t byte_count,
-    ExpertSections sections, DeepSeekCompactSections compact,
+    ExpertSections sections, SplitExpertSections compact,
     std::uint32_t source_abi, std::function<void()> release) noexcept
     : ownership_(std::move(ownership)), bytes_(bytes),
       byte_count_(byte_count), sections_(sections), compact_(compact),
@@ -2105,7 +2101,7 @@ const ExpertSections& HostExpertLease::sections() const noexcept {
   return sections_;
 }
 
-const DeepSeekCompactSections& HostExpertLease::compact_sections()
+const SplitExpertSections& HostExpertLease::compact_sections()
     const noexcept {
   return compact_;
 }

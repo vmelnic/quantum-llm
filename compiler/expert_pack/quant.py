@@ -150,7 +150,7 @@ def write_int8_rows(view: TensorView, destination: BinaryIO, digest: object) -> 
 
 # E2M1 finite magnitudes in nibble-index order; the sign rides bit 3.  This is
 # the exact inverse of the runtime decode table (2x these values, with the
-# kernel's final 0.5 factor) and of deepseek_quant.FP4_E2M1_VALUES.
+# kernel's final 0.5 factor) and of fp4_reference.FP4_E2M1_VALUES.
 _FP4_E2M1_LEVELS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
 _FP4_ACTIVATION_MAXIMUM_CANDIDATES = 64
 

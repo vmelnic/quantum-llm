@@ -24,7 +24,7 @@ QUANT_ABI_ID = 1
 QUANT_GROUP_SIZE = 0  # 0 means one scale per complete output row.
 
 # FP4 E2M1 payload with one UE8M0 scale per 32-value block along each output
-# row, matching the device format already used by the DeepSeek compact path.
+# row, matching the provider's FP4 block-32 device format.
 # Scale codes are clamped to [1, 254]: 255 is the UE8M0 NaN and code 0 decodes
 # inconsistently between the toolchain decoder and the CUDA kernel, so the
 # compiler never emits it.

@@ -37,9 +37,9 @@ struct CreateActiveExpertDeviceExecutorResult final {
   std::shared_ptr<IActiveExpertExecutor> executor;
 };
 
-// Resolves secondary Pascal devices relative to the CUDA device selected by
-// the primary provider. Discovery is launch policy, not a model-family rule.
-[[nodiscard]] std::vector<int> discover_pascal_active_expert_devices();
+// Resolves secondary SM86-compatible devices relative to the CUDA device
+// selected by the primary provider. Discovery is launch policy.
+[[nodiscard]] std::vector<int> discover_active_expert_devices();
 
 [[nodiscard]] CreateActiveExpertDeviceExecutorResult
 create_active_expert_device_executor(

@@ -1,15 +1,16 @@
 # Production readiness
 
 Status: functional research/pilot runtime; not production-ready for the full
-maximum-context coding objective, 2026-09-20.
+maximum-context coding objective, 2026-09-25.
 
 ## Verdict
 
-All seven artifacts start through the common task/VM and return text through
-direct chat and minimal Pi wiring. The seventh is a third-party abliterated
-Qwen artifact; its coding, behavioral quality and maximum-context behavior
-remain unqualified. Artifact validation, lifecycle, bounded API limits,
-telemetry, exact sparse routing and cleanup are functional.
+The six advertised in-scope Pi models returned text through isolated `xhigh`
+`hi` on the CUDA 13.4 clean build. This qualifies wiring only, not coding,
+behavioral quality, long context or sustained throughput. The separate
+abliterated-MSE artifact was not part of this Pi catalog. Artifact validation,
+lifecycle, bounded API limits, telemetry, exact sparse routing and cleanup are
+functional.
 
 The complete product goal is not ready:
 
@@ -20,8 +21,10 @@ The complete product goal is not ready:
 - Qwen Flash and Mistral are callable but fail coding latency/behavior gates;
 - Ornith's historical K1+fit run failed its coding fixture 2/3 after
   1,832.80 s; the new per-head-Q4 default has only a minimal Pi smoke;
-- DeepSeek novel routes remain near 1 tok/s, settled throughput is below target
-  and some cancellations require restart;
+- one Ornith direct `xhigh` `hi` stopped after reasoning without visible text;
+  later requests passed, so intermittent empty-answer reliability is open;
+- the CUDA 13.4 clean build has 14,992 vendored CUTLASS/FlashAttention
+  warnings despite zero first-party and generated-stub warnings;
 - durable supervision, long-prefix failure recovery and a hardened network
   edge remain incomplete.
 - a Qwen native worker faulted inside the NVIDIA CUDA driver during sequential
@@ -32,13 +35,13 @@ The complete product goal is not ready:
 
 | Area | Current boundary |
 |---|---|
-| artifacts | seven stable artifacts under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
+| artifacts | six advertised in-scope Pi models under `MODEL_ROOT`, fail-closed manifests/programs and transactional publication |
 | lifecycle | alias-driven install/start/status/chat/stop through one task and VM |
-| execution | declared QPack FP4, native NVFP4/BF16 and DeepSeek compact experts execute real service paths |
+| execution | declared QPack FP4 and native NVFP4/BF16 execute real service paths |
 | paging | exact top-k/stable merge with measured NVMe/RAM/VRAM traffic |
 | KV/session state | artifact-declared progressive allocation; Qwen provider supports transactional RAM parking and durable, lazy NVMe restart/resume with TTL/LRU and explicit per-artifact cleanup |
 | APIs | bounded OpenAI- and Anthropic-compatible streaming surfaces |
-| harness wiring | current defaults for six advertised models pass isolated minimal Pi `hi`; DeepSeek retains older wiring evidence and was intentionally excluded from the latest regression |
+| harness wiring | current defaults for six advertised in-scope models pass isolated minimal Pi `hi` at `xhigh` |
 | introspection | bounded health/readiness/model/metrics and per-request telemetry |
 
 ## Release blockers
@@ -48,7 +51,7 @@ The complete product goal is not ready:
 | Qwen 262K | populated exact-F16 real-harness prefill and about 15 useful tok/s |
 | harness | reliable representative coding, tools, compaction and retained-prefix behavior |
 | Flash/Mistral/Ornith/Muse | each model's documented latency, quality and populated-context gate |
-| DeepSeek | 10-15 tok/s settled, honest novel-route telemetry and automatic unhealthy-worker recovery |
+| build warnings | eliminate or replace the vendored code emitting 14,992 warnings without suppression; repeat the clean build |
 | concurrency | admission and continuity under real competing sessions; current decode remains serialized |
 | operations | durable supervisor/logs/metrics, tested rollback, TLS and rate limiting |
 | P100 | no release dependency: exact routes work, but measured throughput is worse than the preferred paths |
@@ -61,8 +64,6 @@ The complete product goal is not ready:
 - Format and fidelity names remain exact; `q4-f16-per-head` is the explicit
   lossy default for compatible artifacts, while exact F16 remains the Qwen
   acceptance target and `qwen-f16` reference.
-- DeepSeek keeps exact router/top-k/stable aggregation and receives no
-  unsupported session commands.
 - Native releases use a clean-first Windows CUDA build.
 - `ready=true` proves liveness/admission, not warm state or an SLO.
 - Every gate ends with process and device-memory cleanup.
@@ -71,7 +72,7 @@ The complete product goal is not ready:
 
 1. clean Windows Release/CUDA build, CTest and canonical Python tests;
 2. independent numerical/reference gates for every changed capability;
-3. real chat for the affected model, Qwen and DeepSeek, plus every model claimed
+3. real chat for the affected model, Qwen and every other model claimed
    universal;
 4. representative Pi gate when harness behavior changed;
 5. populated-context and failure-recovery gates relevant to the release;

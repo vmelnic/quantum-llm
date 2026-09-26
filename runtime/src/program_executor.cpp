@@ -774,7 +774,7 @@ struct MoeProgramExecutor::Core final {
           return result;
         }
 
-        const auto& prepared = session->program->prepared[next_operation];
+        const auto& bound_instruction = session->program->prepared[next_operation];
         const auto& compiled =
             session->program->provider.program.operations[next_operation];
         current_inputs.clear();
@@ -787,12 +787,12 @@ struct MoeProgramExecutor::Core final {
           current_inputs.push_back(*values[binding.value_index]);
         }
         const auto state = session->provider_states.find(
-            prepared.provider_registry_index);
+            bound_instruction.provider_registry_index);
         if (state == session->provider_states.end())
           return fail(internal_error(
               "model program lacks provider request state"));
-        inflight = prepared.provider->execute(
-            *prepared.operation, state->second,
+        inflight = bound_instruction.provider->execute(
+            *bound_instruction.operation, state->second,
             OperationInvocation{session->request, compiled, current_inputs});
         if (!inflight.valid())
           return fail(internal_error(
@@ -1002,11 +1002,11 @@ MoeProgramExecutor::Core::SessionState::start_sequence(
   }
 
   std::shared_ptr<IOperationProviderRequestState> provider_state;
-  const auto& sequence = *program->sequence;
+  const auto& bound_sequence = *program->sequence;
   {
     std::lock_guard lock(mutex);
     const auto found =
-        provider_states.find(sequence.provider_registry_index);
+        provider_states.find(bound_sequence.provider_registry_index);
     if (closed)
       return {{ErrorCode::cancelled,
                "model execution session is closed"},
@@ -1024,10 +1024,10 @@ MoeProgramExecutor::Core::SessionState::start_sequence(
     provider_state = found->second;
   }
 
-  step->inflight = sequence.provider->execute_program_sequence(
+  step->inflight = bound_sequence.provider->execute_program_sequence(
       provider_state,
       ProgramSequenceInvocation{request, program->provider.program,
-                                sequence.operations,
+                                bound_sequence.operations,
                                 step->current_inputs});
   if (!step->inflight.valid()) {
     step->cancel(false);
@@ -1058,19 +1058,19 @@ Status MoeProgramExecutor::Core::SessionState::checkpoint_retention(
       return {ErrorCode::backpressure,
               "model execution session already has an active step"};
     for (const auto& [registry_index, state] : provider_states) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
       const auto implementation =
-          prepared == program->prepared.end()
+          candidate == program->prepared.end()
               ? program->exact_decode &&
                         program->exact_decode->provider_registry_index ==
                             registry_index
                     ? program->exact_decode->provider
                     : std::shared_ptr<IOperationProvider>{}
-              : prepared->provider;
+              : candidate->provider;
       if (!implementation)
         return internal_error("retention checkpoint provider is absent");
       const auto status =
@@ -1096,19 +1096,19 @@ Status MoeProgramExecutor::Core::SessionState::rewind_retention(
       return {ErrorCode::backpressure,
               "model execution session already has an active step"};
     for (const auto& [registry_index, state] : provider_states) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
       const auto implementation =
-          prepared == program->prepared.end()
+          candidate == program->prepared.end()
               ? program->exact_decode &&
                         program->exact_decode->provider_registry_index ==
                             registry_index
                     ? program->exact_decode->provider
                     : std::shared_ptr<IOperationProvider>{}
-              : prepared->provider;
+              : candidate->provider;
       if (!implementation)
         return internal_error("retention rewind provider is absent");
       const auto status =
@@ -1142,18 +1142,18 @@ MoeProgramExecutor::Core::SessionState::park_retention(
               0U, 0U};
 
     const auto provider_for = [this](std::uint32_t registry_index) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
-      return prepared == program->prepared.end()
+      return candidate == program->prepared.end()
                  ? program->exact_decode &&
                            program->exact_decode->provider_registry_index ==
                                registry_index
                        ? program->exact_decode->provider
                        : std::shared_ptr<IOperationProvider>{}
-                 : prepared->provider;
+                 : candidate->provider;
     };
 
     std::vector<std::pair<std::shared_ptr<IOperationProvider>,
@@ -1224,18 +1224,18 @@ MoeProgramExecutor::Core::SessionState::restore_retention() noexcept {
               0U, 0U};
 
     const auto provider_for = [this](std::uint32_t registry_index) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
-      return prepared == program->prepared.end()
+      return candidate == program->prepared.end()
                  ? program->exact_decode &&
                            program->exact_decode->provider_registry_index ==
                                registry_index
                        ? program->exact_decode->provider
                        : std::shared_ptr<IOperationProvider>{}
-                 : prepared->provider;
+                 : candidate->provider;
     };
 
     std::vector<std::pair<std::shared_ptr<IOperationProvider>,
@@ -1291,18 +1291,18 @@ MoeProgramExecutor::Core::SessionState::save_snapshot(
               0U, 0U, 0U, 0U};
 
     const auto provider_for = [this](std::uint32_t registry_index) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
-      return prepared == program->prepared.end()
+      return candidate == program->prepared.end()
                  ? program->exact_decode &&
                            program->exact_decode->provider_registry_index ==
                                registry_index
                        ? program->exact_decode->provider
                        : std::shared_ptr<IOperationProvider>{}
-                 : prepared->provider;
+                 : candidate->provider;
     };
     std::uint64_t pages{};
     std::uint64_t logical{};
@@ -1356,18 +1356,18 @@ MoeProgramExecutor::Core::SessionState::load_snapshot(
                "request-state snapshot load target is invalid"},
               0U, 0U, 0U, 0U};
     const auto provider_for = [this](std::uint32_t registry_index) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
-      return prepared == program->prepared.end()
+      return candidate == program->prepared.end()
                  ? program->exact_decode &&
                            program->exact_decode->provider_registry_index ==
                                registry_index
                        ? program->exact_decode->provider
                        : std::shared_ptr<IOperationProvider>{}
-                 : prepared->provider;
+                 : candidate->provider;
     };
     std::uint64_t pages{};
     std::uint64_t logical{};
@@ -1418,18 +1418,18 @@ Status MoeProgramExecutor::Core::SessionState::prune_snapshots(
       return {ErrorCode::invalid_argument,
               "request-state snapshot prune target is invalid"};
     const auto provider_for = [this](std::uint32_t registry_index) {
-      const auto prepared = std::find_if(
+      const auto candidate = std::find_if(
           program->prepared.begin(), program->prepared.end(),
           [registry_index](const Core::PreparedInstruction& item) {
             return item.provider_registry_index == registry_index;
           });
-      return prepared == program->prepared.end()
+      return candidate == program->prepared.end()
                  ? program->exact_decode &&
                            program->exact_decode->provider_registry_index ==
                                registry_index
                        ? program->exact_decode->provider
                        : std::shared_ptr<IOperationProvider>{}
-                 : prepared->provider;
+                 : candidate->provider;
     };
     for (const auto& [registry_index, state] : provider_states) {
       (void)state;
@@ -1472,11 +1472,11 @@ Status MoeProgramExecutor::Core::SessionState::synchronize_exact(
                   }))
     return {ErrorCode::invalid_argument,
             "exact decode synchronization is unavailable or invalid"};
-  const auto& prepared = *program->exact_decode;
+  const auto& exact_instruction = *program->exact_decode;
   std::shared_ptr<IOperationProviderRequestState> provider_state;
   {
     std::lock_guard lock(mutex);
-    const auto found = provider_states.find(prepared.provider_registry_index);
+    const auto found = provider_states.find(exact_instruction.provider_registry_index);
     if (closed)
       return {ErrorCode::cancelled, "model execution session is closed"};
     if (active)
@@ -1500,8 +1500,8 @@ Status MoeProgramExecutor::Core::SessionState::synchronize_exact(
           synchronized_end + 1U < limit->second;
     }
   }
-  auto status = prepared.provider->synchronize_exact_decode_batch(
-      *prepared.operation, provider_state,
+  auto status = exact_instruction.provider->synchronize_exact_decode_batch(
+      *exact_instruction.operation, provider_state,
       ExactDecodeSynchronizationBatch{request, next_tokens,
                                       first_target_position,
                                       effective_produce_final_draft});
@@ -1527,18 +1527,18 @@ MoeProgramExecutor::Core::SessionState::start_exact(
     return {{ErrorCode::invalid_argument,
              "exact decode invocation is unavailable or invalid"},
             {}};
-  const auto& prepared = *program->exact_decode;
+  const auto& exact_instruction = *program->exact_decode;
   auto step = std::make_shared<ExactDecodeState>();
   step->session = shared_from_this();
   step->guaranteed_token = guaranteed_token;
   step->position = position;
   step->context_limit = context_limit;
   step->vocabulary_size = program->descriptor.vocab_size;
-  step->maximum_emitted_tokens = prepared.maximum_emitted_tokens;
+  step->maximum_emitted_tokens = exact_instruction.maximum_emitted_tokens;
   std::shared_ptr<IOperationProviderRequestState> provider_state;
   {
     std::lock_guard lock(mutex);
-    const auto found = provider_states.find(prepared.provider_registry_index);
+    const auto found = provider_states.find(exact_instruction.provider_registry_index);
     if (closed)
       return {{ErrorCode::cancelled, "model execution session is closed"}, {}};
     if (active)
@@ -1552,8 +1552,8 @@ MoeProgramExecutor::Core::SessionState::start_exact(
     active_exact = step;
     provider_state = found->second;
   }
-  step->inflight = prepared.provider->execute_exact_decode(
-      *prepared.operation, provider_state,
+  step->inflight = exact_instruction.provider->execute_exact_decode(
+      *exact_instruction.operation, provider_state,
       ExactDecodeInvocation{request, guaranteed_token, position,
                             context_limit});
   if (!step->inflight.valid()) {
@@ -1616,19 +1616,19 @@ Status MoeProgramExecutor::Core::SessionState::rebind(
   for (const auto& [name, value] : request.parameters)
     replacement.parameters.try_emplace(name, value);
   for (const auto& [registry_index, state] : provider_states) {
-    const auto prepared = std::find_if(
+    const auto candidate = std::find_if(
         program->prepared.begin(), program->prepared.end(),
         [registry_index](const Core::PreparedInstruction& item) {
           return item.provider_registry_index == registry_index;
         });
     const auto implementation =
-        prepared == program->prepared.end()
+        candidate == program->prepared.end()
             ? program->exact_decode &&
                       program->exact_decode->provider_registry_index ==
                           registry_index
                   ? program->exact_decode->provider
                   : std::shared_ptr<IOperationProvider>{}
-            : prepared->provider;
+            : candidate->provider;
     if (!implementation)
       return internal_error("request rebind provider is absent");
     const auto rebound =

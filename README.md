@@ -35,7 +35,6 @@ come from the documented direct-chat conditions, not model startup.
 | Mistral Small 4 | 70.80 GB source tensors | 262,144 | 271.256 s (`off`) | 1.12 tok/s after first | not measured at maximum |
 | Muse-Glimmer-30B | 15.83 GB QPack | 131,072 | 2.559 s (`off`) | 18.49 tok/s end-to-end | not measured at maximum |
 | Ornith-1.5-35B-A3B | 19.23 GB pack | 262,144 | 4.590 s (historical K1+fit cold) | 2.73 tok/s cold; 7.42 next turn, historical K1 | not measured at maximum |
-| DeepSeek V4 Flash | 147.17 GB routed experts + fixed organs | 262,144 | 12.953 s (`off`, novel) | 0.55 tok/s novel; 6.54-6.69 settled primary | not measured at maximum |
 
 The context ceiling is only an admission limit. Of these paths, only Qwen has
 a recorded 262,016-token populated gate. The current per-head Q4 default is
@@ -93,9 +92,8 @@ The common service exposes these aliases:
 | `mistral` | Mistral Small 4, source-native NVFP4/BF16 |
 | `muse` | Muse-Glimmer, dense FP4 with F16 global/sliding KV |
 | `ornith` | Ornith with direct packed `q4-f16-per-head` target KV |
-| `deepseek` | DeepSeek compact top-6 experts demand-paged through NVMe/RAM/VRAM |
 
-Two installed P100s can execute compatible Flash/DeepSeek experts, but current
+Two installed P100s can execute compatible Flash experts, but current
 end-to-end measurements do not justify enabling them for performance. Dense
 Qwen does not use them.
 
@@ -122,7 +120,7 @@ the first prefill.
 Thinking can be selected when opening direct chat:
 
 ```bash
-./ops/model.sh chat deepseek --thinking off
+./ops/model.sh chat qwen --thinking off
 ```
 
 For the maintained coding harness:

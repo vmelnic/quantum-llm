@@ -71,7 +71,6 @@ if (-not $Container -or -not $Runner) {
 }
 $startScript = Join-Path $PSScriptRoot "Start-ExpertServer.ps1"
 foreach ($retiredTask in @(
-    "QuantumLLM-DeepSeekV4Flash",
     "QuantumLLM-P6ExpertServer",
     "QuantumLLM-MoeVm"
 )) {

@@ -1,7 +1,4 @@
 #include "expert/runtime/cuda/expert_uploader.hpp"
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-#include "expert/runtime/cuda/deepseek_admission.hpp"
-#endif
 #include "expert/runtime/expert_record.hpp"
 
 #include <cuda_runtime_api.h>
@@ -10,10 +7,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
-#include <iterator>
-#include <list>
 #include <limits>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -34,12 +28,6 @@ Status cuda_failure(const char* operation, cudaError_t error) {
 }  // namespace
 
 struct CudaExpertPool final {
-  struct CompactEntry final {
-    void* storage{};
-    std::size_t bytes{};
-    std::list<ExpertKey>::iterator lru;
-  };
-
   // One upload handed off to the completion thread. The allocation keeps the
   // device slot alive until the consumer's callback has observed the event;
   // on a stream error the allocation is dropped before the callback runs,
@@ -54,15 +42,8 @@ struct CudaExpertPool final {
   cudaStream_t stream{};
   mutable std::mutex mutex;
   std::uint64_t recycled_capacity_bytes{};
-  std::uint64_t compact_cache_capacity_bytes{};
-  bool persistent_staging{};
-  bool direct_compact_execution{};
   std::unordered_map<std::size_t, std::vector<void*>> recycled;
-  void* staging{};
-  std::size_t staging_bytes{};
   std::uint64_t device_slot_bytes{};
-  std::map<ExpertKey, CompactEntry> compact_cache;
-  std::list<ExpertKey> compact_lru;
   CudaExpertUploaderTelemetry metrics;
   // Uploads complete through events instead of stream-wide host syncs: the
   // enqueueing thread only records an event, and this thread blocks on it and
@@ -78,8 +59,7 @@ struct CudaExpertPool final {
   void update_device_high_water_locked() noexcept {
     metrics.device_bytes_high_water = std::max(
         metrics.device_bytes_high_water,
-        device_slot_bytes + static_cast<std::uint64_t>(staging_bytes) +
-            metrics.compact_cache_bytes);
+        device_slot_bytes);
   }
 
   cudaError_t acquire_locked(std::size_t bytes, void** output) {
@@ -124,28 +104,6 @@ struct CudaExpertPool final {
     release_locked(storage, bytes);
   }
 
-  cudaError_t staging_locked(std::size_t bytes, void** output) {
-    if (!persistent_staging) return cudaMallocAsync(output, bytes, stream);
-    if (staging != nullptr && staging_bytes >= bytes) {
-      *output = staging;
-      return cudaSuccess;
-    }
-    if (staging != nullptr) {
-      const auto error = cudaFreeAsync(staging, stream);
-      if (error != cudaSuccess) return error;
-      staging = nullptr;
-      staging_bytes = 0U;
-    }
-    const auto error = cudaMallocAsync(&staging, bytes, stream);
-    if (error == cudaSuccess) {
-      staging_bytes = bytes;
-      ++metrics.staging_allocations;
-      update_device_high_water_locked();
-      *output = staging;
-    }
-    return error;
-  }
-
   ~CudaExpertPool() {
     {
       std::lock_guard lock(completion_mutex);
@@ -157,10 +115,6 @@ struct CudaExpertPool final {
       for (const auto& [_, slots] : recycled) {
         for (auto* slot : slots) static_cast<void>(cudaFreeAsync(slot, stream));
       }
-      for (const auto& [_, entry] : compact_cache) {
-        static_cast<void>(cudaFreeAsync(entry.storage, stream));
-      }
-      if (staging != nullptr) static_cast<void>(cudaFreeAsync(staging, stream));
       static_cast<void>(cudaStreamSynchronize(stream));
       static_cast<void>(cudaStreamDestroy(stream));
     }
@@ -234,31 +188,6 @@ bool CudaExpertAllocation::native_nvfp4() const noexcept {
   return native_nvfp4_;
 }
 
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-CudaCompactExpertAllocation::CudaCompactExpertAllocation(
-    std::shared_ptr<CudaExpertPool> pool, void* storage, std::size_t bytes,
-    DeepSeekCompactSections sections) noexcept
-    : pool_(std::move(pool)), storage_(storage), bytes_(bytes),
-      sections_(sections) {}
-
-CudaCompactExpertAllocation::~CudaCompactExpertAllocation() {
-  if (storage_ != nullptr && pool_) pool_->release(storage_, bytes_);
-}
-
-std::size_t CudaCompactExpertAllocation::bytes() const noexcept {
-  return bytes_;
-}
-
-const std::uint8_t* CudaCompactExpertAllocation::base() const noexcept {
-  return static_cast<const std::uint8_t*>(storage_);
-}
-
-const DeepSeekCompactSections& CudaCompactExpertAllocation::sections()
-    const noexcept {
-  return sections_;
-}
-#endif
-
 CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
     : pool_(std::make_shared<CudaExpertPool>()) {
   int pools_supported = 0;
@@ -274,10 +203,6 @@ CudaExpertUploader::CudaExpertUploader(CudaExpertUploaderOptions options)
   }
   pool_->stream = stream;
   pool_->recycled_capacity_bytes = options.recycled_capacity_bytes;
-  pool_->compact_cache_capacity_bytes =
-      options.compact_cache_capacity_bytes;
-  pool_->persistent_staging = options.persistent_staging;
-  pool_->direct_compact_execution = options.direct_compact_execution;
   cudaMemPool_t memory_pool{};
   if (const auto error = cudaDeviceGetDefaultMemPool(&memory_pool, 0);
       error != cudaSuccess) {
@@ -342,32 +267,6 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
     allocation.reset();
     completion({admission, {}, 0});
   };
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-  if (request.key.encoding_abi == kExpertEncodingAbiFp4Block32 &&
-      request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
-      pool_->direct_compact_execution) {
-    const auto compact_bytes = request.complete_record.size();
-    void* compact_raw = nullptr;
-    auto error = pool_->acquire_locked(compact_bytes, &compact_raw);
-    if (error == cudaSuccess) {
-      error = cudaMemcpyAsync(compact_raw, request.complete_record.data(),
-                              compact_bytes, cudaMemcpyHostToDevice, stream);
-    }
-    if (error != cudaSuccess) {
-      if (compact_raw != nullptr)
-        pool_->release_locked(compact_raw, compact_bytes);
-      stream_lock.unlock();
-      completion({cuda_failure("DeepSeek direct compact upload", error), {},
-                  0U});
-      return operation;
-    }
-    pool_->metrics.compact_h2d_bytes += compact_bytes;
-    finish_async(std::make_shared<CudaCompactExpertAllocation>(
-                     pool_, compact_raw, compact_bytes, request.compact),
-                 compact_bytes, Status::success());
-    return operation;
-  }
-#endif
   void* raw = nullptr;
   auto error = pool_->acquire_locked(total, &raw);
   if (error != cudaSuccess) {
@@ -384,123 +283,6 @@ OperationId CudaExpertUploader::upload(UploadRequest request,
   cursor += sections.down_q_bytes;
   auto* down_scales = reinterpret_cast<float*>(cursor);
   const auto source = request.complete_record.data();
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-  if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1 ||
-      request.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1) {
-    void* compact_raw = nullptr;
-    bool compact_cached = false;
-    const auto compact_bytes = request.complete_record.size();
-    const bool compact_cache_eligible =
-        request.source_abi == kExpertSourceAbiDeepSeekCompactV1 &&
-        pool_->compact_cache_capacity_bytes >= compact_bytes;
-    if (compact_cache_eligible) {
-      const auto cached = pool_->compact_cache.find(request.key);
-      if (cached != pool_->compact_cache.end()) {
-        compact_raw = cached->second.storage;
-        pool_->compact_lru.splice(pool_->compact_lru.end(),
-                                  pool_->compact_lru,
-                                  cached->second.lru);
-        ++pool_->metrics.compact_cache_hits;
-        compact_cached = true;
-        error = cudaSuccess;
-      } else {
-        ++pool_->metrics.compact_cache_misses;
-        while (pool_->metrics.compact_cache_bytes + compact_bytes >
-               pool_->compact_cache_capacity_bytes) {
-          if (pool_->compact_lru.empty()) break;
-          const auto victim = pool_->compact_cache.find(
-              pool_->compact_lru.front());
-          if (victim == pool_->compact_cache.end()) break;
-          error = cudaFreeAsync(victim->second.storage, stream);
-          if (error != cudaSuccess) break;
-          pool_->metrics.compact_cache_bytes -= victim->second.bytes;
-          pool_->compact_lru.pop_front();
-          pool_->compact_cache.erase(victim);
-          ++pool_->metrics.compact_cache_evictions;
-        }
-        if (error == cudaSuccess &&
-            pool_->metrics.compact_cache_bytes + compact_bytes <=
-                pool_->compact_cache_capacity_bytes) {
-          error = cudaMallocAsync(&compact_raw, compact_bytes, stream);
-          if (error == cudaSuccess) {
-            error = cudaMemcpyAsync(compact_raw, source, compact_bytes,
-                                    cudaMemcpyHostToDevice, stream);
-          }
-          if (error == cudaSuccess) {
-            pool_->compact_lru.push_back(request.key);
-            pool_->compact_cache.emplace(
-                request.key,
-                CudaExpertPool::CompactEntry{
-                    compact_raw, compact_bytes,
-                    std::prev(pool_->compact_lru.end())});
-            pool_->metrics.compact_cache_bytes += compact_bytes;
-            pool_->metrics.compact_h2d_bytes += compact_bytes;
-            pool_->metrics.compact_cache_high_water = std::max(
-                pool_->metrics.compact_cache_high_water,
-                pool_->metrics.compact_cache_bytes);
-            pool_->update_device_high_water_locked();
-            compact_cached = true;
-          } else if (compact_raw != nullptr) {
-            static_cast<void>(cudaFreeAsync(compact_raw, stream));
-            compact_raw = nullptr;
-          }
-        }
-      }
-    } else {
-      error = pool_->staging_locked(compact_bytes, &compact_raw);
-      if (error == cudaSuccess) {
-        error = cudaMemcpyAsync(compact_raw, source, compact_bytes,
-                                cudaMemcpyHostToDevice, stream);
-      }
-    }
-    Status admission = error == cudaSuccess
-                           ? Status::success()
-                           : cuda_failure("DeepSeek compact H2D", error);
-    const auto* compact = static_cast<const std::uint8_t*>(compact_raw);
-    const auto launch = [&](std::uint64_t weight_offset,
-                            std::uint64_t scale_offset, std::int8_t* output,
-                            float* output_scales, std::uint32_t rows,
-                            std::uint32_t columns) {
-      if (!admission.ok()) return;
-      if (request.source_abi == kExpertSourceAbiDeepSeekCompactV1) {
-        admission = admit_deepseek_projection(
-            {compact + weight_offset, compact + scale_offset, output,
-             output_scales, rows, columns, stream, true});
-      } else if (request.source_abi ==
-                 kExpertSourceAbiDeepSeekFp8Block128V1) {
-        admission = admit_deepseek_fp8_projection(
-            {compact + weight_offset, compact + scale_offset, output,
-             output_scales, rows, columns, stream});
-      } else {
-        admission = Status(ErrorCode::invalid_argument,
-                           "unsupported DeepSeek CUDA source ABI");
-      }
-    };
-    if (admission.ok()) {
-      launch(request.compact.w1_weight_offset, request.compact.w1_scale_offset,
-             gate, gate_scales, sections.intermediate, sections.hidden);
-      launch(request.compact.w3_weight_offset, request.compact.w3_scale_offset,
-             gate + static_cast<std::uint64_t>(sections.intermediate) *
-                        sections.hidden,
-             gate_scales + sections.intermediate, sections.intermediate,
-             sections.hidden);
-      launch(request.compact.w2_weight_offset, request.compact.w2_scale_offset,
-             down, down_scales, sections.hidden, sections.intermediate);
-    }
-    if (compact_raw != nullptr) {
-      if (!compact_cached && !pool_->persistent_staging) {
-        const auto free_error = cudaFreeAsync(compact_raw, stream);
-        if (admission.ok() && free_error != cudaSuccess) {
-          admission = cuda_failure("DeepSeek compact release", free_error);
-        }
-      }
-    }
-    finish_async(std::make_shared<CudaExpertAllocation>(
-                     pool_, raw, total, gate, gate_scales, down, down_scales),
-                 total, std::move(admission));
-    return operation;
-  }
-#endif
   const auto copy = [&](void* destination, std::uint64_t offset,
                         std::uint64_t bytes) {
     return cudaMemcpyAsync(destination, source + offset,

@@ -10,7 +10,6 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 from compiler.expert_pack.adapters import RuntimeOperationTopology, adapt_checkpoint
@@ -31,20 +30,11 @@ from compiler.expert_pack.constants import (
     PACK_ALIGNMENT,
     QUANT_ABI_ID,
 )
-from compiler.expert_pack.deepseek_v4 import (
-    _build_expected,
-    estimate_deepseek_v4_representations,
-    validate_deepseek_v4_source,
-)
-from compiler.expert_pack.deepseek_slice import (
-    _deepseek_mtp_mix_reference,
-    _deepseek_mtp_partition,
-)
 from compiler.expert_pack.errors import AdapterError, ValidationError
 from compiler.expert_pack.mistral4_nvfp4_adapter import _yarn_attention_scale
 from compiler.expert_pack.quality import qualify_container_against_source
 from compiler.expert_pack import quant
-from compiler.expert_pack.safetensors import SafeTensorCheckpoint, TensorInfo
+from compiler.expert_pack.safetensors import SafeTensorCheckpoint
 from compiler.expert_pack.source_inventory import group_source_tensors, inspect_source
 from compiler.expert_pack.util import (
     canonical_json_bytes, load_json, sha256_bytes, sha256_file,
@@ -965,61 +955,6 @@ def _make_lfm2_moe_fixture(root: Path, unknown: bool = False) -> None:
     _write_safetensors(root / "model.safetensors", tensors)
 
 
-def _deepseek_v4_config() -> dict[str, object]:
-    ratios = [0, 0]
-    ratios.extend(4 if layer % 2 else 128 for layer in range(1, 42))
-    ratios.append(0)
-    return {
-        "architectures": ["DeepseekV4ForCausalLM"],
-        "model_type": "deepseek_v4",
-        "expert_dtype": "fp4",
-        "hidden_act": "silu",
-        "hidden_size": 4096,
-        "moe_intermediate_size": 2048,
-        "n_routed_experts": 256,
-        "n_shared_experts": 1,
-        "num_experts_per_tok": 6,
-        "num_hidden_layers": 43,
-        "num_hash_layers": 3,
-        "num_nextn_predict_layers": 1,
-        "num_attention_heads": 64,
-        "num_key_value_heads": 1,
-        "head_dim": 512,
-        "q_lora_rank": 1024,
-        "o_lora_rank": 1024,
-        "o_groups": 8,
-        "index_head_dim": 128,
-        "index_n_heads": 64,
-        "hc_mult": 4,
-        "vocab_size": 129280,
-        "max_position_embeddings": 1048576,
-        "compress_ratios": ratios,
-        "quantization_config": {
-            "activation_scheme": "dynamic",
-            "fmt": "e4m3",
-            "quant_method": "fp8",
-            "scale_fmt": "ue8m0",
-            "weight_block_size": [128, 128],
-        },
-    }
-
-
-def _deepseek_metadata_checkpoint() -> SimpleNamespace:
-    config = _deepseek_v4_config()
-    expected = _build_expected(config, 0)
-    tensors = {}
-    for name, item in expected.items():
-        nbytes = 1
-        for dimension in item.shape:
-            nbytes *= dimension
-        if item.dtype in ("BF16", "F16"):
-            nbytes *= 2
-        elif item.dtype == "F32":
-            nbytes *= 4
-        elif item.dtype in ("I64", "U64", "F64"):
-            nbytes *= 8
-        tensors[name] = TensorInfo(name, "synthetic.safetensors", item.dtype, item.shape, 0, nbytes)
-    return SimpleNamespace(config=config, tensors=tensors)
 
 
 class ExpertPackTests(unittest.TestCase):
@@ -1055,39 +990,6 @@ class ExpertPackTests(unittest.TestCase):
             manifest = load_json(output / "manifest.json")
             self.assertEqual(manifest["tokenizer"]["sampling"], profiles)
 
-            # Exercise the exact metadata-only migration used by artifacts
-            # published before auxiliary/placement accounting was mandatory.
-            manifest.pop("auxiliary_tensors")
-            manifest["masses"].pop("resident_dense_bytes")
-            manifest["masses"].pop("host_mapped_dense_bytes")
-            manifest["integrity"]["content_sha256"] = ""
-            manifest["integrity"]["content_sha256"] = sha256_bytes(
-                canonical_json_bytes(manifest)
-            )
-            (output / "manifest.json").write_text(
-                json.dumps(manifest, sort_keys=True, separators=(",", ":")) +
-                "\n",
-                encoding="utf-8",
-            )
-            report = load_json(output / "conversion-report.json")
-            report["manifest_content_sha256"] = manifest["integrity"][
-                "content_sha256"
-            ]
-            (output / "conversion-report.json").write_text(
-                json.dumps(report, sort_keys=True, separators=(",", ":")) +
-                "\n",
-                encoding="utf-8",
-            )
-            (output / "COMPLETED").write_text(json.dumps({
-                "format_version": 1,
-                "manifest_content_sha256": manifest["integrity"][
-                    "content_sha256"
-                ],
-                "manifest_file_sha256": sha256_file(
-                    output / "manifest.json"
-                ),
-            }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
-
             updated = json.loads(json.dumps(profiles))
             updated["schema"] = "sampling-policy"
             updated["maximum_thinking_tokens"] = 32768
@@ -1108,6 +1010,7 @@ class ExpertPackTests(unittest.TestCase):
                 [item["sha256"] for item in refreshed_manifest["packs"]],
                 [item["sha256"] for item in manifest["packs"]],
             )
+
 
     def test_numpy_fp4_row_batches_match_dependency_free_bytes(self) -> None:
         try:
@@ -1151,89 +1054,6 @@ class ExpertPackTests(unittest.TestCase):
                 "{}\n",
             )
 
-    def test_deepseek_v4_contract_is_byte_exact_and_fail_closed(self) -> None:
-        checkpoint = _deepseek_metadata_checkpoint()
-        result = validate_deepseek_v4_source(checkpoint)
-        self.assertTrue(result["valid"])
-        self.assertEqual(result["tensor_count"], 69187)
-        self.assertEqual(result["tensor_bytes"], 159609485896)
-        self.assertEqual(result["mtp_namespace"], 0)
-
-        removed = checkpoint.tensors.pop("layers.42.ffn.experts.255.w3.scale")
-        with self.assertRaisesRegex(AdapterError, "partition mismatch"):
-            validate_deepseek_v4_source(checkpoint)
-        checkpoint.tensors[removed.name] = removed
-
-        name = "layers.0.ffn.experts.0.w1.weight"
-        original = checkpoint.tensors[name]
-        checkpoint.tensors[name] = TensorInfo(
-            original.name, original.shard, original.dtype, (2048, 2047), original.offset,
-            original.nbytes,
-        )
-        with self.assertRaisesRegex(AdapterError, "metadata mismatch"):
-            validate_deepseek_v4_source(checkpoint)
-
-    def test_deepseek_v4_representation_estimate_is_metadata_only(self) -> None:
-        checkpoint = _deepseek_metadata_checkpoint()
-        estimate = estimate_deepseek_v4_representations(checkpoint)
-        self.assertTrue(estimate["payload_only"])
-        self.assertEqual(estimate["source_checkpoint"]["bytes"], 159609485896)
-        self.assertEqual(
-            estimate["source_checkpoint"]["routed_expert_bytes"], 150592290816
-        )
-        self.assertEqual(estimate["eager_fp8_routed_experts"]["bytes"], 292502338120)
-        self.assertEqual(
-            estimate["eager_int8_per_row_routed_experts"]["bytes"], 292854135368
-        )
-        cache = estimate["hot_int8_cache"]
-        self.assertEqual(cache["source_bytes_per_expert"], 13369344)
-        self.assertEqual(cache["compute_bytes_per_expert"], 25198592)
-        self.assertEqual(cache["compute_bytes_for_top_k_one_layer"], 151191552)
-        self.assertEqual(cache["experts_per_gib"], 42)
-
-    def test_deepseek_mtp_partition_is_exact_and_metadata_only(self) -> None:
-        checkpoint = _deepseek_metadata_checkpoint()
-        namespace, typed, dense, shared = _deepseek_mtp_partition(checkpoint)
-        self.assertEqual(namespace, 0)
-        self.assertEqual(len(typed), 19)
-        self.assertEqual(len(dense), 7)
-        self.assertEqual(len(shared), 6)
-        self.assertTrue(all(name.startswith("mtp.0.") for name in typed))
-        self.assertTrue(all(name.startswith("mtp.0.") for name in dense))
-        self.assertEqual(len(set(typed)), len(typed))
-        self.assertEqual(len(set(dense)), len(dense))
-
-    def test_deepseek_mtp_mix_normalizes_last_dimension_and_broadcasts(self) -> None:
-        try:
-            import numpy as np
-        except ImportError:
-            self.skipTest("NumPy is required")
-        previous = np.asarray(
-            [[1.0, 2.0], [2.0, 1.0], [-1.0, 2.0], [3.0, -2.0]],
-            dtype=np.float32,
-        )
-        embedding = np.asarray([2.0, -1.0], dtype=np.float32)
-        enorm = np.asarray([1.5, 0.5], dtype=np.float32)
-        hnorm = np.asarray([0.25, 2.0], dtype=np.float32)
-        matrix_e = np.asarray([[2.0, 0.0], [0.0, -1.0]], dtype=np.float32)
-        matrix_h = np.asarray([[1.0, 0.5], [-0.25, 2.0]], dtype=np.float32)
-        normalized_token, normalized_streams, mixed = \
-            _deepseek_mtp_mix_reference(
-                previous, embedding, enorm, hnorm,
-                lambda value: matrix_e @ value,
-                lambda value: matrix_h @ value,
-            )
-        token_inverse = 1.0 / np.sqrt(np.mean(embedding * embedding) + 1e-6)
-        expected_token = embedding * token_inverse * enorm
-        stream_inverse = 1.0 / np.sqrt(
-            np.mean(previous * previous, axis=1) + 1e-6
-        )
-        expected_streams = previous * stream_inverse[:, None] * hnorm[None, :]
-        expected_mixed = expected_streams @ matrix_h.T + \
-            (matrix_e @ expected_token)[None, :]
-        np.testing.assert_allclose(normalized_token, expected_token, rtol=1e-6)
-        np.testing.assert_allclose(normalized_streams, expected_streams, rtol=1e-6)
-        np.testing.assert_allclose(mixed, expected_mixed, rtol=1e-6)
 
     def test_source_inventory_accepts_float8_metadata_without_conversion(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -9,7 +9,8 @@ param(
     [string]$IndexFile = "model.safetensors.index.json",
     [int]$MaxWorkers = 4,
     [ValidateSet(0, 1)][int]$XetHighPerformance = 1,
-    [int64]$SafetyBytes = 8GB
+    [int64]$SafetyBytes = 8GB,
+    [string]$HfHome = ""
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -41,6 +42,15 @@ foreach ($file in @($ConfigFile, $IndexFile)) {
 }
 if ($selectedFiles.Count -gt 0 -and $selectedFiles.Count -ne $ExpectedShards) {
     throw "ExpectedShards must equal the number of exact Files"
+}
+if ($HfHome) {
+    if (-not (Test-Path -LiteralPath $HfHome -PathType Container)) {
+        throw "HfHome must be an existing directory"
+    }
+    $HfHome = [System.IO.Path]::GetFullPath($HfHome)
+} else {
+    $HfHome = Join-Path $env:USERPROFILE '.cache\huggingface'
+    [System.IO.Directory]::CreateDirectory($HfHome) | Out-Null
 }
 
 $hf = Join-Path $env:USERPROFILE ".hf-cli\venv\Scripts\hf.exe"
@@ -81,7 +91,7 @@ if ($null -ne $existing) {
 }
 
 $cacheName = "models--" + ($ModelId -replace "/", "--")
-$cacheRoot = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
+$cacheRoot = Join-Path (Join-Path $HfHome 'hub') $cacheName
 $snapshot = Join-Path (Join-Path $cacheRoot "snapshots") $Revision
 $initialShardBytes = [int64]0
 if ($selectedFiles.Count -gt 0) {
@@ -112,7 +122,7 @@ foreach ($blob in @(Get-ChildItem (Join-Path $cacheRoot "blobs") -File `
 }
 $remainingBytes = [Math]::Max([int64]0,
     $ExpectedDownloadBytes - $initialShardBytes)
-$driveName = ([System.IO.Path]::GetPathRoot($env:USERPROFILE)).Substring(0, 1)
+$driveName = ([System.IO.Path]::GetPathRoot($HfHome)).Substring(0, 1)
 $freeBytes = [int64](Get-PSDrive -Name $driveName).Free
 if ($freeBytes -lt $remainingBytes + $SafetyBytes) {
     throw "Insufficient disk: free=$freeBytes remaining=$remainingBytes safety=$SafetyBytes"
@@ -126,6 +136,7 @@ Remove-Item -LiteralPath $status -Force -ErrorAction SilentlyContinue
 $workerArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$worker`" " +
     "-HfPath `"$hf`" -ModelId $ModelId -Revision $Revision " +
     "-Files `"$Files`" " +
+    "-HfHome `"$HfHome`" " +
     "-ConfigFile `"$ConfigFile`" -IndexFile `"$IndexFile`" " +
     "-MaxWorkers $MaxWorkers -XetHighPerformance $XetHighPerformance " +
     "-StdoutPath `"$stdout`" " +
@@ -148,6 +159,7 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Settings $settings `
     expected_tensor_bytes = $ExpectedTensorBytes
     expected_shards = $ExpectedShards
     files = $selectedFiles
+    hf_home = $HfHome
     config_file = $ConfigFile
     index_file = $IndexFile
     initial_cached_bytes = $cachedBytes

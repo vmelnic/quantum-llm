@@ -45,7 +45,7 @@ fi
 
 chat_args=(
   --base-url "${CHAT_BASE_URL:-http://127.0.0.1:8080}"
-  --model "${CHAT_MODEL:-deepseek-v4-flash}"
+  --model "${CHAT_MODEL:-qwen3.8-27b-fp4}"
   --max-tokens "${chat_max_tokens}"
   --local-port "${CHAT_LOCAL_PORT:-18080}"
   --remote-port "${MODEL_PORT:-8080}"

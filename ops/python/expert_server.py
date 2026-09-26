@@ -3265,9 +3265,7 @@ class Application:
         "cpu_source_weight_bytes", "cpu_compute_ns", "planner_plans",
         "planner_candidates", "planner_cpu_cost_wins",
         "planner_gpu_cost_wins", "uploader_device_allocations",
-        "uploader_recycled_acquires", "uploader_staging_allocations",
-        "uploader_compact_h2d_bytes", "uploader_compact_cache_hits",
-        "uploader_compact_cache_misses", "worker_mtp_drafts",
+        "uploader_recycled_acquires", "worker_mtp_drafts",
         "worker_mtp_accepted", "worker_mtp_rejected", "worker_verify_pairs",
         "worker_mtp_suppressions", "worker_mtp_acquire_batches",
         "worker_mtp_acquires_launched", "worker_mtp_acquire_wait_ns",
@@ -4957,7 +4955,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--profile-gpu-phases", action="store_true")
     parser.add_argument(
         "--disable-worker-retained-route", action="store_true",
-        help="disable DeepSeek previous-route VRAM leases for placement sweeps",
+        help="disable provider previous-route VRAM leases for placement sweeps",
     )
     parser.add_argument(
         "--enable-worker-cpu-hybrid", action="store_true",
@@ -4965,7 +4963,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--worker-route-trace-file", type=Path,
-        help="write bounded exact DeepSeek route traces as JSONL",
+        help="write bounded exact provider route traces as JSONL",
     )
     parser.add_argument(
         "--worker-route-trace-max-steps", type=int, default=4096,

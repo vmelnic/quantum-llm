@@ -17,9 +17,13 @@ $worker = Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
 $task = Get-ScheduledTask -TaskName ([string]$state.task_name) `
     -ErrorAction SilentlyContinue
 $taskRunning = $null -ne $task -and $task.State -eq "Running"
+$hfHome = if ($null -ne $state.PSObject.Properties['hf_home'] -and
+    $state.hf_home) { [string]$state.hf_home } else {
+    Join-Path $env:USERPROFILE '.cache\huggingface'
+}
 
 $cacheName = "models--" + ($state.model_id -replace "/", "--")
-$root = Join-Path (Join-Path $env:USERPROFILE ".cache\huggingface\hub") $cacheName
+$root = Join-Path (Join-Path $hfHome 'hub') $cacheName
 $blobBytes = [int64]0
 foreach ($blob in @(Get-ChildItem (Join-Path $root "blobs") -File `
         -ErrorAction SilentlyContinue)) {
@@ -133,7 +137,7 @@ $initialCompleteShardBytes = if ($null -ne $state.PSObject.Properties[
 $publishedThisRun = [Math]::Max([int64]0,
     $completeShardBytes - $initialCompleteShardBytes)
 $xetObservedBytes = [int64]0
-$xetLogDirectory = Join-Path $env:USERPROFILE ".cache\huggingface\xet\logs"
+$xetLogDirectory = Join-Path $hfHome 'xet\logs'
 $xetLog = Get-ChildItem $xetLogDirectory -Filter "xet_*.log" -File `
     -ErrorAction SilentlyContinue |
     Where-Object { $_.CreationTimeUtc -ge $startedUtc } |

@@ -1,5 +1,4 @@
 #include "expert/runtime/adaptive_placement.hpp"
-#include "expert/runtime/deepseek_expert.hpp"
 #include "expert/runtime/expert_cache.hpp"
 #include "expert/runtime/expert_catalog.hpp"
 #include "expert/runtime/expert_store.hpp"
@@ -13,7 +12,6 @@
 #include "expert/runtime/resource_governor.hpp"
 #include "expert/runtime/route_census.hpp"
 #include "expert/runtime/routed_expert_runtime.hpp"
-#include "expert/runtime/cpu/deepseek_packed_executor.hpp"
 #include "expert/runtime/cpu/fp4_host_executor.hpp"
 #include "expert/runtime/cpu/expert_executor.hpp"
 #include "expert/runtime/scheduler.hpp"
@@ -116,103 +114,6 @@ void test_exact_rejection_sampling_matches_independent_target_oracle() {
           "sampling distribution changed scalar temperature/top-p math");
 }
 
-void test_deepseek_compact_and_sm86_hot_abi() {
-  const auto geometry = er::DeepSeekExpertGeometry::v4_flash();
-  require(geometry.valid(), "DeepSeek-V4 geometry is invalid");
-  require(geometry.compact_weight_bytes(er::DeepSeekProjection::w1_gate) ==
-              4'194'304U &&
-              geometry.compact_scale_bytes(er::DeepSeekProjection::w1_gate) ==
-                  262'144U &&
-              geometry.compact_expert_bytes() == 13'369'344U,
-          "DeepSeek compact ABI byte geometry changed");
-
-  const auto layout = er::make_deepseek_sm86_hot_layout(geometry);
-  require(layout.alignment == 256U && layout.gate_up_q.offset == 0U &&
-              layout.gate_up_q.bytes == 16'777'216U &&
-              layout.gate_up_scales.offset == 16'777'216U &&
-              layout.gate_up_scales.bytes == 16'384U &&
-              layout.down_q.offset == 16'793'600U &&
-              layout.down_q.bytes == 8'388'608U &&
-              layout.down_scales.offset == 25'182'208U &&
-              layout.down_scales.bytes == 16'384U &&
-              layout.slot_bytes == 25'198'592U,
-          "DeepSeek SM86 hot-cache ABI layout changed");
-
-  bool rejected = false;
-  try {
-    static_cast<void>(er::make_deepseek_sm86_hot_layout(geometry, 192U));
-  } catch (const std::invalid_argument&) {
-    rejected = true;
-  }
-  require(rejected, "DeepSeek hot-cache ABI accepted unsafe alignment");
-}
-
-void test_deepseek_compact_admission_validation() {
-  std::vector<std::byte> bytes(13'369'344U);
-  for (std::size_t index = 0; index < bytes.size(); ++index)
-    bytes[index] = static_cast<std::byte>((index * 29U + 7U) & 0xffU);
-  for (const auto offset : {4'194'304U, 8'650'752U, 13'107'200U}) {
-    for (std::size_t index = offset; index < offset + 262'144U; ++index) {
-      if (bytes[index] == std::byte{0xff}) bytes[index] = std::byte{0xfe};
-    }
-  }
-  er::PayloadRecord record;
-  record.stored_bytes = bytes.size();
-  record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
-  record.device_bytes = 13'369'344U;
-  record.hidden = 4096U;
-  record.intermediate = 2048U;
-  record.quant_block_size = 32U;
-  record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
-  record.header_bytes = 0U;
-  record.alignment = 1U;
-  record.payload_sha256 = er::sha256(bytes);
-  const er::ExpertKey key{17U, 0U, 0U, er::kExpertQuantAbiDeepSeekSm86};
-  const auto valid = er::validate_expert_admission(bytes, key, record);
-  require(valid.status.ok() && valid.target.hidden == 4096U &&
-              valid.target.down_scale_offset == 25'182'208U &&
-              valid.compact.w2_scale_offset == 13'107'200U,
-          "valid DeepSeek compact admission was rejected");
-  bytes.back() ^= std::byte{1};
-  require(!er::validate_expert_admission(bytes, key, record).status.ok(),
-          "corrupt DeepSeek compact admission was accepted");
-  bytes = std::vector<std::byte>(13'369'344U);
-  bytes[4'194'304U] = std::byte{0xff};
-  require(!er::validate_expert_admission(bytes, key, record, false).status.ok(),
-          "trusted DeepSeek compact admission accepted a UE8M0 NaN");
-}
-
-void test_headerless_fp4_admission_is_geometry_driven() {
-  constexpr std::uint32_t hidden = 64U;
-  constexpr std::uint32_t intermediate = 32U;
-  constexpr std::uint64_t elements =
-      static_cast<std::uint64_t>(hidden) * intermediate;
-  constexpr std::uint64_t matrix_bytes = elements / 2U;
-  constexpr std::uint64_t scale_bytes = elements / 32U;
-  std::vector<std::byte> bytes(3U * (matrix_bytes + scale_bytes),
-                               std::byte{1});
-  er::PayloadRecord record;
-  record.stored_bytes = bytes.size();
-  record.decoded_bytes = 3U * elements * sizeof(float);
-  record.device_bytes = bytes.size();
-  record.hidden = hidden;
-  record.intermediate = intermediate;
-  record.quant_block_size = 32U;
-  record.source_abi = er::kExpertSourceAbiDeepSeekCompactV1;
-  record.header_bytes = 0U;
-  record.alignment = 1U;
-  record.payload_sha256 = er::sha256(bytes);
-  const er::ExpertKey key{0xfeedbeefU, 0U, 0U,
-                          er::kExpertEncodingAbiFp4Block32};
-  const auto result = er::validate_expert_admission(bytes, key, record);
-  require(result.status.ok() && result.target.hidden == hidden &&
-              result.target.intermediate == intermediate &&
-              result.compact.w1_scale_offset == matrix_bytes &&
-              result.compact.w3_weight_offset == matrix_bytes + scale_bytes &&
-              result.compact.w2_scale_offset ==
-                  3U * matrix_bytes + 2U * scale_bytes,
-          "headerless FP4 admission ignored descriptor geometry");
-}
 
 void test_universal_model_descriptor_negotiates_capabilities() {
   er::ModelDescriptor descriptor;
@@ -1116,7 +1017,7 @@ void test_generic_expert_catalog_uses_descriptor_cardinality() {
   er::ExpertCatalogConfig config{
       root, root, 2U, 3U, 64U, 32U, 32U, 4U,
       3ULL * 64U * 32U * sizeof(float), 4U,
-      er::kExpertSourceAbiSplitFp4Block32V1, 0U, 0U, 1U,
+      er::kExpertSourceAbiExpertPackV1, 0U, 0U, 1U,
       {{"fixture-extents-v1", "fixture-catalog-v1", 1U, true}}};
   const auto loaded = er::ExpertCatalog::load(config, catalog);
   const auto* record = catalog.find(1U, 2U);
@@ -1186,30 +1087,6 @@ void test_universal_worker_launch_preserves_provider_extensions() {
           "universal worker launch accepted duplicate options");
 }
 
-void test_deepseek_fp8_shared_admission_validation() {
-  std::vector<std::byte> bytes(25'167'360U);
-  for (std::size_t index = 0; index < bytes.size(); ++index) {
-    bytes[index] = static_cast<std::byte>((index * 17U + 11U) & 0x7eU);
-  }
-  er::PayloadRecord record;
-  record.stored_bytes = bytes.size();
-  record.decoded_bytes = 3ULL * 4096U * 2048U * sizeof(float);
-  record.device_bytes = 25'198'592U;
-  record.hidden = 4096U;
-  record.intermediate = 2048U;
-  record.quant_block_size = 128U;
-  record.source_abi = er::kExpertSourceAbiDeepSeekFp8Block128V1;
-  record.header_bytes = 0U;
-  record.alignment = 1U;
-  record.payload_sha256 = er::sha256(bytes);
-  const er::ExpertKey key{17U, 0U, 256U, er::kExpertQuantAbiDeepSeekSm86};
-  const auto valid = er::validate_expert_admission(bytes, key, record);
-  require(valid.status.ok() && valid.compact.w1_scale_offset == 8'388'608U &&
-              valid.compact.w3_weight_offset == 8'389'120U &&
-              valid.compact.w2_scale_offset == 25'166'848U &&
-              valid.target.down_scale_offset == 25'182'208U,
-          "valid DeepSeek FP8 shared admission was rejected");
-}
 
 template <typename T>
 void write_le(std::byte* output, T value) {
@@ -3029,133 +2906,15 @@ void test_cpu_executor_writes_compact_selection_outputs() {
           "CPU executor accepted duplicate compact output slots");
 }
 
-void test_deepseek_packed_executor_engages_every_worker() {
+void test_fp4_host_executor_accepts_prefill_rows() {
   constexpr std::uint32_t hidden = 32U;
   constexpr std::uint32_t intermediate = 32U;
-  constexpr std::size_t matrix_bytes = hidden * intermediate / 2U;
-  constexpr std::size_t scale_bytes = hidden * intermediate / 32U;
-  constexpr std::size_t record_bytes = 3U * (matrix_bytes + scale_bytes);
-  std::vector<std::byte> record(record_bytes);
-  const auto fill_matrix = [&](std::size_t weight_offset,
-                               std::size_t scale_offset) {
-    for (std::size_t index = 0U; index < matrix_bytes; ++index) {
-      record[weight_offset + index] = static_cast<std::byte>(
-          (index * 37U + weight_offset / 17U + 11U) & 0xffU);
-    }
-    std::fill_n(record.begin() + scale_offset, scale_bytes,
-                std::byte{127});
-  };
-  const std::size_t w1_weight = 0U;
-  const std::size_t w1_scale = w1_weight + matrix_bytes;
-  const std::size_t w3_weight = w1_scale + scale_bytes;
-  const std::size_t w3_scale = w3_weight + matrix_bytes;
-  const std::size_t w2_weight = w3_scale + scale_bytes;
-  const std::size_t w2_scale = w2_weight + matrix_bytes;
-  fill_matrix(w1_weight, w1_scale);
-  fill_matrix(w3_weight, w3_scale);
-  fill_matrix(w2_weight, w2_scale);
-  const er::DeepSeekCompactSections sections{
-      w1_weight, matrix_bytes, w1_scale, scale_bytes,
-      w3_weight, matrix_bytes, w3_scale, scale_bytes,
-      w2_weight, matrix_bytes, w2_scale, scale_bytes};
-  const expert::runtime::cpu::DeepSeekPackedWorkGroup group{
-      record, sections, hidden, intermediate, {0U, 3U}, {1U, 0U}};
-  expert::runtime::cpu::DeepSeekPackedExecutor executor(
-      {4U, 8U, 8U, 0.0F, false, false});
-  std::vector<float> inputs(2U * hidden);
-  for (std::size_t column = 0U; column < hidden; ++column) {
-    const auto value = static_cast<float>(
-        static_cast<int>(column % 11U) - 5) * 0.125F;
-    inputs[column] = value;
-    inputs[hidden + column] = value;
-  }
-  std::vector<float> outputs(2U * hidden, -123.0F);
-  const auto status = executor.execute(std::span(&group, 1U), inputs, 2U, 2U,
-                                       outputs);
-  require(status.ok(), "packed DeepSeek CPU executor rejected valid fixture");
-  const auto decode = [](std::uint8_t code) {
-    const auto index = code & 7U;
-    const auto magnitude = index <= 4U ? static_cast<int>(index)
-                           : index == 5U ? 6
-                           : index == 6U ? 8
-                                         : 12;
-    return 0.5F * static_cast<float>((code & 8U) ? -magnitude : magnitude);
-  };
-  std::array<std::int8_t, hidden> q_input{};
-  float input_maximum = 0.0F;
-  for (std::size_t column = 0U; column < hidden; ++column)
-    input_maximum = std::max(input_maximum, std::abs(inputs[column]));
-  const auto input_scale = input_maximum / 127.0F;
-  for (std::size_t column = 0U; column < hidden; ++column) {
-    q_input[column] = static_cast<std::int8_t>(std::clamp(
-        static_cast<int>(std::nearbyint(inputs[column] / input_scale)),
-        -127, 127));
-  }
-  const auto projection = [&](std::size_t offset, std::uint32_t row,
-                              const auto& activation, float scale) {
-    float sum = 0.0F;
-    for (std::size_t column = 0U; column < activation.size(); ++column) {
-      const auto packed = std::to_integer<std::uint8_t>(
-          record[offset + static_cast<std::size_t>(row) *
-                              activation.size() / 2U +
-                 column / 2U]);
-      const auto code = (column & 1U) == 0U ? packed & 0x0fU : packed >> 4U;
-      sum += decode(code) * static_cast<float>(activation[column]) * scale;
-    }
-    return sum;
-  };
-  std::array<float, intermediate> reference_intermediate{};
-  for (std::uint32_t row = 0U; row < intermediate; ++row) {
-    const auto gate = projection(w1_weight, row, q_input, input_scale);
-    const auto up = projection(w3_weight, row, q_input, input_scale);
-    reference_intermediate[row] =
-        (gate / (1.0F + std::exp(-gate))) * up;
-  }
-  float intermediate_maximum = 0.0F;
-  for (const auto value : reference_intermediate)
-    intermediate_maximum = std::max(intermediate_maximum, std::abs(value));
-  const auto intermediate_scale = intermediate_maximum > 0.0F
-                                      ? intermediate_maximum / 127.0F
-                                      : 1.0F;
-  std::array<std::int8_t, intermediate> q_intermediate{};
-  for (std::size_t column = 0U; column < intermediate; ++column) {
-    q_intermediate[column] = static_cast<std::int8_t>(std::clamp(
-        static_cast<int>(std::nearbyint(reference_intermediate[column] /
-                                        intermediate_scale)),
-        -127, 127));
-  }
-  for (std::size_t column = 0U; column < hidden; ++column) {
-    const auto expected = projection(w2_weight,
-                                     static_cast<std::uint32_t>(column),
-                                     q_intermediate, intermediate_scale);
-    require(std::isfinite(outputs[column]) &&
-                std::abs(outputs[column] - outputs[hidden + column]) < 1e-3F &&
-                std::abs(outputs[column] - expected) < 1e-3F,
-            "packed DeepSeek CPU decode or output mapping is incorrect: actual=" +
-                std::to_string(outputs[column]) + ", expected=" +
-                std::to_string(expected) + ", column=" +
-                std::to_string(column));
-  }
-  const auto metrics = executor.telemetry();
-  require(metrics.maximum_threads == 4U && metrics.workers_used_last == 4U &&
-              metrics.worker_mask_last == 0x0fU &&
-              metrics.execute_calls == 1U && metrics.selections == 2U &&
-              metrics.source_weight_bytes == record_bytes &&
-              metrics.compute_ns > 0U,
-          "packed DeepSeek CPU executor did not use every configured worker");
-
   auto standard = make_fp4_record(7U);
-  const auto copy = [&](std::size_t destination, std::size_t source,
-                        std::size_t bytes) {
-    std::memcpy(standard.bytes.data() + destination,
-                record.data() + source, bytes);
-  };
-  copy(256U, w1_weight, matrix_bytes);
-  copy(768U, w3_weight, matrix_bytes);
-  copy(1280U, w1_scale, scale_bytes);
-  copy(1312U, w3_scale, scale_bytes);
-  copy(1536U, w2_weight, matrix_bytes);
-  copy(2048U, w2_scale, scale_bytes);
+  for (const auto& span : {std::pair{1280ULL, 64ULL},
+                           std::pair{2048ULL, 32ULL}}) {
+    std::fill_n(standard.bytes.begin() + span.first, span.second,
+                std::byte{127});
+  }
   const auto digest = er::sha256(
       std::span<const std::byte>(standard.bytes)
           .subspan(er::kExpertHeaderBytes));
@@ -3165,45 +2924,43 @@ void test_deepseek_packed_executor_engages_every_worker() {
       standard.bytes, standard.key, standard.record);
   require(admitted.status.ok(),
           "standard FP4 expert did not expose the universal host ABI");
-  const er::cpu::Fp4HostWorkGroup standard_group{
-      standard.bytes, admitted.compact, hidden, intermediate,
-      {0U, 3U}, {1U, 0U}};
-  er::cpu::Fp4HostExecutor universal(
-      {4U, 8U, 8U, 0.0F, false, false});
-  std::vector<float> standard_outputs(2U * hidden, -321.0F);
-  require(universal.execute(std::span(&standard_group, 1U), inputs, 2U, 2U,
-                            standard_outputs)
-              .ok() &&
-              std::equal(outputs.begin(), outputs.end(),
-                         standard_outputs.begin()),
-          "standard and compact FP4 source layouts diverged on the host ABI");
 
-  // The universal prefill provider routes tiles of up to 512 rows. A hot
-  // expert may therefore receive more than the old decode-oriented 32-row
-  // bound even though every selection and output slot is valid.
-  constexpr std::uint32_t prefill_rows = 33U;
-  std::vector<float> prefill_inputs(prefill_rows * hidden);
-  std::vector<std::uint32_t> prefill_selections(prefill_rows);
-  std::vector<std::uint32_t> prefill_slots(prefill_rows);
-  for (std::uint32_t row = 0U; row < prefill_rows; ++row) {
-    std::copy_n(inputs.begin(), hidden,
-                prefill_inputs.begin() + static_cast<std::size_t>(row) * hidden);
-    prefill_selections[row] = row;
-    prefill_slots[row] = row;
+  er::cpu::Fp4HostExecutor executor({4U, 8U, 8U, 0.0F, false, false});
+  std::vector<float> input(hidden, 0.125F);
+  const er::cpu::Fp4HostWorkGroup single_group{
+      standard.bytes, admitted.compact, hidden, intermediate, {0U}, {0U}};
+  std::vector<float> expected(hidden);
+  require(executor.execute(std::span(&single_group, 1U), input, 1U, 1U,
+                           expected).ok(),
+          "standard FP4 host execution failed");
+
+  constexpr std::uint32_t rows = 33U;
+  std::vector<float> inputs(rows * hidden);
+  std::vector<std::uint32_t> selections(rows);
+  std::vector<std::uint32_t> slots(rows);
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    std::copy(input.begin(), input.end(),
+              inputs.begin() + static_cast<std::size_t>(row) * hidden);
+    selections[row] = row;
+    slots[row] = row;
   }
   const er::cpu::Fp4HostWorkGroup prefill_group{
       standard.bytes, admitted.compact, hidden, intermediate,
-      std::move(prefill_selections), std::move(prefill_slots)};
-  std::vector<float> prefill_outputs(prefill_rows * hidden, -456.0F);
-  require(universal.execute(std::span(&prefill_group, 1U), prefill_inputs,
-                            prefill_rows, 1U, prefill_outputs).ok(),
-          "universal FP4 host ABI rejected a valid prefill-sized work group");
-  for (std::uint32_t row = 0U; row < prefill_rows; ++row) {
-    require(std::equal(standard_outputs.begin(),
-                       standard_outputs.begin() + hidden,
-                       prefill_outputs.begin() +
-                           static_cast<std::size_t>(row) * hidden),
-            "prefill-sized FP4 host work group changed numerical output");
+      std::move(selections), std::move(slots)};
+  std::vector<float> outputs(rows * hidden);
+  require(executor.execute(std::span(&prefill_group, 1U), inputs, rows, 1U,
+                           outputs).ok(),
+          "universal FP4 host ABI rejected a prefill-sized work group");
+  for (std::uint32_t row = 0U; row < rows; ++row) {
+    for (std::uint32_t column = 0U; column < hidden; ++column) {
+      const auto actual = outputs[static_cast<std::size_t>(row) * hidden + column];
+      require(std::isfinite(expected[column]) && std::isfinite(actual) &&
+                  expected[column] == actual,
+              "prefill FP4 mismatch at row=" + std::to_string(row) +
+                  " column=" + std::to_string(column) +
+                  " expected=" + std::to_string(expected[column]) +
+                  " actual=" + std::to_string(actual));
+    }
   }
 }
 
@@ -3726,9 +3483,6 @@ void test_placement_profile_uses_measurements_and_exact_budgets() {
 int main() {
   try {
     test_exact_rejection_sampling_matches_independent_target_oracle();
-    test_deepseek_compact_and_sm86_hot_abi();
-    test_deepseek_compact_admission_validation();
-    test_headerless_fp4_admission_is_geometry_driven();
     test_universal_model_descriptor_negotiates_capabilities();
     test_serialized_model_program_is_provider_neutral();
     test_schema_v2_artifact_binds_unknown_model_without_architecture_branch();
@@ -3737,7 +3491,6 @@ int main() {
     test_generic_expert_catalog_uses_descriptor_cardinality();
     test_universal_worker_launch_preserves_provider_extensions();
     test_vram_budget_fits_only_before_first_device_admission();
-    test_deepseek_fp8_shared_admission_validation();
     test_fp4_block32_admission_validation();
     test_fp4_relu2_block32_admission_validation();
     test_extent_gather_is_exact_and_bounded();
@@ -3763,7 +3516,7 @@ int main() {
     test_ram_hit_reuploads_after_vram_eviction();
     test_host_lease_protects_validated_ram_copy();
     test_cpu_executor_writes_compact_selection_outputs();
-    test_deepseek_packed_executor_engages_every_worker();
+    test_fp4_host_executor_accepts_prefill_rows();
     test_layer_partitioned_eviction_protects_other_layers();
     test_frequency_admission_protects_reused_expert();
     test_routing_score_temperature_breaks_frequency_ties();

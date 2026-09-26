@@ -57,15 +57,6 @@ bool valid_section(std::uint64_t offset, std::uint64_t bytes,
          bytes <= record_bytes && offset <= record_bytes - bytes;
 }
 
-bool align_up(std::uint64_t value, std::uint64_t alignment,
-              std::uint64_t& result) noexcept {
-  if (alignment == 0U || value >
-      std::numeric_limits<std::uint64_t>::max() - (alignment - 1U))
-    return false;
-  result = (value + alignment - 1U) / alignment * alignment;
-  return true;
-}
-
 }  // namespace
 
 ExpertRecordValidation validate_expert_record(
@@ -317,113 +308,9 @@ ExpertAdmissionValidation validate_expert_admission(
     }
     return {validated.status, validated.record.sections, split};
   }
-#ifdef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
   static_cast<void>(verify_payload_sha256);
   return admission_failure(ErrorCode::invalid_argument,
                            "unsupported source/target expert ABI pair");
-#else
-  if (key.encoding_abi != kExpertEncodingAbiFp4Block32 ||
-      (expected.source_abi != kExpertSourceAbiDeepSeekCompactV1 &&
-       expected.source_abi != kExpertSourceAbiDeepSeekFp8Block128V1)) {
-    return admission_failure(ErrorCode::invalid_argument,
-                             "unsupported source/target expert ABI pair");
-  }
-  const bool fp8 =
-      expected.source_abi == kExpertSourceAbiDeepSeekFp8Block128V1;
-  const auto hidden = expected.hidden == 0U ? 4096U : expected.hidden;
-  const auto intermediate =
-      expected.intermediate == 0U ? 2048U : expected.intermediate;
-  const auto block = expected.quant_block_size == 0U
-                         ? (fp8 ? 128U : kExpertFp4BlockSize)
-                         : expected.quant_block_size;
-  std::uint64_t elements = 0U;
-  if (!multiply(hidden, intermediate, elements) ||
-      (fp8 && (block != 128U || hidden % block != 0U ||
-               intermediate % block != 0U)) ||
-      (!fp8 && (block != kExpertFp4BlockSize || hidden % block != 0U ||
-                intermediate % block != 0U)))
-    return admission_failure(ErrorCode::checksum_mismatch,
-                             "split expert source geometry is invalid");
-  const std::uint64_t weight_bytes = fp8 ? elements : elements / 2U;
-  const std::uint64_t scale_bytes =
-      fp8 ? static_cast<std::uint64_t>(hidden / block) *
-                (intermediate / block)
-          : elements / block;
-  const std::uint64_t source_bytes = 3U * (weight_bytes + scale_bytes);
-  std::uint64_t gate_up_scale_offset = 0U;
-  std::uint64_t down_offset = 0U;
-  std::uint64_t down_scale_offset = 0U;
-  std::uint64_t hot_bytes = 0U;
-  const auto gate_up_bytes = 2U * elements;
-  const auto gate_up_scale_bytes =
-      2ULL * intermediate * sizeof(float);
-  const auto down_bytes = elements;
-  const auto down_scale_bytes = static_cast<std::uint64_t>(hidden) * sizeof(float);
-  if (!align_up(gate_up_bytes, kSectionAlignment, gate_up_scale_offset) ||
-      !align_up(gate_up_scale_offset + gate_up_scale_bytes,
-                kSectionAlignment, down_offset) ||
-      !align_up(down_offset + down_bytes, kSectionAlignment,
-                down_scale_offset) ||
-      !align_up(down_scale_offset + down_scale_bytes, kSectionAlignment,
-                hot_bytes))
-    return admission_failure(ErrorCode::checksum_mismatch,
-                             "split expert target geometry overflows");
-  // FP8 source records expand to INT8-per-row. FP4 source records execute
-  // directly from the packed bytes, but target section metadata still
-  // describes the optional expanded view.
-  const std::uint64_t device_bytes = fp8 ? hot_bytes : source_bytes;
-  if (expected.stored_bytes != source_bytes || bytes.size() != source_bytes ||
-      expected.device_bytes != device_bytes || expected.header_bytes != 0U ||
-      expected.decoded_bytes != 3ULL * elements * sizeof(float)) {
-    return admission_failure(ErrorCode::checksum_mismatch,
-                             "DeepSeek compact admission geometry mismatch");
-  }
-  if (verify_payload_sha256 &&
-      !constant_time_equal(sha256(bytes), expected.payload_sha256)) {
-    return admission_failure(ErrorCode::checksum_mismatch,
-                             "DeepSeek compact payload SHA-256 mismatch");
-  }
-  DeepSeekCompactSections compact{};
-  compact.w1_weight_offset = 0U;
-  compact.w1_weight_bytes = weight_bytes;
-  compact.w1_scale_offset = compact.w1_weight_offset + weight_bytes;
-  compact.w1_scale_bytes = scale_bytes;
-  compact.w3_weight_offset = compact.w1_scale_offset + scale_bytes;
-  compact.w3_weight_bytes = weight_bytes;
-  compact.w3_scale_offset = compact.w3_weight_offset + weight_bytes;
-  compact.w3_scale_bytes = scale_bytes;
-  compact.w2_weight_offset = compact.w3_scale_offset + scale_bytes;
-  compact.w2_weight_bytes = weight_bytes;
-  compact.w2_scale_offset = compact.w2_weight_offset + weight_bytes;
-  compact.w2_scale_bytes = scale_bytes;
-  if (!fp8) {
-    const std::array<std::pair<std::uint64_t, std::uint64_t>, 3U> scales = {{
-        {compact.w1_scale_offset, compact.w1_scale_bytes},
-        {compact.w3_scale_offset, compact.w3_scale_bytes},
-        {compact.w2_scale_offset, compact.w2_scale_bytes},
-    }};
-    for (const auto& [offset, count] : scales) {
-      const auto begin = bytes.begin() + static_cast<std::size_t>(offset);
-      const auto end = begin + static_cast<std::size_t>(count);
-      if (std::find(begin, end, std::byte{0xff}) != end) {
-        return admission_failure(ErrorCode::checksum_mismatch,
-                                 "DeepSeek compact source contains UE8M0 NaN");
-      }
-    }
-  }
-  ExpertSections target{};
-  target.hidden = hidden;
-  target.intermediate = intermediate;
-  target.gate_up_q_offset = 0U;
-  target.gate_up_q_bytes = gate_up_bytes;
-  target.gate_up_scale_offset = gate_up_scale_offset;
-  target.gate_up_scale_bytes = gate_up_scale_bytes;
-  target.down_q_offset = down_offset;
-  target.down_q_bytes = down_bytes;
-  target.down_scale_offset = down_scale_offset;
-  target.down_scale_bytes = down_scale_bytes;
-  return {Status::success(), target, compact};
-#endif
 }
 
 }  // namespace expert::runtime

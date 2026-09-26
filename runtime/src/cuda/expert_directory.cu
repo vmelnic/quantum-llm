@@ -15,7 +15,7 @@
 #include <unordered_map>
 
 namespace expert::runtime::cuda {
-namespace {
+namespace expert_directory_detail {
 
 constexpr std::uint32_t kEmptyKey = std::numeric_limits<std::uint32_t>::max();
 constexpr unsigned kThreads = 256;
@@ -149,7 +149,8 @@ __global__ void try_retire_entry(DeviceExpertEntry* entry,
   }
 }
 
-}  // namespace
+}  // namespace expert_directory_detail
+using namespace expert_directory_detail;
 
 struct CudaExpertDirectory::Impl final {
   std::uint64_t model_id{};
@@ -643,13 +644,7 @@ Status CudaExpertDirectory::publish(
   }
   const auto* cuda_allocation =
       dynamic_cast<const CudaExpertAllocation*>(allocation.get());
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-  const auto* compact_allocation =
-      dynamic_cast<const CudaCompactExpertAllocation*>(allocation.get());
-  if (!cuda_allocation && !compact_allocation) {
-#else
   if (!cuda_allocation) {
-#endif
     return Status(ErrorCode::invalid_argument,
                   "CUDA directory received a non-CUDA allocation");
   }
@@ -702,20 +697,6 @@ Status CudaExpertDirectory::publish(
           DeviceExpertFormat::int8_per_row);
     }
   }
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-  else {
-    const auto* base = compact_allocation->base();
-    const auto& sections = compact_allocation->sections();
-    entry.w1_fp4 = base + sections.w1_weight_offset;
-    entry.w1_ue8m0 = base + sections.w1_scale_offset;
-    entry.w3_fp4 = base + sections.w3_weight_offset;
-    entry.w3_ue8m0 = base + sections.w3_scale_offset;
-    entry.w2_fp4 = base + sections.w2_weight_offset;
-    entry.w2_ue8m0 = base + sections.w2_scale_offset;
-    entry.format = static_cast<std::uint32_t>(
-        DeviceExpertFormat::fp4_e2m1_ue8m0_block32);
-  }
-#endif
   entry.generation = ++impl_->generations[index];
   entry.state = static_cast<std::uint32_t>(DeviceExpertState::ready);
   return checked(cudaMemcpy(impl_->entries + index, &entry, sizeof(entry),

@@ -71,37 +71,6 @@ std::uint64_t fp4_device_bytes(std::uint32_t hidden,
   return matrices * (elements / 2U + elements / kExpertFp4BlockSize);
 }
 
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-std::uint64_t runtime_u64(std::string_view text, std::string_view key) {
-  const auto prefix = std::string(key) + "\t";
-  std::optional<std::uint64_t> result;
-  std::size_t offset{};
-  while (offset < text.size()) {
-    const auto end = text.find('\n', offset);
-    auto line = text.substr(offset, end == std::string_view::npos
-                                        ? text.size() - offset
-                                        : end - offset);
-    if (!line.empty() && line.back() == '\r') line.remove_suffix(1U);
-    if (line.starts_with(prefix)) {
-      if (result)
-        throw std::invalid_argument("artifact runtime field is duplicated");
-      const auto value = line.substr(prefix.size());
-      std::uint64_t parsed{};
-      const auto converted = std::from_chars(
-          value.data(), value.data() + value.size(), parsed);
-      if (value.empty() || converted.ec != std::errc{} ||
-          converted.ptr != value.data() + value.size() || parsed == 0U)
-        throw std::invalid_argument("artifact runtime integer is invalid");
-      result = parsed;
-    }
-    if (end == std::string_view::npos) break;
-    offset = end + 1U;
-  }
-  if (!result) throw std::invalid_argument("artifact runtime field is absent");
-  return *result;
-}
-#endif
-
 }  // namespace
 
 Status ModelArtifact::load(const std::filesystem::path& root,
@@ -122,10 +91,6 @@ Status ModelArtifact::load(const std::filesystem::path& root,
         Required(format, "version", "format").AsU64("format.version");
     if (name == "expert-pack" && version == 1U)
       return load_expert_pack_v1(root, destination);
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-    if (name == "deepseek-worker-bundle" && version == 3U)
-      return load_deepseek_worker_bundle_v3(root, destination);
-#endif
     return {ErrorCode::invalid_argument,
             "no artifact storage adapter implements manifest format"};
   } catch (const std::exception& error) {
@@ -133,54 +98,6 @@ Status ModelArtifact::load(const std::filesystem::path& root,
             std::string("invalid artifact manifest: ") + error.what()};
   }
 }
-
-#ifndef EXPERT_RUNTIME_EXCLUDE_COMPRESSED_SPARSE_PROVIDER
-Status ModelArtifact::load_deepseek_worker_bundle_v3(
-    const std::filesystem::path& root, ModelArtifact& destination) noexcept {
-  try {
-    const auto document = expert::core::json::Parse(
-        read_text(root / "manifest.json"));
-    const auto& manifest = document.AsObject("manifest");
-    const auto& integrity = Required(manifest, "integrity", "manifest")
-                                .AsObject("manifest.integrity");
-    const auto content_hash = digest(
-        Required(integrity, "content_sha256", "integrity")
-            .AsString("integrity.content_sha256"));
-    const auto runtime_text = read_text(root / "runtime.tsv");
-    Sha256 runtime_hasher;
-    runtime_hasher.update(std::as_bytes(std::span(runtime_text)));
-    if (!constant_time_equal(runtime_hasher.finalize(), content_hash))
-      return {ErrorCode::checksum_mismatch,
-              "worker bundle runtime index hash mismatch"};
-    const auto& program = Required(manifest, "model_program", "manifest")
-                              .AsObject("manifest.model_program");
-    if (Required(program, "format", "model_program")
-            .AsString("model_program.format") != "expert-runtime-model-v1")
-      return {ErrorCode::invalid_argument,
-              "worker bundle model program format is unsupported"};
-    const auto program_path = safe_child(
-        root, Required(program, "path", "model_program")
-                  .AsString("model_program.path"));
-    auto parsed = load_model_descriptor_artifact(
-        program_path,
-        Required(program, "bytes", "model_program")
-            .AsU64("model_program.bytes"),
-        digest(Required(program, "sha256", "model_program")
-                   .AsString("model_program.sha256")),
-        content_hash, runtime_u64(runtime_text, "model_id"));
-    if (!parsed.status.ok())
-      return {parsed.status.code(), std::string(parsed.status.message())};
-    ModelArtifact candidate;
-    candidate.root_ = root;
-    candidate.model_ = std::move(parsed.descriptor);
-    destination = std::move(candidate);
-    return Status::success();
-  } catch (const std::exception& error) {
-    return {ErrorCode::invalid_argument,
-            std::string("invalid worker bundle artifact: ") + error.what()};
-  }
-}
-#endif
 
 const ArtifactPack* ModelArtifact::find_pack(std::string_view name) const
     noexcept {

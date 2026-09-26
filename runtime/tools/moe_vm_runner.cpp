@@ -52,15 +52,6 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
     std::string_view, std::string_view, bool, bool, std::vector<int>,
     std::uint64_t, std::uint64_t);
-#ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
-er::WorkerProviderDefinition make_sm86_compressed_sparse_moe_provider();
-er::CreateExecutionProviderModuleResult
-make_sm86_compressed_sparse_moe_callable_provider(
-    const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
-    std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
-    bool, std::vector<int>, std::uint64_t, std::uint64_t,
-    std::shared_ptr<const er::ActiveExpertOwnerDirectory>);
-#endif
 
 namespace {
 
@@ -443,14 +434,12 @@ er::ExecutionProviderModule create_module(
   auto active_expert_devices = options.active_expert_devices;
   if (options.discover_active_expert_devices)
     active_expert_devices =
-        er::cuda::discover_pascal_active_expert_devices();
+        er::cuda::discover_active_expert_devices();
 
   std::vector<ModuleFactory> factories;
   // Deployment ownership is common runtime data. An empty directory preserves
   // exact local placement; configured transports can populate the same object
   // without changing provider selection or the artifact program.
-  auto active_expert_owners =
-      std::make_shared<const er::ActiveExpertOwnerDirectory>();
   {
     auto metadata = make_sm86_dense_moe_provider();
     factories.push_back(
@@ -493,24 +482,6 @@ er::ExecutionProviderModule create_module(
                options.active_expert_host_cache_gib << 30U);
          }});
   }
-#ifdef EXPERT_VM_HAS_DEEPSEEK_PROVIDER
-  {
-    auto metadata = make_sm86_compressed_sparse_moe_provider();
-    factories.push_back(
-        {std::move(metadata),
-         [&] {
-           return make_sm86_compressed_sparse_moe_callable_provider(
-               root, options.max_context, options.capacity,
-               options.ram_cache_gib << 30U, options.vram_cache_gib << 30U,
-               options.kv_cache_mib << 20U, options.kv_page_tokens,
-               options.placement_profile,
-               false, active_expert_devices,
-               options.active_expert_device_cache_gib << 30U,
-               options.active_expert_host_cache_gib << 30U,
-               active_expert_owners);
-         }});
-  }
-#endif
 
   std::vector<ModuleFactory*> compatible;
   for (auto& factory : factories) {

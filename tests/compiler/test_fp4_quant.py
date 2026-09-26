@@ -26,7 +26,7 @@ from compiler.expert_pack.constants import (
     PACK_ALIGNMENT,
     QUANT_PROFILE,
 )
-from compiler.expert_pack.deepseek_quant import decode_scaled_fp4_e2m1_row
+from compiler.expert_pack.fp4_reference import decode_scaled_fp4_e2m1_row
 from compiler.expert_pack.errors import SourceFormatError
 from compiler.expert_pack.quant import (
     write_fp4_block32_rows,

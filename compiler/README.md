@@ -20,10 +20,6 @@ encodings. The common runtime never selects a model family from these names.
 | `lfm2_moe` | LFM2-MoE source contract |
 | `olmoe` | OLMoE source contract |
 
-DeepSeek V4 uses the separate exhaustive `deepseek_v4` inspection,
-descriptor/oracle and compact-pack workflow because its source and paging
-container are different.
-
 ## Install and inspect
 
 ```powershell
@@ -65,6 +61,5 @@ Unknown tensors, fields, paths, record versions, operation ABIs, geometries or
 hashes fail closed. FP4 publication additionally requires source reconstruction
 quality and real provider execution; parsing an artifact is not an FP4 gate.
 
-See [Expert Pack v1](../docs/expert-pack-v1.md),
-[DeepSeek compact pack v1](../docs/deepseek-compact-pack-v1.md) and
+See [Expert Pack v1](../docs/expert-pack-v1.md) and
 [Runtime contract](../docs/expert-runtime.md).

@@ -52,7 +52,7 @@ struct UploadRequest final {
   std::uint32_t record_abi{};
   ExpertSections sections;
   std::span<const std::byte> complete_record;
-  DeepSeekCompactSections compact;
+  SplitExpertSections compact;
 };
 
 struct UploadResult final {
@@ -180,13 +180,13 @@ class HostExpertLease final {
   [[nodiscard]] explicit operator bool() const noexcept;
   [[nodiscard]] std::span<const std::byte> bytes() const noexcept;
   [[nodiscard]] const ExpertSections& sections() const noexcept;
-  [[nodiscard]] const DeepSeekCompactSections& compact_sections()
+  [[nodiscard]] const SplitExpertSections& compact_sections()
       const noexcept;
   [[nodiscard]] std::uint32_t source_abi() const noexcept;
 
   HostExpertLease(std::shared_ptr<const void> ownership,
                   const std::byte* bytes, std::size_t byte_count,
-                  ExpertSections sections, DeepSeekCompactSections compact,
+                  ExpertSections sections, SplitExpertSections compact,
                   std::uint32_t source_abi,
                   std::function<void()> release) noexcept;
 
@@ -197,7 +197,7 @@ class HostExpertLease final {
   const std::byte* bytes_{};
   std::size_t byte_count_{};
   ExpertSections sections_{};
-  DeepSeekCompactSections compact_{};
+  SplitExpertSections compact_{};
   std::uint32_t source_abi_{};
   std::function<void()> release_;
 };

@@ -231,7 +231,7 @@ def _tunnel(remote: str, local_port: int, remote_port: int) -> subprocess.Popen[
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--base-url", default="http://127.0.0.1:8080")
-    parser.add_argument("--model", default="deepseek-v4-flash")
+    parser.add_argument("--model", default="qwen3.8-27b-fp4")
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument("--ssh", help="open and own an SSH tunnel to user@host")
     parser.add_argument("--local-port", type=int, default=18080)

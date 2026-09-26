@@ -60,12 +60,12 @@ class DeviceGuard final {
   cudaError_t error_{cudaSuccess};
 };
 
-class PascalAllocationPool final {
+class ActiveExpertAllocationPool final {
  public:
-  PascalAllocationPool(int device, std::size_t slot_bytes)
+  ActiveExpertAllocationPool(int device, std::size_t slot_bytes)
       : device_(device), slot_bytes_(slot_bytes) {}
 
-  ~PascalAllocationPool() {
+  ~ActiveExpertAllocationPool() {
     DeviceGuard guard(device_);
     if (guard.error() != cudaSuccess) return;
     if (arena_) static_cast<void>(cudaFree(arena_));
@@ -166,14 +166,14 @@ class PascalAllocationPool final {
   std::vector<void*> free_;
 };
 
-class PascalPackedAllocation final : public IDeviceAllocation {
+class ActiveExpertPackedAllocation final : public IDeviceAllocation {
  public:
-  PascalPackedAllocation(std::shared_ptr<PascalAllocationPool> pool,
+  ActiveExpertPackedAllocation(std::shared_ptr<ActiveExpertAllocationPool> pool,
                          void* pointer, std::size_t bytes,
                          SplitExpertSections sections) noexcept
       : pool_(std::move(pool)), pointer_(pointer), bytes_(bytes),
         sections_(sections) {}
-  ~PascalPackedAllocation() override {
+  ~ActiveExpertPackedAllocation() override {
     if (pool_ && pointer_) pool_->release(pointer_);
   }
   [[nodiscard]] std::size_t bytes() const noexcept override { return bytes_; }
@@ -185,15 +185,15 @@ class PascalPackedAllocation final : public IDeviceAllocation {
   }
 
  private:
-  std::shared_ptr<PascalAllocationPool> pool_;
+  std::shared_ptr<ActiveExpertAllocationPool> pool_;
   void* pointer_{};
   std::size_t bytes_{};
   SplitExpertSections sections_{};
 };
 
-class PascalPackedUploader final : public IDeviceUploader {
+class ActiveExpertPackedUploader final : public IDeviceUploader {
  public:
-  PascalPackedUploader(std::shared_ptr<PascalAllocationPool> pool,
+  ActiveExpertPackedUploader(std::shared_ptr<ActiveExpertAllocationPool> pool,
                        std::size_t source_record_bytes,
                        std::size_t device_record_bytes,
                        std::uint32_t hidden, std::uint32_t intermediate)
@@ -219,7 +219,7 @@ class PascalPackedUploader final : public IDeviceUploader {
     }
   }
 
-  ~PascalPackedUploader() override {
+  ~ActiveExpertPackedUploader() override {
     DeviceGuard guard(pool_->device());
     if (guard.error() == cudaSuccess && stream_)
       static_cast<void>(cudaStreamDestroy(stream_));
@@ -314,7 +314,7 @@ class PascalPackedUploader final : public IDeviceUploader {
       completion({std::move(allocation_status), {}, 0U});
       return operation;
     }
-    auto allocation = std::make_shared<PascalPackedAllocation>(
+    auto allocation = std::make_shared<ActiveExpertPackedAllocation>(
         pool_, pointer, device_record_bytes_, compact);
     DeviceGuard guard(pool_->device());
     auto error = guard.error();
@@ -336,7 +336,7 @@ class PascalPackedUploader final : public IDeviceUploader {
   void cancel(OperationId) noexcept override {}
 
  private:
-  std::shared_ptr<PascalAllocationPool> pool_;
+  std::shared_ptr<ActiveExpertAllocationPool> pool_;
   std::size_t source_record_bytes_{};
   std::size_t device_record_bytes_{};
   std::uint64_t matrix_values_{};
@@ -565,9 +565,10 @@ class DeviceState final {
       throw std::runtime_error("cannot select secondary CUDA device");
     cudaDeviceProp properties{};
     auto error = cudaGetDeviceProperties(&properties, ordinal_);
-    if (error != cudaSuccess || properties.major != 6)
+    if (error != cudaSuccess || properties.major != 8 ||
+        properties.minor < 6)
       throw std::runtime_error(
-          "active expert device must be a Pascal CUDA GPU");
+          "active expert device must support SM86 kernels");
     const auto source_record_bytes = records_.front().stored_bytes;
     const auto device_record_bytes = records_.front().device_bytes == 0U
                                          ? source_record_bytes
@@ -579,9 +580,9 @@ class DeviceState final {
         static_cast<std::size_t>(config_.component.intermediate_size) *
         sizeof(float);
     maximum_batch_ = config_.staging_slots_per_device;
-    pool_ = std::make_shared<PascalAllocationPool>(
+    pool_ = std::make_shared<ActiveExpertAllocationPool>(
         ordinal_, static_cast<std::size_t>(device_record_bytes));
-    uploader_ = std::make_shared<PascalPackedUploader>(
+    uploader_ = std::make_shared<ActiveExpertPackedUploader>(
         pool_, static_cast<std::size_t>(source_record_bytes),
         static_cast<std::size_t>(device_record_bytes),
         config_.component.hidden_size,
@@ -786,7 +787,7 @@ class DeviceState final {
       const PayloadRecord* record{};
       AcquireHandle acquire;
       ExpertLease lease;
-      const PascalPackedAllocation* allocation{};
+      const ActiveExpertPackedAllocation* allocation{};
       std::uint32_t input_row{};
       bool owns_input_transfer{};
       bool acquired{};
@@ -894,7 +895,7 @@ class DeviceState final {
         }
         item.lease = std::move(acquired.lease);
         item.allocation =
-            dynamic_cast<const PascalPackedAllocation*>(item.lease.get());
+            dynamic_cast<const ActiveExpertPackedAllocation*>(item.lease.get());
         if (!item.allocation) {
           telemetry_.failed.fetch_add(1U, std::memory_order_relaxed);
           complete(item.task,
@@ -1128,8 +1129,8 @@ class DeviceState final {
   ActiveExpertDeviceExecutorConfig config_;
   std::vector<PayloadRecord> records_;
   AtomicTelemetry& telemetry_;
-  std::shared_ptr<PascalAllocationPool> pool_;
-  std::shared_ptr<PascalPackedUploader> uploader_;
+  std::shared_ptr<ActiveExpertAllocationPool> pool_;
+  std::shared_ptr<ActiveExpertPackedUploader> uploader_;
   std::shared_ptr<FixedBufferPool> buffers_;
   std::shared_ptr<FixedBufferPool> output_buffers_;
   std::unique_ptr<ExpertCache> cache_;
@@ -1354,7 +1355,7 @@ CreateActiveExpertDeviceExecutorResult create_active_expert_device_executor(
   }
 }
 
-std::vector<int> discover_pascal_active_expert_devices() {
+std::vector<int> discover_active_expert_devices() {
   int primary_device = -1;
   int device_count = 0;
   auto error = cudaGetDevice(&primary_device);
@@ -1372,7 +1373,8 @@ std::vector<int> discover_pascal_active_expert_devices() {
       throw std::runtime_error(
           std::string("inspect secondary CUDA device: ") +
           cudaGetErrorString(error));
-    if (properties.major == 6) result.push_back(ordinal);
+    if (properties.major == 8 && properties.minor >= 6)
+      result.push_back(ordinal);
   }
   return result;
 }

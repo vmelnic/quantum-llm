@@ -79,8 +79,6 @@ class ModelArtifact final {
       std::string_view name) const noexcept;
 
  private:
-  [[nodiscard]] static Status load_deepseek_worker_bundle_v3(
-      const std::filesystem::path& root, ModelArtifact& destination) noexcept;
   std::filesystem::path root_;
   ModelDescriptor model_;
   std::vector<ArtifactPack> packs_;

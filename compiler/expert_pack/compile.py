@@ -1876,46 +1876,7 @@ def refresh_sampling_profiles(
     output = Path(output).resolve()
     if output.exists():
         raise ResumeError(f"output already exists: {output}")
-    try:
-        validation = validate_container(container)
-        legacy_metadata = False
-    except ValidationError as error:
-        manifest = load_json(container / "manifest.json")
-        legacy_top_keys = {
-            "schema", "format", "compatibility", "source", "architecture",
-            "model_program", "quantization", "kernel_abi", "alignment",
-            "tensors", "experts", "packs", "indexes", "masses",
-            "requirements", "tokenizer", "integrity",
-        }
-        if (str(error) != "unknown or missing top-level manifest fields" or
-                not isinstance(manifest, dict) or
-                set(manifest) != legacy_top_keys):
-            raise
-        integrity = manifest.get("integrity")
-        marker = load_json(container / "COMPLETED")
-        declared_hash = (
-            integrity.get("content_sha256")
-            if isinstance(integrity, dict) else None
-        )
-        unhashed = dict(manifest)
-        unhashed["integrity"] = dict(integrity) \
-            if isinstance(integrity, dict) else {}
-        unhashed["integrity"]["content_sha256"] = ""
-        if (not isinstance(declared_hash, str) or
-                sha256_bytes(canonical_json_bytes(unhashed)) != declared_hash or
-                not isinstance(marker, dict) or
-                set(marker) != {
-                    "format_version", "manifest_content_sha256",
-                    "manifest_file_sha256",
-                } or marker.get("format_version") != FORMAT_VERSION or
-                marker.get("manifest_content_sha256") != declared_hash or
-                marker.get("manifest_file_sha256") !=
-                    sha256_file(container / "manifest.json")):
-            raise ValidationError(
-                "legacy container completion metadata is invalid"
-            ) from error
-        validation = {"manifest_content_sha256": declared_hash}
-        legacy_metadata = True
+    validation = validate_container(container)
     sampling = _load_sampling_profiles(profiles_path)
     if sampling is None:
         raise ValueError("sampling profiles are required")
@@ -1925,53 +1886,6 @@ def refresh_sampling_profiles(
 
     shutil.copytree(container, partial, copy_function=_link_or_copy)
     manifest = load_json(partial / "manifest.json")
-    if legacy_metadata:
-        dense = manifest.get("tensors")
-        model_program = manifest.get("model_program")
-        requirements = manifest.get("requirements")
-        masses = manifest.get("masses")
-        if (not isinstance(dense, list) or
-                not isinstance(model_program, dict) or
-                not isinstance(model_program.get("path"), str) or
-                not isinstance(requirements, dict) or
-                not isinstance(masses, dict)):
-            raise ValidationError("legacy container metadata is incomplete")
-        relative_program = Path(model_program["path"])
-        if relative_program.is_absolute() or ".." in relative_program.parts:
-            raise ValidationError("legacy model program path is unsafe")
-        program_path = partial / relative_program
-        if (not program_path.is_file() or
-                program_path.stat().st_size != model_program.get("bytes") or
-                sha256_file(program_path) != model_program.get("sha256")):
-            raise ValidationError("legacy model program is not authenticated")
-        program_lines = program_path.read_text(encoding="utf-8").splitlines()
-        bound_tensors = {
-            fields[-1]
-            for line in program_lines
-            if (fields := line.split("\t")) and
-            fields[0].endswith("_tensor") and len(fields) >= 3
-        }
-        dense_names = {
-            entry.get("name") for entry in dense if isinstance(entry, dict)
-        }
-        if (None in dense_names or bound_tensors != dense_names or
-                any(line.startswith("operation\t") and
-                    ("\tembedding.ngram-ple.fp4-block32.v1\t" in line or
-                     "\tembedding.ngram-ple.v1\t" in line)
-                    for line in program_lines)):
-            raise ValidationError(
-                "legacy auxiliary or host-mapped placement requires source recompilation"
-            )
-        resident = requirements.get("resident_dense_bytes")
-        dense_bytes = masses.get("dense_bytes")
-        if (not isinstance(resident, int) or resident < 0 or
-                not isinstance(dense_bytes, int) or resident > dense_bytes):
-            raise ValidationError(
-                "legacy dense residency accounting is invalid"
-            )
-        manifest["auxiliary_tensors"] = []
-        masses["resident_dense_bytes"] = resident
-        masses["host_mapped_dense_bytes"] = 0
     tokenizer = manifest.get("tokenizer")
     if not isinstance(tokenizer, dict):
         raise ValueError("container tokenizer metadata is invalid")

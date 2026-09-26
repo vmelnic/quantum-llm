@@ -25,23 +25,14 @@ inline constexpr std::uint32_t kDenseRecordAbiMxfp6E3m2Block32 = 6;
 // encoding ABI, source ABI, and record ABI as separate fields.
 inline constexpr std::uint32_t kExpertQuantAbiInt8PerRow =
     kExpertEncodingAbiInt8PerRow;
-inline constexpr std::uint32_t kExpertQuantAbiDeepSeekSm86 =
-    kExpertEncodingAbiFp4Block32;
 // FP4-E2M1 packed nibbles with one UE8M0 scale per 32-value block along each
-// output row, stored in a standard EPEXPR01 record. Shares the DeepSeek
-// compact device format (DeviceExpertFormat::fp4_e2m1_ue8m0_block32).
+// output row, stored in a standard EPEXPR01 record.
 inline constexpr std::uint32_t kExpertQuantAbiFp4Block32 =
     kExpertRecordAbiFp4Block32;
 inline constexpr std::uint32_t kExpertFp4BlockSize = 32;
 inline constexpr std::uint32_t kExpertNvfp4BlockSize = 16;
 inline constexpr std::uint32_t kDenseMxfp6BlockSize = 32;
 inline constexpr std::uint32_t kExpertSourceAbiExpertPackV1 = 1;
-inline constexpr std::uint32_t kExpertSourceAbiSplitFp4Block32V1 = 2;
-inline constexpr std::uint32_t kExpertSourceAbiSplitFp8Block128V1 = 3;
-inline constexpr std::uint32_t kExpertSourceAbiDeepSeekCompactV1 =
-    kExpertSourceAbiSplitFp4Block32V1;
-inline constexpr std::uint32_t kExpertSourceAbiDeepSeekFp8Block128V1 =
-    kExpertSourceAbiSplitFp8Block128V1;
 
 struct ExpertSections final {
   std::uint32_t hidden{};
@@ -77,12 +68,10 @@ struct SplitExpertSections final {
   std::uint64_t w2_scale_bytes{};
 };
 
-using DeepSeekCompactSections = SplitExpertSections;
-
 struct ExpertAdmissionValidation final {
   Status status;
   ExpertSections target;
-  DeepSeekCompactSections compact;
+  SplitExpertSections compact;
 };
 
 struct ExpertRecordValidation final {
@@ -97,8 +86,7 @@ struct ExpertRecordValidation final {
     std::span<const std::byte> bytes, const ExpertKey& expected_key,
     const PayloadRecord& expected_record) noexcept;
 
-// Representation-aware cache gate. It validates either an Expert Pack record
-// or a compact DeepSeek staging payload and returns the exact device target.
+// Representation-aware cache gate for Expert Pack records.
 [[nodiscard]] ExpertAdmissionValidation validate_expert_admission(
     std::span<const std::byte> bytes, const ExpertKey& expected_key,
     const PayloadRecord& expected_record,

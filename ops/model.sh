@@ -13,7 +13,7 @@ fi
 
 usage() {
   cat <<'EOF'
-Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|clear-cache|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|mistral|deepseek|<artifact-name>|all]
+Usage: ./ops/model.sh <install|sync|start|stop|restart|status|chat|clear-cache|config> [qwen|qwen-abliterated|qwen-f16|qwen-flash|muse|ornith|mistral|<artifact-name>|all]
 
 The model defaults to CHAT_MODEL from .env. `start` synchronizes Git-visible
 files by default, stops the competing model, installs the selected scheduled
@@ -42,7 +42,7 @@ require_uint() {
 action="${1:-status}"
 selection_explicit=0
 if (( $# >= 2 )); then selection_explicit=1; fi
-selection="${2:-${CHAT_MODEL:-deepseek-v4-flash}}"
+selection="${2:-${CHAT_MODEL:-qwen3.8-27b-fp4}}"
 extra_arguments=("${@:3}")
 model_id="${selection}"
 artifact_name="${selection}"

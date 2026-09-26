@@ -5,9 +5,7 @@ param(
     [switch]$TensorGroups,
     [string]$Adapter,
     [string]$ConfigFile = "config.json",
-    [string]$IndexFile = "model.safetensors.index.json",
-    [ValidateSet("deepseek_v4")][string]$Contract,
-    [switch]$EstimateRepresentations
+    [string]$IndexFile = "model.safetensors.index.json"
 )
 
 . (Join-Path $PSScriptRoot "Common.ps1")
@@ -27,8 +25,6 @@ try {
     )
     if ($TensorGroups) { $arguments += "--tensor-groups" }
     if ($Adapter) { $arguments += @("--adapter", $Adapter) }
-    if ($Contract) { $arguments += @("--contract", $Contract) }
-    if ($EstimateRepresentations) { $arguments += "--estimate-representations" }
     & $python.Source @arguments
     if ($LASTEXITCODE -ne 0) {
         throw "Source inventory exited with code $LASTEXITCODE"
