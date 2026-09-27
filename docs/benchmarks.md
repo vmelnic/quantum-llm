@@ -1,6 +1,6 @@
 # Benchmarks and evidence
 
-Status: measurements through 2026-09-25; documentation normalized
+Status: measurements through 2026-09-26; documentation normalized
 2026-09-27.
 
 ## Reporting contract
@@ -194,6 +194,39 @@ pass exists.
 All 25 completed calls reported full-prompt prefill and
 `session_retain_skipped` because an unemitted speculative bonus prevented an
 exact client-visible retained prefix.
+
+### Pinned llama.cpp comparison
+
+The comparative Pi benchmark ran the two backends sequentially on the same RTX
+3090 with the same English dialogue, Pi `xhigh` and a configured 256,000-token
+window. Quantum used official Qwen3.8-27B standard FP4 weights, Q4H target KV
+and MTP-4. The comparison used pinned llama.cpp v0.5.0 with the official
+Q4_K_M GGUF, `q4_0` target KV and an MTP-4 draft. The formats are not
+numerically equivalent.
+
+The opening `hi` call populated exactly 2,239 prompt tokens on both backends:
+
+| Metric | Quantum LLM | llama.cpp | Observed ratio |
+|---|---:|---:|---:|
+| generated tokens | 46 | 37 | — |
+| client TTFT | 2.813 s | 6.281 s | llama.cpp took 2.23× longer |
+| provider prefill | 2.687 s | 6.061 s | llama.cpp took 2.26× longer |
+| post-first decode | 62.670 tok/s | 6.740 tok/s | Quantum reached 9.30× the rate |
+| complete client call | 3.547 s | 11.765 s | llama.cpp took 3.32× longer |
+
+The other two completed llama.cpp calls decoded at 8.390 and 6.672 tok/s. The
+run was stopped because its early rate did not justify continuing the
+long-context dialogue. It reported 48/65 target layers and 66/66 draft layers
+on GPU, 5,727 MiB of CPU-mapped model buffers and 1,125 MiB of CPU KV. Its
+Q4_K_M weights plus Q4_0 target KV, MTP weights and the mandatory 1 GiB reserve
+have a 24.630 GiB lower bound before workspaces, so full placement cannot fit
+in 24 GiB.
+
+Quantum completed 25 calls, reached 58,664 populated prompt tokens and recorded
+69.915 generated tok/s weighted across completed decode. It later stalled with
+an idle GPU before reaching the terminal context gate. Neither run reached
+256K, and the difference in formats prevents a numerical-fidelity comparison.
+The 9.30× figure applies only to the same measured opening call.
 
 ## Sparse and auxiliary paths
 

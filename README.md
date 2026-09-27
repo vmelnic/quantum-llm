@@ -1,14 +1,65 @@
 # Quantum LLM
 
-Quantum LLM is a Windows/CUDA inference runtime for validated model artifacts
-on one self-contained RTX 3090 host. It exposes OpenAI- and
-Anthropic-compatible HTTP APIs and gives explicit control over model state in
-VRAM, host RAM and NVMe.
+> **Qwen3.8-27B at 62.67 tok/s on one RTX 3090.**
+>
+> **9.30× the decode rate of pinned llama.cpp on the same 2,239-token Pi
+> opening call.**
+>
+> **262,016 populated tokens completed through the exact-F16 path on the same
+> GPU.**
 
-The runtime is research/pilot software. Its strongest result is controlled,
-observable execution of large dense, hybrid and sparse-MoE artifacts. The
-product target remains open: Qwen3.8-27B at 262,144 populated positions, exact
-IEEE F16 KV, about 15 useful output tokens/s and a real `xhigh` coding harness.
+Quantum LLM runs validated dense, hybrid and sparse-MoE artifacts through one
+artifact-driven Windows/CUDA runtime on a single RTX 3090. It exposes OpenAI-
+and Anthropic-compatible APIs and makes VRAM, RAM and NVMe placement visible
+instead of hiding it behind an opaque model server.
+
+The open product target is demanding by design: Qwen3.8-27B with 262,144
+actually populated positions, exact IEEE F16 KV semantics, about 15 useful
+output tokens/s and a real `xhigh` coding harness.
+
+## Same call, same GPU
+
+The first call of the pinned 256K Pi benchmark sent the same scripted `hi` and
+the same 2,239-token prompt to both backends on the same RTX 3090. Quantum used
+standard FP4 weights, Q4H target KV and MTP-4. llama.cpp v0.5.0 used the
+official Q4_K_M GGUF, `q4_0` KV and its MTP-4 draft.
+
+| Observed result | Quantum LLM | llama.cpp | Ratio |
+|---|---:|---:|---:|
+| Client TTFT | **2.813 s** | 6.281 s | **llama.cpp took 2.23× longer** |
+| Post-first decode | **62.67 tok/s** | 6.74 tok/s | **Quantum reached 9.30× the rate** |
+| Complete call wall | **3.547 s** | 11.765 s | **llama.cpp took 3.32× longer** |
+| Generated output | 46 tokens | 37 tokens | — |
+
+llama.cpp remained between 6.67 and 8.39 tok/s over its three completed calls
+and was stopped because the early rate did not justify continuing. Quantum
+completed 25 calls, reached a 58,664-token prompt and averaged 69.915 generated
+tok/s across completed decode before a later idle-GPU stall.
+
+The formats and generated outputs differ, so this is an observed comparison of
+the same opening workload rather than a claim of numerical equivalence or a
+completed 256K head-to-head. Raw conditions and the later failure are recorded
+in [Benchmarks](docs/benchmarks.md#pinned-llamacpp-comparison).
+
+## More measured results
+
+These are live service results unless the row says otherwise. Decode rate is
+post-first-token, so TTFT remains visible instead of being averaged away.
+
+| Result | Path and boundary |
+|---|---|
+| **54.54 tok/s at 32,768 prompt tokens** | Qwen Q4H target KV + Q8 MTP-4; 39.627 s TTFT; 128 generated tokens |
+| **47.16 tok/s at 131,072 prompt tokens** | Same live path; 203.250 s TTFT; 128 generated tokens |
+| **60.58 tok/s through the OpenAI endpoint** | GuideLLM, 32,820 prompt tokens, 128 reasoning tokens; 39.861 s TTFT and 3.05 tok/s end to end |
+| **262,016 populated tokens with exact F16 KV** | Retrieved facts planted near the start, middle and end; 47 generated tokens in 2,278.082 s |
+| **4.566 GiB calculated context state at 262,144** | Q4H target KV plus Q8 MTP pages, compared with 16 GiB for exact F16 target KV alone; Q4H is lossy |
+| **Six model artifacts through one service** | Each published model passed an isolated tokenizer, template and generation smoke |
+
+The 262,016-token run proves capacity through the exact-F16 path, but its latency
+misses the product target. The operational Q4H path is fast at measured 32K
+and 128K prompts; a live 262K Q4H coding-quality result still does not exist.
+The complete prompts, sampling settings, counters and negative results are in
+[Benchmarks](docs/benchmarks.md).
 
 ## Current boundary
 
@@ -27,8 +78,7 @@ same Qwen artifact with exact F16 target KV. The lossy default has passed live
 32K and 128K throughput gates; it has not passed a live 262K coding-quality
 gate and does not satisfy the exact-F16 product target.
 
-The latest complete evidence and its limits are in
-[Benchmarks](docs/benchmarks.md). Release blockers are in
+Release blockers are tracked in
 [Production readiness](docs/production-readiness.md).
 
 ## System
