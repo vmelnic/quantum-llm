@@ -1,41 +1,35 @@
 # Deployment
 
-Status: supported single-host lifecycle, 2026-09-20.
+Status: supported single-host lifecycle, 2026-09-27.
 
-## Contract
+## Artifact and task layout
 
-The Windows target contains the synchronized project, Release/CUDA build,
-repository-owned server environment and all published artifacts. The serving
+The Windows host contains the synchronized repository, the Release/CUDA build,
+the repository-owned Python environment and published artifacts below
+`${MODEL_ROOT}`.
+
+One scheduled task, `QuantumLLM-ExpertVm`, owns the active Python service and
+native worker. Starting another model stops the previous task. The serving
 path has no external model-state owner.
-
-Stable artifacts live under `${MODEL_ROOT}`. `Promote-ModelArtifact.ps1`
-validates a candidate, moves an existing stable directory to a timestamped
-rollback, promotes by rename and validates again. Rollbacks are temporary
-release safety, not permanent alternate models; remove them after the promoted
-artifact passes real gates and recovery is no longer needed.
 
 ## Active aliases
 
-`ops/model-aliases.tsv` is authoritative:
+`ops/model-aliases.tsv` is authoritative. Primary aliases are:
 
-| Alias | Advertised model | Path below `MODEL_ROOT` | KV selection |
+| Alias | Advertised model | Artifact below `MODEL_ROOT` | KV policy |
 |---|---|---|---|
-| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | lossy `q4-f16-per-head`; direct packed batch-five decode |
-| `qwen-abliterated` | `qwen3.8-27b-abliterated-fp4` | `qwen3.8-27b-abliterated-fp4` | lossy `q4-f16-per-head`; same compatible attention geometry |
-| `qwen-f16` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | exact `fp16` reference |
+| `qwen` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | lossy `q4-f16-per-head` |
+| `qwen-f16` | `qwen3.8-27b-fp4` | `qwen3.8-27b-fp4` | exact `fp16` |
+| `qwen-abliterated` | `qwen3.8-27b-abliterated-fp4` | `qwen3.8-27b-abliterated-fp4` | lossy `q4-f16-per-head` |
 | `qwen-flash` | `qwen3.8-flash-next-fp4` | `qwen3.8-flash-next-fp4` | `fp16` |
 | `mistral` | `mistral-small-4-119b-nvfp4` | `mistral-small-4-119b-nvfp4` | artifact-declared |
 | `muse` | `muse-glimmer-30b-fp4` | `muse-glimmer-30b-fp4` | `fp16` |
-| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | lossy `q4-f16-per-head`; compatible 256-dimensional GQA |
-| `deepseek` | `deepseek-v4-flash` | `deepseek-v4-flash/worker-bundle-v3` | artifact-declared |
+| `ornith` | `ornith-1.5-35b-a3b-fp4` | `ornith-1.5-35b-a3b-fp4` | lossy `q4-f16-per-head` |
 
-Long artifact-name aliases select the same policies. The compact-Q4/K1
-research implementations remain in source history but are not active service
-aliases. Aliases select an artifact, advertised ID and required KV policy. The task
-`QuantumLLM-ExpertVm`, HTTP service and native VM are common.
-
-Documentation shortens `q4-f16-per-head` to **Q4H**. The service, artifact and
-worker ABI always use the complete string and never accept the shorthand.
+The registry also contains long-name synonyms and explicit Abliterated
+research/reference aliases for MSE-v2 weights, K1 KV and F16 KV. These are not
+additional published model families. Every current alias uses the fixed
+routed-VRAM policy.
 
 ## Lifecycle
 
@@ -46,65 +40,74 @@ worker ABI always use the complete string and never accept the shorthand.
 ./ops/model.sh status
 ./ops/model.sh chat qwen
 ./ops/model.sh restart qwen
+./ops/model.sh clear-cache qwen
 ./ops/model.sh stop all
 ```
 
-`start` synchronizes Git-visible files by default, validates the artifact
-contract, clamps configured context/KV values to artifact requirements, checks
-the pinned Python environment, stops the previous service, installs one task,
-waits for readiness and verifies model/limit identity. Sync never transfers or
-deletes ignored model, build, log or cache state.
+`start` performs these steps:
 
-## Network and authentication
+1. synchronize Git-visible files when `MODEL_SYNC_ON_START=1`;
+2. authenticate and inspect the selected artifact program;
+3. clamp context and exact-KV resources to the artifact contract;
+4. validate the Q4H/MTP contract when applicable;
+5. check the Windows Python environment;
+6. stop the existing task;
+7. install and start the common task;
+8. wait for readiness and verify model, limits and KV policy.
 
-The safe default is loopback on 3090box plus the tunnel used by the local
-client. A non-loopback `MODEL_HOST` requires `EXPERT_API_KEY`. The native edge
-does not provide TLS or public rate limiting; add them at a trusted proxy before
-public exposure.
-
-The reference host uses WireGuard only for `10.10.88.0/24`; public traffic,
-including Hugging Face Xet, uses Ethernet. Routing all traffic through the
-WireGuard tunnel can starve SSH/RDP during downloads. The maintained
-`Set-WireGuardSplitTunnel.ps1` transaction validates the private route, public
-route and direct HTTPS before committing.
+Synchronization does not copy or delete ignored model, build, log or cache
+state.
 
 ## Resource policy
 
-The current common baseline is:
+The maintained baseline is:
 
 ```text
-one RTX 3090
 MODEL_RAM_CACHE_GIB=48
 MODEL_VRAM_CACHE_GIB=12
 MODEL_WORKER_CAPACITY=1
+MODEL_KV_CACHE_MIB=5136
 MODEL_KV_PAGE_TOKENS=256
 MODEL_PLACEMENT_PROFILE=balanced
 ```
 
-Compatible sparse artifacts may opt into the two local P100s with
-`MODEL_ACTIVE_EXPERT_DEVICES`, `MODEL_ACTIVE_EXPERT_DEVICE_CACHE_GIB` and
-`MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB`. These settings carve the declared host
-budget from `MODEL_RAM_CACHE_GIB`; they are ignored by providers whose artifact
-does not bind the capability. Leave this disabled for normal performance:
-Flash regressed and DeepSeek remained slower than its best settled primary
-path. The executor is retained only as an exact capacity experiment.
+The 12 GiB value is the routed-expert cache ceiling. It is separate from dense
+weights, KV, workspaces and the 1 GiB emergency reserve. Do not increase it
+without a new capacity calculation and real affected-model chat gates.
 
-The 12 GiB VRAM value is a cache ceiling, not a reservation. DeepSeek fails
-preflight at 13 GiB after fixed allocations, workspace and the 1 GiB reserve;
-do not raise the common value without real Qwen and DeepSeek chat gates plus
-cleanup. Model context is also a ceiling: pages grow only for populated tokens.
+Optional P100 settings are accepted only as one complete configuration:
 
-## Release sequence
+```dotenv
+MODEL_ACTIVE_EXPERT_DEVICES=auto
+MODEL_ACTIVE_EXPERT_DEVICE_CACHE_GIB=<per-device>
+MODEL_ACTIVE_EXPERT_HOST_CACHE_GIB=<total-host-budget>
+```
 
-1. validate source identity, candidate completion, hashes, format and numerical
-   quality;
-2. promote the candidate transactionally;
-3. run the clean Windows Release/CUDA build, CTest and canonical Python suite;
-4. run `model.sh chat` with `hi` for the affected model, then Qwen and DeepSeek;
-5. for universal releases, repeat for every claimed active model;
-6. run Pi only when harness behavior is part of the release;
-7. stop the service and verify worker/process/GPU cleanup;
-8. remove obsolete rollback/candidate directories after the stable artifact is
-   accepted.
+Compatible providers may use that tier for routed pages. Active deployment
+leaves it disabled because measured paths were slower.
 
-Parser, manifest and microkernel tests never replace the real service gate.
+## Publication
+
+`Promote-ModelArtifact.ps1` requires the candidate and destination to share a
+parent directory. It validates the candidate program, renames an existing
+stable artifact to a timestamped rollback, promotes the candidate, then checks
+that program and manifest identities did not change.
+
+Release sequence:
+
+1. build Windows Release/CUDA with `--clean-first`;
+2. run CTest and the canonical Python suites;
+3. compile a sibling candidate;
+4. validate format, hashes, source quality and provider ABI;
+5. promote transactionally;
+6. start the affected alias;
+7. run its real chat gate, then Qwen for a universal change;
+8. run Pi when harness behavior changed;
+9. stop and verify process and GPU cleanup;
+10. keep or remove the rollback only after the release result is known.
+
+## Network
+
+Loopback plus the SSH tunnel is the supported default. A non-loopback bind
+requires `EXPERT_API_KEY`. The service does not terminate TLS and does not
+implement public rate limiting; use a trusted edge for public exposure.

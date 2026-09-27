@@ -1,24 +1,25 @@
 # Getting started
 
-Status: supported setup path, 2026-09-12.
-
-The control host is POSIX; the execution host is the self-contained Windows
-RTX 3090 machine. The repository may live at any path. `.env` supplies the
-remote project root and the only model-storage root.
+Status: supported setup path, 2026-09-27.
 
 ## Prerequisites
 
 Execution host:
 
-- Windows 11, RTX 3090 driver and CUDA Toolkit 12.x;
-- Visual Studio 2022 C++ tools and CMake 3.25 or newer;
-- Python 3 and PowerShell permission to create the scheduled task;
-- NVMe capacity for the pinned checkpoint, conversion candidate and published
-  artifact;
-- OpenSSH access from the control host.
+- Windows 11;
+- one RTX 3090 with a supported NVIDIA driver;
+- CUDA Toolkit and Visual Studio 2022 C++ tools;
+- CMake 3.25 or newer, Python 3 and PowerShell;
+- OpenSSH access from the control machine;
+- enough NVMe space for the source checkpoint, candidate and published
+  artifact.
 
-Control host: Bash, Git, Python 3 and SSH. Pi is optional and required only for
-the coding-harness path.
+Control machine:
+
+- POSIX shell, Git, Python 3 and SSH;
+- Pi only when the coding harness is required.
+
+The Windows build is authoritative for CUDA execution.
 
 ## Configure
 
@@ -26,7 +27,7 @@ the coding-harness path.
 cp .env.example .env
 ```
 
-Set at least:
+Set:
 
 ```dotenv
 QUANTUM_LLM_REMOTE=user@gpu-host
@@ -35,9 +36,9 @@ MODEL_ROOT=D:/quantum-llm/work/models
 EXPERT_API_KEY=<random-secret>
 ```
 
-`MODEL_ROOT` is the only host-dependent model root. Do not add per-model
-absolute paths to source, scripts or scheduled tasks. Keep
-`MODEL_HOST=127.0.0.1` when clients use the SSH tunnel.
+`MODEL_ROOT` is the only host-dependent model-storage root. Keep
+`MODEL_HOST=127.0.0.1` when clients connect through the maintained SSH
+tunnel.
 
 Inspect resolved non-secret settings:
 
@@ -45,7 +46,7 @@ Inspect resolved non-secret settings:
 ./ops/model.sh config qwen
 ```
 
-## Prepare and build
+## Build
 
 ```bash
 ./ops/model.sh sync
@@ -54,14 +55,15 @@ Inspect resolved non-secret settings:
 ./ops/model.sh install
 ```
 
-The Windows build is authoritative for CUDA. It configures the maintained MSVC
-preset, builds with `--clean-first`, runs CTest and runs the canonical Python
-contract suites. `cmake --fresh` alone is insufficient after an internal ABI
-change because it does not guarantee stale objects were removed.
+The Release/CUDA workflow configures the MSVC preset, builds with
+`--clean-first`, runs CTest and runs the canonical Python contract suites.
+`cmake --fresh` does not remove stale objects and is insufficient after a
+header or ABI change.
 
-## Download with Hugging Face Xet
+## Download
 
-Pin an immutable revision and the expected inventory:
+Hugging Face downloads use the repository's Xet workflow with an immutable
+revision and expected inventory:
 
 ```bash
 ./ops/run-on-windows-host.sh Start-HuggingFaceModelDownload.ps1 \
@@ -74,13 +76,10 @@ Pin an immutable revision and the expected inventory:
 ./ops/run-on-windows-host.sh Get-HuggingFaceModelDownload.ps1
 ```
 
-For nonstandard repositories, declare the actual config/index filenames. The
-worker derives shard paths from the selected index. Do not use `curl`, an
-ad-hoc downloader, invented scheduled tasks or `HF_HUB_DISABLE_XET`.
+The download worker derives shard paths from the selected SafeTensors index.
+Do not replace this path with ad-hoc downloads or disable Xet.
 
 ## Compile and publish
-
-Example Qwen publication:
 
 ```bash
 ./ops/run-on-windows-host.sh Publish-HuggingFaceExpertPack.ps1 \
@@ -91,19 +90,23 @@ Example Qwen publication:
   -QuantProfile fp4-e2m1-ue8m0-block32-v1
 ```
 
-Active source adapters are:
+The compiler implements these source adapters:
 
-- `hybrid_delta`: Qwen3.8-27B and Ornith;
-- `qwen4_exp`: Qwen3.8-Flash-Next;
-- `mistral4_nvfp4`: Mistral Small 4 native NVFP4;
-- `muse_glimmer`: Muse-Glimmer.
+| Adapter | Source contract |
+|---|---|
+| `hybrid_delta` | hybrid DeltaNet/full-attention checkpoints, including current Qwen and Ornith sources |
+| `qwen4_exp` | Hyper, PLE, QSA, recurrent and routed-MoE checkpoints |
+| `mistral4_nvfp4` | source-native NVFP4/BF16 Mistral Small 4 |
+| `muse_glimmer` | Muse-Glimmer text program plus preserved auxiliary tensors |
+| `qwen3_next` | Qwen3-Next MoE source contract |
+| `lfm2_moe` | LFM2-MoE source contract |
+| `olmoe` | OLMoE source contract |
 
-Adapters affect compilation only. Every published artifact uses the common VM
-and service lifecycle. DeepSeek uses the descriptor/oracle/compact-bundle
-workflow in [DeepSeek compact pack v1](deepseek-compact-pack-v1.md).
+Adapters affect compilation only. Published artifacts use the common service
+and VM lifecycle.
 
-Publication is candidate -> validate -> promote. Never point `.env`, an alias
-or a task at `.partial`, `.candidate` or a missing artifact.
+Publication follows candidate -> validate -> promote. Never point an alias or
+service task at a partial, candidate or absent directory.
 
 ## Run
 
@@ -111,20 +114,12 @@ or a task at `.partial`, `.candidate` or a missing artifact.
 ./ops/model.sh start qwen
 ./ops/model.sh status
 ./ops/model.sh chat qwen
+./ops/pi.sh qwen
 ./ops/model.sh stop all
 ```
 
-The lifecycle aliases are `qwen`, `qwen-abliterated`, `qwen-f16`, `qwen-flash`,
-`mistral`, `muse`, `ornith` and `deepseek`. `qwen`, `qwen-abliterated` and
-`ornith` select `q4-f16-per-head`; `qwen-f16` preserves the exact-F16 Qwen
-reference path. A real `hi` validates wiring only. For a minimal Pi check:
-
-```bash
-./ops/model.sh start qwen
-./ops/pi.sh qwen --no-context-files --no-tools --no-extensions \
-  --no-skills --no-prompt-templates --no-session -p hi
-./ops/model.sh stop all
-```
+A successful `hi` verifies artifact, service, tokenizer and generation
+wiring. It does not qualify coding behavior, long context or throughput.
 
 Continue with [Deployment](deployment.md), [Operations](operations.md) and
 [Pi CLI](pi-cli.md).

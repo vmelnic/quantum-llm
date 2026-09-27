@@ -1,322 +1,151 @@
 # Architecture
 
-Status: implemented architecture and boundaries, 2026-09-20.
+Status: implemented architecture, 2026-09-27.
 
-## Scope
+## Host boundary
 
-Quantum LLM serves validated executable artifacts from one self-contained
-Windows host. One RTX 3090 owns the primary program. Two local P100s can own
-compatible routed-expert pages, but current end-to-end measurements do not
-justify enabling that path for speed. The control host only synchronizes and
-invokes operations; there is no remote model-state owner or fallback.
+The serving system is self-contained on one Windows host. One RTX 3090 owns
+the active model program. Two local P100 cards can execute compatible routed
+expert pages, but no active alias depends on them and measured paths did not
+improve throughput. The POSIX control machine synchronizes source and invokes
+operations; it owns no model state.
 
-The runtime solves two different placement problems:
+The service has one hot provider slot. Requests may queue and exact sessions
+may be parked, but model execution is serialized.
 
-- dense/hybrid models have hot matrices and growing attention state; moving
-  either through PCIe or NVMe every decode call is a capacity fallback, not a
-  throughput solution;
-- sparse MoE models touch only routed experts; unselected expert pages are cold
-  and may be retained or demand-paged without changing exact top-k semantics.
-
-## Artifact-driven system
+## Artifact-driven execution
 
 ```text
-official checkpoint
-       |
-       | strict source adapter
-       v
-candidate below ${MODEL_ROOT}
-  manifest + hashes + COMPLETED
-  tokenizer/generation/processor assets
-  QPack payloads
-  runtime-model.tsv
-       |
-       | validate and promote
-       v
-common Python HTTP service
-  authentication, limits, templates, streaming, admission
-       |
-       v
-common native VM runner
-  program validation and capability binding
-       |
-       v
-SM86 FP4/NVFP4 providers
-Qwen/Flash/Mistral/Muse/Ornith operations
-       |
-       v
-optional in-process secondary routed-expert executor
+checkpoint
+  -> source adapter
+  -> candidate artifact
+       manifest.json
+       COMPLETED
+       runtime-model.tsv
+       QPack records and indexes
+       tokenizer/generation/processor assets
+  -> Python service
+  -> native VM runner
+  -> capability-matched provider
 ```
 
-`runtime-model.tsv` declares ordered operations, tensor roles, geometry,
-encodings and required capabilities. Providers advertise the declarations they
-can execute. Common service/runtime code does not select Qwen, Mistral, Muse,
-Ornith, fixed layer counts or family tensor paths. Upstream names are
-handled only by strict source adapters; genuinely new mathematics or encoding
-requires a provider capability and numerical gate.
+`runtime-model.tsv` uses `expert-runtime-model-v1`, schema 3. It declares the
+model geometry, ordered operations, tensor bindings, routed components,
+encodings and required kernel capabilities. The native runner loads the
+authenticated program, finds exactly one compatible provider module and
+compiles the operation sequence. Missing or ambiguous bindings fail startup.
 
-The physical containers are not falsely unified. Expert Pack v1 stores QPack
-records used by the FP4/NVFP4 provider. It also defines dense-record ABI 6 for
-row-major OCP MXFP6 E3M2 weights: four 6-bit values occupy three bytes and one
-UE8M0 scale covers each block of 32 values. Artifacts select that encoding only
-through explicit embedding, head and exact-decode capabilities; SM86 executes
-it through an emulated CUDA path because the RTX 3090 has no native FP6
-instruction. The supported artifacts converge at the executable-program,
-logical-page and provider boundaries.
+Common service and VM code do not select an architecture from a model name,
+fixed layer count or upstream tensor path. Source adapters translate upstream
+layouts. A new mathematical operation or encoding requires a declared
+capability, an ABI and an independent numerical gate.
 
-## Model organs and placement
+## State and placement
 
-| Organ | Access pattern | Placement rule |
+| State | Access pattern | Implemented placement rule |
 |---|---|---|
-| embeddings | selected rows | gather/stage selected rows; never scan per token |
-| dense projections/MLP | every target call | remain beside fastest compute |
-| recurrent state | fixed-size, every next token | remain in the active GPU slot |
-| full-attention K/V | every populated retained position | keep complete exact state beside attention or accept the measured transfer cost |
-| sparse-attention index | every sparse-attention query | keep compact exact index resident when possible |
-| MoE router/shared experts | every routed layer | resident and exact |
-| routed experts | selected top-k only | immutable logical pages eligible for RAM/VRAM/NVMe placement |
-| vocabulary head | every generated token | resident or explicitly accounted hot traffic |
-| draft/MTP state | only when verification policy uses it | allocate conditionally and account separately |
+| embeddings | selected rows | gather selected rows; avoid full scans per token |
+| dense projections and MLP | every target call | remain beside the primary compute path |
+| recurrent state | every next token | remain in the active GPU slot |
+| full-attention KV | every retained position | use device-resident packed state or exact host pages with measured transfer cost |
+| sparse-attention index | every sparse query | retain the compact exact index on device when declared |
+| router and shared experts | every routed layer | resident and exact |
+| routed experts | selected top-k only | immutable pages eligible for RAM, VRAM and NVMe caching |
+| vocabulary head | every generated token | resident; scratch rows grow only on demand |
+| MTP state | speculative requests only | allocate and account separately |
 
-## Active artifacts
+The common fixed routed-VRAM ceiling is 12 GiB. It is a cache ceiling, not an
+up-front allocation. The implemented `fit` policy may derive an
+artifact-specific expert cache only before any expert page is admitted, after
+reserving declared future state and 1 GiB emergency headroom. Current aliases
+select `fixed`.
 
-| Alias | Program and representation | Request state | Callable scope |
-|---|---|---|---|
-| `qwen` / `qwen-f16` / `qwen-abliterated` / `qwen-abliterated-k1` / `qwen-abliterated-f16` | 64-layer hybrid model; 14,775,390,208-byte QPack; FP4 E2M1/UE8M0 block-32 matrices; the abliterated aliases select separately published third-party weights with identical geometry | `qwen` and `qwen-abliterated` select resident `q4-f16-per-head` target KV; `qwen-abliterated-k1` is the matched diagnostic K1 policy; `qwen-f16` and `qwen-abliterated-f16` select progressive exact F16 KV with a bounded disposable VRAM mirror on their respective weight artifacts | text, reasoning, tools and image understanding; the abliterated checkpoint has direct-chat and minimal-Pi wiring qualification only; compact-KV quality remains an explicit real-project gate |
-| `qwen-flash` | 48 layers; 36 Gated DeltaNet, 12 QSA, Hyper, PLE, 512 experts/layer, exact top-10 FP4 routing; scalar decode may execute the selected standard-FP4 experts on local P100s | recurrent state plus progressive exact F16 QSA K/V; compact index retained on device where declared | text/reasoning/tools; P100 execution is exact but slower than the primary path in the measured short chat; quality and long-context performance remain unqualified |
-| `mistral` | source-native block-16 E2M1/E4M3FN NVFP4 W4A4 MoE plus BF16 organs | artifact-declared BF16 MLA latent KV pages | text/reasoning/tools; auxiliary multimodal records are not callable support |
-| `muse` | 52-layer dense FP4 text model with global and exact 2,048-token sliding attention | exact F16 global pages plus cyclic exact F16 sliding windows; artifact maximum 131,072 | text only; preserved vision records are auxiliary |
-| `ornith` | 40-layer hybrid model; 30 recurrent, 10 full attention, 256 experts/layer, exact top-8 standard FP4 routing | resident `q4-f16-per-head` target KV and the fixed common expert cache; the complete 17,154,703,360-byte expert pool can live in the host bank | text/reasoning/tools; per-head Q4 service wiring is qualified separately from model quality |
+## Qwen attention state
 
-An artifact limit is an admission ceiling, not allocated context. Muse is
-clamped to 131,072; the other active artifacts currently advertise 262,144.
-Neither value proves that the context was populated or interactive.
+The exact path stores authoritative F16 KV in 256-token pinned-host pages. A
+bounded disposable device mirror serves prefixes that fit. When it cannot fit,
+the provider releases the mirror and stages exact host KV. Values remain F16;
+the transfer path cannot meet the maximum-context throughput target.
 
-## Dense and attention state
+The operational Qwen aliases select `q4-f16-per-head` (Q4H). Each 256-value K
+or V head record stores 128 signed-Q4 bytes and one F16 scale. A K/V pair uses
+260 bytes, so target KV occupies 4.0625 GiB at 262,144 positions. Q8 MTP pages
+raise the combined target-plus-draft state to 4.566406 GiB. The batch-five
+attention kernel consumes the packed representation directly and expands only
+transient integer operands inside a tile. Q4H is lossy and does not satisfy the
+exact-F16 target.
 
-Qwen's target F16 KV is allocated in 256-token pinned-host pages. Host pages
-are authoritative. While the populated prefix fits a bounded exact F16 device
-mirror, attention consumes the mirror and avoids a per-token PCIe scan. Parking
-releases the disposable mirror; restore may rebuild it. On overflow the mirror
-is released and the provider falls back atomically to bounded exact host-KV
-staging. This preserves values but cannot meet the saturated-context throughput
-target because all full-attention KV remains hot.
+The source also implements other diagnostic KV formats. They are selectable
+only through an explicit alias or worker policy and are not active defaults.
 
-K1 (`fp4-e2m1-ue8m0-block32-key-outlier1`) remains a separate implemented
-lossy KV policy:
-values use block-32 FP4; keys add one FP16 largest-magnitude correction per
-block. At Qwen's 262,144-position ceiling it reduces target KV from 16 GiB to
-4.75 GiB, or 5.015625 GiB including MTP pages. It is no longer selected by an
-active alias. K1 is never reported as exact F16.
+## Program providers
 
-`q4-bfp16-block32-key-outlier1` is a second, explicitly lossy target-KV
-policy. Each 256-value record stores signed Q4 payload, one FP16 base, and
-four-bit block-32 exponents; K also stores one aligned FP16 outlier per block.
-The K+V record pair is 300 bytes, so Qwen target KV occupies 4.6875 GiB at
-262,144 populated positions and 5.191406 GiB with its Q8 MTP pages. The
-batch-five decode kernel reads the head-major packed planes once per K/V tile,
-expands only transient INT8 Tensor Core operands in shared memory, and evaluates
-all five causal queries there. It does not materialize a decoded F16 cache.
-Large cold-prefill batches retain bounded transient BF16 staging for the
-vendored FlashAttention path; that staging is not the decode path or retained
-KV representation. It remains an implemented research format but is not
-selected by an active alias.
+The runner currently links three provider modules selected by capability:
 
-`q4-f16-per-head`, shortened to **Q4H**, is the lower-overhead packed policy selected for the
-40--50 useful-token/s experiment. K and V each store 128 signed-Q4 code bytes
-and one FP16 scale for the complete 256-value head, for a 260-byte K+V record
-pair. Qwen target KV therefore occupies 4.0625 GiB at 262,144 positions, or
-4.566406 GiB including the unchanged Q8 MTP pages. The same batch-five kernel
-loads each packed K/V tile once for all speculative queries and expands it only
-to transient signed-INT8 Tensor Core operands. It never builds an F16 cache.
-This policy is more lossy than block-floating Q4. It is the default only for
-compatible 256-dimensional GQA artifacts: Qwen, Qwen Abliterated and Ornith.
-Passing throughput does not qualify fidelity or exact-F16 semantics.
+- a dense/MoE provider for declared dense-attention and routed programs;
+- a dense FP4/NVFP4 provider for compatible declared operation sets;
+- a hybrid DeltaNet/MoE provider for compatible recurrent programs.
 
-Sampling defaults and the thinking runaway ceiling are artifact policy,
-not model-name branches. The single generic sampling-policy contract carries
-the two explicit thinking/non-thinking profiles and an optional
-`maximum_thinking_tokens`; its schema label is metadata, not a runtime behavior
-switch. The server fails closed on invalid fields and clamps only thinking
-requests. The
-all three operational Q4H artifacts use `presence_penalty=0.5` in both
-sampling profiles. Qwen and Qwen Abliterated also declare a 32,768-token
-thinking-output ceiling after a real long-context Pi session entered unbounded
-lexical repetition. The initial 1.5 penalty on those two artifacts caused
-visible Romanian lexical and grammatical degradation and was rejected. Their
-service context remains 262,144 positions; non-thinking output remains bounded
-only by the populated prompt and that context. Other artifacts retain their
-own declared or tokenizer defaults.
+Provider names are diagnostic. Selection uses the artifact's required kernel
+set and ABI ranges. The service validates the returned context, KV, placement,
+MTP, sampling and session contract before reporting readiness.
 
-For compact non-F16 Qwen attention, prefill uses the vendored official
-FlashAttention implementation over artifact-sized paged segments. Gated
-DeltaNet recurrent prefill uses a numerically gated value-major warp update,
-and the complete compact path uses 1,024 workspace rows. The default F16
-host-authoritative path retains 512 rows. An exact-F16 artifact that also
-declares Hyper, QSA, PLE and routed components may select 1,024 rows only after
-pre- and post-allocation CUDA checks preserve the 1 GiB device reserve. These
-choices are capability- and geometry-driven; common service code does not
-branch on the Qwen family.
+## Routed experts
 
-The generic program-sequence path accepts artifact-declared Hyper initialize,
-read, inject and reduce operations, PLE state, exact QSA/recurrent operations
-and their no-residual variants. It retains an interior stable-prefix checkpoint
-without splitting the prompt into another layer sweep. Hidden, Hyper and
-injection streams stay device-side for the admitted tile; prompts larger than
-the admitted tile remain tiled and do not imply whole-context residency.
-
-Muse and Mistral derive KV bytes and dtype from their artifact programs rather
-than a Qwen-shaped estimate. Muse's global and sliding windows remain distinct;
-Mistral's latent cache remains BF16. Qwen Flash stages only model-selected exact
-QSA payload while keeping its exact index device-side under the balanced policy.
-These are model-declared semantics, not runtime sparsification.
-
-Dense-provider scratch capacity is not synonymous with resident allocation.
-The vocabulary head keeps one logits row for normal service sampling and grows
-only when an invocation actually requests a multi-row head. Decoded FP4 weight
-staging is allocated only for eligible batched single-tile operations, reused
-within that sequence, and released on success, cancellation or failure. A
-multi-tile maximum-context prefill never allocates that staging arena. Runtime
-telemetry reports capacity and currently resident bytes separately.
-
-MXFP6 embedding and vocabulary-head execution uses artifact-declared ABI 6,
-not a model-family branch. The batched head kernel reuses each packed weight
-across up to eight rows and the exact-decode object retains the capability and
-ABI metadata used to validate its I/O tensors. The implementation is available
-for experiments, but no active artifact selects it: the first selective
-embedding/head fidelity trial was rolled back after its Romanian quality and
-decode-speed gates failed.
-
-Dense encoding experiments may select ABI 6 through a compiler policy keyed by
-an operation capability and tensor role. The compiler resolves the concrete
-tensor set from the adapter-provided VM topology, requires every result to be a
-rank-two semantic FP4 matrix, records the resolved set and policy digest in the
-artifact, and fails closed on unmatched roles. Activation captures superseded
-by the alternate ABI are explicitly indexed as exclusions. This is a generic
-artifact mechanism; it does not inspect model names, layer counts or tensor
-path fragments.
-
-Exact-decode ABI 2 is an artifact-declared experimental capability, not an
-exact-F16 qualification. It rolls one source MTP layer recurrently for a declared
-depth of three or four, keeps the target vocabulary head unchanged, and may
-limit only the draft head to an artifact-declared prefix. Its proposer K/V is
-signed Q8 with one FP16 scale per token/head/vector; target K/V retains the
-selected target codec. Before a speculative cycle it checkpoints recurrent
-and proposer state, verifies the guaranteed token plus all draft positions in
-one target batch, applies exact sampled `p/q` rejection and residual
-correction, then commits or restores/replays the accepted prefix. The compact
-attention kernel loads each K/V tile once and evaluates all speculative queries
-inside that tile. This capability remains available for research artifacts,
-and the operational K1 experiment uses it. The target pass exports a recurrent
-checkpoint after every verified row, so exact `p/q` rejection restores the
-selected row without a second target execution. The measured 32K/128K gates
-improved to 26.19/23.89 useful tok/s, but the 262K two-point extrapolation is
-21.39 tok/s; it is therefore implemented and deployable, not a 40-50 tok/s
-completion claim.
-
-## Sparse expert state
-
-Every expert is identified by artifact namespace, component, layer, expert ID
-and encoding ABI. Acquisition has one state machine:
+Expert identity includes artifact namespace, component, layer, expert ID and
+encoding ABI. Acquisition follows one state machine:
 
 ```text
 ABSENT -> SSD_LOADING -> RAM_READY -> GPU_UPLOADING -> VRAM_READY
    +------------------------- failure ----------------------> FAILED
 ```
 
-Demand outranks bounded warm/prefetch work. Leases prevent eviction while CPU
-or CUDA work consumes a page. RAM uses probationary/protected retention; VRAM
-uses transient/protected classes. Missing selected experts are never treated as
-zero, and aggregation preserves router order and weights.
+Demand outranks warm or prefetch work. Leases prevent eviction during CPU or
+CUDA execution. A selected expert is never replaced with zero, and aggregation
+preserves router order and weights. Standard-FP4 prefill may group rows by
+expert ID to reuse weights while preserving the exact route.
 
-For batched standard-FP4 routed work, primary selections are grouped by expert
-ID in bounded groups of four. Gate/up and down kernels reuse the expert weight
-group across those rows; the exact router results and stable aggregation remain
-unchanged. Native NVFP4 and scalar decode retain their existing dispatches.
+An optional secondary-device executor can own compatible routed pages on the
+P100s. Activations and results cross pinned host memory because peer access is
+unavailable. It is a capacity path, not an active performance dependency.
 
-The routed-VRAM policy is alias-declared and provider-neutral. `fixed` keeps the
-configured common ceiling. `fit` is a startup-only policy: after immutable
-dense tensors and fixed workspaces have been allocated, and before any expert
-has entered VRAM, the provider computes
+## Sessions
 
-```text
-available routed bytes = CUDA free after fixed allocations
-                       - maximum declared KV pages
-                       - maximum disposable KV mirror
-                       - possible logits-workspace growth
-                       - emergency reserve
-effective cache       = min(expert-pool bytes, available routed bytes)
-```
+Session behavior is a provider capability. A retaining provider can park
+populated KV and continuation state in host RAM, release the hot GPU slot and
+resume from an exact prompt/media prefix. Only the suffix is prefilled. A
+failed suffix feed rolls back to the last client-visible committed prefix;
+partial assistant output is not retained after cancellation.
 
-The cache is reconfigured only while it has zero admitted device bytes; later
-resize attempts fail closed. Future request-owned allocations remain reserved
-even though context is allocated progressively. The effective byte ceiling is
-reported in `/model-info`, so a configured context limit is never mistaken for
-free cache capacity.
+Qwen also implements persistent restart/resume. It stores immutable 4 MiB
+SHA-256 chunks and a transactional manifest below
+`${MODEL_ROOT}/.session-cache/<artifact>`. The manifest binds artifact,
+tokenizer, template, codec, media identity and token prefix. Startup loads only
+metadata. Matching a prefix loads the state lazily. NVMe is used for restore,
+never as an active per-token KV tier.
 
-Ornith's routed pool fits the configured 48 GiB host budget, so a warmed request
-can execute without NVMe reads.
+## Service boundary
 
-An explicitly configured compatible routed component can execute selected
-experts on the two P100s. Routing, stable aggregation, attention, recurrent
-state and all other organs stay on the RTX 3090. Exact F32 activations/results
-cross pinned host memory because CUDA peer access is unavailable; expert
-weights remain in fitted, slot-aligned P100 arenas. Every selection validates
-artifact identity and its source, execution and encoding ABIs. This is an
-optional expert placement, not a dense-weight sharder or general multi-GPU
-allocator.
-
-The validated common `fixed` primary-RTX routed-VRAM budget is currently 12
-GiB. It is a ceiling, not an upfront allocation. Fitting is
-therefore an explicit per-alias policy rather than a global budget increase.
-The former `ornith-k1` profile fitted 15.9375 GiB after accounting for its
-smaller maximum K1 state. The optional P100 arena is separate and
-reserves its own fitted capacity at startup without loading expert payloads
-into those slots.
-
-## Sessions and concurrency
-
-The FP4/NVFP4 provider advertises exact retained sessions. A retained request
-owns populated KV pages and a continuation blob in host RAM while releasing the
-single hot GPU slot. Resume feeds only the suffix when the client prefix
-matches; unchanged prefixes are valid zero-delta resumes. Failed suffix feed or
-cancellation rolls back to the last client-echoable committed prompt.
-
-For providers that advertise `session_persistence`, the same complete parked
-state can survive a service restart. Qwen writes immutable 4 MiB SHA-256 chunks
-and a transactional manifest below
-`${MODEL_ROOT}/.session-cache/<artifact>`. The manifest binds the artifact,
-tokenizer/template, selected KV codec, media identity and exact token prefix.
-At boot only the metadata index is loaded; no session RAM or GPU pages are
-reserved until an exact client prefix selects an entry. TTL and byte-budget LRU
-remove inactive entries; `./ops/model.sh clear-cache <model>` removes only the
-selected artifact cache. NVMe is an on-resume load tier, never an active decode
-KV tier.
-
-This is continuity, not parallel decode. The Python command channel and hot
-provider slot are serialized. Multiple Pi processes may queue and retain short
-histories, but several actually populated 262K F16 contexts compete for real
-RAM/KV bytes. `MODEL_WORKER_CAPACITY` does not create concurrent GPU execution.
-
-## Response and API boundary
-
-The Python service owns authentication, request limits, official chat
-templates, media normalization, streaming and admission. One artifact-declared
-response parser instance owns reasoning, visible text and structured tool calls
-from the first token through finalization. Pi receives standard API events and
-does not parse model-native XML or bracket syntax.
+The Python service owns authentication, bounded request parsing, official chat
+templates, media normalization, streaming, queue and context admission. One
+artifact-declared parser instance converts native output into reasoning,
+visible text and structured tool calls from the first delta through final
+output.
 
 The native worker owns artifact state, execution, sampling and tier telemetry.
-Unsupported session, vision, tool or operation behavior fails explicitly.
-`/health`, `/ready`, `/model-info` and cached `/metrics` must remain bounded
-during long inference; `ready=true` does not mean caches are warm or an SLO is
-met.
+The line protocol supports begin, feed, step, cancel, status and shutdown;
+session commands are sent only when the provider advertises them.
 
-## Hardware and failure boundary
+`/health`, `/ready`, `/model-info` and `/metrics` use bounded snapshots.
+`ready=true` means the worker is alive and accepting admission; it does not
+mean a cache is warm or a latency objective is met.
 
-The primary provider targets SM86; the optional expert executor targets
-SM60/61. P100 attention, dense-Qwen sharding and Flash acceleration failed
-their measured gates; details belong in [Benchmarks](benchmarks.md) and
-[Research decisions](research-decisions.md). The server provides bearer
-authentication but not TLS, public rate limiting or a hardened edge. Stop must
-terminate Python/native descendants and release model memory on every device.
+## Failure boundary
+
+Unknown manifest fields, unsafe paths, record versions, operations, encodings,
+capabilities, dimensions or hashes fail closed. Startup also fails if the
+provider contract disagrees with launch policy. Stop must terminate Python and
+native descendants and return model allocations on every CUDA device.
+
+The server provides bearer authentication. TLS and public rate limiting require
+a trusted external edge.

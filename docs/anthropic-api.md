@@ -1,17 +1,16 @@
 # Anthropic Messages API
 
-Status: implemented wire adapter; Pi remains the maintained harness,
-2026-09-12.
+Status: implemented wire adapter, 2026-09-27.
 
 ## Endpoints
 
 - `POST /v1/messages`
 - `POST /v1/messages/count_tokens`
 
-The adapter accepts Anthropic user/assistant messages, top-level system text,
-supported text/image blocks, tools/tool results, streaming, sampling and output
-limits. It normalizes them into the same artifact template and native request
-used by the OpenAI surface.
+The adapter accepts Anthropic user and assistant messages, top-level system
+text, supported text and image blocks, tools and tool results, streaming,
+sampling and output limits. It normalizes them into the same artifact template,
+admission path and native request used by the OpenAI-compatible surface.
 
 ```bash
 curl http://127.0.0.1:8080/v1/messages \
@@ -26,23 +25,14 @@ curl http://127.0.0.1:8080/v1/messages \
   }'
 ```
 
-Streaming emits Anthropic message/content-block events and separates visible
-text, thinking and tool use. `count_tokens` uses the same normalization and
-template path.
+Streaming emits Anthropic message and content-block events for thinking, text
+and tool use. `count_tokens` uses the same message normalization, media path
+and chat template as generation.
 
-## Boundary
+The adapter shares the service's model, context, body, image, queue, timeout
+and authentication limits. Invalid role, content block, thinking or tool
+combinations return Anthropic-shaped errors.
 
-Wire compatibility does not turn Qwen or DeepSeek into Claude. Model quality,
-tool reliability and latency remain those of the selected artifact. Claude
-Code injects a large Claude-oriented system/tool prompt; historical project
-gates sent roughly 29K input tokens before a one-word request and had
-unacceptable first-turn latency and factual behavior. Claude Code is therefore
-not the recommended production harness.
-
-The repository `.claude/settings.json` and `ops/claude-api-key.sh` remain a
-bounded compatibility configuration. The helper reads `EXPERT_API_KEY` from
-ignored `.env`; no secret is committed. Pi is the maintained local agent path.
-
-The adapter obeys the same context, body, output, image, queue and timeout
-limits as the OpenAI API. Invalid role/block/thinking/tool combinations fail
-explicitly with Anthropic-shaped errors.
+This is protocol compatibility with the active artifact. Pi is the maintained
+coding harness. The repository's Claude configuration remains a compatibility
+path and does not define a separate runtime or model behavior.

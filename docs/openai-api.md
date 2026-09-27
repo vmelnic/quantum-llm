@@ -1,27 +1,27 @@
 # OpenAI-compatible API
 
-Status: implemented bounded compatibility surface, 2026-09-12.
+Status: implemented bounded compatibility surface, 2026-09-27.
 
-The server implements common OpenAI request/response shapes. It is not the
-OpenAI service and does not promise behavior for unlisted fields.
+The service implements selected OpenAI request and response shapes for the one
+active model. Unlisted fields are unsupported.
 
 ## Endpoints
 
-| Method | Path | Purpose |
+| Method | Path | Result |
 |---|---|---|
-| `GET` | `/v1/models` | list the active model |
-| `GET` | `/v1/models/{id}` | retrieve the active model |
+| `GET` | `/v1/models` | active model list |
+| `GET` | `/v1/models/{id}` | active model metadata |
 | `POST` | `/v1/completions` | text completion |
-| `POST` | `/v1/chat/completions` | chat, reasoning, tools and artifact-supported image input |
-| `POST` | `/v1/responses` | text/function-call Responses shape |
+| `POST` | `/v1/chat/completions` | chat, reasoning, tools and supported images |
+| `POST` | `/v1/responses` | text and function-call Responses shape |
 
-Bearer authentication is required when configured:
+When configured, every endpoint requires:
 
 ```text
 Authorization: Bearer <EXPERT_API_KEY>
 ```
 
-## Chat
+## Chat example
 
 ```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
@@ -36,53 +36,61 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-SSE ends with `[DONE]`. Chat deltas expose visible `content`, optional
-`reasoning_content` and standard structured tool calls. Usage is returned for
-non-streaming responses and when requested for streaming.
+Chat streaming uses SSE and terminates with `[DONE]`. Deltas may contain
+`reasoning_content`, visible `content` and standard tool-call fields.
+Non-streaming responses include usage; streaming includes usage when requested.
 
-## Generation controls
+## Supported controls
 
-The parser validates bounded temperature, top-p, top-k, min-p, supported
-penalties, stop rules, `reasoning_effort` and `enable_thinking`. Artifact
-sampling/template/EOS metadata supplies defaults; explicit supported request
-fields override them per key.
+- `temperature`, `top_p`, `top_k`, `min_p` and
+  `presence_penalty` within service bounds;
+- `frequency_penalty=0` and `repetition_penalty=1`;
+- stop strings;
+- `reasoning_effort` values `low`, `medium` and `xhigh`;
+- `chat_template_kwargs.enable_thinking` and `preserve_thinking`;
+- `speculative_decoding` as a boolean diagnostic override;
+- `stream`, supported usage options and one output candidate;
+- function tools with automatic or disabled tool choice.
 
-`speculative_decoding` is an optional boolean extension. It defaults to
-`true`. Setting it to `false` keeps the target model and sampling distribution
-unchanged while forcing ordinary one-position target decoding for that
-request. This is primarily a fidelity and runtime-diagnostic control; it does
-not remove artifact-declared draft resources from the running service.
-
-For chat requests, `reasoning_effort` accepts `low`, `medium` or `xhigh`.
-Thinking-off is not the string `reasoning_effort: "off"`; use:
+Artifact sampling profiles supply defaults. A supported request value overrides
+the corresponding default. Thinking is disabled with:
 
 ```json
 {"chat_template_kwargs": {"enable_thinking": false}}
 ```
 
-Tools are passed into the official artifact template. One artifact-declared
-parser converts native output into standard events. The client executes tools
-and appends their results; the server does not execute arbitrary tools.
+`speculative_decoding=false` forces ordinary target steps for that request.
+It does not change target weights, target sampling or the loaded artifact.
+
+Required or named tool choice is rejected because constrained decoding is not
+implemented. The server formats tool definitions and parses model output; the
+client executes tools.
+
+Log probabilities, logit bias, multiple candidates, echo, audio, prediction,
+suffix completion, stored response chaining, automatic truncation and
+structured response formats are not implemented.
 
 ## Images
 
-When an artifact declares callable vision operations, OpenAI image parts may
-use supported data URLs or bounded public `image_url` values. The service
-enforces body, pixel and patch-token budgets and blocks private/reserved remote
-targets. Current Qwen supports image understanding. Muse/Mistral auxiliary
-vision tensors do not constitute callable support.
+Image parts are accepted only when the active artifact declares callable media
+operations. Qwen currently exposes image understanding. Muse and Mistral keep
+auxiliary vision tensors that are not callable.
 
-This API does not generate images: the active LLMs generate tokens, not pixels.
+Inputs may use bounded data URLs or public `image_url` values. The service
+enforces body, pixel and patch-token limits and rejects private or reserved
+remote targets. Output is text only.
 
 ## Limits and errors
 
-After exact prompt tokenization:
+After exact tokenization:
 
 ```text
-effective output <= min(requested output, maximum context - prompt tokens)
+effective output <= min(requested output, service output limit,
+                        model context - prompt tokens)
 ```
 
-This clamp does not preallocate KV. Malformed/unsupported input uses 400,
-authentication uses 401, unknown routes/models use 404 and bounded admission
-exhaustion uses 503. Do not retry unchanged 400/401 requests or create
-unbounded 503 retry loops.
+Thinking requests may have a smaller artifact-declared ceiling. Context is
+allocated progressively.
+
+Malformed or unsupported requests return 400, authentication failures 401,
+unknown routes or models 404, and bounded admission exhaustion 503.

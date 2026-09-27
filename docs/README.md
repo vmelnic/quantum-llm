@@ -1,49 +1,48 @@
 # Documentation
 
-Status: canonical documentation index, 2026-09-12.
-
-These documents describe the current implementation and measured state. Each
-fact has one canonical owner: architecture describes mechanisms, benchmarks
-records measurements, research decisions records rejected directions, roadmap
-contains active work and production readiness defines the release boundary.
-Historical journals and detached hypotheses remain in Git history.
+This index defines the current documentation set. Each fact has one owner; use
+links instead of copying measurements or lifecycle rules into another file.
 
 ## System and status
 
-| Document | Purpose |
+| Document | Owns |
 |---|---|
-| [Architecture](architecture.md) | Artifact VM, providers, model organs, memory tiers and failure boundaries |
-| [Production readiness](production-readiness.md) | What is usable now and what blocks promotion |
-| [Benchmarks](benchmarks.md) | Canonical measurements and capacity/bandwidth equations |
-| [Roadmap](roadmap.md) | Active dependency order only |
-| [Research decisions](research-decisions.md) | Rejected mechanisms and the evidence needed to reopen them |
+| [Architecture](architecture.md) | implemented components, state ownership and failure boundaries |
+| [Benchmarks](benchmarks.md) | measured results and exact test conditions |
+| [Research decisions](research-decisions.md) | accepted and rejected mechanisms with reopening gates |
+| [Roadmap](roadmap.md) | active dependency order |
+| [Production readiness](production-readiness.md) | current release boundary and promotion gate |
 
 ## Build and operate
 
-| Document | Purpose |
+| Document | Owns |
 |---|---|
-| [Getting started](getting-started.md) | Configure, build, download, publish and run |
-| [Deployment](deployment.md) | Stable artifacts, aliases, lifecycle and release sequence |
-| [Operations](operations.md) | Health, telemetry, slow requests, failure recovery and cleanup |
-| [Pi CLI](pi-cli.md) | Coding-agent configuration, context and the current harness boundary |
+| [Getting started](getting-started.md) | first supported setup and run |
+| [Deployment](deployment.md) | aliases, resource policy, publication and lifecycle |
+| [Operations](operations.md) | health, telemetry, diagnosis, recovery and cleanup |
+| [Pi CLI](pi-cli.md) | maintained coding harness and 256K benchmark contract |
 
 ## Interfaces and formats
 
-| Document | Purpose |
+| Document | Owns |
 |---|---|
-| [Runtime contract](expert-runtime.md) | Program/provider negotiation, worker lifecycle and placement |
-| [Expert Pack v1](expert-pack-v1.md) | Current QPack record/container ABI |
-| [DeepSeek compact pack v1](deepseek-compact-pack-v1.md) | Current compact expert and worker-bundle layout |
-| [OpenAI-compatible API](openai-api.md) | Implemented OpenAI request/streaming surface |
-| [Anthropic Messages API](anthropic-api.md) | Implemented adapter and its harness limitations |
+| [Runtime contract](expert-runtime.md) | artifact program, provider binding and worker protocol |
+| [Expert Pack v1](expert-pack-v1.md) | QPack container and record ABI |
+| [OpenAI-compatible API](openai-api.md) | implemented OpenAI request and stream surface |
+| [Anthropic Messages API](anthropic-api.md) | implemented Anthropic adapter surface |
 
-## Claims policy
+Historical files and Git history do not define active support. The current
+runtime, alias registry and release boundary take precedence over retired
+model-specific material.
 
-- configured context, populated context and harness overhead are different;
-- a `hi` smoke proves wiring, not quality or maximum-context performance;
-- TTFT, total wall time, useful output and hidden reasoning are reported
-  separately when available;
-- FP4, NVFP4, INT8, BF16, F16 KV and runtime intermediates are never conflated;
-- a theoretical bandwidth ceiling or microbenchmark is not service throughput;
-- only [Roadmap](roadmap.md) is active work; rejected ideas stay in the decision
-  ledger unless new measured evidence changes their prerequisite.
+## Evidence rules
+
+- configured context, populated context and harness prompt overhead are
+  different quantities;
+- a `hi` response proves wiring only;
+- TTFT, prefill, decode, reasoning, visible output and total wall time are
+  reported separately when available;
+- format names describe actual payloads and execution paths;
+- a numerical gate or microbenchmark is not service throughput;
+- only the roadmap defines active work; rejected mechanisms require a new
+  quantitative prerequisite before implementation.

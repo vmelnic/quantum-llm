@@ -1,57 +1,47 @@
 # Pi CLI
 
-Status: maintained coding-harness integration, 2026-09-20.
-
-Pi is the preferred local harness because it can call the repository's
-OpenAI-compatible endpoint without Claude Code's fixed Claude-oriented prompt.
-It is still a real agent: even with context files and tools disabled, Pi may
-send its own system instructions. A one-word user prompt is therefore not
-necessarily a five-token model prefill.
+Status: maintained coding harness, 2026-09-27.
 
 ## Configuration
 
-Repository `.pi/settings.json` selects provider `quantum-llm`, Qwen by default,
-all seven active advertised IDs, `xhigh` thinking, disabled automatic retries and
-a request timeout matching long local prefills. Compaction keeps 32,768 recent
-tokens and reserves 8,192 tokens for the next answer/summary.
+Repository `.pi/settings.json` selects:
 
-The base URL and secret live in Pi's user-local registry
-`~/.pi/agent/models.json`; Git contains no credential. The user-local
-`~/.pi/agent/settings.json` selects `quantum-llm/qwen3.8-27b-fp4` with
-`xhigh` by default. The local registry should contain only these project models:
+- provider `quantum-llm`;
+- model `qwen3.8-27b-fp4`;
+- thinking level `xhigh`;
+- automatic retries disabled;
+- compaction enabled with 32,768 recent tokens and an 8,192-token reserve.
+
+The enabled catalog contains six model IDs:
 
 - `qwen3.8-27b-fp4`;
 - `qwen3.8-27b-abliterated-fp4`;
 - `qwen3.8-flash-next-fp4`;
 - `mistral-small-4-119b-nvfp4`;
 - `muse-glimmer-30b-fp4`;
-- `ornith-1.5-35b-a3b-fp4`;
-- `deepseek-v4-flash`.
+- `ornith-1.5-35b-a3b-fp4`.
 
-## Use
+The provider base URL and secret live in Pi's user-local model registry. Git
+contains no credential.
+
+## Launch
 
 ```bash
 ./ops/model.sh start qwen
 ./ops/pi.sh qwen
 ```
 
-Replace the alias with `qwen-abliterated`, `qwen-f16`, `qwen-flash`, `mistral`,
-`muse`, `ornith` or `deepseek`. `ops/pi.sh` validates the alias/key, reads Pi's configured provider
-URL, then checks the running model ID and explicit KV codec through
-`/model-info` before launching Pi. It defaults to `--thinking xhigh` and
-forwards remaining arguments. The operational `qwen` and `qwen-abliterated`
-aliases select standard FP4 weights and require `q4-f16-per-head` plus
-artifact-declared MTP-4; `ornith` requires Q4H but does not declare MTP.
-The Pi wrapper rejects a Q4H service with an incomplete declared MTP-4
-contract. `qwen-f16` remains the explicit exact-F16 Qwen reference.
+`pi.sh` resolves the repository and `.env` from its own path, then:
 
-The wrapper resolves its repository and `.env` from its own absolute path, not
-from the current directory. Pi's provider/model registry is user-global, so
-the wrapper and direct `pi --provider quantum-llm --model <advertised-id>` calls
-work from any project directory. The current directory remains intentional Pi
-project context unless `--no-context-files` is supplied.
+1. resolves the alias through `ops/model-aliases.tsv`;
+2. verifies that Pi knows the advertised model;
+3. queries `/model-info`;
+4. verifies the running model, output limit and explicit KV codec;
+5. verifies exact-decode ABI 2, draft depth, vocabulary and Q8 MTP state for a
+   Q4H artifact that declares MTP;
+6. launches Pi with `xhigh` and forwards remaining arguments.
 
-Minimal wiring gate:
+Minimal wiring check:
 
 ```bash
 ./ops/pi.sh qwen \
@@ -59,64 +49,60 @@ Minimal wiring gate:
   --no-prompt-templates --no-session --thinking off -p hi
 ```
 
-## Current evidence
-
-All seven advertised model IDs have historical minimal-Pi wiring evidence. The
-current post-promotion regression passed Qwen, Qwen Abliterated and Ornith on
-`q4-f16-per-head`, plus Muse, Flash and Mistral on their unchanged formats.
-DeepSeek was intentionally excluded from that regression; Flash and Mistral
-remain slow. Exact timings live only in [Benchmarks](benchmarks.md). Wiring
-does not qualify tools, coding quality, long context or concurrency.
-
-The 2026-09-24 isolated `xhigh` regression returned `hi` responses for all six
-in-scope published models. Direct Pi using the user-local default and direct
-chat on both standard-FP4 Qwen artifacts also returned text. One native worker
-crash during sequential restart passed on an unchanged controlled retry, but
-restart reliability remains unqualified; see [Benchmarks](benchmarks.md).
+Pi still supplies its own base instructions. The provider's populated prompt
+count is the authoritative context measurement.
 
 ## Thinking and sampling
 
-The repository default is `xhigh`. Pi can append another supported
-`--thinking` level for an explicit run, including `off`. The request path maps
-thinking mode and reasoning effort into the artifact's official template.
-
-Sampling defaults come from artifact metadata, not Pi. The
-upstream-compatible profile remains available as
-`qwen3.8-sampling-profiles-v1.json`. The operational Qwen and Qwen Abliterated
-artifacts select the approved long-agent profile:
+Artifacts own sampling defaults. The operational Qwen profiles are:
 
 ```text
-thinking:     temperature=1.0, top_p=0.95, top_k=20,
-              presence_penalty=0.5
-non-thinking: temperature=0.7, top_p=0.8, top_k=20,
-              presence_penalty=0.5
-thinking output ceiling: 32,768 tokens
+thinking:     temperature=1.0, top_p=0.95, top_k=20, presence_penalty=0.5
+non-thinking: temperature=0.7, top_p=0.8,  top_k=20, presence_penalty=0.5
+thinking output ceiling: 32,768
 ```
 
-The operational Ornith Q4H artifact preserves its tokenizer defaults in both
-profiles (`temperature=1.0`, `top_p=0.95`, `top_k=20`) and declares the same
-`presence_penalty=0.5`; it does not inherit Qwen's thinking-output ceiling.
+The Qwen context remains 262,144 and the normal service output ceiling remains
+262,143. The server applies the 32,768 ceiling only to thinking requests.
+Supported request fields may override individual sampling defaults but cannot
+raise that ceiling.
 
-The service enforces the artifact-declared ceiling only while thinking is
-enabled. Both global Pi model entries retain `contextWindow=262144` and
-`maxTokens=262143`; oversized thinking requests are clamped server-side to
-32,768, while non-thinking output is bounded by the remaining context.
-Supported explicit API/Pi sampling parameters override individual defaults but
-cannot raise the thinking ceiling. Results must report hidden reasoning
-separately; changing thinking is a quality and latency experiment, not a
-runtime correctness setting.
+Ornith has its own artifact profiles and no Qwen-specific thinking ceiling.
+Changing thinking or sampling changes the workload and must be reported with a
+benchmark result.
 
-## Context and concurrency
+## Context and sessions
 
-Pi's compaction reserve is not a model output or context limit. Qwen, Qwen
-Flash, Mistral, Ornith and DeepSeek currently advertise up to 262,144 positions;
-Muse advertises 131,072. The server clamps output after exact tokenization and
-allocates KV only for populated positions.
+The service allocates KV for populated positions. Pi's context window,
+compaction reserve and per-turn output limit are separate values. Several Pi
+processes may queue and compatible sessions may retain exact prefixes, but the
+service has one hot execution slot.
 
-Several Pi processes may queue and retain compatible sessions, but the current
-service has one hot execution slot. They do not decode concurrently. DeepSeek
-does not retain exact sessions, so its history must be replayed.
+Qwen persistence can restore a matching provider state after a service restart.
+Pi replaying its transcript does not guarantee a provider cache hit; telemetry
+must report `resumed=true` or a disk restore.
 
-Representative coding qualification remains separate. Qwen passed the bounded
-Todo fixture but with poor wall time; Flash and Mistral made zero edits; Ornith
-K1+fit reached only 2/3 tests. Muse and DeepSeek are not coding-qualified.
+## Autonomous 256K benchmark
+
+The benchmark in `ops/python/pi256k_benchmark.py` runs a gradual coding-agent
+dialogue on the Windows host. It records every completed model call at its
+actual populated prompt size, writes results atomically and stops only after a
+real prompt reaches 255,000 through 255,999 positions.
+
+It can run the Quantum LLM QPack/Q4H/MTP-4 path and a pinned llama.cpp GGUF
+comparison sequentially. Their formats and placement are different; the tool
+records them rather than treating them as equivalent.
+
+```bash
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 \
+  -Action preflight -Backend quantum
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 \
+  -Action launch -Backend quantum
+./ops/run-on-windows-host.sh Invoke-Pi256kBenchmark.ps1 \
+  -Action status -Backend quantum
+```
+
+The latest Quantum run is incomplete. It recorded 25 completed model calls,
+reached 58,664 populated prompt tokens and then stalled with no provider
+completion. No 256K result exists. Exact measurements belong in
+[Benchmarks](benchmarks.md).
