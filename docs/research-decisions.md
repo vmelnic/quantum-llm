@@ -2161,3 +2161,13 @@ Operations now resolve the actual executable, disable only its inbound TCP
 block and install a TCP/API-port allow rule scoped to the host's WireGuard
 address and 10.10.88.0/24 peers. The remote greeting/tool retest passes.
 Scheduled-task stop leaves zero native workers/listeners and 263 MiB GPU use.
+
+Subsequent startup exposed a launcher defect when no enabled inbound block
+rules remain: Get-NetFirewallRule's filtered CIM query raises
+CmdletizationQuery_NotFound, terminating the strict-mode launcher before
+model startup. The correction enumerates rules with ErrorAction Stop and
+filters the returned objects locally. The real host returns zero matches
+without error; actual enumeration/access failures remain fatal.
+After deploying this correction, the user's exact `./ops/strata.sh start`
+command exits zero with generation_ready=true. An authenticated remote
+GET /v1/models returns HTTP200 and swift-flash-next-iq3-s after SSH closes.

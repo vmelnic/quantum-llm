@@ -202,7 +202,12 @@ function Start-Service {
     }
     # Windows' first-run prompt can create an explicit block for the versioned
     # executable. Such a block overrides even the VPN-only allow rule below.
-    Get-NetFirewallRule -Direction Inbound -Enabled True -Action Block | ForEach-Object {
+    # Filter locally: the CIM-filtered query throws ObjectNotFound when no
+    # enabled inbound block rules exist, which is a valid firewall state.
+    # Keep real enumeration/access errors fatal instead of suppressing them.
+    Get-NetFirewallRule -ErrorAction Stop | Where-Object {
+        $_.Direction -eq 'Inbound' -and $_.Enabled -eq 'True' -and $_.Action -eq 'Block'
+    } | ForEach-Object {
         $blocked = $_
         $application = $blocked | Get-NetFirewallApplicationFilter
         $ports = $blocked | Get-NetFirewallPortFilter

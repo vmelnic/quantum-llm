@@ -104,6 +104,9 @@ If local API requests succeed but VPN requests time out, inspect the
 `QuantumLLM-Strata-WireGuard` firewall rule and any explicit TCP block for
 the versioned Strata Python executable. The launcher resolves the executable
 through the `terminal/current` junction and applies the VPN-scoped allow rule.
+An empty enabled-block rule set is valid. The launcher enumerates rules and
+filters locally because CIM-side filters raise ObjectNotFound for no matches;
+actual firewall enumeration/access failures still stop the launch.
 After a stop, verify the owned native worker and 8082 listener are gone and
 GPU residency returns to the desktop baseline. Do not inspect unrelated Pi
 sessions or logs to diagnose this instance.
