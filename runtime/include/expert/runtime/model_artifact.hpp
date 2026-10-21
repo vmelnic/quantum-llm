@@ -58,6 +58,11 @@ class ModelArtifact final {
   [[nodiscard]] static Status load(
       const std::filesystem::path& root, ModelArtifact& destination) noexcept;
 
+  // Applies a startup execution policy to the in-memory program only.
+  // Stored packs, authenticated metadata and the artifact identity stay intact.
+  [[nodiscard]] Status configure_mtp_draft_depth(
+      std::uint32_t depth) noexcept;
+
   [[nodiscard]] const std::filesystem::path& root() const noexcept {
     return root_;
   }

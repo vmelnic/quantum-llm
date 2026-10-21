@@ -24,6 +24,7 @@ param(
     [int]$WorkerKvPageTokens = 256,
     [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "q4-bfp16-block32-key-outlier1", "q4-bfp16-block32", "q4-f16-per-head", "q5-q4-bfp16-block32", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
+    [ValidateRange(0, 2147483647)][int]$WorkerMtpDraftDepth = 0,
     [string]$SessionCacheRoot = "",
     [int]$SessionCacheGiB = 0,
     [int]$SessionCacheTtlSeconds = 604800,
@@ -89,6 +90,9 @@ $server = Join-Path $script:RepoRoot "ops\python\expert_server.py"
 if (-not (Test-Path $worker -PathType Leaf)) { throw "CUDA worker missing: $worker" }
 if (-not (Test-Path $containerPath -PathType Container)) { throw "Container missing: $containerPath" }
 if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer missing: $tokenizerPath" }
+[string[]]$mtpArguments = if ($WorkerMtpDraftDepth -gt 0) {
+    @("--worker-mtp-draft-depth", [string]$WorkerMtpDraftDepth)
+} else { @() }
 [string[]]$profileArguments = if ($ProfileGpuPhases) {
     "--profile-gpu-phases"
 } else { @() }
@@ -152,6 +156,7 @@ if (-not (Test-Path $tokenizerPath -PathType Container)) { throw "Tokenizer miss
     --worker-kv-cache-mib $WorkerKvCacheMiB `
     --worker-kv-page-tokens $WorkerKvPageTokens `
     --worker-kv-cache-dtype $WorkerKvCacheDtype `
+    @mtpArguments `
     @sessionCacheArguments `
     @sessionRetentionArguments `
     @profileArguments `

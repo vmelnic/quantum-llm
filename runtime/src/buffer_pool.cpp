@@ -219,6 +219,10 @@ std::size_t FixedBufferPool::alignment() const noexcept {
   return state_->alignment;
 }
 
+bool FixedBufferPool::page_locked() const noexcept {
+  return state_->allocator->page_locked();
+}
+
 std::size_t FixedBufferPool::bytes_in_use() const noexcept {
   std::lock_guard lock(state_->mutex);
   return state_->used * state_->slot_bytes;

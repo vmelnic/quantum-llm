@@ -73,6 +73,31 @@ std::uint64_t fp4_device_bytes(std::uint32_t hidden,
 
 }  // namespace
 
+Status ModelArtifact::configure_mtp_draft_depth(std::uint32_t depth) noexcept {
+  try {
+    if (!model_.exact_decode_program || depth == 0U ||
+        depth >= model_.max_context_tokens ||
+        depth == std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("artifact cannot apply the requested MTP depth");
+    auto candidate = model_;
+    auto& decode = *candidate.exact_decode_program;
+    const auto declared = decode.parameters.find("draft_depth");
+    if (decode.abi_version < 2U || declared == decode.parameters.end() ||
+        declared->second == 0U ||
+        declared->second >= std::numeric_limits<std::uint32_t>::max() ||
+        decode.maximum_emitted_tokens != declared->second + 1U)
+      throw std::invalid_argument("artifact does not declare an adjustable MTP policy");
+    decode.parameters["draft_depth"] = depth;
+    decode.maximum_emitted_tokens = depth + 1U;
+    const auto status = validate_model_descriptor(candidate);
+    if (!status.ok()) return status;
+    model_ = std::move(candidate);
+    return Status::success();
+  } catch (const std::exception& error) {
+    return {ErrorCode::invalid_argument, error.what()};
+  }
+}
+
 Status ModelArtifact::load(const std::filesystem::path& root,
                            ModelArtifact& destination) noexcept {
   try {

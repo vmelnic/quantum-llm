@@ -24,6 +24,7 @@ param(
     [int]$WorkerKvPageTokens = 256,
     [ValidateSet("artifact", "fp8-e4m3-per-head", "fp4-e2m1-ue8m0-block32-key-outlier1", "q4-bfp16-block32-key-outlier1", "q4-bfp16-block32", "q4-f16-per-head", "q5-q4-bfp16-block32", "fp16")]
     [string]$WorkerKvCacheDtype = "artifact",
+    [ValidateRange(0, 2147483647)][int]$WorkerMtpDraftDepth = 0,
     [string]$SessionCacheRoot = "",
     [int]$SessionCacheGiB = 0,
     [int]$SessionCacheTtlSeconds = 604800,
@@ -119,6 +120,10 @@ $taskArguments.AddRange([string[]]@(
     "-DrainTimeoutSeconds", [string]$DrainTimeoutSeconds,
     "-BuildId", (Quote-TaskArgument $BuildId)
 ))
+if ($WorkerMtpDraftDepth -gt 0) {
+    $taskArguments.Add("-WorkerMtpDraftDepth")
+    $taskArguments.Add([string]$WorkerMtpDraftDepth)
+}
 if ($SessionCacheRoot) {
     $taskArguments.Add("-SessionCacheRoot")
     $taskArguments.Add((Quote-TaskArgument $SessionCacheRoot))

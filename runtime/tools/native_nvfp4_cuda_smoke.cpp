@@ -24,8 +24,8 @@
 
 namespace {
 
-constexpr std::uint32_t kHidden = 16U;
-constexpr std::uint32_t kIntermediate = 16U;
+constexpr std::uint32_t kHidden = 64U;
+constexpr std::uint32_t kIntermediate = 64U;
 
 void cuda_check(cudaError_t error, const char* operation) {
   if (error != cudaSuccess)
@@ -195,10 +195,11 @@ std::vector<std::uint8_t> make_weights(unsigned seed) {
 
 std::vector<std::uint8_t> make_sidecar(float weight_global_divisor,
                                        float input_global_divisor) {
-  std::vector<std::uint8_t> sidecar(kHidden + 2U * sizeof(float), 0x38U);
-  std::memcpy(sidecar.data() + kHidden, &weight_global_divisor,
+  constexpr auto local_scales = kHidden * kIntermediate / 16U;
+  std::vector<std::uint8_t> sidecar(local_scales + 2U * sizeof(float), 0x38U);
+  std::memcpy(sidecar.data() + local_scales, &weight_global_divisor,
               sizeof(weight_global_divisor));
-  std::memcpy(sidecar.data() + kHidden + sizeof(float),
+  std::memcpy(sidecar.data() + local_scales + sizeof(float),
               &input_global_divisor, sizeof(input_global_divisor));
   return sidecar;
 }
@@ -680,8 +681,101 @@ int main(int argc, char** argv) {
     cuda_check(cudaDeviceSynchronize(), "synchronize native NVFP4 smoke");
     const auto actual = device_selection_output.download();
     const auto metrics = compare(actual, expected);
-    const auto pass = metrics.maximum_relative_error < 0.01 &&
+    bool pass = metrics.maximum_relative_error < 0.01 &&
                       metrics.cosine > 0.99999;
+    // Native grouped prefill: noncontiguous selections, a nonzero directory
+    // layer, different gate/up scale directions, masked output and group tails.
+    // Check independent CPU NVFP4 arithmetic as well as scalar bit identity.
+    for (const auto rows : {6U, 8U, 12U}) {
+      constexpr auto top_k = 2U;
+      const auto selections = rows * top_k;
+      std::vector<float> batch_input(rows * kHidden);
+      for (std::uint32_t row = 0; row < rows; ++row)
+        for (std::uint32_t dim = 0; dim < kHidden; ++dim)
+          batch_input[row * kHidden + dim] = input[dim] *
+              (1.0F + static_cast<float>(row) / 8.0F);
+      auto second = entry;
+      second.w1_fp4 = entry.w3_fp4;
+      second.w1_ue8m0 = entry.w3_ue8m0;
+      second.w3_fp4 = entry.w1_fp4;
+      second.w3_ue8m0 = entry.w1_ue8m0;
+      DeviceBuffer<expert::runtime::cuda::DeviceExpertEntry> batch_directory(4U);
+      batch_directory.upload({{}, {}, entry, second});
+      std::vector<std::uint32_t> indices(selections);
+      std::vector<std::uint8_t> mask(selections, 1U);
+      mask[4] = 0U;
+      for (std::uint32_t selection = 0; selection < selections; ++selection)
+        indices[selection] = selection % top_k;
+      std::vector<expert::runtime::cuda::MoeGroupedSelectionWork> work;
+      for (std::uint32_t expert = 0; expert < top_k; ++expert) {
+        expert::runtime::cuda::MoeGroupedSelectionWork item{};
+        item.expert = expert;
+        for (std::uint32_t last = selections; last != 0U; --last) {
+          const auto selection = last - 1U;
+          if (!mask[selection] || indices[selection] != expert) continue;
+          item.selections[item.count++] = selection;
+          if (item.count == expert::runtime::cuda::kMoeGroupedSelectionWidth) {
+            work.push_back(item); item.count = 0U;
+          }
+        }
+        if (item.count != 0U) work.push_back(item);
+      }
+      DeviceBuffer<float> batch_inputs(batch_input.size()); batch_inputs.upload(batch_input);
+      DeviceBuffer<std::uint32_t> batch_indices(indices.size()); batch_indices.upload(indices);
+      DeviceBuffer<std::uint8_t> batch_mask(mask.size()); batch_mask.upload(mask);
+      DeviceBuffer<float> batch_intermediate(selections * kIntermediate);
+      DeviceBuffer<float> batch_output(selections * kHidden);
+      DeviceBuffer<float> batch_gate(selections * kHidden);
+      DeviceBuffer<float> batch_up(selections * kHidden);
+      DeviceBuffer<float> batch_down(selections * kIntermediate);
+      DeviceBuffer<expert::runtime::cuda::MoeGroupedSelectionWork> batch_work(work.size());
+      batch_work.upload(work);
+      expert::runtime::cuda::MoeSelectionBatchLaunch launch{};
+      launch.input = batch_inputs.get();
+      launch.expert_indices = batch_indices.get();
+      launch.selection_mask = batch_mask.get();
+      launch.intermediate = batch_intermediate.get();
+      launch.selection_outputs = batch_output.get();
+      launch.rows = rows; launch.hidden_size = kHidden;
+      launch.intermediate_size = kIntermediate; launch.top_k = top_k;
+      launch.expert_table_size = top_k; launch.directory_layer = 1U;
+      launch.directory_entries = batch_directory.get();
+      launch.bf16_intermediate = true; launch.enable_native_nvfp4 = true;
+      launch.nvfp4_gate_input = batch_gate.get();
+      launch.nvfp4_up_input = batch_up.get();
+      launch.nvfp4_down_input = batch_down.get();
+      const std::vector<float> sentinel(selections * kHidden, -123.0F);
+      batch_output.upload(sentinel);
+      status_check(expert::runtime::cuda::launch_moe_selection_batch(launch));
+      cuda_check(cudaDeviceSynchronize(), "synchronize scalar NVFP4 batch");
+      const auto scalar = batch_output.download();
+      batch_output.upload(sentinel);
+      launch.grouped_work = batch_work.get();
+      launch.grouped_work_items = static_cast<std::uint32_t>(work.size());
+      launch.enable_grouped_fp4 = true;
+      status_check(expert::runtime::cuda::launch_moe_selection_batch(launch));
+      cuda_check(cudaDeviceSynchronize(), "synchronize grouped NVFP4 batch");
+      const auto grouped = batch_output.download();
+      if (grouped != scalar)
+        throw std::runtime_error("grouped NVFP4 differs from scalar arithmetic");
+      for (std::uint32_t selection = 0; selection < selections; ++selection) {
+        if (!mask[selection]) continue;
+        const auto row = selection / top_k;
+        const std::vector<float> row_input(batch_input.begin() + row * kHidden,
+                                         batch_input.begin() + (row + 1U) * kHidden);
+        const auto reference_output = selection % top_k
+            ? reference(row_input, up_weights, up_sidecar, gate_weights,
+                        gate_sidecar, down_weights, down_sidecar)
+            : reference(row_input, gate_weights, gate_sidecar, up_weights,
+                        up_sidecar, down_weights, down_sidecar);
+        const std::vector<float> output(grouped.begin() + selection * kHidden,
+                                       grouped.begin() + (selection + 1U) * kHidden);
+        const auto grouped_metrics = compare(output, reference_output);
+        if (grouped_metrics.relative_l2 >= 0.01 || grouped_metrics.cosine <= 0.9999)
+          throw std::runtime_error("grouped NVFP4 independent oracle failure");
+      }
+      std::cout << "grouped NVFP4 rows=" << rows << " scalar_bit_identity=true\n";
+    }
     std::cout << "{\"pass\":" << (pass ? "true" : "false")
               << ",\"maximum_absolute_error\":"
               << metrics.maximum_absolute_error

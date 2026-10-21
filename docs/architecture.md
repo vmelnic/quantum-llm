@@ -1,17 +1,59 @@
 # Architecture
 
-Status: implemented architecture, 2026-09-27.
+Status: implemented architecture, 2026-10-21.
 
 ## Host boundary
 
 The serving system is self-contained on one Windows host. One RTX 3090 owns
-the active model program. Two local P100 cards can execute compatible routed
-expert pages, but no active alias depends on them and measured paths did not
-improve throughput. The POSIX control machine synchronizes source and invokes
-operations; it owns no model state.
+the active model program. The A520M/RTX 3090 and X99E/three 16 GiB Tesla P100
+machines are independent rigs. Active serving does not depend on the P100
+rig. The POSIX control machine synchronizes source and invokes operations;
+it owns no model state.
 
 The service has one hot provider slot. Requests may queue and exact sessions
 may be parked, but model execution is serialized.
+
+The user-authorized Swift/KAT GGUF service runs separately through
+`ops/llama.sh` and llama.cpp, on the same 3090 with one active model. Its
+registry, artifacts, task and API port are separate from the artifact VM;
+see [llama.cpp CLI](llama-cli.md). It is not a universal VM qualification.
+The user-authorized latest-stable update installs a clean Windows Release/CUDA
+v0.6.0 build through `artifacts/llama-install.json`. Future launches and the
+prepared launch resolve that executable; the active process was not restarted.
+
+Swift's prepared policy restores one slot with 262,144 context positions,
+MTP-10, full GPU layers and automatic fitting disabled. The user requested
+this rollback after reporting severe slowdown with the two-slot fitted
+policy. Activation remains with the user; no rollback inference was run.
+KAT retains its separate one-slot policy.
+
+Swift Heretic's prepared vision policy adds a pinned Q8 projector through an
+optional artifact-declared registry object. Publication authenticates both
+GGUF files; `--mmproj` and `--no-mmproj-offload` place the visual encoder on
+CPU/RAM. The backbone, target KV and MTP remain on the GPU with context
+262,144, one slot and MTP-10. Pi image input is enabled for the existing
+`swift-heretic` ID. Deployment preparation passed file/argument gates without
+restarting; live image quality and residency remain unmeasured.
+
+The same separate GGUF registry also declares GPT-OSS-20B MXFP4 with one
+slot, 131,072 native context positions, F16 target KV, native high reasoning
+and no draft/projector. Generic optional reasoning policy avoids model-name
+branches and preserves existing xhigh policies. The model passed publication
+and launch-preparation gates; Pi is enabled in home settings without
+changing defaults. No model start or live inference qualification was run.
+
+## Independent Strata service
+
+The separately authorized Strata service uses its own signed upstream engine,
+registry, model pack, `QuantumLLM-Strata` task and API port 8082. It does not
+change artifact-VM execution or llama.cpp. GPU-resident dense/state tensors
+and cached experts cooperate with CPU computation of nonresident routed
+experts. See [Strata CLI](strata-cli.md) for operations and serving policy.
+
+The home Pi registry exposes it as `strata-3090/swift-flash-next-iq3-s`.
+Pi configuration is in `~/.pi/agent/`; the removed project `.pi` directory
+remains absent. Its actual Pi request timings and qualification limits are
+recorded in [Benchmarks](benchmarks.md#actual-pi-request-with-embedded-code-2026-10-21).
 
 ## Artifact-driven execution
 
@@ -90,6 +132,21 @@ Provider names are diagnostic. Selection uses the artifact's required kernel
 set and ABI ranges. The service validates the returned context, KV, placement,
 MTP, sampling and session contract before reporting readiness.
 
+An optional startup MTP proposal limit flows from `MODEL_MTP_DRAFT_DEPTH`
+through the service and the generic worker launch policy. The runner and the
+selected dense-MTP provider apply the same override to their in-memory
+artifact descriptors before binding. The stored manifest/program/tensor
+bytes stay unchanged. Missing policy keeps the artifact default, currently
+four proposals for the Qwen QPack. Verifier rows, recurrent checkpoint strides,
+attention scratch and acceptance counters follow the effective count rather
+than a fixed five-row allocation. Provider workspace/context limits remain
+fail-closed. Worker protocol 13 advertises the effective draft depth; an
+explicit request requires protocol 13 and an exact echoed value at startup.
+The `.env` proposal default applies only when the authenticated artifact
+declares an adjustable sampled-MTP program. Other artifacts omit the worker
+override; explicitly requested unsupported overrides still fail. Both start
+and restart validate the artifact/policy before stopping the prior service.
+
 ## Routed experts
 
 Expert identity includes artifact namespace, component, layer, expert ID and
@@ -149,3 +206,61 @@ native descendants and return model allocations on every CUDA device.
 
 The server provides bearer authentication. TLS and public rate limiting require
 a trusted external edge.
+
+
+### MLA/NVFP4 optimization candidate, 2026-10-07
+
+The compressed BF16 MLA organ retains its page ABI and complete causal support.
+For longer prefixes it scores eight positions per tile and reuses decoded
+latent values in shared memory; short prefixes retain the serial kernel.
+MLA-only operation sets omit standard attention staging and split arenas.
+Mixed declared attention sets retain those workspaces. Selection depends on
+operation capabilities, not model names or fixed layer counts.
+
+Native NVFP4 routed prefill now supports the existing four-selection grouped
+work layout. Each expert's packed weights/scales are decoded once per group,
+while gate/up/down activation quantization remains selection-specific. BF16
+projection/intermediate boundaries and ordered route aggregation are preserved.
+Scalar decode and standard-FP4 grouping retain their existing paths.
+
+This candidate passed offline native numerical/regression gates and subsequent
+direct Mistral and Pi xhigh greetings. Qwen direct chat also passed on the
+same clean-built common runner. Long-context coding qualification remains
+pending; see [Benchmarks](benchmarks.md). It adds no MTP predictor, weight quantization
+ABI, MLA quantized-cache ABI, external executor or additional serving host.
+
+### Retained-RAM expert uploads, 2026-10-07
+
+Pageable retained expert records reuse the existing fixed pinned staging pool
+for H2D. A staging lease remains owned by the cache entry through asynchronous
+upload completion, including cancellation. Already pinned host banks and
+non-pinned pools preserve their existing upload paths. Pool pressure queues
+uploads without overwriting an in-flight record; host copies, routing and
+weight values remain unchanged. This adds no reserved memory or protocol ABI.
+The exact clean-built source passed byte/ownership/cancellation tests and
+Mistral/Pi/Qwen greetings. A trial that prioritized dropping device-backed
+RAM duplicates slowed decode and the complete request sequence; it was
+rejected and reverted. The existing victim ranking remains in use.
+
+
+### Resident MLA context splits, 2026-10-07
+
+Compressed MLA decode with at most eight rows and at least 4096 visible
+positions uses 1024-position context splits. Each GPU block writes its local
+softmax maximum, mass and unnormalized latent sum; a second GPU kernel merges
+these in stable global softmax coordinates and applies the original value
+projection once. Complete causal support, BF16 latent pages, expert routing
+and the weight ABI remain unchanged. F32 summation order differs and is
+qualified against an independent materialized-K/V FP64 oracle.
+
+Dedicated optional scratch is bounded by eight rows, declared head count,
+latent rank and configured context. At the current 32-head/256-rank/262K
+geometry it reserves 64.5 MiB, reused between layers. Larger prefill batches,
+short prefixes and callers without scratch retain the tiled/serial paths.
+The launch structure layout and artifact/wire versions do not change. The
+kernel gate passes at actual geometry through 262K. The same clean-built
+runner also passes direct Mistral/Pi greetings, a Pi request with 4408 prompt
+tokens exercising split decode, Qwen direct chat and process/GPU cleanup.
+Mistral is left running on the qualified candidate. Whole-model populated
+context, capacity and coding throughput remain separate qualification gates;
+real-client latency is still poor. See [Benchmarks](benchmarks.md).

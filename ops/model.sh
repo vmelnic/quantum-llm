@@ -3,12 +3,19 @@ set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "${script_dir}/.." && pwd)"
+# An explicit invocation override takes precedence over the file default.
+mtp_depth_override_set="${MODEL_MTP_DRAFT_DEPTH+x}"
+mtp_depth_override="${MODEL_MTP_DRAFT_DEPTH-}"
 env_file="${repo_root}/.env"
 if [[ -f "${env_file}" ]]; then
   set -a
   # shellcheck disable=SC1090
   source "${env_file}"
   set +a
+fi
+
+if [[ "${mtp_depth_override_set}" == x ]]; then
+  MODEL_MTP_DRAFT_DEPTH="${mtp_depth_override}"
 fi
 
 usage() {
@@ -117,6 +124,7 @@ maximum_queue="${MODEL_MAXIMUM_QUEUE:-4}"
 kv_cache_mib="${MODEL_KV_CACHE_MIB:-2048}"
 kv_page_tokens="${MODEL_KV_PAGE_TOKENS:-256}"
 kv_cache_dtype="${alias_kv_cache_dtype:-${MODEL_KV_CACHE_DTYPE:-artifact}}"
+mtp_draft_depth="${MODEL_MTP_DRAFT_DEPTH:-}"
 placement_profile="${MODEL_PLACEMENT_PROFILE:-balanced}"
 profile_gpu_phases="${MODEL_PROFILE_GPU_PHASES:-0}"
 raw_response_trace_file="${MODEL_RAW_RESPONSE_TRACE_FILE:-}"
@@ -126,8 +134,13 @@ disable_session_retention="${MODEL_DISABLE_SESSION_RETENTION:-0}"
 [[ -n "${remote_root}" ]] || die "QUANTUM_LLM_REMOTE_ROOT must reference the remote project root"
 [[ -n "${model_root}" ]] || die "MODEL_ROOT must reference the remote model store"
 container="${model_root}/${artifact_name}"
-vm_runner="${remote_root}/out/build/windows-msvc-release/runtime/Release/expert-moe-vm-runner.exe"
+vm_runner="${MODEL_VM_RUNNER:-${remote_root}/out/build/windows-msvc-release/runtime/Release/expert-moe-vm-runner.exe}"
 
+if [[ -n "${mtp_draft_depth}" ]]; then
+  require_uint MODEL_MTP_DRAFT_DEPTH "${mtp_draft_depth}"
+  (( ${#mtp_draft_depth} <= 10 )) && (( mtp_draft_depth <= 2147483647 )) ||
+    die "MODEL_MTP_DRAFT_DEPTH exceeds the Windows launch integer range"
+fi
 require_uint MODEL_PORT "${port}"
 require_uint MODEL_MAX_CONTEXT "${max_context}"
 if [[ -z "${max_output}" ]]; then
@@ -245,6 +258,7 @@ print_config() {
     "kv_cache_mib=${kv_cache_mib}" \
     "kv_page_tokens=${kv_page_tokens}" \
     "kv_cache_dtype=${kv_cache_dtype}" \
+    "mtp_draft_depth=${mtp_draft_depth:-artifact}" \
     "placement_profile=${placement_profile}" \
     "profile_gpu_phases=${profile_gpu_phases}" \
     "session_cache_gib=${session_cache_gib}" \
@@ -296,17 +310,31 @@ print(maximum, maximum_thinking_output, per_token, *values)
   if [[ "${kv_cache_dtype}" == q4-f16-per-head ]] &&
      (( artifact_mtp_layers > 0 )) &&
      ! (( artifact_exact_decode_abi == 2 &&
-          artifact_draft_depth >= 3 && artifact_draft_depth <= 4 &&
+          artifact_draft_depth > 0 &&
           artifact_draft_vocabulary_size > 0 &&
           artifact_draft_vocabulary_size <= 65536 &&
           artifact_mtp_kv_encoding == 1 &&
           artifact_maximum_emitted_tokens == artifact_draft_depth + 1 )); then
-    die "Q4H artifact with MTP requires exact-decode ABI 2, MTP-3/4, a <=65,536 draft vocabulary, and Q8 MTP KV (got ABI=${artifact_exact_decode_abi} depth=${artifact_draft_depth} vocabulary=${artifact_draft_vocabulary_size} MTP-KV=${artifact_mtp_kv_encoding} emitted=${artifact_maximum_emitted_tokens})"
+    die "Q4H artifact with MTP requires exact-decode ABI 2, positive draft depth, a <=65,536 draft vocabulary, and Q8 MTP KV (got ABI=${artifact_exact_decode_abi} depth=${artifact_draft_depth} vocabulary=${artifact_draft_vocabulary_size} MTP-KV=${artifact_mtp_kv_encoding} emitted=${artifact_maximum_emitted_tokens})"
+  fi
+  if [[ -n "${mtp_draft_depth}" ]] &&
+     ! (( artifact_mtp_layers > 0 && artifact_exact_decode_abi >= 2 &&
+          artifact_draft_depth > 0 &&
+          artifact_maximum_emitted_tokens == artifact_draft_depth + 1 )); then
+    if [[ "${mtp_depth_override_set}" == x ]]; then
+      die "MODEL_MTP_DRAFT_DEPTH invocation override requires an artifact with an adjustable sampled-MTP program"
+    fi
+    printf 'Ignoring .env MODEL_MTP_DRAFT_DEPTH=%s: selected artifact has no adjustable sampled-MTP program\n' \
+      "${mtp_draft_depth}"
+    mtp_draft_depth=""
   fi
   if (( max_context > artifact_max_context )); then
     printf 'Using artifact context limit %s instead of configured %s\n' \
       "${artifact_max_context}" "${max_context}"
     max_context="${artifact_max_context}"
+  fi
+  if [[ -n "${mtp_draft_depth}" ]] && (( mtp_draft_depth >= max_context )); then
+    die "MODEL_MTP_DRAFT_DEPTH must be smaller than the effective artifact context"
   fi
   if (( artifact_kv_bytes_per_token > 0 )) &&
      [[ "${kv_cache_dtype}" == fp16 || "${kv_cache_dtype}" == artifact ]]; then
@@ -347,6 +375,9 @@ print(maximum, maximum_thinking_output, per_token, *values)
     -BuildId "${build_id}"
     -Start
   )
+  if [[ -n "${mtp_draft_depth}" ]]; then
+    common+=(-WorkerMtpDraftDepth "${mtp_draft_depth}")
+  fi
   if (( session_cache_gib > 0 )); then
     common+=(
       -SessionCacheRoot "${model_root}/.session-cache/${artifact_name}"
@@ -415,7 +446,6 @@ case "${action}" in
     ;;
   restart)
     [[ -n "${model_id}" ]] || die "restart requires one model"
-    stop_task "${task_name}"
     start_model
     ;;
   status)

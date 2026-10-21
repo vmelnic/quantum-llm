@@ -1463,6 +1463,7 @@ class TestDeviceAllocation final : public er::IDeviceAllocation {
 
 class ControlledUploader final : public er::IDeviceUploader {
  public:
+  bool defer_cancellation{};
   struct Pending final {
     er::OperationId id{};
     er::UploadRequest request;
@@ -1483,6 +1484,7 @@ class ControlledUploader final : public er::IDeviceUploader {
   }
 
   void cancel(er::OperationId operation) noexcept override {
+    if (defer_cancellation) return;
     er::UploadCompletion completion;
     {
       std::lock_guard lock(mutex_);
@@ -1528,6 +1530,12 @@ class ControlledUploader final : public er::IDeviceUploader {
                                [&] { return pending_.size() >= count; });
   }
 
+  [[nodiscard]] std::span<const std::byte> pending_record() const {
+    std::lock_guard lock(mutex_);
+    require(!pending_.empty(), "no pending upload record");
+    return pending_.front().request.complete_record;
+  }
+
  private:
   Pending take_one() {
     std::unique_lock lock(mutex_);
@@ -1556,9 +1564,12 @@ struct Harness final {
 
   explicit Harness(std::uint64_t budget = 8192, std::size_t slots = 2,
                    std::uint64_t vram_budget = 0,
-                   er::CachePlacementConfig placement = {})
+                   er::CachePlacementConfig placement = {},
+                   std::shared_ptr<er::IHostAllocator> staging_allocator =
+                       std::make_shared<er::AlignedHostAllocator>())
       : buffers(std::make_shared<er::FixedBufferPool>(
-            slots, er::kExpertPackAlignment, er::kExpertPackAlignment)),
+            slots, er::kExpertPackAlignment, er::kExpertPackAlignment,
+            std::move(staging_allocator))),
         cache({{budget, budget, std::min<std::uint64_t>(4096, budget)},
                {vram_budget ? vram_budget : budget,
                 vram_budget ? vram_budget : budget,
@@ -2837,6 +2848,75 @@ void test_ram_hit_reuploads_after_vram_eviction() {
           "RAM reupload telemetry mismatch");
 }
 
+class TaggedPinnedAllocator final : public er::IHostAllocator {
+ public:
+  void* allocate(std::size_t bytes, std::size_t alignment) override {
+    auto* pointer = backing_.allocate(bytes, alignment);
+    pointers.push_back(pointer);
+    return pointer;
+  }
+  void deallocate(void* pointer) noexcept override {
+    backing_.deallocate(pointer);
+  }
+  bool page_locked() const noexcept override { return true; }
+  std::vector<void*> pointers;
+
+ private:
+  er::AlignedHostAllocator backing_;
+};
+
+void test_ram_upload_staging_preserves_bytes_and_async_ownership() {
+  auto allocator = std::make_shared<TaggedPinnedAllocator>();
+  Harness harness(12288, 1, 8192, {}, allocator);
+  harness.uploader->defer_cancellation = true;
+  const auto first = make_record(80, 0);
+  const auto second = make_record(81, 4096);
+  for (const auto* fixture : {&first, &second}) {
+    auto preload = harness.cache.preload_host(
+        fixture->key, fixture->record,
+        {er::ExpertRequestPriority::demand, false});
+    harness.storage->complete_success(fixture->bytes);
+    require(preload.get().status.ok(), "RAM staging fixture did not preload");
+    const auto deadline = std::chrono::steady_clock::now() + 1s;
+    while (harness.buffers->bytes_in_use()) {
+      require(std::chrono::steady_clock::now() < deadline,
+              "host preload did not release staging");
+      std::this_thread::yield();
+    }
+  }
+  auto first_upload = harness.cache.acquire(first.key, first.record);
+  require(harness.uploader->pending_count() == 1 &&
+              harness.buffers->bytes_in_use() == er::kExpertPackAlignment,
+          "pageable RAM hit did not retain the bounded upload staging slot");
+  const auto staged = harness.uploader->pending_record();
+  require(staged.data() == allocator->pointers.front() &&
+              std::equal(staged.begin(), staged.end(), first.bytes.begin()),
+          "RAM upload staging changed bytes or used the pageable record");
+  auto second_upload = harness.cache.acquire(second.key, second.record);
+  require(harness.uploader->pending_count() == 1 &&
+              second_upload.wait_for(0ms) == std::future_status::timeout &&
+              harness.storage->read_count() == 2 &&
+              std::equal(staged.begin(), staged.end(), first.bytes.begin()),
+          "staging exhaustion overwrote an in-flight upload or reread storage");
+  harness.uploader->complete_success();
+  auto first_result = first_upload.get();
+  require(first_result.status.ok() && first_result.lease &&
+              harness.uploader->pending_count() == 1,
+          "upload completion did not unblock the next RAM upload");
+  const auto second_staged = harness.uploader->pending_record();
+  require(std::equal(second_staged.begin(), second_staged.end(),
+                     second.bytes.begin()),
+          "recycled pinned staging retained the previous expert bytes");
+  second_upload.cancel();
+  require(second_upload.get().status.code() == er::ErrorCode::cancelled &&
+              harness.buffers->bytes_in_use() == er::kExpertPackAlignment,
+          "cancellation released staging before the asynchronous H2D completed");
+  harness.uploader->complete_failure();
+  require(harness.buffers->bytes_in_use() == 0 &&
+              harness.cache.telemetry().validated_ram_reuses == 2,
+          "failed or cancelled upload leaked staging or lost RAM reuse telemetry");
+}
+
 void test_host_lease_protects_validated_ram_copy() {
   Harness harness(8192, 1, 4096);
   const auto first = make_record(24, 0);
@@ -3514,6 +3594,7 @@ int main() {
     test_device_admission_can_fail_fast_without_changing_default_waiting();
     test_short_read_checksum_and_upload_fail_closed();
     test_ram_hit_reuploads_after_vram_eviction();
+    test_ram_upload_staging_preserves_bytes_and_async_ownership();
     test_host_lease_protects_validated_ram_copy();
     test_cpu_executor_writes_compact_selection_outputs();
     test_fp4_host_executor_accepts_prefill_rows();

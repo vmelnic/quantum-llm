@@ -38,6 +38,9 @@ class ImmutableHostBuffer final {
   [[nodiscard]] std::byte* data() noexcept { return data_; }
   [[nodiscard]] const std::byte* data() const noexcept { return data_; }
   [[nodiscard]] std::size_t size() const noexcept { return bytes_; }
+  [[nodiscard]] bool page_locked() const noexcept {
+    return allocator_->page_locked();
+  }
 
  private:
   std::shared_ptr<IHostAllocator> allocator_;
@@ -126,6 +129,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     bool force_host_retention{};
     bool host_preloaded{};
     bool preparing_host{};
+    bool upload_from_retained_copy{};
     OperationId io_operation{};
     OperationId upload_operation{};
     std::chrono::steady_clock::time_point load_started_at{};
@@ -397,6 +401,7 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
 
   void release_staging_locked(Entry& entry) noexcept {
     entry.host.reset();
+    entry.upload_from_retained_copy = false;
   }
 
   void release_host_locked(Entry& entry) noexcept {
@@ -938,6 +943,26 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
           reserve_vram_locked(*entry, device_bytes(entry->record), resident);
           update_usage_locked();
         }
+        if (buffers->page_locked() && !entry->host && entry->host_copy &&
+            !entry->host_copy->page_locked()) {
+          auto staging = buffers->try_acquire(
+              static_cast<std::size_t>(entry->record.stored_bytes),
+              buffer_class(priority));
+          if (!staging) {
+            Telemetry::add(metrics.stalled_by_budget_);
+            Telemetry::add(
+                metrics.staging_stalls_by_priority_[priority_index(priority)]);
+            continue;
+          }
+          if (staging->page_locked()) {
+            // Reuse the existing bounded pinned pool for pageable RAM hits.
+            // Its lease remains owned by the entry until H2D completes.
+            entry->host = std::move(staging);
+            entry->upload_from_retained_copy = true;
+            entry->staging_priority = priority;
+            update_usage_locked();
+          }
+        }
         transition_locked(*entry, CacheState::gpu_uploading);
         entry->upload_priority = priority;
         entry->upload_started_at = std::chrono::steady_clock::now();
@@ -1069,6 +1094,9 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     std::span<const std::byte> bytes;
     if (entry->host) {
       const auto buffer = entry->host->buffer();
+      if (entry->upload_from_retained_copy) {
+        std::memcpy(buffer.data, entry->host_copy->data(), count);
+      }
       bytes = std::span<const std::byte>(buffer.data, count);
     } else if (entry->host_copy) {
       bytes = std::span<const std::byte>(entry->host_copy->data(), count);
@@ -1094,7 +1122,8 @@ struct ExpertCacheCore final : public std::enable_shared_from_this<ExpertCacheCo
     }
     const auto sections = *entry->validated_sections;
     const auto compact = entry->validated_compact;
-    if (!entry->host && entry->host_copy) {
+    if (entry->host_copy &&
+        (!entry->host || entry->upload_from_retained_copy)) {
       Telemetry::add(metrics.validated_ram_reuses_);
     }
 

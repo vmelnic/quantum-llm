@@ -166,6 +166,11 @@ if(EXPERT_RUNTIME_ENABLE_CUDA_COMPUTE)
   target_compile_features(expert-native-nvfp4-cuda-smoke PRIVATE cxx_std_20)
   target_link_libraries(expert-native-nvfp4-cuda-smoke PRIVATE
     expert_runtime CUDA::cudart)
+  add_executable(expert-mla-attention-cuda-smoke
+    tools/mla_attention_cuda_smoke.cpp)
+  target_compile_features(expert-mla-attention-cuda-smoke PRIVATE cxx_std_20)
+  target_link_libraries(expert-mla-attention-cuda-smoke PRIVATE
+    expert_runtime CUDA::cudart)
   add_library(expert-sm86-dense-moe-provider OBJECT tools/olmoe_runner.cpp)
   target_compile_features(expert-sm86-dense-moe-provider PRIVATE cxx_std_20)
   target_compile_definitions(expert-sm86-dense-moe-provider PRIVATE
@@ -229,5 +234,11 @@ if(EXPERT_RUNTIME_BUILD_TESTS)
   if(TARGET expert-native-nvfp4-cuda-smoke)
     add_test(NAME expert-native-nvfp4-cuda-smoke
       COMMAND expert-native-nvfp4-cuda-smoke)
+  endif()
+  if(TARGET expert-mla-attention-cuda-smoke)
+    add_test(NAME expert-mla-attention-cuda-smoke
+      COMMAND expert-mla-attention-cuda-smoke)
+    add_test(NAME expert-mla-attention-long-context-gate
+      COMMAND expert-mla-attention-cuda-smoke --long-context)
   endif()
 endif()

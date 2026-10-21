@@ -121,6 +121,7 @@ class FixedBufferPool final {
   [[nodiscard]] std::size_t slot_count() const noexcept;
   [[nodiscard]] std::size_t slot_bytes() const noexcept;
   [[nodiscard]] std::size_t alignment() const noexcept;
+  [[nodiscard]] bool page_locked() const noexcept;
   [[nodiscard]] std::size_t bytes_in_use() const noexcept;
   [[nodiscard]] BufferPoolSnapshot snapshot() const noexcept;
 

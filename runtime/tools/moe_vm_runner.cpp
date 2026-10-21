@@ -51,7 +51,7 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     const std::filesystem::path&, std::uint32_t, std::uint32_t, std::uint64_t,
     std::uint64_t, std::uint64_t, std::uint32_t, std::string_view,
     std::string_view, std::string_view, bool, bool, std::vector<int>,
-    std::uint64_t, std::uint64_t);
+    std::uint64_t, std::uint64_t, std::uint32_t);
 
 namespace {
 
@@ -464,7 +464,8 @@ er::ExecutionProviderModule create_module(
                options.routed_vram_policy,
                options.profile_gpu_phases, false, active_expert_devices,
                options.active_expert_device_cache_gib << 30U,
-               options.active_expert_host_cache_gib << 30U);
+               options.active_expert_host_cache_gib << 30U,
+               options.mtp_draft_depth.value_or(0U));
          }});
   }
   {
@@ -573,7 +574,7 @@ void print_ready(const er::ModelDescriptor& descriptor,
   const auto* routed = descriptor.routed_components.empty()
                            ? nullptr
                            : &descriptor.routed_components.front();
-  std::cout << "{\"type\":\"ready\",\"protocol\":12,\"capacity\":"
+  std::cout << "{\"type\":\"ready\",\"protocol\":13,\"capacity\":"
             << capacity << ",\"architecture_id\":\""
             << json_text(descriptor.architecture_id)
             << "\",\"vocab_size\":" << descriptor.vocab_size
@@ -621,6 +622,11 @@ void print_ready(const er::ModelDescriptor& descriptor,
             << (service.mtp_runtime_ready ? "true" : "false")
             << ",\"mtp_enabled\":"
             << (service.mtp_enabled ? "true" : "false")
+            << ",\"mtp_draft_depth\":"
+            << (descriptor.exact_decode_program &&
+                        descriptor.exact_decode_program->parameters.contains("draft_depth")
+                    ? descriptor.exact_decode_program->parameters.at("draft_depth")
+                    : 0U)
             << ",\"retain_previous_route\":"
             << (service.retain_previous_route ? "true" : "false")
             << ",\"cpu_hybrid_enabled\":"
@@ -1494,6 +1500,10 @@ int main(int argc, char** argv) {
     er::ModelArtifact artifact;
     auto status = er::ModelArtifact::load(root, artifact);
     require(status.ok(), status.message());
+    if (parsed.options.mtp_draft_depth) {
+      status = artifact.configure_mtp_draft_depth(*parsed.options.mtp_draft_depth);
+      require(status.ok(), status.message());
+    }
     require(artifact.model().schema_version >= 3U,
             "callable VM service requires a schema v3 artifact");
     startup_phase("artifact_load_complete");

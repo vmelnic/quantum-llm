@@ -502,7 +502,8 @@ class CudaWorker:
                  active_expert_devices: str = "",
                  active_expert_device_cache_gib: int = 0,
                  active_expert_host_cache_gib: int = 0,
-                 routed_vram_policy: str = "fixed") -> None:
+                 routed_vram_policy: str = "fixed",
+                 mtp_draft_depth: int | None = None) -> None:
         command = [
             str(executable), str(container), "--worker",
             f"--max-context={max_context}",
@@ -515,6 +516,12 @@ class CudaWorker:
             f"--kv-cache-dtype={kv_cache_dtype}",
             f"--placement-profile={placement_profile}",
         ]
+        if mtp_draft_depth is not None:
+            if (isinstance(mtp_draft_depth, bool) or
+                    not isinstance(mtp_draft_depth, int) or
+                    not 0 < mtp_draft_depth < 2**32 - 1):
+                raise WorkerError("MTP draft depth must be a positive uint32 policy")
+            command.append(f"--mtp-draft-depth={mtp_draft_depth}")
         if prefill_chunk_tokens:
             command.append(f"--prefill-chunk-limit={prefill_chunk_tokens}")
         if placement_settle_steps is not None:
@@ -609,6 +616,15 @@ class CudaWorker:
         )
         self.mtp_runtime_ready = bool(response.get("mtp_runtime_ready", False))
         self.mtp_enabled = bool(response.get("mtp_enabled", False))
+        raw_mtp_depth = response.get("mtp_draft_depth")
+        if ((mtp_draft_depth is not None and self.protocol < 13) or
+                (self.protocol >= 13 and (
+                    isinstance(raw_mtp_depth, bool) or
+                    not isinstance(raw_mtp_depth, int) or raw_mtp_depth < 0)) or
+                (mtp_draft_depth is not None and raw_mtp_depth != mtp_draft_depth)):
+            self.process.kill()
+            raise WorkerError("CUDA worker did not confirm the MTP execution policy")
+        self.mtp_draft_depth = raw_mtp_depth if self.protocol >= 13 else None
         self.retain_previous_route = bool(
             response.get("retain_previous_route", True)
         )
@@ -1354,7 +1370,8 @@ class Application:
                                  args.worker_active_expert_devices,
                                  args.worker_active_expert_device_cache_gib,
                                  args.worker_active_expert_host_cache_gib,
-                                 args.worker_routed_vram_policy)
+                                 args.worker_routed_vram_policy,
+                                 getattr(args, "worker_mtp_draft_depth", None))
         self.vision_capability = (
             "vision.patch-transformer-merge.fp4-block32.v1"
         )
@@ -3816,6 +3833,7 @@ class Application:
                 "mtp_resource_available": self.worker.mtp_resource_available,
                 "mtp_runtime_ready": self.worker.mtp_runtime_ready,
                 "mtp_enabled": self.worker.mtp_enabled,
+                "mtp_draft_depth": getattr(self.worker, "mtp_draft_depth", None),
                 "retain_previous_route": self.worker.retain_previous_route,
                 "cpu_hybrid_enabled": self.worker.cpu_hybrid_enabled,
                 "response_protocol": self.response_protocol,
@@ -4921,6 +4939,10 @@ def parse_args() -> argparse.Namespace:
         "--placement-profile", choices=("latency", "balanced", "capacity"),
         default="balanced",
     )
+    parser.add_argument(
+        "--worker-mtp-draft-depth", type=int, default=None,
+        help="MTP proposal limit (omitted uses the artifact policy)",
+    )
     parser.add_argument("--worker-kv-cache-mib", type=int, default=2048)
     parser.add_argument("--worker-kv-page-tokens", type=int, default=256)
     parser.add_argument(
@@ -4997,6 +5019,8 @@ def main() -> int:
         args.worker_active_expert_host_cache_gib < 0 or
         args.worker_kv_cache_mib < 1 or args.worker_kv_page_tokens < 1 or
         args.worker_prefill_chunk_tokens < 0 or
+        (args.worker_mtp_draft_depth is not None and
+         not 0 < args.worker_mtp_draft_depth < 2**32 - 1) or
         (args.worker_placement_settle_steps is not None and
          args.worker_placement_settle_steps < 0) or
         args.session_idle_seconds < 0 or args.session_cache_bytes < 0 or

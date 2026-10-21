@@ -42,6 +42,8 @@ struct WorkerLaunchOptions final {
   // Provider extensions are deliberately opaque to the common parser. A new
   // execution provider can add an option without changing this contract.
   std::map<std::string, std::optional<std::string>, std::less<>> extensions;
+  // Omitted retains the authenticated artifact's proposal policy.
+  std::optional<std::uint32_t> mtp_draft_depth;
 };
 
 struct WorkerLaunchOptionsResult final {

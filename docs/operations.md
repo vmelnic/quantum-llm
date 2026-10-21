@@ -1,6 +1,23 @@
 # Operations
 
-Status: current operator runbook, 2026-09-27.
+Status: current operator runbook, 2026-10-21.
+
+## Select the serving backend
+
+This runbook's health/session/worker contracts describe the artifact VM
+controlled by `ops/model.sh`. Independent llama.cpp and Strata instances use
+their own launchers, scheduled tasks and API ports on the same RTX 3090:
+
+| Backend | Status | Lifecycle and API guide |
+|---|---|---|
+| Artifact VM / QPack | `./ops/model.sh status` | sections below |
+| llama.cpp | `./ops/llama.sh status` | [llama.cpp CLI](llama-cli.md) |
+| Strata | `./ops/strata.sh status swift` | [Strata CLI](strata-cli.md) |
+
+Stop the active backend with its own controller before starting another.
+`model.sh stop all` does not stop the independent Strata or llama.cpp tasks.
+The Strata home Pi configuration and measured larger-prompt request are
+linked from [Pi CLI](pi-cli.md#strata-through-pi).
 
 ## Health
 
@@ -76,6 +93,32 @@ slot still executes one batch at a time.
 
 After a header, provider ABI, wire ABI or launch-structure change, reproduce a
 native failure once on the canonical clean build before editing model logic.
+
+## MTP proposal policy
+
+`MODEL_MTP_DRAFT_DEPTH` is an optional positive integer in `.env` for a
+QPack artifact that declares adjustable sampled MTP. Blank or absent keeps
+the authenticated artifact default (four for the current Qwen QPack).
+The deployed local configuration selects `MODEL_MTP_DRAFT_DEPTH=6` for the
+next manual Qwen start; the example environment has the same value.
+A command-specific environment override takes precedence over the file value.
+The file default applies only to artifacts declaring adjustable sampled MTP;
+non-MTP artifacts omit the worker override and report the ignored default.
+An explicit invocation override on an unsupported artifact fails validation.
+The same limit reaches the worker, effective compiled program and provider
+checkpoint/workspace allocation. Explicit unsupported overrides or values
+exceeding the selected provider's workspace/context fail startup; there is no silent
+clamp or speculative fallback. Larger limits have no guaranteed speed benefit.
+Restart validates the selected artifact and policy before stopping the service.
+
+`MODEL_VM_RUNNER` can select a separately built Windows Release/CUDA
+executable for a deployment that preserves a live binary. An empty value
+retains the canonical runner path. Changing either variable takes effect
+at the next service start; it does not alter an active request.
+
+The requested MTP-policy deployment is built without tests or model probes,
+as explicitly instructed by the user. Startup, native numerical behavior,
+real chat/tool transport and coding speed remain unrun for this build.
 
 ## Cleanup
 

@@ -2100,6 +2100,7 @@ class ContinuousDecodeBatcherTests(unittest.TestCase):
             "mtp_resource_available": True,
             "mtp_runtime_ready": True,
             "mtp_enabled": False,
+            "mtp_draft_depth": None,
             "retain_previous_route": True,
             "cpu_hybrid_enabled": True,
             "response_protocol": None,

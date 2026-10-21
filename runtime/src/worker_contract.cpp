@@ -112,6 +112,8 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
     if (const auto found = raw.find("kv-cache-dtype"); found != raw.end())
       options.kv_cache_dtype = required_value(raw, "kv-cache-dtype");
     options.placement_profile = required_value(raw, "placement-profile");
+    if (raw.contains("mtp-draft-depth"))
+      options.mtp_draft_depth = u32(required_value(raw, "mtp-draft-depth"));
     if (options.ram_cache_gib == 0U || options.vram_cache_gib == 0U ||
         options.kv_cache_mib == 0U ||
         (options.routed_vram_policy != "fixed" &&
@@ -165,7 +167,7 @@ WorkerLaunchOptionsResult parse_worker_launch_options(
         "max-context",          "ram-cache-gib",
         "vram-cache-gib",      "routed-vram-policy", "capacity",
         "kv-cache-mib",        "kv-page-tokens",
-        "kv-cache-dtype",
+        "kv-cache-dtype", "mtp-draft-depth",
         "placement-profile",   "prefill-chunk-limit",
         "placement-settle-steps", "profile-gpu-phases",
         "active-expert-devices", "active-expert-device-cache-gib",

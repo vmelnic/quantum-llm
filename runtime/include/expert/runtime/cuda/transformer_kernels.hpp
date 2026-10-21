@@ -192,6 +192,8 @@ struct Nvfp4Block16Matrix final {
 // Exact compressed-latent attention organ. Each page retains BF16
 // [kv_rank + rope_dim] values per token/layer. Algebraic absorption of the
 // BF16 up-projection avoids materializing full K/V in the cache.
+inline constexpr std::uint32_t kMlaContextSplitTokens = 1024U;
+inline constexpr std::uint32_t kMlaContextSplitMaximumRows = 8U;
 struct MlaCausalLaunch final {
   float* query{};                 // [rows, heads, nope_dim + rope_dim]
   float* latent{};                // [rows, kv_rank + rope_dim]
@@ -199,9 +201,13 @@ struct MlaCausalLaunch final {
   const void* const* page_table{};
   float* output{};                // [rows, heads, value_dim]
   float* latent_query{};          // [rows, heads, kv_rank]
-  float* partial_maxima{};        // [heads]
-  float* partial_sums{};          // [heads]
-  float* partial_outputs{};       // [heads, kv_rank]
+  // Optional dedicated split workspace; either all three or none. With
+  // S=ceil((first_position+rows)/kMlaContextSplitTokens), allocate rows*heads*S
+  // maxima/sums and rows*heads*S*kv_rank outputs for up to MaximumRows.
+  // Larger batches and prefixes below 4096 do not use this workspace.
+  float* partial_maxima{};
+  float* partial_sums{};
+  float* partial_outputs{};
   std::uint32_t layer{};
   std::uint32_t page_tokens{};
   std::uint32_t first_position{};

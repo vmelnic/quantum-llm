@@ -125,6 +125,22 @@ cp .env.example .env
 not included in this repository. Follow [Getting started](docs/getting-started.md)
 before compiling or publishing an artifact.
 
+The user-authorized [llama.cpp](docs/llama-cli.md) and
+[Strata](docs/strata-cli.md) services have independent controllers on the
+same 3090. For the installed Strata Swift Flash-Next GGUF:
+
+```bash
+./ops/strata.sh start swift
+pi --model strata-3090/swift-flash-next-iq3-s --thinking xhigh
+./ops/strata.sh stop swift
+```
+
+Pi uses the model registry and settings in `~/.pi/agent/`; the project `.pi`
+directory is intentionally absent. See [Pi CLI](docs/pi-cli.md) for model
+selection and [the actual Strata Pi test](docs/benchmarks.md#actual-pi-request-with-embedded-code-2026-10-21)
+for generation speed, reasoning latency and memory. Stop the active backend
+before starting a different service on the 3090.
+
 ## Repository map
 
 | Path | Responsibility |

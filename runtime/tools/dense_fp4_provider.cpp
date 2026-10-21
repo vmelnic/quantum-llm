@@ -80,7 +80,6 @@ constexpr std::uint32_t kDefaultWorkspaceRows = 512U;
 constexpr std::uint32_t kMaximumWorkspaceRows = 1024U;
 constexpr std::uint32_t kMaximumVisionPatches = 4096U;
 constexpr std::uint32_t kMaximumGpuSamplingTopK = 64U;
-constexpr std::uint32_t kMaximumExactDecodeRows = 5U;
 constexpr std::uint32_t kAttentionSplitTokens = 512U;
 constexpr std::uint32_t kStagedPrefillSplitTokens = 8192U;
 
@@ -1786,7 +1785,7 @@ class Fp4RoutedExperts final {
         found->output_slots.push_back(alternate_slots[selection]);
       }
 
-      const auto grouped_prefill = rows > 8U && !native_nvfp4_;
+      const auto grouped_prefill = rows > 8U;
       std::vector<ec::MoeGroupedSelectionWork> grouped_work;
       std::size_t grouped_work_count{};
       std::uint64_t grouped_selection_count{};
@@ -2073,8 +2072,8 @@ class Fp4RoutedExperts final {
           quantized_intermediate_scales, rows, component_.hidden_size,
           component_.intermediate_size, component_.route_width,
           component_.experts_per_layer, execution_stream_,
-          directory_->device_entries(), layer, 0.0F, false,
-          true, false, nvfp4_gate_input, nvfp4_up_input, nvfp4_down_input,
+          directory_->device_entries(), layer, 0.0F, native_nvfp4_,
+          !native_nvfp4_, native_nvfp4_, nvfp4_gate_input, nvfp4_up_input, nvfp4_down_input,
           device_grouped_work_, grouped_work_items, true}));
       return;
     }
@@ -2461,7 +2460,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
         mtp_q8_kv_ =
             parameter_u32(exact.parameters, "mtp_kv_encoding") == 1U;
         if (parameter_u32(exact.parameters, "source_mtp_layers") != 1U ||
-            draft_depth_ < 3U || draft_depth_ > 4U ||
+            draft_depth_ == 0U || draft_depth_ >= kMaximumWorkspaceRows ||
+            exact.maximum_emitted_tokens != draft_depth_ + 1U ||
             draft_vocabulary_size_ == 0U ||
             draft_vocabulary_size_ > vocabulary_size_ || !mtp_q8_kv_)
           throw std::runtime_error(
@@ -2661,6 +2661,15 @@ class DenseFp4Provider final : public er::IOperationProvider {
         (compact_flash_prefill_ || large_exact_prefill_workspace_)
             ? kMaximumWorkspaceRows
             : kDefaultWorkspaceRows;
+    if (descriptor_.exact_decode_program)
+      exact_decode_rows_ = descriptor_.exact_decode_program->maximum_emitted_tokens;
+    if (exact_decode_rows_ > workspace_rows_)
+      throw std::runtime_error("MTP verifier exceeds the provider workspace rows");
+    const auto queries_per_kv_head =
+        std::max(1U, query_heads_ / std::max(1U, kv_heads_));
+    attention_scratch_rows_ = std::max(
+        exact_decode_rows_, std::min(workspace_rows_, 32U / queries_per_kv_head));
+    accepted_depth_calls_.resize(exact_decode_rows_);
     if (qsa_enabled_ && !device_resident_fp16_kv_ && !qsa_tiered_)
       throw std::runtime_error(
           "latency-profile QSA requires exact FP16 KV and index to fit in VRAM");
@@ -3116,11 +3125,6 @@ class DenseFp4Provider final : public er::IOperationProvider {
             {"provider_exact_calls", exact_calls_},
             {"provider_exact_target_batches", exact_target_batches_},
             {"provider_accepted_drafts", accepted_drafts_},
-            {"provider_accepted_depth_0", accepted_depth_calls_[0]},
-            {"provider_accepted_depth_1", accepted_depth_calls_[1]},
-            {"provider_accepted_depth_2", accepted_depth_calls_[2]},
-            {"provider_accepted_depth_3", accepted_depth_calls_[3]},
-            {"provider_accepted_depth_4", accepted_depth_calls_[4]},
             {"provider_speculative_recurrent_checkpoint_bytes",
              speculative_recurrent_checkpoint_bytes_},
             {"provider_speculative_recurrent_restores",
@@ -3248,6 +3252,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
                  })) * host_fp16_target_page_bytes_},
             {"kv_allocated_pages", resident_pages},
             {"kv_physical_pages", all_kv_pages_.size()}};
+    for (std::size_t depth = 0U; depth < accepted_depth_calls_.size(); ++depth)
+      result.emplace("provider_accepted_depth_" + std::to_string(depth),
+                     accepted_depth_calls_[depth]);
     if (routed_experts_) {
       const auto cache = routed_experts_->telemetry();
       const auto hybrid = routed_experts_->hybrid_telemetry();
@@ -4016,6 +4023,8 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint32_t mtp_layers_{};
   std::uint32_t exact_decode_abi_{};
   std::uint32_t draft_depth_{};
+  std::uint32_t exact_decode_rows_{2U};
+  std::uint32_t attention_scratch_rows_{};
   std::uint32_t draft_vocabulary_size_{};
   bool mtp_q8_kv_{};
   std::uint32_t target_full_layers_{};
@@ -4094,7 +4103,7 @@ class DenseFp4Provider final : public er::IOperationProvider {
   std::uint64_t exact_calls_{};
   std::uint64_t exact_target_batches_{};
   std::uint64_t accepted_drafts_{};
-  std::array<std::uint64_t, kMaximumExactDecodeRows> accepted_depth_calls_{};
+  std::vector<std::uint64_t> accepted_depth_calls_;
   std::uint64_t speculative_recurrent_checkpoint_bytes_{};
   std::uint64_t speculative_recurrent_restores_{};
   std::uint64_t fused_multiquery_attention_calls_{};
@@ -4182,6 +4191,9 @@ class DenseFp4Provider final : public er::IOperationProvider {
   float* mla_query_rank_{};
   float* mla_latent_{};
   float* mla_latent_query_{};
+  float* mla_partial_maxima_{};
+  float* mla_partial_sums_{};
+  float* mla_partial_outputs_{};
   float* key_{};
   float* value_{};
   float* attention_{};
@@ -5050,10 +5062,10 @@ void DenseFp4Provider::allocate_workspace() {
       target_kv_encoding_ == TargetKvEncoding::q4_per_head ||
       target_kv_encoding_ == TargetKvEncoding::q5_q4_bfp) {
     attention_q8_queries_ = device_allocate<std::int8_t>(
-        allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
+        allocations_, static_cast<std::size_t>(attention_scratch_rows_) *
                           query_heads_ * head_dim_);
     attention_query_scales_ = device_allocate<float>(
-        allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
+        allocations_, static_cast<std::size_t>(attention_scratch_rows_) *
                           query_heads_);
   }
   if (mla_enabled_) {
@@ -5066,6 +5078,16 @@ void DenseFp4Provider::allocate_workspace() {
     mla_latent_query_ = device_allocate<float>(
         allocations_, static_cast<std::size_t>(workspace_rows_) *
                           query_heads_ * kv_lora_rank_);
+    const auto splits = (static_cast<std::uint64_t>(max_context_) +
+                        ec::kMlaContextSplitTokens - 1U) /
+                       ec::kMlaContextSplitTokens;
+    const auto partials = static_cast<std::size_t>(
+        std::min(workspace_rows_, ec::kMlaContextSplitMaximumRows)) *
+        query_heads_ * splits;
+    mla_partial_maxima_ = device_allocate<float>(allocations_, partials);
+    mla_partial_sums_ = device_allocate<float>(allocations_, partials);
+    mla_partial_outputs_ = device_allocate<float>(
+        allocations_, partials * kv_lora_rank_);
   }
   key_ = device_allocate<float>(allocations_, workspace_rows_ * key_value_width);
   value_ = device_allocate<float>(allocations_, workspace_rows_ * key_value_width);
@@ -5197,66 +5219,77 @@ void DenseFp4Provider::allocate_workspace() {
   staged_dense_input_ = device_allocate<std::uint16_t>(
       allocations_, staged_dense_input_capacity_bytes_ /
                         sizeof(std::uint16_t));
-  attention_maximum_splits_ =
-      (max_context_ + kAttentionSplitTokens - 1U) / kAttentionSplitTokens;
-  const auto attention_state_rows =
-      std::max<std::uint64_t>(
-          workspace_rows_,
-          static_cast<std::uint64_t>(kMaximumExactDecodeRows) *
-              attention_maximum_splits_);
-  partial_maxima_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_state_rows) *
-                        query_heads_);
-  partial_sums_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(attention_state_rows) *
-                        query_heads_);
-  partial_outputs_ = device_allocate<float>(
-      allocations_, static_cast<std::size_t>(kMaximumExactDecodeRows) *
-                        attention_maximum_splits_ * query_heads_ * head_dim_);
-  staged_split_tokens_ = std::min(kStagedPrefillSplitTokens, max_context_);
-  const auto staged_query_values =
-      static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
-  const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
-                                staged_split_tokens_ * head_dim_;
-  const auto full_score_values =
-      static_cast<std::size_t>(workspace_rows_) * query_heads_ *
-      staged_split_tokens_;
-  staged_score_capacity_values_ = compact_flash_prefill_
-      ? staged_query_values
-      : full_score_values;
-  // The paged FlashAttention path does not materialize probabilities, but the
-  // common workspace contract requires a non-null pointer for fail-closed
-  // validation. Exact-F16 and unsupported geometries retain the full arena.
-  staged_probability_capacity_values_ = compact_flash_prefill_
-      ? 1U
-      : full_score_values;
-  staged_queries_ =
-      device_allocate<std::uint16_t>(allocations_, staged_query_values);
-  if (exact_fp16_kv()) {
-    staged_raw_keys_ =
-        device_allocate<std::uint16_t>(allocations_, staged_kv_values);
-    staged_raw_values_ =
-        device_allocate<std::uint16_t>(allocations_, staged_kv_values);
-    if (host_authoritative_fp16_kv()) {
-      const auto staged_layer_values = static_cast<std::size_t>(max_context_) *
-                                       kv_heads_ * head_dim_;
-      staged_device_keys_ =
-          device_allocate<std::uint16_t>(allocations_, staged_layer_values);
-      staged_device_values_ =
-          device_allocate<std::uint16_t>(allocations_, staged_layer_values);
+  // Compressed MLA consumes its latent cache directly. Allocate standard
+  // attention arenas only when another declared attention operation needs
+  // them; mixed operation sets must retain their original workspaces.
+  const auto needs_standard_attention_workspace = !mla_enabled_ ||
+      std::any_of(descriptor_.operation_program.begin(),
+                  descriptor_.operation_program.end(), [](const auto& operation) {
+        return kernel_from_capability(operation.capability) == Kernel::full_attention &&
+               operation.capability != "block.mla.causal.latent-kv.bfloat16.v1";
+      });
+  if (needs_standard_attention_workspace) {
+    attention_maximum_splits_ =
+        (max_context_ + kAttentionSplitTokens - 1U) / kAttentionSplitTokens;
+    const auto attention_state_rows =
+        std::max<std::uint64_t>(
+            workspace_rows_,
+            static_cast<std::uint64_t>(attention_scratch_rows_) *
+                attention_maximum_splits_);
+    partial_maxima_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(attention_state_rows) *
+                          query_heads_);
+    partial_sums_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(attention_state_rows) *
+                          query_heads_);
+    partial_outputs_ = device_allocate<float>(
+        allocations_, static_cast<std::size_t>(attention_scratch_rows_) *
+                          attention_maximum_splits_ * query_heads_ * head_dim_);
+    staged_split_tokens_ = std::min(kStagedPrefillSplitTokens, max_context_);
+    const auto staged_query_values =
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ * head_dim_;
+    const auto staged_kv_values = static_cast<std::size_t>(kv_heads_) *
+                                  staged_split_tokens_ * head_dim_;
+    const auto full_score_values =
+        static_cast<std::size_t>(workspace_rows_) * query_heads_ *
+        staged_split_tokens_;
+    staged_score_capacity_values_ = compact_flash_prefill_
+        ? staged_query_values
+        : full_score_values;
+    // The paged FlashAttention path does not materialize probabilities, but the
+    // common workspace contract requires a non-null pointer for fail-closed
+    // validation. Exact-F16 and unsupported geometries retain the full arena.
+    staged_probability_capacity_values_ = compact_flash_prefill_
+        ? 1U
+        : full_score_values;
+    staged_queries_ =
+        device_allocate<std::uint16_t>(allocations_, staged_query_values);
+    if (exact_fp16_kv()) {
+      staged_raw_keys_ =
+          device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+      staged_raw_values_ =
+          device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+      if (host_authoritative_fp16_kv()) {
+        const auto staged_layer_values = static_cast<std::size_t>(max_context_) *
+                                         kv_heads_ * head_dim_;
+        staged_device_keys_ =
+            device_allocate<std::uint16_t>(allocations_, staged_layer_values);
+        staged_device_values_ =
+            device_allocate<std::uint16_t>(allocations_, staged_layer_values);
+      }
     }
+    staged_keys_ =
+        device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+    staged_values_ =
+        device_allocate<std::uint16_t>(allocations_, staged_kv_values);
+    staged_scores_ =
+        device_allocate<float>(allocations_, staged_score_capacity_values_);
+    staged_probabilities_ =
+        device_allocate<std::uint16_t>(
+            allocations_, staged_probability_capacity_values_);
+    staged_accumulator_ =
+        device_allocate<float>(allocations_, staged_query_values);
   }
-  staged_keys_ =
-      device_allocate<std::uint16_t>(allocations_, staged_kv_values);
-  staged_values_ =
-      device_allocate<std::uint16_t>(allocations_, staged_kv_values);
-  staged_scores_ =
-      device_allocate<float>(allocations_, staged_score_capacity_values_);
-  staged_probabilities_ =
-      device_allocate<std::uint16_t>(
-          allocations_, staged_probability_capacity_values_);
-  staged_accumulator_ =
-      device_allocate<float>(allocations_, staged_query_values);
   mtp_embedding_ =
       device_allocate<float>(allocations_, workspace_rows_ * hidden_size_);
   mtp_embedding_norm_ =
@@ -5302,10 +5335,10 @@ void DenseFp4Provider::allocate_state() {
         device_allocate<float>(allocations_, capacity_ * matrix_values);
     recurrent_conv_speculative_checkpoint_[layer] = device_allocate<float>(
         allocations_, static_cast<std::size_t>(capacity_) *
-                          kMaximumExactDecodeRows * conv_values);
+                          exact_decode_rows_ * conv_values);
     recurrent_matrix_speculative_checkpoint_[layer] = device_allocate<float>(
         allocations_, static_cast<std::size_t>(capacity_) *
-                          kMaximumExactDecodeRows * matrix_values);
+                          exact_decode_rows_ * matrix_values);
     recurrent_conv_retention_checkpoint_[layer] =
         device_allocate<float>(allocations_, capacity_ * conv_values);
     recurrent_matrix_retention_checkpoint_[layer] =
@@ -6927,8 +6960,8 @@ void DenseFp4Provider::run_full_attention(
     }
     status_check(ec::mla_causal_latent_bf16({
         query_gate_, mla_latent_, binding(operation, "kv_b").bf16,
-        page_table, attention_, mla_latent_query_, partial_maxima_,
-        partial_sums_, partial_outputs_, full_attention_slot, kv_page_tokens_,
+        page_table, attention_, mla_latent_query_, mla_partial_maxima_,
+        mla_partial_sums_, mla_partial_outputs_, full_attention_slot, kv_page_tokens_,
         cache_positions.front(), rows, query_heads_, kv_lora_rank_,
         qk_nope_head_dim_, qk_rope_head_dim_, v_head_dim_,
         mla_attention_scale_, rope_theta_, rope_factor_, rope_beta_fast_,
@@ -8021,13 +8054,13 @@ void DenseFp4Provider::run_recurrent_attention(
     auto* conv_checkpoints = checkpoint_every_row
         ? recurrent_conv_speculative_checkpoint_.at(
               operation.recurrent_slot) +
-              static_cast<std::size_t>(slot) * kMaximumExactDecodeRows *
+              static_cast<std::size_t>(slot) * exact_decode_rows_ *
                   conv_state_values
         : nullptr;
     auto* matrix_checkpoints = checkpoint_every_row
         ? recurrent_matrix_speculative_checkpoint_.at(
               operation.recurrent_slot) +
-              static_cast<std::size_t>(slot) * kMaximumExactDecodeRows *
+              static_cast<std::size_t>(slot) * exact_decode_rows_ *
                   matrix_state_values
         : nullptr;
     status_check(ec::split_gated_delta_prefill({
@@ -8622,7 +8655,7 @@ void DenseFp4Provider::restore_recurrent_checkpoint(std::uint32_t slot) {
 
 void DenseFp4Provider::restore_speculative_recurrent_checkpoint(
     std::uint32_t slot, std::uint32_t row) {
-  if (slot >= capacity_ || row >= kMaximumExactDecodeRows)
+  if (slot >= capacity_ || row >= exact_decode_rows_)
     throw std::runtime_error("invalid speculative recurrent checkpoint");
   ++speculative_recurrent_restores_;
   const auto conv_values = recurrent_conv_values_;
@@ -8632,13 +8665,13 @@ void DenseFp4Provider::restore_speculative_recurrent_checkpoint(
                    recurrent_conv(layer, slot),
                    recurrent_conv_speculative_checkpoint_[layer] +
                        (static_cast<std::size_t>(slot) *
-                            kMaximumExactDecodeRows +
+                            exact_decode_rows_ +
                         row) * conv_values,
                    conv_values * sizeof(float), cudaMemcpyDeviceToDevice),
                "restore speculative recurrent convolution state");
     status_check(ec::restore_split_gated_delta_recurrent_checkpoint(
         recurrent_matrix_speculative_checkpoint_[layer] +
-            (static_cast<std::size_t>(slot) * kMaximumExactDecodeRows + row) *
+            (static_cast<std::size_t>(slot) * exact_decode_rows_ + row) *
                 matrix_values,
         recurrent_matrix(layer, slot), value_heads_, key_head_dim_,
         value_head_dim_, nullptr));
@@ -11124,7 +11157,7 @@ er::ExactDecodeExecutionHandle DenseFp4Provider::execute_exact_decode(
       if (state->draft_predictions.empty() ||
           state->draft_predictions.size() > draft_depth_ ||
           state->draft_predictions.size() + 1U >
-              kMaximumExactDecodeRows ||
+              exact_decode_rows_ ||
           invocation.position + state->draft_predictions.size() >=
               invocation.context_limit)
         throw std::runtime_error("multi-draft MTP state is invalid");
@@ -11375,7 +11408,8 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     bool profile_gpu_phases, bool discover_active_expert_devices,
     std::vector<int> active_expert_devices,
     std::uint64_t active_expert_device_cache_bytes,
-    std::uint64_t active_expert_host_cache_bytes) {
+    std::uint64_t active_expert_host_cache_bytes,
+    std::uint32_t mtp_draft_depth) {
   try {
     if (discover_active_expert_devices)
       active_expert_devices = ec::discover_active_expert_devices();
@@ -11386,6 +11420,10 @@ er::CreateExecutionProviderModuleResult make_sm86_dense_fp4_callable_provider(
     auto artifact = std::make_shared<er::ModelArtifact>();
     auto status = er::ModelArtifact::load(artifact_root, *artifact);
     if (!status.ok()) return {status, {}};
+    if (mtp_draft_depth != 0U) {
+      status = artifact->configure_mtp_draft_depth(mtp_draft_depth);
+      if (!status.ok()) return {status, {}};
+    }
     auto tensor_store = std::make_shared<er::MappedModelTensorStore>();
     status = er::MappedModelTensorStore::create(*artifact, *tensor_store);
     if (!status.ok()) return {status, {}};

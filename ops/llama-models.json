@@ -1,0 +1,105 @@
+{
+  "schema": "llama-models-v1",
+  "models": [
+    {
+      "aliases": [
+        "swift",
+        "swith",
+        "swift-1.5-iq3-xxs"
+      ],
+      "model_id": "swift-1.5-iq3-xxs",
+      "name": "Swift 1.5 GSQ-RCO IQ3_XXS",
+      "artifact": "swift-1.5-iq3-xxs-mtp10",
+      "repository": "ukisai/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF",
+      "revision": "d74895bbe5db4bec1e0024e7cc87d59c02d7631a",
+      "file": "Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf",
+      "bytes": 10442827776,
+      "sha256": "e23eb251493b8a89f7d0217590b593e696ac9bacaeac8605541e477533dc5838",
+      "context": 262144,
+      "max_output": 32768,
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0",
+      "speculative": {
+        "type": "draft-mtp",
+        "max_tokens": 10,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0"
+      }
+    },
+    {
+      "aliases": [
+        "kat",
+        "kat-coder-v2.5-iq4-xs"
+      ],
+      "model_id": "kat-coder-v2.5-iq4-xs",
+      "name": "KAT-Coder-V2.5-Dev IQ4_XS + Qwen3.6 MTP",
+      "artifact": "kat-coder-v2.5-iq4-xs-mtp4",
+      "repository": "thread13/Kwaipilot_KAT-Coder-V2.5-Dev-GGUF-MTP",
+      "revision": "b2c680bf22e192eae1fc30e6060cac77dd144a91",
+      "file": "Kwaipilot_KAT-Coder-V2.5-Dev-IQ4_XS.bartowski.mtp.gguf",
+      "bytes": 19704404096,
+      "sha256": "5037eb2b43466696aa5e3e918f4bfb8d12b6d3a769a28a36ceb84c9289a195a9",
+      "context": 262144,
+      "max_output": 32768,
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0",
+      "speculative": {
+        "type": "draft-mtp",
+        "max_tokens": 4,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0"
+      }
+    },
+    {
+      "aliases": [
+        "swift-heretic"
+      ],
+      "model_id": "swift-heretic",
+      "name": "Swift 1.5 Heretic IQ4_XS",
+      "artifact": "swift-heretic-iq4-xs-mtp10-vision-cpu",
+      "repository": "mradermacher/Swift-1.5-Qwen3.8-27b-heretic-i1-GGUF",
+      "revision": "45c709974da7cdcb04ea580c7edf55a1804d1953",
+      "file": "Swift-1.5-Qwen3.8-27b-heretic.i1-IQ4_XS.gguf",
+      "bytes": 15309040416,
+      "sha256": "73f61a912ec30961161ab96083b95866eed7298448ddf1f53512e1711d6e2c2f",
+      "context": 262144,
+      "max_output": 32768,
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0",
+      "speculative": {
+        "type": "draft-mtp",
+        "max_tokens": 10,
+        "cache_type_k": "q8_0",
+        "cache_type_v": "q8_0"
+      },
+      "projector": {
+        "repository": "mradermacher/Swift-1.5-Qwen3.8-27b-heretic-GGUF",
+        "revision": "19cb94a114abdd6c8fba7669e4743fb1f25d2fd0",
+        "file": "Swift-1.5-Qwen3.8-27b-heretic.mmproj-Q8_0.gguf",
+        "bytes": 629247712,
+        "sha256": "7cd1484ca1b93b8d5d27aa0b8965a657389060565f16e08612ee4c253912eb88",
+        "offload": false
+      }
+    },
+    {
+      "aliases": [
+        "gpt-oss",
+        "gpt-oss-20b",
+        "gpt-oss-20b-mxfp4"
+      ],
+      "model_id": "gpt-oss-20b-mxfp4",
+      "name": "GPT-OSS-20B MXFP4",
+      "artifact": "gpt-oss-20b-mxfp4",
+      "repository": "ggml-org/gpt-oss-20b-GGUF",
+      "revision": "ef9b12f2ff56c69cf32153a02784e7a3c88bf524",
+      "file": "gpt-oss-20b-MXFP4.gguf",
+      "bytes": 12109566624,
+      "sha256": "27cd6c432c7672cb812a92f611cf3ba7bbc35928262bb1e1253ff4ee6ae35901",
+      "context": 131072,
+      "max_output": 32768,
+      "cache_type_k": "f16",
+      "cache_type_v": "f16",
+      "reasoning_effort": "high"
+    }
+  ]
+}

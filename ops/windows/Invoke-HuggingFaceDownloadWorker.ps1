@@ -26,6 +26,10 @@ try {
     $env:HF_HOME = [System.IO.Path]::GetFullPath($HfHome)
     $env:HF_HUB_CACHE = Join-Path $env:HF_HOME 'hub'
     $env:HF_XET_CACHE = Join-Path $env:HF_HOME 'xet'
+    # Limited Windows tasks may lack symlink privileges. Force the supported
+    # copy/move cache mode for this worker instead of relying on a concurrent
+    # symlink capability probe. Xet transport remains enabled.
+    $env:HF_HUB_DISABLE_SYMLINKS = '1'
     # huggingface_hub uses hf_xet automatically when the package is installed.
     # Xet remains enabled in both modes. This flag controls whether Xet may
     # maximize internal CPU, network, buffer, and range-request concurrency.

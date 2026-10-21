@@ -1,30 +1,59 @@
 # Pi CLI
 
-Status: maintained coding harness, 2026-09-27.
+Status: maintained coding harness, 2026-10-21.
 
 ## Configuration
 
-Repository `.pi/settings.json` selects:
+Pi configuration lives in the user's home:
 
-- provider `quantum-llm`;
-- model `qwen3.8-27b-fp4`;
-- thinking level `xhigh`;
-- automatic retries disabled;
-- compaction enabled with 32,768 recent tokens and an 8,192-token reserve.
+- `~/.pi/agent/models.json`: provider endpoints, credentials and model metadata;
+- `~/.pi/agent/settings.json`: defaults, enabled models, thinking and compaction.
 
-The enabled catalog contains six model IDs:
+The project `.pi` directory has been removed. It is intentionally absent;
+repository documentation and launch commands use the home configuration.
 
-- `qwen3.8-27b-fp4`;
-- `qwen3.8-27b-abliterated-fp4`;
-- `qwen3.8-flash-next-fp4`;
-- `mistral-small-4-119b-nvfp4`;
-- `muse-glimmer-30b-fp4`;
-- `ornith-1.5-35b-a3b-fp4`.
+The home default remains `llama-3090/swift-1.5-iq3-xxs`, with xhigh
+reasoning. Automatic retries are disabled. Compaction keeps 32768 recent
+tokens and reserves 26214 tokens. Select Strata explicitly for the active
+Strata service; starting a server does not change Pi's saved default.
 
-The provider base URL and secret live in Pi's user-local model registry. Git
-contains no credential.
+| Local 3090 backend | Pi provider | Model selection | Serving operations |
+|---|---|---|---|
+| Artifact VM / QPack | `quantum-llm` | artifact model ID | `ops/model.sh`, `ops/pi.sh` |
+| llama.cpp | `llama-3090` | `swift-1.5-iq3-xxs`, `swift-heretic`, `kat-coder-v2.5-iq4-xs`, `gpt-oss-20b-mxfp4` | [llama.cpp CLI](llama-cli.md) |
+| Strata | `strata-3090` | `swift-flash-next-iq3-s` | [Strata CLI](strata-cli.md) |
 
-## Launch
+The backends have separate serving processes. Use one active model on the
+3090 and stop it through its own backend before switching to another backend.
+
+## Strata through Pi
+
+The independent Strata service is registered in the user's
+`~/.pi/agent/models.json` as provider `strata-3090`, base URL
+`http://10.10.88.4:8082/v1`, model `swift-flash-next-iq3-s`. User
+`settings.json` enables `strata-3090/swift-flash-next-iq3-s:xhigh` for model
+selection. It advertises 262144 context positions, 32768 maximum output tokens,
+text input and native xhigh reasoning. Authentication uses the existing local
+service key, stored only in private user configuration. Configuration backups
+are under ignored `out/strata-20261021/pi-config-backups/`.
+
+```bash
+./ops/strata.sh start swift
+pi --provider strata-3090 --model swift-flash-next-iq3-s --thinking xhigh
+```
+
+In an existing Pi client, open `/model` and select
+`strata-3090/swift-flash-next-iq3-s`. The model registry reloads when the
+picker opens. The enabled-model entry also makes it available in model cycling.
+
+The [actual Pi measurement](benchmarks.md#actual-pi-request-with-embedded-code-2026-10-21)
+records a larger embedded-code prompt, engine generation rate, prefill,
+reasoning/visible latency, memory and test limits. Completion throughput
+includes thinking; Pi's reported zero reasoning-token count is not a valid
+breakdown. This was a single coding-generation response with tools disabled,
+not a coding correctness or multi-turn tool benchmark.
+
+## Artifact VM through Pi
 
 ```bash
 ./ops/model.sh start qwen
@@ -52,7 +81,7 @@ Minimal wiring check:
 Pi still supplies its own base instructions. The provider's populated prompt
 count is the authoritative context measurement.
 
-## Thinking and sampling
+## Artifact VM thinking and sampling
 
 Artifacts own sampling defaults. The operational Qwen profiles are:
 
@@ -73,9 +102,13 @@ benchmark result.
 
 ## Context and sessions
 
-The service allocates KV for populated positions. Pi's context window,
-compaction reserve and per-turn output limit are separate values. Several Pi
-processes may queue and compatible sessions may retain exact prefixes, but the
+Pi's context window, compaction reserve and per-turn output limit are
+separate values. Strata advertises 262144 context positions and 32768 maximum
+output tokens; the larger-prompt Pi test does not qualify a populated262K
+conversation. KV placement and session reuse depend on the selected backend.
+
+The artifact VM allocates KV for populated positions. Several Pi processes
+may queue and compatible sessions may retain exact prefixes, but the VM
 service has one hot execution slot.
 
 Qwen persistence can restore a matching provider state after a service restart.

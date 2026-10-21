@@ -2224,6 +2224,163 @@ __global__ void mla_attention_kernel(
   }
 }
 
+// Each warp scores one position. Reuse its latent values for the value sum,
+// and update online softmax once per tile rather than once per position.
+// The cache ABI and the complete causal support remain unchanged.
+__global__ void mla_attention_tiled_kernel(
+    const float* query, const float* latent_query,
+    const std::uint16_t* kv_up, const void* const* pages, float* output,
+    std::uint32_t layer, std::uint32_t page_tokens,
+    std::uint32_t first_position, std::uint32_t heads,
+    std::uint32_t kv_rank, std::uint32_t nope_dim,
+    std::uint32_t rope_dim, std::uint32_t value_dim,
+    float attention_scale, float* partial_maxima, float* partial_sums,
+    float* partial_outputs, std::uint32_t splits) {
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto warp = dimension / kWarpSize;
+  const auto lane = dimension % kWarpSize;
+  const auto width = kv_rank + rope_dim;
+  const auto* query_head = query +
+      (static_cast<std::size_t>(row) * heads + head) * (nope_dim + rope_dim);
+  const auto* absorbed = latent_query +
+      (static_cast<std::size_t>(row) * heads + head) * kv_rank;
+  __shared__ float values[kWarpsPerBlock][kThreads];
+  __shared__ float scores[kWarpsPerBlock];
+  __shared__ float probabilities[kWarpsPerBlock];
+  __shared__ float accumulator[kThreads];
+  __shared__ float maximum;
+  __shared__ float denominator;
+  __shared__ float old_scale;
+  if (dimension < kv_rank) accumulator[dimension] = 0.0F;
+  if (dimension == 0U) {
+    maximum = kNegativeInfinity;
+    denominator = 0.0F;
+  }
+  const auto visible = first_position + row + 1U;
+  const auto begin = partial_outputs
+      ? static_cast<std::uint32_t>(blockIdx.z) * kMlaContextSplitTokens : 0U;
+  const auto end = partial_outputs
+      ? min(visible, begin + kMlaContextSplitTokens) : visible;
+  for (std::uint32_t first = begin; first < end;
+       first += kWarpsPerBlock) {
+    const auto token = first + warp;
+    float partial = 0.0F;
+    if (token < end) {
+      for (std::uint32_t latent = lane; latent < kv_rank;
+           latent += kWarpSize) {
+        const auto bits = *mla_page_value(
+            pages, layer, page_tokens, token, width, latent);
+        const auto value =
+            __uint_as_float(static_cast<unsigned>(bits) << 16U);
+        values[warp][latent] = value;
+        partial += absorbed[latent] * value;
+      }
+      for (std::uint32_t rope = lane; rope < rope_dim;
+           rope += kWarpSize) {
+        const auto bits = *mla_page_value(
+            pages, layer, page_tokens, token, width, kv_rank + rope);
+        partial += query_head[nope_dim + rope] *
+            __uint_as_float(static_cast<unsigned>(bits) << 16U);
+      }
+    }
+    const auto score = warp_sum(partial) * attention_scale;
+    if (lane == 0U)
+      scores[warp] = token < end ? score : kNegativeInfinity;
+    __syncthreads();
+    const auto count = min(kWarpsPerBlock, end - first);
+    if (dimension == 0U) {
+      auto next_maximum = maximum;
+      for (unsigned item = 0U; item < count; ++item)
+        next_maximum = fmaxf(next_maximum, scores[item]);
+      old_scale = expf(maximum - next_maximum);
+      auto next_denominator = denominator * old_scale;
+      for (unsigned item = 0U; item < count; ++item) {
+        probabilities[item] = expf(scores[item] - next_maximum);
+        next_denominator += probabilities[item];
+      }
+      maximum = next_maximum;
+      denominator = next_denominator;
+    }
+    __syncthreads();
+    if (dimension < kv_rank) {
+      auto total = accumulator[dimension] * old_scale;
+      for (unsigned item = 0U; item < count; ++item)
+        total += values[item][dimension] * probabilities[item];
+      accumulator[dimension] = total;
+    }
+    // All warps must finish consuming this tile before any overwrite it.
+    __syncthreads();
+  }
+  if (partial_outputs) {
+    const auto index = (static_cast<std::size_t>(row) * heads + head) *
+                       splits + blockIdx.z;
+    if (dimension == 0U) {
+      partial_maxima[index] = maximum;
+      partial_sums[index] = denominator;
+    }
+    if (dimension < kv_rank)
+      partial_outputs[index * kv_rank + dimension] = accumulator[dimension];
+    return;
+  }
+  if (dimension < value_dim) {
+    const auto* weight = kv_up + static_cast<std::size_t>(head) *
+        (nope_dim + value_dim) * kv_rank +
+        static_cast<std::size_t>(nope_dim + dimension) * kv_rank;
+    float total = 0.0F;
+    for (std::uint32_t latent = 0U; latent < kv_rank; ++latent)
+      total += __uint_as_float(static_cast<unsigned>(weight[latent]) << 16U) *
+               (accumulator[latent] / denominator);
+    output[(static_cast<std::size_t>(row) * heads + head) * value_dim +
+           dimension] = __bfloat162float(__float2bfloat16_rn(total));
+  }
+}
+
+__global__ void mla_attention_merge_kernel(
+    const std::uint16_t* kv_up, float* maxima, const float* sums,
+    const float* partial_outputs, float* output, std::uint32_t heads,
+    std::uint32_t kv_rank, std::uint32_t nope_dim,
+    std::uint32_t value_dim, std::uint32_t splits) {
+  const auto dimension = static_cast<std::uint32_t>(threadIdx.x);
+  const auto head = static_cast<std::uint32_t>(blockIdx.x);
+  const auto row = static_cast<std::uint32_t>(blockIdx.y);
+  const auto base = (static_cast<std::size_t>(row) * heads + head) * splits;
+  float local_maximum = kNegativeInfinity;
+  for (auto split = dimension; split < splits; split += kThreads)
+    if (sums[base + split] > 0.0F)
+      local_maximum = fmaxf(local_maximum, maxima[base + split]);
+  const auto maximum = reduce_max(local_maximum);
+  float local_sum = 0.0F;
+  for (auto split = dimension; split < splits; split += kThreads) {
+    const auto mass = sums[base + split];
+    const auto factor = mass > 0.0F ? expf(maxima[base + split] - maximum) : 0.0F;
+    maxima[base + split] = factor;
+    local_sum += mass * factor;
+  }
+  const auto denominator = reduce_sum(local_sum);
+  __shared__ float latent[kThreads];
+  if (dimension < kv_rank) {
+    float total = 0.0F;
+    for (std::uint32_t split = 0U; split < splits; ++split)
+      total += partial_outputs[(base + split) * kv_rank + dimension] *
+               maxima[base + split];
+    latent[dimension] = total / denominator;
+  }
+  __syncthreads();
+  if (dimension < value_dim) {
+    const auto* weight = kv_up + static_cast<std::size_t>(head) *
+        (nope_dim + value_dim) * kv_rank +
+        static_cast<std::size_t>(nope_dim + dimension) * kv_rank;
+    float total = 0.0F;
+    for (std::uint32_t index = 0U; index < kv_rank; ++index)
+      total += __uint_as_float(static_cast<unsigned>(weight[index]) << 16U) *
+               latent[index];
+    output[(static_cast<std::size_t>(row) * heads + head) * value_dim +
+           dimension] = __bfloat162float(__float2bfloat16_rn(total));
+  }
+}
+
 __global__ void rms_kernel(const float* input, const float* weight,
                            float* output, std::uint32_t count, float epsilon) {
   float square = 0.0F;
@@ -7844,10 +8001,17 @@ Status nvfp4_gemv_f32_batch(
 }
 Status mla_causal_latent_bf16(const MlaCausalLaunch& launch) noexcept {
   const auto latent_width = launch.kv_rank + launch.rope_dim;
+  const auto positions = static_cast<std::uint64_t>(launch.first_position) + launch.rows;
+  const auto any_partials = launch.partial_maxima || launch.partial_sums || launch.partial_outputs;
+  const auto all_partials = launch.partial_maxima && launch.partial_sums && launch.partial_outputs;
+  const auto split_count = (positions + kMlaContextSplitTokens - 1U) / kMlaContextSplitTokens;
   if (!launch.query || !launch.latent || !launch.kv_up ||
       !launch.page_table || !launch.output || !launch.latent_query ||
       !launch.rows || !launch.heads || !launch.kv_rank ||
       launch.kv_rank > kThreads || !launch.nope_dim || !launch.rope_dim ||
+      positions > std::numeric_limits<std::uint32_t>::max() ||
+      (any_partials && !all_partials) ||
+      (all_partials && launch.rows <= kMlaContextSplitMaximumRows && split_count > 65535U) ||
       launch.rope_dim > 256U || launch.rope_dim % 2U ||
       latent_width % 2U || !launch.value_dim || launch.value_dim > kThreads ||
       !std::isfinite(launch.attention_scale) ||
@@ -7877,12 +8041,37 @@ Status mla_causal_latent_bf16(const MlaCausalLaunch& launch) noexcept {
       launch.kv_rank, launch.nope_dim, launch.rope_dim, launch.value_dim);
   status = checked(cudaPeekAtLastError(), "MLA absorbed query");
   if (!status.ok()) return status;
-  mla_attention_kernel<<<query_grid, kThreads, 0, stream>>>(
-      launch.query, launch.latent_query, launch.kv_up, launch.page_table,
-      launch.output, launch.layer, launch.page_tokens,
-      launch.first_position, launch.heads, launch.kv_rank,
-      launch.nope_dim, launch.rope_dim, launch.value_dim,
-      launch.attention_scale);
+  if (all_partials && launch.rows <= kMlaContextSplitMaximumRows && positions >= 4096U) {
+    const auto splits = static_cast<std::uint32_t>(split_count);
+    const dim3 split_grid(launch.heads, launch.rows, splits);
+    mla_attention_tiled_kernel<<<split_grid, kThreads, 0, stream>>>(
+        launch.query, launch.latent_query, launch.kv_up, launch.page_table,
+        launch.output, launch.layer, launch.page_tokens,
+        launch.first_position, launch.heads, launch.kv_rank,
+        launch.nope_dim, launch.rope_dim, launch.value_dim,
+        launch.attention_scale, launch.partial_maxima, launch.partial_sums,
+        launch.partial_outputs, splits);
+    status = checked(cudaPeekAtLastError(), "compressed MLA split attention");
+    if (!status.ok()) return status;
+    mla_attention_merge_kernel<<<query_grid, kThreads, 0, stream>>>(
+        launch.kv_up, launch.partial_maxima, launch.partial_sums,
+        launch.partial_outputs, launch.output, launch.heads, launch.kv_rank,
+        launch.nope_dim, launch.value_dim, splits);
+  } else if (positions >= 64U) {
+    mla_attention_tiled_kernel<<<query_grid, kThreads, 0, stream>>>(
+        launch.query, launch.latent_query, launch.kv_up, launch.page_table,
+        launch.output, launch.layer, launch.page_tokens,
+        launch.first_position, launch.heads, launch.kv_rank,
+        launch.nope_dim, launch.rope_dim, launch.value_dim,
+        launch.attention_scale, nullptr, nullptr, nullptr, 1U);
+  } else {
+    mla_attention_kernel<<<query_grid, kThreads, 0, stream>>>(
+        launch.query, launch.latent_query, launch.kv_up, launch.page_table,
+        launch.output, launch.layer, launch.page_tokens,
+        launch.first_position, launch.heads, launch.kv_rank,
+        launch.nope_dim, launch.rope_dim, launch.value_dim,
+        launch.attention_scale);
+  }
   return checked(cudaPeekAtLastError(), "compressed MLA attention");
 }
 Status bf16_gemm_f32_batch(

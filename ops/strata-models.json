@@ -1,0 +1,66 @@
+{
+  "schema": "strata-models-v1",
+  "release": "v0.2.1",
+  "port": 8082,
+  "models": [
+    {
+      "aliases": [
+        "swift",
+        "swift-flash",
+        "swift-flash-next-iq3-s"
+      ],
+      "model_id": "swift-flash-next-iq3-s",
+      "name": "Swift 1.5 Flash Next GSQ-RCO IQ3_S",
+      "family": "swift",
+      "quant": "IQ3_S",
+      "directory": "models/swift-IQ3_S",
+      "context_size": 262144,
+      "sources": [
+        {
+          "role": "target",
+          "repository": "ukisai/Swift-1.5-Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+          "revision": "99bb8f7f95c7aa7b24a36a7786a4f657b30f5d3d",
+          "files": [
+            {
+              "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00001-of-00002.gguf",
+              "size": 44900816736,
+              "sha256": "46cb3996cd1a17fe8bc5ae1f9bb16869480de5a03f17f868d6047a20a46edd3b"
+            },
+            {
+              "path": "Swift-Qwen3.8-Flash-Next-GSQ-RCO-IQ3_S-00002-of-00002.gguf",
+              "size": 38842920384,
+              "sha256": "70ce6fb48a94fe34bd7e9a53a526be68066c64b5a5077cdc82fb31350b66b608"
+            }
+          ]
+        },
+        {
+          "role": "mtp",
+          "repository": "Maximilian228/Qwen3.8-Flash-Next-NVFP4-GPTQ-Strata",
+          "revision": "379ff0b8a39f83dfd93d2122cc91dd4029cf9602",
+          "files": [
+            {
+              "path": "mtp/dense.bin",
+              "size": 116099072,
+              "sha256": "c724dc0b0822ada5d2977bf5bde821605feabaa64ea2e0045b67ca656329070a"
+            },
+            {
+              "path": "mtp/dense.txt",
+              "size": 1880,
+              "git_sha1": "0a6b354ada9f26d07c4d51684089bdc2fda06a1b"
+            },
+            {
+              "path": "mtp/draft_vocab.bin",
+              "size": 235852,
+              "sha256": "25d7fd1670a2e0ec885868d1718d410a3baab03bceeacf0a156cf93ffe4e1ef4"
+            },
+            {
+              "path": "mtp/experts.bin",
+              "size": 707788800,
+              "sha256": "09398406be61f1f54c93861f449e48b8df0bfccbc9ec9b2b7636775a6ea9244f"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

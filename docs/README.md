@@ -21,6 +21,8 @@ links instead of copying measurements or lifecycle rules into another file.
 | [Deployment](deployment.md) | aliases, resource policy, publication and lifecycle |
 | [Operations](operations.md) | health, telemetry, diagnosis, recovery and cleanup |
 | [Pi CLI](pi-cli.md) | maintained coding harness and 256K benchmark contract |
+| [llama.cpp CLI](llama-cli.md) | independent GGUF service, model registry and Pi selection |
+| [Strata CLI](strata-cli.md) | independent Strata service, Swift Flash-Next, lifecycle, API and Pi selection |
 
 ## Interfaces and formats
 
