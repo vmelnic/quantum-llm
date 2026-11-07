@@ -12,7 +12,7 @@ fi
 die() { echo "llama.sh: $*" >&2; exit 2; }
 usage() {
   cat <<'EOF'
-Usage: ./ops/llama.sh <update|publish|deploy|start|restart|stop|status|pi|chat|config> [swift|swith|swift-heretic|kat|gpt-oss] [Pi arguments...]
+Usage: ./ops/llama.sh <update|publish|deploy|start|restart|stop|status|pi|chat|config> [swift|swith|swift-heretic|kat|gpt-oss|arex] [Pi arguments...]
 
 Runs the selected published GGUF on the Windows RTX 3090 with llama.cpp.
 One model is active at a time. QPack operations remain in ops/model.sh.
@@ -57,7 +57,7 @@ case "${action}" in
     remote Update-LlamaCpp.ps1
     ;;
   publish|deploy|start|restart)
-    [[ -n "${selection}" ]] || die "${action} requires a model selector (swift, swift-heretic, kat or gpt-oss)"
+    [[ -n "${selection}" ]] || die "${action} requires a model selector (swift, swift-heretic, kat, gpt-oss or arex)"
     "${script_dir}/sync-to-windows-host.sh" "${QUANTUM_LLM_REMOTE}" "${QUANTUM_LLM_REMOTE_ROOT}"
     remote Publish-LlamaModel.ps1 -Model "${selection}"
     if [[ "${action}" != publish ]]; then

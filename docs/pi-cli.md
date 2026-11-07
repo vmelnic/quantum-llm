@@ -12,19 +12,34 @@ Pi configuration lives in the user's home:
 The project `.pi` directory has been removed. It is intentionally absent;
 repository documentation and launch commands use the home configuration.
 
-The home default remains `llama-3090/swift-1.5-iq3-xxs`, with xhigh
-reasoning. Automatic retries are disabled. Compaction keeps 32768 recent
-tokens and reserves 26214 tokens. Select Strata explicitly for the active
-Strata service; starting a server does not change Pi's saved default.
+The user-selected home default is `llama-3090/arex-2-q4-k-m`, with xhigh
+reasoning and a 262144-token context window. Automatic retries are disabled.
+Compaction keeps 32768 recent tokens and reserves 26214 tokens. Starting a
+server does not itself change Pi's saved default.
 
 | Local 3090 backend | Pi provider | Model selection | Serving operations |
 |---|---|---|---|
 | Artifact VM / QPack | `quantum-llm` | artifact model ID | `ops/model.sh`, `ops/pi.sh` |
-| llama.cpp | `llama-3090` | `swift-1.5-iq3-xxs`, `swift-heretic`, `kat-coder-v2.5-iq4-xs`, `gpt-oss-20b-mxfp4` | [llama.cpp CLI](llama-cli.md) |
+| llama.cpp | `llama-3090` | `arex-2-q4-k-m`, `swift-1.5-iq3-xxs`, `swift-heretic`, `kat-coder-v2.5-iq4-xs`, `gpt-oss-20b-mxfp4` | [llama.cpp CLI](llama-cli.md) |
 | Strata | `strata-3090` | `swift-flash-next-iq3-s` | [Strata CLI](strata-cli.md) |
 
 The backends have separate serving processes. Use one active model on the
 3090 and stop it through its own backend before switching to another backend.
+
+## AREX-2 through Pi
+
+```bash
+./ops/llama.sh start arex
+./ops/llama.sh pi arex
+```
+
+The home catalog declares `arex-2-q4-k-m` with text input, xhigh reasoning,
+262144 context positions and 32768 maximum output tokens. The independent
+llama.cpp service uses Q4_K_M weights, Q4_0 K/V, one slot and no draft or
+vision projector. The repository `.env` already sets
+`MODEL_MAX_CONTEXT=262144`; the llama.cpp registry supplies the service's
+actual context argument. Existing providers and compaction settings are
+preserved, and project `.pi` remains absent.
 
 ## Strata through Pi
 

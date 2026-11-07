@@ -109,6 +109,25 @@ See [Architecture](docs/architecture.md) for the implemented boundaries.
 
 The control machine is POSIX. The execution host is Windows with the RTX 3090.
 
+For the installed AREX-2 model:
+
+```bash
+./ops/llama.sh start arex
+./ops/llama.sh pi arex
+./ops/llama.sh stop
+```
+
+AREX-2 uses Q4_K_M weights through the existing llama.cpp service: one slot,
+262,144 context positions, Q4_0 K/V and xhigh reasoning. The published artifact
+is `${MODEL_ROOT}/arex-2-q4-k-m-256k`. Home Pi settings select
+`llama-3090/arex-2-q4-k-m` by default, so `pi` connects to it directly.
+The repository `.env` sets `MODEL_MAX_CONTEXT=262144`; the llama.cpp registry
+and Pi model catalog also declare 262,144. See [llama.cpp CLI](docs/llama-cli.md)
+for the pinned file and service configuration. Stop the active backend before
+switching services on the 3090.
+
+To build and run the artifact VM:
+
 ```bash
 cp .env.example .env
 # Set QUANTUM_LLM_REMOTE, QUANTUM_LLM_REMOTE_ROOT, MODEL_ROOT and EXPERT_API_KEY.

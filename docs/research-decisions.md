@@ -2171,3 +2171,138 @@ without error; actual enumeration/access failures remain fatal.
 After deploying this correction, the user's exact `./ops/strata.sh start`
 command exits zero with generation_ready=true. An authenticated remote
 GET /v1/models returns HTTP200 and swift-flash-next-iq3-s after SSH closes.
+
+## AREX-2 single-3090 documentary screen, 2026-11-07
+
+Scope: user-requested feasibility analysis of BAAI/AREX-2; one RTX 3090
+24 GiB on the existing host, text-only, one slot, xhigh, scalar target decode
+without a draft. Context cases below mean populated positions, not a short
+prompt inside a configured large window. No model payload download, remote
+host operation, inference, runtime edit or serving-policy change was performed.
+Weight/KV quantization alternatives are screening candidates, not new fidelity
+approval or qualification of the universal artifact VM.
+
+The official card describes a dense Qwen3.8-27B fine-tune. Source config uses
+the Qwen3_5 encoding: 64 layers, 16 full-attention layers, 48 recurrent layers,
+4 KV heads, 256 head width, recurrent 48 value heads of width 128 and key
+width 128, and 262144 maximum positions. No routed experts or routers exist.
+The official safetensors index reports 54,713,457,120 payload bytes and no MTP
+tensors, despite config declaring mtp_num_hidden_layers=1. Do not infer usable
+MTP from that field or reuse another fine-tune's acceptance/speed result.
+[Card](https://huggingface.co/BAAI/AREX-2),
+[config](https://huggingface.co/BAAI/AREX-2/blob/main/config.json),
+[index](https://huggingface.co/BAAI/AREX-2/blob/main/model.safetensors.index.json).
+
+Published evaluation reports Frontier-CS 70.7, MLE-Lite Any Medal 81.8,
+BrowseComp 84.0 and GAIA 92.2. Frontier-CS permits five hours/task; MLE-Lite
+permits twelve and includes skills. These are upstream agent-environment
+results, not quantized Pi repository repair, Romanian quality, or local speed.
+Self-improvement means iterative solution refinement at inference time, not
+online weight updates. No controlled AREX-versus-Swift local result or
+reproducible populated-256K single-3090 coding measurement was established.
+[Paper and protocols](https://arxiv.org/html/2609.38288),
+[evaluation code](https://github.com/VectorSpaceLab/AREX-2).
+
+Publisher tree metadata gives these exact file masses; GiB = bytes / 2^30:
+
+| Bartowski artifact | Bytes | GiB |
+|---|---:|---:|
+| IQ4_XS | 15,236,967,520 | 14.191 |
+| Q4_K_M | 17,203,416,160 | 16.022 |
+| Q5_K_M | 20,684,893,280 | 19.264 |
+
+These whole-file allowances are not measured VRAM or per-token traffic.
+Dense projections, recurrent weights, embeddings and output head have not
+been separately measured in the quantized artifact. Input embeddings gather
+selected rows; dense matrices and output head are hot per target call.
+Vision is excluded; the optional F16 projector is another 927,607,264 bytes
+plus image-dependent encoder workspaces. The GGUF publisher explicitly lists
+no speculative decoding.
+[GGUF publisher](https://huggingface.co/bartowski/BAAI_AREX-2-GGUF),
+[file metadata](https://huggingface.co/api/models/bartowski/BAAI_AREX-2-GGUF/tree/main?recursive=true&limit=1000).
+
+Capacity prerequisite:
+
+```text
+M = W_dense/recurrent + W_embeddings + W_head + W_norms
+    + S_recurrent + S_convolution + KV_target(C)
+    + W_draft + KV_draft + S_rollback + workspaces + 1 GiB reserve
+W_routed = W_router = W_draft = KV_draft = S_rollback = 0 in this screen
+core S_recurrent = 48*48*128*128*4 = 144 MiB
+KV_target(C) = 2*16*4*256*C*bytes_per_value
+F16 bytes_per_value=2; Q8_0=34/32; Q4_0=18/32
+```
+
+For Bartowski Q4_K_M, the following subtotals include the whole file,
+core recurrent state and 1 GiB reserve, but exclude convolution state,
+workspaces, other allocations and vision. They are capacity arithmetic,
+not runtime allocation measurements:
+
+| Populated context | F16 KV / subtotal GiB | Q8_0 KV / subtotal GiB | Q4_0 KV / subtotal GiB |
+|---|---:|---:|---:|
+| 32768 | 2 / 19.163 | 1.0625 / 18.225 | 0.5625 / 17.726 |
+| 65536 | 4 / 21.163 | 2.125 / 19.288 | 1.125 / 18.288 |
+| 131072 | 8 / 25.163 | 4.25 / 21.413 | 2.25 / 19.413 |
+| 262144 | 16 / 33.163 | 8.5 / 25.663 | 4.5 / 21.663 |
+
+Stop the Q4_K_M fully resident 256K F16/Q8 proposals at capacity failure.
+Q4_K_M + 64K F16 or +256K Q4_0 passes only the preliminary subtotal test.
+The latter leaves 2.337 GiB before uncounted allocations and requires explicit
+KV-fidelity approval and real long-context quality/residency gates. Q4_0 is
+not the artifact VM's Q4H ABI. IQ4_XS saves another 1.831 GiB but cannot
+inherit the original checkpoint's benchmark quality without validation.
+
+Traffic, bandwidth and speculative prerequisites remain:
+
+```text
+B_target_call >= B_hot_dense/recurrent/head + KV_target(C)
+                 + B_recurrent_state + B_intermediates
+A_scalar=1; B_per_accepted=B_target_call; proposer/verifier extra cost=0
+T_call >= max(B_GPU/936e9, B_RAM/BW_RAM,
+              B_PCIe/(12.46*2^30), B_NVMe/BW_NVMe)
+15 useful tok/s requires complete useful-token latency <=66.667 ms
+T_task = T_cold_or_reused_prefill + N_generated/r_useful + T_tools/retries
+If speculation is added:
+T_cycle=T_proposer(D)+T_verify(D+1)+T_rollback/sampling
+r_useful=A_D/T_cycle; B_per_accepted=B_cycle/A_D; 1<=A_D<=D+1
+```
+
+936 GB/s is theoretical GPU bandwidth; 12.46 GiB/s is historical host-link
+evidence. Actual GPU/RAM/NVMe rates and hot quantized role masses are unknown.
+The fully resident candidate plans zero per-token hot-state RAM/PCIe/NVMe
+traffic; NVMe remains startup storage. Transferring the full 16 GiB F16 KV
+over that historical PCIe link alone would cost at least 1.284 s/call.
+Hot dense/KV offload therefore does not rescue the throughput proposal.
+No positive generated-token rate, cold/reused prefill time, TTFT or tool-loop
+wall time is claimed. MTP has a separate community adapted W8A16 release,
+with offline acceptance evidence and a nonstandard draft-vocabulary ABI;
+it is not a drop-in MTP speed result for this GGUF candidate.
+[Community MTP limitations](https://huggingface.co/numsu/AREX-2-27B-INT8-W8A16-MTP).
+
+Candidate qualification order: source/reference fidelity, native numerical
+gate, direct chat, streaming/tools, then real Pi coding with separately
+measured cold/reused prefill, TTFT, reasoning/visible output, decode,
+tool-loop wall time, residency and cleanup. Existing llama.cpp operations
+are the practical evaluation candidate; adding AREX to a registry or claiming
+universal artifact-VM support is outside this documentary analysis.
+
+### AREX-2 deployment, 2026-11-07
+
+The user requested Xet download, deployment, home Pi selection and a single
+`hi` prompt. The canonical download worker transferred the pinned Bartowski
+Q4_K_M file above with exit code zero. The status reader lacked its cached
+tree metadata; Publish-LlamaModel.ps1 independently verified the pinned file
+size, GGUF v3 header and SHA256 before transactional publication.
+
+Artifact: `${MODEL_ROOT}/arex-2-q4-k-m-256k`. Aliases: `arex`, `arex-2`,
+`arex-2-q4-k-m`. Existing llama.cpp v0.6.0, one slot, 262144 context,
+Q4_0 K/V, all GPU layers, fitting off, xhigh, 32768 maximum output tokens,
+no draft or vision projector. Repository `.env` already has
+MODEL_MAX_CONTEXT=262144. Home Pi defaults now select
+`llama-3090/arex-2-q4-k-m:xhigh`; other providers and compaction are preserved.
+Private backups and operation evidence: `out/arex-20261107/`.
+
+`./ops/llama.sh pi arex --no-session --mode json -p hi` exited zero and
+returned `Salut! Cu ce te pot ajuta în proiectul quantum-llm?`. Pi issued
+one incidental `bash` call, `echo "OK"`, before the greeting. Stop removed
+the AREX process and process record; GPU use returned to 288 MiB.

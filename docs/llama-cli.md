@@ -16,6 +16,9 @@ it does not qualify either model for the artifact VM or change QPack launchers.
 ./ops/llama.sh start kat
 ./ops/llama.sh pi kat
 
+./ops/llama.sh start arex
+./ops/llama.sh pi arex
+
 ./ops/llama.sh start swift-heretic
 ./ops/llama.sh pi swift-heretic
 
@@ -138,12 +141,14 @@ restarting a service; live coding/tool quality and speed have not been tested.
 `~/.pi/agent/models.json` contains provider `llama-3090`, pointing from the
 local Mac to `http://10.10.88.4:8081/v1`, with:
 
+- `arex-2-q4-k-m`;
 - `swift-1.5-iq3-xxs`;
 - `swift-heretic`;
 - `kat-coder-v2.5-iq4-xs`.
 
-Home Pi settings include these models for `/model` and Ctrl+P. Swift is the
-home default with xhigh reasoning. The project `.pi` directory has been
+Home Pi settings include these models for `/model` and Ctrl+P. The user-selected
+home default is now `llama-3090/arex-2-q4-k-m` with xhigh reasoning.
+The project `.pi` directory has been
 removed and remains absent; current selection uses `~/.pi/agent/`.
 Other providers and compaction settings are preserved. Historical user
 configuration backups remain beside the originals, and the former project
@@ -170,6 +175,15 @@ pi --provider llama-3090 --model kat-coder-v2.5-iq4-xs --thinking xhigh
 
 ## Capacity prerequisite
 
+AREX-2 is available through `arex`, `arex-2` and `arex-2-q4-k-m`. Its pinned
+Bartowski Q4_K_M GGUF is published under `${MODEL_ROOT}/arex-2-q4-k-m-256k`.
+Policy: 262144 context positions, one slot, Q4_0 K/V, all GPU layers, fitting
+off, xhigh and 32768 maximum output tokens. It has no MTP or projector.
+The file is 17203416160 bytes at revision
+`b5817eb07865e9619f1516140472f61d66268922`, SHA256
+`45453eed75a1c32b0ee203c1864ed388b46868305fb523d88f4484faa0837b4a`.
+The preliminary subtotal is 21.663 GiB including core recurrent state,
+4.5 GiB target KV and 1 GiB reserve, before convolution and workspaces.
 At 262,144 configured positions, the previously recorded geometry gives:
 
 ```text

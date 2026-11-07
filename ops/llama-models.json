@@ -100,6 +100,25 @@
       "cache_type_k": "f16",
       "cache_type_v": "f16",
       "reasoning_effort": "high"
+    },
+    {
+      "aliases": [
+        "arex",
+        "arex-2",
+        "arex-2-q4-k-m"
+      ],
+      "model_id": "arex-2-q4-k-m",
+      "name": "AREX-2 Q4_K_M",
+      "artifact": "arex-2-q4-k-m-256k",
+      "repository": "bartowski/BAAI_AREX-2-GGUF",
+      "revision": "b5817eb07865e9619f1516140472f61d66268922",
+      "file": "BAAI_AREX-2-Q4_K_M.gguf",
+      "bytes": 17203416160,
+      "sha256": "45453eed75a1c32b0ee203c1864ed388b46868305fb523d88f4484faa0837b4a",
+      "context": 262144,
+      "max_output": 32768,
+      "cache_type_k": "q4_0",
+      "cache_type_v": "q4_0"
     }
   ]
 }
